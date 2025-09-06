@@ -2,6 +2,8 @@ import numpy as np
 import re
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
+
+
 def semantic_search(
     query: str,
     embed_model: Any,                 # SentenceTransformer OR callable(texts)->np.ndarray

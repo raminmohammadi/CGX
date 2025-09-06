@@ -28,15 +28,12 @@ This file does NOT import faiss directly; it relies on the provided builder.
 """
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Iterable, Mapping
+from typing import Any, Dict, List, Optional, Sequence
 import logging
 import numpy as np
 
-try:
-    # S4 helper to flatten view rows
-    from ..embeddings.records import prepare_embedding_corpus
-except Exception as _e:
-    prepare_embedding_corpus = None  # type: ignore
+# ✅ fixed: no silent fallback, always import directly
+from cgx.embeddings.records import prepare_embedding_corpus
 
 logger = logging.getLogger(__name__)
 if not logger.handlers:
@@ -61,6 +58,7 @@ class ViewSlice:
     index: Any
     meta: Dict[str, Any]
     dim: Optional[int] = None
+
 
 
 class TwoViewIndex:
@@ -103,54 +101,36 @@ class TwoViewIndex:
         which: Sequence[str] = ("intent", "impl"),
         metric: str = "cosine",
         index_type: str = "flat",
-        normalize: Optional[bool] = None,     # pass-through to your builder if it supports it
+        normalize: Optional[bool] = None,
         batch: int = 64,
         use_gpu: bool = False,
         builder_kwargs: Optional[Dict[str, Any]] = None,
     ) -> "TwoViewIndex":
         """
         Build indices from S4 records.
-
-        Parameters
-        ----------
-        records : list[dict]
-            Output of `make_index_records`. Must include "view_intent" / "view_impl".
-        embedder : object
-            Must implement `.encode(list[str]) -> np.ndarray[float32]`.
-            No further assumptions are made.
-        index_builder : callable
-            Signature like:
-                (embeddings: np.ndarray, ids: np.ndarray|None, metric: str, index: str, **kw)
-             -> (faiss_index, meta_dict)
-            You can pass your existing `build_faiss_index` here.
-        which : ("intent","impl")
-            Which views to build (order does not matter for internal wiring).
-        metric, index_type, normalize, use_gpu, builder_kwargs
-            Passed to `index_builder` as appropriate.
-
-        Returns
-        -------
-        TwoViewIndex
         """
-        if prepare_embedding_corpus is None:
-            raise RuntimeError("TwoViewIndex: missing prepare_embedding_corpus import.")
+        if prepare_embedding_corpus is None or not callable(prepare_embedding_corpus):
+            raise RuntimeError("TwoViewIndex: prepare_embedding_corpus is not available. Check imports.")
         if not hasattr(embedder, "encode"):
             raise TypeError("TwoViewIndex: 'embedder' must implement .encode(list[str])->ndarray.")
         if not callable(index_builder):
-            raise TypeError("TwoViewIndex: 'index_builder' must be a callable(X, **kwargs)->(index, meta).")
+            raise TypeError("TwoViewIndex: 'index_builder' must be callable(X, **kwargs)->(index, meta).")
 
         builder_kwargs = dict(builder_kwargs or {})
 
         # Flatten records into corpus rows
         corpus = prepare_embedding_corpus(records, which=which)
+        if corpus is None or not isinstance(corpus, list):
+            raise RuntimeError(f"TwoViewIndex: prepare_embedding_corpus returned invalid value: {type(corpus)}")
+
         # Split per view
         intent_rows = [r for r in corpus if r.get("view") == "intent"]
         impl_rows   = [r for r in corpus if r.get("view") == "impl"]
 
-        # Embed texts view-by-view (keep row order stable)
+        # Encode helper
         def _encode(rows: List[Dict[str, Any]]) -> np.ndarray:
             texts = [str(r.get("text") or "") for r in rows]
-            embs = embedder.encode(texts)  # expected shape (N, D)
+            embs = embedder.encode(texts)
             X = np.asarray(embs, dtype=np.float32)
             if X.ndim != 2 or X.shape[0] != len(rows):
                 raise ValueError(f"TwoViewIndex: embedder returned shape {X.shape}, expected (N,D) with N={len(rows)}.")
@@ -186,7 +166,7 @@ class TwoViewIndex:
             )
             tvi._impl = ViewSlice(rows=impl_rows, ids=ids_impl, index=idx_c, meta=meta_c or {}, dim=int(X_impl.shape[1]))
 
-        # Build chunk->rows map (helps later fusing at symbol granularity)
+        # Build chunk->rows map
         tvi._chunk_id_to_rows = {}
         for view_name, vs in (("intent", tvi._intent), ("impl", tvi._impl)):
             if vs is None:
@@ -214,10 +194,6 @@ class TwoViewIndex:
         return vs
 
     def encode_query(self, embedder: Any, text: str, *, l2_normalize: Optional[bool] = None, metric: Optional[str] = None) -> np.ndarray:
-        """
-        Encode a query string using the provided embedder. We do not assume any model;
-        if you want cosine/IP, pass l2_normalize=True to normalize the query vector.
-        """
         if not hasattr(embedder, "encode"):
             raise TypeError("encode_query: 'embedder' must implement .encode([text])->ndarray.")
         q = embedder.encode([str(text or "")])
@@ -237,15 +213,9 @@ class TwoViewIndex:
         *,
         embedder: Any,
         top_k: int = 10,
-        metric: Optional[str] = None,          # "cosine"|"l2"|"ip"; if None, we infer from meta
-        normalize_query: Optional[bool] = None # override normalization behavior
+        metric: Optional[str] = None,
+        normalize_query: Optional[bool] = None
     ) -> List[Dict[str, Any]]:
-        """
-        Search a single view index and return ranked rows with scores, then fold to chunk_ids.
-
-        Returns a list of results:
-          [{ "chunk_id": str, "row": dict, "score": float, "distance": float, "rank": int }, ...]
-        """
         vs = self._ensure_view(view)
         m = (metric or vs.meta.get("metric") or "cosine").lower()
         if m in {"inner_product", "dot"}:
@@ -253,7 +223,6 @@ class TwoViewIndex:
 
         Q = self.encode_query(embedder, query, l2_normalize=(normalize_query if normalize_query is not None else (m in {"cosine", "ip"})), metric=m)
 
-        # FAISS-like API: index.search(Q, k) -> (D, I)
         try:
             D, I = vs.index.search(Q, int(top_k))
         except Exception as e:
@@ -270,17 +239,12 @@ class TwoViewIndex:
             try:
                 row = vs.rows[int(idx)]
             except Exception:
-                # Defensive: skip if index out of range
                 rank += 1
                 continue
-            # unify scoring: higher is better
             if m in {"cosine", "ip"}:
-                score = float(1.0 - float(dist)) if "normalized_for_cosine" not in vs.meta else float(vs.index.reconstruct(int(idx)) @ Q.T)  # defensive
-                # In many FAISS configs with IP on normalized vectors, `dist` already is (1 - IP) or IP;
-                # we still provide both distance and a monotonically increasing score.
-                score = float(1.0 - float(dist)) if (vs.meta.get("faiss_metric") == "L2") else float(dist)
-                distance = float(1.0 - score) if vs.meta.get("faiss_metric") != "L2" else float(dist)
-            else:  # L2
+                score = float(dist)
+                distance = float(1.0 - dist)
+            else:
                 distance = float(dist)
                 score = float(-distance)
             out.append({
@@ -297,9 +261,6 @@ class TwoViewIndex:
     # ---------- utilities ----------
 
     def rows_for_chunk(self, chunk_id: str) -> Dict[str, List[int]]:
-        """
-        Return {"intent":[row_idx...], "impl":[row_idx...]} for the given chunk id (may be empty lists).
-        """
         return self._chunk_id_to_rows.get(chunk_id, {"intent": [], "impl": []})
 
     def available_views(self) -> List[str]:

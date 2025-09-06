@@ -1,26 +1,34 @@
-# src/cgx/retrieval/hybrid.py
 from __future__ import annotations
 
 """
-Two-view hybrid retrieval orchestrator (ADD-ONLY).
+Two-view hybrid retrieval orchestrator (UNIFIED).
 
 Consumes:
   - TwoViewIndex (S6) for ANN over 'intent' and 'impl'
-  - LexicalIndex (BM25-lite) from S7 lexical.py
-  - S4 records for metadata + grouping (file/class)
-  - Optional knowledge graph G for 1-hop expansion (safe to omit)
+  - LexicalIndex (BM25-lite) from S7 lexical.py, OR fallback regex over chunks
+  - S4 records/chunks for metadata + grouping (file/class)
+  - Optional knowledge graph G for 1-hop/multi-hop expansion
 
 Outputs:
-  - chunk_results: ranked list of chunks
-  - file_results:  aggregated ranking by file
-  - class_results: aggregated ranking by parent class
+  {
+    "chunks":  [ {chunk_id, score, rank, provenance}, ... ],
+    "files":   [ {file, score, members:[...]}, ... ],
+    "classes": [ {class_id, score, members:[...]}, ... ]
+  }
 
-No changes to existing modules; pure consumer layer.
+Provenance per chunk includes:
+  - intent_rank, intent_score
+  - impl_rank, impl_score
+  - lexical_count
+  - graph_depth
+  - symbol_match
 """
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Iterable, Callable
 import logging
+import re
+from collections import deque
 
 from .index import TwoViewIndex
 from .lexical import LexicalIndex
@@ -41,74 +49,51 @@ logger.setLevel(logging.INFO)
 def _records_map(records: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     return {str(r.get("id")): r for r in records if isinstance(r.get("id"), str) and r.get("id")}
 
-def _neighbors_ids_from_record(rec: Dict[str, Any], max_n: int = 32) -> List[str]:
-    out: List[str] = []
-    for tup in rec.get("neighbors_summary") or []:
-        try:
-            edge_type, nid = tup
-        except Exception:
+
+def _expand_multi_hop(
+    seeds: List[str],
+    *,
+    G,
+    max_depth: int = 1,
+    relation_types: Optional[Iterable[str]] = None,
+) -> Dict[str, int]:
+    """Multi-hop graph expansion with optional relation-type filtering."""
+    depths: Dict[str, int] = {}
+    if G is None:
+        return depths
+    qd = deque([(sid, 0) for sid in seeds if sid in G])
+    visited = set(seeds)
+
+    while qd:
+        nid, d = qd.popleft()
+        if d >= max_depth:
             continue
-        if isinstance(nid, str) and nid:
-            out.append(nid)
-        if len(out) >= max_n:
-            break
-    return out
+        for nbr in list(G.successors(nid)) + list(G.predecessors(nid)):
+            if nbr in visited:
+                continue
+            edge_ok = True
+            if relation_types:
+                attrs = G[nid].get(nbr) or G.get(nid, {}).get(nbr, {})
+                etypes = [ed.get("type") for ed in (attrs.values() if isinstance(attrs, dict) else []) if isinstance(ed, dict)]
+                if etypes and not any(et in relation_types for et in etypes):
+                    edge_ok = False
+            if not edge_ok:
+                continue
+            visited.add(nbr)
+            qd.append((nbr, d + 1))
+            depths[str(nbr)] = d + 1
+    return depths
 
-def _neighbors_ids_from_graph(G, cid: str, max_n: int = 32) -> List[str]:
-    out: List[str] = []
-    if G is None or cid not in G:
-        return out
-    try:
-        # predecessors + successors, stable sort by (edge_type, node_id)
-        pairs = []
-        for u in G.predecessors(cid):
-            attrs = G[u][cid]
-            if isinstance(attrs, dict) and any(isinstance(v, dict) for v in attrs.values()):
-                for ed in attrs.values():
-                    et = ed.get("type", "")
-                    pairs.append((et, u))
-            else:
-                et = attrs.get("type", "")
-                pairs.append((et, u))
-        for v in G.successors(cid):
-            attrs = G[cid][v]
-            if isinstance(attrs, dict) and any(isinstance(v2, dict) for v2 in attrs.values()):
-                for ed in attrs.values():
-                    et = ed.get("type", "")
-                    pairs.append((et, v))
-            else:
-                et = attrs.get("type", "")
-                pairs.append((et, v))
-        pairs = sorted({(et, nid) for et, nid in pairs})
-        for _, nid in pairs[:max_n]:
-            out.append(nid)
-    except Exception:
-        return out
-    return out
 
-def _expand_1hop(seed_ids: List[str], *, records_by_id: Dict[str, Dict[str, Any]], G=None, per_seed: int = 16) -> List[str]:
-    """
-    Deterministic 1-hop expansion: for each seed, append up to `per_seed` neighbors
-    (graph if provided, else neighbor summary from the record).
-    Output is a flattened list (duplicates removed while preserving order).
-    """
-    seen = set(seed_ids)
-    out: List[str] = []
-    for sid in seed_ids:
-        rec = records_by_id.get(sid) or {}
-        neigh = _neighbors_ids_from_graph(G, sid, per_seed) if G is not None else _neighbors_ids_from_record(rec, per_seed)
-        for nid in neigh:
-            if nid not in seen:
-                out.append(nid)
-                seen.add(nid)
-    return out
-
-def _aggregate_group(scores_by_chunk: List[Tuple[str, float]], *, key_fn, alpha: float = 0.5, decay: float = 0.75, max_per_group: int = 6) -> List[Tuple[str, float, List[Tuple[str, float]]]]:
-    """
-    Aggregate chunk scores to groups using:
-      group_score = best + alpha * sum(decay^(i-1) * next_i)
-    Deterministic: ties broken by group id.
-    """
+def _aggregate_group(
+    scores_by_chunk: List[Tuple[str, float]],
+    *,
+    key_fn,
+    alpha: float = 0.5,
+    decay: float = 0.75,
+    max_per_group: int = 6
+) -> List[Tuple[str, float, List[Tuple[str, float]]]]:
+    """Aggregate chunk scores to groups using: best + alpha * sum(decay^(i-1)*next_i)."""
     by_group: Dict[str, List[Tuple[str, float]]] = {}
     for cid, s in scores_by_chunk:
         gid = key_fn(cid)
@@ -120,9 +105,7 @@ def _aggregate_group(scores_by_chunk: List[Tuple[str, float]], *, key_fn, alpha:
     for gid, items in by_group.items():
         items = sorted(items, key=lambda kv: (-kv[1], kv[0]))
         best = items[0][1]
-        extra = 0.0
-        for i, (_, sc) in enumerate(items[1:max_per_group], start=1):
-            extra += (decay ** (i - 1)) * sc
+        extra = sum((decay ** (i - 1)) * sc for i, (_, sc) in enumerate(items[1:max_per_group], start=1))
         total = best + alpha * extra
         out.append((gid, float(total), items[:max_per_group]))
 
@@ -130,38 +113,47 @@ def _aggregate_group(scores_by_chunk: List[Tuple[str, float]], *, key_fn, alpha:
     return out
 
 
+def _extract_symbol_tokens(q: str) -> List[str]:
+    q = q or ""
+    quoted = re.findall(r"[`\"]([A-Za-z_][A-Za-z0-9_]*)[`\"]", q)
+    bare = re.findall(r"[A-Za-z_][A-Za-z0-9_]{3,}", q)
+    return list({t.lower() for t in quoted + bare})
+
+
 # ---------------------------
-# public api
+# config
 # ---------------------------
 
 @dataclass
 class HybridConfig:
-    # per-view cutoffs
     k_intent: int = 50
     k_impl: int = 50
     k_lex: int = 50
 
-    # graph expansion
-    expand_top_n: int = 10      # expand the top-N fused seeds
-    expand_per_seed: int = 12   # up to M neighbors per seed
+    expand_top_n: int = 10
+    expand_per_seed: int = 12
+    graph_depth: int = 1
+    relation_types: Optional[List[str]] = None
 
-    # RRF stabilizer
     rrf_k: float = 60.0
 
-    # final cutoffs
     top_k_chunks: int = 50
     top_k_files: int = 20
     top_k_classes: int = 20
 
-    # aggregation recipe
     agg_alpha: float = 0.5
     agg_decay: float = 0.75
     agg_max_per_group: int = 6
 
 
+# ---------------------------
+# retriever
+# ---------------------------
+
 class HybridRetriever:
     """
-    Orchestrates two-view ANN + lexical + (optional) 1-hop graph expansion with RRF fusion.
+    Orchestrates two-view ANN + lexical (index or regex) + multi-hop graph expansion
+    with RRF fusion, symbol boosting, provenance, and file/class aggregation.
     """
 
     def __init__(
@@ -170,75 +162,117 @@ class HybridRetriever:
         tv_index: TwoViewIndex,
         records: List[Dict[str, Any]],
         lexical_index: Optional[LexicalIndex] = None,
+        chunks: Optional[List[Dict[str, Any]]] = None,
         G=None
     ) -> None:
         self.tv = tv_index
         self.records = records
         self.lex = lexical_index
+        self.chunks = chunks or []
         self.G = G
         self._rec_by_id = _records_map(records)
-
-    # ---- main search ----
 
     def search(
         self,
         query: str,
         *,
         embedder: Any,
-        cfg: Optional[HybridConfig] = None
+        cfg: Optional[HybridConfig] = None,
+        lexical_search_fn: Optional[Callable[..., List[Dict[str, Any]]]] = None,
+        lex_fields: Iterable[str] = ("code", "name", "id", "file", "meta.docstring"),
+        lex_regex: bool = True,
+        lex_case_sensitive: bool = False,
+        lex_whole_word: bool = False,
     ) -> Dict[str, Any]:
         cfg = cfg or HybridConfig()
-
         lists_for_rrf: List[List[Dict[str, Any]]] = []
+        provenance: Dict[str, Dict[str, Any]] = {}
 
-        # 1) intent ANN
-        if "intent" in self.tv.available_views():
-            intent_hits = self.tv.search_view(
-                "intent",
-                query,
-                embedder=embedder,
-                top_k=cfg.k_intent,
-            )
-            # convert to rank list
-            lists_for_rrf.append([{"chunk_id": h["chunk_id"], "rank": h["rank"]} for h in intent_hits])
+        # --- semantic per view ---
+        for view, k in (("intent", cfg.k_intent), ("impl", cfg.k_impl)):
+            if view in self.tv.available_views():
+                hits = self.tv.search_view(view, query, embedder=embedder, top_k=k)
+                lists_for_rrf.append([{"chunk_id": h["chunk_id"], "rank": h["rank"]} for h in hits])
+                for h in hits:
+                    provenance.setdefault(h["chunk_id"], {}).update({
+                        f"{view}_rank": h["rank"],
+                        f"{view}_score": h["score"],
+                    })
 
-        # 2) impl ANN
-        if "impl" in self.tv.available_views():
-            impl_hits = self.tv.search_view(
-                "impl",
-                query,
-                embedder=embedder,
-                top_k=cfg.k_impl,
-            )
-            lists_for_rrf.append([{"chunk_id": h["chunk_id"], "rank": h["rank"]} for h in impl_hits])
+        # --- lexical ---
+        if cfg.k_lex > 0:
+            if self.lex is not None:
+                lex_hits = self.lex.search(query, top_k=cfg.k_lex)
+                lists_for_rrf.append([{"chunk_id": h["chunk_id"], "rank": h["rank"]} for h in lex_hits])
+                for h in lex_hits:
+                    provenance.setdefault(h["chunk_id"], {}).update({"lexical_count": 1})
+            elif self.chunks:
+                tokens = _extract_symbol_tokens(query)
+                if not tokens:
+                    tokens = [t for t in re.findall(r"[A-Za-z_][A-Za-z0-9_]{3,}", query)]
+                if tokens:
+                    def _mk_rx(tok: str, whole: bool) -> str:
+                        return (r"\b" + re.escape(tok) + r"\b") if whole else re.escape(tok)
+                    pat = r"(" + "|".join(_mk_rx(t, bool(lex_whole_word)) for t in tokens) + r")"
+                    rx = re.compile(pat, 0 if bool(lex_case_sensitive) else re.IGNORECASE)
 
-        # 3) lexical
-        if self.lex is not None:
-            lex_hits = self.lex.search(query, top_k=cfg.k_lex)
-            # scores -> ranks internally in RRF helper if we pass scores; but we keep explicit ranks for stability
-            lists_for_rrf.append([{"chunk_id": h["chunk_id"], "rank": h["rank"]} for h in lex_hits])
+                    def _field_get(d: Dict[str, Any], dotted: str) -> str:
+                        cur: Any = d
+                        for p in dotted.split("."):
+                            cur = cur.get(p, "") if isinstance(cur, dict) else ""
+                        return str(cur or "")
 
-        # If nothing to fuse, return empty result
+                    lex_counts: Dict[str, int] = {}
+                    for ch in self.chunks:
+                        cid = str(ch.get("id") or "")
+                        if not cid:
+                            continue
+                        total = 0
+                        for f in tuple(lex_fields):
+                            s = _field_get(ch, f)
+                            if s:
+                                total += len(list(rx.finditer(s)))
+                        if total:
+                            lex_counts[cid] = total
+                            provenance.setdefault(cid, {}).update({"lexical_count": total})
+                    if lex_counts:
+                        sorted_ids = sorted(lex_counts.items(), key=lambda kv: (-kv[1], kv[0]))
+                        lists_for_rrf.append([{"chunk_id": cid, "rank": i+1} for i, (cid, _) in enumerate(sorted_ids)])
+
         if not lists_for_rrf:
             return {"chunks": [], "files": [], "classes": []}
 
-        # 4) initial fusion
+        # --- fusion ---
         fused = rrf_fuse(lists_for_rrf, k=cfg.rrf_k, top_k=cfg.top_k_chunks + cfg.expand_top_n)
 
-        # 5) 1-hop expansion from top-N seeds (optional)
-        if cfg.expand_top_n > 0:
-            seeds = [cid for cid, _ in fused[:cfg.expand_top_n]]
-            expanded = _expand_1hop(seeds, records_by_id=self._rec_by_id, G=self.G, per_seed=cfg.expand_per_seed)
-            # make an expansion list where neighbors follow seeds deterministically
-            exp_list = [{"chunk_id": cid} for cid in expanded]
-            lists_for_rrf.append(exp_list)
-            fused = rrf_fuse(lists_for_rrf, k=cfg.rrf_k, top_k=cfg.top_k_chunks)
+        # --- graph expansion ---
+        seeds = [cid for cid, _ in fused[:cfg.expand_top_n]]
+        graph_depths = _expand_multi_hop(
+            seeds, G=self.G,
+            max_depth=cfg.graph_depth,
+            relation_types=cfg.relation_types,
+        )
+        for cid, depth in graph_depths.items():
+            provenance.setdefault(cid, {}).update({"graph_depth": depth})
+            fused = [(c, sc + 0.2 / (depth + 1) if c == cid else sc) for c, sc in fused]
 
-        # chunk results (with simple normalized score for display)
-        chunk_scores: List[Tuple[str, float]] = fused[:cfg.top_k_chunks]
-        chunk_results = [{"chunk_id": cid, "score": float(sc), "rank": i + 1} for i, (cid, sc) in enumerate(chunk_scores)]
+        # --- symbol boosting ---
+        sym_tokens = _extract_symbol_tokens(query)
+        for cid in list(provenance.keys()):
+            rec = self._rec_by_id.get(cid) or {}
+            nm = str(rec.get("name") or "").lower()
+            if any(t in cid.lower() or nm == t for t in sym_tokens):
+                provenance[cid]["symbol_match"] = True
+                fused = [(c, sc + 0.5 if c == cid else sc) for c, sc in fused]
 
-        # 6) aggregate to files/classes
+        # --- final chunks ---
+        chunk_scores: List[Tuple[str, float]] = sorted(fused, key=lambda kv: -kv[1])[:cfg.top_k_chunks]
+        chunk_results = []
+        for i, (cid, sc) in enumerate(chunk_scores, start=1):
+            prov = provenance.get(cid, {})
+            chunk_results.append({"chunk_id": cid, "score": float(sc), "rank": i, "provenance": prov})
+
+        # --- aggregate to files/classes ---
         def file_key(cid: str) -> Optional[str]:
             rec = self._rec_by_id.get(cid)
             return rec.get("file") if rec else None
@@ -247,8 +281,12 @@ class HybridRetriever:
             rec = self._rec_by_id.get(cid)
             return rec.get("parent_class_id") if rec else None
 
-        files = _aggregate_group(chunk_scores, key_fn=file_key, alpha=cfg.agg_alpha, decay=cfg.agg_decay, max_per_group=cfg.agg_max_per_group)
-        classes = _aggregate_group(chunk_scores, key_fn=class_key, alpha=cfg.agg_alpha, decay=cfg.agg_decay, max_per_group=cfg.agg_max_per_group)
+        files = _aggregate_group(chunk_scores, key_fn=file_key,
+                                 alpha=cfg.agg_alpha, decay=cfg.agg_decay,
+                                 max_per_group=cfg.agg_max_per_group)
+        classes = _aggregate_group(chunk_scores, key_fn=class_key,
+                                   alpha=cfg.agg_alpha, decay=cfg.agg_decay,
+                                   max_per_group=cfg.agg_max_per_group)
 
         file_results = [{
             "file": gid,
@@ -263,7 +301,8 @@ class HybridRetriever:
         } for gid, sc, items in classes[:cfg.top_k_classes] if gid]
 
         return {
-            "chunks": chunk_results,
-            "files": file_results,
-            "classes": class_results,
+            "hits": chunk_results,          # was "chunks"
+            "top_files": file_results,      # was "files"
+            "top_classes": class_results,   # was "classes"
+            "anchors": []                   # keep placeholder for insertion points
         }

@@ -1,4 +1,3 @@
-# src/cgx/embeddings/records.py
 from __future__ import annotations
 
 """
@@ -21,7 +20,7 @@ Both are pure functions and return NEW data structures.
 
 from src.cgx.logging_setup import get_logger
 from typing import Any, Dict, List, Sequence
-from .helpers import (
+from src.cgx.embeddings.helpers import (
     _safe_get,
     _neighbors_summary,
     _lexical_helpers,
@@ -118,16 +117,37 @@ def make_index_records(
         raise TypeError(f"make_index_records: 'chunks' must be a list, got {type(chunks)}")
 
     records: List[Dict[str, Any]] = []
+    seen_ids = set()
 
     for ch in chunks:
+        # --- Validation ---
+        if not isinstance(ch, dict):
+            logger.error("make_index_records: skipping non-dict chunk %r", ch)
+            continue
+
+        cid = ch.get("id")
+        ctype = ch.get("type")
+
+        if not cid or not ctype:
+            logger.error("make_index_records: skipping invalid chunk (missing id/type): %r", ch)
+            continue
+
+        if cid in seen_ids:
+            logger.warning("make_index_records: duplicate chunk id %s skipped", cid)
+            continue
+        seen_ids.add(cid)
+
         try:
-            ctype = ch.get("type", "")
-            cid = ch.get("id", "")
             meta = ch.get("meta") or {}
 
             # Views (deterministic; do not mutate original chunk)
             v_intent = build_intent_view(ch, G=G, topk_callees=topk_callees)
-            v_impl = build_implementation_view(ch, all_chunks=chunks, normalize=normalize_impl, strip_literals=strip_literals)
+            v_impl = build_implementation_view(
+                ch,
+                all_chunks=chunks,
+                normalize=normalize_impl,
+                strip_literals=strip_literals,
+            )
 
             # Graph-derived
             parent_file_id = ch.get("file")
@@ -145,7 +165,12 @@ def make_index_records(
 
             # Identity & doc
             doc_full = meta.get("docstring")
-            doc_first = _safe_get(meta, "doc_parsed.summary") or (doc_full.splitlines()[0].strip() if isinstance(doc_full, str) and doc_full.strip() else "")
+            doc_first = (
+                _safe_get(meta, "doc_parsed.summary")
+                or (doc_full.splitlines()[0].strip()
+                    if isinstance(doc_full, str) and doc_full.strip()
+                    else "")
+            )
 
             # Search helpers
             lex = _lexical_helpers(ch)
@@ -204,7 +229,7 @@ def make_index_records(
             records.append(rec)
 
         except Exception as e:
-            logger.error("make_index_records: failed on chunk %r: %s", ch.get("id"), e)
+            logger.error("make_index_records: failed on chunk %s: %s", cid, e)
 
     return records
 
@@ -246,23 +271,35 @@ def prepare_embedding_corpus(
     allowed = {"intent", "impl"}
     for w in which:
         if w not in allowed:
-            raise ValueError(f"prepare_embedding_corpus: unsupported view '{w}'. Use any of {sorted(allowed)}.")
+            raise ValueError(
+                f"prepare_embedding_corpus: unsupported view '{w}'. Use any of {sorted(allowed)}."
+            )
 
     corpus: List[Dict[str, Any]] = []
-    for rec in records:
+    for idx, rec in enumerate(records):
+        if not isinstance(rec, dict):
+            logger.error(
+                "prepare_embedding_corpus: BAD RECORD at index=%s type=%s value=%r",
+                idx, type(rec), rec
+            )
+            continue
         try:
             for w in which:
                 text = rec.get(f"view_{w}", "")
                 tok = rec.get("tokens_estimate", {}).get(w, 0)
-                corpus.append({
-                    "chunk_id": rec.get("id"),
-                    "view": w,
-                    "text": text or "",
-                    "tokens_estimate": int(tok) if isinstance(tok, int) else 0,
-                    "type": rec.get("type"),
-                    "name": rec.get("name"),
-                    "file": rec.get("file"),
-                })
+                corpus.append(
+                    {
+                        "chunk_id": rec.get("id"),
+                        "view": w,
+                        "text": text or "",
+                        "tokens_estimate": int(tok) if isinstance(tok, int) else 0,
+                        "type": rec.get("type"),
+                        "name": rec.get("name"),
+                        "file": rec.get("file"),
+                    }
+                )
         except Exception as e:
-            logger.warning("prepare_embedding_corpus: failed to append row for %r (%s)", rec.get("id"), e)
-    return corpus
+            logger.exception(
+                "prepare_embedding_corpus: FAILED on record index=%s type=%s rec=%r",
+                idx, type(rec), rec
+            )

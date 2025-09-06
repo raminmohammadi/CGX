@@ -1,4 +1,3 @@
-# src/cgx/retrieval/lexical.py
 from __future__ import annotations
 
 """
@@ -17,9 +16,17 @@ Purely additive; does not read/modify any existing indices or models.
 """
 
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Iterable, Optional
+from typing import Dict, List, Tuple, Optional
 import math
 import re
+import logging
+
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+    logger.addHandler(_h)
+logger.setLevel(logging.INFO)
 
 
 def _tokenize_lc(q: str) -> List[str]:
@@ -48,11 +55,17 @@ class LexicalIndex:
     @classmethod
     def from_records(cls, records: List[Dict]) -> "LexicalIndex":
         self = cls()
+        valid = 0
 
         for rec in records:
+            if not isinstance(rec, dict):
+                logger.warning("LexicalIndex.from_records: skipping non-dict record %r", type(rec))
+                continue
+
             cid = rec.get("id")
             if not isinstance(cid, str) or not cid:
                 continue
+
             lex = rec.get("lexical_helpers") or {}
             toks: List[str] = []
             toks.extend(lex.get("ngrams_1") or [])
@@ -74,8 +87,10 @@ class LexicalIndex:
 
             self.doc_len[cid] = dl
             self.N += 1
+            valid += 1
 
         self.avgdl = (sum(self.doc_len.values()) / self.N) if self.N else 0.0
+        logger.info("LexicalIndex built over %d valid records (N=%d docs)", valid, self.N)
         return self
 
     # ---------- scoring ----------

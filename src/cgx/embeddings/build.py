@@ -3,6 +3,11 @@ from typing import List, Dict, Optional, Callable, Iterable
 import numpy as np
 import torch
 
+import math
+from typing import List, Dict, Optional, Callable, Iterable
+import numpy as np
+import torch
+
 def build_embeddings(
     chunks: List[Dict],
     model_name: str = "jinaai/jina-embeddings-v2-base-code",
@@ -12,82 +17,101 @@ def build_embeddings(
     device: Optional[str] = None,          # None -> auto: cuda if available else cpu
     normalize: bool = True,                # L2 normalize output for cosine similarity
     max_length: Optional[int] = None,      # None -> sensible default per model family
-    field_strategy: str = "code_only",     # "code_only" | "code_signature_doc" | "custom"
+    field_strategy: str = "auto",          # "auto" | "code_only" | "code_signature_doc" | "custom"
     text_builder: Optional[Callable[[Dict], str]] = None,  # used when field_strategy="custom"
 ) -> np.ndarray:
     """
-    Build dense vector embeddings for code chunks using either a Sentence-Transformers
-    model (preferred) or a plain HF Transformers model with robust pooling.
+    Build dense vector embeddings for code chunks or corpus rows using either a 
+    Sentence-Transformers model (preferred) or a plain Hugging Face Transformers model.
 
     Parameters
     ----------
     chunks : list of dict
-        Each dict SHOULD include at least:
-          - "code": str          (source of function/class/method)
-        Optionally:
-          - "name": str          (symbol name)
-          - "signature": str     (function signature)
-          - "docstring": str     (docstring)
-          - "file": str          (path)
+        Input data; supports two formats:
+          - **Corpus rows** (from prepare_embedding_corpus):
+              {
+                "chunk_id": str,
+                "view": "intent" | "impl",
+                "text": str,
+                ...
+              }
+          - **Raw parsed chunks** (from parse_codebase):
+              {
+                "code": str,
+                "name": str,
+                "signature": str,
+                "docstring": str,
+                "file": str,
+                ...
+              }
+
     model_name : str, default "jinaai/jina-embeddings-v2-base-code"
-        HF Hub model id or local path.
-        Good defaults for code listed below.
+        Hugging Face Hub model id or local path. 
+        - Defaults to Jina’s long-context code embeddings (~8k tokens).
+        - Any Sentence-Transformers or Transformers encoder model is supported.
+
     backend : {"auto","sentence-transformers","transformers"}, default "auto"
-        How to load/encode. "auto" tries Sentence-Transformers then falls back to Transformers.
+        How to load/encode:
+          - "sentence-transformers": force SentenceTransformer.encode
+          - "transformers": force AutoModel + pooling
+          - "auto": try Sentence-Transformers, fall back to Transformers
+
     batch_size : int, default 64
-        Encoding batch size.
+        Batch size for encoding.
+
     device : str or None, default None
-        "cuda", "cpu" or "mps". None auto-selects "cuda" if available else "cpu".
+        "cuda", "cpu", or "mps". 
+        None auto-selects "cuda" if available, then "mps", else "cpu".
+
     normalize : bool, default True
-        L2-normalize embeddings row-wise (recommended for cosine similarity search).
+        L2-normalize embeddings row-wise for cosine similarity search.
+
     max_length : int or None
-        Token length for truncation. If None, uses sensible defaults:
-          - 8192 for Jina v2 code models
-          - 512 for most others
-    field_strategy : {"code_only","code_signature_doc","custom"}, default "code_only"
-        How to compose the text that gets embedded:
+        Token length for truncation.
+        - Defaults to 8192 for Jina v2 code models.
+        - Defaults to 512 otherwise.
+
+    field_strategy : {"auto","code_only","code_signature_doc","custom"}, default "auto"
+        How to compose text per chunk:
+          - "auto": if "text" is present (corpus rows), use it; else fallback to "code_only".
           - "code_only": only the 'code' field
-          - "code_signature_doc": signature + docstring + code (when present)
-          - "custom": call `text_builder(chunk)` and embed that string
+          - "code_signature_doc": combine signature + docstring + code
+          - "custom": call `text_builder(chunk)`
+
     text_builder : Callable or None
-        Required when field_strategy="custom". Receives chunk dict, returns str.
+        Required if field_strategy="custom". Receives a chunk/corpus row, returns a string.
 
     Returns
     -------
     np.ndarray
-        Array of shape (N, D) float32, one embedding per chunk (in the same order).
-
-    Raises
-    ------
-    ValueError
-        - If `chunks` is empty or no chunk contains usable text.
-        - If `field_strategy="custom"` but `text_builder` is None.
+        Array of shape (N, D), float32, one embedding per input row (order preserved).
 
     Notes
     -----
     - Pooling strategy:
-        * For BGE-* models: CLS pooling (per BAAI usage guide). :contentReference[oaicite:0]{index=0}
-        * For GraphCodeBERT (base): mean pooling works; community ST variants also exist. :contentReference[oaicite:1]{index=1}
-        * For Sentence-Transformers models: use `SentenceTransformer.encode`.
-    - Long context:
-        * Jina v2 base code supports ~8k tokens (we default to 8192 if not overridden). :contentReference[oaicite:2]{index=2}
-        
-    Examples:
-    # 1) Code-specialized, long context (default in this function)
-        emb = build_embeddings(chunks)  # uses jinaai/jina-embeddings-v2-base-code
+        * For BGE-* models: CLS pooling (per BAAI usage guide).
+        * Otherwise: mean pooling with attention mask.
+        * Sentence-Transformers models: use built-in .encode.
+    - Normalization is always applied consistently for cosine similarity search.
 
-    # 2) BGE-Code with CLS pooling (auto-detected)
+    Examples
+    --------
+    # 1) Default: Jina v2 code embeddings
+        emb = build_embeddings(chunks)
+
+    # 2) Corpus rows (from prepare_embedding_corpus)
+        corpus = prepare_embedding_corpus(records, which=("intent",))
+        emb = build_embeddings(corpus)
+
+    # 3) BGE with CLS pooling
         emb = build_embeddings(chunks, model_name="BAAI/bge-code-v1")
 
-    # 3) GraphCodeBERT ST variant (pure Sentence-Transformers path)
-        emb = build_embeddings(chunks, model_name="buelfhood/SOCO-C-GraphCodeBERT-ST")
-
-    # 4) Compose richer text for retrieval: signature + docstring + code
+    # 4) Signature + docstring + code
         emb = build_embeddings(chunks, field_strategy="code_signature_doc")
 
-    # 5) Custom text builder
+    # 5) Custom builder
         def my_builder(ch):
-            return f"{ch.get('file','')}\n{ch.get('name','')}\n{ch.get('signature','')}\n{ch.get('docstring','')}\n{ch.get('code','')}"
+            return f"{ch.get('file','')}\n{ch.get('signature','')}\n{ch.get('docstring','')}\n{ch.get('code','')}"
         emb = build_embeddings(chunks, field_strategy="custom", text_builder=my_builder)
     """
     if not isinstance(chunks, list) or len(chunks) == 0:
@@ -99,7 +123,11 @@ def build_embeddings(
     # 1) Compose texts per chunk
     # ----------------------------
     def compose_text(ch: Dict) -> str:
-        if field_strategy == "code_only":
+        if field_strategy == "auto":
+            if "text" in ch:   # corpus row
+                return str(ch.get("text", ""))
+            return str(ch.get("code", "") or "")
+        elif field_strategy == "code_only":
             return str(ch.get("code", "") or "")
         elif field_strategy == "code_signature_doc":
             parts: List[str] = []
@@ -114,11 +142,9 @@ def build_embeddings(
             return str(text_builder(ch))
 
     texts: List[str] = [compose_text(ch) for ch in chunks]
-    # Filter out completely empty texts but preserve alignment
     mask = [bool(t.strip()) for t in texts]
     if not any(mask):
-        raise ValueError("build_embeddings: none of the chunks produced non-empty text to embed.")
-    # Replace empty texts with a safe placeholder to keep indices aligned
+        raise ValueError("build_embeddings: none of the inputs produced non-empty text.")
     texts = [t if m else " " for t, m in zip(texts, mask)]
 
     # ----------------------------
@@ -133,17 +159,14 @@ def build_embeddings(
         denom = np.linalg.norm(x, axis=1, keepdims=True) + 1e-12
         return (x / denom).astype("float32", copy=False)
 
-    # Heuristic default max_length
     name_lower = model_name.lower()
     if max_length is None:
         if "jina-embeddings-v2-base-code" in name_lower:
-            max_length = 8192  # Jina v2 code supports 8k context. :contentReference[oaicite:3]{index=3}
+            max_length = 8192
         else:
-            max_length = 512   # safe default for most HF encoder models
+            max_length = 512
 
-    # Detect families for pooling choice
     def _use_cls_pooling() -> bool:
-        # BGE family recommends CLS pooling. :contentReference[oaicite:4]{index=4}
         return "baai/bge" in name_lower or "bge-" in name_lower
 
     # ----------------------------
@@ -154,7 +177,6 @@ def build_embeddings(
             from sentence_transformers import SentenceTransformer
             st_model = SentenceTransformer(model_name, device=device)
             try:
-                # Respect model’s tokenizer max if smaller than requested
                 st_model.max_seq_length = min(getattr(st_model, "max_seq_length", max_length), max_length)
             except Exception:
                 pass
@@ -164,16 +186,16 @@ def build_embeddings(
                 batch_size=batch_size,
                 show_progress_bar=False,
                 convert_to_numpy=True,
-                normalize_embeddings=False,  # we normalize ourselves for consistency
+                normalize_embeddings=False,
             )
             return _norm(embs)
-        except Exception as _st_err:
+        except Exception:
             if backend == "sentence-transformers":
                 raise
-            # else fall through to plain transformers backend
+            # else fall through
 
     # ----------------------------
-    # 4) Plain Transformers fallback
+    # 4) Transformers fallback
     # ----------------------------
     from transformers import AutoTokenizer, AutoModel
 
@@ -200,12 +222,9 @@ def build_embeddings(
                 return_tensors="pt",
             ).to(device)
             out = model(**toks)
-            # Choose pooling
             if _use_cls_pooling():
-                # Use first token (CLS) embedding
                 vec = out.last_hidden_state[:, 0]
             else:
-                # Default to mean pooling with attention mask
                 vec = _mean_pool(out.last_hidden_state, toks["attention_mask"])
             pooled.append(vec.detach().cpu().numpy())
 

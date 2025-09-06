@@ -5,6 +5,10 @@ from pathlib import Path
 
 from cgx.io.persist import load_indices, load_jsonl
 from cgx.answer.providers import LLMProvider
+from cgx.answer.intent import detect_intent  # <-- NEW central intent detection
+
+from networkx.readwrite import json_graph
+import networkx as nx  # type: ignore
 
 ALLOWED_CITATION_NOTE = (
     "Cite only chunk_ids that appear in SOURCES. "
@@ -80,7 +84,6 @@ def _as_sources_with_meta(
         row = cmap.get(cid) or {}
         text = row.get("text", "") if isinstance(row, dict) else ""
         path, kind, symbol = _split_chunk_id(cid)
-        # keep score and nested provenance (intent/impl ranks/scores, lexical_count, graph_depth, etc.)
         prov = {}
         for k, v in (h or {}).items():
             if k == "chunk_id":
@@ -99,20 +102,7 @@ def _as_sources_with_meta(
         })
     return out
 
-def _route(question: str) -> str:
-    q = (question or "").lower()
-    if any(k in q for k in ["overview", "what does this repo", "what is this repo", "high level", "summary"]):
-        return "overview"
-    if any(k in q for k in ["add", "implement", "feature", "refactor", "plan", "change", "extend"]):
-        return "change_plan"
-    if any(k in q for k in ["how do i", "how to", "where to"]):
-        return "howto"
-    if re.search(r"\b(what does|explain|describe)\b.*\b([A-Za-z_][A-Za-z0-9_]*)\b", q):
-        return "symbol_explain"
-    return "overview"
-
 def _symbol_tokens(question: str) -> List[str]:
-    # prefer tokens inside quotes/backticks first
     quoted = re.findall(r"[`\"]([A-Za-z_][A-Za-z0-9_]*)[`\"]", question or "")
     bare = re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", question or "")
     seen, out = set(), []
@@ -138,7 +128,6 @@ def _find_symbol_rows(indices: Dict[str, Any], symbol: str) -> List[Tuple[str, D
                 or pat_def.search(text) is not None
             ):
                 out.append((cid, r, view))
-    # de-dup by cid while preserving first occurrence (intent tends to carry docstring)
     seen, dedup = set(), []
     for cid, r, view in out:
         if cid not in seen:
@@ -146,14 +135,12 @@ def _find_symbol_rows(indices: Dict[str, Any], symbol: str) -> List[Tuple[str, D
     return dedup
 
 def _hits_from_records(indices: Dict[str, Any], records_path: Optional[str], symbol: Optional[str]) -> List[Dict[str, Any]]:
-    """Use records.jsonl to lock onto exact chunk ids for a symbol name, then map to indexed rows."""
     if not records_path or not symbol:
         return []
     try:
         recs = load_jsonl(records_path)
     except Exception:
         return []
-    # collect candidate record ids where name matches (case-insensitive)
     target_ids = set()
     sym_l = symbol.lower()
     for rec in recs:
@@ -164,20 +151,16 @@ def _hits_from_records(indices: Dict[str, Any], records_path: Optional[str], sym
                 target_ids.add(str(cid))
     if not target_ids:
         return []
-
-    # map indices rows by chunk_id for both views
     rows_by_cid = {}
     for view in ["intent", "impl"]:
         vw = (indices.get("views") or {}).get(view) or {}
         for r in (vw.get("rows") or []):
             rows_by_cid.setdefault(str(r.get("chunk_id")), []).append((view, r))
-
     hits: List[Dict[str, Any]] = []
     for cid in target_ids:
         for view_r in rows_by_cid.get(cid, []):
             view, _row = view_r
             hits.append({"chunk_id": cid, "score": 3.0, "view": view})
-
     return hits
 
 def _sanitize_citations(citations, allowed_ids):
@@ -205,6 +188,7 @@ SYSTEM = (
     "Do not include prose outside JSON. "
 ) + ALLOWED_CITATION_NOTE
 
+
 def answer_with_llm(
     index_dir: str,
     records_path: str,
@@ -214,35 +198,93 @@ def answer_with_llm(
     top_k: int = 20,
     hits: Optional[List[Dict[str, Any]]] = None
 ) -> Dict[str, Any]:
-    """Retrieve context from indices and ask the LLM to synthesize a grounded answer.
-    Returns a payload with `answer_md`, `citations`, and a `debug` section containing the
-    SOURCES (with trimmed text and hit provenance) and the raw `hits` list used.
+    """
+    Retrieve context from indices/graph and ask the LLM to synthesize a grounded answer.
+
+    Smart routing:
+      - For callers/callees queries → answer deterministically from the graph.
+      - For symbol explanation/location → build SOURCES and ask LLM.
+      - For repo overview/change plan → use LLM with README + SOURCES.
+      - Otherwise → fallback to LLM with SOURCES.
+
+    Returns
+    -------
+    dict
+        {
+          "answer_md": str,
+          "citations": list,
+          "suggested_changes": list,
+          "confidence": float,
+          "debug": { ... }
+        }
     """
     indices = load_indices(index_dir)
     _ = load_jsonl(records_path) if records_path else None
-
     cmap = _chunk_map(indices)
 
-    # 1) Determine target symbol (if any)
+    # Detect intent
+    mode = detect_intent(question)
+
+    # Target symbol
     symbols = _symbol_tokens(question)
     target = None
     for t in symbols:
-        rows_for_t = _find_symbol_rows(indices, t)
-        if rows_for_t:
+        if _find_symbol_rows(indices, t):
             target = t
             break
     if target is None and symbols:
         target = symbols[0]
 
-    # 2) Build/augment hits: prefer exact-symbol rows; reinforce with records.jsonl mapping
+    # Load graph if needed
+    graph_path = Path(index_dir).parent / "graph.json"
+    G = None
+    if graph_path.exists():
+        try:
+            with open(graph_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            G = json_graph.node_link_graph(data)
+        except Exception:
+            G = None
+
+    # --- Graph-based answering for callers/callees ---
+    if mode in {"callers_list", "callees_list"} and target and G is not None:
+        results = []
+        try:
+            target_nodes = [cid for cid, _row, _ in _find_symbol_rows(indices, target)]
+            for node in target_nodes:
+                if node not in G:
+                    continue
+                if mode == "callers_list":
+                    neighbors = list(G.predecessors(node))
+                    header = f"Functions that call `{target}`"
+                else:
+                    neighbors = list(G.successors(node))
+                    header = f"Functions called by `{target}`"
+
+                for nbr in neighbors:
+                    if "::" in str(nbr):
+                        results.append({"chunk_id": str(nbr), "score": 1.0})
+        except Exception:
+            results = []
+
+        if results:
+            sources = _as_sources_with_meta(results, cmap, max_chunks=40, max_chars=900)
+            return {
+                "answer_md": header + ":\n\n" + "\n".join(
+                    f"- {s['symbol']} ({s['path']})" for s in sources
+                ),
+                "citations": [{"chunk_id": s["chunk_id"]} for s in sources],
+                "suggested_changes": [],
+                "confidence": 0.9,
+                "debug": {"mode": mode, "target_symbol": target, "graph_used": True, "sources": sources},
+            }
+
+    # --- Build/augment hits ---
     forced_hits: List[Dict[str, Any]] = []
     if target:
-        # from indices rows
         for cid, _row, view in _find_symbol_rows(indices, target):
             forced_hits.append({"chunk_id": cid, "score": 2.0, "view": view})
-        # from records.jsonl (exact id match)
         rec_hits = _hits_from_records(indices, records_path, target)
-        # merge dedup
         seen = {str(h["chunk_id"]) for h in forced_hits}
         for h in rec_hits:
             if str(h["chunk_id"]) not in seen:
@@ -258,7 +300,6 @@ def answer_with_llm(
                 for r in (vw.get("rows") or [])[:top_k]:
                     base_hits.append({"chunk_id": r.get("chunk_id"), "score": 1.0, "view": name})
 
-    # de-dup with priority to forced hits
     seen = set()
     merged_hits: List[Dict[str, Any]] = []
     for h in forced_hits + base_hits:
@@ -275,15 +316,19 @@ def answer_with_llm(
             "citations": [],
             "suggested_changes": [],
             "confidence": 0.2,
-            "debug": {"mode": _route(question), "target_symbol": target, "sources": [], "hits": []},
+            "debug": {"mode": mode, "target_symbol": target, "sources": [], "hits": []},
         }
 
-    # 3) SOURCES with larger window for symbol explanations
-    mode = _route(question)
+    # --- SOURCES for LLM ---
     max_chars = 1400 if mode == "symbol_explain" else 900
-    sources = _as_sources_with_meta(merged_hits, cmap, max_chunks=40 if mode == "symbol_explain" else 24, max_chars=max_chars)
+    sources = _as_sources_with_meta(
+        merged_hits,
+        cmap,
+        max_chunks=40 if mode == "symbol_explain" else 24,
+        max_chars=max_chars
+    )
 
-    # Require that target is covered in at least one source if we have a target
+    # Require target coverage
     if target:
         covers = [s for s in sources if (s.get("symbol") or "").lower() == target.lower() or f"::{target}" in s.get("chunk_id", "")]
         if not covers:
@@ -311,7 +356,7 @@ def answer_with_llm(
             "return value, side-effects, key branches/logic, dependencies (internal calls), and typical usage. "
             "Ground every claim with a citation.\n\n"
         )
-    if readme and mode != "symbol_explain":
+    if readme and mode not in {"symbol_explain"}:
         lead_lines = [ln for ln in readme.splitlines() if ln.strip()][:12]
         context += "README (lead):\n" + "\n".join(lead_lines) + "\n\n"
     if target:
@@ -323,11 +368,9 @@ def answer_with_llm(
         {"role": "user", "content": context},
     ]
 
-    # Ask the model to output JSON
     resp = provider.chat(messages, temperature=0.2)
     content = (resp.get("content") or "").strip()
 
-    # Try to extract JSON
     def extract_json(text: str) -> Dict[str, Any]:
         m = re.search(r"\{.*\}", text, flags=re.S)
         if not m:
@@ -339,7 +382,6 @@ def answer_with_llm(
 
     parsed: Dict[str, Any] = extract_json(content)
 
-    # Retry if empty or missing answer
     if not parsed or not isinstance(parsed, dict) or not parsed.get("answer_md"):
         messages.append({"role": "assistant", "content": content})
         messages.append({"role": "user", "content": "Reformat to strict JSON only. "
@@ -348,7 +390,6 @@ def answer_with_llm(
         resp2 = provider.chat(messages, temperature=0)
         parsed = extract_json((resp2.get("content") or "")) or {"answer_md": content, "citations": []}
 
-    # Normalize answer_md to string
     ans = parsed.get("answer_md")
     if isinstance(ans, dict):
         parsed["answer_md"] = ans.get("content") or ans.get("text") or ans.get("markdown") or ans.get("md") or json.dumps(ans, ensure_ascii=False)
@@ -357,7 +398,6 @@ def answer_with_llm(
     elif ans is None:
         parsed["answer_md"] = ""
 
-    # Final guard: if still empty, provide explicit insufficiency
     if not parsed["answer_md"].strip():
         parsed["answer_md"] = (
             "The provided SOURCES did not contain enough content to explain this symbol without guessing. "
@@ -367,14 +407,12 @@ def answer_with_llm(
         parsed.setdefault("suggested_changes", [])
         parsed["confidence"] = 0.2
 
-    # Minimal normalization + citation sanitation
     allowed_ids = [s['chunk_id'] for s in sources]
     parsed["citations"] = _sanitize_citations(parsed.get("citations", []), allowed_ids)
     parsed.setdefault("suggested_changes", [])
     if "confidence" not in parsed or not isinstance(parsed["confidence"], (int, float)):
         parsed["confidence"] = 0.6 if parsed["citations"] else 0.4
 
-    # Attach rich debug payload for UI
     parsed["debug"] = {
         "mode": mode,
         "target_symbol": target,
@@ -384,6 +422,9 @@ def answer_with_llm(
     }
 
     return parsed
+
+
+
 
 def generate_code_plan(
     index_dir: str,

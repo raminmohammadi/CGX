@@ -45,16 +45,22 @@ def save_jsonl(items: List[Dict[str, Any]], path: str) -> None:
     _ensure_dir(os.path.dirname(path) or ".")
     with open(path, "w", encoding="utf-8") as f:
         for it in items:
+            if not isinstance(it, dict):
+                logger.warning("save_jsonl: skipping non-dict item %r", it)
+                continue
             f.write(json.dumps(it, ensure_ascii=False) + "\n")
 
 
-def load_jsonl(path: str) -> List[Dict[str, Any]]:
+def load_jsonl(path: str):
     out: List[Dict[str, Any]] = []
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
-            if line.strip():
-                out.append(json.loads(line))
+            obj = json.loads(line)
+            if isinstance(obj, dict):
+                out.append(obj)
     return out
+
+
 
 
 def save_indices(indices: Dict[str, Any], out_dir: str) -> None:

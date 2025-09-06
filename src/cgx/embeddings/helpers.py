@@ -19,7 +19,7 @@ Primary entrypoints:
 Both are pure functions and return NEW data structures.
 """
 
-from cgx.logging_setup import get_logger
+from src.cgx.logging_setup import get_logger
 import math
 import re
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -29,7 +29,7 @@ try:
 except Exception:  # pragma: no cover
     nx = None  # we guard for None at call sites
 
-from .views import (
+from src.cgx.embeddings.views import (
     build_intent_view,
     build_implementation_view,
 )
