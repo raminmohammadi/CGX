@@ -1,0 +1,7 @@
+networkx
+sentence-transformers
+numpy
+faiss-cpu
+transformers
+matplotlib
+gradio

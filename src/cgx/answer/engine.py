@@ -1,0 +1,474 @@
+from __future__ import annotations
+import os, json, re
+from typing import Any, Dict, List, Optional, Tuple
+from pathlib import Path
+
+from cgx.io.persist import load_indices, load_jsonl
+from cgx.answer.providers import LLMProvider
+from cgx.answer.intent import detect_intent  # <-- NEW central intent detection
+
+from networkx.readwrite import json_graph
+import networkx as nx  # type: ignore
+
+ALLOWED_CITATION_NOTE = (
+    "Cite only chunk_ids that appear in SOURCES. "
+    "Return citations as an array of objects: { \"chunk_id\": \"...\" }. "
+    "Do not return numbers or invented ids."
+)
+
+# ---------------- utilities ----------------
+
+def _split_chunk_id(cid: str) -> Tuple[str, str, str]:
+    parts = str(cid).split("::")
+    p = parts[0] if parts else ""
+    k = parts[1] if len(parts) > 1 else ""
+    s = parts[2] if len(parts) > 2 else ""
+    return p, k, s
+
+def _chunk_map(indices: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Build a map: chunk_id -> row (prefer intent view text)."""
+    cmap: Dict[str, Dict[str, Any]] = {}
+    views = indices.get("views") or {}
+    for name in ["intent", "impl"]:
+        vw = views.get(name) or {}
+        for r in (vw.get("rows") or []):
+            cid = r.get("chunk_id")
+            if cid:
+                cmap[str(cid)] = r
+    return cmap
+
+def _read_readme(project_root: Optional[str]) -> Optional[str]:
+    if not project_root:
+        return None
+    for nm in ["README.md", "Readme.md", "readme.md"]:
+        p = Path(project_root) / nm
+        if p.exists():
+            try:
+                return p.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                pass
+    return None
+
+def _guess_root(indices: Dict[str, Any]) -> Optional[str]:
+    paths: List[str] = []
+    for vw in (indices.get("views") or {}).values():
+        for r in (vw.get("rows") or [])[:200]:
+            p, _, _ = _split_chunk_id(r.get("chunk_id", ""))
+            if p and os.path.isabs(p):
+                paths.append(p)
+    if not paths:
+        return None
+    try:
+        return os.path.commonpath(paths)
+    except Exception:
+        return str(Path(paths[0]).parent)
+
+def _trim(txt: Optional[str], max_chars: int) -> str:
+    if txt is None:
+        return ""
+    t = str(txt)
+    if len(t) <= max_chars:
+        return t
+    return t[: max_chars - 3] + "..."
+
+def _as_sources_with_meta(
+    hits: List[Dict[str, Any]],
+    cmap: Dict[str, Dict[str, Any]],
+    max_chunks: int = 24,
+    max_chars: int = 900
+) -> List[Dict[str, Any]]:
+    """Select top hits and attach trimmed text + hit provenance for grounding & debug."""
+    out: List[Dict[str, Any]] = []
+    for h in hits[:max_chunks]:
+        cid = str(h.get("chunk_id"))
+        row = cmap.get(cid) or {}
+        text = row.get("text", "") if isinstance(row, dict) else ""
+        path, kind, symbol = _split_chunk_id(cid)
+        prov = {}
+        for k, v in (h or {}).items():
+            if k == "chunk_id":
+                continue
+            if k == "provenance" and isinstance(v, dict):
+                prov.update(v)
+            else:
+                prov[k] = v
+        out.append({
+            "chunk_id": cid,
+            "path": path,
+            "kind": kind,
+            "symbol": symbol,
+            "text": _trim(text, max_chars),
+            "hit_meta": prov,
+        })
+    return out
+
+# --- Stopwords list for symbol token filtering ---
+_STOPWORDS = {
+    "from", "import", "which", "that", "this", "will", "would", "could",
+    "should", "can", "may", "might", "if", "else", "elif", "for", "while",
+    "with", "def", "class", "return", "true", "false", "none", "and", "or",
+    "not", "is", "in", "on", "to", "by", "of", "at", "as", "do", "does", "did",
+}
+
+def _symbol_tokens(question: str) -> List[str]:
+    """
+    Extract candidate symbol tokens from a question, filtering out stopwords.
+    Includes tokens inside quotes/backticks and bare identifiers.
+    """
+    quoted = re.findall(r"[`\"]([A-Za-z_][A-Za-z0-9_]*)[`\"]", question or "")
+    bare = re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", question or "")
+    seen, out = set(), []
+    for t in quoted + bare:
+        tl = t.lower()
+        if tl in _STOPWORDS:
+            continue
+        if t not in seen:
+            seen.add(t); out.append(t)
+    return out
+
+def _find_symbol_rows(indices: Dict[str, Any], symbol: str) -> List[Tuple[str, Dict[str, Any], str]]:
+    """Return list of (chunk_id, row, view) that match the symbol by cid/name/text."""
+    out: List[Tuple[str, Dict[str, Any], str]] = []
+    sym_l = symbol.lower()
+    pat_def = re.compile(rf"\b(def|class)\s+{re.escape(symbol)}\b")
+    for view in ["intent", "impl"]:
+        vw = (indices.get("views") or {}).get(view) or {}
+        for r in (vw.get("rows") or []):
+            cid = str(r.get("chunk_id", ""))
+            name = str(r.get("name", "")).lower()
+            text = r.get("text", "") or ""
+            if (
+                f"::{symbol}" in cid or f"::{sym_l}" in cid.lower()
+                or name == sym_l
+                or pat_def.search(text) is not None
+            ):
+                out.append((cid, r, view))
+    seen, dedup = set(), []
+    for cid, r, view in out:
+        if cid not in seen:
+            seen.add(cid); dedup.append((cid, r, view))
+    return dedup
+
+def _hits_from_records(indices: Dict[str, Any], records_path: Optional[str], symbol: Optional[str]) -> List[Dict[str, Any]]:
+    if not records_path or not symbol:
+        return []
+    try:
+        recs = load_jsonl(records_path)
+    except Exception:
+        return []
+    target_ids = set()
+    sym_l = symbol.lower()
+    for rec in recs:
+        nm = str(rec.get("name", "")).lower()
+        if nm == sym_l:
+            cid = rec.get("id")
+            if cid is not None:
+                target_ids.add(str(cid))
+    if not target_ids:
+        return []
+    rows_by_cid = {}
+    for view in ["intent", "impl"]:
+        vw = (indices.get("views") or {}).get(view) or {}
+        for r in (vw.get("rows") or []):
+            rows_by_cid.setdefault(str(r.get("chunk_id")), []).append((view, r))
+    hits: List[Dict[str, Any]] = []
+    for cid in target_ids:
+        for view_r in rows_by_cid.get(cid, []):
+            view, _row = view_r
+            hits.append({"chunk_id": cid, "score": 3.0, "view": view})
+    return hits
+
+def _sanitize_citations(citations, allowed_ids):
+    out = []
+    if not isinstance(citations, (list, tuple)):
+        return out
+    for c in citations:
+        if isinstance(c, dict) and "chunk_id" in c and c["chunk_id"] in allowed_ids:
+            out.append({"chunk_id": c["chunk_id"]})
+        elif isinstance(c, str) and c in allowed_ids:
+            out.append({"chunk_id": c})
+    seen = set(); dedup = []
+    for c in out:
+        if c["chunk_id"] not in seen:
+            seen.add(c["chunk_id"]); dedup.append(c)
+    return dedup
+
+# ---------------- main API ----------------
+
+SYSTEM = (
+    "You are a senior codebase assistant. Use ONLY the provided SOURCES to answer. "
+    "Cite facts with [[chunk_id]] exactly as provided. Be concise but complete. "
+    "If information is missing, say what else is needed rather than inventing details. "
+    "Return JSON with keys: answer_md, citations, suggested_changes, confidence (0-1). "
+    "Do not include prose outside JSON. "
+) + ALLOWED_CITATION_NOTE
+
+def answer_with_llm(
+    index_dir: str,
+    records_path: str,
+    question: str,
+    provider: LLMProvider,
+    *,
+    top_k: int = 20,
+    hits: Optional[List[Dict[str, Any]]] = None
+) -> Dict[str, Any]:
+    """
+    Retrieve context from indices/graph and ask the LLM to synthesize a grounded answer.
+    """
+    indices = load_indices(index_dir)
+    _ = load_jsonl(records_path) if records_path else None
+    cmap = _chunk_map(indices)
+
+    # Detect intent
+    mode = detect_intent(question)
+
+    # --- Improved Target symbol detection ---
+    symbols = _symbol_tokens(question)
+    target = None
+    # 1. Prefer the first token that actually exists in the index
+    for t in symbols:
+        if _find_symbol_rows(indices, t):
+            target = t
+            break
+    # 2. If none matched, try reversed order (favor last tokens like "parse_codebase")
+    if target is None and symbols:
+        for t in reversed(symbols):
+            if _find_symbol_rows(indices, t):
+                target = t
+                break
+    # 3. As last resort, pick the last token instead of the first
+    if target is None and symbols:
+        target = symbols[-1]
+
+    # Load graph if needed
+    graph_path = Path(index_dir).parent / "graph.json"
+    G = None
+    if graph_path.exists():
+        try:
+            with open(graph_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            G = json_graph.node_link_graph(data)
+        except Exception:
+            G = None
+
+    # --- Graph-based answering for callers/callees ---
+    if mode in {"callers_list", "callees_list"} and target and G is not None:
+        results = []
+        try:
+            target_nodes = [cid for cid, _row, _ in _find_symbol_rows(indices, target)]
+            for node in target_nodes:
+                if node not in G:
+                    continue
+                if mode == "callers_list":
+                    neighbors = list(G.predecessors(node))
+                    header = f"Functions that call `{target}`"
+                else:
+                    neighbors = list(G.successors(node))
+                    header = f"Functions called by `{target}`"
+                for nbr in neighbors:
+                    if "::" in str(nbr):
+                        results.append({"chunk_id": str(nbr), "score": 1.0})
+        except Exception:
+            results = []
+        if results:
+            sources = _as_sources_with_meta(results, cmap, max_chunks=40, max_chars=900)
+            return {
+                "answer_md": header + ":\n\n" + "\n".join(
+                    f"- {s['symbol']} ({s['path']})" for s in sources
+                ),
+                "citations": [{"chunk_id": s["chunk_id"]} for s in sources],
+                "suggested_changes": [],
+                "confidence": 0.9,
+                "debug": {"mode": mode, "target_symbol": target, "graph_used": True, "sources": sources},
+            }
+
+    # --- Build/augment hits ---
+    forced_hits: List[Dict[str, Any]] = []
+    if target:
+        for cid, _row, view in _find_symbol_rows(indices, target):
+            forced_hits.append({"chunk_id": cid, "score": 2.0, "view": view})
+        rec_hits = _hits_from_records(indices, records_path, target)
+        seen = {str(h["chunk_id"]) for h in forced_hits}
+        for h in rec_hits:
+            if str(h["chunk_id"]) not in seen:
+                forced_hits.append(h); seen.add(str(h["chunk_id"]))
+
+    base_hits: List[Dict[str, Any]] = []
+    if hits:
+        base_hits = hits
+    else:
+        if not forced_hits:
+            for name in ["intent", "impl"]:
+                vw = (indices.get("views") or {}).get(name) or {}
+                for r in (vw.get("rows") or [])[:top_k]:
+                    base_hits.append({"chunk_id": r.get("chunk_id"), "score": 1.0, "view": name})
+
+    seen = set()
+    merged_hits: List[Dict[str, Any]] = []
+    for h in forced_hits + base_hits:
+        cid = str(h.get("chunk_id"))
+        if cid not in seen:
+            seen.add(cid); merged_hits.append(h)
+
+    if not merged_hits:
+        return {
+            "answer_md": (
+                "I couldn't locate matching symbols or chunks for this question in the current index. "
+                "Re-index the repo and try again, or provide the file containing the target function/class."
+            ),
+            "citations": [],
+            "suggested_changes": [],
+            "confidence": 0.2,
+            "debug": {"mode": mode, "target_symbol": target, "sources": [], "hits": []},
+        }
+
+    # --- SOURCES for LLM ---
+    max_chars = 1400 if mode == "symbol_explain" else 900
+    sources = _as_sources_with_meta(
+        merged_hits,
+        cmap,
+        max_chunks=40 if mode == "symbol_explain" else 24,
+        max_chars=max_chars
+    )
+
+    # Require target coverage
+    if target:
+        covers = [s for s in sources if (s.get("symbol") or "").lower() == target.lower() or f"::{target}" in s.get("chunk_id", "")]
+        if not covers:
+            return {
+                "answer_md": (
+                    f"I couldn't find the symbol `{target}` in the indexed chunks. "
+                    "Please re-index or verify the symbol name/file."
+                ),
+                "citations": [],
+                "suggested_changes": [],
+                "confidence": 0.2,
+                "debug": {"mode": mode, "target_symbol": target, "sources": sources, "hits": merged_hits},
+            }
+
+    root = _guess_root(indices)
+    readme = _read_readme(root)
+
+    def fmt_source(s: Dict[str, Any]) -> str:
+        return f"- {s['chunk_id']} :: {s['path']} :: {s['kind']} :: {s['symbol']}\n  {s['text']}"
+
+    context = "QUESTION:\n" + (question or "").strip() + "\n\n"
+    if mode == "symbol_explain":
+        context += (
+            "TASK: Explain the function/class in detail. Cover: purpose, parameters & types (if visible), "
+            "return value, side-effects, key branches/logic, dependencies (internal calls), and typical usage. "
+            "Ground every claim with a citation.\n\n"
+        )
+    if readme and mode not in {"symbol_explain"}:
+        lead_lines = [ln for ln in readme.splitlines() if ln.strip()][:12]
+        context += "README (lead):\n" + "\n".join(lead_lines) + "\n\n"
+    if target:
+        context += f"TARGET_SYMBOL: {target}\n\n"
+    context += "SOURCES:\n" + "\n".join(fmt_source(s) for s in sources)
+
+    messages = [
+        {"role": "system", "content": SYSTEM},
+        {"role": "user", "content": context},
+    ]
+
+    resp = provider.chat(messages, temperature=0.2)
+    content = (resp.get("content") or "").strip()
+
+    def extract_json(text: str) -> Dict[str, Any]:
+        m = re.search(r"\{.*\}", text, flags=re.S)
+        if not m:
+            return {}
+        try:
+            return json.loads(m.group(0))
+        except Exception:
+            return {}
+
+    parsed: Dict[str, Any] = extract_json(content)
+
+    if not parsed or not isinstance(parsed, dict) or not parsed.get("answer_md"):
+        messages.append({"role": "assistant", "content": content})
+        messages.append({"role": "user", "content": "Reformat to strict JSON only. "
+                                                   "Ensure non-empty 'answer_md' grounded in SOURCES with citations. "
+                                                   "Keep the same content; do not add external knowledge."})
+        resp2 = provider.chat(messages, temperature=0)
+        parsed = extract_json((resp2.get("content") or "")) or {"answer_md": content, "citations": []}
+
+    ans = parsed.get("answer_md")
+    if isinstance(ans, dict):
+        parsed["answer_md"] = ans.get("content") or ans.get("text") or ans.get("markdown") or ans.get("md") or json.dumps(ans, ensure_ascii=False)
+    elif isinstance(ans, list):
+        parsed["answer_md"] = "\n".join(str(x) for x in ans)
+    elif ans is None:
+        parsed["answer_md"] = ""
+
+    if not parsed["answer_md"].strip():
+        parsed["answer_md"] = (
+            "The provided SOURCES did not contain enough content to explain this symbol without guessing. "
+            "Please re-index or narrow the question to a specific file or snippet."
+        )
+        parsed.setdefault("citations", [])
+        parsed.setdefault("suggested_changes", [])
+        parsed["confidence"] = 0.2
+
+    allowed_ids = [s['chunk_id'] for s in sources]
+    parsed["citations"] = _sanitize_citations(parsed.get("citations", []), allowed_ids)
+    parsed.setdefault("suggested_changes", [])
+    if "confidence" not in parsed or not isinstance(parsed["confidence"], (int, float)):
+        parsed["confidence"] = 0.6 if parsed["citations"] else 0.4
+
+    parsed["debug"] = {
+        "mode": mode,
+        "target_symbol": target,
+        "sources": sources,
+        "hits": merged_hits,
+        "readme_included": bool(readme),
+    }
+
+    return parsed
+
+
+def generate_code_plan(
+    index_dir: str,
+    records_path: str,
+    task: str,
+    provider: LLMProvider
+) -> Dict[str, Any]:
+    """Use LLM to propose a change plan and diffs (unified patch) grounded in SOURCES."""
+    indices = load_indices(index_dir)
+    _ = load_jsonl(records_path) if records_path else None
+
+    cmap = _chunk_map(indices)
+    # Use top impl-view rows for code-centric tasks
+    impl_rows = (indices.get("views") or {}).get("impl", {}) or {}
+    hits = [
+        {"chunk_id": r.get("chunk_id"), "score": 1.0, "view": "impl"}
+        for r in (impl_rows.get("rows") or [])[:24]
+    ]
+    sources = _as_sources_with_meta(hits, cmap, max_chunks=24, max_chars=700)
+
+    SYSTEM2 = (
+        "You are a principal engineer. Propose a step-by-step change plan and unified diffs "
+        "to implement the requested change. Use ONLY provided SOURCES and cite with [[chunk_id]]. "
+        "Return JSON with keys: plan_md, diffs (array of objects: file, patch), citations, confidence. "
+        "Do not include prose outside JSON. "
+    ) + ALLOWED_CITATION_NOTE
+
+    def fmt_s(s: Dict[str, Any]) -> str:
+        return f"- {s['chunk_id']} :: {s['path']} :: {s['kind']} :: {s['symbol']}\n  {s['text']}"
+
+    context = "TASK:\n" + (task or "").strip() + "\n\nSOURCES:\n" + "\n".join(fmt_s(s) for s in sources)
+    messages = [{"role": "system", "content": SYSTEM2}, {"role": "user", "content": context}]
+    out_text = provider.chat(messages, temperature=0.2).get("content", "")
+    try:
+        m = re.search(r"\{.*\}", out_text, flags=re.S)
+        parsed = json.loads(m.group(0)) if m else {"plan_md": out_text, "diffs": [], "citations": [], "confidence": 0.5}
+    except Exception:
+        parsed = {"plan_md": out_text, "diffs": [], "citations": [], "confidence": 0.5}
+
+    allowed_ids = [s['chunk_id'] for s in sources]
+    parsed["citations"] = _sanitize_citations(parsed.get("citations", []), allowed_ids)
+    if "confidence" not in parsed or not isinstance(parsed["confidence"], (int, float)):
+        parsed["confidence"] = 0.5
+
+    parsed["debug"] = {"sources": sources, "hits": hits}
+    return parsed
