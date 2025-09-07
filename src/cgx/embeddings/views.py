@@ -1,4 +1,3 @@
-# src/cgx/embeddings/views.py
 from __future__ import annotations
 
 """
@@ -18,6 +17,17 @@ Or, to attach (additive keys):
     enriched = attach_views_to_chunks(chunks, G, topk_callees=10, normalize_impl=False, strip_literals=False)
 
 All outputs are deterministic and derived purely from AST/graph metadata you already emit.
+
+Embedding Context
+-----------------
+The `view_intent` and `view_impl` strings produced here are the **exact inputs**
+to embedding models (e.g., BGE, Jina, Gemma) when constructing FAISS indices.
+
+The actual embedding step is delegated to:
+    `cgx.embeddings.build.build_embeddings(model_name, ...)`
+
+So if you want to add support for a new embedding model (e.g., Gemma), update
+**build.py**. This file only prepares the text to embed.
 """
 
 import ast
@@ -223,6 +233,9 @@ def build_intent_view(chunk: Dict[str, Any], G=None, *, topk_callees: int = 10) 
     """
     Build the NL-friendly "card" per your template, deterministically.
 
+    This view is later passed to **embedding models** (see `build_embeddings` in
+    `cgx/embeddings/build.py`). It is the main "semantic search" input.
+
     Template:
         type: {type}
         symbol: {id}
@@ -231,17 +244,7 @@ def build_intent_view(chunk: Dict[str, Any], G=None, *, topk_callees: int = 10) 
         class: {class_name}
         signature: {signature}
         summary: {first_sentence_of_docstring_or_empty}
-
-        imports: {comma_join(imports_used_fullnames_sorted)}
-        reads: {comma_join(attribute_roots_read)}
-        writes: {comma_join(attribute_roots_written)}
-        raises: {comma_join(raises)}
-        calls_out: {comma_join(topK_callee_names)}
-        called_by_count: {n_incoming_calls}
-        metrics: n_loc={n_loc}, n_params={n_params}, async={is_async}, generator={is_generator}
-
-    For type in {"file","class"}, signature/class lines are omitted (empty).
-    `called_by_count` uses the graph if provided; otherwise 0.
+        ...
     """
     try:
         ctype = chunk.get("type", "")

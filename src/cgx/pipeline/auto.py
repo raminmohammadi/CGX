@@ -10,8 +10,9 @@ Auto-wired pipeline that exercises the canonical components:
 - retrieval.orchestrator.hybrid_retrieve_two_view
 - retrieval.orchestrator.aggregate_by_file/aggregate_by_class
 - retrieval.orchestrator.suggest_insertion_points
+- retrieval.orchestrator.analyze_change_impact  (NEW)
 
-Adds **graph + chunks persistence and loading** so hybrid retrieval can
+Adds graph + chunks persistence and loading so hybrid retrieval can
 actually use lexical and graph expansion at query time.
 """
 
@@ -30,6 +31,7 @@ from cgx.retrieval.orchestrator import (
     aggregate_by_file,
     aggregate_by_class,
     suggest_insertion_points,
+    analyze_change_impact,  # NEW
 )
 from cgx.io.persist import save_indices, load_indices, save_jsonl, load_jsonl
 
@@ -51,10 +53,6 @@ def _to_faiss_ids(rows: List[Dict[str, Any]]) -> np.ndarray:
     return np.arange(len(rows), dtype=np.int64)
 
 
-import os
-import numpy as np
-from typing import Any, Dict, Tuple, List
-
 def run_index_auto(
     project_root: str,
     out_dir: str,
@@ -66,64 +64,49 @@ def run_index_auto(
 ) -> Dict[str, Any]:
     """
     Build two-view FAISS indices and persist alongside records and graph/chunks.
-
-    This pipeline is deterministic and consistent:
-      - Parses a codebase into chunks + call graph.
-      - Builds index records (with view_intent and view_impl).
-      - Flattens into corpus rows.
-      - Embeds each view via build_embeddings (always).
-      - Builds FAISS indices for each view.
-      - Persists metadata including original chunk IDs.
-
-    Parameters
-    ----------
-    project_root : str
-        Root path of the project to parse.
-    out_dir : str
-        Output directory to save indices and metadata.
-    metric : {"cosine","ip","l2"}, default "cosine"
-        Distance metric for FAISS.
-    index_type : str, default "flat"
-        FAISS index type ("flat","ivf","hnsw",...).
-    which : tuple[str], default ("intent","impl")
-        Which views to index.
-    model_name : str, default "jinaai/jina-embeddings-v2-base-code"
-        Hugging Face model ID for embeddings.
-    batch_size : int, default 64
-        Batch size for embedding.
-
-    Returns
-    -------
-    dict
-        {
-          "views": {
-            "intent": {"index": faiss.Index, "meta": {...}, "rows": [...], "ids": np.ndarray},
-            "impl": {...}
-          },
-          "metric": str
-        }
     """
     os.makedirs(out_dir, exist_ok=True)
+    logger.info("=== run_index_auto starting ===")
+    logger.info("project_root=%s out_dir=%s metric=%s index_type=%s model=%s",
+                project_root, out_dir, metric, index_type, model_name)
 
-    # Parse & build graph
+    # ---------------- Parse & Graph ----------------
     chunks, calls = _ensure_tuple_parse(parse_codebase(project_root))
+    logger.info("Parsed codebase: %d chunks, %d calls", len(chunks), len(calls or []))
+
     G = build_knowledge_graph(chunks, calls)
+    logger.info("Knowledge graph built: %d nodes, %d edges", G.number_of_nodes(), G.number_of_edges())
 
-    # Records + corpus
+    # ---------------- Records + Corpus ----------------
     records = make_index_records(chunks, G)
-    corpus = prepare_embedding_corpus(records, which=which)
+    logger.info("make_index_records produced %d records", len(records))
 
-    # Split corpus per view
+    try:
+        corpus = prepare_embedding_corpus(records, which=which)
+        if corpus is None:
+            logger.error("prepare_embedding_corpus returned None (records=%d)", len(records))
+            raise RuntimeError("prepare_embedding_corpus returned None")
+        logger.info("prepare_embedding_corpus produced %d rows across views=%s", len(corpus), which)
+    except Exception as e:
+        logger.error("prepare_embedding_corpus failed: %s", e, exc_info=True)
+        raise
+
+    # ---------------- Split corpus per view ----------------
     per_view: Dict[str, List[Dict[str, Any]]] = {"intent": [], "impl": []}
     for row in corpus:
         vw = row.get("view")
         if vw in per_view:
             per_view[vw].append(row)
 
-    # Build embeddings & FAISS per view
+    for v in per_view:
+        logger.info("View %s has %d rows", v, len(per_view[v]))
+
+    # ---------------- Embeddings + FAISS ----------------
     indices: Dict[str, Any] = {"views": {}, "metric": metric}
     for view_name, rows in per_view.items():
+        logger.info("Building index for view=%s (rows=%d)", view_name, len(rows))
         if not rows:
+            logger.warning("No rows for view=%s, skipping", view_name)
             indices["views"][view_name] = {
                 "index": None,
                 "meta": None,
@@ -132,29 +115,36 @@ def run_index_auto(
             }
             continue
 
-        # Always use build_embeddings with corpus rows
-        embs = build_embeddings(
-            rows,
-            model_name=model_name,
-            backend="auto",
-            normalize=(metric in {"cosine", "ip"}),
-            batch_size=batch_size,
-            field_strategy="auto",
-            max_length=256,   # << safer default for GPU
-        )
-
+        # Embed
+        try:
+            embs = build_embeddings(
+                rows,
+                model_name=model_name,
+                backend="auto",
+                normalize=(metric in {"cosine", "ip"}),
+                batch_size=batch_size,
+                field_strategy="auto",
+                max_length=256,
+            )
+        except Exception as e:
+            logger.error("Embedding failed for view=%s: %s", view_name, e, exc_info=True)
+            raise
 
         embs = np.asarray(embs, dtype=np.float32)
 
         # Build FAISS index
-        index, meta = build_faiss_index(
-            embs,
-            metric=metric,
-            index=index_type,
-            return_meta=True,
-        )
+        try:
+            index, meta = build_faiss_index(
+                embs,
+                metric=metric,
+                index=index_type,
+                return_meta=True,
+            )
+        except Exception as e:
+            logger.error("build_faiss_index failed for view=%s: %s", view_name, e, exc_info=True)
+            raise
 
-        # Preserve original chunk IDs
+        # Preserve chunk IDs
         orig_ids = [r.get("chunk_id") for r in rows]
         meta = {**(meta or {}), "orig_chunk_ids": orig_ids}
 
@@ -164,22 +154,40 @@ def run_index_auto(
             "rows": rows,
             "ids": _to_faiss_ids(rows),
         }
+        logger.info("Finished view=%s: index type=%s rows=%d", view_name, type(index).__name__, len(rows))
 
-    # Persist indices/records
-    save_indices(indices, os.path.join(out_dir, "indices"))
-    save_jsonl(records, os.path.join(out_dir, "records.jsonl"))
+    # ---------------- Persist ----------------
+    try:
+        save_indices(indices, os.path.join(out_dir, "indices"))
+        logger.info("Saved indices -> %s/indices", out_dir)
+    except Exception as e:
+        logger.error("save_indices failed: %s", e, exc_info=True)
+        raise
 
-    # Persist raw chunks and graph for lexical + graph expansion at query time
-    save_jsonl(chunks, os.path.join(out_dir, "chunks.jsonl"))
+    try:
+        save_jsonl(records, os.path.join(out_dir, "records.jsonl"))
+        logger.info("Saved records.jsonl (%d records)", len(records))
+    except Exception as e:
+        logger.error("save_jsonl(records) failed: %s", e, exc_info=True)
+        raise
+
+    try:
+        save_jsonl(chunks, os.path.join(out_dir, "chunks.jsonl"))
+        logger.info("Saved chunks.jsonl (%d chunks)", len(chunks))
+    except Exception as e:
+        logger.error("save_jsonl(chunks) failed: %s", e, exc_info=True)
+        raise
+
     graph_path = os.path.join(out_dir, "graph.json")
     try:
         with open(graph_path, "w", encoding="utf-8") as f:
             json.dump(json_graph.node_link_data(G), f)
-    except Exception:
-        # Fail-soft: if graph cannot be serialized, continue; query path will just skip it.
+        logger.info("Saved graph.json (nodes=%d edges=%d)", G.number_of_nodes(), G.number_of_edges())
+    except Exception as e:
+        logger.warning("Graph serialization failed, continuing: %s", e, exc_info=True)
         graph_path = None
 
-    return {
+    result = {
         "counts": {k: len(v) for k, v in per_view.items()},
         "out": {
             "indices": os.path.join(out_dir, "indices"),
@@ -188,8 +196,13 @@ def run_index_auto(
             "graph": graph_path,
         },
     }
-    
-    
+    logger.info("=== run_index_auto completed === %s", result["counts"])
+    return result
+
+
+# ---------------------------
+# Query wrapper (ALL SIGNALS + IMPACT)
+# ---------------------------
 
 def run_query_auto(
     index_dir: str,
@@ -201,91 +214,22 @@ def run_query_auto(
     graph_path: Optional[str] = None,
     top_k_per_view: int = 10,
     neighbor_depth: int = 1,
-    use_lexical: bool = True,
+    use_lexical: bool = True,   # retained for API compatibility; hybrid ignores and uses lexical anyway
     single_view: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Load indices, records, chunks, and graph, then execute hybrid two-view retrieval
-    using the same embedding pipeline as indexing.
-
-    Ensures consistency between index-time and query-time embeddings by always
-    wrapping `build_embeddings` in a standard interface.
-
-    Retrieval flow
-    --------------
-    1. Load FAISS indices (intent and impl views).
-    2. Embed the query using the same pipeline as indexing.
-    3. Perform hybrid retrieval:
-         - Semantic search on both views (intent + impl).
-         - Optional lexical search (BM25/keyword).
-         - Optional graph expansion using neighbors in the code graph.
-         - Fuse results with RRF.
-    4. Aggregate results by file, class, and insertion anchors.
-    5. Optionally run a single-view semantic search ("intent" or "impl") for debug.
-
-    Parameters
-    ----------
-    index_dir : str
-        Path to directory containing persisted FAISS indices (from run_index_auto).
-    records_path : str
-        Path to JSONL file with index records (from run_index_auto).
-    query : str
-        Natural language or code query string.
-    model_name : str, default "jinaai/jina-embeddings-v2-base-code"
-        Hugging Face model ID used for query embedding. Must match the model used at index time.
-    chunks_path : str or None
-        Optional path to raw chunks JSONL file. Enables lexical search and code context expansion.
-    graph_path : str or None
-        Optional path to serialized graph JSON. Enables graph-based neighbor expansion.
-    top_k_per_view : int, default 10
-        Number of top results to retrieve per view.
-    neighbor_depth : int, default 1
-        Depth of graph neighbors to include during expansion.
-    use_lexical : bool, default True
-        Whether to include lexical retrieval (e.g., BM25).
-    single_view : {"intent","impl"} or None
-        If set, perform an additional semantic search only on that view.
-
-    Returns
-    -------
-    dict
-        {
-          "hits": list,             # fused retrieval results
-          "top_files": list,        # aggregated results by file
-          "top_classes": list,      # aggregated results by class
-          "anchors": list,          # suggested insertion points
-          "single_view": dict,      # (optional) single-view semantic results
-          "debug": dict             # debug info: graph_used, chunks_available, etc.
-        }
+    using the same embedding pipeline as indexing. ALWAYS uses semantic+lexical+graph
+    and fuses with RRF. Also returns impact analysis for change-style queries.
     """
 
-    # ---------------- Wrapper around build_embeddings ----------------
-def run_query_auto(
-    index_dir: str,
-    records_path: str,
-    query: str,
-    *,
-    model_name: str = "jinaai/jina-embeddings-v2-base-code",
-    chunks_path: Optional[str] = None,
-    graph_path: Optional[str] = None,
-    top_k_per_view: int = 10,
-    neighbor_depth: int = 1,
-    use_lexical: bool = True,
-    single_view: Optional[str] = None,
-) -> Dict[str, Any]:
-    """
-    Load indices, records, chunks, and graph, then execute hybrid two-view retrieval
-    using the same embedding pipeline as indexing.
-    """
     class BuildEmbedder:
         """Wrapper so build_embeddings can be used consistently at query time."""
-
         def __init__(self, model_name: str, batch_size: int = 64, normalize: bool = True, max_length: int = 256):
             self.model_name = model_name
             self.batch_size = batch_size
             self.normalize = normalize
             self.max_length = max_length
-
         def encode(self, texts: List[str]) -> np.ndarray:
             rows = [{"text": t} for t in texts]
             return build_embeddings(
@@ -315,19 +259,7 @@ def run_query_auto(
 
     embedder = BuildEmbedder(model_name=model_name, batch_size=64, normalize=True)
 
-    # Debug
-    logger.info("run_query_auto: loaded %d records", len(records))
-    for view_name, view in (indices.get("views") or {}).items():
-        idx = view.get("index")
-        rows = view.get("rows")
-        logger.info(
-            "run_query_auto: view=%s, index_type=%s, rows=%s",
-            view_name,
-            type(idx).__name__ if idx is not None else None,
-            len(rows) if isinstance(rows, list) else None,
-        )
-
-    # Hybrid retrieval
+    # Hybrid retrieval (semantic+lexical+graph → RRF)
     retrieval_out = hybrid_retrieve_two_view(
         query,
         indices=indices,
@@ -337,21 +269,39 @@ def run_query_auto(
         G=G,
         top_k_per_view=top_k_per_view,
         neighbor_depth=neighbor_depth,
-        use_lexical=use_lexical,
+        use_lexical=True,  # forced on
     )
 
-    # FIX: extract proper hits list
-    hits = retrieval_out.get("chunks", [])
+    hits = retrieval_out.get("hits", [])
+    top_files = retrieval_out.get("top_files", [])
+    top_classes = retrieval_out.get("top_classes", [])
 
-    files = retrieval_out.get("files", [])
-    classes = retrieval_out.get("classes", [])
-    anchors = suggest_insertion_points(query, hits, records)
+    # Impact analysis (NEW): even if the question isn't explicitly "which files...",
+    # we compute it and let the UI/agent decide how to present it.
+    impact = analyze_change_impact(query, hits, records, G)
+
+    # Optional: insertion anchors (non-critical)
+    try:
+        anchors = suggest_insertion_points(query, hits, records, G=G, embedder=embedder)
+    except Exception as e:
+        logger.warning("suggest_insertion_points failed: %s", e)
+        anchors = []
 
     out: Dict[str, Any] = {
         "hits": hits,
-        "top_files": files,
-        "top_classes": classes,
+        "top_files": top_files,
+        "top_classes": top_classes,
+        "impact": impact,       # <= use this for "which files will be impacted?"
         "anchors": anchors,
+        "debug": {
+            "graph_used": bool(G is not None),
+            "chunks_available": bool(chunks),
+            "top_k_per_view": top_k_per_view,
+            "neighbor_depth": neighbor_depth,
+            "lexical_forced": True,
+            "semantic_views": ["intent", "impl"],
+            "fusion": "RRF",
+        },
     }
 
     if single_view in {"intent", "impl"}:
@@ -360,27 +310,11 @@ def run_query_auto(
             view = indices.get("views", {}).get(single_view, {})
             index = view.get("index")
             rows = view.get("rows", [])
-
-            logger.info(
-                "run_query_auto: single_view=%s, index_type=%s, rows=%d",
-                single_view,
-                type(index).__name__ if index is not None else None,
-                len(rows) if isinstance(rows, list) else -1,
-            )
-
             out["single_view"] = {
                 "view": single_view,
                 "results": semantic_search(query, embedder, index, rows, top_k=top_k_per_view),
             }
         except Exception as e:
             out["single_view_error"] = f"{type(e).__name__}: {e}"
-
-    out["debug"] = {
-        "graph_used": G is not None,
-        "chunks_available": bool(chunks),
-        "top_k_per_view": top_k_per_view,
-        "neighbor_depth": neighbor_depth,
-        "use_lexical": use_lexical,
-    }
 
     return out

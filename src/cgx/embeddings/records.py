@@ -15,7 +15,12 @@ Primary entrypoints:
 - make_index_records(chunks, G=None, ...)
 - prepare_embedding_corpus(records, which=('intent','impl'))
 
-Both are pure functions and return NEW data structures.
+Embedding Context
+-----------------
+- The records built here feed directly into **embedding backends**.
+- Each row from `prepare_embedding_corpus` is consumed by
+  `cgx.embeddings.build.build_embeddings`, which turns `text` into dense vectors.
+- To add a new model (e.g., Gemma), extend `build_embeddings` in `build.py`.
 """
 
 from src.cgx.logging_setup import get_logger
@@ -283,16 +288,24 @@ def prepare_embedding_corpus(
                 idx, type(rec), rec
             )
             continue
+
         try:
+            token_est = rec.get("tokens_estimate", {})
             for w in which:
-                text = rec.get(f"view_{w}", "")
-                tok = rec.get("tokens_estimate", {}).get(w, 0)
+                # normalize token_est
+                if isinstance(token_est, dict):
+                    tok = token_est.get(w, 0)
+                elif isinstance(token_est, (int, float)):
+                    tok = token_est
+                else:
+                    tok = 0
+
                 corpus.append(
                     {
                         "chunk_id": rec.get("id"),
                         "view": w,
-                        "text": text or "",
-                        "tokens_estimate": int(tok) if isinstance(tok, int) else 0,
+                        "text": rec.get(f"view_{w}", "") or "",
+                        "tokens_estimate": int(tok),
                         "type": rec.get("type"),
                         "name": rec.get("name"),
                         "file": rec.get("file"),
@@ -300,6 +313,12 @@ def prepare_embedding_corpus(
                 )
         except Exception as e:
             logger.exception(
-                "prepare_embedding_corpus: FAILED on record index=%s type=%s rec=%r",
-                idx, type(rec), rec
+                "prepare_embedding_corpus: FAILED on record index=%s type=%s rec=%r (%s)",
+                idx, type(rec), rec, e
             )
+
+    logger.info(
+        "prepare_embedding_corpus: built %d rows from %d records",
+        len(corpus), len(records)
+    )
+    return corpus

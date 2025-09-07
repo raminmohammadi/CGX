@@ -102,11 +102,26 @@ def _as_sources_with_meta(
         })
     return out
 
+# --- Stopwords list for symbol token filtering ---
+_STOPWORDS = {
+    "from", "import", "which", "that", "this", "will", "would", "could",
+    "should", "can", "may", "might", "if", "else", "elif", "for", "while",
+    "with", "def", "class", "return", "true", "false", "none", "and", "or",
+    "not", "is", "in", "on", "to", "by", "of", "at", "as", "do", "does", "did",
+}
+
 def _symbol_tokens(question: str) -> List[str]:
+    """
+    Extract candidate symbol tokens from a question, filtering out stopwords.
+    Includes tokens inside quotes/backticks and bare identifiers.
+    """
     quoted = re.findall(r"[`\"]([A-Za-z_][A-Za-z0-9_]*)[`\"]", question or "")
     bare = re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", question or "")
     seen, out = set(), []
     for t in quoted + bare:
+        tl = t.lower()
+        if tl in _STOPWORDS:
+            continue
         if t not in seen:
             seen.add(t); out.append(t)
     return out
@@ -188,7 +203,6 @@ SYSTEM = (
     "Do not include prose outside JSON. "
 ) + ALLOWED_CITATION_NOTE
 
-
 def answer_with_llm(
     index_dir: str,
     records_path: str,
@@ -200,23 +214,6 @@ def answer_with_llm(
 ) -> Dict[str, Any]:
     """
     Retrieve context from indices/graph and ask the LLM to synthesize a grounded answer.
-
-    Smart routing:
-      - For callers/callees queries → answer deterministically from the graph.
-      - For symbol explanation/location → build SOURCES and ask LLM.
-      - For repo overview/change plan → use LLM with README + SOURCES.
-      - Otherwise → fallback to LLM with SOURCES.
-
-    Returns
-    -------
-    dict
-        {
-          "answer_md": str,
-          "citations": list,
-          "suggested_changes": list,
-          "confidence": float,
-          "debug": { ... }
-        }
     """
     indices = load_indices(index_dir)
     _ = load_jsonl(records_path) if records_path else None
@@ -225,15 +222,23 @@ def answer_with_llm(
     # Detect intent
     mode = detect_intent(question)
 
-    # Target symbol
+    # --- Improved Target symbol detection ---
     symbols = _symbol_tokens(question)
     target = None
+    # 1. Prefer the first token that actually exists in the index
     for t in symbols:
         if _find_symbol_rows(indices, t):
             target = t
             break
+    # 2. If none matched, try reversed order (favor last tokens like "parse_codebase")
     if target is None and symbols:
-        target = symbols[0]
+        for t in reversed(symbols):
+            if _find_symbol_rows(indices, t):
+                target = t
+                break
+    # 3. As last resort, pick the last token instead of the first
+    if target is None and symbols:
+        target = symbols[-1]
 
     # Load graph if needed
     graph_path = Path(index_dir).parent / "graph.json"
@@ -260,13 +265,11 @@ def answer_with_llm(
                 else:
                     neighbors = list(G.successors(node))
                     header = f"Functions called by `{target}`"
-
                 for nbr in neighbors:
                     if "::" in str(nbr):
                         results.append({"chunk_id": str(nbr), "score": 1.0})
         except Exception:
             results = []
-
         if results:
             sources = _as_sources_with_meta(results, cmap, max_chunks=40, max_chars=900)
             return {
@@ -422,8 +425,6 @@ def answer_with_llm(
     }
 
     return parsed
-
-
 
 
 def generate_code_plan(
