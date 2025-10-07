@@ -1,4 +1,8 @@
+from venv import logger
 import numpy as np
+from src.cgx.logging_setup import get_logger
+logger = get_logger(__name__)
+
 
 def build_faiss_index(
     embeddings: np.ndarray,
@@ -201,6 +205,8 @@ def build_faiss_index(
             "normalized_for_cosine": normalized_used if metric_l == "cosine" else None,
             "num_vectors": int(N),
         }
+        
+        logger.info(f"The metadata is {meta}")
         return idmap, meta
 
     return idmap

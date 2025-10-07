@@ -126,6 +126,7 @@ def run_index_auto(
                 field_strategy="auto",
                 max_length=256,
             )
+            logger.info("Embedding done for view=%s", view_name)
         except Exception as e:
             logger.error("Embedding failed for view=%s: %s", view_name, e, exc_info=True)
             raise
@@ -134,7 +135,7 @@ def run_index_auto(
 
         # Build FAISS index
         try:
-            index, meta = build_faiss_index(
+            index, meta = build_faiss_index( # TODO: Why meta is so small? 
                 embs,
                 metric=metric,
                 index=index_type,

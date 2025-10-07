@@ -1,0 +1,11 @@
+{
+  "metric": "cosine",
+  "views": {
+    "intent": {
+      "has_index": true
+    },
+    "impl": {
+      "has_index": true
+    }
+  }
+}

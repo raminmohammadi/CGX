@@ -61,11 +61,13 @@ def _first_sentence(text: Optional[str]) -> str:
     if not text:
         return ""
     # Prefer first non-empty line
-    for line in text.splitlines():
-        s = line.strip()
-        if s:
-            # Trim trailing sentence terminators conservatively
-            return s
+    
+    # TODO: For now return the full string, later maybe only first line or a summary
+    # for line in text.splitlines():
+    s = text.strip()
+    if s:
+        # Trim trailing sentence terminators conservatively
+        return s
     return ""
 
 
@@ -231,7 +233,7 @@ def _metrics_meta(meta: Dict[str, Any]) -> Tuple[Optional[int], Optional[int], b
 
 def build_intent_view(chunk: Dict[str, Any], G=None, *, topk_callees: int = 10) -> str:
     """
-    Build the NL-friendly "card" per your template, deterministically.
+    Build the text version / NL-friendly "card" per your template, deterministically.
 
     This view is later passed to **embedding models** (see `build_embeddings` in
     `cgx/embeddings/build.py`). It is the main "semantic search" input.
