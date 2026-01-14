@@ -463,5 +463,3 @@ from cgx.pipeline.run import run_index, run_query
 ---
 
 ## License & Contributing
-
-Add your license here. PRs welcome — especially for new embedders, ANN backends, or graph strategies.
