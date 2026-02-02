@@ -1,4 +1,4 @@
-# Codebase RAG — End-to-End Guide (Auto‑wired)
+# Codebase RAG
 
 This README explains how the repository works **end‑to‑end** and exactly **how to run it**.  
 It also documents the main modules, data flow, CLI flags, expected inputs/outputs, and API surfaces you can call from code.
