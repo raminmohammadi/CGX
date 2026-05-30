@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # Averix — Local-first Codebase RAG
 
 Averix indexes a code repository, retrieves grounded context via a hybrid
