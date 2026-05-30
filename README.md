@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Averix — Local-first Codebase RAG
 
 Averix indexes a code repository, retrieves grounded context via a hybrid
@@ -554,3 +555,6 @@ as a **two-job matrix**:
 ## License
 
 MIT.
+=======
+
+>>>>>>> 7ec6828b50cdf926cc8d19ec8782ac48726093ce
