@@ -1,0 +1,126 @@
+{
+  "local_model_catalog": [
+    {
+      "name": "qwen2.5-coder:1.5b",
+      "params_b": 1.5,
+      "min_ram_gb": 4.0,
+      "recommended_vram_gb": 2.0,
+      "ctx_window": 32768,
+      "family": "coder",
+      "notes": "smallest viable coder; CPU-friendly"
+    },
+    {
+      "name": "qwen2.5-coder:3b",
+      "params_b": 3.0,
+      "min_ram_gb": 6.0,
+      "recommended_vram_gb": 4.0,
+      "ctx_window": 32768,
+      "family": "coder",
+      "notes": "balanced default for code Q&A"
+    },
+    {
+      "name": "qwen2.5-coder:7b-instruct",
+      "params_b": 7.0,
+      "min_ram_gb": 10.0,
+      "recommended_vram_gb": 8.0,
+      "ctx_window": 32768,
+      "family": "coder",
+      "notes": "higher-quality coder; sweet spot on 16GB GPUs"
+    },
+    {
+      "name": "qwen2.5-coder:14b-instruct",
+      "params_b": 14.0,
+      "min_ram_gb": 20.0,
+      "recommended_vram_gb": 16.0,
+      "ctx_window": 32768,
+      "family": "coder",
+      "notes": "near-cloud coder quality; needs \u226516GB VRAM"
+    },
+    {
+      "name": "llama3.2:3b-instruct",
+      "params_b": 3.0,
+      "min_ram_gb": 6.0,
+      "recommended_vram_gb": 4.0,
+      "ctx_window": 131072,
+      "family": "general",
+      "notes": "long context, light general-purpose"
+    },
+    {
+      "name": "llama3.1:8b-instruct",
+      "params_b": 8.0,
+      "min_ram_gb": 12.0,
+      "recommended_vram_gb": 8.0,
+      "ctx_window": 131072,
+      "family": "general",
+      "notes": "general-purpose with strong reasoning"
+    },
+    {
+      "name": "qwen2.5:7b-instruct",
+      "params_b": 7.0,
+      "min_ram_gb": 10.0,
+      "recommended_vram_gb": 8.0,
+      "ctx_window": 32768,
+      "family": "general",
+      "notes": "general-purpose alternative to llama 8b"
+    },
+    {
+      "name": "phi3.5:3.8b-mini-instruct",
+      "params_b": 3.8,
+      "min_ram_gb": 6.0,
+      "recommended_vram_gb": 4.0,
+      "ctx_window": 131072,
+      "family": "general",
+      "notes": "small, long-context, low-RAM"
+    }
+  ],
+  "tradeoffs": [
+    {
+      "dimension": "Privacy / data egress",
+      "local": "Prompts + code never leave the machine.",
+      "cloud": "Prompts + retrieved snippets go to the provider; subject to their data policy.",
+      "winner": "local"
+    },
+    {
+      "dimension": "Marginal cost / token",
+      "local": "Electricity only; zero per-call cost once the model is downloaded.",
+      "cloud": "Pay-per-token; cost scales linearly with usage and context length.",
+      "winner": "local"
+    },
+    {
+      "dimension": "Quality ceiling",
+      "local": "Capped by what fits on your hardware (\u224814B params on a 16 GB GPU).",
+      "cloud": "Access to frontier models (100B+ params, long context, tool-use).",
+      "winner": "cloud"
+    },
+    {
+      "dimension": "Latency (cold)",
+      "local": "First token after model load (seconds on small models, minutes on large).",
+      "cloud": "Sub-second TTFT in steady state; spikes during provider load.",
+      "winner": "tie"
+    },
+    {
+      "dimension": "Latency (warm)",
+      "local": "Predictable; bound by local GPU/CPU.",
+      "cloud": "Variable; subject to rate limits + network round-trip.",
+      "winner": "local"
+    },
+    {
+      "dimension": "Offline use",
+      "local": "Works on a plane / air-gapped network.",
+      "cloud": "Requires connectivity.",
+      "winner": "local"
+    },
+    {
+      "dimension": "Setup effort",
+      "local": "Install Ollama, pull a model (~GB-scale download).",
+      "cloud": "Sign up, mint an API key, paste into a profile.",
+      "winner": "cloud"
+    },
+    {
+      "dimension": "Operational risk",
+      "local": "Your machine = your SLO.",
+      "cloud": "Vendor outages / price changes / model deprecations.",
+      "winner": "local"
+    }
+  ]
+}

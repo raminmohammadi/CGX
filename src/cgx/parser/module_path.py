@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import os
-from src.cgx.logging_setup import get_logger
+from cgx.logging_setup import get_logger
 
 logger = get_logger("module_path")
 

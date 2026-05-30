@@ -1,6 +1,5 @@
-from venv import logger
 import numpy as np
-from src.cgx.logging_setup import get_logger
+from cgx.logging_setup import get_logger
 logger = get_logger(__name__)
 
 
@@ -25,7 +24,7 @@ def build_faiss_index(
     return_meta: bool = False,
 ):
     """
-    Build a FAISS index for fast nearest-neighbor search over embeddings.
+    Build a FAISS index that can be used for fast nearest-neighbor search over embeddings.
 
     Parameters
     ----------

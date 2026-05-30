@@ -138,4 +138,8 @@ def load_graph_json(path: str):
         raise RuntimeError("networkx is required to save/load graphs.")
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
-    return json_graph.node_link_graph(data)  # type: ignore
+    # networkx>=3.4 changed the default edges key in node_link_data from
+    # "links" to "edges". Honour whichever key the saved file uses so older
+    # graph.json artifacts continue to load.
+    edges_key = "edges" if isinstance(data, dict) and "edges" in data else "links"
+    return json_graph.node_link_graph(data, edges=edges_key)  # type: ignore

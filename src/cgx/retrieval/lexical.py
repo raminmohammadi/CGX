@@ -18,6 +18,7 @@ Purely additive; does not read/modify any existing indices or models.
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
 import math
+import os
 import re
 import logging
 
@@ -136,3 +137,46 @@ class LexicalIndex:
         for i, (cid, s) in enumerate(scored[:top_k], start=1):
             out.append({"chunk_id": cid, "score": float(s), "rank": i})
         return out
+
+
+# ---------------------------
+# Path-keyed cache
+# ---------------------------
+
+# Module-level cache: (abs_path, mtime_ns, size_bytes) -> LexicalIndex.
+# Bounded size with simple FIFO eviction; queries are read-only so this is
+# safe across the Gradio app or any in-process re-use.
+_LEX_CACHE: "Dict[Tuple[str, int, int], LexicalIndex]" = {}
+_LEX_CACHE_MAX = 4
+
+
+def _cache_key(path: str) -> Optional[Tuple[str, int, int]]:
+    try:
+        ap = os.path.abspath(path)
+        st = os.stat(ap)
+        return (ap, int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))), int(st.st_size))
+    except Exception:
+        return None
+
+
+def get_cached_lexical_index(records_path: str, records: List[Dict]) -> LexicalIndex:
+    """
+    Return a LexicalIndex for the given records, reusing a cached instance
+    when the underlying file (path + mtime + size) is unchanged.
+
+    Falls back to a fresh build (without caching) when the path is invalid.
+    """
+    key = _cache_key(records_path) if records_path else None
+    if key is not None:
+        idx = _LEX_CACHE.get(key)
+        if idx is not None:
+            return idx
+    idx = LexicalIndex.from_records(records)
+    if key is not None:
+        if len(_LEX_CACHE) >= _LEX_CACHE_MAX:
+            try:
+                _LEX_CACHE.pop(next(iter(_LEX_CACHE)))
+            except StopIteration:
+                pass
+        _LEX_CACHE[key] = idx
+    return idx

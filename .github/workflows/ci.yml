@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+# Two-stage strategy: a fast "core" matrix that verifies the lazy-import
+# path (no torch / transformers / sentence-transformers) on every push,
+# and a single "ml" job that exercises the optional embedding stack so
+# regressions in either path are caught.
+jobs:
+  core:
+    name: Core (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install core deps (no torch / transformers)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -e ".[dev,codegen]"
+
+      - name: Assert ML stack is *not* installed
+        run: |
+          python - <<'PY'
+          import importlib, sys
+          for m in ("torch", "transformers", "sentence_transformers"):
+              spec = importlib.util.find_spec(m)
+              assert spec is None, f"{m} should not be installed in the core job (found at {spec.origin})"
+          print("OK: ML stack absent — lazy-import path will be exercised.")
+          PY
+
+      - name: Compile-check sources
+        run: |
+          python -m compileall -q src
+
+      - name: Lint (non-blocking)
+        continue-on-error: true
+        run: |
+          ruff check src tests || true
+
+      - name: Run tests
+        env:
+          CGX_CONFIG_DIR: ${{ runner.temp }}/cgx-config
+        run: |
+          pytest -q
+
+  ml:
+    name: ML extras (Python 3.11)
+    runs-on: ubuntu-latest
+    # Don't block the merge if the heavy ML matrix flakes; core must stay green.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install core + ML deps (CPU torch)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install --extra-index-url https://download.pytorch.org/whl/cpu -r requirements-ml.txt
+          pip install -e ".[dev,codegen]"
+
+      - name: Run tests
+        env:
+          CGX_CONFIG_DIR: ${{ runner.temp }}/cgx-config
+          TRANSFORMERS_OFFLINE: "1"
+          HF_HUB_OFFLINE: "1"
+        run: |
+          pytest -q

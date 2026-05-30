@@ -1,12 +1,98 @@
-import math
-from typing import List, Dict, Optional, Callable, Iterable
-import numpy as np
-import torch
+"""Embedding builder.
 
-import math
-from typing import List, Dict, Optional, Callable, Iterable
+Heavy ML dependencies (``torch``, ``transformers``, ``sentence_transformers``)
+are imported lazily inside :func:`build_embeddings` so that simply importing
+this module — or any module that re-exports it (e.g. ``cgx.pipeline.auto``) —
+does not require the full ML stack. This keeps the UI and API-only providers
+usable on machines without a local embedder installed.
+"""
+
+from typing import Any, List, Dict, Optional, Callable, Tuple
+import threading
 import numpy as np
-import torch
+
+
+# Module-level caches so the encoder model is loaded once per process and
+# reused across calls. Without this the query path (which calls
+# build_embeddings on every .encode()) reloads the model 2-3× per question,
+# which is slow and floods the logs with HF init warnings.
+_ST_MODEL_CACHE: Dict[Tuple[str, str], Any] = {}
+_HF_MODEL_CACHE: Dict[Tuple[str, str], Tuple[Any, Any]] = {}
+
+# Locks prevent concurrent model loads (e.g. hybrid_retrieve_two_view runs
+# intent and impl views in a ThreadPoolExecutor). Without them two threads
+# both miss the cache, both call SentenceTransformer(device="cuda") in
+# parallel, and the concurrent CUDA allocations trigger the meta-tensor error.
+_ST_MODEL_LOCK = threading.Lock()
+_HF_MODEL_LOCK = threading.Lock()
+
+
+def _get_st_model(model_name: str, device: str, max_length: int) -> Any:
+    """Return a (cached) SentenceTransformer for (model_name, device).
+
+    trust_remote_code is required for models like jina-embeddings-v2-* which
+    ship a custom BERT (GLU MLP + ALiBi). Without it, ST falls back to vanilla
+    BertModel, leaves the encoder layers randomly initialized, and every
+    input collapses to the same vector.
+    """
+    key = (model_name, device)
+    # Fast path: model already cached.
+    st_model = _ST_MODEL_CACHE.get(key)
+    if st_model is None:
+        # Slow path: acquire lock so concurrent callers (e.g. two ThreadPoolExecutor
+        # workers encoding intent/impl views simultaneously) don't both try to load
+        # the model on CUDA at the same time, which triggers the meta-tensor error.
+        with _ST_MODEL_LOCK:
+            st_model = _ST_MODEL_CACHE.get(key)  # re-check after acquiring
+            if st_model is None:
+                from sentence_transformers import SentenceTransformer
+                # low_cpu_mem_usage=False prevents transformers>=4.35 from placing
+                # weights on the "meta" device during from_pretrained, which would
+                # cause a NotImplementedError when ST then calls .to(device).
+                _no_meta = {"low_cpu_mem_usage": False}
+                try:
+                    st_model = SentenceTransformer(
+                        model_name, device=device, trust_remote_code=True,
+                        model_kwargs=_no_meta,
+                    )
+                except TypeError:
+                    # Older sentence-transformers without model_kwargs / trust_remote_code.
+                    try:
+                        st_model = SentenceTransformer(model_name, device=device, trust_remote_code=True)
+                    except TypeError:
+                        st_model = SentenceTransformer(model_name, device=device)
+                _ST_MODEL_CACHE[key] = st_model
+    try:
+        cur = getattr(st_model, "max_seq_length", max_length) or max_length
+        st_model.max_seq_length = min(int(cur), int(max_length))
+    except Exception:
+        pass
+    return st_model
+
+
+def _get_hf_model(model_name: str, device: str) -> Tuple[Any, Any]:
+    """Return (cached) (tokenizer, model) for the HF transformers fallback."""
+    key = (model_name, device)
+    cached = _HF_MODEL_CACHE.get(key)
+    if cached is not None:
+        return cached
+    with _HF_MODEL_LOCK:
+        cached = _HF_MODEL_CACHE.get(key)
+        if cached is not None:
+            return cached
+        from transformers import AutoTokenizer, AutoModel
+        tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True, trust_remote_code=True)
+        # low_cpu_mem_usage=False: transformers>=4.35 defaults to lazy meta-tensor
+        # loading when this flag is True, causing .to(device) to raise
+        # NotImplementedError ("Cannot copy out of meta tensor").
+        model = AutoModel.from_pretrained(
+            model_name, trust_remote_code=True, low_cpu_mem_usage=False
+        )
+        model.to(device)
+        model.eval()
+        _HF_MODEL_CACHE[key] = (tokenizer, model)
+    return _HF_MODEL_CACHE[key]
+
 
 def build_embeddings(
     chunks: List[Dict],
@@ -150,6 +236,7 @@ def build_embeddings(
     # ----------------------------
     # 2) Device, max_length, helpers
     # ----------------------------
+    import torch  # lazy: only needed when actually encoding
     if device is None:
         device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
 
@@ -174,13 +261,7 @@ def build_embeddings(
     # ----------------------------
     if backend in ("auto", "sentence-transformers"):
         try:
-            from sentence_transformers import SentenceTransformer
-            st_model = SentenceTransformer(model_name, device=device)
-            try:
-                st_model.max_seq_length = min(getattr(st_model, "max_seq_length", max_length), max_length)
-            except Exception:
-                pass
-
+            st_model = _get_st_model(model_name, device, max_length)
             embs = st_model.encode(
                 texts,
                 batch_size=batch_size,
@@ -197,14 +278,9 @@ def build_embeddings(
     # ----------------------------
     # 4) Transformers fallback
     # ----------------------------
-    from transformers import AutoTokenizer, AutoModel
+    tokenizer, model = _get_hf_model(model_name, device)
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True, trust_remote_code=True)
-    model = AutoModel.from_pretrained(model_name, trust_remote_code=True)
-    model.to(device)
-    model.eval()
-
-    def _mean_pool(last_hidden_state: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    def _mean_pool(last_hidden_state: "torch.Tensor", attention_mask: "torch.Tensor") -> "torch.Tensor":
         mask = attention_mask.unsqueeze(-1).expand(last_hidden_state.size()).float()
         summed = (last_hidden_state * mask).sum(dim=1)
         counts = mask.sum(dim=1).clamp(min=1e-9)

@@ -2,17 +2,85 @@
 from __future__ import annotations
 
 import ast
+import fnmatch
 import io
 import os
 import tokenize
-from typing import Any, Dict, List, Optional, Tuple
-from src.cgx.parser.module_path import compute_module_path
-from src.cgx.logging_setup import get_logger
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+from cgx.parser.module_path import compute_module_path
+from cgx.logging_setup import get_logger
 
 logger = get_logger("parser")
 
+# Defaults: keep the indexer cheap & safe on arbitrary trusted-but-noisy repos.
+# Override with the CGX_PARSER_MAX_FILE_BYTES env var or the `max_file_bytes`
+# argument to parse_codebase().
+DEFAULT_MAX_FILE_BYTES = 1_000_000  # 1 MB
 
-def parse_codebase(project_root: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+# Directory names that are essentially always noise for code indexing. Kept as
+# basename matches so they apply at any depth in the tree.
+DEFAULT_IGNORE_DIRS = (
+    ".git", ".hg", ".svn",
+    "venv", ".venv", "env", ".env",
+    "__pycache__", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox",
+    "node_modules",
+    "build", "dist", ".eggs", "site-packages",
+    ".idea", ".vscode",
+)
+
+# Glob patterns (gitignore-style) applied to repo-relative paths.
+DEFAULT_IGNORE_GLOBS = (
+    "*.pyc", "*.pyo", "*.pyd", "*.so", "*.dll", "*.dylib",
+    "*.egg-info", "*.egg-info/**",
+    ".DS_Store",
+)
+
+
+def _load_gitignore_patterns(project_root: str) -> List[str]:
+    """Read .gitignore at the project root and return a normalized pattern list."""
+    pats: List[str] = []
+    gi = os.path.join(project_root, ".gitignore")
+    if not os.path.isfile(gi):
+        return pats
+    try:
+        with open(gi, "r", encoding="utf-8", errors="ignore") as f:
+            for raw in f:
+                ln = raw.strip()
+                if not ln or ln.startswith("#"):
+                    continue
+                if ln.startswith("!"):
+                    # Negations are not supported; safer to skip than mis-handle.
+                    continue
+                pats.append(ln.lstrip("/"))
+    except Exception:
+        pass
+    return pats
+
+
+def _matches_any(rel_path: str, patterns: Iterable[str]) -> bool:
+    """fnmatch-style match against repo-relative POSIX paths and basenames."""
+    rp = rel_path.replace(os.sep, "/")
+    name = rp.rsplit("/", 1)[-1]
+    for p in patterns:
+        pat = p.rstrip("/").replace(os.sep, "/")
+        if not pat:
+            continue
+        if fnmatch.fnmatch(rp, pat) or fnmatch.fnmatch(name, pat):
+            return True
+        # Match nested entries when pattern is dir-like (no glob chars).
+        if "*" not in pat and "?" not in pat and "[" not in pat:
+            if rp == pat or rp.startswith(pat + "/"):
+                return True
+    return False
+
+
+def parse_codebase(
+    project_root: str,
+    *,
+    ignore_patterns: Optional[List[str]] = None,
+    max_file_bytes: Optional[int] = None,
+    follow_symlinks: bool = False,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
     Parse and analyze an entire Python codebase into structured entities and call relations.
 
@@ -643,6 +711,11 @@ def parse_codebase(project_root: str) -> Tuple[List[Dict[str, Any]], List[Dict[s
             self.func_index: Dict[str, int] = {}
             self.import_alias: Dict[str, str] = {}
             self.star_imports: List[str] = []
+            # Stack of enclosing function names (non-method only) so nested
+            # functions get a qualified ID like "outer.inner" instead of just
+            # "inner", preventing duplicate chunk IDs when identically-named
+            # helpers are defined inside multiple different test functions.
+            self._func_name_stack: List[str] = []
 
         # -------- imports --------
         def visit_Import(self, node: ast.Import):
@@ -786,11 +859,15 @@ def parse_codebase(project_root: str) -> Tuple[List[Dict[str, Any]], List[Dict[s
                 if effective_is_method and self.current_class_name
                 else node.name
             )
-            func_id = (
-                f"{self.filename}::method::{qual}"
-                if effective_is_method
-                else f"{self.filename}::function::{node.name}"
-            )
+            if effective_is_method:
+                func_id = f"{self.filename}::method::{qual}"
+            elif self._func_name_stack:
+                # Nested function inside another function: qualify with the
+                # enclosing function path so identically-named helpers in
+                # different test functions get distinct chunk IDs.
+                func_id = f"{self.filename}::function::{'.'.join(self._func_name_stack)}.{node.name}"
+            else:
+                func_id = f"{self.filename}::function::{node.name}"
 
             func_code = _get_source(self.source, node)
             decorators = [_unparse(d) for d in node.decorator_list]
@@ -864,12 +941,16 @@ def parse_codebase(project_root: str) -> Tuple[List[Dict[str, Any]], List[Dict[s
             self.func_index[func_id] = idx
             self.func_meta[func_id] = meta
 
+            if not effective_is_method:
+                self._func_name_stack.append(node.name)
             prev_func = self.current_func_id
             self.current_func_id = func_id
             try:
                 self.generic_visit(node)
             finally:
                 self.current_func_id = prev_func
+                if not effective_is_method:
+                    self._func_name_stack.pop()
 
             # finalize meta
             meta["attributes_used"] = sorted(meta["attributes_used"])
@@ -1171,14 +1252,52 @@ def parse_codebase(project_root: str) -> Tuple[List[Dict[str, Any]], List[Dict[s
             self.generic_visit(node)
 
     # ---------- walk project ----------
-    for root, _, files in os.walk(project_root):
-        if "venv" in root:
-            continue
+    # Resolve safety knobs (args > env > defaults).
+    if max_file_bytes is None:
+        try:
+            max_file_bytes = int(os.environ.get("CGX_PARSER_MAX_FILE_BYTES", "") or DEFAULT_MAX_FILE_BYTES)
+        except Exception:
+            max_file_bytes = DEFAULT_MAX_FILE_BYTES
+    user_globs = list(ignore_patterns or [])
+    gitignore_globs = _load_gitignore_patterns(project_root)
+    all_globs = list(DEFAULT_IGNORE_GLOBS) + gitignore_globs + user_globs
+    abs_root = os.path.abspath(project_root)
+
+    def _rel(p: str) -> str:
+        try:
+            return os.path.relpath(p, abs_root)
+        except Exception:
+            return p
+
+    for root, dirs, files in os.walk(project_root, followlinks=follow_symlinks):
+        # Prune ignored directories in-place to avoid descending into them.
+        pruned: List[str] = []
+        for d in list(dirs):
+            if d in DEFAULT_IGNORE_DIRS:
+                continue
+            rel_d = _rel(os.path.join(root, d))
+            if _matches_any(rel_d, all_globs):
+                continue
+            pruned.append(d)
+        dirs[:] = pruned
+
         for fname in files:
             if not fname.endswith(".py"):
                 continue
             filepath = os.path.join(root, fname)
+            rel_fp = _rel(filepath)
+            if _matches_any(rel_fp, all_globs):
+                continue
             try:
+                if not follow_symlinks and os.path.islink(filepath):
+                    continue
+                st = os.stat(filepath)
+                if max_file_bytes and st.st_size > max_file_bytes:
+                    logger.warning(
+                        "Skipping %s: size %d bytes exceeds max_file_bytes=%d",
+                        rel_fp, st.st_size, max_file_bytes,
+                    )
+                    continue
                 with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
                     source_code = f.read()
                 try:

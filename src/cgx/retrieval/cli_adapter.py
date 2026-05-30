@@ -78,7 +78,14 @@ def _load_embedder(model_name: str):
     """
     try:
         from sentence_transformers import SentenceTransformer
-        m = SentenceTransformer(model_name)
+        # trust_remote_code is required for models like jina-embeddings-v2-*
+        # which ship a custom BERT (GLU MLP + ALiBi). Without it the encoder
+        # weights are random-initialized and all inputs collapse to the same
+        # vector.
+        try:
+            m = SentenceTransformer(model_name, trust_remote_code=True)
+        except TypeError:
+            m = SentenceTransformer(model_name)
         class _ST:
             def encode(self, texts: List[str]):
                 import numpy as np

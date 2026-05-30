@@ -1,5 +1,5 @@
 from __future__ import annotations
-from src.cgx.logging_setup import get_logger
+from cgx.logging_setup import get_logger
 logger = get_logger(__name__)
 
 """
@@ -16,6 +16,7 @@ Adds graph + chunks persistence and loading so hybrid retrieval can
 actually use lexical and graph expansion at query time.
 """
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import os
@@ -34,6 +35,7 @@ from cgx.retrieval.orchestrator import (
     analyze_change_impact,  # NEW
 )
 from cgx.io.persist import save_indices, load_indices, save_jsonl, load_jsonl
+from cgx.retrieval.lexical import get_cached_lexical_index
 
 # Graph persistence
 from networkx.readwrite import json_graph
@@ -53,6 +55,16 @@ def _to_faiss_ids(rows: List[Dict[str, Any]]) -> np.ndarray:
     return np.arange(len(rows), dtype=np.int64)
 
 
+def _encode_with_embedder(embedder: Any, rows: List[Dict[str, Any]], *, normalize: bool) -> np.ndarray:
+    """Encode rows with a user-provided embedder exposing .encode(list[str])."""
+    texts = [str(r.get("text") or r.get("code") or "") for r in rows]
+    embs = np.asarray(embedder.encode(texts), dtype=np.float32)
+    if normalize:
+        denom = np.linalg.norm(embs, axis=1, keepdims=True) + 1e-12
+        embs = (embs / denom).astype(np.float32)
+    return embs
+
+
 def run_index_auto(
     project_root: str,
     out_dir: str,
@@ -61,9 +73,18 @@ def run_index_auto(
     which: Tuple[str, str] = ("intent", "impl"),
     model_name: str = "jinaai/jina-embeddings-v2-base-code",
     batch_size: int = 64,
+    embedder: Optional[Any] = None,
+    incremental: bool = True,
 ) -> Dict[str, Any]:
     """
     Build two-view FAISS indices and persist alongside records and graph/chunks.
+
+    Parameters
+    ----------
+    embedder
+        Optional object exposing ``.encode(list[str]) -> np.ndarray``. When
+        provided it takes precedence over ``model_name`` and bypasses
+        ``build_embeddings`` (useful for BYO encoders / tests / mocks).
     """
     os.makedirs(out_dir, exist_ok=True)
     logger.info("=== run_index_auto starting ===")
@@ -101,61 +122,96 @@ def run_index_auto(
     for v in per_view:
         logger.info("View %s has %d rows", v, len(per_view[v]))
 
-    # ---------------- Embeddings + FAISS ----------------
+    # ---------------- Embeddings + FAISS (views built in parallel) ----------------
+    from cgx.embeddings.cache import embed_with_cache
     indices: Dict[str, Any] = {"views": {}, "metric": metric}
-    for view_name, rows in per_view.items():
+    cache_stats_per_view: Dict[str, Dict[str, int]] = {}
+    normalize = (metric in {"cosine", "ip"})
+
+    def _build_view(view_name: str, rows: List[Dict[str, Any]]):
+        """Embed + index one corpus view; returns (view_name, index_dict, cache_stats)."""
         logger.info("Building index for view=%s (rows=%d)", view_name, len(rows))
         if not rows:
             logger.warning("No rows for view=%s, skipping", view_name)
-            indices["views"][view_name] = {
-                "index": None,
-                "meta": None,
-                "rows": [],
+            return view_name, {
+                "index": None, "meta": None, "rows": [],
                 "ids": np.array([], dtype=np.int64),
-            }
-            continue
+            }, {}
 
-        # Embed
         try:
-            embs = build_embeddings(
-                rows,
-                model_name=model_name,
-                backend="auto",
-                normalize=(metric in {"cosine", "ip"}),
-                batch_size=batch_size,
-                field_strategy="auto",
-                max_length=256,
-            )
-            logger.info("Embedding done for view=%s", view_name)
+            if incremental:
+                cache_path = os.path.join(out_dir, f"emb_cache_{view_name}.npz")
+                texts = [str(r.get("text") or r.get("code") or "") for r in rows]
+
+                def _encode(missing_texts: List[str]) -> np.ndarray:
+                    if embedder is not None and hasattr(embedder, "encode"):
+                        arr = np.asarray(embedder.encode(missing_texts), dtype=np.float32)
+                        if normalize and arr.size:
+                            denom = np.linalg.norm(arr, axis=1, keepdims=True) + 1e-12
+                            arr = (arr / denom).astype(np.float32)
+                        return arr
+                    return build_embeddings(
+                        [{"text": t} for t in missing_texts],
+                        model_name=model_name,
+                        backend="auto",
+                        normalize=normalize,
+                        batch_size=batch_size,
+                        field_strategy="auto",
+                        max_length=256,
+                    )
+
+                embs, stats = embed_with_cache(
+                    texts, encode_fn=_encode, cache_path=cache_path,
+                    model_name=model_name, normalize=normalize,
+                )
+                logger.info("Embedding cache view=%s hits=%d misses=%d",
+                            view_name, stats["hits"], stats["misses"])
+            else:
+                stats = {}
+                if embedder is not None and hasattr(embedder, "encode"):
+                    embs = _encode_with_embedder(embedder, rows, normalize=normalize)
+                else:
+                    embs = build_embeddings(
+                        rows, model_name=model_name, backend="auto",
+                        normalize=normalize, batch_size=batch_size,
+                        field_strategy="auto", max_length=256,
+                    )
+            logger.info("Embedding done for view=%s shape=%s", view_name, np.asarray(embs).shape)
         except Exception as e:
             logger.error("Embedding failed for view=%s: %s", view_name, e, exc_info=True)
             raise
 
         embs = np.asarray(embs, dtype=np.float32)
-
-        # Build FAISS index
         try:
-            index, meta = build_faiss_index( # TODO: Why meta is so small? 
-                embs,
-                metric=metric,
-                index=index_type,
-                return_meta=True,
-            )
+            index, meta = build_faiss_index(embs, metric=metric, index=index_type, return_meta=True)
         except Exception as e:
             logger.error("build_faiss_index failed for view=%s: %s", view_name, e, exc_info=True)
             raise
 
-        # Preserve chunk IDs
         orig_ids = [r.get("chunk_id") for r in rows]
         meta = {**(meta or {}), "orig_chunk_ids": orig_ids}
-
-        indices["views"][view_name] = {
-            "index": index,
-            "meta": meta,
-            "rows": rows,
-            "ids": _to_faiss_ids(rows),
-        }
         logger.info("Finished view=%s: index type=%s rows=%d", view_name, type(index).__name__, len(rows))
+        return view_name, {
+            "index": index, "meta": meta,
+            "rows": rows, "ids": _to_faiss_ids(rows),
+        }, stats
+
+    # Run both views concurrently (embedding is the bottleneck; FAISS build is CPU-bound).
+    # ThreadPoolExecutor is appropriate here: torch releases the GIL during GPU ops, and
+    # FAISS C++ calls also release the GIL, so true parallelism occurs for both.
+    logger.info("Building embeddings + FAISS for %d views in parallel", len(per_view))
+    with ThreadPoolExecutor(max_workers=len(per_view)) as pool:
+        futures = {pool.submit(_build_view, vn, rows): vn for vn, rows in per_view.items()}
+        for fut in as_completed(futures):
+            view_name = futures[fut]
+            try:
+                vn, view_dict, vstats = fut.result()
+                indices["views"][vn] = view_dict
+                if vstats:
+                    cache_stats_per_view[vn] = vstats
+            except Exception as e:
+                logger.error("View %s failed: %s", view_name, e, exc_info=True)
+                raise
 
     # ---------------- Persist ----------------
     try:
@@ -196,6 +252,8 @@ def run_index_auto(
             "chunks": os.path.join(out_dir, "chunks.jsonl"),
             "graph": graph_path,
         },
+        "incremental": bool(incremental),
+        "embedding_cache": cache_stats_per_view,
     }
     logger.info("=== run_index_auto completed === %s", result["counts"])
     return result
@@ -217,6 +275,7 @@ def run_query_auto(
     neighbor_depth: int = 1,
     use_lexical: bool = True,   # retained for API compatibility; hybrid ignores and uses lexical anyway
     single_view: Optional[str] = None,
+    embedder: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     Load indices, records, chunks, and graph, then execute hybrid two-view retrieval
@@ -247,18 +306,26 @@ def run_query_auto(
     records = load_jsonl(records_path)
     chunks = load_jsonl(chunks_path) if chunks_path else None
 
-    # Load graph if available
+    # Load graph if available. networkx>=3.4 changed the default edges key
+    # in node_link_data from "links" to "edges"; detect whichever the saved
+    # file actually uses so the loader is forward- and backward-compatible.
     G = None
     if graph_path:
         try:
             with open(graph_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            G = json_graph.node_link_graph(data, edges="links")
+            edges_key = "edges" if isinstance(data, dict) and "edges" in data else "links"
+            G = json_graph.node_link_graph(data, edges=edges_key)
         except Exception as e:
             logger.warning("run_query_auto: failed to load graph (%s)", e)
             G = None
 
-    embedder = BuildEmbedder(model_name=model_name, batch_size=64, normalize=True)
+    if embedder is None or not hasattr(embedder, "encode"):
+        embedder = BuildEmbedder(model_name=model_name, batch_size=64, normalize=True)
+
+    # Reuse a path-keyed LexicalIndex across queries to avoid rebuilding BM25
+    # on every call (build is O(N) over all records).
+    lex_idx = get_cached_lexical_index(records_path, records) if records else None
 
     # Hybrid retrieval (semantic+lexical+graph → RRF)
     retrieval_out = hybrid_retrieve_two_view(
@@ -271,6 +338,7 @@ def run_query_auto(
         top_k_per_view=top_k_per_view,
         neighbor_depth=neighbor_depth,
         use_lexical=True,  # forced on
+        lexical_index=lex_idx,
     )
 
     hits = retrieval_out.get("hits", [])

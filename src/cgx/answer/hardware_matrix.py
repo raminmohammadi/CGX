@@ -1,0 +1,147 @@
+"""Static hardware-vs-model matrix and local-vs-cloud trade-offs.
+
+The data here is intentionally offline — no network calls, no model
+downloads. It augments :mod:`cgx.answer.ollama_discovery` (which holds a
+small "recommended ladder") with a wider catalogue of locally-runnable
+models so the UI can show users at a glance which models will fit on
+their machine, and how the local path compares to a cloud endpoint on
+the dimensions that actually matter (privacy, latency, cost, ceiling).
+
+The thresholds below are deliberate approximations meant for UI sorting,
+not capacity planning; they assume 4-bit quantised GGUF/AWQ-style
+inference which is what Ollama serves by default.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional
+
+
+# (name, params_b, min_ram_gb, recommended_vram_gb, ctx_window, family, notes)
+LOCAL_MODEL_CATALOG: List[Dict[str, Any]] = [
+    {"name": "qwen2.5-coder:1.5b", "params_b": 1.5, "min_ram_gb": 4.0,
+     "recommended_vram_gb": 2.0, "ctx_window": 32768, "family": "coder",
+     "notes": "smallest viable coder; CPU-friendly"},
+    {"name": "qwen2.5-coder:3b", "params_b": 3.0, "min_ram_gb": 6.0,
+     "recommended_vram_gb": 4.0, "ctx_window": 32768, "family": "coder",
+     "notes": "balanced default for code Q&A"},
+    {"name": "qwen2.5-coder:7b-instruct", "params_b": 7.0, "min_ram_gb": 10.0,
+     "recommended_vram_gb": 8.0, "ctx_window": 32768, "family": "coder",
+     "notes": "higher-quality coder; sweet spot on 16GB GPUs"},
+    {"name": "qwen2.5-coder:14b-instruct", "params_b": 14.0, "min_ram_gb": 20.0,
+     "recommended_vram_gb": 16.0, "ctx_window": 32768, "family": "coder",
+     "notes": "near-cloud coder quality; needs ≥16GB VRAM"},
+    {"name": "llama3.2:3b-instruct", "params_b": 3.0, "min_ram_gb": 6.0,
+     "recommended_vram_gb": 4.0, "ctx_window": 131072, "family": "general",
+     "notes": "long context, light general-purpose"},
+    {"name": "llama3.1:8b-instruct", "params_b": 8.0, "min_ram_gb": 12.0,
+     "recommended_vram_gb": 8.0, "ctx_window": 131072, "family": "general",
+     "notes": "general-purpose with strong reasoning"},
+    {"name": "qwen2.5:7b-instruct", "params_b": 7.0, "min_ram_gb": 10.0,
+     "recommended_vram_gb": 8.0, "ctx_window": 32768, "family": "general",
+     "notes": "general-purpose alternative to llama 8b"},
+    {"name": "phi3.5:3.8b-mini-instruct", "params_b": 3.8, "min_ram_gb": 6.0,
+     "recommended_vram_gb": 4.0, "ctx_window": 131072, "family": "general",
+     "notes": "small, long-context, low-RAM"},
+]
+
+
+def _effective_budget_gb(hw: Dict[str, Any]) -> float:
+    """Return a single GB number representing how much model we can afford.
+
+    Mirrors :func:`cgx.answer.ollama_discovery.recommend_default_model`:
+    VRAM (when present) dominates because the model lives in GPU memory;
+    otherwise fall back to system RAM.
+    """
+    ram = float(hw.get("ram_gb") or 0.0)
+    vram = float(hw.get("gpu_vram_gb") or 0.0)
+    if vram > 0:
+        return max(ram, vram * 2.0)
+    return ram
+
+
+def _verdict(entry: Dict[str, Any], hw: Dict[str, Any]) -> Dict[str, str]:
+    budget = _effective_budget_gb(hw)
+    min_ram = float(entry["min_ram_gb"])
+    vram = float(hw.get("gpu_vram_gb") or 0.0)
+    rec_vram = float(entry["recommended_vram_gb"])
+    if budget == 0:
+        return {"fit": "❓ unknown", "reason": "hardware probe returned no values"}
+    if budget < min_ram * 0.9:
+        return {"fit": "❌ won't fit",
+                "reason": f"need ≥{min_ram:g} GB, have {budget:.1f} GB"}
+    if vram and vram < rec_vram * 0.75:
+        return {"fit": "⚠️ tight",
+                "reason": f"≥{rec_vram:g} GB VRAM recommended, GPU has {vram:.1f} GB"}
+    if budget < min_ram * 1.2:
+        return {"fit": "⚠️ tight",
+                "reason": f"within ~20% of the {min_ram:g} GB minimum"}
+    return {"fit": "✅ fits", "reason": f"budget {budget:.1f} GB ≥ {min_ram:g} GB"}
+
+
+def compute_local_fit(hw: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    """Annotate :data:`LOCAL_MODEL_CATALOG` with a fit verdict for ``hw``.
+
+    Returns a list of dicts ready for tabular display. Sorted by params
+    so the smallest models appear first.
+    """
+    hw = hw or {}
+    rows: List[Dict[str, Any]] = []
+    for entry in LOCAL_MODEL_CATALOG:
+        v = _verdict(entry, hw)
+        rows.append({
+            "model": entry["name"],
+            "params_b": entry["params_b"],
+            "min_ram_gb": entry["min_ram_gb"],
+            "rec_vram_gb": entry["recommended_vram_gb"],
+            "ctx_window": entry["ctx_window"],
+            "family": entry["family"],
+            "fit": v["fit"],
+            "reason": v["reason"],
+            "notes": entry["notes"],
+        })
+    rows.sort(key=lambda r: (r["params_b"], r["model"]))
+    return rows
+
+
+# Local-vs-cloud trade-offs. Pure editorial summary; no live numbers, no
+# vendor-specific quotes. Each row is one decision dimension.
+TRADEOFFS: List[Dict[str, str]] = [
+    {"dimension": "Privacy / data egress",
+     "local": "Prompts + code never leave the machine.",
+     "cloud": "Prompts + retrieved snippets go to the provider; subject to their data policy.",
+     "winner": "local"},
+    {"dimension": "Marginal cost / token",
+     "local": "Electricity only; zero per-call cost once the model is downloaded.",
+     "cloud": "Pay-per-token; cost scales linearly with usage and context length.",
+     "winner": "local"},
+    {"dimension": "Quality ceiling",
+     "local": "Capped by what fits on your hardware (≈14B params on a 16 GB GPU).",
+     "cloud": "Access to frontier models (100B+ params, long context, tool-use).",
+     "winner": "cloud"},
+    {"dimension": "Latency (cold)",
+     "local": "First token after model load (seconds on small models, minutes on large).",
+     "cloud": "Sub-second TTFT in steady state; spikes during provider load.",
+     "winner": "tie"},
+    {"dimension": "Latency (warm)",
+     "local": "Predictable; bound by local GPU/CPU.",
+     "cloud": "Variable; subject to rate limits + network round-trip.",
+     "winner": "local"},
+    {"dimension": "Offline use",
+     "local": "Works on a plane / air-gapped network.",
+     "cloud": "Requires connectivity.",
+     "winner": "local"},
+    {"dimension": "Setup effort",
+     "local": "Install Ollama, pull a model (~GB-scale download).",
+     "cloud": "Sign up, mint an API key, paste into a profile.",
+     "winner": "cloud"},
+    {"dimension": "Operational risk",
+     "local": "Your machine = your SLO.",
+     "cloud": "Vendor outages / price changes / model deprecations.",
+     "winner": "local"},
+]
+
+
+def tradeoffs_rows() -> List[Dict[str, str]]:
+    """Return the editorial local-vs-cloud comparison table."""
+    return list(TRADEOFFS)

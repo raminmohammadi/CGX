@@ -1,5 +1,5 @@
 import os
-from src.cgx.logging_setup import get_logger
+from cgx.logging_setup import get_logger
 import networkx as nx
 
 # -------------------------------

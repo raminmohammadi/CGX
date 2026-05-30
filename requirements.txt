@@ -1,8 +1,35 @@
-networkx
-sentence-transformers
-numpy
-faiss-cpu
-transformers
-matplotlib
-gradio
-optimum
+# Averix core runtime dependencies.
+#
+# Prefer `pip install -e .[all]` (reads pyproject.toml) for development. This
+# file is the install path for environments that bootstrap from requirements.
+#
+# This file installs the *core* feature set: indexing, hybrid retrieval, the
+# FastAPI/React web UI, and the local-LLM/API answer pipeline. It does NOT
+# include the heavy ML embedding stack (torch / transformers /
+# sentence-transformers); see `requirements-ml.txt` to opt in to local
+# embedding model loading.
+#
+# Why split? Embeddings are pluggable. The default "BYO embedder" path and the
+# Ollama/OpenAI answer pipelines do not need torch, so a clean install can stay
+# under ~150 MB. Install the ML stack only when you want to run the default
+# Jina embedding model locally.
+
+# Core (required)
+networkx>=3.0
+numpy>=1.24
+requests>=2.31
+pathspec>=0.11
+
+# Vector index + codegen
+faiss-cpu>=1.7
+unidiff>=0.7
+
+# Web UI (FastAPI backend serving the prebuilt React SPA)
+fastapi>=0.115
+uvicorn[standard]>=0.30
+sse-starlette>=2.1
+python-multipart>=0.0.9
+
+# Optional but lightweight
+keyring>=24
+matplotlib>=3.7

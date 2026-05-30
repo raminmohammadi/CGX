@@ -1,0 +1,128 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    color-scheme: dark;
+  }
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+  body {
+    font-family: "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
+    background-color: #030712;
+    color: #f3f4f6;
+    overflow: hidden;
+  }
+  *::-webkit-scrollbar {
+    width: 5px;
+    height: 5px;
+  }
+  *::-webkit-scrollbar-track {
+    background: #030712;
+  }
+  *::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.1);
+    border-radius: 99px;
+  }
+  *::-webkit-scrollbar-thumb:hover {
+    background: #10b981;
+  }
+}
+
+@layer components {
+  /* Premium minimal card border — picks up neon glow on focus-within. */
+  .av-card {
+    @apply rounded-xl border border-muted bg-surface transition;
+    transition: border-color 0.25s cubic-bezier(0.4, 0, 0.2, 1),
+      box-shadow 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+  }
+  .av-card:focus-within,
+  .av-card.is-active {
+    border-color: #10b981;
+    box-shadow: 0 0 20px rgba(16, 185, 129, 0.08);
+  }
+
+  .av-nav-item {
+    @apply w-full flex items-center gap-2.5 px-3 py-2 rounded text-slate-400
+           hover:text-white hover:bg-white/5 transition text-xs text-left;
+  }
+  .av-nav-item.is-active {
+    color: #ffffff;
+    background-color: rgba(255, 255, 255, 0.04);
+    border-left: 2px solid #10b981;
+    padding-left: calc(0.75rem - 2px);
+  }
+  .av-nav-item.is-active svg {
+    color: #34d399;
+  }
+
+  .av-pill {
+    @apply inline-flex items-center gap-1 px-2 py-0.5 rounded font-mono text-[10px] font-semibold;
+  }
+  .av-pill-neon {
+    @apply av-pill bg-emerald-500/10 text-emerald-400 border border-emerald-500/20;
+  }
+  .av-pill-amber {
+    @apply av-pill bg-amber-500/10 text-amber-400 border border-amber-500/20;
+  }
+  .av-pill-red {
+    @apply av-pill bg-red-500/10 text-red-400 border border-red-500/20;
+  }
+  .av-pill-slate {
+    @apply av-pill bg-slate-800 text-slate-400 border border-white/5;
+  }
+
+  .av-btn {
+    @apply inline-flex items-center gap-1.5 rounded text-xs font-semibold transition px-3 py-1.5
+           disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+  .av-btn-primary {
+    @apply av-btn bg-emerald-500 text-slate-950 hover:bg-emerald-400 font-bold;
+  }
+  .av-btn-ghost {
+    @apply av-btn bg-slate-950 text-slate-300 border border-white/5 hover:bg-slate-900;
+  }
+  .av-btn-icon {
+    @apply inline-flex h-7 w-7 items-center justify-center rounded text-slate-400
+           hover:text-white hover:bg-white/5 transition;
+  }
+
+  .av-input {
+    @apply w-full bg-slate-950 border border-white/5 rounded p-2 text-slate-200
+           font-mono text-xs outline-none focus:border-emerald-500/50 transition;
+  }
+  .av-label {
+    @apply block text-slate-400 font-mono text-[10px] uppercase tracking-widest mb-1;
+  }
+
+  .av-section-eyebrow {
+    @apply text-[10px] uppercase tracking-widest text-slate-500 font-bold font-mono;
+  }
+}
+
+/* Streaming dot pulse for "thinking" indicators. */
+.av-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 9999px;
+  background: #10b981;
+  display: inline-block;
+  animation: av-pulse 1.2s ease-in-out infinite;
+}
+@keyframes av-pulse {
+  0%, 100% { opacity: 0.25; transform: scale(0.9); }
+  50% { opacity: 1; transform: scale(1.1); }
+}
+
+/* Syntax-highlight overrides — keep contrast strong on dark base. */
+.hljs { background: transparent !important; color: #cbd5e1; }
+.hljs-keyword, .hljs-built_in { color: #c084fc; }
+.hljs-string { color: #6ee7b7; }
+.hljs-number, .hljs-literal { color: #fbbf24; }
+.hljs-title, .hljs-name { color: #60a5fa; }
+.hljs-comment { color: #64748b; font-style: italic; }
+.hljs-attr { color: #f472b6; }

@@ -1,0 +1,51 @@
+{
+  "name": "averix",
+  "displayName": "Averix",
+  "description": "Open the Averix RAG UI inside a VS Code webview panel.",
+  "version": "0.0.1",
+  "publisher": "averix",
+  "private": true,
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [],
+  "contributes": {
+    "commands": [
+      {
+        "command": "averix.openUI",
+        "title": "Averix: Open UI",
+        "category": "Averix"
+      },
+      {
+        "command": "averix.refreshUI",
+        "title": "Averix: Reload UI",
+        "category": "Averix"
+      }
+    ],
+    "configuration": {
+      "title": "Averix",
+      "properties": {
+        "averix.ui.url": {
+          "type": "string",
+          "default": "http://localhost:7860",
+          "description": "URL of the running Averix Gradio UI. Start the server with `averix-ui` or `python app.py` before opening the panel."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.4.0"
+  }
+}

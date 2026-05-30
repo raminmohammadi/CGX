@@ -1,0 +1,22 @@
+# Averix optional ML extras.
+#
+# Install with:    pip install -r requirements.txt -r requirements-ml.txt
+# Or via extras:   pip install -e .[embeddings]
+#
+# What this gives you:
+#   * Local loading of the default Jina embedding model
+#     (`jinaai/jina-embeddings-v2-base-code`) for indexing.
+#   * The optional cross-encoder reranker
+#     (`cross-encoder/ms-marco-MiniLM-L-6-v2`) used when
+#     `HybridConfig.enable_reranker=True`.
+#
+# What you can skip this for:
+#   * Using a BYO embedder (any callable that returns vectors).
+#   * Running Averix purely against an Ollama or remote LLM endpoint.
+#
+# Note: `torch` is ~700 MB; pick a CUDA/CPU build that matches your platform.
+# See https://pytorch.org/get-started/locally/ if the pin below doesn't apply.
+
+sentence-transformers>=2.7
+transformers>=4.40,<5
+torch>=2.1

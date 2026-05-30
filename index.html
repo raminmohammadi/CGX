@@ -1,0 +1,482 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Averix — Local-first Codebase RAG Platform</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap');
+        
+        :root {
+            --bg-base: #030712;
+            --bg-surface: #0B1329;
+            --bg-inset: #02040A;
+            --border-muted: rgba(255, 255, 255, 0.06);
+            --border-bright: rgba(16, 185, 129, 0.3);
+            --color-neon: #10B981; 
+            --color-warning: #F59E0B;
+            --color-error: #EF4444;
+            --glow-neon: rgba(16, 185, 129, 0.08);
+        }
+
+        body {
+            font-family: 'Plus Jakarta Sans', sans-serif;
+            background-color: var(--bg-base);
+            color: #F3F4F6;
+            overflow: hidden;
+        }
+
+        .mono { font-family: 'JetBrains Mono', monospace; }
+
+        /* Premium Minimal Borders */
+        .premium-border {
+            border: 1px solid var(--border-muted);
+            transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+        .premium-border:focus-within, .premium-border.active-card {
+            border-color: var(--color-neon);
+            box-shadow: 0 0 20px var(--glow-neon);
+        }
+
+        /* Sidebar State Switching styling */
+        .tab-btn-active {
+            color: #FFFFFF !important;
+            background-color: rgba(255, 255, 255, 0.04);
+            border-left: 2px solid var(--color-neon);
+        }
+
+        /* Standard custom scrollbars */
+        ::-webkit-scrollbar { width: 5px; height: 5px; }
+        ::-webkit-scrollbar-track { background: var(--bg-base); }
+        ::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.1); border-radius: 99px; }
+        ::-webkit-scrollbar-thumb:hover { background: var(--color-neon); }
+
+        .tab-viewport { display: none; }
+        .tab-viewport.active { display: flex; flex-direction: column; height: 100%; width: 100%; }
+    </style>
+</head>
+<body class="h-screen flex flex-col">
+
+    <!-- PLATFORM NAVIGATION HEADER -->
+    <header class="h-14 border-b flex items-center justify-between px-6 bg-[#090F1F]" style="border-color: var(--border-muted)">
+        <div class="flex items-center space-x-3">
+            <div class="h-7 w-7 bg-emerald-500 rounded flex items-center justify-center text-slate-950 font-bold text-sm shadow-md shadow-emerald-500/10">A</div>
+            <div class="flex items-baseline space-x-2">
+                <span class="font-bold tracking-tight text-white text-base mono">AVERIX</span>
+                <span class="text-[10px] text-slate-500 mono">cgx.ui v1.0</span>
+            </div>
+        </div>
+
+        <!-- System Architecture Environment Badges -->
+        <div class="flex items-center space-x-6 text-xs mono">
+            <div class="flex items-center space-x-2 bg-slate-950 px-2.5 py-1 rounded border border-white/5">
+                <span class="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
+                <span class="text-slate-400">Ollama status: <span class="text-white">Connected</span></span>
+            </div>
+            <div class="text-slate-400">
+                <i class="fa-solid fa-microchip text-slate-600 mr-1"></i> Mode: <span class="text-emerald-400">Air-Gapped / Local-First</span>
+            </div>
+        </div>
+    </header>
+
+    <!-- WORKSPACE FRAMEWORK CONTAINER -->
+    <div class="flex-1 flex overflow-hidden">
+        
+        <!-- SIDEBAR INTERNAL CONTROLS -->
+        <aside class="w-64 bg-[#090F1F] border-r flex flex-col justify-between flex-shrink-0" style="border-color: var(--border-muted)">
+            <div class="p-3 space-y-5">
+                <div>
+                    <div class="text-[10px] uppercase tracking-widest text-slate-500 font-bold px-2 mb-2 mono">Engine Core Layers</div>
+                    <nav class="space-y-0.5" id="tab-nav-group">
+                        <button onclick="switchTab('tab-setup', this)" class="w-full flex items-center space-x-2.5 px-3 py-2 rounded text-slate-400 hover:text-white hover:bg-white/5 transition text-xs text-left">
+                            <i class="fa-solid fa-sliders text-slate-500 w-4"></i><span>⚙️ Profiles & Setup</span>
+                        </button>
+                        <button onclick="switchTab('tab-index', this)" class="w-full flex items-center space-x-2.5 px-3 py-2 rounded text-slate-400 hover:text-white hover:bg-white/5 transition text-xs text-left">
+                            <i class="fa-solid fa-database text-slate-500 w-4"></i><span>📚 Incremental Index</span>
+                        </button>
+                        <button onclick="switchTab('tab-ask', this)" class="w-full tab-btn-active flex items-center space-x-2.5 px-3 py-2 rounded text-slate-200 transition text-xs text-left font-medium">
+                            <i class="fa-solid fa-comment-dots text-emerald-400 w-4"></i><span>💬 Contextual Ask</span>
+                        </button>
+                        <button onclick="switchTab('tab-plan', this)" class="w-full flex items-center space-x-2.5 px-3 py-2 rounded text-slate-400 hover:text-white hover:bg-white/5 transition text-xs text-left">
+                            <i class="fa-solid fa-wand-magic-sparkles text-slate-500 w-4"></i><span>🛠️ Self-Testing Plan</span>
+                        </button>
+                        <button onclick="switchTab('tab-agent', this)" class="w-full flex items-center space-x-2.5 px-3 py-2 rounded text-slate-400 hover:text-white hover:bg-white/5 transition text-xs text-left justify-between">
+                            <div class="flex items-center space-x-2.5"><i class="fa-solid fa-robot text-slate-500 w-4"></i><span>🤖 Agent Loop</span></div>
+                            <span class="bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 text-[9px] px-1 py-0.2 rounded mono">RUNNING</span>
+                        </button>
+                        <button onclick="switchTab('tab-hardware', this)" class="w-full flex items-center space-x-2.5 px-3 py-2 rounded text-slate-400 hover:text-white hover:bg-white/5 transition text-xs text-left">
+                            <i class="fa-solid fa-microchip text-slate-500 w-4"></i><span>📊 Hardware Pick</span>
+                        </button>
+                    </nav>
+                </div>
+
+                <!-- Active Persistent Sessions List (cgx.sessions Layer) -->
+                <div>
+                    <div class="flex items-center justify-between px-2 mb-1.5">
+                        <span class="text-[10px] uppercase tracking-widest text-slate-500 font-bold mono">Active turn paths</span>
+                        <span class="text-[9px] text-slate-600 mono">.jsonl storage</span>
+                    </div>
+                    <div class="space-y-1 max-h-40 overflow-y-auto">
+                        <div class="p-2 bg-slate-950 border border-emerald-500/20 rounded text-xs cursor-pointer">
+                            <p class="text-slate-300 font-medium truncate">⚡ refactor/parse_codebase</p>
+                            <span class="text-[9px] text-slate-500 mono">12 turns · cgx.sessions</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Fixed Sandbox Footer Protection Shield -->
+            <div class="p-3 border-t bg-slate-950/40 flex items-center justify-between" style="border-color: var(--border-muted)">
+                <span class="text-[10px] text-slate-500 mono">Storage context: ~/.cgx/</span>
+                <i class="fa-solid fa-circle-check text-emerald-500 text-xs" title="0700 Owner-Only Permissions Enabled"></i>
+            </div>
+        </aside>
+
+        <!-- VIEWPORT DISPLAY CANVAS WORKSPACE -->
+        <main class="flex-1 bg-[#030712] relative overflow-hidden">
+            
+            <!-- LAYER 1: SETUP & CONFIGURATION PROFILES (cgx.answer.profiles) -->
+            <div id="tab-setup" class="tab-viewport">
+                <div class="p-6 space-y-6 max-w-4xl overflow-y-auto h-full">
+                    <div>
+                        <h2 class="text-lg font-bold text-white tracking-tight">⚙️ Provider Settings & Profiles</h2>
+                        <p class="text-xs text-slate-400 mt-0.5">Configure model profiles, token budgets, and client-side bucket parameters.</p>
+                    </div>
+                    
+                    <div class="grid grid-cols-2 gap-4">
+                        <div class="bg-[#0B1329] p-5 rounded-xl border space-y-4" style="border-color: var(--border-muted)">
+                            <div class="flex justify-between items-center">
+                                <h3 class="text-xs font-semibold text-emerald-400 mono">Profile: local-ollama</h3>
+                                <span class="text-[10px] bg-emerald-400/10 text-emerald-400 border border-emerald-500/20 px-1.5 py-0.5 rounded mono">ACTIVE</span>
+                            </div>
+                            <div class="space-y-3 text-xs">
+                                <div>
+                                    <label class="block text-slate-400 mono text-[10px] uppercase mb-1">Base Endpoint URL</label>
+                                    <input type="text" value="http://localhost:11434" class="w-full bg-slate-950 border border-white/5 rounded p-2 text-slate-300 mono outline-none" readonly>
+                                </div>
+                                <div class="grid grid-cols-2 gap-2">
+                                    <div>
+                                        <label class="block text-slate-400 mono text-[10px] uppercase mb-1">Rate Limit (req/sec)</label>
+                                        <input type="text" value="0 (No-Op Limiter)" class="w-full bg-slate-950 border border-white/5 rounded p-2 text-slate-500 mono outline-none" readonly>
+                                    </div>
+                                    <div>
+                                        <label class="block text-slate-400 mono text-[10px] uppercase mb-1">Max Retries</label>
+                                        <input type="text" value="0" class="w-full bg-slate-950 border border-white/5 rounded p-2 text-slate-500 mono outline-none" readonly>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="bg-[#0B1329] p-5 rounded-xl border space-y-4 opacity-70 hover:opacity-100 transition" style="border-color: var(--border-muted)">
+                            <div class="flex justify-between items-center">
+                                <h3 class="text-xs font-semibold text-slate-300 mono">Profile: cloud-backup</h3>
+                                <span class="text-[10px] bg-slate-800 text-slate-400 border border-white/5 px-1.5 py-0.5 rounded mono">STANDBY</span>
+                            </div>
+                            <div class="space-y-3 text-xs">
+                                <div>
+                                    <label class="block text-slate-400 mono text-[10px] uppercase mb-1">Base Endpoint URL</label>
+                                    <input type="text" value="https://api.openai.com/v1" class="w-full bg-slate-950 border border-white/5 rounded p-2 text-slate-400 mono outline-none" readonly>
+                                </div>
+                                <div class="grid grid-cols-2 gap-2">
+                                    <div>
+                                        <label class="block text-slate-400 mono text-[10px] uppercase mb-1">Rate Limit (req/sec)</label>
+                                        <input type="text" value="2.0" class="w-full bg-slate-950 border border-white/5 rounded p-2 text-emerald-400 mono outline-none" readonly>
+                                    </div>
+                                    <div>
+                                        <label class="block text-slate-400 mono text-[10px] uppercase mb-1">Max Retries</label>
+                                        <input type="text" value="4 (Exp Backoff)" class="w-full bg-slate-950 border border-white/5 rounded p-2 text-emerald-400 mono outline-none" readonly>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- LAYER 2: INCREMENTAL INDEX MANAGEMENT (cgx.embeddings.cache) -->
+            <div id="tab-index" class="tab-viewport">
+                <div class="p-6 space-y-6 max-w-4xl overflow-y-auto h-full">
+                    <div>
+                        <h2 class="text-lg font-bold text-white tracking-tight">📚 Content-Addressed Embedding Cache</h2>
+                        <p class="text-xs text-slate-400 mt-0.5">Tracks repository updates via SHA-256 validation mapping, processing only altered chunks.</p>
+                    </div>
+
+                    <div class="bg-[#0B1329] p-5 rounded-xl border space-y-5" style="border-color: var(--border-muted)">
+                        <div class="flex justify-between items-center border-b border-white/5 pb-4">
+                            <div>
+                                <span class="text-[10px] uppercase font-bold text-slate-500 tracking-wider mono block">Target Directory Path</span>
+                                <span class="text-xs text-slate-200 font-medium mono">/Users/dev/projects/Averix</span>
+                            </div>
+                            <div class="flex space-x-2">
+                                <button class="bg-slate-950 text-slate-300 border border-white/5 font-medium px-3 py-1.5 rounded text-xs hover:bg-slate-900 transition">Force Clean Rebuild</button>
+                                <button class="bg-emerald-500 text-slate-950 font-bold px-3 py-1.5 rounded text-xs hover:bg-emerald-400 transition">Run Incremental Sync</button>
+                            </div>
+                        </div>
+
+                        <div>
+                            <span class="text-[10px] uppercase font-bold text-slate-500 tracking-wider mono block mb-2">Cache Storage Vectors Metrics (.npz views)</span>
+                            <div class="grid grid-cols-2 gap-3 text-xs mono">
+                                <div class="bg-slate-950 p-3 rounded border border-white/5 flex justify-between items-center">
+                                    <span class="text-slate-400">emb_cache_intent.npz</span>
+                                    <span class="text-emerald-400 font-medium bg-emerald-500/5 border border-emerald-500/10 px-2 py-0.5 rounded">412 Hits / 5 Misses</span>
+                                </div>
+                                <div class="bg-slate-950 p-3 rounded border border-white/5 flex justify-between items-center">
+                                    <span class="text-slate-400">emb_cache_impl.npz</span>
+                                    <span class="text-emerald-400 font-medium bg-emerald-500/5 border border-emerald-500/10 px-2 py-0.5 rounded">410 Hits / 7 Misses</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- LAYER 3: CONTEXTUAL ASK - HYBRID RETRIEVAL VIEWPORT (cgx.retrieval) -->
+            <div id="tab-ask" class="tab-viewport active">
+                <div class="flex h-full w-full p-4 gap-4 overflow-hidden">
+                    
+                    <!-- Left Multi-View Trace Panel -->
+                    <div class="w-72 bg-[#0B1329] rounded-xl border flex flex-col flex-shrink-0" style="border-color: var(--border-muted)">
+                        <div class="p-3 border-b bg-slate-950/80 flex items-center justify-between text-[11px] font-semibold uppercase tracking-wider text-slate-400 mono" style="border-color: var(--border-muted)">
+                            <span class="flex items-center gap-1.5"><i class="fa-solid fa-brain text-emerald-400"></i> Retrieval Ranks</span>
+                            <span class="text-[9px] text-slate-500 lowercase mono">fused via rrf</span>
+                        </div>
+                        <div class="flex-1 p-3 mono text-[10px] space-y-2.5 overflow-y-auto bg-slate-950/20 text-slate-400">
+                            <div class="p-2 bg-slate-950 border border-white/5 rounded space-y-1">
+                                <div class="text-slate-200 font-medium truncate">cgx.retrieval.orchestrator</div>
+                                <div class="text-[9px] text-emerald-400 flex flex-wrap gap-1">
+                                    <span class="bg-emerald-500/5 px-1 rounded">semantic_intent</span>
+                                    <span class="bg-emerald-500/5 px-1 rounded">symbol_boost (+0.5)</span>
+                                </div>
+                            </div>
+                            <div class="p-2 bg-slate-950/40 border border-white/5 rounded space-y-1">
+                                <div class="text-slate-300 font-medium truncate">cgx.embeddings.cache</div>
+                                <div class="text-[9px] text-slate-400 flex flex-wrap gap-1">
+                                    <span class="bg-slate-500/5 px-1 rounded">semantic_impl</span>
+                                    <span class="bg-slate-500/5 px-1 rounded">graph_depth (hop_1)</span>
+                                </div>
+                            </div>
+                            <p class="text-amber-400/80 bg-amber-500/5 p-2 rounded text-[9px] border border-amber-500/10">
+                                <i class="fa-solid fa-triangle-exclamation mr-1"></i> Cross-encoder bypass: missing ML stack. Falling back to core RRF order.
+                            </p>
+                        </div>
+                    </div>
+
+                    <!-- Right Interaction & Answer Panel -->
+                    <div class="flex-1 flex flex-col bg-[#0B1329] rounded-xl border overflow-hidden" style="border-color: var(--border-muted)">
+                        <div class="flex-1 p-5 overflow-y-auto space-y-5 text-xs">
+                            <div class="flex gap-3">
+                                <div class="bg-emerald-500/10 text-emerald-400 h-5 w-5 font-bold rounded flex items-center justify-center border border-emerald-500/20 text-[10px]">U</div>
+                                <div class="space-y-0.5">
+                                    <p class="text-slate-400 text-[10px] mono">Grounded Input Query</p>
+                                    <p class="text-slate-200 font-medium text-sm">How do you trigger code plan executions via the internal pipeline layer?</p>
+                                </div>
+                            </div>
+                            <hr style="border-color: var(--border-muted)">
+                            <div class="flex gap-3">
+                                <div class="bg-purple-500/10 text-purple-400 h-5 w-5 rounded flex items-center justify-center border border-purple-500/20 text-[10px]"><i class="fa-solid fa-robot"></i></div>
+                                <div class="space-y-3 w-full">
+                                    <p class="text-slate-300 leading-relaxed text-sm">Averix runs plan queries through an automatic diff verification loop inside the code layer path <code class="mono text-xs bg-slate-950 px-1 py-0.5 text-pink-400 rounded">cgx.codegen.pipeline.validate_and_test</code>. It evaluates changes sequentially in memory before exporting artifacts.</p>
+                                    
+                                    <!-- Rendered Python Block -->
+                                    <div class="bg-slate-950 rounded-lg border overflow-hidden" style="border-color: var(--border-muted)">
+                                        <div class="bg-slate-900 px-3 py-1.5 flex items-center justify-between text-[10px] text-slate-400 border-b border-white/5 mono">
+                                            <span>cgx/answer/engine.py</span>
+                                        </div>
+                                        <pre class="p-3 mono text-[11px] text-slate-300 overflow-x-auto"><code><span class="text-purple-400">def</span> <span class="text-blue-400">generate_code_plan</span>(query, index_dir, provider):
+    <span class="text-slate-500"># Routes into the validation retry structure</span>
+    <span class="text-purple-400">return</span> validate_and_test(query, provider)</code></pre>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Command Input Dock Box -->
+                        <div class="p-3 border-t bg-slate-950" style="border-color: var(--border-muted)">
+                            <div class="premium-border rounded-lg bg-slate-900 p-1.5 flex items-center justify-between">
+                                <input type="text" class="w-full bg-transparent outline-none text-xs text-white px-2 placeholder-slate-500" placeholder="Query code signatures, modules, or implementations...">
+                                <button class="bg-emerald-500 text-slate-950 text-xs font-bold px-3 py-1 rounded hover:bg-emerald-400 transition">Ask Engine</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- LAYER 4: SELF-TESTING CODE GENERATION (cgx.codegen) -->
+            <div id="tab-plan" class="tab-viewport">
+                <div class="p-6 space-y-6 overflow-y-auto h-full max-w-4xl">
+                    <div>
+                        <h2 class="text-lg font-bold text-white tracking-tight">🛠️ Self-Testing Verification Loop</h2>
+                        <p class="text-xs text-slate-400 mt-0.5">Executes isolated dry-run evaluations, verifying code change validity inside safe AST parsing environments.</p>
+                    </div>
+
+                    <div class="bg-[#0B1329] rounded-xl border overflow-hidden" style="border-color: var(--border-muted)">
+                        <div class="bg-slate-950 px-4 py-3 border-b flex justify-between items-center" style="border-color: var(--border-muted)">
+                            <div class="flex items-center space-x-2">
+                                <span class="bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 px-2 py-0.5 rounded text-[10px] font-bold mono">PARSED CODEGEN REPORT</span>
+                                <span class="text-xs text-slate-300 mono">Target: `cgx/parser.py`</span>
+                            </div>
+                            <div class="flex items-center space-x-3 text-xs mono">
+                                <span class="text-emerald-400 font-semibold"><i class="fa-solid fa-circle-check"></i> AST Match</span>
+                                <span class="text-emerald-400 font-semibold"><i class="fa-solid fa-flask"></i> Pytest Success</span>
+                            </div>
+                        </div>
+                        
+                        <div class="p-4 bg-slate-950/60 font-mono text-xs space-y-1 border-b border-white/5">
+                            <p class="text-slate-500">@@ -32,3 +32,7 @@ def parse_codebase(project_root):</p>
+                            <p class="text-red-400 bg-red-950/20 px-1">-   if len(file_path) &gt; 1024:</p>
+                            <p class="text-emerald-400 bg-emerald-950/20 px-1">+   if os.path.getsize(file_path) &gt; 1 * 1024 * 1024:</p>
+                            <p class="text-emerald-400 bg-emerald-950/20 px-1">+       return None  # Enforce 1MB core framework cap file criteria</p>
+                        </div>
+
+                        <div class="p-3 bg-slate-950/20 text-[11px] mono text-slate-400 flex justify-between">
+                            <span>Sandbox Process Context: Stable Isolation</span>
+                            <span class="text-slate-500">Execution Timeout Threshold: 30s</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- LAYER 5: MULTI-AGENT ORCHESTRATION PIPELINE (cgx.agents) -->
+            <div id="tab-agent" class="tab-viewport">
+                <div class="p-6 space-y-6 overflow-y-auto h-full">
+                    <div>
+                        <h2 class="text-lg font-bold text-white tracking-tight">🤖 Multi-Agent Orchestration Tracker</h2>
+                        <p class="text-xs text-slate-400 mt-0.5">Live execution pipeline traversing Planner generation, Tracker task dispatches, and structural Judge diagnostics.</p>
+                    </div>
+
+                    <!-- Flow Diagram Track Matrix -->
+                    <div class="grid grid-cols-3 gap-4">
+                        <div class="bg-[#0B1329] p-4 rounded-xl border border-emerald-500/20 space-y-1.5 relative">
+                            <div class="flex justify-between items-center text-xs font-bold mono">
+                                <span class="text-white">1. PLANNER LAYER</span>
+                                <span class="text-emerald-400 text-[10px]"><i class="fa-solid fa-circle-check"></i> Pass</span>
+                            </div>
+                            <p class="text-xs text-slate-400">Decomposed user goal inputs into 2 synchronized JSON task metrics blocks.</p>
+                        </div>
+                        <div class="bg-[#0B1329] p-4 rounded-xl border border-emerald-500 shadow-md shadow-emerald-500/5 space-y-1.5 relative">
+                            <div class="flex justify-between items-center text-xs font-bold mono">
+                                <span class="text-emerald-400">2. TRACKER ENGINE</span>
+                                <span class="text-emerald-400 text-[10px] animate-pulse"><i class="fa-solid fa-spinner animate-spin"></i> Processing</span>
+                            </div>
+                            <p class="text-xs text-slate-400">Dispatching sub-routine callable types directly to <code class="mono text-[11px] text-pink-400">cgx.codegen</code> specs.</p>
+                        </div>
+                        <div class="bg-[#0B1329] p-4 rounded-xl border border-white/5 opacity-40 space-y-1.5">
+                            <div class="flex justify-between items-center text-xs font-bold mono">
+                                <span class="text-slate-500">3. JUDGE VERDICT</span>
+                                <span class="text-slate-500 text-[10px]">Pending</span>
+                            </div>
+                            <p class="text-xs text-slate-400">Awaiting automated structural verification checks and JSON validation passes.</p>
+                        </div>
+                    </div>
+
+                    <!-- Live Event Terminal Output View -->
+                    <div class="bg-slate-950 border border-white/5 rounded-xl p-4 mono text-xs text-slate-400 h-48 overflow-y-auto space-y-1.5">
+                        <p><span class="text-slate-600">[Event Node: plan]</span> Goal initialized: "Inject safety umask constraints across session streams"</p>
+                        <p><span class="text-slate-600">[Event Node: task_start]</span> Task 1 of 2 running -> [Kind: search, Target: cgx.sessions]</p>
+                        <p class="text-slate-200 animate-pulse"><span class="text-emerald-400">[Event Node: task_done]</span> Validation matched structural block requirements successfully.</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- LAYER 6: HARDWARE MODEL CATALOG & VERDICTS (cgx.answer.hardware_matrix) -->
+            <div id="tab-hardware" class="tab-viewport">
+                <div class="p-6 space-y-6 overflow-y-auto h-full max-w-5xl">
+                    <div class="flex justify-between items-start">
+                        <div>
+                            <h2 class="text-lg font-bold text-white tracking-tight">📊 Hardware-Aware Local Catalog</h2>
+                            <p class="text-xs text-slate-400 mt-0.5">Cross-references localized system resources directly against 4-bit quantized GGUF inference thresholds.</p>
+                        </div>
+                        <button class="bg-emerald-500 text-slate-950 font-bold px-3 py-1.5 rounded text-xs hover:bg-emerald-400 transition flex items-center gap-1.5">
+                            <i class="fa-solid fa-microchip"></i> Detect Hardware Budget
+                        </button>
+                    </div>
+
+                    <!-- Catalogue Model Matrix Grid -->
+                    <div class="bg-[#0B1329] rounded-xl border overflow-hidden" style="border-color: var(--border-muted)">
+                        <table class="w-full text-left text-xs mono">
+                            <thead class="bg-slate-950 text-slate-400 uppercase border-b border-white/5">
+                                <tr>
+                                    <th class="p-3 text-[10px]">Model Tag Target</th>
+                                    <th class="p-3 text-[10px]">Parameters</th>
+                                    <th class="p-3 text-[10px]">Min RAM</th>
+                                    <th class="p-3 text-[10px]">Rec VRAM</th>
+                                    <th class="p-3 text-[10px]">Fit Verdict Status</th>
+                                </tr>
+                            </thead>
+                            <tbody class="divide-y divide-white/5 text-slate-300">
+                                <tr>
+                                    <td class="p-3 font-semibold text-white">qwen2.5-coder:3b</td>
+                                    <td class="p-3">3.0B</td>
+                                    <td class="p-3">6.0 GB</td>
+                                    <td class="p-3">4.0 GB</td>
+                                    <td class="p-3 text-emerald-400 font-medium">✅ fits (VRAM Allocation Safe)</td>
+                                </tr>
+                                <tr>
+                                    <td class="p-3 font-semibold text-white">qwen2.5-coder:14b-instruct</td>
+                                    <td class="p-3">14.0B</td>
+                                    <td class="p-3">20.0 GB</td>
+                                    <td class="p-3">16.0 GB</td>
+                                    <td class="p-3 text-amber-400 font-medium">⚠️ tight (Context Limits Strained)</td>
+                                </tr>
+                                <tr>
+                                    <td class="p-3 font-semibold text-white">llama3.1:8b-instruct</td>
+                                    <td class="p-3">8.0B</td>
+                                    <td class="p-3">12.0 GB</td>
+                                    <td class="p-3">8.0 GB</td>
+                                    <td class="p-3 text-red-400 font-medium">❌ won't fit (Insufficient Host Memory)</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <!-- Editorial Tradeoff Chart Display -->
+                    <div class="space-y-2">
+                        <span class="text-[10px] font-bold tracking-wider text-slate-500 uppercase mono block">Local-First Engine Architecture Trade-offs Matrix</span>
+                        <div class="grid grid-cols-2 gap-3 text-xs">
+                            <div class="bg-[#0B1329] p-3 rounded-lg border border-white/5 flex justify-between items-center">
+                                <span class="text-slate-400 font-medium">Privacy & Data Egress Posture</span>
+                                <span class="text-emerald-400 uppercase text-[10px] font-bold bg-emerald-500/5 px-2 py-0.5 rounded border border-emerald-500/10 mono">Winner: Local</span>
+                            </div>
+                            <div class="bg-[#0B1329] p-3 rounded-lg border border-white/5 flex justify-between items-center">
+                                <span class="text-slate-400 font-medium">Quality Ceiling Metrics Threshold</span>
+                                <span class="text-purple-400 uppercase text-[10px] font-bold bg-purple-500/5 px-2 py-0.5 rounded border border-purple-500/10 mono">Winner: Cloud</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+        </main>
+    </div>
+
+    <!-- INTERACTION ROUTING LOGIC SCRIPT -->
+    <script>
+        function switchTab(targetTabId, element) {
+            // 1. Terminate all active display targets
+            const viewports = document.getElementsByClassName('tab-viewport');
+            for (let i = 0; i < viewports.length; i++) {
+                viewports[i].classList.remove('active');
+            }
+
+            // 2. Map current display view active selection targets
+            document.getElementById(targetTabId).classList.add('active');
+
+            // 3. Purge highlight tags from navigation lists
+            const targetNavButtons = document.querySelectorAll('#tab-nav-group button');
+            targetNavButtons.forEach(btn => {
+                btn.classList.remove('tab-btn-active');
+                const embeddedIcon = btn.querySelector('i');
+                if (embeddedIcon) embeddedIcon.classList.remove('text-emerald-400');
+            });
+
+            // 4. Anchor current selections with active accent badges
+            element.classList.add('tab-btn-active');
+            const targetActiveIcon = element.querySelector('i');
+            if (targetActiveIcon) targetActiveIcon.classList.add('text-emerald-400');
+        }
+    </script>
+</body>
+</html>

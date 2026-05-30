@@ -1,467 +1,556 @@
-# Codebase RAG — End-to-End Guide (Auto‑wired)
+# Averix — Local-first Codebase RAG
 
-This README explains how the repository works **end‑to‑end** and exactly **how to run it**.  
-It also documents the main modules, data flow, CLI flags, expected inputs/outputs, and API surfaces you can call from code.
+Averix indexes a code repository, retrieves grounded context via a hybrid
+engine (semantic + lexical + graph), and asks a local or remote LLM to
+answer questions or produce **self-tested** code change plans. It is
+model-agnostic and ships with a polished Gradio UI.
 
-> The system is **model‑agnostic**. Bring your own embedder exposing `.encode(list[str]) -> np.ndarray`.
+- 🔒 **Local-first.** Indexing, embedding, retrieval, sessions, and
+  telemetry **never leave the machine.** Works fully offline with
+  [Ollama](https://ollama.com/).
+- 🔌 **Bring your own LLM.** Any OpenAI-compatible endpoint, with API
+  keys stored in your OS keyring when available.
+- 🧠 **Hybrid retrieval.** Two-view semantic + BM25 + graph expansion,
+  fused with Reciprocal Rank Fusion and an optional cross-encoder
+  rerank.
+- 🤖 **Multi-agent orchestration.** A Planner / Tracker / Judge loop
+  decomposes complex requests into atomic tasks (`ask`, `plan`,
+  `scaffold`, `search`, `summarize`, `apply`, `verify`) and validates
+  each artefact before moving on (`cgx.agents`, **🤖 Agent** tab). The
+  planner routes scaffold goals to the new `scaffold` kind, downgrades
+  expensive code-gen tasks to plain Q&A for read-only goals, and the
+  tracker streams live `task_progress` heartbeats so the UI never looks
+  frozen on long LLM calls. See [docs/flowcharts.md](docs/flowcharts.md)
+  for a visual.
+- 🏗️ **New project generation.** Give Averix a plain-language idea
+  (e.g. *"create a FastAPI todo app"* or *"create a React calculator
+  app"*), set a destination directory as Project Root, and the
+  `scaffold → apply → verify` chain generates a complete, working project
+  from scratch — no existing codebase or index required. The scaffold
+  prompt has technology-aware instruction blocks: frontend goals
+  (React, Vue, etc.) produce component files and `package.json`; Python
+  goals produce `requirements.txt`, `conftest.py`, and pytest tests.
+  The Judge enforces the match and retries on a technology mismatch.
+- 💬 **Persistent chat sessions.** Conversations are saved as JSONL
+  threads under `~/.cgx/sessions/`; resume them later from the Ask
+  tab's session sidebar.
+- 🧪 **Self-testing code generation.** Diffs are parsed, syntax-checked,
+  and optionally run against impacted pytest tests in a sandbox before
+  being surfaced.
+- ⚡ **Incremental indexing.** A content-addressed embedding cache
+  (per-view `.npz` keyed on sha256 of the corpus text) makes
+  re-indexing a touched-only-a-few-files repo nearly instant.
+- 📊 **Hardware-aware model picker.** The Hardware tab reports
+  ✅/⚠️/❌ verdicts for ~8 local models against your detected RAM/VRAM
+  and shows a local-vs-cloud trade-off table.
+- 🩹 **Client-side rate limiting + 429 retry** on every provider, with
+  per-profile budgets persisted alongside the model config.
+- 👀 **Thought-process panel.** Live streaming of the model's reasoning
+  sketch, followed by the final grounded answer.
+- 🧩 **VS Code extension scaffold** (`extension/`) that hosts the
+  Gradio UI inside an editor webview.
+- 📋 **Task registry & cancel.** Every operation is tracked in
+  `~/.cgx/tasks.db`; cancel any running task with
+  `DELETE /api/tasks/{id}` or the in-UI Cancel button.
+- 🔴 **Cancel button on every tab.** Stop a streaming request mid-flight
+  from Ask (Stop), Plan, Agent, or Index (Cancel).
+- 🔁 **Tab persistence.** Switching between tabs mid-task no longer loses
+  the running view — state is held in a session-scoped Zustand store
+  (`frontend/src/store/tasks.ts`) and the SSE stream continues in the
+  background via `frontend/src/lib/connections.ts`.
+- 🖥️ **Terminal observability.** All operations emit structured
+  `[INFO]`/`[WARNING]` log lines to stdout from startup
+  (`setup_logging(INFO)` in `launch.py`).
+- ⚡ **Parallel two-view execution.** FAISS index building
+  (`run_index_auto`) and semantic retrieval (`HybridRetriever.search`)
+  both run the intent and impl views concurrently via
+  `ThreadPoolExecutor`.
 
 ---
 
-## Which file do I run? (Entry Point)
+## Install
 
-Use the **CLI** at `cgx/cli/main.py`. It now routes through a new **auto‑wired pipeline** that connects all key components.
+Averix has a **small core** and a **separately-installable ML stack**. Pick
+the path that matches how you plan to use it.
+
+### Core install (no torch)
+
+Use this if you'll point Averix at an Ollama server or an OpenAI-compatible
+endpoint and supply your own embeddings via a BYO embedder callable.
 
 ```bash
-# Make the src/ layout importable
-export PYTHONPATH="$PWD/src:$PYTHONPATH"
-
-# 1) INDEX — parse → graph → records → two-view embeddings → FAISS → persist
-python -m cgx.cli.main index   --project-root /path/to/your/codebase   --embedder "myproj.embed:make_model"   --out-dir /tmp/cgx_index   --metric cosine   --index-type flat
-
-# 2) QUERY — hybrid retrieval (semantic + optional lexical + graph) + aggregation + insertion anchors
-python -m cgx.cli.main query   --index-dir /tmp/cgx_index/indices   --records /tmp/cgx_index/records.jsonl   --embedder "myproj.embed:make_model"   --query "How do we add a new FastAPI route?"
-```
-
-Under the hood the CLI calls the **auto‑wired** pipeline:
-
-- `src/cgx/pipeline/auto.py`  
-  - `run_index_auto(project_root, embedder, out_dir, metric, index_type)`  
-  - `run_query_auto(index_dir, records_path, embedder, query, ...)`
-
-Your **original** pipeline remains unchanged and available:
-
-- `src/cgx/pipeline/run.py`  
-  - `run_index(...)`  
-  - `run_query(...)`
-
-You can keep using these or delegate them to the auto‑wired versions if you want one canonical path.
-
----
-
-## Architecture & Data Flow
-
-1. **Parse → Chunks**  
-   `cgx.parser.parse_codebase.parse_codebase(project_root)`  
-   Produces canonical **chunks** (files/classes/functions/methods) and, if available, basic call edges.
-
-2. **Graph**  
-   `cgx.graph.build_graph.build_knowledge_graph(chunks, calls=None)`  
-   Builds a NetworkX **knowledge graph** over code entities and relations (calls/modules/attrs/etc.).
-
-3. **Records & Two‑View Corpus**  
-   - `cgx.embeddings.records.make_index_records(chunks, G)` → **records** (deterministic S4‑style)  
-   - `cgx.embeddings.records.prepare_embedding_corpus(records, which=('intent','impl'))` → **corpus**  
-     - **intent** view: NL‑friendly summary (names/docstrings/comments)  
-     - **impl** view: implementation‑centric text (code/signatures), optionally normalized
-
-4. **Embeddings & FAISS per view**  
-   - Embeddings (explicitly exercised): `cgx.embeddings.build.build_embeddings(...)`  
-   - ANN index (explicitly exercised): `cgx.embeddings.index.build_faiss_index(...)`  
-   - Persist per‑view artifacts via `cgx.io.persist.save_indices(...)`
-
-5. **Retrieval, Fusion & Post‑processing**  
-   - **Hybrid two‑view** retrieval (semantic on both views + optional lexical + optional graph) with RRF fusion:  
-     `cgx.retrieval.orchestrator.hybrid_retrieve_two_view(...)`  
-   - Aggregate to implementation units:  
-     - `cgx.retrieval.orchestrator.aggregate_by_file(...)`  
-     - `cgx.retrieval.orchestrator.aggregate_by_class(...)`  
-   - Suggest **insertion points** for new code:  
-     - `cgx.retrieval.orchestrator.suggest_insertion_points(query, results, records)`
-
----
-
-## CLI Reference
-
-### `index`
-
-Builds two FAISS indices (one per view) and saves metadata + rows + records.
-
-**Flags**
-
-- `--project-root` (required): Repository to index.  
-- `--embedder` (required): Import spec `"module:attr"` that yields an object with `.encode(list[str]) -> ndarray`.  
-  - Class → instantiated with no args.  
-  - Callable (factory) → called to produce the object.  
-  - Pre‑instantiated object (module attr) → used directly.  
-- `--out-dir` (required): Output directory.  
-- `--metric` (default `cosine`): One of `cosine|l2|ip`.  
-- `--index-type` (default `flat`): One of `flat|ivf|hnsw`.  
-- Compatibility flags (kept for UX continuity; not required):  
-  `--no-normalize-impl`, `--strip-literals-impl`.
-
-**Output Layout**
-
-```
-/out-dir/
-  ├── indices/
-  │   ├── meta.json
-  │   ├── intent.index
-  │   ├── intent.rows.jsonl
-  │   ├── impl.index
-  │   └── impl.rows.jsonl
-  └── records.jsonl
-```
-
-### `query`
-
-Runs hybrid two‑view retrieval + file/class aggregation + insertion‑point suggestions.  
-Optionally, runs a **single‑view** semantic helper for debugging.
-
-**Flags**
-
-- `--index-dir` (required): Directory containing `indices/` from the `index` step.  
-- `--records` (required): Path to `records.jsonl`.  
-- `--embedder` (required): Same import spec used at index time.  
-- `--query` (required): User question / task.  
-- `--chunks`: Optional `chunks.jsonl` to power lexical search.  
-- `--graph`: Optional JSON graph (if you wish to include graph expansion).  
-- `--top-k` (default 10): Per‑view semantic top‑k.  
-- `--depth` (default 1): Graph neighbor depth (if graph expansion is enabled).  
-- `--no-lexical`: Disable lexical component.  
-- `--single-view {intent,impl}`: Also run the `semantic_search(...)` helper on a single view and return its top‑k.
-
-**Output (printed JSON)**
-
-- `hits` — fused top‑k chunks with ranks/scores.  
-- `top_files` — aggregated by file.  
-- `top_classes` — aggregated by class.  
-- `anchors` — suggested insertion points (deterministic overlap signals).  
-- `single_view` — optional block (when `--single-view` is provided).
-
----
-
-## Programmatic Usage
-
-### Auto‑wired pipeline (same as the CLI)
-
-```python
-from cgx.pipeline.auto import run_index_auto, run_query_auto
-
-# Build indices
-summary = run_index_auto(
-    project_root="/path/to/code",
-    embedder=make_model(),          # object with .encode(list[str]) -> ndarray
-    out_dir="/tmp/cgx_index",
-    metric="cosine",
-    index_type="flat",
-)
-
-# Query with hybrid fusion + anchors
-results = run_query_auto(
-    index_dir="/tmp/cgx_index/indices",
-    records_path="/tmp/cgx_index/records.jsonl",
-    embedder=make_model(),
-    query="How to add JWT validation?",
-    top_k_per_view=10,
-    neighbor_depth=1,
-    use_lexical=True,
-    single_view=None,               # or "intent"/"impl"
-)
-```
-
-### Legacy pipeline (kept intact)
-
-```python
-from cgx.pipeline.run import run_index, run_query
-# These remain available and unchanged.
-```
-
----
-
-## Configuration Objects
-
-Typed configs live in `cgx/config.py` and support a simple overrides surface:
-
-- `EmbeddingConfig.from_overrides(...).to_dict()`  
-- `FaissConfig.from_overrides(metric="cosine", index_type="flat").to_dict()`  
-- `HybridSearchConfig.from_overrides(rrf_k=60.0, ...).to_dict()`
-
-> Some fields may also read environment variables (see `cgx/config.py` for exact names).
-
----
-
-## Embedder Contract (BYO Model)
-
-Any embedder works as long as it implements:
-
-```python
-.encode(list[str]) -> numpy.ndarray  # shape (N, D), dtype float32 preferred
-```
-
-**Tips**
-
-- For `cosine`/`ip` metrics, L2‑normalize vectors across rows (both for index and query).  
-- Reuse model/tokenizer across calls; batch requests to avoid overhead.
-
----
-
-## Troubleshooting & Tips
-
-- **PYTHONPATH**: Always export `PYTHONPATH="$PWD/src:$PYTHONPATH"` for src‑layout imports.  
-- **Missing FAISS**: The persist layer degrades gracefully; install FAISS for best performance.  
-- **Graph Optionality**: Hybrid retrieval works without a graph; provide one to enable graph expansion.  
-- **Large Repos**: Consider `ivf`/`hnsw` for larger corpora; tune `nlist`, `efSearch`, etc., if exposed by your build.  
-- **Determinism**: Records and row order are deterministic; indices map back to stable record IDs written in `*.rows.jsonl`.
-
----
-
-## Module Map
-
-- Parsing — `cgx.parser.parse_codebase.parse_codebase`  
-- Graph — `cgx.graph.build_graph.build_knowledge_graph`  
-- Records — `cgx.embeddings.records.make_index_records`, `prepare_embedding_corpus`  
-- Embeddings — `cgx.embeddings.build.build_embeddings`  
-- Index — `cgx.embeddings.index.build_faiss_index`  
-- Orchestrator — `cgx.retrieval.orchestrator.hybrid_retrieve_two_view`, `aggregate_by_file`, `aggregate_by_class`, `suggest_insertion_points`  
-- Persistence — `cgx.io.persist.save_indices/load_indices/save_jsonl/load_jsonl`  
-- CLI — `cgx.cli.main`  
-- Pipeline — **auto**: `cgx.pipeline.auto.run_index_auto`, `run_query_auto`; **legacy**: `cgx.pipeline.run.run_index`, `run_query`
-
----
-
-
-# Codebase RAG — Full Guide (Capabilities & Usage)
-
-This project indexes an entire **codebase** and lets you **ask questions**, **find the right places to modify**, and **add new functionality that fits** the existing patterns. It does this by parsing code into canonical chunks, building a two‑view embedding index (intent & implementation), optionally expanding across a code graph, and fusing multiple signals for grounded retrieval. It also suggests **insertion points** to help you place new code safely.
-
-> **Bring‑Your‑Own Embedder** (BYOE). Any model works as long as it exposes `.encode(list[str]) -> numpy.ndarray`.
-
----
-
-## What you can do
-
-- **Ask questions about the codebase** in natural language (e.g., “Where is JWT verification implemented?”)
-- **Find where to add new functionality** (e.g., “Where should I add CSV export for reports?”)
-- **Reuse patterns** (e.g., “Show me canonical logging setup and usage across services”)
-- **Discover APIs & contracts** (e.g., “Which class validates requests?”)
-- **Explore related code** using optional **graph expansion** (follow callers/callees/imports)
-- **Get insertion anchors** for new code (files/classes/locations most likely to be correct)
-
-The system returns:
-- `hits` (top chunks)
-- `top_files` (file rollups)
-- `top_classes` (class rollups)
-- `anchors` (suggested insertion points)
-
----
-
-## Which file do I run? (Entry Point)
-
-Use the **CLI** at `cgx/cli/main.py`. It routes through the **auto‑wired pipeline** that connects all major components.
-
-```bash
-# Make the src/ layout importable
-export PYTHONPATH="$PWD/src:$PYTHONPATH"
-
-# 1) INDEX — parse → graph → records → two‑view (intent/impl) embeddings → FAISS → persist
-python -m cgx.cli.main index   --project-root /path/to/your/codebase   --embedder "myproj.embed:make_model"   --out-dir /tmp/cgx_index   --metric cosine   --index-type flat
-
-# 2) QUERY — hybrid retrieval (semantic + optional lexical + graph) + aggregation + insertion anchors
-python -m cgx.cli.main query   --index-dir /tmp/cgx_index/indices   --records /tmp/cgx_index/records.jsonl   --embedder "myproj.embed:make_model"   --query "How do we add a new FastAPI route?"
-```
-
-**Under the hood** the CLI calls the **auto‑wired** pipeline:
-- `src/cgx/pipeline/auto.py`
-  - `run_index_auto(project_root, embedder, out_dir, metric, index_type)`
-  - `run_query_auto(index_dir, records_path, embedder, query, ...)`
-
-Your **original** pipeline remains unchanged and available:
-- `src/cgx/pipeline/run.py`
-  - `run_index(...)`
-  - `run_query(...)`
-
----
-
-## Install / Environment
-
-```bash
-python -m venv .venv
-source .venv/bin/activate    # Windows: .venv\Scripts\activate
+git clone <your fork>
+cd Averix
+python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-
-# Make src/ layout importable for local development
-export PYTHONPATH="$PWD/src:$PYTHONPATH"
-# (Alternatively, pip install -e . if you have a proper pyproject/setup)
+pip install -e ".[codegen]"
 ```
 
-**Embedding Model** — provide an object created from `"module:attr"`:
-- If it’s a **class**: it will be instantiated with no arguments.
-- If it’s a **callable factory**: it will be called to obtain the object.
-- If it’s an **object**: it will be used directly.
-- The object must expose: `.encode(list[str]) -> numpy.ndarray`
+This installs FAISS, Gradio, NetworkX, and the codegen pieces but skips
+`torch` / `transformers` / `sentence-transformers` entirely. Heavy ML
+modules are imported lazily, so the UI and CLI work out of the box.
+
+### Full install (with local embeddings)
+
+Use this if you want Averix to load the default Jina embedding model
+locally and/or run the optional cross-encoder reranker.
+
+```bash
+pip install -r requirements.txt -r requirements-ml.txt
+pip install -e ".[codegen]"
+# or, equivalently, via extras:
+# pip install -e ".[ui,embeddings,faiss,codegen]"
+```
+
+Optional extras:
+
+| Extra        | Adds                                              |
+|--------------|---------------------------------------------------|
+| `ui`         | Gradio UI                                         |
+| `embeddings` | `sentence-transformers`, `transformers`, `torch`  |
+| `faiss`      | `faiss-cpu` (large speedup over numpy fallback)   |
+| `codegen`    | `unidiff` (stricter diff parsing)                 |
+| `keyring`    | OS keyring for API-key storage                    |
+| `dev`        | `pytest`, `ruff`, `mypy`                          |
+
+Pull a small local model (recommended default):
+
+```bash
+ollama pull qwen2.5-coder:3b
+```
 
 ---
 
-## CLI Reference
+## Quick start
 
-### `index`
-Builds two FAISS indices (one per view) and saves metadata + rows + records.
+### UI (recommended)
 
-**Flags**
-- `--project-root` (required): Repository to index
-- `--embedder` (required): Import spec `"module:attr"` returning an object with `.encode(...)`
-- `--out-dir` (required): Output directory
-- `--metric` (default `cosine`): `cosine|l2|ip`
-- `--index-type` (default `flat`): `flat|ivf|hnsw`
-- Compatibility flags (kept for UX continuity): `--no-normalize-impl`, `--strip-literals-impl`
-
-**Output Layout**
-```
-/out-dir/
-  ├── indices/
-  │   ├── meta.json
-  │   ├── intent.index
-  │   ├── intent.rows.jsonl
-  │   ├── impl.index
-  │   └── impl.rows.jsonl
-  └── records.jsonl
+```bash
+averix-ui            # after `pip install -e ".[ui]"`
+# or
+python app.py
 ```
 
-### `query`
-Runs **hybrid two‑view** retrieval + file/class aggregation + insertion‑point suggestions.  
-Optionally, runs a **single‑view** semantic helper for debugging.
+Tabs (left → right):
 
-**Flags**
-- `--index-dir` (required): Directory containing `indices/` from the `index` step
-- `--records` (required): Path to `records.jsonl`
-- `--embedder` (required): Same import spec used at index time
-- `--query` (required): The question or task
-- `--chunks`: Optional `chunks.jsonl` to power lexical search
-- `--graph`: Optional JSON graph to enable graph expansion
-- `--top-k` (default 10): Per‑view semantic top‑k
-- `--depth` (default 1): Graph neighbor depth
-- `--no-lexical`: Disable lexical component
-- `--single-view {intent,impl}`: Also run `semantic_search(...)` on a single view
+1. **⚙️ Setup** — pick a provider (Ollama or OpenAI-compatible), check
+   health (`Ping Ollama`), detect hardware (RAM + GPU VRAM), pick a
+   sampling profile (temperature, max new tokens).
+2. **📚 Index** — point at a project root or upload a `.zip`. Honours
+   `.gitignore` and a 1 MB file-size cap; emits `indices/`,
+   `records.jsonl`, `chunks.jsonl`, `graph.json` and per-view
+   `emb_cache_<view>.npz` for incremental re-indexing. Intent and impl
+   views are indexed in parallel. A **Cancel** button is available while
+   indexing is in progress.
+3. **💬 Ask** — natural-language question with a streaming "thought
+   process" panel and a final grounded answer. Sidebar holds the
+   **session list** (➕ New / 🗑️ Delete / dropdown to resume an existing
+   thread). A **Stop** button halts the stream mid-flight; switching
+   tabs preserves the answer in progress.
+4. **🛠️ Plan** — request a change plan; optionally tick *Validate diffs*
+   and *Run impacted tests* to have Averix self-check its own output
+   before returning. The full self-test report renders inline. A
+   **Cancel** button is available while planning is in progress; tab
+   switching is non-destructive.
+5. **🤖 Agent** — give Averix a goal, watch the **Planner → Tracker →
+   Judge** loop decompose it into 1–5 atomic tasks, dispatch each task
+   to a capability (`ask`, `plan`, `scaffold`, `search`, `summarize`,
+   `apply`, `verify`), and judge the artefact against per-task criteria.
+   For goals like *"create a new FastAPI project"* the planner emits a
+   `scaffold → apply → verify` chain that generates a complete project
+   from scratch in the Project Root directory. Live event log,
+   task-status table, and DAG view of the plan. A **Cancel** button is
+   available while the loop is running; tab switching keeps the agent
+   running and state is fully restored on return. The sidebar shows an
+   animated spinner next to this tab while a task is active.
+6. **📊 Hardware** — click **Detect hardware** to annotate the local
+   model catalogue with ✅/⚠️/❌ fit verdicts against your machine. The
+   second table shows the editorial local-vs-cloud trade-off across
+   privacy, cost, quality ceiling, latency, offline use, setup effort,
+   and operational risk. Pure-offline; no network calls fire from this
+   tab.
+7. **👤 Profiles** — save provider configurations. API keys are
+   persisted in the OS keyring when available, otherwise in a
+   `0600`-permissioned file under `~/.cgx/`. Optional per-profile
+   `rate_limit` (req/sec) and `max_retries` apply automatically to
+   every call made by that profile.
 
-**Printed JSON**
-- `hits` — fused top‑k chunks with ranks/scores
-- `top_files` — aggregated by file
-- `top_classes` — aggregated by class
-- `anchors` — suggested insertion points
-- `single_view` — optional block when `--single-view` is provided
+### CLI
 
----
+```bash
+averix index --project-root /path/to/repo --out-dir /tmp/averix_index
+averix query --index-dir /tmp/averix_index/indices \
+             --records  /tmp/averix_index/records.jsonl \
+             --query "What does parse_codebase do?"
+```
 
-## Programmatic Usage
-
-### Auto‑wired (same execution path as the CLI)
+### Python
 
 ```python
 from cgx.pipeline.auto import run_index_auto, run_query_auto
+from cgx.answer.engine import answer_with_llm, generate_code_plan
+from cgx.answer.providers import OllamaProvider
 
-# Build indices
-summary = run_index_auto(
-    project_root="/path/to/code",
-    embedder=make_model(),          # object with .encode(list[str]) -> ndarray
-    out_dir="/tmp/cgx_index",
-    metric="cosine",
-    index_type="flat",
+run_index_auto(project_root="./", out_dir="/tmp/averix_index")
+prov = OllamaProvider(model="qwen2.5-coder:3b")
+ans = answer_with_llm(
+    "/tmp/averix_index/indices",
+    "/tmp/averix_index/records.jsonl",
+    "What does parse_codebase do?",
+    prov,
 )
-
-# Query with hybrid fusion + anchors
-results = run_query_auto(
-    index_dir="/tmp/cgx_index/indices",
-    records_path="/tmp/cgx_index/records.jsonl",
-    embedder=make_model(),
-    query="How to add JWT validation?",
-    top_k_per_view=10,
-    neighbor_depth=1,
-    use_lexical=True,
-    single_view=None,               # or "intent"/"impl"
-)
+print(ans["answer_md"])
 ```
 
-### Legacy pipeline (kept intact)
+---
+
+## How it works
+
+Three picture-first views of the same system live in
+[docs/flowcharts.md](docs/flowcharts.md):
+
+- **For users** ([flow_user.svg](docs/diagrams/flow_user.svg)) — the
+  install → index → ask/plan/agent → grounded-answer journey.
+- **For developers** ([flow_developer.svg](docs/diagrams/flow_developer.svg)) —
+  the Planner → Tracker → Judge loop, the capability dispatch table,
+  and the full SSE event timeline (including `task_progress`).
+- **For companies** ([flow_company.svg](docs/diagrams/flow_company.svg)) —
+  trust boundaries: what stays on the local machine, where credentials
+  live, and the single opt-in egress path to a remote LLM.
+
+---
+
+## Tuning hybrid retrieval
+
+`HybridConfig` (in `cgx.retrieval.orchestrator`) exposes the knobs that
+shape post-RRF reranking. The defaults are reasonable, but each signal can
+be disabled or amplified independently:
+
+| Field             | Default | Effect                                                    |
+|-------------------|---------|-----------------------------------------------------------|
+| `graph_bonus`     | `0.2`   | Score bump (RRF-scaled) for chunks reached via the import/call graph. Set to `0.0` to ignore graph-only neighbors. |
+| `symbol_boost`    | `0.5`   | RRF-scaled bonus for chunks whose identifier or file path matches a token in the question. |
+| `enable_reranker` | `False` | Run an optional cross-encoder over the top-N fused chunks. |
+| `reranker_model`  | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Hugging Face model id. |
+| `reranker_top_n`  | `30`    | How many head candidates to re-score.                     |
+| `reranker_weight` | `1.0`   | Convex blend between cross-encoder and RRF score (`1.0` = CE only). |
+
+The reranker lazy-loads `sentence_transformers` only when
+`enable_reranker=True`; if the ML stack isn't installed it silently falls
+back to the RRF order. Install it via `requirements-ml.txt` to opt in.
 
 ```python
-from cgx.pipeline.run import run_index, run_query
-# Same responsibilities as auto-wired; available if you prefer legacy names.
+from cgx.retrieval.orchestrator import HybridConfig
+cfg = HybridConfig(enable_reranker=True, reranker_top_n=20, graph_bonus=0.3)
 ```
 
 ---
 
-## How it works (Architecture)
+## Self-testing code generation
 
-1) **Parsing → Chunks**  
-`cgx.parser.parse_codebase.parse_codebase(project_root)` produces canonical chunks representing files/classes/functions/methods (and optionally call edges).
+When you tick **Validate diffs** in the Plan tab (or pass `self_test=True`
+to `generate_code_plan`), Averix will:
 
-2) **Graph (optional)**  
-`cgx.graph.build_graph.build_knowledge_graph(chunks, calls=None)` creates a NetworkX graph of entities and relations (calls/imports/attributes).
+1. Parse fenced ```diff path=...``` blocks from the model output.
+2. Dry-apply each diff in memory.
+3. Run `ast.parse` on the projected file contents.
+4. If **Run impacted tests** is enabled, copy the project to a sandbox,
+   materialise the diffs, and run pytest scoped to impacted files.
+5. If anything fails, retry once with the concrete failures as feedback.
 
-3) **Deterministic Records & Two‑View Corpus**  
-- `cgx.embeddings.records.make_index_records(chunks, G)` → records (stable IDs, metadata)  
-- `cgx.embeddings.records.prepare_embedding_corpus(records, which=('intent','impl'))` → corpus rows
-  - **intent** view = NL‑friendly (names/docstrings/comments)
-  - **impl** view = code‑focused (signatures/bodies)
-
-4) **Two‑view Embeddings & FAISS**  
-- `cgx.embeddings.build.build_embeddings(...)` encodes text per view
-- `cgx.embeddings.index.build_faiss_index(...)` builds an ANN index per view
-- Metadata + row mappings persisted with `cgx.io.persist.save_indices(...)`
-
-5) **Hybrid Retrieval & Post‑Processing**  
-- `cgx.retrieval.orchestrator.hybrid_retrieve_two_view(...)`: semantic on both views + optional lexical + optional graph → fused with RRF
-- Aggregates: `aggregate_by_file(...)`, `aggregate_by_class(...)`
-- Anchors: `suggest_insertion_points(query, results, records)` for safe code placement
+The full report is attached to the result as `codegen_report` and rendered
+under the plan in the UI.
 
 ---
 
-## BYO Embedder (Contract & Tips)
+## Multi-agent orchestration
 
-**Contract**: any object with
+For requests that don't fit into a single Ask or Plan round-trip,
+Averix ships a Planner → Tracker → Judge loop in `cgx.agents`:
+
+1. The **Planner** decomposes your goal into 1–5 ordered atomic
+   `Task`s, each tagged with a short `name`, a `description`, a `kind`
+   (`ask`, `plan`, `scaffold`, `search`, `summarize`, `apply`,
+   `verify`) and plain-English `criteria`. It prefers a strict JSON
+   plan from the LLM but falls back to a deterministic single-task
+   plan derived from `cgx.answer.intent.detect_intent` when no
+   provider is available. A kind-policy pass:
+   - Routes *new-project* goals to a `scaffold → apply → verify` chain.
+   - Downgrades `plan` → `ask` for read-only goals so informational
+     queries don't pay for code-generation work.
+   - Appends `apply` + `verify` after the final `plan` or `scaffold`
+     task so generated code always reaches disk and gets tested.
+2. The **Tracker** is a state machine that walks the plan task by
+   task, dispatching each one to the matching capability callable on a
+   worker thread. It emits `AgentEvent`s (`plan`, `task_start`,
+   `task_progress`, `task_done`, `task_failed`, `task_skipped`,
+   `judge`, `summary`) that stream as SSE into the UI. `task_progress`
+   ticks every `progress_interval` seconds (default `2.0`) with the
+   elapsed running time.
+3. The **Judge** validates each completed task against its criteria
+   with cheap structural short-circuits (*search* passes when
+   `hits > 0`; *plan* hard-fails only when both `plan_md` and `diffs`
+   are absent; *scaffold* hard-fails only when no files were produced)
+   before optionally asking the LLM for a strict
+   `{verdict, confidence, rationale}` JSON.
+
+Use it from the **🤖 Agent** tab, or programmatically:
+
 ```python
-.encode(list[str]) -> numpy.ndarray  # shape (N, D), dtype float32 preferred
+from cgx.agents import run_agent
+from cgx.answer.providers import OllamaProvider
+
+prov = OllamaProvider(model="qwen2.5-coder:3b")
+
+# Modify an existing codebase — stream=True yields AgentEvent objects.
+for event in run_agent(
+    goal="Add docstrings to every public function in cgx.parser",
+    provider=prov,
+    index_dir="/tmp/averix_index/indices",
+    records_path="/tmp/averix_index/records.jsonl",
+    project_root="./",
+    stop_on_fail=True,
+    stream=True,
+):
+    print(event.type, event.payload)
+
+# Generate a brand-new project — no index required.
+for event in run_agent(
+    goal="Create a FastAPI todo app with SQLite and pytest tests",
+    provider=prov,
+    project_root="/tmp/my_todo_app",   # destination directory
+    stream=True,
+):
+    print(event.type, event.payload)
+
+# stream=False (default) blocks until done and returns the final Plan.
+plan = run_agent(
+    goal="Add docstrings to every public function in cgx.parser",
+    provider=prov, index_dir="/tmp/averix_index/indices",
+    records_path="/tmp/averix_index/records.jsonl",
+)
+for task in plan.tasks:
+    print(task.kind, task.status, task.output)
 ```
 
-**Tips**
-- For `cosine`/`ip`, L2‑normalize vectors across rows for both index and query.
-- Batch large inputs to avoid overhead; reuse model/tokenizer across calls.
+The Agent tab renders the same `AgentEvent` stream as a live status
+table + DAG (`src/cgx/agents/viz.py`).
 
 ---
 
-## Scenarios (Copy/Paste)
+## Persistent chat sessions
 
-- **Find where to add a feature** (CSV export):
-  ```bash
-  python -m cgx.cli.main query     --index-dir /tmp/cgx_index/indices     --records /tmp/cgx_index/records.jsonl     --embedder "myproj.embed:make_model"     --query "Where should I add CSV export for reports? Show helpers and similar code paths."
-  ```
+The Ask tab's sidebar manages local conversation history:
 
-- **Follow canonical logging pattern**:
-  ```bash
-  python -m cgx.cli.main query     --index-dir /tmp/cgx_index/indices     --records /tmp/cgx_index/records.jsonl     --embedder "myproj.embed:make_model"     --query "Find canonical logging setup and usage patterns across services"     --single-view impl
-  ```
+- **➕ New** — creates a session, returns a UUID, and starts an empty
+  thread.
+- **🗑️ Delete** — removes the selected session file.
+- Selecting a session from the dropdown renders prior turns inline
+  and routes new questions through that thread; user + assistant
+  turns are appended automatically as the answer stream finishes.
 
-- **New OAuth provider** with awareness of neighbors:
-  ```bash
-  python -m cgx.cli.main query     --index-dir /tmp/cgx_index/indices     --records /tmp/cgx_index/records.jsonl     --embedder "myproj.embed:make_model"     --query "Add new OAuth provider: where to plug in config, handlers, and tests?"     --depth 2
-  ```
+Storage layout (under `~/.cgx/sessions/`, or `$CGX_CONFIG_DIR/sessions/`):
 
----
+```
+~/.cgx/sessions/
+├── index.json                 # session headers (id, title, counts, timestamps)
+└── <session-uuid>.jsonl       # one append-only message per line
+```
 
-## Troubleshooting
+Programmatic access:
 
-- **PYTHONPATH**: Ensure `export PYTHONPATH="$PWD/src:$PYTHONPATH"` for src‑layout imports.
-- **FAISS**: If FAISS isn’t present, ensure the `requirements.txt` includes a CPU build (or install via conda).
-- **Graph**: Not required. Provide one only if you want graph expansion.
-- **Index / Query Mismatch**: Use the **same embedder** for querying as you used for indexing.
-- **Large Repos**: Consider `--index-type ivf|hnsw` for scale; tune advanced params if exposed by your FAISS build.
+```python
+from cgx import sessions
+meta = sessions.create_session(title="refactor parse_codebase")
+sessions.append_message(meta.id, role="user", content="What does it return?")
+for m in sessions.list_sessions():
+    print(m.id, m.title, m.message_count)
+```
 
----
-
-## Module Map (for navigation)
-
-- **Parsing** — `cgx.parser.parse_codebase.parse_codebase`
-- **Graph** — `cgx.graph.build_graph.build_knowledge_graph`
-- **Records** — `cgx.embeddings.records.make_index_records`, `prepare_embedding_corpus`
-- **Embeddings** — `cgx.embeddings.build.build_embeddings`
-- **ANN Index** — `cgx.embeddings.index.build_faiss_index`
-- **Retrieval** — `cgx.retrieval.orchestrator.hybrid_retrieve_two_view`, `aggregate_by_file`, `aggregate_by_class`, `suggest_insertion_points`
-- **Persistence** — `cgx.io.persist.save_indices/load_indices/save_jsonl/load_jsonl`
-- **CLI** — `cgx.cli.main`
-- **Pipelines** — **auto**: `cgx.pipeline.auto.run_index_auto`, `run_query_auto`; **legacy**: `cgx.pipeline.run.run_index`, `run_query`
+Sessions are stdlib-only (no extra deps) and written atomically via
+`os.replace`.
 
 ---
 
-## License & Contributing
+## Incremental indexing
 
-Add your license here. PRs welcome — especially for new embedders, ANN backends, or graph strategies.
+`run_index_auto` is incremental by default. On every re-index it
+consults a per-view content-addressed cache that lives next to the
+FAISS indices:
+
+```
+<out_dir>/
+├── indices/...
+├── records.jsonl
+├── emb_cache_intent.npz       # ← cache, keyed on sha256(corpus_text)
+└── emb_cache_impl.npz
+```
+
+The cache stores `{sha256(corpus_text): np.ndarray}` pairs. Unchanged
+chunks reuse their cached vectors; only modified chunks reach the
+embedder. The cache is auto-invalidated when the embedding
+`model_name`, `dim`, or `normalize` flag changes — there is no risk of
+serving stale vectors against a different model.
+
+Inspect the hit/miss ratio:
+
+```python
+result = run_index_auto(project_root="./", out_dir="/tmp/averix_index")
+print(result["incremental"])         # True
+print(result["embedding_cache"])
+# {'intent': {'hits': 412, 'misses': 5, 'dim': 768},
+#  'impl':   {'hits': 410, 'misses': 7, 'dim': 768}}
+```
+
+Disable for a clean rebuild:
+
+```python
+run_index_auto(project_root="./", out_dir="/tmp/averix_index", incremental=False)
+```
+
+---
+
+## Hardware-aware model picker
+
+The **📊 Hardware** tab annotates a static catalogue of 8
+locally-runnable models against the RAM/VRAM detected by
+`cgx.answer.ollama_discovery.detect_hardware()`. Each row reports:
+
+| Column        | Meaning                                                                                        |
+|---------------|------------------------------------------------------------------------------------------------|
+| `model`       | Ollama tag (e.g. `qwen2.5-coder:3b`, `llama3.1:8b-instruct`).                                  |
+| `params_b`    | Approx parameter count in billions.                                                            |
+| `min_ram_gb`  | Lower bound for 4-bit quantised inference.                                                     |
+| `rec_vram_gb` | VRAM at which throughput is smooth.                                                            |
+| `ctx_window`  | Maximum prompt window the model advertises.                                                    |
+| `family`      | `coder` or `general`.                                                                          |
+| `fit`         | ✅ *fits* / ⚠️ *tight* / ❌ *won't fit* against your detected budget.                          |
+| `reason`      | The numeric comparison behind the verdict.                                                     |
+
+The second table shows the editorial local-vs-cloud trade-off across
+**privacy, marginal cost, quality ceiling, cold/warm latency,
+offline use, setup effort, and operational risk**. Every number is
+computed locally — opening this tab does **not** make any network
+call. The same data is exported as
+[`docs/hardware_matrix.json`](docs/hardware_matrix.json) for downstream
+tooling and documented in
+[`docs/hardware_matrix.md`](docs/hardware_matrix.md).
+
+---
+
+## Rate limiting and retries
+
+Every HTTP-backed provider goes through `cgx.answer.ratelimit`, which
+adds a thread-safe token-bucket limiter plus exponential-backoff
+retry (honouring `Retry-After` when present) on HTTP **429** and
+**5xx** responses.
+
+Configure per-profile in the **Profiles** tab (or programmatically):
+
+```python
+from cgx.answer.profiles import Profile, save_profile
+save_profile(Profile(
+    name="my-cloud",
+    kind="openai-compat",
+    model="gpt-4o-mini",
+    base_url="https://api.openai.com/v1",
+    rate_limit=2.0,   # 2 requests/sec, bucket capacity = rate
+    max_retries=4,    # default is 0 (no retry); 4 ≈ ~30s ceiling
+))
+```
+
+Setting `rate_limit=None` (the default) makes the limiter a no-op so
+existing call sites keep their pre-feature behaviour.
+
+---
+
+## VS Code extension scaffold
+
+[`extension/`](extension/) is a minimal TypeScript extension that hosts
+the running Gradio UI inside a VS Code webview panel. It is **not**
+packaged into a `.vsix` from the repo — build it locally:
+
+```bash
+cd extension
+npm install
+npm run compile
+# then press F5 in VS Code to launch an Extension Development Host
+```
+
+Commands contributed: **Averix: Open UI**, **Averix: Reload UI**.
+The server URL is read from the `averix.ui.url` setting (default
+`http://localhost:7860`). The extension does not spawn the server —
+start it with `averix-ui` (or `python app.py`) first.
+
+See [`extension/README.md`](extension/README.md) for the full setup.
+
+---
+
+## Architecture
+
+See [`docs/architecture.md`](docs/architecture.md) for a deeper dive.
+
+---
+
+## Privacy & data flow
+
+Averix is built around **local-first** processing. The following table is
+the complete list of network egress paths in the product:
+
+| Activity                          | Network egress? | Where it goes                                     |
+|-----------------------------------|-----------------|---------------------------------------------------|
+| Parsing, embedding, indexing      | **No**          | All on-device.                                    |
+| Hybrid retrieval / reranking      | **No**          | All on-device.                                    |
+| Asking a question / planning code | Yes             | Only the LLM endpoint you configure.              |
+| Local LLM (default: Ollama)       | Yes (loopback)  | `http://localhost:11434` — never leaves your box. |
+| OpenAI-compatible providers       | Yes             | The exact base URL you set in the Setup tab.      |
+| Session history, profiles, cache  | **No**          | `~/.cgx/` (locked-down `0600` files).             |
+| Anonymous startup telemetry       | **Opt-in**      | Disabled by default; see below.                   |
+
+### Telemetry
+
+A single, anonymous startup ping is available for measuring active
+installs. It is **off by default** and contains *only* a random install
+UUID generated on first run and the Averix version — no prompts, no
+code, no file paths, no model names, no PII.
+
+Enable:
+```bash
+export CGX_TELEMETRY=1
+```
+Disable: unset the variable, or set `CGX_TELEMETRY=0`. To rotate the
+install id, delete `~/.cgx/install_id` and restart.
+
+The exact payload shape and source live in
+[`src/cgx/telemetry.py`](src/cgx/telemetry.py).
+
+---
+
+## Tests
+
+```bash
+pip install -e ".[dev]"
+pytest -q
+```
+
+The suite covers parser, embeddings cache, hybrid retrieval / rerank,
+codegen pipeline, agents (planner / tracker / judge / viz), sessions,
+hardware matrix, rate limiter, telemetry, profiles, and an end-to-end
+index → query smoke test with a deterministic fake embedder (no model
+download, no GPU). Expected count is in the high 90s and grows with
+each feature.
+
+CI is configured in [`.github/workflows/ci.yml`](.github/workflows/ci.yml)
+as a **two-job matrix**:
+
+- **core** — runs on Python 3.10 / 3.11 / 3.12 with only
+  `requirements.txt`. Asserts the lazy-import path stays clean (no
+  hard dependency on `torch`).
+- **ml** (optional) — installs `requirements-ml.txt` too and exercises
+  the embedding + reranker stack.
+
+---
+
+## License
+
+MIT.

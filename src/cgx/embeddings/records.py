@@ -23,9 +23,9 @@ Embedding Context
 - To add a new model (e.g., Gemma), extend `build_embeddings` in `build.py`.
 """
 
-from src.cgx.logging_setup import get_logger
+from cgx.logging_setup import get_logger
 from typing import Any, Dict, List, Sequence
-from src.cgx.embeddings.helpers import (
+from cgx.embeddings.helpers import (
     _safe_get,
     _neighbors_summary,
     _lexical_helpers,

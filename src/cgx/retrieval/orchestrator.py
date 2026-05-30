@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import concurrent.futures
+
 """
 Two-view retrieval orchestrator (ALL SIGNALS REQUIRED + IMPACT ANALYSIS).
 
@@ -42,14 +44,58 @@ from cgx.retrieval.rrf import rrf_fuse
 def _records_map(records: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     return {str(r.get("id")): r for r in records if isinstance(r, dict) and r.get("id")}
 
+# Shared stopword set for filtering identifier-like tokens out of NL questions.
+# Kept here so both the engine and the orchestrator agree on what counts as a
+# real symbol token. Quoted/backticked tokens bypass this filter on purpose.
+SYMBOL_STOPWORDS = frozenset({
+    "from", "import", "which", "that", "this", "will", "would", "could",
+    "should", "can", "may", "might", "if", "else", "elif", "for", "while",
+    "with", "def", "class", "return", "true", "false", "none", "and", "or",
+    "not", "is", "in", "on", "to", "by", "of", "at", "as", "do", "does", "did",
+    "what", "where", "when", "who", "why", "how", "whose", "whom",
+    "the", "a", "an", "it", "its", "there", "their", "they", "them",
+    "are", "was", "were", "be", "been", "being", "has", "have", "had",
+    "function", "functions", "method", "methods", "code", "codebase",
+    "file", "files", "module", "modules", "repo", "repository", "package",
+    "please", "show", "tell", "give", "find", "list", "describe", "explain",
+    "any", "all", "some", "into", "onto", "out", "over", "under", "about",
+    "between", "across", "after", "before", "than", "then", "so", "such",
+    "use", "used", "uses", "using",
+})
+
+_MIN_SYMBOL_LEN = 3
+
+
 def _extract_symbol_tokens(q: str) -> List[str]:
+    """
+    Extract candidate identifier tokens from a natural-language query.
+
+    Quoted/backticked names always pass through. Bare identifiers are filtered
+    against SYMBOL_STOPWORDS and required to be at least _MIN_SYMBOL_LEN chars.
+    Returned list is deduplicated (lowercased) and sorted longest-first for
+    stable downstream matching.
+    """
     q = q or ""
     quoted = re.findall(r"[`\"]([A-Za-z_][A-Za-z0-9_]*)[`\"]", q)
     bare = re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", q)
-    # prefer long tokens, preserve lowercased unique set
-    tokens = list({t.lower() for t in quoted + bare})
-    tokens.sort(key=lambda s: (-len(s), s))
-    return tokens
+    tokens: set[str] = set()
+    for t in quoted:
+        tokens.add(t.lower())
+    for t in bare:
+        tl = t.lower()
+        if len(tl) < _MIN_SYMBOL_LEN:
+            continue
+        if tl in SYMBOL_STOPWORDS:
+            continue
+        tokens.add(tl)
+    out = list(tokens)
+    out.sort(key=lambda s: (-len(s), s))
+    return out
+
+
+def _cid_segments(cid: str) -> List[str]:
+    """Return the '::'-separated segments of a chunk id, lowercased."""
+    return [seg.lower() for seg in str(cid).split("::") if seg]
 
 @dataclass
 class HybridConfig:
@@ -58,7 +104,9 @@ class HybridConfig:
     k_lex: int = 50
 
     expand_top_n: int = 10
+    expand_per_seed: int = 12   # accepted for cli_adapter compatibility
     graph_depth: int = 1
+    relation_types: Optional[List[str]] = None  # ditto: edge-type filter
     rrf_k: float = 60.0
 
     top_k_chunks: int = 50
@@ -68,6 +116,26 @@ class HybridConfig:
     agg_alpha: float = 0.5
     agg_decay: float = 0.75
     agg_max_per_group: int = 6
+
+    # Rerank knobs (post-RRF). The defaults preserve historical behavior.
+    # Symbol-match boost applied to chunks whose name/id matches a quoted or
+    # identifier-like token from the query. RRF scores at k=60 sit around
+    # 0.01–0.05 per signal, so 0.5 deliberately dominates when the user
+    # explicitly names a symbol.
+    symbol_boost: float = 0.5
+    # Graph-proximity bonus added to chunks reachable from top seeds. The
+    # actual per-chunk increment is ``graph_bonus / (depth + 1)`` so closer
+    # neighbors get more credit. Set to 0.0 to disable.
+    graph_bonus: float = 0.2
+
+    # Optional cross-encoder reranker over the top-N fused chunks. Disabled
+    # by default to keep the no-torch path clean. When enabled, the rest of
+    # the fused ordering is preserved as a tiebreaker for chunks below
+    # ``reranker_top_n``.
+    enable_reranker: bool = False
+    reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    reranker_top_n: int = 30
+    reranker_weight: float = 1.0
 
 
 # ---------------------------
@@ -100,6 +168,7 @@ def hybrid_retrieve_two_view(
     top_k_per_view: int = 10,
     neighbor_depth: int = 1,
     use_lexical: bool = True,  # kept for API compatibility; we always include lexical anyway
+    lexical_index: Optional[LexicalIndex] = None,
 ) -> Dict[str, Any]:
     """
     Hybrid retrieval over two views (intent + impl), lexical, and graph—then fuse.
@@ -118,19 +187,22 @@ def hybrid_retrieve_two_view(
     recs = records or []
     chs = chunks or []
 
-    # Config mapped to the legacy params:
-    # - use top_k_per_view as k for each semantic view and lexical
-    # - cap final chunk outputs at top_k_per_view (conservative, backwards-friendly)
+    # Internal candidate pools are deliberately decoupled from the caller's
+    # display-time `top_k_per_view`. RRF/graph expansion/symbol boosting only
+    # work when each signal contributes a healthy pool. We use generous
+    # internal pools (~50) and only restrict the final returned list to
+    # `top_k_per_view`. Callers can still cap display by post-slicing.
+    k_pool = max(int(top_k_per_view), 50)
     cfg = HybridConfig(
-        k_intent=top_k_per_view,
-        k_impl=top_k_per_view,
-        k_lex=top_k_per_view,
-        expand_top_n=min(10, top_k_per_view),
+        k_intent=k_pool,
+        k_impl=k_pool,
+        k_lex=k_pool,
+        expand_top_n=max(10, int(top_k_per_view)),
         graph_depth=max(0, neighbor_depth),
         rrf_k=60.0,
-        top_k_chunks=top_k_per_view,
-        top_k_files=top_k_per_view,
-        top_k_classes=top_k_per_view,
+        top_k_chunks=max(int(top_k_per_view), 20),
+        top_k_files=max(int(top_k_per_view), 20),
+        top_k_classes=max(int(top_k_per_view), 20),
         agg_alpha=0.5,
         agg_decay=0.75,
         agg_max_per_group=6,
@@ -139,7 +211,7 @@ def hybrid_retrieve_two_view(
     retriever = HybridRetriever(
         tv_index=tv,
         records=recs,
-        lexical_index=None,  # will be created from records on demand
+        lexical_index=lexical_index,
         chunks=chs,
         G=G,
     )
@@ -434,41 +506,26 @@ class HybridRetriever:
         lists_for_rrf: List[List[Dict[str, Any]]] = []
         provenance: Dict[str, Dict[str, Any]] = {}
 
-        # --- semantic per view (intent + impl, required) ---
-        """
-        Run semantic search separately on both the "intent" and "impl" views
-        of the code. Each view has its own FAISS index built from embeddings.
+        # --- semantic per view (intent + impl) — run both views in parallel ---
+        available_views = [(v, k) for v, k in (("intent", cfg.k_intent), ("impl", cfg.k_impl))
+                           if v in self.tv.available_views()]
 
-        - "intent" view encodes the *purpose* of a chunk (docstring, signature, etc.).
-        - "impl"   view encodes the *implementation* details (body, code).
+        def _search_view(view_k):
+            view, k = view_k
+            return view, self.tv.search_view(view, query, embedder=embedder, top_k=k)
 
-        For each view, we:
-          1. Query its ANN index with the given query embedding.
-          2. Collect the top-k hits as candidate chunks.
-          3. Store minimal info (chunk_id + rank) for RRF fusion later.
-          4. Record provenance (rank/score per view) so we know
-             how strongly each chunk matched in each view.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as _ex:
+            view_results = list(_ex.map(_search_view, available_views))
 
-        Example
-        -------
-        Suppose the query is "add a new logging utility".
-        - In the "intent" view, a chunk with docstring "Utility for logging"
-          may rank high even if its code body is short.
-        - In the "impl" view, a function with heavy logging calls may rank high
-          even if its docstring doesn’t mention logging.
-        Both signals are preserved and will be fused downstream.
-        """
-        for view, k in (("intent", cfg.k_intent), ("impl", cfg.k_impl)):
-            if view in self.tv.available_views():
-                hits = self.tv.search_view(view, query, embedder=embedder, top_k=k)
-                lists_for_rrf.append([{"chunk_id": h["chunk_id"], "rank": h["rank"]} for h in hits])
-                for h in hits:
-                    provenance.setdefault(h["chunk_id"], {}).update({
-                        f"{view}_rank": h["rank"],
-                        f"{view}_score": h["score"],
-                    })
+        for view, hits in view_results:
+            lists_for_rrf.append([{"chunk_id": h["chunk_id"], "rank": h["rank"]} for h in hits])
+            for h in hits:
+                provenance.setdefault(h["chunk_id"], {}).update({
+                    f"{view}_rank": h["rank"],
+                    f"{view}_score": h["score"],
+                })
 
-        logger.info(f"DEBUG: provenance {provenance}")
+        logger.debug("provenance %s", provenance)
         
         # --- lexical (required): BM25 over records; fallback regex over chunks ---
         """
@@ -545,7 +602,7 @@ class HybridRetriever:
         if not lists_for_rrf:
             return {"hits": [], "top_files": [], "top_classes": [], "anchors": []}
 
-        logger.info(f"DEBUG: lists_for_rrf {lists_for_rrf}")
+        logger.debug("lists_for_rrf %s", lists_for_rrf)
 
 
         # --- RRF fusion of all lists ---
@@ -588,7 +645,7 @@ class HybridRetriever:
         """
         fused = rrf_fuse(lists_for_rrf, k=cfg.rrf_k, top_k=cfg.top_k_chunks + cfg.expand_top_n)
 
-        logger.info(f"DEBUG: fused {fused}")
+        logger.debug("fused %s", fused)
 
         # --- graph expansion (required shape; no-op if G is None) ---
         """
@@ -625,12 +682,32 @@ class HybridRetriever:
         """
         seeds = [cid for cid, _ in fused[:cfg.expand_top_n]]
         graph_depths = self._expand_multi_hop(seeds, max_depth=cfg.graph_depth)
+        # Fix: previously this loop only updated scores for chunks already in
+        # ``fused``, so graph-only neighbors (discovered via expansion but not
+        # surfaced by semantic/lexical) were silently dropped. We now both
+        # bump existing chunks and append graph-only neighbors with a base
+        # score of ``graph_bonus / (depth + 1)``.
+        in_fused = {c for c, _ in fused}
         for cid, depth in graph_depths.items():
+            # Keep graph-only neighbors restricted to chunks we actually have
+            # records for; otherwise they can't be aggregated to file/class.
+            if cid not in self._rec_by_id and cid not in in_fused:
+                continue
             provenance.setdefault(cid, {}).update({"graph_depth": depth})
-            # small bonus by proximity
-            fused = [(c, sc + 0.2 / (depth + 1) if c == cid else sc) for c, sc in fused]
+        if cfg.graph_bonus > 0.0 and graph_depths:
+            bumped: List[Tuple[str, float]] = []
+            for c, sc in fused:
+                d = graph_depths.get(c)
+                bumped.append((c, sc + cfg.graph_bonus / (d + 1)) if d is not None else (c, sc))
+            fused = bumped
+            for cid, depth in graph_depths.items():
+                if cid in in_fused:
+                    continue
+                if cid not in self._rec_by_id:
+                    continue
+                fused.append((cid, cfg.graph_bonus / (depth + 1)))
 
-        logger.info(f"DEBUG: fused after graph {fused}")
+        logger.debug("fused after graph %s", fused)
 
         # --- symbol boosting (quote or exact name matches) ---
         """
@@ -662,14 +739,41 @@ class HybridRetriever:
           since the user explicitly mentioned it.
         """
         sym_tokens = _extract_symbol_tokens(query)
-        for cid, _ in list(fused):
-            rec = self._rec_by_id.get(cid) or {}
-            nm = str(rec.get("name") or "").lower()
-            if any(t == nm or t in cid.lower() for t in sym_tokens):
-                provenance.setdefault(cid, {})["symbol_match"] = True
-                fused = [(c, sc + 0.5 if c == cid else sc) for c, sc in fused]
+        if sym_tokens and cfg.symbol_boost > 0.0:
+            tok_set = set(sym_tokens)
+            boosted: Dict[str, float] = {}
+            for cid, _ in list(fused):
+                rec = self._rec_by_id.get(cid) or {}
+                nm = str(rec.get("name") or "").lower()
+                segs = set(_cid_segments(cid))
+                # Require exact match against the record name OR a full '::'
+                # segment of the chunk id, never a bare substring (avoids
+                # short tokens like 'add' matching 'add_calls_edges' etc.).
+                if (nm and nm in tok_set) or (segs & tok_set):
+                    provenance.setdefault(cid, {})["symbol_match"] = True
+                    boosted[cid] = cfg.symbol_boost
+            if boosted:
+                fused = [(c, sc + boosted.get(c, 0.0)) for c, sc in fused]
 
-        logger.info(f"DEBUG: fused after sym_tokens {fused}")
+        logger.debug("fused after sym_tokens %s", fused)
+
+        # --- optional cross-encoder reranker (opt-in, post-RRF) ---
+        if cfg.enable_reranker and fused:
+            try:
+                from cgx.retrieval.reranker import rerank_chunks
+                fused = rerank_chunks(
+                    query=query,
+                    fused=fused,
+                    rec_by_id=self._rec_by_id,
+                    chunks=self.chunks,
+                    model_name=cfg.reranker_model,
+                    top_n=cfg.reranker_top_n,
+                    weight=cfg.reranker_weight,
+                    provenance=provenance,
+                )
+            except Exception as e:
+                logger.warning("Cross-encoder reranker disabled (%s: %s); falling back to RRF order.",
+                               type(e).__name__, e)
 
         # --- finalize chunks ---
         """
@@ -1105,15 +1209,18 @@ def analyze_change_impact(
             if cid:
                 seeds.append(cid)
 
-    # fallback: top fused hits that include token in id/name
+    # fallback: top fused hits whose name matches a token or whose chunk_id
+    # contains the token as a full '::'-segment
     if not seeds:
+        tok_set = set(tokens)
         for h in fused_hits:
             cid = str(h.get("chunk_id") or "")
-            r = rec_map.get(cid) or {}
-            nm = str(r.get("name") or "").lower()
             if not cid:
                 continue
-            if any(t in cid.lower() or t == nm for t in tokens):
+            r = rec_map.get(cid) or {}
+            nm = str(r.get("name") or "").lower()
+            segs = set(_cid_segments(cid))
+            if (nm and nm in tok_set) or (segs & tok_set):
                 seeds.append(cid)
             if len(seeds) >= 10:
                 break
