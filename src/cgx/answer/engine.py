@@ -1,4 +1,5 @@
 from __future__ import annotations
+import logging
 import os, json, re
 from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
@@ -13,6 +14,8 @@ from cgx.retrieval.orchestrator import (
 
 from networkx.readwrite import json_graph
 import networkx as nx  # type: ignore
+
+logger = logging.getLogger(__name__)
 
 ALLOWED_CITATION_NOTE = (
     "Cite only chunk_ids that appear in SOURCES. "
@@ -812,6 +815,7 @@ def generate_code_plan(
     max_retries: int = 1,
     test_timeout_seconds: float = 120.0,
     embedder: Optional[Any] = None,
+    skills: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
     Use LLM to propose a change plan and diffs (unified patch) grounded in SOURCES.
@@ -910,34 +914,64 @@ def generate_code_plan(
     parts.append("SOURCES:\n" + "\n".join(_fmt_source(s) for s in sources))
     context = "\n\n".join(parts)
 
-    messages = [{"role": "system", "content": SYSTEM2}, {"role": "user", "content": context}]
+    # Compose skill-specific plan guidance onto SYSTEM2 / the freeform
+    # fallback system prompt. Skills are resolved either from the
+    # caller-supplied ``skills`` kwarg (Planner-attached) or by detecting
+    # them from the task text.
+    active_skills = _resolve_skills(skills, task or "")
+    try:
+        import skills as _sk
+        skill_fragment = _sk.compose_plan_prompt(active_skills)
+        skill_names_str = ", ".join(s.name for s in active_skills)
+    except Exception:  # pragma: no cover - defensive
+        skill_fragment = ""
+        skill_names_str = ""
+    system2 = SYSTEM2
+    if skill_fragment:
+        system2 = (
+            SYSTEM2
+            + f"\n\nACTIVE SKILLS: {skill_names_str}\n"
+            + "Apply the technology-specific guidance below in addition to "
+            + "the rules above.\n\n"
+            + skill_fragment
+        )
+
+    messages = [{"role": "system", "content": system2}, {"role": "user", "content": context}]
     out_text = provider.chat(messages, temperature=0.2, force_json=True).get("content", "")
     parsed = _extract_json_object(out_text)
     # Fallback: JSON-mode often mangles unified diffs through backslash escaping
     # on small local models. Retry once in free-form mode and parse fenced blocks.
     if not parsed or not parsed.get("plan_md"):
+        freeform_system = (
+            "You are a principal engineer. Produce a change plan and unified diffs.\n"
+            "Use ONLY provided SOURCES. Cite chunk_ids inline as [[chunk_id]].\n"
+            "Format strictly as:\n"
+            "## Plan\n<markdown plan>\n\n"
+            "## Diffs\nFor each modified file, emit ONE fenced block:\n"
+            "```diff path=<relative/path>\n<unified diff>\n```\n"
+            "Every unified diff MUST include a hunk header line starting with '@@'.\n"
+            "EDIT an existing file (example):\n"
+            "```diff path=pkg/mod.py\n"
+            "--- a/pkg/mod.py\n+++ b/pkg/mod.py\n@@ -1,3 +1,4 @@\n"
+            " def add(a, b):\n     return a + b\n+def mul(a, b):\n+    return a * b\n"
+            "```\n"
+            "NEW file (example):\n"
+            "```diff path=pkg/extra.py\n"
+            "--- /dev/null\n+++ b/pkg/extra.py\n@@ -0,0 +1,2 @@\n"
+            "+def hello():\n+    return 'hi'\n"
+            "```\n"
+            "Rules: relative POSIX paths only, one fenced block per file, no duplicates, "
+            "no prose between the fenced blocks.\n"
+        )
+        if skill_fragment:
+            freeform_system = (
+                freeform_system
+                + f"\nACTIVE SKILLS: {skill_names_str}\n"
+                + skill_fragment
+                + "\n"
+            )
         free_messages = [
-            {"role": "system", "content": (
-                "You are a principal engineer. Produce a change plan and unified diffs.\n"
-                "Use ONLY provided SOURCES. Cite chunk_ids inline as [[chunk_id]].\n"
-                "Format strictly as:\n"
-                "## Plan\n<markdown plan>\n\n"
-                "## Diffs\nFor each modified file, emit ONE fenced block:\n"
-                "```diff path=<relative/path>\n<unified diff>\n```\n"
-                "Every unified diff MUST include a hunk header line starting with '@@'.\n"
-                "EDIT an existing file (example):\n"
-                "```diff path=pkg/mod.py\n"
-                "--- a/pkg/mod.py\n+++ b/pkg/mod.py\n@@ -1,3 +1,4 @@\n"
-                " def add(a, b):\n     return a + b\n+def mul(a, b):\n+    return a * b\n"
-                "```\n"
-                "NEW file (example):\n"
-                "```diff path=pkg/extra.py\n"
-                "--- /dev/null\n+++ b/pkg/extra.py\n@@ -0,0 +1,2 @@\n"
-                "+def hello():\n+    return 'hi'\n"
-                "```\n"
-                "Rules: relative POSIX paths only, one fenced block per file, no duplicates, "
-                "no prose between the fenced blocks.\n"
-            )},
+            {"role": "system", "content": freeform_system},
             {"role": "user", "content": context},
         ]
         free_text = provider.chat(free_messages, temperature=0.2, force_json=False).get("content", "")
@@ -1076,8 +1110,21 @@ _SCAFFOLD_SYSTEM = (
     "  ],\n"
     '  "confidence": 0.8\n'
     "}\n\n"
+    "Path discipline (CRITICAL — read carefully):\n"
+    "- The deployment directory IS the project root. Emit paths RELATIVE to it.\n"
+    "- NEVER prepend a top-level project folder. WRONG: 'calculator/src/App.jsx', "
+    "'my-project/backend/app.py'. RIGHT: 'src/App.jsx', 'backend/app.py'.\n"
+    "- Use this canonical layout so sibling scaffold tasks (UI + backend + tests) "
+    "share one coherent tree:\n"
+    "    src/        — frontend source OR main code for single-language projects\n"
+    "    backend/    — Python/Node backend service (only when the project has a "
+    "separate backend distinct from the frontend in src/)\n"
+    "    tests/      — ALL test files live here (test_*.py for Python, *.test.jsx "
+    "or *.test.ts for JS/TS). REQUIRED — every scaffold MUST emit at least one "
+    "test file covering its primary logic.\n"
+    "    public/     — static assets (index.html, favicons) for frontend projects\n"
+    "- All paths must be lowercase-with-underscores or kebab-case. No spaces.\n"
     "Requirements:\n"
-    "- path: relative POSIX path from the project root (e.g. 'src/main.py')\n"
     "- content: complete, working file content — NOT stubs or placeholders\n"
     "- CRITICAL: If the goal names a specific technology or framework (React, Vue, Angular, "
     "FastAPI, Flask, Django, Express, etc.), you MUST use ONLY that technology. "
@@ -1089,10 +1136,13 @@ _SCAFFOLD_SYSTEM = (
     "pyproject.toml for modern Python, Cargo.toml for Rust, go.mod for Go, etc.)\n"
     "  * README.md with setup and usage instructions\n"
     "  * Entry point / main module\n"
+    "  * At least one real test file under tests/ exercising the main code paths.\n"
     "- For FRONTEND projects (React, Vue, Angular, Svelte, etc.):\n"
     "  * Generate actual component files (e.g. src/App.jsx, src/components/MyComponent.jsx)\n"
-    "  * Include index.html (in public/ for CRA, or root for Vite)\n"
+    "  * Include public/index.html (for CRA) or index.html at root (for Vite)\n"
     "  * Include src/index.js or src/main.jsx as the React/Vue entry point\n"
+    "  * Tests go under tests/ as <Component>.test.jsx using Jest + "
+    "@testing-library/react conventions.\n"
     "  * Do NOT generate webpack.config.js, babel.config.js, or other build tooling — "
     "use Create React App (react-scripts) or Vite conventions instead\n"
     "  * Do NOT include conftest.py, requirements.txt, or any Python files\n"
@@ -1117,10 +1167,17 @@ _SCAFFOLD_FREEFORM_SYSTEM = (
     "<complete file content>\n"
     "```\n\n"
     "Examples of valid language tags: python, javascript, jsx, tsx, typescript, text, yaml, toml, json\n\n"
+    "Path discipline (CRITICAL):\n"
+    "- Paths are RELATIVE to the project root. NEVER prepend a top-level project "
+    "folder. WRONG: 'calculator/src/App.jsx'. RIGHT: 'src/App.jsx'.\n"
+    "- Canonical layout shared with sibling tasks: src/ (frontend or main code), "
+    "backend/ (Python backend when distinct), tests/ (REQUIRED — at least one "
+    "test file per scaffold), public/ (static assets).\n"
     "Rules:\n"
     "- Use any language tag (python, javascript, jsx, tsx, text, yaml, toml, etc.) followed by path=<relative/path>\n"
     "- Generate complete, working code — not stubs\n"
     "- Include README.md and the appropriate dependency file for the technology\n"
+    "- Emit at least one real test file under tests/ exercising the main logic.\n"
     "- Use relative POSIX paths only\n"
     "- CRITICAL: If the goal names a specific technology (React, Vue, FastAPI, etc.), use it exactly. "
     "Do NOT substitute a different technology.\n"
@@ -1131,12 +1188,200 @@ _SCAFFOLD_FREEFORM_SYSTEM = (
 )
 
 
+def _resolve_skills(skills: Optional[List[str]],
+                    goal: str) -> List[Any]:
+    """Resolve a ``skills`` kwarg (or detect from ``goal``) to Skill objects.
+
+    When ``skills`` is a non-empty list of names, look them up in the
+    registry. Otherwise fall back to running detection over ``goal``.
+    Both paths are silent on the ``skills`` package being unavailable.
+    """
+    try:
+        import skills as _sk
+    except Exception:  # pragma: no cover - defensive
+        return []
+    if skills:
+        return _sk.skills_by_names(list(skills))
+    if goal:
+        return _sk.detect_skills(goal)
+    return []
+
+
+_CANONICAL_TOP_DIRS = (
+    "src", "backend", "tests", "public", "docs", "scripts",
+)
+
+
+def _normalize_scaffold_path(path: str, existing_files: Optional[List[str]]) -> str:
+    """Strip stray top-level project folders the LLM may have prepended.
+
+    The SCAFFOLD prompt forbids paths like ``calculator/src/App.jsx`` but
+    weak local models frequently emit them anyway. This collapses the
+    first segment to the canonical layout (``src/``, ``backend/``, ...)
+    when the LLM prepended a non-canonical root, while leaving paths
+    that already begin at the canonical root untouched.
+
+    When ``existing_files`` is supplied we also honour any top-level
+    directory a sibling scaffold task has already established, so a
+    later task can extend that layout rather than relocating into a
+    different parent.
+    """
+    if not path:
+        return path
+    # Strip a literal "./" prefix and leading slashes, but NOT a bare
+    # leading "." — otherwise dotfiles like ".env.example" / ".gitignore"
+    # lose their leading dot and stop being dotfiles on disk.
+    p = path.replace("\\", "/")
+    while p.startswith("./"):
+        p = p[2:]
+    p = p.lstrip("/")
+    if "/" not in p:
+        return p
+    first, rest = p.split("/", 1)
+    first_lc = first.lower()
+    if first_lc in _CANONICAL_TOP_DIRS:
+        return p
+    if existing_files:
+        established = {f.split("/", 1)[0].lower()
+                       for f in existing_files if "/" in f}
+        if first_lc in established:
+            return p
+    # Drop the inferred project-name prefix; downstream paths win.
+    return rest
+
+
+def _extension_framework_pin(path: str) -> str:
+    """Return a per-extension framework constraint block for the single-file
+    scaffold system prompt, or ``""`` when the extension has no pin.
+
+    This is the prompt-side companion to :func:`_extension_content_mismatch`:
+    the validator catches cross-framework substitutions after generation,
+    and this hard-pins the prompt so they're far less likely to occur in
+    the first place. It runs regardless of skill detection so a missing or
+    typo'd framework name in the goal can't strip the constraint.
+    """
+    ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+    if ext in ("jsx", "tsx"):
+        return (
+            f"FILE EXTENSION CONSTRAINT (.{ext}):\n"
+            f"- This is a React component file. Write it as JSX/TSX only.\n"
+            f"- MUST import from 'react' (e.g. `import React from 'react'` "
+            f"or named hook imports) and export a function component.\n"
+            f"- Do NOT emit Vue SFC syntax: no `<template>`, no `<script "
+            f"setup>`, no `<style scoped>`, no `import ... from 'vue'`.\n"
+            f"- Do NOT emit Svelte syntax or a full HTML document.\n"
+            f"- Use functional components with hooks (useState, useEffect)."
+        )
+    if ext == "vue":
+        return (
+            "FILE EXTENSION CONSTRAINT (.vue):\n"
+            "- This is a Vue Single-File Component. Include a `<template>` "
+            "block and a `<script setup>` block.\n"
+            "- Do NOT import from 'react' and do NOT emit JSX."
+        )
+    if ext == "svelte":
+        return (
+            "FILE EXTENSION CONSTRAINT (.svelte):\n"
+            "- This is a Svelte component. Use `<script>` + markup + "
+            "`<style>` blocks.\n"
+            "- Do NOT emit React JSX or Vue SFC syntax."
+        )
+    return ""
+
+
+def _extension_content_mismatch(path: str, ext: str, content: str) -> Optional[str]:
+    """Return a short error message when ``content`` looks wrong for ``ext``.
+
+    Catches the common cross-framework substitutions a small local model
+    makes (Vue SFC under ``.jsx``, React under ``.vue``, plain JS under
+    ``.py``). Conservative: only reports on strong signals so we don't
+    block valid edge cases.
+    """
+    if not content:
+        return None
+    lc = content.lower()
+    has_vue_tpl = "<template" in lc
+    has_vue_import = "from 'vue'" in lc or 'from "vue"' in lc
+    has_react_import = ("from 'react'" in lc or 'from "react"' in lc
+                        or "import react" in lc)
+    has_react_jsx_export = ("export default function" in lc
+                            and ("return (" in lc or "return <" in lc))
+    has_svelte_block = "<script" in lc and "</script>" in lc and "<style" in lc
+
+    if ext in ("jsx", "tsx"):
+        if has_vue_tpl or has_vue_import:
+            return (f"{ext} file contains Vue SFC syntax "
+                    "(<template> / import from 'vue').")
+        # A .jsx/.tsx file must look like React — at minimum it should
+        # mention React or export a component. A 3B model occasionally
+        # emits a plain HTML document under .jsx; catch that.
+        is_html_doc = lc.lstrip().startswith(("<!doctype", "<html"))
+        has_react_signal = (
+            has_react_import
+            or has_react_jsx_export
+            or "export default" in lc
+            or "export {" in lc        # named exports: export { App }
+            or "return <" in lc        # JSX return statement — strong React indicator
+        )
+        if is_html_doc or not has_react_signal:
+            return (f".{ext} file does not look like React "
+                    "(no React import / component export).")
+    if ext in ("js", "ts", "mjs"):
+        # A small model commonly emits a full Vue SFC into a .js file
+        # because nothing in the prompt forbids it. Catch the obvious
+        # signal: a <template> block or a Vue import in plain JS.
+        if has_vue_tpl or has_vue_import:
+            return (f"{ext} file contains Vue SFC syntax "
+                    "(<template> / import from 'vue').")
+    if ext == "vue":
+        if not has_vue_tpl:
+            return ".vue file is missing a <template> block."
+        if has_react_import and not has_vue_import:
+            return ".vue file imports React instead of Vue."
+    if ext == "svelte":
+        if not has_svelte_block and not has_vue_tpl:
+            # Svelte files usually contain a <script> and template-ish HTML.
+            if has_react_import:
+                return ".svelte file imports React."
+    if ext == "py":
+        # Reject content that's clearly JS/TS pretending to be Python.
+        first = content.lstrip().splitlines()[0] if content.strip() else ""
+        if first.startswith(("import {", "const ", "let ", "var ", "function ")):
+            return ".py file contains JavaScript-style syntax."
+        # Python test files occasionally come back as JavaScript bodies
+        # that happen to parse as Python (`x = document.getElementById(...)`).
+        # Catch the common JS DOM tokens; restrict to test files so we
+        # don't false-positive on legitimate Python modules that mention
+        # those strings.
+        base = path.rsplit("/", 1)[-1].lower()
+        if base.startswith("test_") or base.endswith("_test.py"):
+            js_tokens = (
+                "document.getelementbyid", "document.queryselector",
+                "addeventlistener", ".click()", "console.log",
+            )
+            if any(tok in lc for tok in js_tokens):
+                return ("python test file contains JavaScript DOM calls "
+                        "(document.*, addEventListener, …).")
+    if ext in ("css", "scss", "sass", "less"):
+        # The model occasionally leaks the file's extension as the first
+        # token (".css\nbody { … }"). Reject that pattern — a real
+        # stylesheet starts with a selector, @rule, or a comment.
+        stripped = content.lstrip()
+        first_line = stripped.splitlines()[0].strip() if stripped else ""
+        if first_line.lower() in (f".{ext}", f".{ext};"):
+            return (f".{ext} file starts with a literal '.{ext}' token "
+                    "(filename leakage).")
+    return None
+
+
 def generate_project_scaffold(
     idea: str,
     provider: Any,
     *,
     project_root: Optional[str] = None,
     goal: Optional[str] = None,
+    skills: Optional[List[str]] = None,
+    existing_files: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Generate a complete new project from a plain-language idea.
 
@@ -1156,6 +1401,16 @@ def generate_project_scaffold(
     project_root:
         Destination directory (forwarded to the caller for APPLY; not
         used by this function directly).
+    skills:
+        Optional list of skill names (from the Planner's
+        ``task.inputs['skills']``). When supplied, the matching skill
+        prompt fragments are appended to the scaffold system prompt.
+        When omitted, skills are auto-detected from ``goal``/``idea``.
+    existing_files:
+        Paths produced by sibling SCAFFOLD tasks earlier in the same
+        plan. Surfaced to the LLM so it doesn't regenerate them or
+        invent a parallel directory tree, and used to normalise stray
+        top-level prefixes the LLM may emit.
     """
     if provider is None:
         return {
@@ -1166,15 +1421,49 @@ def generate_project_scaffold(
 
     idea_clean = (idea or "").strip()
     goal_clean = (goal or "").strip()
-    if goal_clean and goal_clean != idea_clean:
-        context = (
-            f"ORIGINAL USER GOAL:\n{goal_clean}\n\n"
-            f"TASK DESCRIPTION:\n{idea_clean}"
+    detect_text = goal_clean or idea_clean
+    active_skills = _resolve_skills(skills, detect_text)
+    try:
+        import skills as _sk
+        skill_fragment = _sk.compose_scaffold_prompt(active_skills)
+        skill_names_str = ", ".join(s.name for s in active_skills)
+    except Exception:  # pragma: no cover - defensive
+        skill_fragment = ""
+        skill_names_str = ""
+
+    json_system = _SCAFFOLD_SYSTEM
+    freeform_system = _SCAFFOLD_FREEFORM_SYSTEM
+    if skill_fragment:
+        # Skills get appended so the generic scaffold rules apply first
+        # and the technology-specific layout instructions win on conflict
+        # (later fragments override earlier ones in LLM prompting).
+        header = (
+            f"\n\nACTIVE SKILLS: {skill_names_str}\n"
+            "Apply the technology-specific instructions below in addition "
+            "to the rules above.\n\n"
         )
+        json_system = _SCAFFOLD_SYSTEM + header + skill_fragment
+        freeform_system = _SCAFFOLD_FREEFORM_SYSTEM + header + skill_fragment
+
+    parts: List[str] = []
+    if goal_clean and goal_clean != idea_clean:
+        parts.append(f"ORIGINAL USER GOAL:\n{goal_clean}")
+        parts.append(f"TASK DESCRIPTION:\n{idea_clean}")
     else:
-        context = f"PROJECT IDEA:\n{idea_clean}"
+        parts.append(f"PROJECT IDEA:\n{idea_clean}")
+    if existing_files:
+        # Cap the list — local models can't reason over 200+ paths and the
+        # context window starts to crowd the actual instructions.
+        listed = "\n".join(f"- {p}" for p in list(existing_files)[:60])
+        parts.append(
+            "EXISTING FILES (already generated by sibling scaffold tasks). "
+            "Do NOT regenerate any of these; do NOT relocate them into a "
+            "different parent directory; only emit NEW files that complement "
+            "this existing tree:\n" + listed
+        )
+    context = "\n\n".join(parts)
     messages = [
-        {"role": "system", "content": _SCAFFOLD_SYSTEM},
+        {"role": "system", "content": json_system},
         {"role": "user", "content": context},
     ]
     raw = provider.chat(messages, temperature=0.3, force_json=True).get("content", "")
@@ -1183,25 +1472,31 @@ def generate_project_scaffold(
     # Fallback: local models often produce free-form text even with JSON mode on.
     if not parsed or not parsed.get("files"):
         ff_messages = [
-            {"role": "system", "content": _SCAFFOLD_FREEFORM_SYSTEM},
+            {"role": "system", "content": freeform_system},
             {"role": "user", "content": context},
         ]
         ff_text = provider.chat(ff_messages, temperature=0.3, force_json=False).get("content", "")
         parsed = _parse_scaffold_freeform(ff_text) or {
             "plan_md": ff_text, "diffs": [], "confidence": 0.3,
         }
+        # Normalise freeform diffs through the same path discipline.
+        for d in parsed.get("diffs") or []:
+            if isinstance(d, dict) and d.get("file"):
+                d["file"] = _normalize_scaffold_path(str(d["file"]), existing_files)
         return parsed
 
     # Convert {path, content} file list → {file, patch} unified diffs.
     files = parsed.get("files") or []
     diffs: List[Dict[str, str]] = []
     seen: set = set()
+    existing_set = set(existing_files or [])
     for f in files:
         if not isinstance(f, dict):
             continue
-        path = str(f.get("path") or f.get("file") or "").strip()
+        raw_path = str(f.get("path") or f.get("file") or "").strip()
         content = str(f.get("content") or "")
-        if not path or path in seen:
+        path = _normalize_scaffold_path(raw_path, existing_files)
+        if not path or path in seen or path in existing_set:
             continue
         seen.add(path)
         diffs.append({"file": path, "patch": _content_to_new_file_patch(path, content)})
@@ -1212,6 +1507,831 @@ def generate_project_scaffold(
         "citations": [],
         "confidence": float(parsed.get("confidence") or 0.7) if diffs else 0.3,
     }
+
+
+_MANIFEST_SYSTEM = (
+    "You are a senior software architect planning a new project.\n\n"
+    "Your job is to OUTPUT ONLY A FILE MANIFEST — paths and one-line descriptions. "
+    "Do NOT write any file contents.\n\n"
+    "Return strict JSON only:\n"
+    "{\n"
+    '  "plan_md": "2-4 sentence architecture overview",\n'
+    '  "layers": [\n'
+    '    {\n'
+    '      "name": "core|ui|config|tests",\n'
+    '      "files": [\n'
+    '        {"path": "src/foo.py", "description": "one-line purpose"}\n'
+    "      ]\n"
+    "    }\n"
+    "  ]\n"
+    "}\n\n"
+    "Rules:\n"
+    "- Relative POSIX paths only. No top-level project-name prefix "
+    "(wrong: calculator/src/App.jsx, right: src/App.jsx).\n"
+    "- Group files by layer: core logic, UI, config/packaging, tests.\n"
+    "- Test files REQUIRED under tests/.\n"
+    "- 3 to 15 files total. Prefer completeness over brevity.\n"
+    "- Canonical top-level dirs: src/, backend/, tests/, public/, docs/.\n"
+)
+
+
+def plan_scaffold_manifest(
+    idea: str,
+    provider: Any,
+    *,
+    goal: Optional[str] = None,
+    skills: Optional[List[str]] = None,
+    existing_files: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Return a file manifest for a new project — paths and descriptions only, no content.
+
+    This is the lightweight first step of the manifest-first scaffold flow.
+    The returned ``layers`` list is consumed by ``loop.py`` to dynamically
+    inject one ``SCAFFOLD_FILE`` task per file into the running plan.
+    """
+    if provider is None:
+        return {"plan_md": "No LLM provider available.", "layers": []}
+
+    idea_clean = (idea or "").strip()
+    goal_clean = (goal or "").strip()
+    detect_text = goal_clean or idea_clean
+    active_skills = _resolve_skills(skills, detect_text)
+    try:
+        import skills as _sk
+        skill_fragment = _sk.compose_scaffold_prompt(active_skills)
+        skill_names_str = ", ".join(s.name for s in active_skills)
+    except Exception:
+        skill_fragment = ""
+        skill_names_str = ""
+
+    system = _MANIFEST_SYSTEM
+    if skill_fragment:
+        header = (
+            f"\n\nACTIVE SKILLS: {skill_names_str}\n"
+            "Apply the technology-specific file layout below.\n\n"
+        )
+        system = _MANIFEST_SYSTEM + header + skill_fragment
+
+    parts: List[str] = []
+    if goal_clean and goal_clean != idea_clean:
+        parts.append(f"ORIGINAL USER GOAL:\n{goal_clean}")
+        parts.append(f"TASK DESCRIPTION:\n{idea_clean}")
+    else:
+        parts.append(f"PROJECT IDEA:\n{idea_clean}")
+    if existing_files:
+        listed = "\n".join(f"- {p}" for p in list(existing_files)[:60])
+        parts.append("EXISTING FILES (already planned — do NOT repeat):\n" + listed)
+
+    def _call(user_msg: str) -> Dict[str, Any]:
+        # Manifest generation is a structural step validated by a
+        # deterministic Judge (required files, layer shape). Sampling
+        # variance here turns the same prompt into different file trees
+        # across retries and makes pass/fail outcomes flaky, so we pin
+        # the temperature to 0.
+        resp = provider.chat(
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_msg},
+            ],
+            temperature=0.0,
+            max_tokens=6000,
+            force_json=True,
+        )
+        if isinstance(resp, dict) and resp.get("error"):
+            logger.warning("plan_scaffold_manifest: provider returned error — %s",
+                           resp.get("error"))
+        raw = (resp or {}).get("content", "") if isinstance(resp, dict) else ""
+        return _extract_json_object(raw) or {}
+
+    def _layers_have_files(p: Dict[str, Any]) -> bool:
+        ls = p.get("layers")
+        if not isinstance(ls, list) or not ls:
+            return False
+        return any(
+            isinstance(l, dict) and (l.get("files") or [])
+            for l in ls
+        )
+
+    context = "\n\n".join(parts)
+    parsed = _call(context)
+    # Small models occasionally emit empty layers when given a verbose
+    # retry prompt; fall back to a minimal idea-only prompt before
+    # surrendering to the empty-layer placeholder.
+    if not _layers_have_files(parsed) and goal_clean:
+        retry_context = f"PROJECT IDEA:\n{idea_clean[:600]}"
+        if existing_files:
+            listed = "\n".join(f"- {p}" for p in list(existing_files)[:60])
+            retry_context += "\n\nEXISTING FILES (already planned — do NOT repeat):\n" + listed
+        parsed = _call(retry_context)
+    if not parsed or not isinstance(parsed.get("layers"), list):
+        # Fallback: a single generic layer so the flow can still proceed.
+        return {
+            "plan_md": str(parsed.get("plan_md") or idea_clean),
+            "layers": [{"name": "project", "files": []}],
+        }
+    layers = _normalize_manifest_paths(parsed["layers"])
+    layers = _inject_required_manifest_files(
+        layers,
+        goal=goal_clean or idea_clean,
+        skill_names=skills,
+    )
+    layers = _inject_python_package_inits(layers)
+    return {
+        "plan_md": str(parsed.get("plan_md") or "").strip(),
+        "layers": layers,
+    }
+
+
+def _inject_required_manifest_files(
+    layers: List[Any],
+    *,
+    goal: str = "",
+    skill_names: Optional[List[str]] = None,
+) -> List[Any]:
+    """Ensure required framework files appear in the manifest.
+
+    Small models frequently omit config files like ``package.json`` even
+    when the skill prompt instructs them to include it.  Rather than
+    burning retries on a deterministic omission, we inject a placeholder
+    entry here so the Judge always sees a well-formed manifest.
+
+    Injected files carry a description so the per-file generator knows
+    what to produce; the file's actual content is generated later by the
+    ``SCAFFOLD_FILE`` capability.
+    """
+    existing: set = set()
+    existing_paths: set = set()
+    for lay in layers or []:
+        if not isinstance(lay, dict):
+            continue
+        for f in (lay.get("files") or []):
+            if isinstance(f, dict):
+                p = str(f.get("path") or "").strip()
+                if p:
+                    existing.add(p.lower().rsplit("/", 1)[-1])
+                    existing_paths.add(p)
+
+    goal_low = (goal or "").lower()
+    names_low = {s.lower() for s in (skill_names or [])}
+    to_inject: Dict[str, str] = {}  # path → description
+
+    _JS_STACKS = re.compile(
+        r"\b(react|vue|svelte|next\.?js|express|angular)\b", re.IGNORECASE
+    )
+    if _JS_STACKS.search(goal_low) or names_low & {"react", "vue", "svelte", "nextjs", "express"}:
+        if "package.json" not in existing:
+            to_inject["package.json"] = (
+                "npm package manifest: dependencies, devDependencies, and scripts"
+            )
+
+    _PY_STACKS = re.compile(
+        r"\b(python|fastapi|flask|django)\b", re.IGNORECASE
+    )
+    _BACKEND_KW = re.compile(r"\b(backend|server|api)\b", re.IGNORECASE)
+    if _PY_STACKS.search(goal_low) or names_low & {"python", "fastapi", "flask", "django"}:
+        if "requirements.txt" not in existing and "pyproject.toml" not in existing:
+            to_inject["requirements.txt"] = "Python package dependencies"
+        # The judge checks for at least one .py source file when the goal names
+        # Python. Inject an entry module if none exists yet.
+        has_py_source = any(p.endswith(".py") for p in existing)
+        if not has_py_source and _BACKEND_KW.search(goal_low):
+            if re.search(r"\bfastapi\b", goal_low) or "fastapi" in names_low:
+                to_inject["backend/main.py"] = "FastAPI application entry point"
+            elif re.search(r"\bflask\b", goal_low) or "flask" in names_low:
+                to_inject["backend/app.py"] = "Flask application entry point"
+            elif re.search(r"\bdjango\b", goal_low) or "django" in names_low:
+                to_inject["manage.py"] = "Django management entry point"
+            else:
+                to_inject["backend/app.py"] = "Python backend entry module"
+
+    # For Python projects that use the src/ layout, inject a root-level
+    # conftest.py that prepends src/ to sys.path. Without it, tests under
+    # tests/ cannot resolve `from <module> import …` when <module> lives
+    # in src/, because pytest's rootdir does not implicitly include src/
+    # as a sys.path entry. Generated at scaffold time so the run-tests
+    # verify step works without manual setup.
+    has_src_py = any(
+        p.startswith("src/") and p.endswith(".py")
+        for p in existing_paths
+    )
+    if has_src_py and "conftest.py" not in existing:
+        to_inject["conftest.py"] = (
+            "pytest bootstrap: prepend src/ to sys.path so tests import "
+            "modules by their flat name (e.g. `from foo import bar`)"
+        )
+
+    if not to_inject:
+        return layers
+
+    # Prefer an existing config/packaging layer; otherwise append one.
+    out = list(layers)
+    config_layer = next(
+        (lay for lay in out
+         if isinstance(lay, dict)
+         and str(lay.get("name") or "").lower() in ("config", "config/packaging", "packaging")),
+        None,
+    )
+    if config_layer is not None:
+        config_layer["files"] = list(config_layer.get("files") or []) + [
+            {"path": p, "description": d} for p, d in to_inject.items()
+        ]
+    else:
+        out.append({
+            "name": "config",
+            "files": [{"path": p, "description": d} for p, d in to_inject.items()],
+        })
+    return out
+
+
+def _inject_python_package_inits(layers: List[Any]) -> List[Any]:
+    """Ensure every Python source directory has an ``__init__.py``.
+
+    Small models emit ``backend/calculator.py`` but forget the package
+    marker, which makes ``from backend.calculator import add`` work only
+    under Python 3 namespace-package discovery — and pytest's rootdir
+    inference fails on that path when no ``conftest.py`` is present.
+    Adding an explicit ``__init__.py`` for every package directory
+    turns the layout into regular packages so imports resolve reliably
+    regardless of pytest's discovery mode.
+
+    Excludes ``tests/`` and its descendants because pytest convention
+    is that test directories are NOT packages (pytest's collector
+    handles them via rootdir/conftest, not via ``import tests.…``).
+    Also excludes the top-level ``src/`` directory itself: the standard
+    "src layout" treats ``src/`` as a sys.path root rather than a
+    package, so files inside ``src/`` are imported by their flat module
+    name (``from foo import bar``) rather than ``from src.foo import
+    bar``. Subpackages under ``src/`` (e.g. ``src/models/``) are still
+    regular packages and DO get an ``__init__.py``.
+    Files at the project root need no marker either.
+    """
+    # Collect every directory that contains at least one .py file, plus
+    # the set of paths already in the manifest so we don't duplicate.
+    py_dirs: set = set()
+    existing: set = set()
+    for lay in layers or []:
+        if not isinstance(lay, dict):
+            continue
+        for f in (lay.get("files") or []):
+            if not isinstance(f, dict):
+                continue
+            p = str(f.get("path") or "").strip()
+            if not p:
+                continue
+            existing.add(p)
+            if not p.endswith(".py"):
+                continue
+            if "/" not in p:
+                continue
+            parent = p.rsplit("/", 1)[0]
+            # Walk every ancestor directory so nested packages
+            # (backend/utils/helpers.py → backend/, backend/utils/)
+            # all get markers.
+            while parent:
+                head = parent.split("/", 1)[0]
+                if head == "tests":
+                    break
+                # Skip the top-level src/ directory: it's a sys.path root
+                # in the standard "src layout", not a package. Subpackages
+                # under it (src/models/, …) are still added below.
+                if parent == "src":
+                    break
+                py_dirs.add(parent)
+                if "/" not in parent:
+                    break
+                parent = parent.rsplit("/", 1)[0]
+
+    to_inject: List[str] = []
+    for d in sorted(py_dirs):
+        marker = f"{d}/__init__.py"
+        if marker not in existing:
+            to_inject.append(marker)
+
+    if not to_inject:
+        return layers
+
+    out = list(layers)
+    # Prefer adding the markers to the layer that already contains the
+    # corresponding .py files so the manifest stays grouped; fall back
+    # to a dedicated "packaging" layer when no obvious owner exists.
+    by_dir: Dict[str, Dict[str, Any]] = {}
+    for lay in out:
+        if not isinstance(lay, dict):
+            continue
+        for f in (lay.get("files") or []):
+            if not isinstance(f, dict):
+                continue
+            p = str(f.get("path") or "")
+            if p.endswith(".py") and "/" in p:
+                by_dir.setdefault(p.rsplit("/", 1)[0], lay)
+
+    leftover: List[str] = []
+    for marker in to_inject:
+        owner_dir = marker.rsplit("/", 1)[0]
+        host = by_dir.get(owner_dir)
+        if host is None:
+            leftover.append(marker)
+            continue
+        host_files = list(host.get("files") or [])
+        host_files.append({
+            "path": marker,
+            "description": f"Package marker for {owner_dir}/.",
+        })
+        host["files"] = host_files
+
+    if leftover:
+        out.append({
+            "name": "packaging",
+            "files": [
+                {"path": m, "description": f"Package marker for {m.rsplit('/', 1)[0]}/."}
+                for m in leftover
+            ],
+        })
+    return out
+
+
+# Framework-convention path overrides: filename basename → canonical path.
+# These run after the manifest is parsed so the LLM's intent is preserved
+# but config files end up where the toolchain actually expects them.
+_CANONICAL_CONFIG_PATHS: Dict[str, str] = {
+    "package.json": "package.json",
+    "vite.config.js": "vite.config.js",
+    "vite.config.ts": "vite.config.ts",
+    "next.config.js": "next.config.js",
+    "next.config.mjs": "next.config.mjs",
+    "next.config.ts": "next.config.ts",
+    "tailwind.config.js": "tailwind.config.js",
+    "tailwind.config.ts": "tailwind.config.ts",
+    "postcss.config.js": "postcss.config.js",
+    "tsconfig.json": "tsconfig.json",
+    "manage.py": "manage.py",
+    "pyproject.toml": "pyproject.toml",
+}
+
+
+def _normalize_manifest_paths(layers: List[Any]) -> List[Any]:
+    """Rewrite known-misplaced framework config files to their canonical
+    project-root location and de-duplicate paths across layers.
+    """
+    seen: set = set()
+    out: List[Any] = []
+    for lay in layers or []:
+        if not isinstance(lay, dict):
+            out.append(lay)
+            continue
+        new_files: List[Any] = []
+        for f in (lay.get("files") or []):
+            if not isinstance(f, dict):
+                new_files.append(f)
+                continue
+            p = str(f.get("path") or "").strip()
+            if not p:
+                continue
+            base = p.rsplit("/", 1)[-1].lower()
+            canon = _CANONICAL_CONFIG_PATHS.get(base)
+            if canon and p != canon:
+                f = {**f, "path": canon}
+                p = canon
+            if p in seen:
+                continue
+            seen.add(p)
+            new_files.append(f)
+        out.append({**lay, "files": new_files})
+    return out
+
+
+_SINGLE_FILE_SYSTEM = (
+    "You are a senior software engineer generating EXACTLY ONE source file.\n\n"
+    "You will be given:\n"
+    "- The project goal\n"
+    "- The file path and its purpose\n"
+    "- The content of files already generated in this project\n\n"
+    "Output the COMPLETE content of the requested file only. "
+    "Return strict JSON:\n"
+    '{"content": "complete file content as a string"}\n\n'
+    "Rules:\n"
+    "- Output the full file — no stubs, no placeholders, no ellipsis.\n"
+    "- Use imports consistent with what already exists in the project.\n"
+    "- Do not repeat or regenerate any already-existing file.\n"
+    "- The content MUST be functionally different from every file in "
+    "ALREADY GENERATED FILES. Do NOT copy another file's body and rename "
+    "the export — write the unique content that fulfils THIS file's "
+    "purpose. If the requested purpose duplicates an already-generated "
+    "file, return {\"content\": \"\"} instead.\n"
+    "- Satisfy the file's stated purpose exactly.\n"
+    "Python import discipline (applies to every .py file in this project):\n"
+    "- src/ is a sys.path ROOT, NOT a package. There is no src/__init__.py.\n"
+    "- Inside files under src/, import sibling modules by their flat name. "
+    "RIGHT: `from chat_manager import ChatManager`. "
+    "WRONG: `from src.chat_manager import ChatManager`.\n"
+    "- Test files under tests/ also import from the same flat module names "
+    "(a conftest.py at the project root puts src/ on sys.path). "
+    "RIGHT: `from chat_manager import ChatManager`. "
+    "WRONG: `from src.chat_manager import ChatManager`.\n"
+    "- Subpackages that live under src/ (e.g. src/models/) ARE regular "
+    "packages with their own __init__.py and are imported without the "
+    "src. prefix: `from models.user import User`, never "
+    "`from src.models.user import User`.\n"
+    "- Relative imports (`from .foo import bar`) are OK between modules in "
+    "the same subpackage, but NEVER use them inside a script that may be "
+    "launched directly (streamlit run, python src/app.py, etc.) — those "
+    "scripts run as __main__ and have no parent package.\n"
+)
+
+_SINGLE_FILE_FREEFORM_SYSTEM = (
+    "You are a senior software engineer generating EXACTLY ONE source file.\n\n"
+    "Output the complete file content inside a fenced code block with the path:\n"
+    "```language path=<relative/path>\n"
+    "<full file content>\n"
+    "```\n\n"
+    "No other files. No explanations outside the fence.\n"
+)
+
+
+# Signature-line regex for the generic (non-Python, non-JSON) summarizer.
+# Matches top-level imports, exports, function/class/interface/type decls,
+# Python defs, capitalised const bindings (React/Vue components), and
+# CommonJS exports. Kept intentionally conservative to avoid leaking full
+# function bodies into the "ALREADY GENERATED FILES" prompt block.
+_SIG_LINE_RE = re.compile(
+    r"^\s*(import\s|from\s+\S+\s+import|export\s|function\s|async\s+function|"
+    r"class\s|interface\s|type\s+[A-Z]|const\s+[A-Z_][A-Za-z0-9_]*\s*=|"
+    r"def\s|async\s+def\s|module\.exports|@[A-Za-z_])"
+)
+
+
+def _summarize_python(src: str) -> str:
+    """Return a Python file's structural skeleton with bodies elided.
+
+    Walks the top-level AST: keeps every ``import``/``from`` line verbatim,
+    keeps top-level constant assignments capped at 120 chars, and replaces
+    each function/method/class body with ``...`` so the model sees what
+    symbols already exist without paying for their implementation tokens.
+    """
+    import ast as _ast
+    try:
+        tree = _ast.parse(src)
+    except SyntaxError:
+        return ""
+    lines = src.splitlines()
+
+    def _sig(node: Any) -> str:
+        start = node.lineno - 1
+        body = getattr(node, "body", None)
+        end = (body[0].lineno - 1) if body else start + 1
+        end = max(end, start + 1)
+        return "\n".join(lines[start:end]).rstrip()
+
+    out: List[str] = []
+    for node in tree.body:
+        if isinstance(node, (_ast.Import, _ast.ImportFrom)):
+            out.append(lines[node.lineno - 1].rstrip())
+        elif isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+            out.append(_sig(node) + "\n    ...")
+        elif isinstance(node, _ast.ClassDef):
+            sig = _sig(node)
+            methods: List[str] = []
+            for sub in node.body:
+                if isinstance(sub, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                    msig = _sig(sub)
+                    msig_lines = msig.splitlines() or [""]
+                    msig_lines[0] = "    " + msig_lines[0].lstrip()
+                    methods.append("\n".join(msig_lines) + "\n        ...")
+            body = "\n".join(methods) if methods else "    ..."
+            out.append(sig + "\n" + body)
+        elif isinstance(node, (_ast.Assign, _ast.AnnAssign)):
+            ln = lines[node.lineno - 1].rstrip()
+            if len(ln) > 120:
+                ln = ln[:117] + "..."
+            out.append(ln)
+    return "\n".join(out)
+
+
+def _summarize_json(src: str) -> str:
+    """Return a compact ``{ "k1", "k2", ... }`` summary of a JSON file."""
+    try:
+        obj = json.loads(src)
+    except Exception:
+        return ""
+    if isinstance(obj, dict):
+        keys = list(obj.keys())[:30]
+        rendered = ", ".join(repr(k) for k in keys)
+        return "{ " + rendered + (" ... }" if len(obj) > 30 else " }")
+    if isinstance(obj, list):
+        return f"[ array of {len(obj)} item(s) ]"
+    return repr(obj)[:200]
+
+
+def _summarize_textual(src: str, *, max_lines: int = 25) -> str:
+    """Regex-based signature extractor for JS/TS/JSX/TSX/Vue/etc."""
+    kept: List[str] = []
+    for ln in src.splitlines():
+        if _SIG_LINE_RE.match(ln):
+            kept.append(ln.rstrip())
+            if len(kept) >= max_lines:
+                break
+    if not kept:
+        kept = [ln.rstrip() for ln in src.splitlines()[:6]]
+    return "\n".join(kept)
+
+
+def _summarize_file_for_context(
+    path: str, content: str, *, max_chars: int = 800
+) -> str:
+    """Produce a compact structural summary of a generated file.
+
+    Used in the "ALREADY GENERATED FILES" prompt block when generating
+    a new sibling file: the LLM sees the available symbols (imports,
+    function / class signatures, top-level constants) without paying
+    for the full file body. ``max_chars`` is a hard cap; everything
+    beyond it is dropped with a trailing marker.
+    """
+    if not content:
+        return ""
+    ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+    text = ""
+    try:
+        if ext == "py":
+            text = _summarize_python(content)
+        elif ext == "json":
+            text = _summarize_json(content)
+        else:
+            text = _summarize_textual(content)
+    except Exception:  # pragma: no cover - defensive
+        text = ""
+    if not text:
+        text = "\n".join(content.splitlines()[:8])
+    if len(text) > max_chars:
+        text = text[:max_chars].rsplit("\n", 1)[0] + "\n# ... (summary truncated)"
+    return text
+
+
+def generate_single_scaffold_file(
+    path: str,
+    description: str,
+    provider: Any,
+    *,
+    layer: str = "",
+    existing_files_with_content: Optional[List[Dict[str, str]]] = None,
+    goal: str = "",
+    skills: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Generate the content of a single file in a new-project scaffold.
+
+    Each call generates exactly one file, with the content of all
+    previously-generated files provided as context so imports resolve
+    correctly. Runs inline syntax validation before returning.
+
+    Returns a dict with keys: ``file``, ``patch``, ``content``,
+    ``syntax_ok``, ``confidence``.
+    """
+    if provider is None:
+        return {"file": path, "patch": "", "content": "", "syntax_ok": False, "confidence": 0.0}
+
+    path = _normalize_scaffold_path(path, [f["path"] for f in (existing_files_with_content or [])])
+
+    # Deterministic short-circuit for ``__init__.py`` package markers:
+    # these are emitted by ``_inject_python_package_inits`` to make
+    # every Python source directory a regular package so pytest can
+    # resolve first-party imports without sys.path tricks. The file is
+    # content-free by convention; we still need a non-empty body so the
+    # Judge's "no content" gate passes, hence a one-line docstring.
+    base = path.rsplit("/", 1)[-1]
+    if base == "__init__.py":
+        owner = path.rsplit("/", 1)[0] if "/" in path else ""
+        content = (f'"""Package marker for {owner}/."""\n'
+                   if owner else '"""Package marker."""\n')
+        patch = _content_to_new_file_patch(path, content)
+        return {
+            "file": path,
+            "patch": patch,
+            "content": content,
+            "diffs": [{"file": path, "patch": patch}],
+            "syntax_ok": True,
+            "confidence": 1.0,
+        }
+
+    # Deterministic short-circuit for root-level ``conftest.py``: emitted
+    # by ``_inject_required_manifest_files`` for Python projects that use
+    # the src/ layout. Its job is fixed and one-line — prepend src/ to
+    # sys.path — so we generate it without an LLM round-trip to avoid the
+    # model writing test stubs into it or omitting the sys.path insert.
+    if path == "conftest.py":
+        content = (
+            '"""pytest bootstrap: make src/ importable as a sys.path root.\n\n'
+            "Tests under tests/ import first-party modules by their flat\n"
+            "name (e.g. ``from foo import bar`` for ``src/foo.py``). This\n"
+            "file runs before collection and prepends src/ to ``sys.path``\n"
+            "so those imports resolve without installing the project.\n"
+            '"""\n'
+            "import os\n"
+            "import sys\n"
+            "\n"
+            "_HERE = os.path.dirname(os.path.abspath(__file__))\n"
+            "_SRC = os.path.join(_HERE, \"src\")\n"
+            "if os.path.isdir(_SRC) and _SRC not in sys.path:\n"
+            "    sys.path.insert(0, _SRC)\n"
+        )
+        patch = _content_to_new_file_patch(path, content)
+        return {
+            "file": path,
+            "patch": patch,
+            "content": content,
+            "diffs": [{"file": path, "patch": patch}],
+            "syntax_ok": True,
+            "confidence": 1.0,
+        }
+
+    # Feed the file path into skill detection so an explicit .jsx/.tsx/.vue
+    # extension can pull in the matching frontend skill even when the goal
+    # text was ambiguous or contained a typo. _JSX_RE / Vue regex match on
+    # `\b(?:jsx|tsx)\b` so the dot in ".jsx" forms a word boundary.
+    detect_text = " ".join(t for t in (goal, description, path) if t)
+    active_skills = _resolve_skills(skills, detect_text)
+    try:
+        import skills as _sk
+        skill_fragment = _sk.compose_scaffold_prompt(active_skills)
+        skill_names_str = ", ".join(s.name for s in active_skills)
+    except Exception:  # pragma: no cover - defensive
+        skill_fragment = ""
+        skill_names_str = ""
+
+    system = _SINGLE_FILE_SYSTEM
+    if skill_fragment:
+        header = (
+            f"\n\nACTIVE SKILLS: {skill_names_str}\n"
+            "The file you generate MUST follow the technology conventions below "
+            "(language, imports, framework idioms). Do NOT substitute a different "
+            "framework or language than the one declared for this project.\n\n"
+        )
+        system = _SINGLE_FILE_SYSTEM + header + skill_fragment
+
+    # Defense-in-depth: hard-pin framework conventions by file extension so
+    # the model cannot cross-contaminate frameworks (Vue SFC under .jsx,
+    # React under .vue) regardless of whether a skill was detected. The
+    # symptom this guards against is the per-file judge rejecting a .jsx
+    # file that contains <template> / `import from 'vue'`.
+    ext_pin = _extension_framework_pin(path)
+    if ext_pin:
+        system = system + "\n\n" + ext_pin
+
+    parts: List[str] = []
+    if goal:
+        parts.append(f"PROJECT GOAL:\n{goal}")
+    parts.append(f"FILE TO GENERATE:\nPath: {path}\nPurpose: {description}")
+    if layer:
+        parts.append(f"Layer: {layer}")
+    # Per-call prompt + response budget scaled to the active provider's
+    # model context window. Local 8K models get tight caps; cloud
+    # models with 200K+ windows get generous ones. See
+    # :mod:`cgx.answer.model_caps`.
+    from cgx.answer.model_caps import get_summary_budget
+    budget = get_summary_budget(provider)
+
+    if existing_files_with_content:
+        # Send a *structural summary* of each prior file (imports +
+        # function/class signatures with bodies elided) rather than the
+        # full source. This keeps the prompt small as the scaffold grows
+        # and is what the model actually needs to know: which symbols
+        # already exist, not how they are implemented. The full content
+        # is still kept in ``existing_files_with_content`` for the
+        # downstream duplicate-content guard.
+        context_blocks: List[str] = []
+        for ef in existing_files_with_content[: budget["max_files"]]:
+            ep = ef.get("path", "")
+            ec = ef.get("content", "")
+            if not ep or not ec:
+                continue
+            summary = _summarize_file_for_context(
+                ep, ec, max_chars=budget["max_chars"],
+            )
+            if not summary:
+                continue
+            context_blocks.append(f"### {ep}\n```\n{summary}\n```")
+        if context_blocks:
+            parts.append(
+                "ALREADY GENERATED FILES (do not re-emit these; signatures "
+                "shown, bodies elided):\n\n" + "\n\n".join(context_blocks)
+            )
+
+    context = "\n\n".join(parts)
+
+    raw = provider.chat(
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": context},
+        ],
+        temperature=0.2,
+        max_tokens=budget["output_tokens"],
+        force_json=True,
+    ).get("content", "")
+    parsed = _extract_json_object(raw)
+    content = str(parsed.get("content") or "") if parsed else ""
+
+    if not content:
+        # Fallback to freeform. Carry the same skill constraints over.
+        ff_system = _SINGLE_FILE_FREEFORM_SYSTEM
+        if skill_fragment:
+            ff_system = _SINGLE_FILE_FREEFORM_SYSTEM + header + skill_fragment
+        ff_raw = provider.chat(
+            messages=[
+                {"role": "system", "content": ff_system},
+                {"role": "user", "content": context},
+            ],
+            temperature=0.2,
+            force_json=False,
+        ).get("content", "")
+        parsed_ff = _parse_scaffold_freeform(ff_raw)
+        for d in (parsed_ff.get("diffs") or []):
+            if isinstance(d, dict) and d.get("file") == path:
+                content = str(d.get("patch") or "")
+                break
+        if not content and parsed_ff.get("diffs"):
+            first = parsed_ff["diffs"][0]
+            content = str(first.get("patch") or "")
+
+    # Inline syntax validation.
+    syntax_ok = True
+    syntax_error: Optional[str] = None
+    ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+    # Strip leading/trailing markdown code fences a 3B model occasionally
+    # wraps around the file body even when asked for raw content
+    # (```python\n…\n```). We only strip when the WHOLE content is
+    # wrapped, never an inner fence.
+    if content:
+        stripped = content.strip()
+        if stripped.startswith("```"):
+            m = re.match(r"^```[a-zA-Z0-9_+\-]*\s*\n(.*?)\n```\s*$",
+                         stripped, re.DOTALL)
+            if m:
+                content = m.group(1)
+    # Reject unified-diff fragments that leak through the freeform parser
+    # into the file body (`--- /dev/null`, `+++ b/...`, `@@ ...`).
+    if content:
+        head = content.lstrip().splitlines()[0] if content.strip() else ""
+        if head.startswith(("--- ", "+++ ", "@@ ")):
+            syntax_ok = False
+            syntax_error = "content is a unified-diff header, not a file body"
+    if syntax_ok and ext == "py" and content:
+        try:
+            import ast as _ast
+            _ast.parse(content)
+        except SyntaxError as e:
+            syntax_ok = False
+            syntax_error = str(e)
+    elif syntax_ok and ext == "json" and content:
+        try:
+            import json as _json
+            _json.loads(content)
+        except Exception as e:
+            syntax_ok = False
+            syntax_error = str(e)
+    elif syntax_ok and ext == "toml" and content:
+        try:
+            import tomllib as _tomllib
+            _tomllib.loads(content)
+        except Exception as e:
+            syntax_ok = False
+            syntax_error = f"TOML parse error: {e}"
+
+    # Extension/content mismatch check: a 3B model frequently emits Vue
+    # SFC content under a .jsx path, or vice versa. These heuristics catch
+    # the cross-framework mistakes before APPLY writes garbage to disk.
+    if content and syntax_ok:
+        mismatch = _extension_content_mismatch(path, ext, content)
+        if mismatch:
+            syntax_ok = False
+            syntax_error = mismatch
+
+    # Duplicate-content guard: refuse content that byte-matches a prior
+    # file (after normalising whitespace). 3B models frequently rename the
+    # export of an already-generated file instead of writing fresh content.
+    if content and existing_files_with_content:
+        norm_new = "".join(content.split())
+        if norm_new:
+            for ef in existing_files_with_content:
+                ep = ef.get("path", "")
+                ec = ef.get("content", "")
+                if not ep or not ec or ep == path:
+                    continue
+                if "".join(ec.split()) == norm_new:
+                    syntax_ok = False
+                    syntax_error = f"duplicate content of {ep}"
+                    content = ""
+                    break
+
+    patch = _content_to_new_file_patch(path, content) if content else ""
+    result: Dict[str, Any] = {
+        "file": path,
+        "patch": patch,
+        "content": content,
+        "diffs": [{"file": path, "patch": patch}] if patch else [],
+        "syntax_ok": syntax_ok,
+        "confidence": 0.8 if (content and syntax_ok) else 0.3,
+    }
+    if syntax_error:
+        result["syntax_error"] = syntax_error
+    return result
 
 
 def _render_plan_for_validation(parsed: Dict[str, Any]) -> str:

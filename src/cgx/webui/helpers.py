@@ -10,7 +10,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from cgx.answer.profiles import Profile, get_profile, load_api_key
-from cgx.answer.providers import LLMProvider, OllamaProvider, OpenAICompatProvider
+from cgx.answer.providers import (
+    GeminiProvider, LLMProvider, OllamaProvider, OpenAICompatProvider,
+)
 
 
 def build_provider(
@@ -23,27 +25,50 @@ def build_provider(
     num_predict: int = 1024,
     rate_limit: Optional[float] = None,
     max_retries: Optional[int] = None,
+    endpoint_path: str = "/v1/chat/completions",
+    allow_no_auth: bool = False,
 ) -> LLMProvider:
-    """Construct a provider with per-call overrides for temperature/tokens."""
+    """Construct a provider with per-call overrides for temperature/tokens.
+
+    Supports four kinds:
+      - ``ollama``       — local Ollama server
+      - ``openai-compat``— OpenAI or any /v1/chat/completions-compatible API
+      - ``gemini``       — Google Gemini via REST
+      - ``custom``       — OpenAI-compatible with custom host, path, and optional auth-bypass
+    """
     ollama_opts: Dict[str, Any] = {"temperature": float(temperature),
                                    "num_predict": int(num_predict)}
     openai_opts: Dict[str, Any] = {"temperature": float(temperature),
                                    "max_tokens": int(num_predict)}
-    kwargs: Dict[str, Any] = {}
+    rl_kwargs: Dict[str, Any] = {}
     if rate_limit is not None:
-        kwargs["rate_limit"] = float(rate_limit)
+        rl_kwargs["rate_limit"] = float(rate_limit)
     if max_retries is not None:
-        kwargs["max_retries"] = int(max_retries)
+        rl_kwargs["max_retries"] = int(max_retries)
+
     if kind == "ollama":
         base = (base_url or "http://localhost:11434").replace("/v1", "").rstrip("/")
         return OllamaProvider(model=model, base_url=base,
-                              extra_options=ollama_opts, **kwargs)
+                              extra_options=ollama_opts, **rl_kwargs)
+
+    if kind == "gemini":
+        return GeminiProvider(
+            model=model or "gemini-2.5-flash",
+            api_key=api_key or "",
+            **rl_kwargs,
+        )
+
+    # "openai-compat" and "custom" both use OpenAICompatProvider; "custom"
+    # additionally supports a non-standard endpoint path and auth bypass.
+    eff_endpoint_path = endpoint_path or "/v1/chat/completions"
     return OpenAICompatProvider(
         model=model,
         base_url=(base_url or "").rstrip("/"),
         api_key=api_key or None,
         extra_options=openai_opts,
-        **kwargs,
+        endpoint_path=eff_endpoint_path,
+        allow_no_auth=bool(allow_no_auth),
+        **rl_kwargs,
     )
 
 
@@ -58,6 +83,8 @@ def provider_from_profile_name(name: str) -> LLMProvider:
         temperature=p.temperature, num_predict=p.num_predict,
         rate_limit=getattr(p, "rate_limit", None),
         max_retries=getattr(p, "max_retries", None),
+        endpoint_path=getattr(p, "endpoint_path", "/v1/chat/completions"),
+        allow_no_auth=getattr(p, "allow_no_auth", False),
     )
 
 

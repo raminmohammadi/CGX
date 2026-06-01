@@ -39,6 +39,8 @@ async def ask(req: AskRequest) -> EventSourceResponse:
             kind=pcfg.kind, model=pcfg.model, base_url=pcfg.base_url,
             api_key=pcfg.api_key, temperature=pcfg.temperature,
             num_predict=pcfg.num_predict,
+            endpoint_path=getattr(pcfg, "endpoint_path", "/v1/chat/completions"),
+            allow_no_auth=bool(getattr(pcfg, "allow_no_auth", False)),
             cancel_event=cancel_event,
         ):
             if ev == "intent":

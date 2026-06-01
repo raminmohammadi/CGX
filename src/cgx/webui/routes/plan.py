@@ -40,6 +40,8 @@ async def plan(req: PlanRequest) -> EventSourceResponse:
             num_predict=pcfg.num_predict,
             self_test=req.self_test, run_tests=req.run_tests,
             project_root=req.project_root,
+            endpoint_path=getattr(pcfg, "endpoint_path", "/v1/chat/completions"),
+            allow_no_auth=bool(getattr(pcfg, "allow_no_auth", False)),
             cancel_event=cancel_event,
         )
 

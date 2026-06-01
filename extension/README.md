@@ -1,6 +1,6 @@
 # Averix — VS Code extension scaffold
 
-Hosts the Averix Gradio UI inside a VS Code webview so you can ask
+Hosts the Averix web UI inside a VS Code webview so you can ask
 questions about the open workspace without leaving the editor.
 
 This directory is a **scaffold only** — it is not packaged into a
@@ -12,11 +12,15 @@ This directory is a **scaffold only** — it is not packaged into a
   - **Averix: Open UI** — opens a webview panel pointing at the running
     Averix server.
   - **Averix: Reload UI** — re-renders the iframe (useful after
-    restarting the Gradio server).
+    restarting the Averix server).
 - Reads the server URL from `averix.ui.url` (default
-  `http://localhost:7860`).
+  `http://localhost:8765`).
 - Does **not** spawn the server. Start it first with `averix-ui` (or
-  `python app.py`) from the repo root.
+  `python app.py`) from the repo root. `averix-ui` resolves to
+  `cgx.webui.launch:launch` and serves the React frontend + FastAPI
+  backend (Ask / Plan / Agent / Setup / Index pages, the
+  `/api/tasks` registry, and the `/api/rollback` undo endpoint) on
+  port 8765.
 
 ## Layout
 
@@ -55,6 +59,6 @@ This produces `averix-0.0.1.vsix` which can be side-loaded via
 ## Privacy
 
 The extension only loads the URL configured in `averix.ui.url`. No
-telemetry is emitted by this scaffold. The Gradio server itself
+telemetry is emitted by this scaffold. The Averix server itself
 processes everything locally; see the top-level project README for the
 full privacy posture.

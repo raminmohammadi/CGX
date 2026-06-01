@@ -16,7 +16,8 @@ export interface WorkspaceState {
   setProjectRoot: (root: string) => void;
   setSelectedSession: (id: string | null) => void;
   applyProfile: (profile: { name: string; kind: string; model: string;
-    base_url: string; temperature: number; num_predict: number }) => void;
+    base_url: string; temperature: number; num_predict: number;
+    endpoint_path?: string; allow_no_auth?: boolean }) => void;
 }
 
 const defaultProvider: ProviderConfig = {
@@ -28,6 +29,8 @@ const defaultProvider: ProviderConfig = {
   api_key: null,
   temperature: 0.2,
   num_predict: 1024,
+  endpoint_path: "/v1/chat/completions",
+  allow_no_auth: false,
 };
 
 const defaultIndex: IndexLocation = {
@@ -59,6 +62,8 @@ export const useWorkspace = create<WorkspaceState>()(
             base_url: p.base_url,
             temperature: p.temperature,
             num_predict: p.num_predict,
+            endpoint_path: p.endpoint_path ?? "/v1/chat/completions",
+            allow_no_auth: p.allow_no_auth ?? false,
           },
         })),
     }),

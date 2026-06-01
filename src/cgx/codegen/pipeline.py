@@ -9,6 +9,7 @@ instructions, or fail.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -20,6 +21,8 @@ from cgx.codegen.diff_apply import (
 )
 from cgx.codegen.test_runner import TestRunOutcome, run_impacted_tests
 from cgx.codegen.validate import SyntaxDiagnostic, validate_patch_results
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -88,6 +91,8 @@ def validate_and_test(
         When True, copies the project to a sandbox, materializes the patches,
         and runs impacted tests with pytest.
     """
+    logger.info("codegen.pipeline: validate_and_test root=%s plan_len=%d run_tests=%s",
+                project_root, len(plan_text or ""), run_tests)
     targets = parse_fenced_diffs(plan_text or "")
     patches = apply_diffs_in_memory(project_root, targets, allow_new_files=allow_new_files)
     diagnostics = validate_patch_results(patches)
@@ -112,6 +117,11 @@ def validate_and_test(
         and summary["n_syntax_failed"] == 0
         and (not run_tests or summary["tests_passed"] or (tests and tests.skipped_reason))
     )
+    logger.info("codegen.pipeline: report targets=%d patches_ok=%d patches_failed=%d "
+                "syntax_ok=%d syntax_failed=%d tests_ran=%s tests_passed=%s overall_ok=%s",
+                summary["n_targets"], summary["n_patches_ok"], summary["n_patches_failed"],
+                summary["n_syntax_ok"], summary["n_syntax_failed"],
+                summary["tests_ran"], summary["tests_passed"], summary["overall_ok"])
     return CodegenReport(
         targets=targets, patches=patches, diagnostics=diagnostics,
         tests=tests, summary=summary,

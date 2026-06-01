@@ -7,12 +7,13 @@ object ``{"role": "user|assistant|system", "content": str, "at": float,
 ``index.json`` alongside the message files.
 
 The module is dependency-free (stdlib only) and safe to call from the
-Gradio UI on every interaction; writes are atomic via ``os.replace``.
+web UI on every interaction; writes are atomic via ``os.replace``.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 import uuid
@@ -20,6 +21,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
+
+logger = logging.getLogger(__name__)
 
 CONFIG_DIR = Path(os.environ.get("CGX_CONFIG_DIR", str(Path.home() / ".cgx")))
 SESSIONS_DIR = CONFIG_DIR / "sessions"
@@ -52,8 +55,9 @@ def _load_index() -> Dict[str, Any]:
             data = json.load(f)
         if isinstance(data, dict) and isinstance(data.get("sessions"), list):
             return data
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("sessions: failed to load index %s: %s: %s",
+                       INDEX_PATH, type(e).__name__, e)
     return {"sessions": []}
 
 
@@ -82,7 +86,9 @@ def list_sessions() -> List[SessionMeta]:
                 updated_at=float(s.get("updated_at") or 0.0),
                 message_count=int(s.get("message_count") or 0),
             ))
-        except Exception:
+        except Exception as e:
+            logger.warning("sessions: skipping malformed index entry %r: %s: %s",
+                           s.get("id"), type(e).__name__, e)
             continue
     out.sort(key=lambda m: m.updated_at, reverse=True)
     return out
@@ -110,8 +116,9 @@ def delete_session(session_id: str) -> bool:
     _save_index(data)
     try:
         _path_for(session_id).unlink(missing_ok=True)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("sessions: failed to delete log for %s: %s: %s",
+                       session_id, type(e).__name__, e)
     return True
 
 
@@ -151,7 +158,9 @@ def load_messages(session_id: str) -> List[Dict[str, Any]]:
                 continue
             try:
                 out.append(json.loads(line))
-            except Exception:
+            except Exception as e:
+                logger.warning("sessions: skipping malformed message in %s: %s: %s",
+                               session_id, type(e).__name__, e)
                 continue
     return out
 

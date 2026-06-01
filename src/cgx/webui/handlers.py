@@ -36,12 +36,15 @@ def _resolve_provider(
     *, use_profile: bool, profile_name: Optional[str],
     kind: str, model: str, base_url: str, api_key: Optional[str],
     temperature: float, num_predict: int,
+    endpoint_path: str = "/v1/chat/completions",
+    allow_no_auth: bool = False,
 ) -> Any:
     if use_profile and profile_name:
         return provider_from_profile_name(profile_name)
     return build_provider(
         kind=kind, model=model, base_url=base_url, api_key=api_key or None,
         temperature=temperature, num_predict=num_predict,
+        endpoint_path=endpoint_path, allow_no_auth=allow_no_auth,
     )
 
 
@@ -92,6 +95,7 @@ def stream_ask(
     *, index_dir: str, records: str, question: str, embed_model: str,
     use_profile: bool, profile_name: Optional[str], kind: str, model: str,
     base_url: str, api_key: Optional[str], temperature: float, num_predict: int,
+    endpoint_path: str = "/v1/chat/completions", allow_no_auth: bool = False,
     cancel_event=None,
 ) -> Iterator[Event]:
     """Stream thoughts then the grounded answer with sources + meta."""
@@ -101,6 +105,7 @@ def stream_ask(
             use_profile=use_profile, profile_name=profile_name, kind=kind,
             model=model, base_url=base_url, api_key=api_key,
             temperature=temperature, num_predict=num_predict,
+            endpoint_path=endpoint_path, allow_no_auth=allow_no_auth,
         )
     except Exception as e:
         logger.error("stream_ask: provider init failed: %s", e)
@@ -187,6 +192,7 @@ def stream_plan(
     use_profile: bool, profile_name: Optional[str], kind: str, model: str,
     base_url: str, api_key: Optional[str], temperature: float, num_predict: int,
     self_test: bool, run_tests: bool, project_root: Optional[str],
+    endpoint_path: str = "/v1/chat/completions", allow_no_auth: bool = False,
     cancel_event=None,
 ) -> Iterator[Event]:
     """Stream sketch thoughts, then the generated plan + structured diffs."""
@@ -196,6 +202,7 @@ def stream_plan(
             use_profile=use_profile, profile_name=profile_name, kind=kind,
             model=model, base_url=base_url, api_key=api_key,
             temperature=temperature, num_predict=num_predict,
+            endpoint_path=endpoint_path, allow_no_auth=allow_no_auth,
         )
     except Exception as e:
         logger.error("stream_plan: provider init failed: %s", e)
@@ -263,7 +270,9 @@ def stream_agent(
     embed_model: str, use_profile: bool, profile_name: Optional[str],
     kind: str, model: str, base_url: str, api_key: Optional[str],
     temperature: float, num_predict: int, project_root: Optional[str],
-    stop_on_fail: bool, cancel_event=None,
+    stop_on_fail: bool,
+    endpoint_path: str = "/v1/chat/completions", allow_no_auth: bool = False,
+    cancel_event=None,
 ) -> Iterator[Event]:
     """Bridge the Planner → Tracker → Judge loop into typed UI events."""
     from cgx.agents import run_agent
@@ -274,6 +283,7 @@ def stream_agent(
             use_profile=use_profile, profile_name=profile_name, kind=kind,
             model=model, base_url=base_url, api_key=api_key,
             temperature=temperature, num_predict=num_predict,
+            endpoint_path=endpoint_path, allow_no_auth=allow_no_auth,
         )
     except Exception as e:
         logger.error("stream_agent: provider init failed: %s", e)
@@ -302,6 +312,9 @@ def stream_agent(
             project_root=(project_root or None),
             stop_on_fail=bool(stop_on_fail),
             stream=True,
+            # Allow two re-plan cycles so a failed manifest or apply step
+            # can be revisited (default of 1 only covers a single retry).
+            max_retries=2,
         )
     except Exception as e:
         logger.error("stream_agent: run_agent init failed: %s", e)

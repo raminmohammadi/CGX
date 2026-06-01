@@ -20,12 +20,14 @@ class ProviderConfig(BaseModel):
 
     use_profile: bool = False
     profile_name: Optional[str] = None
-    kind: str = "ollama"  # "ollama" | "openai-compat"
+    kind: str = "ollama"  # "ollama" | "openai-compat" | "gemini" | "custom"
     model: str = "qwen2.5-coder:3b"
     base_url: str = "http://localhost:11434"
     api_key: Optional[str] = None
     temperature: float = 0.2
     num_predict: int = 1024
+    endpoint_path: str = "/v1/chat/completions"
+    allow_no_auth: bool = False
 
 
 class IndexLocation(BaseModel):
@@ -75,12 +77,14 @@ class AgentRequest(BaseModel):
 
 class ProfileUpsertRequest(BaseModel):
     name: str
-    kind: str = "ollama"
+    kind: str = "ollama"  # "ollama" | "openai-compat" | "gemini" | "custom"
     model: str = "qwen2.5-coder:3b"
     base_url: str = "http://localhost:11434"
     api_key: Optional[str] = None
     temperature: float = 0.2
     num_predict: int = 1024
+    endpoint_path: str = "/v1/chat/completions"
+    allow_no_auth: bool = False
 
 
 class SessionCreateRequest(BaseModel):
@@ -102,6 +106,8 @@ class ProfileSummary(BaseModel):
     has_api_key: bool
     temperature: float
     num_predict: int
+    endpoint_path: str = "/v1/chat/completions"
+    allow_no_auth: bool = False
 
 
 class SessionSummary(BaseModel):

@@ -16,6 +16,7 @@ runtime, the runner reports that cleanly rather than raising.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import shutil
@@ -27,6 +28,8 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence
 
 from cgx.codegen.diff_apply import PatchResult
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -158,6 +161,28 @@ def _project_python_exe(project_root: Path) -> str:
     return sys.executable
 
 
+def _pytest_env(project_root: Path) -> Dict[str, str]:
+    """Return ``os.environ`` plus a ``PYTHONPATH`` that includes ``project_root``.
+
+    Freshly-scaffolded projects often lay code out as ``backend/`` + ``tests/``
+    with no ``conftest.py``, ``pyproject.toml`` or ``setup.py`` declaring the
+    package roots — so pytest's automatic ``rootdir`` insertion isn't enough
+    for first-party imports like ``from backend.calculator import …``. We
+    prepend the project root (and ``project_root/src`` when present) to any
+    existing ``PYTHONPATH`` so those imports resolve regardless of layout.
+    """
+    env = dict(os.environ)
+    parts: List[str] = [str(project_root)]
+    src_dir = project_root / "src"
+    if src_dir.is_dir():
+        parts.append(str(src_dir))
+    existing = env.get("PYTHONPATH", "")
+    if existing:
+        parts.append(existing)
+    env["PYTHONPATH"] = os.pathsep.join(parts)
+    return env
+
+
 def _ensure_sandbox_venv(sandbox: Path, setup_timeout: float = 120.0) -> str:
     """Create a venv in *sandbox*, install deps, and return the python executable path.
 
@@ -216,8 +241,11 @@ def run_impacted_tests(
     copy_filter: Optional[Iterable[str]] = None,
 ) -> TestRunOutcome:
     """Copy the project, apply patches, and run impacted tests under pytest."""
+    logger.info("codegen.test_runner: run_impacted_tests root=%s patches=%d timeout=%.0fs",
+                project_root, len(list(results)), timeout_seconds)
     src = Path(project_root).resolve()
     if not src.is_dir():
+        logger.warning("codegen.test_runner: project_root not a directory: %s", src)
         return TestRunOutcome(ran=False, skipped_reason=f"project_root not a directory: {src}")
 
     tmp = Path(tempfile.mkdtemp(prefix="averix_sandbox_"))
@@ -241,7 +269,7 @@ def run_impacted_tests(
         try:
             proc = subprocess.run(
                 cmd, cwd=sandbox, capture_output=True, text=True,
-                timeout=timeout_seconds,
+                timeout=timeout_seconds, env=_pytest_env(sandbox),
             )
         except FileNotFoundError:
             return TestRunOutcome(ran=False, sandbox_dir=str(sandbox), skipped_reason="pytest not installed")
@@ -251,12 +279,16 @@ def run_impacted_tests(
                 stdout=e.stdout or "", stderr=(e.stderr or "") + "\n[timeout]",
                 tests_selected=tests, sandbox_dir=str(sandbox),
             )
+        logger.info("codegen.test_runner: pytest done rc=%d tests=%d",
+                    proc.returncode, len(tests))
         return TestRunOutcome(
             ran=True, returncode=proc.returncode,
             stdout=proc.stdout, stderr=proc.stderr,
             tests_selected=tests, sandbox_dir=str(sandbox),
         )
     except Exception as e:
+        logger.warning("codegen.test_runner: sandbox run failed: %s: %s",
+                       type(e).__name__, e)
         return TestRunOutcome(ran=False, skipped_reason=f"{type(e).__name__}: {e}")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -281,6 +313,7 @@ def run_pytest_paths(
     try:
         proc = subprocess.run(
             cmd, cwd=root, capture_output=True, text=True, timeout=timeout_seconds,
+            env=_pytest_env(root),
         )
     except FileNotFoundError:
         return TestRunOutcome(ran=False, skipped_reason="pytest not installed")

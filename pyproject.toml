@@ -5,12 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "averix"
 version = "0.2.0"
-description = "Averix — local-first codebase RAG with hybrid retrieval and self-testing code generation."
+description = "Averix — local-first codebase RAG with hybrid retrieval, multi-agent orchestration (Planner / Tracker / Judge), manifest-driven project scaffolding, and self-testing code generation."
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [{name = "Ramin Mohammadi"}]
-keywords = ["rag", "codebase", "retrieval", "llm", "ollama", "code-generation", "averix"]
+keywords = ["rag", "codebase", "retrieval", "llm", "ollama", "code-generation", "scaffold", "multi-agent", "averix"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Developers",
@@ -74,13 +74,21 @@ cgx = "cgx.cli.main:main"
 averix-ui = "cgx.webui.launch:launch"
 
 [tool.setuptools.packages.find]
-where = ["src"]
+# Discover packages from both src/ (cgx and its subpackages) and the
+# repo root (skills/ — top-level pluggable technology bundles).
+where = ["src", "."]
+include = ["cgx*", "skills*"]
+exclude = ["tests*", "frontend*", "extension*", "docs*", "notebooks*",
+           "cgx_index*", "build*", "dist*"]
 
 [tool.setuptools.package-data]
 "cgx" = ["py.typed"]
 
 [tool.setuptools]
-package-dir = {"" = "src"}
+# Map each top-level package to its source directory explicitly. The
+# empty-string anchor was removed in favour of per-package mappings so
+# `skills` can live at the repo root alongside `src/`.
+package-dir = {"cgx" = "src/cgx", "skills" = "skills"}
 
 [tool.ruff]
 line-length = 100

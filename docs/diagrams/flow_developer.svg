@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1180 720" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace">
-  <!-- Averix · Developer Architecture: Planner → Tracker → Judge -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 1040" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace">
+  <!-- Averix · Developer Architecture: Planner → Tracker → Judge + Skills + Retry loop -->
   <defs>
     <linearGradient id="dbg" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0%" stop-color="#0f172a"/>
@@ -9,6 +9,10 @@
     <linearGradient id="moduleFill" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0%" stop-color="#1e293b"/>
       <stop offset="100%" stop-color="#0f172a"/>
+    </linearGradient>
+    <linearGradient id="retryFill" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1c1917"/>
+      <stop offset="100%" stop-color="#0c0a09"/>
     </linearGradient>
     <marker id="darrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
       <path d="M 0 0 L 10 5 L 0 10 z" fill="#34d399"/>
@@ -19,31 +23,34 @@
     <marker id="darrowPurple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
       <path d="M 0 0 L 10 5 L 0 10 z" fill="#a78bfa"/>
     </marker>
+    <marker id="darrowRed" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#f87171"/>
+    </marker>
     <marker id="darrowMuted" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
       <path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/>
     </marker>
   </defs>
-  <rect width="1180" height="720" fill="url(#dbg)"/>
+  <rect width="1280" height="1040" fill="url(#dbg)"/>
 
   <text x="40" y="44" font-family="Inter, sans-serif" font-size="22" font-weight="700" fill="#f1f5f9">Averix Agent Loop — Developer View</text>
-  <text x="40" y="66" font-family="Inter, sans-serif" font-size="12" fill="#94a3b8">cgx.agents.run_agent  ·  goal → Planner → Tracker → (capability + Judge)*  → SSE stream → React UI</text>
+  <text x="40" y="66" font-family="Inter, sans-serif" font-size="12" fill="#94a3b8">cgx.agents.run_agent  ·  goal → Planner (4-branch routing, skills attach) → Tracker → (capability + Judge)*  → SSE stream → React UI · failure-driven retry</text>
 
   <!-- UI side -->
   <g>
     <rect x="40" y="100" width="220" height="100" rx="12" fill="url(#moduleFill)" stroke="#38bdf8" stroke-width="2"/>
     <text x="60" y="124" font-size="13" font-weight="700" fill="#38bdf8">AgentPage.tsx</text>
     <text x="60" y="146" font-size="11" fill="#cbd5e1">POST /api/agent (goal, opts)</text>
-    <text x="60" y="164" font-size="11" fill="#cbd5e1">EventSource &lt;- SSE</text>
-    <text x="60" y="184" font-size="10" fill="#64748b">TaskRow {name, kind, status, elapsed}</text>
+    <text x="60" y="164" font-size="11" fill="#cbd5e1">EventSource &lt;- SSE  ·  Cancel btn</text>
+    <text x="60" y="184" font-size="10" fill="#64748b">tasks store · sessionStorage replay</text>
   </g>
 
   <!-- API / SSE bridge -->
   <g>
     <rect x="300" y="100" width="220" height="100" rx="12" fill="url(#moduleFill)" stroke="#94a3b8" stroke-width="2"/>
-    <text x="320" y="124" font-size="13" font-weight="700" fill="#cbd5e1">cgx.api server</text>
-    <text x="320" y="146" font-size="11" fill="#cbd5e1">SSE bridge (text/event-stream)</text>
-    <text x="320" y="164" font-size="11" fill="#cbd5e1">AgentEvent → SSE event lines</text>
-    <text x="320" y="184" font-size="10" fill="#64748b">heartbeat ping every ~15s</text>
+    <text x="320" y="124" font-size="13" font-weight="700" fill="#cbd5e1">cgx.webui  ·  SSE bridge</text>
+    <text x="320" y="146" font-size="11" fill="#cbd5e1">text/event-stream  ·  /api/tasks  ·  /api/rollback</text>
+    <text x="320" y="164" font-size="11" fill="#cbd5e1">task_store (SQLite) + cancel_event</text>
+    <text x="320" y="184" font-size="10" fill="#64748b">replay-on-remount · DELETE cancels</text>
   </g>
 
   <!-- run_agent -->
@@ -51,8 +58,17 @@
     <rect x="560" y="100" width="220" height="100" rx="12" fill="url(#moduleFill)" stroke="#a78bfa" stroke-width="2"/>
     <text x="580" y="124" font-size="13" font-weight="700" fill="#a78bfa">cgx.agents.loop</text>
     <text x="580" y="146" font-size="11" fill="#cbd5e1">run_agent(goal, ..., stream=True)</text>
-    <text x="580" y="164" font-size="11" fill="#cbd5e1">progress_interval=2.0s</text>
+    <text x="580" y="164" font-size="11" fill="#cbd5e1">progress_interval=2.0s · max_retries</text>
     <text x="580" y="184" font-size="10" fill="#64748b">wires Planner + Tracker + Judge</text>
+  </g>
+
+  <!-- Provider summary (Phase 5) -->
+  <g>
+    <rect x="820" y="100" width="420" height="100" rx="12" fill="url(#moduleFill)" stroke="#f472b6" stroke-width="2"/>
+    <text x="840" y="124" font-size="13" font-weight="700" fill="#f472b6">cgx.answer.providers  ·  uniform chat() / chat_stream()</text>
+    <text x="840" y="146" font-size="11" fill="#cbd5e1">OllamaProvider  ·  OpenAICompatProvider  ·  GeminiProvider  ·  custom</text>
+    <text x="840" y="164" font-size="11" fill="#cbd5e1">endpoint_path · allow_no_auth · rate_limit · max_retries</text>
+    <text x="840" y="184" font-size="10" fill="#64748b">POST /api/provider/ping → {ok, latency_ms, error}</text>
   </g>
 
   <!-- arrows UI -->
@@ -61,99 +77,192 @@
 
   <!-- Planner -->
   <g>
-    <rect x="40" y="240" width="320" height="160" rx="12" fill="url(#moduleFill)" stroke="#38bdf8" stroke-width="2"/>
-    <text x="60" y="266" font-size="14" font-weight="700" fill="#38bdf8">Planner  ·  cgx.agents.planner</text>
-    <text x="60" y="290" font-size="11" fill="#cbd5e1">LLM (strict JSON) or deterministic fallback</text>
-    <text x="60" y="308" font-size="11" fill="#cbd5e1">Schema: {name, description, kind, criteria}</text>
-    <text x="60" y="328" font-size="11" fill="#f59e0b">_enforce_kind_policy():</text>
-    <text x="60" y="344" font-size="10.5" fill="#cbd5e1">  read-only goal ⇒ downgrade plan → ask</text>
-    <text x="60" y="362" font-size="10.5" fill="#cbd5e1">  uses detect_intent + _CHANGE_VERB_RE</text>
-    <text x="60" y="384" font-size="10" fill="#64748b">_derive_name(): short title from first sentence</text>
+    <rect x="40" y="240" width="370" height="200" rx="12" fill="url(#moduleFill)" stroke="#38bdf8" stroke-width="2"/>
+    <text x="60" y="264" font-size="14" font-weight="700" fill="#38bdf8">Planner  ·  cgx.agents.planner</text>
+    <text x="60" y="284" font-size="11" fill="#cbd5e1">LLM (strict JSON) or deterministic fallback</text>
+    <text x="60" y="300" font-size="10.5" fill="#cbd5e1">Schema: {name, description, kind, criteria}</text>
+    <text x="60" y="316" font-size="10.5" fill="#cbd5e1">kind ∈ {ask, plan, scaffold, scaffold_manifest,</text>
+    <text x="60" y="330" font-size="10.5" fill="#cbd5e1">  scaffold_file, search, summarize, apply, verify, fill_logic}</text>
+    <text x="60" y="350" font-size="11" fill="#f59e0b">_enforce_kind_policy — 4 routing branches:</text>
+    <text x="60" y="366" font-size="10.5" fill="#cbd5e1">  SCAFFOLD → [scaffold_manifest, apply, verify]</text>
+    <text x="60" y="380" font-size="10.5" fill="#cbd5e1">    (manifest injects N scaffold_file tasks at runtime)</text>
+    <text x="60" y="394" font-size="10.5" fill="#cbd5e1">  VERIFY-ONLY · READ-ONLY (plan→ask) · CHANGE-GOAL</text>
+    <text x="60" y="412" font-size="10.5" fill="#cbd5e1">attaches task.inputs[goal, skills] to SCAFFOLD/PLAN</text>
+    <text x="60" y="428" font-size="10" fill="#64748b">[INFO] kind-policy branch + skills=[...] log line</text>
   </g>
 
   <!-- Tracker -->
   <g>
-    <rect x="430" y="240" width="320" height="160" rx="12" fill="url(#moduleFill)" stroke="#34d399" stroke-width="2"/>
-    <text x="450" y="266" font-size="14" font-weight="700" fill="#34d399">Tracker  ·  cgx.agents.tracker</text>
-    <text x="450" y="290" font-size="11" fill="#cbd5e1">stream(plan) → Iterator[AgentEvent]</text>
-    <text x="450" y="310" font-size="11" fill="#cbd5e1">capability runs in a worker thread</text>
-    <text x="450" y="328" font-size="11" fill="#f59e0b">every progress_interval (2s default):</text>
-    <text x="450" y="344" font-size="10.5" fill="#cbd5e1">  yield task_progress {task_id, elapsed}</text>
-    <text x="450" y="364" font-size="10.5" fill="#cbd5e1">on done: judge → task_done / task_failed</text>
-    <text x="450" y="384" font-size="10" fill="#64748b">stop_on_fail halts; otherwise skips downstream</text>
+    <rect x="450" y="240" width="370" height="200" rx="12" fill="url(#moduleFill)" stroke="#34d399" stroke-width="2"/>
+    <text x="470" y="264" font-size="14" font-weight="700" fill="#34d399">Tracker  ·  cgx.agents.tracker</text>
+    <text x="470" y="284" font-size="11" fill="#cbd5e1">stream(plan) → Iterator[AgentEvent]</text>
+    <text x="470" y="300" font-size="11" fill="#cbd5e1">capability runs in a worker thread</text>
+    <text x="470" y="320" font-size="11" fill="#f59e0b">every progress_interval (2s default):</text>
+    <text x="470" y="336" font-size="10.5" fill="#cbd5e1">  yield task_progress {task_id, elapsed}</text>
+    <text x="470" y="356" font-size="11" fill="#f59e0b">after each apply:</text>
+    <text x="470" y="372" font-size="10.5" fill="#cbd5e1">  updates plan.owned_files[path] = applied|failed</text>
+    <text x="470" y="392" font-size="10.5" fill="#cbd5e1">on done: judge → task_done | task_failed | task_skipped</text>
+    <text x="470" y="412" font-size="10.5" fill="#cbd5e1">stop_on_fail halts; otherwise skips downstream</text>
+    <text x="470" y="428" font-size="10" fill="#64748b">8 AgentEvent kinds streamed as SSE</text>
   </g>
 
   <!-- Judge -->
   <g>
-    <rect x="820" y="240" width="320" height="160" rx="12" fill="url(#moduleFill)" stroke="#a78bfa" stroke-width="2"/>
-    <text x="840" y="266" font-size="14" font-weight="700" fill="#a78bfa">Judge  ·  cgx.agents.judge</text>
-    <text x="840" y="290" font-size="11" fill="#cbd5e1">Structural short-circuits first:</text>
-    <text x="840" y="308" font-size="10.5" fill="#cbd5e1">  PLAN: needs fenced diff in plan_md</text>
-    <text x="840" y="324" font-size="10.5" fill="#cbd5e1">  SEARCH: pass when hits &gt; 0 (skip LLM)</text>
-    <text x="840" y="340" font-size="10.5" fill="#cbd5e1">  ASK: fail when answer empty</text>
-    <text x="840" y="362" font-size="11" fill="#f59e0b">LLM verdict (when needed):</text>
-    <text x="840" y="380" font-size="10.5" fill="#cbd5e1">  {verdict, confidence, rationale} JSON</text>
+    <rect x="860" y="240" width="380" height="200" rx="12" fill="url(#moduleFill)" stroke="#a78bfa" stroke-width="2"/>
+    <text x="880" y="264" font-size="14" font-weight="700" fill="#a78bfa">Judge  ·  cgx.agents.judge</text>
+    <text x="880" y="284" font-size="11" fill="#cbd5e1">Structural short-circuits per kind:</text>
+    <text x="880" y="300" font-size="10.5" fill="#cbd5e1">  ASK: fail when answer_md empty</text>
+    <text x="880" y="316" font-size="10.5" fill="#cbd5e1">  PLAN: needs plan_md or diffs · skills.validate_plan</text>
+    <text x="880" y="332" font-size="10.5" fill="#cbd5e1">  SCAFFOLD: skills.validate_scaffold → pass short-circuit</text>
+    <text x="880" y="348" font-size="10.5" fill="#cbd5e1">  SEARCH: pass when hits &gt; 0  (LLM skipped)</text>
+    <text x="880" y="364" font-size="10.5" fill="#cbd5e1">  APPLY: pass when failed_files empty (partial OK)</text>
+    <text x="880" y="380" font-size="10.5" fill="#cbd5e1">  VERIFY: trust pytest returncode</text>
+    <text x="880" y="400" font-size="11" fill="#f59e0b">LLM verdict (when needed):</text>
+    <text x="880" y="416" font-size="10.5" fill="#cbd5e1">  scaffold render: plan_md + files + preview (≤7.5k)</text>
+    <text x="880" y="430" font-size="10" fill="#64748b">{verdict, confidence, rationale} JSON  ·  [skill] prefix on fail</text>
   </g>
 
   <!-- Flow arrows between Planner -> Tracker -> Judge -->
-  <line x1="360" y1="320" x2="428" y2="320" stroke="#34d399" stroke-width="2" marker-end="url(#darrow)"/>
-  <line x1="750" y1="320" x2="818" y2="320" stroke="#a78bfa" stroke-width="2" marker-end="url(#darrowPurple)"/>
-  <line x1="980" y1="400" x2="980" y2="430" stroke="#a78bfa" stroke-width="2" marker-end="url(#darrowPurple)"/>
-  <line x1="980" y1="430" x2="590" y2="430" stroke="#a78bfa" stroke-width="2" stroke-dasharray="6 4"/>
-  <line x1="590" y1="430" x2="590" y2="400" stroke="#a78bfa" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#darrowPurple)"/>
-  <text x="700" y="448" font-size="10" fill="#a78bfa" font-family="Inter, sans-serif">verdict feeds next task</text>
+  <line x1="410" y1="330" x2="448" y2="330" stroke="#34d399" stroke-width="2" marker-end="url(#darrow)"/>
+  <line x1="820" y1="330" x2="858" y2="330" stroke="#a78bfa" stroke-width="2" marker-end="url(#darrowPurple)"/>
+  <!-- Judge → Tracker feedback (verdict feeds next task) -->
+  <path d="M 1050 440 L 1050 462 L 635 462 L 635 442" fill="none" stroke="#a78bfa" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#darrowPurple)"/>
+  <text x="780" y="458" font-size="10" fill="#a78bfa" font-family="Inter, sans-serif">verdict feeds next task</text>
 
-  <!-- Capabilities row -->
-  <text x="40" y="490" font-size="13" font-weight="700" fill="#cbd5e1" font-family="Inter, sans-serif">Capabilities (dispatched by task.kind)</text>
-  <line x1="40" y1="500" x2="1140" y2="500" stroke="#1e293b"/>
+  <!-- Skills banner -->
   <g>
-    <rect x="40"  y="520" width="260" height="80" rx="10" fill="#0b1220" stroke="#34d399" stroke-opacity="0.6"/>
-    <text x="58" y="544" font-size="12" font-weight="700" fill="#34d399">search</text>
-    <text x="58" y="564" font-size="10.5" fill="#cbd5e1">cgx.pipeline.auto.run_query_auto</text>
-    <text x="58" y="582" font-size="10" fill="#64748b">→ {hits, top_files, impact}</text>
+    <rect x="40" y="478" width="1200" height="46" rx="10" fill="#0b1220" stroke="#f472b6" stroke-opacity="0.6"/>
+    <text x="60" y="500" font-size="12" font-weight="700" fill="#f472b6" font-family="Inter, sans-serif">skills/ package</text>
+    <text x="170" y="500" font-size="11" fill="#cbd5e1">react · nextjs · vue · tailwind · fastapi · flask · django · express · python_cli · sqlite</text>
+    <text x="60" y="516" font-size="10.5" fill="#94a3b8">detect_skills(goal) → compose_scaffold_prompt / compose_plan_prompt · validate_scaffold / validate_plan (returns SkillVerdict)</text>
+  </g>
+
+  <!-- Capabilities (dispatched by task.kind) -->
+  <text x="40" y="554" font-size="13" font-weight="700" fill="#cbd5e1" font-family="Inter, sans-serif">Capabilities (dispatched by task.kind)</text>
+  <line x1="40" y1="562" x2="1240" y2="562" stroke="#1e293b"/>
+
+  <!-- Row 1: search · ask · plan · scaffold -->
+  <g>
+    <rect x="40"  y="572" width="290" height="86" rx="10" fill="#0b1220" stroke="#34d399" stroke-opacity="0.6"/>
+    <text x="58" y="596" font-size="12" font-weight="700" fill="#34d399">search</text>
+    <text x="58" y="616" font-size="10.5" fill="#cbd5e1">cgx.pipeline.auto.run_query_auto</text>
+    <text x="58" y="634" font-size="10" fill="#94a3b8">parallel intent + impl ANN  ·  RRF</text>
+    <text x="58" y="650" font-size="10" fill="#64748b">→ {hits, top_files, impact}</text>
   </g>
   <g>
-    <rect x="320" y="520" width="260" height="80" rx="10" fill="#0b1220" stroke="#38bdf8" stroke-opacity="0.6"/>
-    <text x="338" y="544" font-size="12" font-weight="700" fill="#38bdf8">ask</text>
-    <text x="338" y="564" font-size="10.5" fill="#cbd5e1">cgx.answer.engine.answer_with_llm</text>
-    <text x="338" y="582" font-size="10" fill="#64748b">→ {answer_md, citations}</text>
+    <rect x="350" y="572" width="290" height="86" rx="10" fill="#0b1220" stroke="#38bdf8" stroke-opacity="0.6"/>
+    <text x="368" y="596" font-size="12" font-weight="700" fill="#38bdf8">ask</text>
+    <text x="368" y="616" font-size="10.5" fill="#cbd5e1">cgx.answer.engine.answer_with_llm</text>
+    <text x="368" y="634" font-size="10" fill="#94a3b8">intent-conditioned system prompts</text>
+    <text x="368" y="650" font-size="10" fill="#64748b">→ {answer_md, citations}</text>
   </g>
   <g>
-    <rect x="600" y="520" width="260" height="80" rx="10" fill="#0b1220" stroke="#f59e0b" stroke-opacity="0.6"/>
-    <text x="618" y="544" font-size="12" font-weight="700" fill="#f59e0b">plan</text>
-    <text x="618" y="564" font-size="10.5" fill="#cbd5e1">cgx.answer.engine.generate_code_plan</text>
-    <text x="618" y="582" font-size="10" fill="#64748b">→ {plan_md, diffs, codegen_report}</text>
+    <rect x="660" y="572" width="290" height="86" rx="10" fill="#0b1220" stroke="#f59e0b" stroke-opacity="0.6"/>
+    <text x="678" y="596" font-size="12" font-weight="700" fill="#f59e0b">plan</text>
+    <text x="678" y="616" font-size="10.5" fill="#cbd5e1">cgx.answer.engine.generate_code_plan</text>
+    <text x="678" y="634" font-size="10" fill="#94a3b8">+ symbol_map context · skills= prompts</text>
+    <text x="678" y="650" font-size="10" fill="#64748b">→ {plan_md, diffs, codegen_report}</text>
   </g>
   <g>
-    <rect x="880" y="520" width="260" height="80" rx="10" fill="#0b1220" stroke="#a78bfa" stroke-opacity="0.6"/>
-    <text x="898" y="544" font-size="12" font-weight="700" fill="#a78bfa">summarize</text>
-    <text x="898" y="564" font-size="10.5" fill="#cbd5e1">LLM over prior task outputs</text>
-    <text x="898" y="582" font-size="10" fill="#64748b">→ {answer_md}</text>
+    <rect x="970" y="572" width="270" height="86" rx="10" fill="#0b1220" stroke="#f472b6" stroke-opacity="0.7"/>
+    <text x="988" y="596" font-size="12" font-weight="700" fill="#f472b6">scaffold_manifest → scaffold_file × N</text>
+    <text x="988" y="616" font-size="10.5" fill="#cbd5e1">manifest: plan_scaffold_manifest(idea)</text>
+    <text x="988" y="634" font-size="10" fill="#94a3b8">per file: generate_single_scaffold_file()</text>
+    <text x="988" y="650" font-size="10" fill="#64748b">tracker injects 1 SCAFFOLD_FILE per layer file</text>
+  </g>
+
+  <!-- Row 2: summarize · apply · verify · fill_logic -->
+  <g>
+    <rect x="40"  y="672" width="290" height="86" rx="10" fill="#0b1220" stroke="#a78bfa" stroke-opacity="0.6"/>
+    <text x="58" y="696" font-size="12" font-weight="700" fill="#a78bfa">summarize</text>
+    <text x="58" y="716" font-size="10.5" fill="#cbd5e1">LLM over prior task outputs</text>
+    <text x="58" y="734" font-size="10" fill="#94a3b8">composes a final report</text>
+    <text x="58" y="750" font-size="10" fill="#64748b">→ {answer_md}</text>
+  </g>
+  <g>
+    <rect x="350" y="672" width="290" height="86" rx="10" fill="#0b1220" stroke="#22d3ee" stroke-opacity="0.7"/>
+    <text x="368" y="696" font-size="12" font-weight="700" fill="#22d3ee">apply</text>
+    <text x="368" y="716" font-size="10.5" fill="#cbd5e1">cgx.codegen.disk_apply.apply_diffs_to_disk</text>
+    <text x="368" y="734" font-size="10" fill="#94a3b8">partial-apply + cross-file coherence · backup dir</text>
+    <text x="368" y="750" font-size="10" fill="#64748b">→ {applied_files, failed_files, smoke_ok, backup_dir}</text>
+  </g>
+  <g>
+    <rect x="660" y="672" width="290" height="86" rx="10" fill="#0b1220" stroke="#84cc16" stroke-opacity="0.7"/>
+    <text x="678" y="696" font-size="12" font-weight="700" fill="#84cc16">verify</text>
+    <text x="678" y="716" font-size="10.5" fill="#cbd5e1">env_manager.preflight_install → pytest</text>
+    <text x="678" y="734" font-size="10" fill="#94a3b8">missing pkgs auto-installed + req.txt</text>
+    <text x="678" y="750" font-size="10" fill="#64748b">→ {ran, tests_passed, returncode}</text>
+  </g>
+  <g>
+    <rect x="970" y="672" width="270" height="86" rx="10" fill="#0b1220" stroke="#fb923c" stroke-opacity="0.7"/>
+    <text x="988" y="696" font-size="12" font-weight="700" fill="#fb923c">fill_logic</text>
+    <text x="988" y="716" font-size="10.5" fill="#cbd5e1">stitches one function body at a time</text>
+    <text x="988" y="734" font-size="10" fill="#94a3b8">regex matches pass / # TODO  ·  ast.parse</text>
+    <text x="988" y="750" font-size="10" fill="#64748b">→ {applied, syntax_ok}</text>
+  </g>
+
+  <!-- Retry loop section -->
+  <g>
+    <rect x="40" y="780" width="1200" height="160" rx="12" fill="url(#retryFill)" stroke="#f87171" stroke-width="2"/>
+    <text x="60" y="804" font-size="13" font-weight="700" fill="#f87171" font-family="Inter, sans-serif">Failure-driven retry  ·  cgx.agents.loop._stream_with_retry  ·  recurses up to max_retries</text>
+
+    <!-- sub: verify -->
+    <g>
+      <rect x="60" y="820" width="370" height="100" rx="10" fill="#0b1220" stroke="#f87171" stroke-opacity="0.6"/>
+      <text x="78" y="842" font-size="11" font-weight="700" fill="#f87171">verify failure</text>
+      <text x="78" y="860" font-size="10.5" fill="#cbd5e1">_diagnose_failure → import / syntax / logic</text>
+      <text x="78" y="876" font-size="10.5" fill="#cbd5e1">_extract_error_snippet — ±5 line window</text>
+      <text x="78" y="892" font-size="10.5" fill="#cbd5e1">  with `# &lt;-- ERROR HERE` (10-line buffer)</text>
+      <text x="78" y="908" font-size="10" fill="#94a3b8">_build_fix_goal names broken files only</text>
+    </g>
+
+    <!-- sub: apply -->
+    <g>
+      <rect x="450" y="820" width="370" height="100" rx="10" fill="#0b1220" stroke="#22d3ee" stroke-opacity="0.6"/>
+      <text x="468" y="842" font-size="11" font-weight="700" fill="#22d3ee">apply failure</text>
+      <text x="468" y="860" font-size="10.5" fill="#cbd5e1">smoke / cross-file coherence rejected</text>
+      <text x="468" y="876" font-size="10.5" fill="#cbd5e1">regenerate only failed_files</text>
+      <text x="468" y="892" font-size="10.5" fill="#cbd5e1">passing files already on disk (partial apply)</text>
+      <text x="468" y="908" font-size="10" fill="#94a3b8">plan.owned_files = "applied" | "failed"</text>
+    </g>
+
+    <!-- sub: codegen -->
+    <g>
+      <rect x="840" y="820" width="380" height="100" rx="10" fill="#0b1220" stroke="#f59e0b" stroke-opacity="0.6"/>
+      <text x="858" y="842" font-size="11" font-weight="700" fill="#f59e0b">scaffold / plan judge fail</text>
+      <text x="858" y="860" font-size="10.5" fill="#cbd5e1">_build_core_fix_goal re-asks LLM</text>
+      <text x="858" y="876" font-size="10.5" fill="#cbd5e1">SCAFFOLD: tech-mismatch hard-fail still applies</text>
+      <text x="858" y="892" font-size="10.5" fill="#cbd5e1">PLAN: skill.validate_plan can short-circuit</text>
+      <text x="858" y="908" font-size="10" fill="#94a3b8">re-routes through Planner → Tracker → Judge</text>
+    </g>
   </g>
 
   <!-- Event timeline -->
-  <text x="40" y="635" font-size="13" font-weight="700" fill="#cbd5e1" font-family="Inter, sans-serif">SSE event stream (per task)</text>
-  <line x1="40" y1="645" x2="1140" y2="645" stroke="#1e293b"/>
+  <text x="40" y="966" font-size="13" font-weight="700" fill="#cbd5e1" font-family="Inter, sans-serif">SSE event stream (per task)</text>
+  <line x1="40" y1="974" x2="1240" y2="974" stroke="#1e293b"/>
   <g font-size="11" font-family="JetBrains Mono, monospace">
-    <rect x="40"  y="665" width="100" height="30" rx="6" fill="#0b1220" stroke="#38bdf8"/>
-    <text x="90" y="685" text-anchor="middle" fill="#38bdf8">plan</text>
-    <rect x="170" y="665" width="120" height="30" rx="6" fill="#0b1220" stroke="#34d399"/>
-    <text x="230" y="685" text-anchor="middle" fill="#34d399">task_start</text>
-    <rect x="320" y="665" width="160" height="30" rx="6" fill="#0b1220" stroke="#f59e0b"/>
-    <text x="400" y="685" text-anchor="middle" fill="#f59e0b">task_progress · Nx</text>
-    <rect x="510" y="665" width="100" height="30" rx="6" fill="#0b1220" stroke="#a78bfa"/>
-    <text x="560" y="685" text-anchor="middle" fill="#a78bfa">judge</text>
-    <rect x="640" y="665" width="120" height="30" rx="6" fill="#0b1220" stroke="#34d399"/>
-    <text x="700" y="685" text-anchor="middle" fill="#34d399">task_done</text>
-    <rect x="790" y="665" width="120" height="30" rx="6" fill="#0b1220" stroke="#f87171"/>
-    <text x="850" y="685" text-anchor="middle" fill="#f87171">task_failed?</text>
-    <rect x="940" y="665" width="100" height="30" rx="6" fill="#0b1220" stroke="#a78bfa"/>
-    <text x="990" y="685" text-anchor="middle" fill="#a78bfa">summary</text>
-    <line x1="140" y1="680" x2="168" y2="680" stroke="#475569" stroke-width="1.5" marker-end="url(#darrowMuted)"/>
-    <line x1="290" y1="680" x2="318" y2="680" stroke="#475569" stroke-width="1.5" marker-end="url(#darrowMuted)"/>
-    <line x1="480" y1="680" x2="508" y2="680" stroke="#475569" stroke-width="1.5" marker-end="url(#darrowMuted)"/>
-    <line x1="610" y1="680" x2="638" y2="680" stroke="#475569" stroke-width="1.5" marker-end="url(#darrowMuted)"/>
-    <line x1="760" y1="680" x2="788" y2="680" stroke="#475569" stroke-width="1.5" marker-end="url(#darrowMuted)"/>
-    <line x1="910" y1="680" x2="938" y2="680" stroke="#475569" stroke-width="1.5" marker-end="url(#darrowMuted)"/>
+    <rect x="40"  y="990" width="80"  height="30" rx="6" fill="#0b1220" stroke="#38bdf8"/>
+    <text x="80" y="1010" text-anchor="middle" fill="#38bdf8">plan</text>
+    <rect x="140" y="990" width="110" height="30" rx="6" fill="#0b1220" stroke="#34d399"/>
+    <text x="195" y="1010" text-anchor="middle" fill="#34d399">task_start</text>
+    <rect x="270" y="990" width="160" height="30" rx="6" fill="#0b1220" stroke="#f59e0b"/>
+    <text x="350" y="1010" text-anchor="middle" fill="#f59e0b">task_progress · Nx</text>
+    <rect x="450" y="990" width="80"  height="30" rx="6" fill="#0b1220" stroke="#a78bfa"/>
+    <text x="490" y="1010" text-anchor="middle" fill="#a78bfa">judge</text>
+    <rect x="550" y="990" width="110" height="30" rx="6" fill="#0b1220" stroke="#34d399"/>
+    <text x="605" y="1010" text-anchor="middle" fill="#34d399">task_done</text>
+    <rect x="680" y="990" width="120" height="30" rx="6" fill="#0b1220" stroke="#94a3b8"/>
+    <text x="740" y="1010" text-anchor="middle" fill="#cbd5e1">task_skipped</text>
+    <rect x="820" y="990" width="120" height="30" rx="6" fill="#0b1220" stroke="#f87171"/>
+    <text x="880" y="1010" text-anchor="middle" fill="#f87171">task_failed?</text>
+    <rect x="960" y="990" width="100" height="30" rx="6" fill="#0b1220" stroke="#a78bfa"/>
+    <text x="1010" y="1010" text-anchor="middle" fill="#a78bfa">summary</text>
+    <line x1="120" y1="1005" x2="138" y2="1005" stroke="#475569" stroke-width="1.5" marker-end="url(#darrowMuted)"/>
+    <line x1="250" y1="1005" x2="268" y2="1005" stroke="#475569" stroke-width="1.5" marker-end="url(#darrowMuted)"/>
+    <line x1="430" y1="1005" x2="448" y2="1005" stroke="#475569" stroke-width="1.5" marker-end="url(#darrowMuted)"/>
+    <line x1="530" y1="1005" x2="548" y2="1005" stroke="#475569" stroke-width="1.5" marker-end="url(#darrowMuted)"/>
+    <line x1="660" y1="1005" x2="678" y2="1005" stroke="#475569" stroke-width="1.5" marker-end="url(#darrowMuted)"/>
+    <line x1="800" y1="1005" x2="818" y2="1005" stroke="#475569" stroke-width="1.5" marker-end="url(#darrowMuted)"/>
+    <line x1="940" y1="1005" x2="958" y2="1005" stroke="#475569" stroke-width="1.5" marker-end="url(#darrowMuted)"/>
   </g>
 </svg>

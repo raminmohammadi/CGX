@@ -71,54 +71,7 @@ def _import_hybrid():
 
 
 # ---------- minimal embedder loader (ST first, HF fallback) ----------
-def _load_embedder(model_name: str):
-    """
-    Returns an object with .encode(list[str]) -> np.ndarray[float32].
-    Prefers Sentence-Transformers if available; else uses Transformers CLS/mean pooling.
-    """
-    try:
-        from sentence_transformers import SentenceTransformer
-        # trust_remote_code is required for models like jina-embeddings-v2-*
-        # which ship a custom BERT (GLU MLP + ALiBi). Without it the encoder
-        # weights are random-initialized and all inputs collapse to the same
-        # vector.
-        try:
-            m = SentenceTransformer(model_name, trust_remote_code=True)
-        except TypeError:
-            m = SentenceTransformer(model_name)
-        class _ST:
-            def encode(self, texts: List[str]):
-                import numpy as np
-                vecs = m.encode(texts, show_progress_bar=False, convert_to_numpy=True, normalize_embeddings=False)
-                return vecs.astype("float32", copy=False)
-        logger.info("Embedder: sentence-transformers (%s)", model_name)
-        return _ST()
-    except Exception:
-        pass
-
-    from transformers import AutoTokenizer, AutoModel
-    import torch, numpy as np
-    tok = AutoTokenizer.from_pretrained(model_name, use_fast=True, trust_remote_code=True)
-    mdl = AutoModel.from_pretrained(model_name, trust_remote_code=True)
-    mdl.eval()
-    device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
-    mdl.to(device)
-
-    def _encode(texts: List[str]):
-        with torch.no_grad():
-            t = tok(texts, padding=True, truncation=True, max_length=512, return_tensors="pt").to(device)
-            out = mdl(**t)
-            # simple mean pooling with attention mask
-            hidden = out.last_hidden_state
-            mask = t["attention_mask"].unsqueeze(-1).expand(hidden.size()).float()
-            summed = (hidden * mask).sum(dim=1)
-            counts = mask.sum(dim=1).clamp(min=1e-9)
-            vec = (summed / counts).cpu().numpy().astype("float32", copy=False)
-            return vec
-    class _HF:
-        def encode(self, texts: List[str]): return _encode(texts)
-    logger.info("Embedder: transformers (%s)", model_name)
-    return _HF()
+from cgx.embeddings.loader import load_embedder_from_model as _load_embedder
 
 
 # ---------- tiny printer ----------

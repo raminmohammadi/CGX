@@ -3,16 +3,19 @@
 This module is intentionally dependency-light: a single ``requests`` call
 against ``GET /api/tags`` to list installed models, and a small static
 catalogue mapping VRAM/RAM hints to a recommended ladder. It returns plain
-dicts so the Gradio UI can render them without extra coupling.
+dicts so the web UI can render them without extra coupling.
 """
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_BASE_URL = "http://localhost:11434"
 DEFAULT_TIMEOUT = float(os.environ.get("CGX_OLLAMA_DISCOVERY_TIMEOUT", "3.0"))
@@ -36,7 +39,9 @@ def list_installed_models(base_url: str = DEFAULT_BASE_URL) -> List[Dict[str, An
         r = requests.get(url, timeout=DEFAULT_TIMEOUT)
         r.raise_for_status()
         data = r.json()
-    except Exception:
+    except Exception as e:
+        logger.info("ollama_discovery: list_installed_models %s unreachable: %s: %s",
+                    url, type(e).__name__, e)
         return []
     models = data.get("models") if isinstance(data, dict) else None
     if not isinstance(models, list):
@@ -80,8 +85,8 @@ def _detect_total_ram_gb() -> Optional[float]:
                     if line.startswith("MemTotal:"):
                         kb = int(line.split()[1])
                         return round(kb / (1024.0 * 1024.0), 1)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.info("ollama_discovery: RAM probe failed: %s: %s", type(e).__name__, e)
     return None
 
 
@@ -101,7 +106,8 @@ def _detect_gpu_vram_gb() -> Optional[float]:
         if not vals:
             return None
         return round(max(vals) / 1024.0, 1)
-    except Exception:
+    except Exception as e:
+        logger.info("ollama_discovery: VRAM probe failed: %s: %s", type(e).__name__, e)
         return None
 
 

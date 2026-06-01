@@ -224,3 +224,39 @@ def test_run_pytest_paths_executes_discovered_tests(tmp_path: Path) -> None:
     assert outcome.ran
     assert outcome.returncode == 0
     assert outcome.tests_selected == discovered
+
+
+def test_run_pytest_paths_resolves_first_party_imports_without_packaging(
+    tmp_path: Path,
+) -> None:
+    """A freshly-scaffolded project with ``backend/`` + ``tests/`` and no
+    ``pyproject.toml`` / ``conftest.py`` must still import its own modules
+    under pytest. ``run_pytest_paths`` should set ``PYTHONPATH`` so
+    ``from backend.calculator import …`` resolves.
+    """
+    pytest.importorskip("pytest")
+    (tmp_path / "backend").mkdir()
+    (tmp_path / "backend" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "backend" / "calculator.py").write_text(
+        "def add(a, b):\n    return a + b\n", encoding="utf-8",
+    )
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_calculator.py").write_text(
+        textwrap.dedent(
+            """
+            from backend.calculator import add
+
+            def test_add():
+                assert add(2, 3) == 5
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    discovered = discover_all_tests(str(tmp_path))
+    outcome = run_pytest_paths(str(tmp_path), discovered, timeout_seconds=60.0)
+    assert outcome.ran
+    assert outcome.returncode == 0, (
+        f"pytest should import backend.* via PYTHONPATH; "
+        f"stdout={outcome.stdout!r} stderr={outcome.stderr!r}"
+    )

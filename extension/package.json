@@ -32,8 +32,8 @@
       "properties": {
         "averix.ui.url": {
           "type": "string",
-          "default": "http://localhost:7860",
-          "description": "URL of the running Averix Gradio UI. Start the server with `averix-ui` or `python app.py` before opening the panel."
+          "default": "http://localhost:8765",
+          "description": "URL of the running Averix web UI. Start the server with `averix-ui` or `python app.py` before opening the panel."
         }
       }
     }

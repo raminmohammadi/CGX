@@ -25,7 +25,7 @@ from cgx.codegen.diff_apply import (
     apply_diffs_in_memory,
     parse_fenced_diffs,
 )
-from cgx.codegen.validate import validate_patch_results
+from cgx.codegen.validate import check_cross_file_coherence, validate_patch_results
 
 logger = logging.getLogger(__name__)
 
@@ -154,10 +154,15 @@ def apply_diffs_to_disk(
                 "backup_dir": None, "smoke_ok": False,
                 "error": "no parseable diffs"}
 
-    # Step 1: in-memory apply + syntax validation (smoke test).
+    # Step 1: in-memory apply + syntax validation (smoke test) + cross-file coherence.
     patches = apply_diffs_in_memory(str(root), targets, allow_new_files=allow_new_files)
     diagnostics = validate_patch_results(patches)
+    coherence_issues = check_cross_file_coherence(patches, project_root=str(root))
+    # Merge coherence issues into the per-path diagnostic map; they take
+    # precedence over a "ok" structural diagnostic for the same file.
     diag_by_path = {d.path: d for d in diagnostics}
+    for ci in coherence_issues:
+        diag_by_path[ci.path] = ci
 
     failed_files: List[Dict[str, str]] = []
     for p in patches:
@@ -172,22 +177,26 @@ def apply_diffs_to_disk(
             })
 
     if failed_files:
-        logger.warning("apply_diffs_to_disk: smoke test failed for %d file(s); not writing",
-                       len(failed_files))
-        return {
-            "applied_files": [], "failed_files": failed_files,
-            "diffs": deduped_diffs, "backup_dir": None, "smoke_ok": False,
-        }
+        logger.warning(
+            "apply_diffs_to_disk: smoke test failed for %d file(s); "
+            "writing %d passing file(s) and reporting partial failure",
+            len(failed_files),
+            sum(1 for p in patches if p.ok and p.new_content is not None
+                and p.path not in {f["file"] for f in failed_files}),
+        )
 
-    # Step 2: prepare a backup mirror.
+    # Step 2: prepare a backup mirror (always, so passing files are safely backed up).
     run_id = time.strftime("%Y%m%d-%H%M%S")
     backup_dir = root / backup_root / run_id
     backup_dir.mkdir(parents=True, exist_ok=True)
 
+    failed_paths = {f["file"] for f in failed_files}
     applied: List[str] = []
     for p in patches:
         if not p.ok or p.new_content is None:
             continue
+        if p.path in failed_paths:
+            continue  # skip files that failed smoke check
         rel = _normalize_rel(p.path, root)
         if rel is None:
             failed_files.append({"file": p.path,
@@ -217,7 +226,7 @@ def apply_diffs_to_disk(
         "applied_files": applied, "failed_files": failed_files,
         "diffs": deduped_diffs, "backup_dir": str(backup_dir),
         "project_tree": _build_file_tree(applied),
-        "smoke_ok": True,
+        "smoke_ok": len(failed_files) == 0,
     }
 
 

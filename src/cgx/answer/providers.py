@@ -1,13 +1,17 @@
 # src/cgx/answer/providers.py
 from __future__ import annotations
+import logging
 import os
 import json
+import re
 from typing import Any, Dict, Iterator, List, Optional
 import requests  # intentionally re-exported; UI imports this to ensure dependency
 
 from cgx.answer.ratelimit import RateLimiter, request_with_retry
 
 DEFAULT_TIMEOUT = float(os.environ.get("CGX_HTTP_TIMEOUT", "120"))
+
+logger = logging.getLogger(__name__)
 
 
 def _build_limiter(rate_limit: Optional[float]) -> Optional[RateLimiter]:
@@ -177,6 +181,190 @@ class OllamaProvider(LLMProvider):
             yield f"\n[stream error: {type(e).__name__}: {e}]"
 
 
+class GeminiProvider(LLMProvider):
+    """Google Gemini via the official REST API (generativelanguage.googleapis.com).
+
+    Maps Averix's internal ``messages`` format to Gemini's ``contents`` +
+    ``systemInstruction`` format so the orchestration layer stays provider-agnostic.
+    """
+
+    _BASE = "https://generativelanguage.googleapis.com/v1beta/models"
+
+    def __init__(
+        self,
+        model: str = "gemini-2.5-flash",
+        api_key: str = "",
+        timeout: float = DEFAULT_TIMEOUT,
+        rate_limit: Optional[float] = None,
+        max_retries: int = 3,
+    ) -> None:
+        self.model = model
+        self.api_key = api_key or os.environ.get("GEMINI_API_KEY") or ""
+        self.timeout = timeout
+        self._limiter = _build_limiter(rate_limit)
+        self._max_retries = max(0, int(max_retries))
+
+    def _url(self, method: str = "generateContent") -> str:
+        return f"{self._BASE}/{self.model}:{method}?key={self.api_key}"
+
+    @staticmethod
+    def _map_messages(
+        messages: List[Dict[str, str]],
+    ) -> tuple:
+        """Split Averix messages into (system_text, gemini_contents)."""
+        system_parts: List[str] = []
+        contents: List[Dict] = []
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            if role == "system":
+                system_parts.append(content)
+            else:
+                gemini_role = "user" if role == "user" else "model"
+                # Merge consecutive same-role turns (Gemini requires alternating).
+                if contents and contents[-1]["role"] == gemini_role:
+                    contents[-1]["parts"][0]["text"] += "\n" + content
+                else:
+                    contents.append({"role": gemini_role, "parts": [{"text": content}]})
+        return "\n\n".join(system_parts), contents
+
+    def chat(
+        self,
+        messages: List[Dict[str, str]],
+        temperature: float = 0.2,
+        max_tokens: Optional[int] = None,
+        force_json: bool = True,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        system_text, contents = self._map_messages(messages)
+        body: Dict[str, Any] = {
+            "contents": contents,
+            "generationConfig": {"temperature": float(temperature)},
+        }
+        if system_text:
+            body["systemInstruction"] = {"parts": [{"text": system_text}]}
+        if max_tokens:
+            body["generationConfig"]["maxOutputTokens"] = int(max_tokens)
+        if force_json:
+            # Gemini supports constrained JSON output via responseMimeType.
+            body["generationConfig"]["responseMimeType"] = "application/json"
+
+        resp = request_with_retry(
+            lambda: requests.post(self._url(), json=body, timeout=self.timeout),
+            limiter=self._limiter,
+            max_retries=self._max_retries,
+        )
+        try:
+            resp.raise_for_status()
+        except Exception as e:
+            return {
+                "content": "",
+                "error": f"Gemini HTTP {resp.status_code}: {self._scrub_secret(str(e))}",
+                "raw": getattr(resp, "text", ""),
+            }
+        data = resp.json()
+        content = ""
+        try:
+            content = data["candidates"][0]["content"]["parts"][0]["text"]
+        except Exception:
+            pass
+        result: Dict[str, Any] = {
+            "content": content, "provider": "gemini", "model": self.model, "raw": data,
+        }
+        if not content:
+            reason = self._diagnose_empty_response(data)
+            if reason:
+                logger.warning("Gemini returned empty content: %s", reason)
+                result["error"] = reason
+        return result
+
+    @staticmethod
+    def _scrub_secret(text: str) -> str:
+        """Redact ``key=<value>`` query parameters so the API key never appears
+        in logs or error payloads. Matches Gemini's URL-style key parameter
+        until the next ``&``, whitespace, or end-of-string."""
+        if not text:
+            return text
+        return re.sub(r"([?&]key=)[^&\s]+", r"\1<redacted>", text)
+
+    @staticmethod
+    def _diagnose_empty_response(data: Any) -> str:
+        """Return a human-readable reason when the Gemini response carries no text.
+
+        Inspects the documented Gemini error/feedback shapes — top-level
+        ``error.message``, ``promptFeedback.blockReason``, the candidate's
+        ``finishReason`` (``SAFETY`` / ``MAX_TOKENS`` / ``RECITATION`` /
+        ``OTHER``), and any non-``NEGLIGIBLE`` ``safetyRatings`` — so the
+        caller can surface why the call produced no content instead of
+        silently degrading to an empty plan.
+        """
+        if not isinstance(data, dict):
+            return ""
+        err = data.get("error")
+        if isinstance(err, dict) and err.get("message"):
+            status = err.get("status") or err.get("code") or ""
+            return f"Gemini API error: {err['message']}" + (
+                f" (status={status})" if status else ""
+            )
+        pf = data.get("promptFeedback") or {}
+        if isinstance(pf, dict) and pf.get("blockReason"):
+            return f"Prompt blocked: {pf['blockReason']}"
+        candidates = data.get("candidates") or []
+        if not candidates:
+            return "No candidates returned (possibly blocked by safety filters)"
+        cand = candidates[0] if isinstance(candidates[0], dict) else {}
+        finish = cand.get("finishReason") or ""
+        if finish and finish.upper() not in ("STOP", "FINISH_REASON_UNSPECIFIED"):
+            blocked: List[str] = []
+            for r in cand.get("safetyRatings") or []:
+                if isinstance(r, dict) and r.get("blocked"):
+                    blocked.append(str(r.get("category") or "unknown"))
+            extra = f" (safety categories: {', '.join(blocked)})" if blocked else ""
+            return f"Response truncated: finishReason={finish}{extra}"
+        return "Response contained no text parts"
+
+    def chat_stream(
+        self,
+        messages: List[Dict[str, str]],
+        temperature: float = 0.2,
+        max_tokens: Optional[int] = None,
+        **kwargs: Any,
+    ) -> Iterator[str]:
+        """Stream via Gemini's streamGenerateContent SSE endpoint."""
+        system_text, contents = self._map_messages(messages)
+        body: Dict[str, Any] = {
+            "contents": contents,
+            "generationConfig": {"temperature": float(temperature)},
+        }
+        if system_text:
+            body["systemInstruction"] = {"parts": [{"text": system_text}]}
+        if max_tokens:
+            body["generationConfig"]["maxOutputTokens"] = int(max_tokens)
+        url = self._url("streamGenerateContent") + "&alt=sse"
+        try:
+            with requests.post(url, json=body, timeout=self.timeout, stream=True) as resp:
+                resp.raise_for_status()
+                for raw in resp.iter_lines(decode_unicode=True):
+                    if not raw:
+                        continue
+                    line = raw.strip()
+                    if line.startswith("data:"):
+                        line = line[5:].strip()
+                    if not line or line == "[DONE]":
+                        if line == "[DONE]":
+                            break
+                        continue
+                    try:
+                        obj = json.loads(line)
+                        delta = obj["candidates"][0]["content"]["parts"][0]["text"]
+                        if delta:
+                            yield delta
+                    except Exception:
+                        continue
+        except Exception as e:
+            yield f"\n[stream error: {type(e).__name__}: {self._scrub_secret(str(e))}]"
+
+
 class OpenAICompatProvider(LLMProvider):
     """
     Talks to an OpenAI-compatible /v1/chat/completions endpoint.
@@ -194,10 +382,14 @@ class OpenAICompatProvider(LLMProvider):
         extra_options: Optional[Dict[str, Any]] = None,
         rate_limit: Optional[float] = None,
         max_retries: int = 3,
+        endpoint_path: str = "/v1/chat/completions",
+        allow_no_auth: bool = False,
     ) -> None:
         self.model = model
         self.base_url = base_url.rstrip("/")
-        self.api_key = api_key or os.environ.get("OPENAI_API_KEY") or ""
+        self.endpoint_path = endpoint_path or "/v1/chat/completions"
+        self.allow_no_auth = bool(allow_no_auth)
+        self.api_key = api_key or (os.environ.get("OPENAI_API_KEY") or "") if not allow_no_auth else (api_key or "")
         self.timeout = timeout
         self.headers = {"Content-Type": "application/json"}
         if self.api_key:
@@ -219,7 +411,8 @@ class OpenAICompatProvider(LLMProvider):
         force_json: bool = True,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        url = f"{self.base_url}/v1/chat/completions"
+        path = self.endpoint_path if self.endpoint_path.startswith("/") else "/" + self.endpoint_path
+        url = f"{self.base_url}{path}"
         body: Dict[str, Any] = {
             "model": self.model,
             "messages": messages,
@@ -280,7 +473,8 @@ class OpenAICompatProvider(LLMProvider):
         **kwargs: Any,
     ) -> Iterator[str]:
         """Stream deltas from OpenAI-compatible SSE chat completions."""
-        url = f"{self.base_url}/v1/chat/completions"
+        path = self.endpoint_path if self.endpoint_path.startswith("/") else "/" + self.endpoint_path
+        url = f"{self.base_url}{path}"
         body: Dict[str, Any] = {
             "model": self.model,
             "messages": messages,

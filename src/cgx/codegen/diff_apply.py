@@ -22,10 +22,13 @@ The parser accepts two shapes:
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 
 _FENCE_RE = re.compile(
@@ -181,6 +184,8 @@ def apply_diffs_in_memory(
     target doesn't exist yet) are recognized and their additive lines are
     materialized when ``allow_new_files`` is True.
     """
+    logger.info("codegen.diff_apply: applying %d target(s) root=%s allow_new=%s",
+                len(targets), project_root, allow_new_files)
     results: List[PatchResult] = []
     for tgt in targets:
         rel = tgt.path
@@ -241,9 +246,14 @@ def apply_diffs_in_memory(
                 error=("partial apply" if rejected else None),
             ))
         except Exception as e:
+            logger.warning("codegen.diff_apply: exception applying %s: %s: %s",
+                           rel, type(e).__name__, e)
             results.append(PatchResult(
                 path=rel, ok=False, error=f"{type(e).__name__}: {e}",
                 original_content=original, is_new_file=False,
             ))
+    n_ok = sum(1 for r in results if r.ok)
+    logger.info("codegen.diff_apply: done ok=%d failed=%d",
+                n_ok, len(results) - n_ok)
     return results
 

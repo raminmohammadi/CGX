@@ -89,6 +89,10 @@ def _doc_first_sentence(meta: Dict[str, Any]) -> str:
 def _attribute_roots_read(meta: Dict[str, Any]) -> List[str]:
     """
     Unique roots for `self.foo.*` -> 'foo'. Sorted for determinism.
+
+    Canonical home for this helper; :mod:`cgx.embeddings.helpers` re-exports
+    it for back-compatibility with the original import path used by
+    :mod:`cgx.embeddings.records`.
     """
     roots = set()
     try:
