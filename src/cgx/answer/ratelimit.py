@@ -23,10 +23,13 @@ Public API:
 
 from __future__ import annotations
 
+import logging
 import random
 import threading
 import time
 from typing import Any, Callable, Optional
+
+logger = logging.getLogger(__name__)
 
 
 class RateLimiter:
@@ -129,8 +132,13 @@ def request_with_retry(
         except Exception as e:
             last_exc = e
             if attempt > max_retries:
+                logger.warning("ratelimit: giving up after %d attempt(s); last exception %s: %s",
+                               attempt, type(e).__name__, e)
                 raise
-            sleep(backoff_seconds(attempt))
+            delay = backoff_seconds(attempt)
+            logger.info("ratelimit: attempt %d raised %s: %s — retrying in %.2fs",
+                        attempt, type(e).__name__, e, delay)
+            sleep(delay)
             continue
         sc = getattr(resp, "status_code", 200)
         if not should_retry(sc) or attempt > max_retries:
@@ -139,8 +147,11 @@ def request_with_retry(
         try:
             retry_after = resp.headers.get("Retry-After")  # type: ignore[attr-defined]
         except Exception:
-            pass
-        sleep(backoff_seconds(attempt, retry_after=retry_after))
+            retry_after = None
+        delay = backoff_seconds(attempt, retry_after=retry_after)
+        logger.info("ratelimit: attempt %d returned status=%d — retrying in %.2fs "
+                    "(Retry-After=%r)", attempt, sc, delay, retry_after)
+        sleep(delay)
     if last_exc is not None:
         raise last_exc
     return resp  # type: ignore[possibly-unbound]

@@ -7,6 +7,8 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 import networkx as nx
 import matplotlib.pyplot as plt
 
+from cgx.graph.aggregation import project_graph_for_visualization
+
 
 # ---------------------------
 # Small utilities
@@ -598,12 +600,7 @@ def query_graph(G: nx.Graph, query: str) -> Optional[List[str]]:
     Gq: nx.DiGraph
     try:
         if isinstance(G, nx.MultiDiGraph):
-            # Prefer project_graph_for_visualization if present
-            if "project_graph_for_visualization" in globals():
-                Gq = project_graph_for_visualization(G)  # type: ignore[name-defined]
-            else:
-                print("query_graph: projection helper not found; using fallback aggregation.")
-                Gq = _fallback_aggregate(G)
+            Gq = project_graph_for_visualization(G)
         else:
             Gq = G.copy()
     except Exception as e:

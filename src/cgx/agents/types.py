@@ -34,13 +34,16 @@ class TaskKind(str, enum.Enum):
     so the agent layer doesn't reinvent retrieval or codegen.
     """
 
-    ASK = "ask"             # routes to cgx.answer.engine.answer_with_llm
-    PLAN = "plan"           # routes to cgx.answer.engine.generate_code_plan
-    SCAFFOLD = "scaffold"   # routes to cgx.answer.engine.generate_project_scaffold (new project from scratch)
-    SEARCH = "search"       # routes to cgx.pipeline.auto.run_query_auto
-    SUMMARIZE = "summarize" # short, LLM-driven summarisation of prior outputs
-    APPLY = "apply"         # write a prior PLAN/SCAFFOLD's files to disk (+ smoke test)
-    VERIFY = "verify"       # run impacted pytest tests against the modified tree
+    ASK = "ask"                         # routes to cgx.answer.engine.answer_with_llm
+    PLAN = "plan"                       # routes to cgx.answer.engine.generate_code_plan
+    SCAFFOLD = "scaffold"               # routes to cgx.answer.engine.generate_project_scaffold (new project from scratch)
+    SCAFFOLD_MANIFEST = "scaffold_manifest"  # lightweight call: returns file list only, injects SCAFFOLD_FILE tasks
+    SCAFFOLD_FILE = "scaffold_file"     # generates exactly one file given spec + prior context
+    SEARCH = "search"                   # routes to cgx.pipeline.auto.run_query_auto
+    SUMMARIZE = "summarize"             # short, LLM-driven summarisation of prior outputs
+    APPLY = "apply"                     # write a prior PLAN/SCAFFOLD's files to disk (+ smoke test)
+    VERIFY = "verify"                   # run impacted pytest tests against the modified tree
+    FILL_LOGIC = "fill_logic"           # fill empty function bodies in a skeleton file (skeleton-and-fill phase 2)
 
 
 @dataclass
@@ -76,6 +79,15 @@ class Plan:
     tasks: List[Task] = field(default_factory=list)
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
     created_at: float = field(default_factory=time.time)
+    #: Planner-supplied free-text explanation of *why* the plan is
+    #: structured this way. Surfaced in the SSE ``plan`` event payload
+    #: so the UI can render a "Plan Rationale" card above the DAG.
+    rationale: str = ""
+    #: File manifest populated by the Tracker after each APPLY task.
+    #: Maps project-relative path → status: "applied" | "failed".
+    #: Lets the retry loop identify which files are already on disk and
+    #: which ones still need to be fixed, so it can issue targeted prompts.
+    owned_files: Dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -83,6 +95,8 @@ class Plan:
             "goal": self.goal,
             "created_at": self.created_at,
             "tasks": [t.to_dict() for t in self.tasks],
+            "rationale": self.rationale,
+            "owned_files": dict(self.owned_files),
         }
 
     def summary_lines(self) -> List[str]:

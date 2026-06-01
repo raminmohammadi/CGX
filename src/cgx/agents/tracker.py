@@ -45,6 +45,15 @@ Capability = Callable[..., Dict[str, Any]]
 # alive without spamming the SSE channel.
 _DEFAULT_PROGRESS_INTERVAL = 2.0
 
+# Kinds whose failure is treated as local rather than plan-wide. When
+# ``stop_on_fail`` is True, the Tracker still continues past these because
+# a single bad file (e.g. an LLM-empty ``package.json`` or a syntax-fail
+# on one component) shouldn't waste the siblings that already succeeded.
+# The APPLY task then writes whatever survived, populating
+# ``plan.owned_files`` so the retry loop can regenerate only the failed
+# file(s) instead of re-running the entire manifest.
+_SOFT_FAIL_KINDS = frozenset({TaskKind.SCAFFOLD_FILE})
+
 
 def _summarize_task_output(task: Task) -> str:
     """Return a short, human-readable description of what ``task`` produced.
@@ -112,6 +121,22 @@ def _summarize_task_output(task: Task) -> str:
             plan_md = str(out.get("plan_md") or "").strip()
             if plan_md:
                 bits.append(plan_md.splitlines()[0][:160])
+        elif task.kind == TaskKind.SCAFFOLD_MANIFEST:
+            layers = out.get("layers") or []
+            n_files = sum(len(lay.get("files") or []) for lay in layers
+                          if isinstance(lay, dict))
+            if n_files:
+                bits.append(f"manifest: {n_files} file(s) across {len(layers)} layer(s)")
+            plan_md = str(out.get("plan_md") or "").strip()
+            if plan_md:
+                bits.append(plan_md.splitlines()[0][:160])
+        elif task.kind == TaskKind.SCAFFOLD_FILE:
+            fp = str(out.get("file") or "").strip()
+            if fp:
+                bits.append(fp)
+            ok = out.get("syntax_ok")
+            if ok is not None:
+                bits.append("syntax ok" if ok else "syntax ERROR")
         elif task.kind == TaskKind.SEARCH:
             hits = out.get("hits") or []
             if hits:
@@ -148,6 +173,19 @@ def _summarize_task_output(task: Task) -> str:
             backup = out.get("backup_dir")
             if backup:
                 bits.append(f"backups → {backup}")
+        elif task.kind == TaskKind.FILL_LOGIC:
+            fn = str(out.get("function_name") or "").strip()
+            fp = str(out.get("file_path") or "").strip()
+            if fn and fp:
+                bits.append(f"{fn}() in {fp}")
+            applied = out.get("applied")
+            if applied is True:
+                bits.append("stitched")
+            elif applied is False:
+                bits.append("stitch skipped")
+            ok = out.get("syntax_ok")
+            if ok is not None:
+                bits.append("syntax ok" if ok else "syntax ERROR")
         elif task.kind == TaskKind.VERIFY:
             if out.get("tests_passed"):
                 n = out.get("tests_selected") or []
@@ -317,6 +355,33 @@ def _extract_display_output(task: Task) -> Dict[str, Any]:
             cr = _compact_codegen_report(report)
             if cr:
                 result["codegen_report"] = cr
+    elif task.kind == TaskKind.SCAFFOLD_MANIFEST:
+        if out.get("plan_md"):
+            result["plan_md"] = str(out["plan_md"])
+        if out.get("layers"):
+            result["layers"] = out["layers"]
+    elif task.kind == TaskKind.SCAFFOLD_FILE:
+        fp = out.get("file")
+        if fp:
+            result["file"] = str(fp)
+        patch = out.get("patch")
+        if patch:
+            result["diffs"] = [{"file": str(fp or ""), "patch": str(patch)}]
+        result["syntax_ok"] = bool(out.get("syntax_ok", True))
+        if out.get("syntax_error"):
+            result["syntax_error"] = str(out["syntax_error"])
+    elif task.kind == TaskKind.FILL_LOGIC:
+        if out.get("file_path"):
+            result["file_path"] = str(out["file_path"])
+        if out.get("function_name"):
+            result["function_name"] = str(out["function_name"])
+        if out.get("body_code"):
+            result["body_code"] = str(out["body_code"])
+        result["syntax_ok"] = bool(out.get("syntax_ok", True))
+        if out.get("syntax_error"):
+            result["syntax_error"] = str(out["syntax_error"])
+        if out.get("stitch_error"):
+            result["stitch_error"] = str(out["stitch_error"])
     elif task.kind == TaskKind.ASK:
         if out.get("answer_md"):
             result["answer_md"] = str(out["answer_md"])
@@ -406,12 +471,45 @@ class Tracker:
         yield AgentEvent(type="plan", payload={"plan": plan.to_dict()})
         prior_outputs: List[Dict[str, Any]] = []
         halted = False
-        for task in plan.tasks:
+        # Index-based loop so that inject_tasks inserted mid-run are visited.
+        i = 0
+        while i < len(plan.tasks):
+            task = plan.tasks[i]
+            i += 1
+
             if halted:
                 logger.info("Tracker: skipping task id=%s (plan halted)", task.id)
                 task.status = TaskStatus.SKIPPED
                 yield AgentEvent(type="task_skipped",
                                  payload={"task_id": task.id})
+                continue
+
+            # Skip SCAFFOLD_FILE tasks whose target path is already on
+            # disk from a previous attempt. The retry loop carries the
+            # prior plan's ``owned_files`` forward, so a stray scaffold
+            # for an already-applied file would only overwrite working
+            # code. Apply this guard before marking the task RUNNING so
+            # the timeline shows it as ⊝ skipped from the start.
+            if (
+                task.kind == TaskKind.SCAFFOLD_FILE
+                and plan.owned_files.get(str(task.inputs.get("path") or "")) == "applied"
+            ):
+                target = str(task.inputs.get("path") or "")
+                task.status = TaskStatus.SKIPPED
+                task.started_at = time.time()
+                task.ended_at = task.started_at
+                reason = (
+                    f"already applied on a previous attempt: {target}"
+                )
+                logger.info(
+                    "Tracker: skipping SCAFFOLD_FILE id=%s (%s)",
+                    task.id, reason,
+                )
+                yield AgentEvent(type="task_skipped",
+                                 payload={"task_id": task.id,
+                                          "kind": task.kind.value,
+                                          "name": task.name or task.description,
+                                          "reason": reason})
                 continue
 
             task.status = TaskStatus.RUNNING
@@ -473,7 +571,7 @@ class Tracker:
                 logger.warning("Tracker: task FAILED id=%s error=%s", task.id, task.error)
                 yield AgentEvent(type="task_failed",
                                  payload={"task_id": task.id, "error": task.error})
-                if self.stop_on_fail:
+                if self.stop_on_fail and task.kind not in _SOFT_FAIL_KINDS:
                     halted = True
                 continue
 
@@ -500,12 +598,36 @@ class Tracker:
                                               "error": f"judge: {verdict.rationale}",
                                               "summary": _summarize_task_output(task),
                                               "output": _extract_display_output(task)})
-                    if self.stop_on_fail:
+                    if self.stop_on_fail and task.kind not in _SOFT_FAIL_KINDS:
                         halted = True
                     continue
 
             task.ended_at = time.time()
             prior_outputs.append(task.output or {})
+            # Update the plan's file manifest after every APPLY task so the
+            # retry loop knows which files are on disk and which still need fixing.
+            if task.kind == TaskKind.APPLY:
+                out = task.output or {}
+                for fp in (out.get("applied_files") or []):
+                    plan.owned_files[str(fp)] = "applied"
+                for entry in (out.get("failed_files") or []):
+                    fp = entry.get("file") if isinstance(entry, dict) else str(entry)
+                    if fp:
+                        plan.owned_files[str(fp)] = "failed"
+
+            # Dynamic task injection: if a capability (e.g. scaffold_manifest)
+            # returned an "inject_tasks" list, insert those tasks immediately
+            # after the current position so they execute before APPLY/VERIFY.
+            inject = (task.output or {}).pop("inject_tasks", None)
+            if inject and isinstance(inject, list):
+                logger.info(
+                    "Tracker: injecting %d task(s) after task id=%s",
+                    len(inject), task.id)
+                for j, new_task in enumerate(inject):
+                    plan.tasks.insert(i + j, new_task)
+                # Re-emit the updated plan so the UI can render new rows.
+                yield AgentEvent(type="plan", payload={"plan": plan.to_dict()})
+
             elapsed = (task.ended_at - task.started_at) if task.started_at else None
             logger.info("Tracker: task completed id=%s elapsed=%.1fs", task.id, elapsed or 0)
             yield AgentEvent(type="task_done",
@@ -546,6 +668,15 @@ class Tracker:
             # These kinds consume previous task outputs (the prior PLAN's
             # diffs in particular) rather than a free-text query.
             return cap(prior_outputs, **inputs)
+        if task.kind in (TaskKind.SCAFFOLD, TaskKind.SCAFFOLD_MANIFEST, TaskKind.SCAFFOLD_FILE):
+            # Forward prior outputs so sibling scaffold tasks share one
+            # coherent file tree. The wrapper in loop.py extracts
+            # ``_prior_outputs`` before calling the engine.
+            return cap(task.description, _prior_outputs=prior_outputs, **inputs)
+        # FILL_LOGIC: task description carries the instruction; inputs carry
+        # file_path, function_name, and optional skeleton.
+        if task.kind == TaskKind.FILL_LOGIC:
+            return cap(task.description, **inputs)
         # ASK / PLAN / SEARCH all take the task description as the first arg.
         return cap(task.description, **inputs)
 

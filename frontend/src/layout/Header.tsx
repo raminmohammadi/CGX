@@ -31,7 +31,7 @@ export default function Header() {
             AVERIX
           </span>
           <span className="text-[10px] text-slate-500 font-mono">
-            cgx.ui v{status?.version || "0.2.0"}
+            cgx.webui v{status?.version || "0.2.0"}
           </span>
         </div>
       </div>

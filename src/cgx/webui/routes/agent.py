@@ -40,6 +40,8 @@ async def agent(req: AgentRequest) -> EventSourceResponse:
             api_key=pcfg.api_key, temperature=pcfg.temperature,
             num_predict=pcfg.num_predict,
             project_root=req.project_root, stop_on_fail=req.stop_on_fail,
+            endpoint_path=getattr(pcfg, "endpoint_path", "/v1/chat/completions"),
+            allow_no_auth=bool(getattr(pcfg, "allow_no_auth", False)),
             cancel_event=cancel_event,
         )
 

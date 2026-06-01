@@ -3,40 +3,66 @@
 Averix indexes a code repository, retrieves grounded context via a hybrid
 engine (semantic + lexical + graph), and asks a local or remote LLM to
 answer questions or produce **self-tested** code change plans. It is
-model-agnostic and ships with a polished Gradio UI.
+model-agnostic and ships with a React/Vite web UI served by a FastAPI
+backend that streams progress over Server-Sent Events.
 
 - 🔒 **Local-first.** Indexing, embedding, retrieval, sessions, and
   telemetry **never leave the machine.** Works fully offline with
   [Ollama](https://ollama.com/).
-- 🔌 **Bring your own LLM.** Any OpenAI-compatible endpoint, with API
-  keys stored in your OS keyring when available.
+- 🔌 **Universal LLM provider.** Ollama (local), OpenAI-compatible
+  endpoints, native **Google Gemini**, or any self-hosted server with a
+  custom IP, path, and optional auth-bypass — switchable from the Settings
+  tab with a live **Ping** latency check. API keys live in your OS keyring.
 - 🧠 **Hybrid retrieval.** Two-view semantic + BM25 + graph expansion,
   fused with Reciprocal Rank Fusion and an optional cross-encoder
   rerank.
 - 🤖 **Multi-agent orchestration.** A Planner / Tracker / Judge loop
   decomposes complex requests into atomic tasks (`ask`, `plan`,
-  `scaffold`, `search`, `summarize`, `apply`, `verify`) and validates
-  each artefact before moving on (`cgx.agents`, **🤖 Agent** tab). The
-  planner routes scaffold goals to the new `scaffold` kind, downgrades
-  expensive code-gen tasks to plain Q&A for read-only goals, and the
-  tracker streams live `task_progress` heartbeats so the UI never looks
-  frozen on long LLM calls. See [docs/flowcharts.md](docs/flowcharts.md)
-  for a visual.
+  `scaffold`, `scaffold_manifest`, `scaffold_file`, `search`, `summarize`,
+  `apply`, `verify`, `fill_logic`) and validates each artefact before
+  moving on (`cgx.agents`, **🤖 Agent** tab). The planner routes scaffold
+  goals through a manifest-then-per-file chain, downgrades expensive
+  code-gen tasks to plain Q&A for read-only goals, and the tracker
+  streams live `task_progress` heartbeats so the UI never looks frozen on
+  long LLM calls. See [docs/flowcharts.md](docs/flowcharts.md) for a visual.
 - 🏗️ **New project generation.** Give Averix a plain-language idea
   (e.g. *"create a FastAPI todo app"* or *"create a React calculator
   app"*), set a destination directory as Project Root, and the
-  `scaffold → apply → verify` chain generates a complete, working project
-  from scratch — no existing codebase or index required. The scaffold
-  prompt has technology-aware instruction blocks: frontend goals
-  (React, Vue, etc.) produce component files and `package.json`; Python
-  goals produce `requirements.txt`, `conftest.py`, and pytest tests.
-  The Judge enforces the match and retries on a technology mismatch.
+  `scaffold_manifest → scaffold_file × N → apply → verify` chain
+  generates a complete, working project from scratch — no existing
+  codebase or index required. The `apply` step writes a per-run backup
+  mirror under `<project_root>/.averix-backups/` so the whole run can
+  be undone via `POST /api/rollback`.
+- 🧩 **Modular skills registry** (`skills/`). Each supported technology
+  lives in its own folder (`skills/react/`, `skills/fastapi/`,
+  `skills/nextjs/`, `skills/vue/`, `skills/tailwind/`, `skills/flask/`,
+  `skills/django/`, `skills/express/`, `skills/python_cli/`,
+  `skills/sqlite/`) and bundles three things: detection from the goal,
+  the prompt fragment the LLM sees while generating, and a structural
+  validator the Judge runs against the produced diffs. Multi-skill
+  goals compose naturally — *"React UI + FastAPI backend"* activates
+  both, so the scaffold prompt carries both layouts and the Judge
+  refuses to silently pass an output that only honours one half. Adding
+  a new framework is a single-folder change with no agent-layer edits.
+  See [docs/usage.md](docs/usage.md#generating-a-new-project-from-scratch)
+  for the full table and [docs/architecture.md](docs/architecture.md#skills)
+  for the protocol.
 - 💬 **Persistent chat sessions.** Conversations are saved as JSONL
   threads under `~/.cgx/sessions/`; resume them later from the Ask
   tab's session sidebar.
 - 🧪 **Self-testing code generation.** Diffs are parsed, syntax-checked,
   and optionally run against impacted pytest tests in a sandbox before
-  being surfaced.
+  being surfaced. The sandbox now auto-installs missing Python packages
+  before running pytest (`cgx.codegen.env_manager`) so a model choosing
+  a new library doesn't mask real failures.
+- 🗺️ **Symbol table context.** Before generating a change plan, Averix
+  injects a compressed `# AVAILABLE CONTEXT` map of every symbol already
+  defined in the indexed codebase (`cgx.codegen.symbol_map`), preventing
+  local models from re-implementing helpers that already exist.
+- 🔬 **Granular error slicing.** Retry prompts include ±5 lines of source
+  context around the first traceback line number rather than a raw
+  1 200-character pytest dump, keeping small models focused on the precise
+  failure site.
 - ⚡ **Incremental indexing.** A content-addressed embedding cache
   (per-view `.npz` keyed on sha256 of the corpus text) makes
   re-indexing a touched-only-a-few-files repo nearly instant.
@@ -48,7 +74,7 @@ model-agnostic and ships with a polished Gradio UI.
 - 👀 **Thought-process panel.** Live streaming of the model's reasoning
   sketch, followed by the final grounded answer.
 - 🧩 **VS Code extension scaffold** (`extension/`) that hosts the
-  Gradio UI inside an editor webview.
+  Averix web UI inside an editor webview.
 - 📋 **Task registry & cancel.** Every operation is tracked in
   `~/.cgx/tasks.db`; cancel any running task with
   `DELETE /api/tasks/{id}` or the in-UI Cancel button.
@@ -86,9 +112,10 @@ pip install -r requirements.txt
 pip install -e ".[codegen]"
 ```
 
-This installs FAISS, Gradio, NetworkX, and the codegen pieces but skips
-`torch` / `transformers` / `sentence-transformers` entirely. Heavy ML
-modules are imported lazily, so the UI and CLI work out of the box.
+This installs FAISS, FastAPI/Uvicorn, NetworkX, and the codegen pieces
+but skips `torch` / `transformers` / `sentence-transformers` entirely.
+Heavy ML modules are imported lazily, so the UI and CLI work out of the
+box.
 
 ### Full install (with local embeddings)
 
@@ -106,7 +133,7 @@ Optional extras:
 
 | Extra        | Adds                                              |
 |--------------|---------------------------------------------------|
-| `ui`         | Gradio UI                                         |
+| `ui`         | FastAPI + Uvicorn web UI backend                  |
 | `embeddings` | `sentence-transformers`, `transformers`, `torch`  |
 | `faiss`      | `faiss-cpu` (large speedup over numpy fallback)   |
 | `codegen`    | `unidiff` (stricter diff parsing)                 |
@@ -133,9 +160,11 @@ python app.py
 
 Tabs (left → right):
 
-1. **⚙️ Setup** — pick a provider (Ollama or OpenAI-compatible), check
-   health (`Ping Ollama`), detect hardware (RAM + GPU VRAM), pick a
-   sampling profile (temperature, max new tokens).
+1. **⚙️ Setup** — choose a **Provider Type** (Ollama, OpenAI, Google
+   Gemini, or Custom Server), fill in the model and credentials, and click
+   **Ping** to verify the connection with a live latency check. Detect
+   hardware (RAM + GPU VRAM) and tune sampling parameters. Save named
+   profiles; API keys are stored in your OS keyring.
 2. **📚 Index** — point at a project root or upload a `.zip`. Honours
    `.gitignore` and a 1 MB file-size cap; emits `indices/`,
    `records.jsonl`, `chunks.jsonl`, `graph.json` and per-view
@@ -169,11 +198,13 @@ Tabs (left → right):
    privacy, cost, quality ceiling, latency, offline use, setup effort,
    and operational risk. Pure-offline; no network calls fire from this
    tab.
-7. **👤 Profiles** — save provider configurations. API keys are
-   persisted in the OS keyring when available, otherwise in a
-   `0600`-permissioned file under `~/.cgx/`. Optional per-profile
-   `rate_limit` (req/sec) and `max_retries` apply automatically to
-   every call made by that profile.
+7. **👤 Profiles** — save provider configurations for any supported
+   provider kind (`ollama`, `openai-compat`, `gemini`, `custom`). Custom
+   profiles expose an **Endpoint Path** field and a **Skip auth** toggle
+   for private-subnet servers. API keys are persisted in the OS keyring
+   when available, otherwise in a `0600`-permissioned file under
+   `~/.cgx/`. Optional per-profile `rate_limit` (req/sec) and
+   `max_retries` apply automatically to every call made by that profile.
 
 ### CLI
 
@@ -189,10 +220,22 @@ averix query --index-dir /tmp/averix_index/indices \
 ```python
 from cgx.pipeline.auto import run_index_auto, run_query_auto
 from cgx.answer.engine import answer_with_llm, generate_code_plan
-from cgx.answer.providers import OllamaProvider
+from cgx.answer.providers import OllamaProvider, GeminiProvider, OpenAICompatProvider
 
 run_index_auto(project_root="./", out_dir="/tmp/averix_index")
+
+# Local Ollama
 prov = OllamaProvider(model="qwen2.5-coder:3b")
+
+# Google Gemini
+# prov = GeminiProvider(model="gemini-1.5-flash", api_key="YOUR_KEY")
+
+# Custom self-hosted server (no auth, non-standard path)
+# prov = OpenAICompatProvider(
+#     model="my-model", base_url="http://100.10.20.10:8080",
+#     endpoint_path="/completion", allow_no_auth=True,
+# )
+
 ans = answer_with_llm(
     "/tmp/averix_index/indices",
     "/tmp/averix_index/records.jsonl",
@@ -271,7 +314,7 @@ Averix ships a Planner → Tracker → Judge loop in `cgx.agents`:
 1. The **Planner** decomposes your goal into 1–5 ordered atomic
    `Task`s, each tagged with a short `name`, a `description`, a `kind`
    (`ask`, `plan`, `scaffold`, `search`, `summarize`, `apply`,
-   `verify`) and plain-English `criteria`. It prefers a strict JSON
+   `verify`, `fill_logic`) and plain-English `criteria`. It prefers a strict JSON
    plan from the LLM but falls back to a deterministic single-task
    plan derived from `cgx.answer.intent.detect_intent` when no
    provider is available. A kind-policy pass:
@@ -467,7 +510,7 @@ existing call sites keep their pre-feature behaviour.
 ## VS Code extension scaffold
 
 [`extension/`](extension/) is a minimal TypeScript extension that hosts
-the running Gradio UI inside a VS Code webview panel. It is **not**
+the running Averix web UI inside a VS Code webview panel. It is **not**
 packaged into a `.vsix` from the repo — build it locally:
 
 ```bash
@@ -479,7 +522,7 @@ npm run compile
 
 Commands contributed: **Averix: Open UI**, **Averix: Reload UI**.
 The server URL is read from the `averix.ui.url` setting (default
-`http://localhost:7860`). The extension does not spawn the server —
+`http://localhost:8765`). The extension does not spawn the server —
 start it with `averix-ui` (or `python app.py`) first.
 
 See [`extension/README.md`](extension/README.md) for the full setup.
@@ -503,7 +546,8 @@ the complete list of network egress paths in the product:
 | Hybrid retrieval / reranking      | **No**          | All on-device.                                    |
 | Asking a question / planning code | Yes             | Only the LLM endpoint you configure.              |
 | Local LLM (default: Ollama)       | Yes (loopback)  | `http://localhost:11434` — never leaves your box. |
-| OpenAI-compatible providers       | Yes             | The exact base URL you set in the Setup tab.      |
+| OpenAI-compatible providers       | Yes             | The exact base URL / endpoint path you configure. |
+| Google Gemini provider            | Yes             | `generativelanguage.googleapis.com` only.         |
 | Session history, profiles, cache  | **No**          | `~/.cgx/` (locked-down `0600` files).             |
 | Anonymous startup telemetry       | **Opt-in**      | Disabled by default; see below.                   |
 

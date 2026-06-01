@@ -1,6 +1,6 @@
 from cgx.logging_setup import get_logger
 import networkx as nx
-/home/rmohammadi/Downloads/Code_Gen/src/cgx/logging_setup.py
+
 # -------------------------------
 # Logger
 # -------------------------------

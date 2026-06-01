@@ -3,17 +3,101 @@
 Wraps :mod:`cgx.answer.ollama_discovery` so the React app can populate
 the model dropdown and re-detect hardware without re-implementing the
 heuristics client-side.
+
+Also provides ``/provider/ping`` so the frontend can validate any
+provider configuration before saving it.
 """
 
 from __future__ import annotations
 
+import time
+from typing import List, Optional
+
 from fastapi import APIRouter
+from pydantic import BaseModel
 
 from cgx.answer import ollama_discovery
+from cgx.answer.profiles import get_profile, load_api_key
+from cgx.answer.providers import GeminiProvider
 from cgx.webui.models import HardwareInfo, ModelChoicesResponse
 
 
 router = APIRouter(tags=["setup"])
+
+
+class PingRequest(BaseModel):
+    kind: str = "ollama"
+    base_url: str = "http://localhost:11434"
+    model: str = "qwen2.5-coder:3b"
+    api_key: Optional[str] = None
+    endpoint_path: str = "/v1/chat/completions"
+    allow_no_auth: bool = False
+
+
+class PingResponse(BaseModel):
+    ok: bool
+    latency_ms: Optional[float] = None
+    error: Optional[str] = None
+
+
+@router.post("/provider/ping", response_model=PingResponse)
+def ping_provider(req: PingRequest) -> PingResponse:
+    """Send a minimal request to the configured provider and report latency.
+
+    For Ollama: GET /api/tags (lightweight list models call).
+    For Gemini: a short generateContent request.
+    For OpenAI-compat / custom: GET the base URL root or a HEAD request.
+    """
+    start = time.monotonic()
+    try:
+        if req.kind == "ollama":
+            import requests as _req
+            base = (req.base_url or "http://localhost:11434").replace("/v1", "").rstrip("/")
+            r = _req.get(f"{base}/api/tags", timeout=8)
+            r.raise_for_status()
+
+        elif req.kind == "gemini":
+            import requests as _req
+            api_key = req.api_key or ""
+            if not api_key:
+                return PingResponse(ok=False, error="Gemini requires an API key")
+            model = req.model or "gemini-2.5-flash"
+            url = (
+                f"https://generativelanguage.googleapis.com/v1beta/models/"
+                f"{model}:generateContent?key={api_key}"
+            )
+            body = {
+                "contents": [{"role": "user", "parts": [{"text": "ping"}]}],
+                "generationConfig": {"maxOutputTokens": 1},
+            }
+            r = _req.post(url, json=body, timeout=15)
+            r.raise_for_status()
+
+        else:
+            # openai-compat or custom: attempt a GET to the base URL to verify reachability.
+            import requests as _req
+            base = (req.base_url or "").rstrip("/")
+            if not base:
+                return PingResponse(ok=False, error="base_url is required")
+            path = req.endpoint_path or "/v1/chat/completions"
+            # Lightweight OPTIONS/HEAD is usually enough to confirm the host is up.
+            headers = {}
+            if req.api_key and not req.allow_no_auth:
+                headers["Authorization"] = f"Bearer {req.api_key}"
+            try:
+                r = _req.options(f"{base}{path}", headers=headers, timeout=8)
+            except Exception:
+                r = _req.head(base, headers=headers, timeout=8)
+            # Accept any response — a 405 (Method Not Allowed) still proves the server is up.
+            if r.status_code >= 500:
+                r.raise_for_status()
+
+        elapsed = (time.monotonic() - start) * 1000
+        return PingResponse(ok=True, latency_ms=round(elapsed, 1))
+
+    except Exception as exc:
+        elapsed = (time.monotonic() - start) * 1000
+        return PingResponse(ok=False, latency_ms=round(elapsed, 1), error=str(exc)[:300])
 
 
 @router.get("/setup/models", response_model=ModelChoicesResponse)
@@ -36,3 +120,160 @@ def hardware_probe() -> HardwareInfo:
     except Exception:
         hw = {}
     return HardwareInfo(**hw)
+
+
+class CloudModelsRequest(BaseModel):
+    kind: str  # "gemini" | "openai-compat" | "custom"
+    base_url: Optional[str] = None
+    api_key: Optional[str] = None
+    profile_name: Optional[str] = None
+
+
+# Static fallback used when an API call fails or no key is available; kept short
+# and up to date so the dropdown is never empty for new users picking a kind.
+_GEMINI_FALLBACK = [
+    "gemini-2.5-flash",
+    "gemini-2.5-pro",
+    "gemini-2.0-flash",
+]
+_OPENAI_FALLBACK = [
+    "gpt-4o-mini",
+    "gpt-4o",
+    "gpt-4.1-mini",
+    "gpt-4.1",
+]
+
+# OpenAI returns every model id including embeddings/audio/image; this filter
+# keeps the dropdown focused on chat-capable text models.
+_OPENAI_CHAT_PREFIXES = ("gpt-", "o1", "o3", "o4", "chatgpt-")
+_OPENAI_NONCHAT_SUBSTR = (
+    "embedding", "whisper", "tts", "audio", "image", "vision-preview",
+    "dall-e", "moderation", "search", "transcribe",
+)
+
+
+def _resolve_api_key(req: CloudModelsRequest) -> str:
+    """Return the API key from the request body or the saved profile."""
+    if req.api_key:
+        return req.api_key
+    if req.profile_name:
+        return load_api_key(req.profile_name) or ""
+    return ""
+
+
+_GEMINI_CHAT_PREFIXES = ("gemini-", "gemma-")
+_GEMINI_NONCHAT_SUBSTR = (
+    "embedding", "aqa", "tts", "audio", "image-gen", "vision-preview",
+    "-image", "robotics", "computer-use",
+)
+
+
+def _gemini_list(api_key: str) -> List[str]:
+    import requests as _req
+    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
+    r = _req.get(url, timeout=15)
+    try:
+        r.raise_for_status()
+    except Exception as exc:
+        raise RuntimeError(
+            f"Gemini ListModels HTTP {r.status_code}: "
+            f"{GeminiProvider._scrub_secret(str(exc))}"
+        )
+    data = r.json() if r.content else {}
+    out: List[str] = []
+    for m in (data.get("models") or []):
+        if not isinstance(m, dict):
+            continue
+        methods = m.get("supportedGenerationMethods") or []
+        if "generateContent" not in methods:
+            continue
+        name = str(m.get("name") or "")
+        if name.startswith("models/"):
+            name = name[len("models/"):]
+        if not name or not name.startswith(_GEMINI_CHAT_PREFIXES):
+            continue
+        if any(s in name for s in _GEMINI_NONCHAT_SUBSTR):
+            continue
+        out.append(name)
+    out.sort()
+    return out
+
+
+def _openai_list(base_url: str, api_key: str) -> List[str]:
+    import requests as _req
+    base = (base_url or "https://api.openai.com").rstrip("/")
+    if base.endswith("/v1"):
+        base = base[:-3]
+    url = f"{base}/v1/models"
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    r = _req.get(url, headers=headers, timeout=15)
+    r.raise_for_status()
+    data = r.json() if r.content else {}
+    items = data.get("data") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        return []
+    out: List[str] = []
+    for m in items:
+        mid = str((m or {}).get("id") or "")
+        if not mid:
+            continue
+        if not mid.startswith(_OPENAI_CHAT_PREFIXES):
+            continue
+        low = mid.lower()
+        if any(s in low for s in _OPENAI_NONCHAT_SUBSTR):
+            continue
+        out.append(mid)
+    out.sort()
+    return out
+
+
+def _pick_default(kind: str, choices: List[str]) -> str:
+    """Pick a sensible default highlighting newest flash-tier model."""
+    if not choices:
+        return ""
+    if kind == "gemini":
+        for prefer in ("gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash"):
+            if prefer in choices:
+                return prefer
+    else:
+        for prefer in ("gpt-4o-mini", "gpt-4.1-mini", "gpt-4o"):
+            if prefer in choices:
+                return prefer
+    return choices[0]
+
+
+@router.post("/setup/cloud_models", response_model=ModelChoicesResponse)
+def cloud_models(req: CloudModelsRequest) -> ModelChoicesResponse:
+    """List chat-capable models for a cloud provider.
+
+    Looks the API key up from a saved profile when ``profile_name`` is given
+    so the frontend doesn't have to round-trip the secret. Falls back to a
+    short static list of current models when the call fails so the dropdown
+    is never empty.
+    """
+    kind = (req.kind or "").lower()
+    api_key = _resolve_api_key(req)
+
+    if kind == "gemini":
+        try:
+            choices = _gemini_list(api_key) if api_key else []
+        except Exception:
+            choices = []
+        if not choices:
+            choices = list(_GEMINI_FALLBACK)
+        return ModelChoicesResponse(
+            choices=choices, recommended_default=_pick_default("gemini", choices),
+        )
+
+    if kind in ("openai-compat", "custom"):
+        try:
+            choices = _openai_list(req.base_url or "", api_key) if api_key else []
+        except Exception:
+            choices = []
+        if not choices:
+            choices = list(_OPENAI_FALLBACK)
+        return ModelChoicesResponse(
+            choices=choices, recommended_default=_pick_default("openai", choices),
+        )
+
+    return ModelChoicesResponse(choices=[], recommended_default="")

@@ -97,10 +97,10 @@
   <g>
     <rect x="640" y="285" width="280" height="120" rx="12" fill="#0b1220" stroke="#a78bfa" stroke-opacity="0.5"/>
     <text x="658" y="312" font-size="14" font-weight="600" fill="#a78bfa">🤖 Agent</text>
-    <text x="658" y="335" font-size="11" fill="#cbd5e1">"Find every public function</text>
-    <text x="658" y="350" font-size="11" fill="#cbd5e1">without a docstring and fix it."</text>
+    <text x="658" y="335" font-size="11" fill="#cbd5e1">"Fix every undocumented function."</text>
+    <text x="658" y="352" font-size="11" fill="#cbd5e1">"Create a React calculator app."</text>
     <text x="658" y="370" font-size="11" fill="#94a3b8">→ Multi-step plan, live progress.</text>
-    <text x="658" y="392" font-size="10" fill="#64748b">Best for: bigger or fuzzy goals.</text>
+    <text x="658" y="392" font-size="10" fill="#64748b">Best for: bigger goals · new projects.</text>
   </g>
 
   <!-- Privacy / local-first banner -->

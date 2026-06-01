@@ -16,47 +16,14 @@ compatible with prior flags seen in the project.
 """
 
 import argparse
-import importlib
-import inspect
 import json
-import os
 import sys
 from pathlib import Path
 from typing import Any, Dict
 
 from cgx.pipeline.auto import run_index_auto, run_query_auto
 from cgx.config import EmbeddingConfig, FaissConfig, HybridSearchConfig
-
-
-def _load_embedder(spec: str) -> Any:
-    """
-    Load an object or factory from "module:attr".
-    If it's a class: instantiate with no args. If it's a callable: call to get the object.
-    Otherwise: return the object itself.
-    The returned object must expose `.encode(list[str]) -> ndarray`.
-
-    Security note
-    -------------
-    This performs `importlib.import_module(<user-supplied>)`, which runs that
-    module's top-level code. Only pass module names you trust. To restrict to a
-    short list, set CGX_EMBEDDER_ALLOWLIST=mod1,mod2 in the environment.
-    """
-    if not spec or ":" not in spec:
-        raise ValueError('Embedder spec must be "module:attr" (got %r)' % spec)
-    mod_name, attr = spec.split(":", 1)
-    allow = [s.strip() for s in (os.environ.get("CGX_EMBEDDER_ALLOWLIST", "") or "").split(",") if s.strip()]
-    if allow and mod_name not in allow:
-        raise PermissionError(
-            f"Embedder module {mod_name!r} not in CGX_EMBEDDER_ALLOWLIST={allow!r}"
-        )
-    mod = importlib.import_module(mod_name)
-    obj = getattr(mod, attr)
-    if inspect.isclass(obj):
-        return obj()
-    if callable(obj) and not hasattr(obj, "encode"):
-        # factory
-        return obj()
-    return obj
+from cgx.embeddings.loader import load_embedder_from_spec
 
 
 def _resolve_embedder_or_model(args: argparse.Namespace) -> tuple[Any, str]:
@@ -67,7 +34,7 @@ def _resolve_embedder_or_model(args: argparse.Namespace) -> tuple[Any, str]:
     neither, in which case the default model in ``run_index_auto`` is used.
     """
     if getattr(args, "embedder", None):
-        return _load_embedder(args.embedder), getattr(args, "model", None) or ""
+        return load_embedder_from_spec(args.embedder), getattr(args, "model", None) or ""
     return None, getattr(args, "model", None) or "jinaai/jina-embeddings-v2-base-code"
 
 

@@ -32,6 +32,7 @@ except Exception:  # pragma: no cover
 from cgx.embeddings.views import (
     build_intent_view,
     build_implementation_view,
+    _attribute_roots_read,  # canonical home; re-exported here for back-compat
 )
 
 logger = get_logger(__name__)
@@ -119,29 +120,6 @@ def _estimate_tokens(s: str) -> int:
         return 0
     est = max(1, int(math.ceil(len(s) / 4.0)))
     return est
-
-def _attribute_roots_read(meta: Dict[str, Any]) -> List[str]:
-    """
-    Extract root attributes accessed via `self.<attr>` from metadata.
-
-    Args:
-        meta (Dict[str, Any]): Metadata dictionary.
-
-    Returns:
-        List[str]: Sorted unique root attributes.
-    """
-    roots = set()
-    try:
-        reads = meta.get("attributes_used") or meta.get("reads") or []
-        for dotted in reads if isinstance(reads, list) else []:
-            if isinstance(dotted, str) and dotted.startswith("self."):
-                after = dotted.split("self.", 1)[1]
-                root = after.split(".", 1)[0]
-                if root:
-                    roots.add(root)
-    except Exception:
-        pass
-    return sorted(roots)
 
 def _normalize_raises(meta: Dict[str, Any]) -> List[str]:
     """

@@ -95,6 +95,8 @@ export interface AgentState {
   awaitingApproval: boolean;
   tasks: TaskRow[];
   planTitle: string | null;
+  /** Planner-supplied explanation of why the plan is structured this way. */
+  rationale: string;
   events: RawEvent[];
   summary: string | null;
   error: string | null;
@@ -177,7 +179,8 @@ interface TasksStore {
 const defaultAgent: AgentState = {
   busy: false, phase: "idle", goal: "", stopOnFail: true,
   executionMode: "auto", awaitingApproval: false,
-  tasks: [], planTitle: null, events: [], summary: null, error: null,
+  tasks: [], planTitle: null, rationale: "",
+  events: [], summary: null, error: null,
 };
 const defaultAsk: AskState = { busy: false, messages: [], error: null };
 const defaultPlan: PlanState = {
@@ -288,6 +291,7 @@ export const useTasks = create<TasksStore>()(
           awaitingApproval: s.agent.awaitingApproval,
           tasks: s.agent.tasks,
           planTitle: s.agent.planTitle,
+          rationale: s.agent.rationale,
           events: s.agent.events.slice(-200), // cap stored events
           summary: s.agent.summary,
           error: s.agent.error,

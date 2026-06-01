@@ -1,7 +1,7 @@
-// Minimal VS Code extension that hosts the Averix Gradio UI inside a
+// Minimal VS Code extension that hosts the Averix web UI inside a
 // webview panel. The extension does NOT spawn the server; the user is
 // expected to run `averix-ui` (or `python app.py`) separately. The URL
-// is read from the `averix.ui.url` setting (default http://localhost:7860).
+// is read from the `averix.ui.url` setting (default http://localhost:8765).
 
 import * as vscode from "vscode";
 
@@ -25,7 +25,7 @@ export function deactivate(): void {
 
 function currentUrl(): string {
   const cfg = vscode.workspace.getConfiguration("averix");
-  return (cfg.get<string>("ui.url") || "http://localhost:7860").trim();
+  return (cfg.get<string>("ui.url") || "http://localhost:8765").trim();
 }
 
 function openOrFocus(context: vscode.ExtensionContext): void {
@@ -41,7 +41,7 @@ function openOrFocus(context: vscode.ExtensionContext): void {
     {
       enableScripts: true,
       retainContextWhenHidden: true,
-      // The Gradio server is reached over plain HTTP on localhost; we
+      // The Averix server is reached over plain HTTP on localhost; we
       // do not load any local resources, so no localResourceRoots are
       // declared (an empty list would block the iframe outright).
     }
@@ -53,7 +53,7 @@ function openOrFocus(context: vscode.ExtensionContext): void {
 }
 
 function renderHtml(url: string): string {
-  // The Gradio UI is served as a full HTML document, so we frame it as
+  // The Averix UI is served as a full HTML document, so we frame it as
   // an iframe filling the panel. We escape the URL so a malicious
   // setting value can't break out of the attribute.
   const safe = url.replace(/"/g, "&quot;");
@@ -76,7 +76,7 @@ function renderHtml(url: string): string {
             referrerpolicy="no-referrer"></iframe>
     <noscript>
       <div class="err">
-        Averix needs scripts enabled. Configure the Gradio URL via the
+        Averix needs scripts enabled. Configure the web UI URL via the
         <code>averix.ui.url</code> setting and run
         <code>averix-ui</code> in a terminal first.
       </div>

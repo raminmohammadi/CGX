@@ -3,7 +3,7 @@
 Two surfaces are produced:
 
 * :func:`status_rows` — table rows ``[#, kind, description, status, judge, ms]``
-  consumed by the Gradio ``Dataframe`` on the Agent tab.
+  consumed by the React task table on the Agent page.
 * :func:`render_graph_html` — a self-contained, dependency-free HTML chip
   flow that visualises the plan as a horizontal arrow chain.
 
@@ -74,7 +74,8 @@ def render_graph_html(plan: Plan) -> str:
     """Render the plan as an inline HTML chip flow.
 
     The output is intentionally self-contained: no external CSS, no JS,
-    and uses inline styles so it survives Gradio's sanitiser intact.
+    and uses inline styles so it survives the React renderer's HTML
+    sanitisation when injected via ``dangerouslySetInnerHTML``.
     """
     if not plan or not plan.tasks:
         return "<div style='color:#868e96'>No plan yet.</div>"

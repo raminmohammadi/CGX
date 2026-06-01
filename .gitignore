@@ -26,6 +26,7 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+cgx_index/
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
@@ -201,3 +202,16 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Node / frontend build artifacts
+node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/coverage/
+
+# VS Code extension build output
+extension/out/
+
+# Averix runtime artifacts
+/cgx_index/
+src/averix.egg-info/

@@ -11,6 +11,7 @@ import {
   Eye,
   Gavel,
   GitBranch,
+  Lightbulb,
   Loader2,
   Network,
   Play,
@@ -43,13 +44,16 @@ const PAGE_KEY = "agent";
 const KIND_META: Record<string, {
   border: string; bg: string; text: string; badge: string;
 }> = {
-  search:    { border: "border-sky-500/50",     bg: "bg-sky-950/40",    text: "text-sky-300",    badge: "bg-sky-900/80 text-sky-300" },
-  ask:       { border: "border-purple-500/50",  bg: "bg-purple-950/40", text: "text-purple-300", badge: "bg-purple-900/80 text-purple-300" },
-  plan:      { border: "border-orange-500/50",  bg: "bg-orange-950/40", text: "text-orange-300", badge: "bg-orange-900/80 text-orange-300" },
-  apply:     { border: "border-emerald-500/50", bg: "bg-emerald-950/40",text: "text-emerald-300",badge: "bg-emerald-900/80 text-emerald-300" },
-  verify:    { border: "border-cyan-500/50",    bg: "bg-cyan-950/40",   text: "text-cyan-300",   badge: "bg-cyan-900/80 text-cyan-300" },
-  scaffold:  { border: "border-amber-500/50",   bg: "bg-amber-950/40",  text: "text-amber-300",  badge: "bg-amber-900/80 text-amber-300" },
-  summarize: { border: "border-slate-500/40",   bg: "bg-slate-800/40",  text: "text-slate-300",  badge: "bg-slate-700/80 text-slate-300" },
+  search:            { border: "border-sky-500/50",     bg: "bg-sky-950/40",    text: "text-sky-300",    badge: "bg-sky-900/80 text-sky-300" },
+  ask:               { border: "border-purple-500/50",  bg: "bg-purple-950/40", text: "text-purple-300", badge: "bg-purple-900/80 text-purple-300" },
+  plan:              { border: "border-orange-500/50",  bg: "bg-orange-950/40", text: "text-orange-300", badge: "bg-orange-900/80 text-orange-300" },
+  apply:             { border: "border-emerald-500/50", bg: "bg-emerald-950/40",text: "text-emerald-300",badge: "bg-emerald-900/80 text-emerald-300" },
+  verify:            { border: "border-cyan-500/50",    bg: "bg-cyan-950/40",   text: "text-cyan-300",   badge: "bg-cyan-900/80 text-cyan-300" },
+  scaffold:          { border: "border-amber-500/50",   bg: "bg-amber-950/40",  text: "text-amber-300",  badge: "bg-amber-900/80 text-amber-300" },
+  scaffold_manifest: { border: "border-yellow-500/50",  bg: "bg-yellow-950/40", text: "text-yellow-300", badge: "bg-yellow-900/80 text-yellow-300" },
+  scaffold_file:     { border: "border-amber-400/40",   bg: "bg-amber-900/30",  text: "text-amber-200",  badge: "bg-amber-800/70 text-amber-200" },
+  fill_logic:        { border: "border-rose-500/50",    bg: "bg-rose-950/40",   text: "text-rose-300",   badge: "bg-rose-900/80 text-rose-300" },
+  summarize:         { border: "border-slate-500/40",   bg: "bg-slate-800/40",  text: "text-slate-300",  badge: "bg-slate-700/80 text-slate-300" },
 };
 const defaultKindMeta = KIND_META.ask;
 
@@ -97,7 +101,7 @@ export default function AgentPage() {
 
   const {
     busy, phase, goal, stopOnFail, executionMode, awaitingApproval,
-    tasks, planTitle, events, summary, error,
+    tasks, planTitle, rationale, events, summary, error,
   } = agent;
 
   const [liveProgress, setLiveProgress] = useState<
@@ -123,6 +127,7 @@ export default function AgentPage() {
       events: [],
       summary: null,
       planTitle: null,
+      rationale: "",
       phase: "planning",
       awaitingApproval: false,
     });
@@ -167,6 +172,7 @@ export default function AgentPage() {
           const goalText = planObj?.goal || data?.goal || goal;
           setAgent({
             planTitle: String(goalText),
+            rationale: String(planObj?.rationale || data?.rationale || ""),
             tasks: planTasks.map((t: any) => ({
               id: String(t.id || t.description || Math.random()),
               name: String(t.name || t.title || ""),
@@ -302,6 +308,7 @@ export default function AgentPage() {
       events: [],
       summary: null,
       planTitle: null,
+      rationale: "",
       phase: "planning",
       awaitingApproval: false,
     });
@@ -332,6 +339,7 @@ export default function AgentPage() {
         phase: "idle",
         tasks: planTasks,
         planTitle: result.plan.goal || goal,
+        rationale: String(result.plan.rationale || ""),
         awaitingApproval: executionMode === "review",
       });
     } catch (e: any) {
@@ -433,6 +441,9 @@ export default function AgentPage() {
           description="Structural verification of task outputs against criteria." />
       </div>
 
+      {/* ── Planner rationale — shown above the DAG whenever the planner returned one ── */}
+      {rationale && <PlanRationaleCard rationale={rationale} />}
+
       {/* ── DAG panel — shown as soon as we have a plan (any mode) ── */}
       {showDag && (
         <PlanDAGPanel
@@ -460,7 +471,23 @@ export default function AgentPage() {
 
       {summary && (
         <Card padded>
-          <CardHeader title="Summary" eyebrow="Tracker output" right={<Pill tone="neon">Complete</Pill>} />
+          <CardHeader
+            title="Summary"
+            eyebrow="Tracker output"
+            right={(() => {
+              // Derive the badge from the effective (retry-collapsed) task
+              // list so a recovered SCAFFOLD_FILE failure doesn't show red.
+              const stage = computeStages(tasks, phase);
+              const anySkipped = tasks.some((t) => t.status === "skipped");
+              if (stage.tracker === "failed") {
+                return <Pill tone="red">Failed</Pill>;
+              }
+              if (anySkipped) {
+                return <Pill tone="amber">Complete with warnings</Pill>;
+              }
+              return <Pill tone="neon">Complete</Pill>;
+            })()}
+          />
           <pre className="text-[11px] text-slate-300 font-mono whitespace-pre-wrap leading-relaxed">
             {summary}
           </pre>
@@ -490,6 +517,35 @@ export default function AgentPage() {
         </Card>
       )}
     </div>
+  );
+}
+
+// ─── planner rationale card ───────────────────────────────────────────────────
+
+function PlanRationaleCard({ rationale }: { rationale: string }) {
+  const [open, setOpen] = useState(true);
+  return (
+    <Card padded>
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="w-full flex items-center gap-2 text-left"
+      >
+        <Lightbulb className="h-4 w-4 text-amber-300 shrink-0" />
+        <span className="text-sm font-semibold text-slate-200">Plan Rationale</span>
+        <span className="text-[10px] font-mono uppercase tracking-wider text-slate-500">
+          Planner thoughts
+        </span>
+        <span className="ml-auto text-slate-500">
+          {open ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+        </span>
+      </button>
+      {open && (
+        <div className="mt-3 text-[12px] text-slate-300 leading-relaxed">
+          <Markdown text={rationale} />
+        </div>
+      )}
+    </Card>
   );
 }
 
@@ -1475,9 +1531,22 @@ function computeStages(tasks: TaskRow[], phase: string) {
       judge: "pending",
     } as const;
   }
+  // Collapse retried tasks: when a SCAFFOLD_FILE failed on the first
+  // attempt and a retry-plan regenerated the same file, the latter row
+  // supersedes the former. Without this, the stage cards would keep
+  // showing red long after the failure was recovered.
+  const latestByKey = new Map<string, TaskRow>();
+  for (const t of tasks) {
+    const key = `${t.kind}::${t.name || t.description}`;
+    latestByKey.set(key, t);
+  }
+  const effective = Array.from(latestByKey.values());
+
   const anyRunning = tasks.some((t) => t.status === "running");
-  const allDone = tasks.every((t) => t.status === "done" || t.status === "skipped");
-  const anyFailed = tasks.some((t) => t.status === "failed");
+  const allDone = effective.every(
+    (t) => t.status === "done" || t.status === "skipped",
+  );
+  const anyFailed = effective.some((t) => t.status === "failed");
   const anyJudge = tasks.some((t) => t.judge);
   // Judge is "running" only in the narrow window where a task just finished
   // (status === "done") but its judge verdict hasn't arrived yet.

@@ -145,7 +145,7 @@ class LexicalIndex:
 
 # Module-level cache: (abs_path, mtime_ns, size_bytes) -> LexicalIndex.
 # Bounded size with simple FIFO eviction; queries are read-only so this is
-# safe across the Gradio app or any in-process re-use.
+# safe across the FastAPI app or any in-process re-use.
 _LEX_CACHE: "Dict[Tuple[str, int, int], LexicalIndex]" = {}
 _LEX_CACHE_MAX = 4
 
