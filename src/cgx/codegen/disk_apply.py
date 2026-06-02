@@ -1,6 +1,9 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Ramin Mohammadi
+
 """Write LLM-proposed diffs to the user's working tree.
 
-This module is the only place in Averix that touches the real filesystem
+This module is the only place in CGX that touches the real filesystem
 on behalf of the agent. To keep the operation recoverable, every original
 file is mirrored into a per-run backup directory before its contents are
 overwritten. Callers receive the list of applied and failed files plus
@@ -119,7 +122,7 @@ def apply_diffs_to_disk(
     diffs: Sequence[Dict[str, str]],
     *,
     allow_new_files: bool = True,
-    backup_root: str = ".averix-backups",
+    backup_root: str = ".cgx-backups",
 ) -> Dict[str, Any]:
     """Apply ``diffs`` to ``project_root`` after a syntax smoke test.
 

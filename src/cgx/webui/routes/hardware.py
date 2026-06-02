@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Ramin Mohammadi
+
 """Hardware page payload — model fit matrix + local-vs-cloud tradeoffs.
 
 Stateless: every request re-detects RAM/VRAM and re-annotates the

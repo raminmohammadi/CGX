@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Ramin Mohammadi
+
 """End-to-end validation of an LLM-generated code plan.
 
 This module composes the diff parser, the syntax validator, and the impacted

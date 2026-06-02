@@ -223,7 +223,7 @@ function ChatBubble({ msg }: { msg: ChatMsg }) {
       </div>
       <div className="space-y-3 w-full min-w-0">
         <div className="flex items-center gap-2">
-          <p className="text-slate-400 text-[10px] font-mono">Averix Response</p>
+          <p className="text-slate-400 text-[10px] font-mono">CGX Response</p>
           {msg.intent?.mode && <Pill tone="purple">{msg.intent.mode}</Pill>}
         </div>
         {msg.thought && (
@@ -346,7 +346,7 @@ function SourceRow({ src, rank }: { src: any; rank: number }) {
 function AskEmptyState() {
   return (
     <div className="text-center text-slate-500 text-xs font-mono py-10">
-      Drop a question below. Averix will fuse semantic + symbolic + graph retrieval before answering.
+      Drop a question below. CGX will fuse semantic + symbolic + graph retrieval before answering.
     </div>
   );
 }

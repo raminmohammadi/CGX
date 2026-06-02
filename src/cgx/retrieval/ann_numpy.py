@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Ramin Mohammadi
+
 # src/cgx/retrieval/ann_numpy.py
 from __future__ import annotations
 from typing import Any, Dict, Optional

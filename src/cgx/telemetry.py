@@ -1,4 +1,7 @@
-"""Ultra-minimal, opt-in anonymous telemetry for Averix.
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Ramin Mohammadi
+
+"""Ultra-minimal, opt-in anonymous telemetry for CGX.
 
 Design constraints (non-negotiable):
 
@@ -33,8 +36,9 @@ from typing import Optional
 CONFIG_DIR = Path(os.environ.get("CGX_CONFIG_DIR", str(Path.home() / ".cgx")))
 INSTALL_ID_PATH = CONFIG_DIR / "install_id"
 
-# Public endpoint. Override with ``CGX_TELEMETRY_URL`` for self-hosting.
-DEFAULT_ENDPOINT = "https://averix.dev/api/telemetry/ping"
+# Default endpoint is intentionally empty — telemetry is a self-hosted
+# extension point. Set ``CGX_TELEMETRY_URL`` to your collector to enable.
+DEFAULT_ENDPOINT = ""
 
 # Module-level guard so multiple imports/launches share state.
 _HAS_PINGED = False
@@ -79,10 +83,10 @@ def get_install_id() -> str:
     return new_id
 
 
-def _averix_version() -> str:
+def _cgx_version() -> str:
     try:
         from importlib.metadata import version  # py3.8+
-        return version("averix")
+        return version("cgx")
     except Exception:
         return "unknown"
 
@@ -100,7 +104,7 @@ def _payload() -> dict:
     """Return the (intentionally minimal) telemetry payload."""
     return {
         "install_id": get_install_id(),
-        "averix_version": _averix_version(),
+        "cgx_version": _cgx_version(),
         "event": "startup",
     }
 
@@ -119,6 +123,8 @@ def ping(endpoint: Optional[str] = None) -> bool:
             return False
         _HAS_PINGED = True
     url = endpoint or os.environ.get("CGX_TELEMETRY_URL", DEFAULT_ENDPOINT)
+    if not url:
+        return False
     t = threading.Thread(target=_post, args=(url, _payload()), daemon=True)
     t.start()
     return True

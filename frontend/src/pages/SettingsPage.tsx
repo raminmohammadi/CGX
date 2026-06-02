@@ -1,8 +1,10 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
-  Check, Plus, Save, ShieldCheck, Trash2, Wifi, WifiOff, X, BookmarkPlus,
+  Check, Download, Loader2, Plus, Save, ShieldCheck, Trash2,
+  Wifi, WifiOff, X, BookmarkPlus,
 } from "lucide-react";
 import { api, type PingResult, type ProfileSummary } from "../lib/api";
+import { cancelPull, startPull, usePullState } from "../lib/pullManager";
 import { useWorkspace } from "../store/workspace";
 import { Card, CardHeader } from "../components/Card";
 import { Field, NumberInput, Select, TextInput } from "../components/Input";
@@ -20,6 +22,15 @@ interface EditState {
   num_predict: number;
   endpoint_path: string;
   allow_no_auth: boolean;
+}
+
+interface PullState {
+  model: string;
+  status: string;
+  total: number;
+  completed: number;
+  done: boolean;
+  error: string | null;
 }
 
 const KIND_DEFAULTS: Record<ProviderKind, Partial<EditState>> = {
@@ -75,10 +86,26 @@ export default function SettingsPage() {
   const [edit, setEdit] = useState<EditState | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // Model lists: choices = installed + full catalog
   const [models, setModels] = useState<string[]>([]);
+  const [installedModels, setInstalledModels] = useState<string[]>([]);
+  const [ollamaReachable, setOllamaReachable] = useState(false);
   const [editModels, setEditModels] = useState<string[]>([]);
-  const [pingResult, setPingResult] = useState<PingResult | null>(null);
-  const [pinging, setPinging] = useState(false);
+  const [editInstalledModels, setEditInstalledModels] = useState<string[]>([]);
+  const [editOllamaReachable, setEditOllamaReachable] = useState(false);
+
+  // Separate ping state for active provider vs modal form
+  const [activePingResult, setActivePingResult] = useState<PingResult | null>(null);
+  const [activePinging, setActivePinging] = useState(false);
+  const [editPingResult, setEditPingResult] = useState<PingResult | null>(null);
+  const [editPinging, setEditPinging] = useState(false);
+
+  // Active-provider pull: module-level singleton (survives tab switches)
+  const activePull = usePullState();
+  // Edit-modal pull: local state is fine — modal is always visible while pulling
+  const [editPull, setEditPull] = useState<PullState | null>(null);
+  const editPullRef = useRef<{ abort: () => void } | null>(null);
 
   const loadProfiles = async () => {
     try {
@@ -92,6 +119,7 @@ export default function SettingsPage() {
     loadProfiles();
   }, []);
 
+  // Refresh model list when active provider changes
   useEffect(() => {
     const kind = provider.kind as ProviderKind;
     if (kind === "ollama") {
@@ -99,15 +127,17 @@ export default function SettingsPage() {
         try {
           const r = await api.setupModels(provider.base_url);
           setModels(r.choices);
+          setInstalledModels(r.installed || []);
+          setOllamaReachable(r.ollama_reachable ?? false);
         } catch {
           setModels([]);
+          setInstalledModels([]);
+          setOllamaReachable(false);
         }
       })();
       return;
     }
     if (kind === "gemini" || kind === "openai-compat" || kind === "custom") {
-      // Use the active profile's stored key when no inline key was typed so the
-      // dropdown can be populated without re-entering credentials.
       const inlineKey = (provider as any).api_key || "";
       const profileName =
         provider.use_profile && provider.profile_name ? provider.profile_name : null;
@@ -135,11 +165,11 @@ export default function SettingsPage() {
     (provider as any).api_key,
   ]);
 
-  // Same idea as the active-provider effect, but driven by the editor draft so
-  // the profile creation form also shows real current models for cloud kinds.
+  // Refresh model list for edit form
   useEffect(() => {
     if (!edit) {
       setEditModels([]);
+      setEditInstalledModels([]);
       return;
     }
     const kind = edit.kind;
@@ -148,8 +178,12 @@ export default function SettingsPage() {
         try {
           const r = await api.setupModels(edit.base_url);
           setEditModels(r.choices);
+          setEditInstalledModels(r.installed || []);
+          setEditOllamaReachable(r.ollama_reachable ?? false);
         } catch {
           setEditModels([]);
+          setEditInstalledModels([]);
+          setEditOllamaReachable(false);
         }
       })();
       return;
@@ -173,8 +207,13 @@ export default function SettingsPage() {
     setEditModels([]);
   }, [edit?.kind, edit?.base_url, edit?.api_key, edit?.name]);
 
-  const startNew = () => setEdit({ ...emptyEdit });
-  const startEdit = (p: ProfileSummary) =>
+  const startNew = () => {
+    setEdit({ ...emptyEdit });
+    setEditPingResult(null);
+    setEditPull(null);
+  };
+
+  const startEdit = (p: ProfileSummary) => {
     setEdit({
       name: p.name,
       kind: (p.kind as ProviderKind) || "ollama",
@@ -186,9 +225,10 @@ export default function SettingsPage() {
       endpoint_path: p.endpoint_path || "/v1/chat/completions",
       allow_no_auth: p.allow_no_auth ?? false,
     });
+    setEditPingResult(null);
+    setEditPull(null);
+  };
 
-  // Snapshot the current Active Provider into a new-profile draft so the
-  // user can persist the inline config without re-typing it.
   const saveActiveAsProfile = () => {
     const suggestion =
       provider.use_profile && provider.profile_name
@@ -205,18 +245,31 @@ export default function SettingsPage() {
       endpoint_path: provider.endpoint_path || "/v1/chat/completions",
       allow_no_auth: provider.allow_no_auth ?? false,
     });
-    setPingResult(null);
+    setEditPingResult(null);
+    setEditPull(null);
   };
 
   const handleKindChange = (kind: ProviderKind) => {
     const defaults = KIND_DEFAULTS[kind] || {};
-    setEdit((prev) =>
-      prev ? { ...prev, kind, ...defaults } : null
-    );
-    setPingResult(null);
+    setEdit((prev) => (prev ? { ...prev, kind, ...defaults } : null));
+    setEditPingResult(null);
+    setEditPull(null);
   };
 
-  const ping = async (src: EditState | typeof provider) => {
+  const closeModal = () => {
+    setEdit(null);
+    setEditPingResult(null);
+    editPullRef.current?.abort();
+    editPullRef.current = null;
+    setEditPull(null);
+  };
+
+  // Generic ping helper
+  const runPing = async (
+    src: EditState | typeof provider,
+    setPinging: (v: boolean) => void,
+    setPingResult: (r: PingResult | null) => void,
+  ) => {
     setPinging(true);
     setPingResult(null);
     try {
@@ -224,7 +277,7 @@ export default function SettingsPage() {
         kind: (src as any).kind,
         base_url: (src as any).base_url,
         model: (src as any).model,
-        api_key: (src as any).api_key || (src as any).api_key || null,
+        api_key: (src as any).api_key || null,
         endpoint_path: (src as any).endpoint_path || "/v1/chat/completions",
         allow_no_auth: (src as any).allow_no_auth ?? false,
       });
@@ -234,6 +287,39 @@ export default function SettingsPage() {
     } finally {
       setPinging(false);
     }
+  };
+
+  // Pull a model via Ollama — for the edit modal only (active-provider uses pullManager)
+  const startEditPull = (model: string, baseUrl: string, afterDone?: () => void) => {
+    editPullRef.current?.abort();
+    setEditPull({ model, status: "Connecting…", total: 0, completed: 0, done: false, error: null });
+    const conn = api.ollamaPull(
+      model,
+      baseUrl,
+      (data) => {
+        setEditPull((prev) =>
+          prev
+            ? {
+                ...prev,
+                status: data.status || prev.status,
+                total: data.total ?? prev.total,
+                completed: data.completed ?? prev.completed,
+                done: data.status === "success",
+              }
+            : null,
+        );
+      },
+      () => {
+        setEditPull((prev) => (prev ? { ...prev, done: true, status: "Download complete" } : null));
+        afterDone?.();
+      },
+      (err) => {
+        setEditPull((prev) =>
+          prev ? { ...prev, error: String(err), done: true } : null,
+        );
+      },
+    );
+    editPullRef.current = conn;
   };
 
   const save = async () => {
@@ -256,8 +342,7 @@ export default function SettingsPage() {
         endpoint_path: edit.endpoint_path || "/v1/chat/completions",
         allow_no_auth: edit.allow_no_auth,
       });
-      setEdit(null);
-      setPingResult(null);
+      closeModal();
       await loadProfiles();
     } catch (e: any) {
       setError(String(e?.message || e));
@@ -281,10 +366,24 @@ export default function SettingsPage() {
   const needsEndpointPath = (kind: ProviderKind) => kind === "custom";
   const needsBaseUrl = (kind: ProviderKind) => kind !== "gemini";
 
+  // Show the pull button whenever Ollama is reachable and the model isn't installed yet.
+  const showPullButton = (
+    kind: ProviderKind,
+    model: string,
+    installed: string[],
+    reachable: boolean,
+    pulling: boolean,
+  ) =>
+    kind === "ollama" &&
+    !!model &&
+    reachable &&
+    !installed.includes(model) &&
+    !pulling;
+
   return (
     <div className="p-6 space-y-6 max-w-5xl overflow-y-auto h-full">
       <CardHeader
-        title="⚙️ Provider Settings & Profiles"
+        title="Provider Settings & Profiles"
         description="Configure model profiles. Choose from Ollama (local), OpenAI, Google Gemini, or a custom OpenAI-compatible server."
         right={
           <button onClick={startNew} className="av-btn-primary">
@@ -304,27 +403,13 @@ export default function SettingsPage() {
           }
           right={
             <div className="flex items-center gap-2">
-              {pingResult && (
-                <span
-                  className={`text-[10px] font-mono flex items-center gap-1 ${pingResult.ok ? "text-emerald-400" : "text-red-400"}`}
-                >
-                  {pingResult.ok ? (
-                    <Wifi className="h-3 w-3" />
-                  ) : (
-                    <WifiOff className="h-3 w-3" />
-                  )}
-                  {pingResult.ok
-                    ? `${pingResult.latency_ms?.toFixed(0)}ms`
-                    : pingResult.error?.slice(0, 60)}
-                </span>
-              )}
               <button
                 className="av-btn-ghost"
-                onClick={() => ping(provider)}
-                disabled={pinging}
+                onClick={() => runPing(provider, setActivePinging, setActivePingResult)}
+                disabled={activePinging}
               >
-                <Wifi className="h-3 w-3" />
-                {pinging ? "Pinging…" : "Ping"}
+                {activePinging ? <Loader2 className="h-3 w-3 animate-spin" /> : <Wifi className="h-3 w-3" />}
+                {activePinging ? "Pinging…" : "Ping"}
               </button>
               <button
                 className="av-btn-primary"
@@ -340,7 +425,6 @@ export default function SettingsPage() {
           }
         />
         <div className="grid grid-cols-2 gap-3">
-          {/* Provider type selector */}
           <Field label="Provider Type" className="col-span-2">
             <Select
               value={provider.kind}
@@ -348,7 +432,8 @@ export default function SettingsPage() {
                 const k = (e.target as any).value as ProviderKind;
                 const defaults = KIND_DEFAULTS[k] || {};
                 setProvider({ kind: k, use_profile: false, ...defaults });
-                setPingResult(null);
+                setActivePingResult(null);
+                cancelPull();
               }}
             >
               {(Object.keys(KIND_LABELS) as ProviderKind[]).map((k) => (
@@ -385,7 +470,34 @@ export default function SettingsPage() {
                   ))}
                 </Select>
               )}
+              {activePull && activePull.model === provider.model && !activePull.done && !activePull.error ? (
+                <button className="av-btn-ghost whitespace-nowrap" onClick={cancelPull}>
+                  <X className="h-3 w-3" /> Cancel
+                </button>
+              ) : showPullButton(
+                provider.kind as ProviderKind,
+                provider.model,
+                installedModels,
+                ollamaReachable,
+                false,
+              ) ? (
+                <button
+                  className="av-btn-ghost whitespace-nowrap"
+                  onClick={() =>
+                    startPull(provider.model, provider.base_url, () => {
+                      api.setupModels(provider.base_url).then((r) => {
+                        setModels(r.choices);
+                        setInstalledModels(r.installed || []);
+                        setOllamaReachable(r.ollama_reachable ?? false);
+                      }).catch(() => {});
+                    })
+                  }
+                >
+                  <Download className="h-3 w-3" /> Pull
+                </button>
+              ) : null}
             </div>
+            <PullProgress pull={activePull} model={provider.model} />
           </Field>
 
           {needsApiKey(provider.kind as ProviderKind) && (
@@ -467,271 +579,404 @@ export default function SettingsPage() {
             />
           </Field>
         </div>
+        <PingBanner result={activePingResult} model={provider.model} />
       </Card>
 
       {/* ── Saved profiles ── */}
-      <div className="grid grid-cols-2 gap-4">
-        {profiles.map((p) => {
-          const active =
-            provider.use_profile && provider.profile_name === p.name;
-          return (
-            <Card key={p.name} padded active={active}>
-              <div className="flex justify-between items-center mb-3">
-                <h3 className="text-xs font-semibold text-emerald-400 font-mono">
-                  Profile: {p.name}
-                </h3>
-                <Pill tone={active ? "neon" : "slate"}>
-                  {active ? "ACTIVE" : "STANDBY"}
-                </Pill>
-              </div>
-              <div className="space-y-3 text-xs">
-                <KvRead label="Provider" value={KIND_LABELS[p.kind as ProviderKind] || p.kind} />
-                {p.kind !== "gemini" && (
-                  <KvRead label="Base Endpoint URL" value={p.base_url} />
-                )}
-                {p.kind === "custom" && (
-                  <KvRead label="Endpoint Path" value={p.endpoint_path || "/v1/chat/completions"} />
-                )}
-                <div className="grid grid-cols-2 gap-2">
-                  <KvRead label="Model" value={p.model} />
-                  <KvRead label="Temperature" value={p.temperature.toFixed(2)} />
-                  <KvRead label="num_predict" value={String(p.num_predict)} />
-                  {p.kind === "custom" && (
-                    <KvRead
-                      label="Auth bypass"
-                      value={p.allow_no_auth ? "yes (no-auth)" : "no"}
-                    />
-                  )}
-                </div>
-                <p className="text-[10px] text-slate-500 font-mono flex items-center gap-1">
-                  <ShieldCheck className="h-3 w-3" />
-                  API key: {p.has_api_key ? "stored (keyring)" : "—"}
-                </p>
-                <p className="text-[10px] text-slate-500 font-mono">
-                  Read-only snapshot — click <strong>Edit</strong> to change values, then <strong>Save</strong>.
-                </p>
-              </div>
-              <div className="flex gap-2 mt-4">
-                <button
-                  className="av-btn-primary flex-1"
-                  onClick={() => applyProfile(p)}
-                >
-                  <Check className="h-3 w-3" /> Use
-                </button>
-                <button className="av-btn-ghost" onClick={() => startEdit(p)}>
-                  Edit
-                </button>
-                <button
-                  className="av-btn bg-red-500/10 text-red-300 border border-red-500/30 hover:bg-red-500/20"
-                  onClick={() => remove(p.name)}
-                >
-                  <Trash2 className="h-3 w-3" />
-                </button>
-              </div>
-            </Card>
-          );
-        })}
-        {profiles.length === 0 && (
-          <Card padded className="col-span-2 text-center text-xs text-slate-400">
-            No saved profiles yet. Click <strong>New profile</strong> to save your
-            current setup for reuse.
-          </Card>
-        )}
-      </div>
-
-      {/* ── Edit / New profile form ── */}
-      {edit && (
-        <Card padded active>
-          <CardHeader
-            eyebrow={edit.name ? "Edit profile" : "New profile"}
-            title={edit.name || "Untitled profile"}
-            right={
-              <>
-                {/* Ping button */}
-                <div className="flex items-center gap-2">
-                  {pingResult && (
-                    <span
-                      className={`text-[10px] font-mono flex items-center gap-1 ${pingResult.ok ? "text-emerald-400" : "text-red-400"}`}
+      <Card padded>
+        <CardHeader
+          eyebrow="Saved profiles"
+          title="Profiles"
+          description="Click a profile row to expand details, or use the action buttons to switch, edit, or delete."
+        />
+        {profiles.length === 0 ? (
+          <p className="text-xs text-slate-500 text-center py-4">
+            No saved profiles yet — click <strong>New profile</strong> above to save your current setup.
+          </p>
+        ) : (
+          <div className="mt-3 rounded-lg border border-white/5 overflow-hidden">
+            <table className="w-full text-xs font-mono">
+              <thead className="bg-slate-950 text-slate-500 uppercase border-b border-white/5">
+                <tr>
+                  <th className="px-3 py-2 text-left text-[10px] tracking-wider">Name</th>
+                  <th className="px-3 py-2 text-left text-[10px] tracking-wider">Provider</th>
+                  <th className="px-3 py-2 text-left text-[10px] tracking-wider">Model</th>
+                  <th className="px-3 py-2 text-left text-[10px] tracking-wider">Temp</th>
+                  <th className="px-3 py-2 text-left text-[10px] tracking-wider">Key</th>
+                  <th className="px-3 py-2 text-left text-[10px] tracking-wider">Status</th>
+                  <th className="px-3 py-2 text-right text-[10px] tracking-wider">Actions</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-white/5">
+                {profiles.map((p) => {
+                  const active = provider.use_profile && provider.profile_name === p.name;
+                  return (
+                    <tr
+                      key={p.name}
+                      className={`transition-colors ${active ? "bg-emerald-500/5" : "hover:bg-slate-950/60"}`}
                     >
-                      {pingResult.ok ? (
-                        <Wifi className="h-3 w-3" />
-                      ) : (
-                        <WifiOff className="h-3 w-3" />
-                      )}
-                      {pingResult.ok
-                        ? `OK · ${pingResult.latency_ms?.toFixed(0)}ms`
-                        : pingResult.error?.slice(0, 80)}
-                    </span>
-                  )}
-                  <button
-                    className="av-btn-ghost"
-                    onClick={() => ping(edit)}
-                    disabled={pinging}
-                  >
-                    <Wifi className="h-3 w-3" />
-                    {pinging ? "Pinging…" : "Ping"}
-                  </button>
-                </div>
-                <button className="av-btn-ghost" onClick={() => { setEdit(null); setPingResult(null); }}>
-                  <X className="h-3 w-3" /> Cancel
-                </button>
-                <button className="av-btn-primary" onClick={save} disabled={busy}>
-                  <Save className="h-3 w-3" /> {busy ? "Saving…" : "Save"}
-                </button>
-              </>
-            }
-          />
-          <div className="grid grid-cols-2 gap-3">
-            <Field label="Name">
-              <TextInput
-                value={edit.name}
-                onChange={(e) => setEdit({ ...edit, name: e.target.value })}
-              />
-            </Field>
-
-            {/* Provider type selector */}
-            <Field label="Provider Type">
-              <Select
-                value={edit.kind}
-                onChange={(e) =>
-                  handleKindChange((e.target as any).value as ProviderKind)
-                }
-              >
-                {(Object.keys(KIND_LABELS) as ProviderKind[]).map((k) => (
-                  <option key={k} value={k}>
-                    {KIND_LABELS[k]}
-                  </option>
-                ))}
-              </Select>
-            </Field>
-
-            <Field label="Model" className="col-span-2">
-              <div className="flex gap-2">
-                <TextInput
-                  value={edit.model}
-                  placeholder={
-                    edit.kind === "gemini"
-                      ? "gemini-2.5-flash"
-                      : edit.kind === "openai-compat"
-                      ? "gpt-4o-mini"
-                      : "qwen2.5-coder:3b"
-                  }
-                  onChange={(e) => setEdit({ ...edit, model: e.target.value })}
-                  className="flex-1"
-                />
-                {editModels.length > 0 && (
-                  <Select
-                    value=""
-                    onChange={(e) => {
-                      const v = (e.target as any).value;
-                      if (v) setEdit({ ...edit, model: v });
-                    }}
-                    className="w-40"
-                  >
-                    <option value="">presets…</option>
-                    {editModels.map((m) => (
-                      <option key={m} value={m}>
-                        {m}
-                      </option>
-                    ))}
-                  </Select>
-                )}
-              </div>
-            </Field>
-
-            {needsBaseUrl(edit.kind) && (
-              <Field label="Base URL" className="col-span-2">
-                <TextInput
-                  value={edit.base_url}
-                  placeholder={KIND_DEFAULTS[edit.kind]?.base_url || ""}
-                  onChange={(e) => setEdit({ ...edit, base_url: e.target.value })}
-                />
-              </Field>
-            )}
-
-            {needsApiKey(edit.kind) && (
-              <Field
-                label={
-                  edit.kind === "gemini"
-                    ? "Gemini API Key"
-                    : edit.kind === "openai-compat"
-                    ? "OpenAI API Key"
-                    : "Bearer Token (optional)"
-                }
-                className="col-span-2"
-              >
-                <TextInput
-                  type="password"
-                  value={edit.api_key}
-                  placeholder={
-                    edit.allow_no_auth ? "skip — private subnet" : "sk-…"
-                  }
-                  onChange={(e) => setEdit({ ...edit, api_key: e.target.value })}
-                />
-              </Field>
-            )}
-
-            {needsEndpointPath(edit.kind) && (
-              <>
-                <Field label="Endpoint Path">
-                  <TextInput
-                    value={edit.endpoint_path}
-                    placeholder="/v1/chat/completions"
-                    onChange={(e) =>
-                      setEdit({ ...edit, endpoint_path: e.target.value })
-                    }
-                  />
-                </Field>
-                <Field label="Auth">
-                  <label className="flex items-center gap-2 text-xs text-slate-300 mt-2 cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={edit.allow_no_auth}
-                      onChange={(e) =>
-                        setEdit({ ...edit, allow_no_auth: e.target.checked })
-                      }
-                      className="rounded"
-                    />
-                    Skip auth (private subnet / no-key server)
-                  </label>
-                </Field>
-              </>
-            )}
-
-            <Field label="Temperature">
-              <NumberInput
-                step={0.05}
-                value={edit.temperature}
-                onChange={(e) =>
-                  setEdit({ ...edit, temperature: Number(e.target.value) })
-                }
-              />
-            </Field>
-            <Field label="num_predict">
-              <NumberInput
-                step={64}
-                value={edit.num_predict}
-                onChange={(e) =>
-                  setEdit({ ...edit, num_predict: Number(e.target.value) })
-                }
-              />
-            </Field>
+                      <td className="px-3 py-2.5 font-semibold text-white">{p.name}</td>
+                      <td className="px-3 py-2.5 text-slate-400">
+                        {KIND_LABELS[p.kind as ProviderKind]?.split(" ")[0] || p.kind}
+                      </td>
+                      <td className="px-3 py-2.5 text-slate-300 max-w-[160px] truncate" title={p.model}>
+                        {p.model}
+                      </td>
+                      <td className="px-3 py-2.5 text-slate-400">{p.temperature.toFixed(2)}</td>
+                      <td className="px-3 py-2.5">
+                        {p.has_api_key ? (
+                          <span className="flex items-center gap-1 text-emerald-400">
+                            <ShieldCheck className="h-3 w-3" /> stored
+                          </span>
+                        ) : (
+                          <span className="text-slate-600">—</span>
+                        )}
+                      </td>
+                      <td className="px-3 py-2.5">
+                        <Pill tone={active ? "neon" : "slate"} className="text-[9px]">
+                          {active ? "ACTIVE" : "STANDBY"}
+                        </Pill>
+                      </td>
+                      <td className="px-3 py-2.5 text-right">
+                        <div className="flex items-center justify-end gap-1.5">
+                          <button
+                            className="av-btn-primary py-1 px-2 text-[10px]"
+                            onClick={() => applyProfile(p)}
+                          >
+                            <Check className="h-3 w-3" /> Use
+                          </button>
+                          <button
+                            className="av-btn-ghost py-1 px-2 text-[10px]"
+                            onClick={() => startEdit(p)}
+                          >
+                            Edit
+                          </button>
+                          <button
+                            className="av-btn py-1 px-2 text-[10px] bg-red-500/10 text-red-300 border border-red-500/30 hover:bg-red-500/20"
+                            onClick={() => remove(p.name)}
+                          >
+                            <Trash2 className="h-3 w-3" />
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
           </div>
-        </Card>
-      )}
+        )}
+      </Card>
 
       {error && (
         <Card padded className="border-red-500/40">
           <p className="text-xs text-red-300 font-mono">{error}</p>
         </Card>
       )}
+
+      {/* ── Profile edit / new — modal overlay ── */}
+      {edit && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
+          onMouseDown={(e) => {
+            if (e.target === e.currentTarget) closeModal();
+          }}
+        >
+          <div className="bg-[#0d1117] border border-white/10 rounded-xl w-full max-w-2xl mx-4 max-h-[90vh] overflow-y-auto shadow-2xl shadow-black/60">
+            {/* Modal header */}
+            <div className="flex items-center justify-between px-6 py-4 border-b border-white/5">
+              <div>
+                <p className="text-[10px] text-slate-500 uppercase tracking-widest font-mono mb-0.5">
+                  {edit.name ? "Edit profile" : "New profile"}
+                </p>
+                <h2 className="text-sm font-semibold text-white font-mono">
+                  {edit.name || "Untitled profile"}
+                </h2>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  className="av-btn-ghost"
+                  onClick={() => runPing(edit, setEditPinging, setEditPingResult)}
+                  disabled={editPinging}
+                >
+                  {editPinging ? <Loader2 className="h-3 w-3 animate-spin" /> : <Wifi className="h-3 w-3" />}
+                  {editPinging ? "Pinging…" : "Ping"}
+                </button>
+                <button className="av-btn-ghost" onClick={closeModal}>
+                  <X className="h-3 w-3" /> Cancel
+                </button>
+                <button className="av-btn-primary" onClick={save} disabled={busy}>
+                  <Save className="h-3 w-3" /> {busy ? "Saving…" : "Save"}
+                </button>
+              </div>
+            </div>
+
+            {/* Modal body */}
+            <div className="p-6">
+              <div className="grid grid-cols-2 gap-3">
+                <Field label="Name">
+                  <TextInput
+                    value={edit.name}
+                    onChange={(e) => setEdit({ ...edit, name: e.target.value })}
+                  />
+                </Field>
+
+                <Field label="Provider Type">
+                  <Select
+                    value={edit.kind}
+                    onChange={(e) =>
+                      handleKindChange((e.target as any).value as ProviderKind)
+                    }
+                  >
+                    {(Object.keys(KIND_LABELS) as ProviderKind[]).map((k) => (
+                      <option key={k} value={k}>
+                        {KIND_LABELS[k]}
+                      </option>
+                    ))}
+                  </Select>
+                </Field>
+
+                <Field label="Model" className="col-span-2">
+                  <div className="flex gap-2">
+                    <TextInput
+                      value={edit.model}
+                      placeholder={
+                        edit.kind === "gemini"
+                          ? "gemini-2.5-flash"
+                          : edit.kind === "openai-compat"
+                          ? "gpt-4o-mini"
+                          : "qwen2.5-coder:3b"
+                      }
+                      onChange={(e) => setEdit({ ...edit, model: e.target.value })}
+                      className="flex-1"
+                    />
+                    {editModels.length > 0 && (
+                      <Select
+                        value=""
+                        onChange={(e) => {
+                          const v = (e.target as any).value;
+                          if (v) setEdit({ ...edit, model: v });
+                        }}
+                        className="w-40"
+                      >
+                        <option value="">presets…</option>
+                        {editModels.map((m) => (
+                          <option key={m} value={m}>
+                            {m}
+                          </option>
+                        ))}
+                      </Select>
+                    )}
+                    {showPullButton(
+                      edit.kind,
+                      edit.model,
+                      editInstalledModels,
+                      editOllamaReachable,
+                      !!(editPull && !editPull.done && !editPull.error),
+                    ) && (
+                      <button
+                        className="av-btn-ghost whitespace-nowrap"
+                        onClick={() =>
+                          startEditPull(edit.model, edit.base_url, () => {
+                            api.setupModels(edit.base_url).then((r) => {
+                              setEditModels(r.choices);
+                              setEditInstalledModels(r.installed || []);
+                              setEditOllamaReachable(r.ollama_reachable ?? false);
+                            }).catch(() => {});
+                          })
+                        }
+                      >
+                        <Download className="h-3 w-3" /> Pull
+                      </button>
+                    )}
+                  </div>
+                  <PullProgress pull={editPull} model={edit.model} />
+                </Field>
+
+                {needsBaseUrl(edit.kind) && (
+                  <Field label="Base URL" className="col-span-2">
+                    <TextInput
+                      value={edit.base_url}
+                      placeholder={KIND_DEFAULTS[edit.kind]?.base_url || ""}
+                      onChange={(e) => setEdit({ ...edit, base_url: e.target.value })}
+                    />
+                  </Field>
+                )}
+
+                {needsApiKey(edit.kind) && (
+                  <Field
+                    label={
+                      edit.kind === "gemini"
+                        ? "Gemini API Key"
+                        : edit.kind === "openai-compat"
+                        ? "OpenAI API Key"
+                        : "Bearer Token (optional)"
+                    }
+                    className="col-span-2"
+                  >
+                    <TextInput
+                      type="password"
+                      value={edit.api_key}
+                      placeholder={
+                        edit.allow_no_auth ? "skip — private subnet" : "sk-…"
+                      }
+                      onChange={(e) => setEdit({ ...edit, api_key: e.target.value })}
+                    />
+                  </Field>
+                )}
+
+                {needsEndpointPath(edit.kind) && (
+                  <>
+                    <Field label="Endpoint Path">
+                      <TextInput
+                        value={edit.endpoint_path}
+                        placeholder="/v1/chat/completions"
+                        onChange={(e) =>
+                          setEdit({ ...edit, endpoint_path: e.target.value })
+                        }
+                      />
+                    </Field>
+                    <Field label="Auth">
+                      <label className="flex items-center gap-2 text-xs text-slate-300 mt-2 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={edit.allow_no_auth}
+                          onChange={(e) =>
+                            setEdit({ ...edit, allow_no_auth: e.target.checked })
+                          }
+                          className="rounded"
+                        />
+                        Skip auth (private subnet / no-key server)
+                      </label>
+                    </Field>
+                  </>
+                )}
+
+                <Field label="Temperature">
+                  <NumberInput
+                    step={0.05}
+                    value={edit.temperature}
+                    onChange={(e) =>
+                      setEdit({ ...edit, temperature: Number(e.target.value) })
+                    }
+                  />
+                </Field>
+                <Field label="num_predict">
+                  <NumberInput
+                    step={64}
+                    value={edit.num_predict}
+                    onChange={(e) =>
+                      setEdit({ ...edit, num_predict: Number(e.target.value) })
+                    }
+                  />
+                </Field>
+              </div>
+
+              <PingBanner result={editPingResult} model={edit.model} className="mt-4" />
+              {error && (
+                <p className="mt-4 text-xs text-red-300 font-mono border border-red-500/30 bg-red-500/5 rounded px-3 py-2">
+                  {error}
+                </p>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Sub-components ───────────────────────────────────────────────────────────
+
+function PullProgress({ pull, model }: { pull: PullState | null; model: string }) {
+  if (!pull || pull.model !== model) return null;
+  const pct =
+    pull.total > 0 ? Math.min(100, Math.round((pull.completed / pull.total) * 100)) : null;
+
+  return (
+    <div className="mt-1.5 space-y-1">
+      <div className="h-1 bg-slate-800 rounded-full overflow-hidden">
+        {pull.error ? (
+          <div className="h-full w-full bg-red-500/60" />
+        ) : pull.done ? (
+          <div className="h-full w-full bg-emerald-500" />
+        ) : pct !== null ? (
+          <div
+            className="h-full bg-emerald-500 transition-all duration-300"
+            style={{ width: `${pct}%` }}
+          />
+        ) : (
+          <div className="h-full w-1/3 bg-emerald-500/70 animate-pulse" />
+        )}
+      </div>
+      <p className={`text-[10px] font-mono ${pull.error ? "text-red-400" : "text-slate-400"}`}>
+        {pull.error
+          ? pull.error.slice(0, 80)
+          : pull.done
+          ? "Download complete"
+          : pct !== null
+          ? `${pull.status} — ${pct}%`
+          : pull.status}
+      </p>
+    </div>
+  );
+}
+
+function PingBanner({
+  result,
+  model,
+  className,
+}: {
+  result: PingResult | null;
+  model: string;
+  className?: string;
+}) {
+  if (!result) return null;
+
+  if (result.ok) {
+    return (
+      <div
+        className={`mt-3 flex items-start gap-3 rounded-lg border border-emerald-500/20 bg-emerald-500/5 px-4 py-3 text-xs font-mono ${className ?? ""}`}
+      >
+        <Wifi className="h-4 w-4 text-emerald-400 shrink-0 mt-0.5" />
+        <div>
+          <p className="text-emerald-400 font-semibold">Ping successful</p>
+          <p className="text-slate-400 mt-0.5">
+            Connected to <span className="text-white">{model}</span> in{" "}
+            <span className="text-white">{result.latency_ms?.toFixed(0)}ms</span>. Provider is reachable and responding.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  const errMsg = result.error || "Unknown error";
+  const isNotInstalled =
+    errMsg.toLowerCase().includes("not found") ||
+    errMsg.toLowerCase().includes("model") ||
+    errMsg.toLowerCase().includes("pull");
+
+  return (
+    <div
+      className={`mt-3 flex items-start gap-3 rounded-lg border border-red-500/20 bg-red-500/5 px-4 py-3 text-xs font-mono ${className ?? ""}`}
+    >
+      <WifiOff className="h-4 w-4 text-red-400 shrink-0 mt-0.5" />
+      <div>
+        <p className="text-red-400 font-semibold">
+          {isNotInstalled ? "Model not available" : "Ping failed"}
+        </p>
+        <p className="text-slate-400 mt-0.5 break-all">{errMsg}</p>
+        {isNotInstalled && (
+          <p className="text-slate-500 mt-1">
+            Use the <strong className="text-slate-300">Pull</strong> button to download this model first.
+          </p>
+        )}
+      </div>
     </div>
   );
 }
 
 function KvRead({ label, value }: { label: string; value: string }) {
-  // Rendered as a static styled value (NOT an <input>) so users do not
-  // mistake a saved-profile snapshot for an editable field.
   return (
     <div>
       <label className="av-label">{label}</label>

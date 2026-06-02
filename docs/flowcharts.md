@@ -1,4 +1,4 @@
-# Averix — Flowcharts
+# CGX — Flowcharts
 
 Three audience-specific views of the same system. Each SVG is hand-authored,
 scales cleanly, and renders inline on GitHub.
@@ -7,9 +7,9 @@ scales cleanly, and renders inline on GitHub.
 
 ## For users
 
-![Averix user flow](diagrams/flow_user.svg)
+![CGX user flow](diagrams/flow_user.svg)
 
-Install once, point Averix at a repo, then ask questions or request changes in
+Install once, point CGX at a repo, then ask questions or request changes in
 plain English. The **Ask** tab returns a streaming, cited explanation; the
 **Plan** tab returns a self-tested code-change diff; the **Agent** tab handles
 larger goals — including generating brand-new projects from scratch — by
@@ -20,7 +20,7 @@ locally by default — cloud LLMs are strictly opt-in.
 
 ## For developers
 
-![Averix developer flow](diagrams/flow_developer.svg)
+![CGX developer flow](diagrams/flow_developer.svg)
 
 `cgx.agents.run_agent` wires the **Planner → Tracker → Judge** loop. The
 Planner asks the LLM for a strict-JSON
@@ -83,7 +83,7 @@ verdict is written to stdout as `[INFO]` log lines.
 
 ## For companies
 
-![Averix trust boundaries](diagrams/flow_company.svg)
+![CGX trust boundaries](diagrams/flow_company.svg)
 
 Source code, embeddings, FAISS indices, chat sessions, the SQLite task
 registry (`~/.cgx/tasks.db`), and the embedding cache all live on the

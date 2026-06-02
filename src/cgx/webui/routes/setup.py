@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Ramin Mohammadi
+
 """Discovery endpoints used by the Settings page.
 
 Wraps :mod:`cgx.answer.ollama_discovery` so the React app can populate
@@ -13,8 +16,13 @@ from __future__ import annotations
 import time
 from typing import List, Optional
 
+import asyncio
+import json as _json
+import threading
+
 from fastapi import APIRouter
 from pydantic import BaseModel
+from sse_starlette.sse import EventSourceResponse
 
 from cgx.answer import ollama_discovery
 from cgx.answer.profiles import get_profile, load_api_key
@@ -55,6 +63,24 @@ def ping_provider(req: PingRequest) -> PingResponse:
             base = (req.base_url or "http://localhost:11434").replace("/v1", "").rstrip("/")
             r = _req.get(f"{base}/api/tags", timeout=8)
             r.raise_for_status()
+            # Verify the selected model is actually installed.
+            data = r.json() if r.content else {}
+            installed_names = {
+                (m.get("name") or m.get("model") or "")
+                for m in (data.get("models") or [])
+                if isinstance(m, dict)
+            }
+            model = (req.model or "").strip()
+            if model and installed_names and model not in installed_names:
+                # Check without the tag suffix too (e.g. "llama3.1:8b" vs "llama3.1:8b-instruct")
+                base_name = model.split(":")[0]
+                if not any(n.startswith(base_name) for n in installed_names):
+                    elapsed = (time.monotonic() - start) * 1000
+                    return PingResponse(
+                        ok=False,
+                        latency_ms=round(elapsed, 1),
+                        error=f"Model '{model}' is not installed. Use Pull to download it first.",
+                    )
 
         elif req.kind == "gemini":
             import requests as _req
@@ -97,20 +123,49 @@ def ping_provider(req: PingRequest) -> PingResponse:
 
     except Exception as exc:
         elapsed = (time.monotonic() - start) * 1000
-        return PingResponse(ok=False, latency_ms=round(elapsed, 1), error=str(exc)[:300])
+        # Scrub Gemini-style ?key=... query params from the error string so
+        # an HTTP failure carrying the request URL never leaks the API key.
+        scrubbed = GeminiProvider._scrub_secret(str(exc))
+        return PingResponse(ok=False, latency_ms=round(elapsed, 1), error=scrubbed[:300])
 
 
 @router.get("/setup/models", response_model=ModelChoicesResponse)
 def models(base_url: str = "http://localhost:11434") -> ModelChoicesResponse:
+    from cgx.answer.hardware_matrix import LOCAL_MODEL_CATALOG
+
+    ollama_reachable = False
     try:
+        installed_list = ollama_discovery.list_installed_models(base_url)
+        installed = [m["name"] for m in installed_list]
+        # list_installed_models returns [] both when unreachable and when no
+        # models are installed — do a lightweight health check to distinguish.
+        health = ollama_discovery.health_check(base_url)
+        ollama_reachable = bool(health.get("ok"))
         choices = ollama_discovery.model_choices(base_url)
     except Exception:
+        installed = []
         choices = [tag for tag, *_ in ollama_discovery.RECOMMENDED_LADDER]
+
+    # Merge the full hardware-catalog so every known local model appears in
+    # the presets dropdown (sorted by parameter count, smallest first).
+    seen: set = set(choices)
+    catalog_by_size = sorted(LOCAL_MODEL_CATALOG, key=lambda m: m["params_b"])
+    for entry in catalog_by_size:
+        name = entry["name"]
+        if name not in seen:
+            choices.append(name)
+            seen.add(name)
+
     try:
         default = ollama_discovery.recommend_default_model(base_url=base_url)
     except Exception:
         default = choices[0] if choices else "qwen2.5-coder:3b"
-    return ModelChoicesResponse(choices=choices, recommended_default=default)
+    return ModelChoicesResponse(
+        choices=choices,
+        recommended_default=default,
+        installed=installed,
+        ollama_reachable=ollama_reachable,
+    )
 
 
 @router.get("/setup/hardware", response_model=HardwareInfo)
@@ -240,6 +295,63 @@ def _pick_default(kind: str, choices: List[str]) -> str:
             if prefer in choices:
                 return prefer
     return choices[0]
+
+
+class PullRequest(BaseModel):
+    model: str
+    base_url: str = "http://localhost:11434"
+
+
+@router.post("/ollama/pull")
+async def ollama_pull(req: PullRequest) -> EventSourceResponse:
+    """Stream progress of `ollama pull <model>` as SSE events.
+
+    Each SSE event has name ``progress`` and a JSON payload matching the
+    Ollama pull NDJSON format: ``{status, digest?, total?, completed?}``.
+    A final ``done`` event is emitted when the stream closes.
+    """
+    import requests as _req
+
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue = asyncio.Queue(maxsize=256)
+    _SENTINEL = object()
+
+    def _worker() -> None:
+        base = (req.base_url or "http://localhost:11434").rstrip("/")
+        if base.endswith("/v1"):
+            base = base[:-3]
+        try:
+            with _req.post(
+                f"{base}/api/pull",
+                json={"model": req.model, "stream": True},
+                stream=True,
+                timeout=600,
+            ) as r:
+                r.raise_for_status()
+                for line in r.iter_lines():
+                    if line:
+                        loop.call_soon_threadsafe(queue.put_nowait, line)
+        except Exception as exc:
+            err = _json.dumps({"status": "error", "error": str(exc)[:300]}).encode()
+            loop.call_soon_threadsafe(queue.put_nowait, err)
+        finally:
+            loop.call_soon_threadsafe(queue.put_nowait, _SENTINEL)
+
+    threading.Thread(target=_worker, daemon=True, name="ollama-pull").start()
+
+    async def _gen():
+        while True:
+            item = await queue.get()
+            if item is _SENTINEL:
+                break
+            try:
+                data = _json.loads(item)
+                yield {"event": "progress", "data": _json.dumps(data)}
+            except Exception:
+                pass
+        yield {"event": "done", "data": "{}"}
+
+    return EventSourceResponse(_gen())
 
 
 @router.post("/setup/cloud_models", response_model=ModelChoicesResponse)

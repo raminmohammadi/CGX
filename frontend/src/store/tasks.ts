@@ -277,7 +277,7 @@ export const useTasks = create<TasksStore>()(
       resetIndex: () => set({ index: defaultIndex }),
     }),
     {
-      name: "averix-tasks",
+      name: "cgx-tasks",
       storage: createJSONStorage(() => sessionStorage),
       // Only persist non-streaming state to keep sessionStorage lean.
       // `busy` persists so the UI can show "Running" on remount.

@@ -1,8 +1,11 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Ramin Mohammadi
+
 """High-level :func:`run_agent` entrypoint.
 
 Wires :class:`~cgx.agents.planner.Planner`,
 :class:`~cgx.agents.tracker.Tracker`, and
-:class:`~cgx.agents.judge.Judge` to the existing Averix capabilities:
+:class:`~cgx.agents.judge.Judge` to the existing CGX capabilities:
 
 * ``ask``      → :func:`cgx.answer.engine.answer_with_llm`
 * ``plan``     → :func:`cgx.answer.engine.generate_code_plan`
@@ -69,7 +72,7 @@ def _build_default_capabilities(
         kw.setdefault("project_root", project_root)
         if project_root:
             kw.setdefault("self_test", True)
-            kw.setdefault("run_tests", False)
+            kw.setdefault("run_tests", True)
             kw.setdefault("max_retries", 1)
         # Phase 3: inject symbol map so the SLM knows what's already defined.
         if records_path and not kw.get("symbol_context"):
@@ -151,13 +154,25 @@ def _build_default_capabilities(
         if not project_root:
             raise ValueError("verify requires project_root to be set")
         from cgx.codegen.test_runner import (
-            discover_all_tests, run_pytest_paths, run_tests_on_disk,
+            discover_all_tests, ensure_project_venv,
+            run_pytest_paths, run_tests_on_disk,
         )
         changed = _changed_files_from_prior(prior)
 
+        # Phase 1: ensure the project has its own .venv with declared
+        # dependencies installed. Without this, pytest runs against
+        # CGX's own interpreter, which doesn't have the LLM-chosen
+        # libraries (e.g. google-generativeai) and tests die at collection.
+        project_python: Optional[str] = None
+        try:
+            project_python = ensure_project_venv(project_root)
+        except Exception as _e:
+            logger.debug("verify: ensure_project_venv skipped: %s", _e)
+
         # Phase 2: pre-flight dependency check — scan generated Python files
         # for imports that aren't in requirements.txt and auto-install them
-        # before running pytest, so ModuleNotFoundError doesn't mask real failures.
+        # into the project venv (NOT CGX's own), so ModuleNotFoundError
+        # doesn't mask real failures.
         py_files = [f for f in changed if f.endswith(".py")]
         if py_files:
             try:
@@ -166,7 +181,9 @@ def _build_default_capabilities(
                     os.path.join(project_root, f) if not os.path.isabs(f) else f
                     for f in py_files
                 ]
-                missing, results = preflight_install(abs_py, project_root)
+                missing, results = preflight_install(
+                    abs_py, project_root, python=project_python,
+                )
                 if missing:
                     logger.info(
                         "verify: preflight installed %d package(s): %s",
@@ -1365,28 +1382,30 @@ def _stream_with_retry(
             unrecoverable = _verify_failure_is_unrecoverable(
                 verify_failures, project_root,
             )
-            # When the FAISS index is missing (typical for a freshly-
-            # scaffolded user project), ``plan_fix`` would crash on
-            # ``meta.json`` before any retry work could happen, and the
-            # outer fallback would then trigger a full re-plan that
-            # restarts the whole scaffold from scratch. Treat that as
-            # unrecoverable too: the files are already on disk, so the
-            # right answer is to leave them for manual review rather
-            # than scaffold-storm the project.
             if not unrecoverable and not _plan_fix_index_available(index_dir):
-                unrecoverable = (
-                    "Verify failed but the retry planner has no search "
-                    "index for this project yet — leaving files on disk "
-                    "for manual review instead of regenerating everything."
+                # No retriever index: can't re-plan. Leave VERIFY as FAILED
+                # so the user sees the real test output rather than a
+                # misleading "skipped" badge. Just skip the retry attempt.
+                logger.info(
+                    "run_agent: verify failure on attempt %d — no index for "
+                    "re-planning; reporting failure as-is", attempt,
                 )
+                yield AgentEvent(
+                    type="retry_skipped",
+                    payload={"attempt": attempt, "reason": (
+                        "Tests failed — no search index available for re-planning. "
+                        "Review the test output above and fix manually."
+                    )},
+                )
+                return
             if unrecoverable:
                 logger.info(
                     "run_agent: verify failure on attempt %d is unrecoverable — "
                     "skipping re-plan (%s)", attempt, unrecoverable,
                 )
-                # Demote each failed VERIFY to SKIPPED so the UI doesn't
-                # flag the whole run as failed when the files are already
-                # on disk and the only issue was the test runner itself.
+                # Only demote to SKIPPED for true environmental failures
+                # (packaging issues, missing pytest, sandbox errors) where
+                # the test runner itself couldn't run — not for real failures.
                 demoted = _demote_unrecoverable_verify(current_plan, unrecoverable)
                 for entry in demoted:
                     yield AgentEvent(
@@ -1587,11 +1606,13 @@ def run_agent(
                 verify_failures, project_root,
             )
             if not unrecoverable and not _plan_fix_index_available(index_dir):
-                unrecoverable = (
-                    "Verify failed but the retry planner has no search "
-                    "index for this project yet — leaving files on disk "
-                    "for manual review instead of regenerating everything."
+                # No index: skip re-planning but leave VERIFY as FAILED so
+                # the caller sees the honest test outcome, not a hidden skip.
+                logger.info(
+                    "run_agent: verify failure — no index for re-planning; "
+                    "returning plan with VERIFY as FAILED"
                 )
+                return plan_obj
             if unrecoverable:
                 logger.info(
                     "run_agent: verify failure is unrecoverable — skipping retry (%s)",

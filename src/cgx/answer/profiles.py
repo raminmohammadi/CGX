@@ -1,4 +1,7 @@
-"""Provider profile store for Averix.
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Ramin Mohammadi
+
+"""Provider profile store for CGX.
 
 Profiles let users save named LLM endpoint configurations (provider kind,
 model, base URL, optional API key) and recall them from the UI without
@@ -28,7 +31,7 @@ logger = logging.getLogger(__name__)
 CONFIG_DIR = Path(os.environ.get("CGX_CONFIG_DIR", str(Path.home() / ".cgx")))
 PROFILES_PATH = CONFIG_DIR / "profiles.json"
 SECRETS_PATH = CONFIG_DIR / "secrets.json"
-KEYRING_SERVICE = "averix"
+KEYRING_SERVICE = "cgx"
 
 
 @dataclass
@@ -75,7 +78,22 @@ def _read_json(path: Path) -> Dict[str, Any]:
 
 def _write_json(path: Path, data: Dict[str, Any]) -> None:
     _ensure_dir()
-    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    payload = json.dumps(data, indent=2).encode("utf-8")
+    # Open with O_CREAT|O_WRONLY|O_TRUNC and explicit 0600 mode so the file is
+    # never world-readable, even for the brief window before the post-write
+    # chmod below. os.open honours the umask on file creation but the explicit
+    # chmod ensures the final mode regardless of the caller's umask.
+    flags = os.O_CREAT | os.O_WRONLY | os.O_TRUNC
+    fd = os.open(str(path), flags, stat.S_IRUSR | stat.S_IWUSR)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(payload)
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
     try:
         os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
     except Exception:
@@ -170,12 +188,21 @@ def get_profile(name: str) -> Optional[Profile]:
 def save_profile(profile: Profile, api_key: Optional[str] = None) -> Profile:
     raw = _read_json(PROFILES_PATH)
     profiles = raw.get("profiles") or {}
+    existing = profiles.get(profile.name) or {}
     has_key = False
     if api_key:
         _store_secret(profile.name, api_key)
         has_key = True
-    elif profile.has_api_key:
-        has_key = _load_secret(profile.name) is not None
+    else:
+        # No new secret supplied — preserve any key already attached to
+        # this profile name so an "edit profile" round-trip that doesn't
+        # re-type the password doesn't silently orphan the stored key.
+        # ``profile.has_api_key`` is honoured for callers that fully
+        # populated the dataclass; we also consult the on-disk record
+        # for the common case where the route builds a fresh ``Profile``.
+        had_key = bool(profile.has_api_key) or bool(existing.get("has_api_key"))
+        if had_key:
+            has_key = _load_secret(profile.name) is not None
     profile.has_api_key = has_key
     entry: Dict[str, Any] = {
         "kind": profile.kind,

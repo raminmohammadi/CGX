@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Ramin Mohammadi
+
 """Shared types for the agent orchestration layer.
 
 All data types here are plain dataclasses so they JSON-serialise cleanly

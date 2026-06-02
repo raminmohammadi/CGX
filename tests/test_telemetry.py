@@ -4,7 +4,7 @@ These verify the (small but important) privacy guarantees:
 
 * ``ping()`` is a no-op when the env var is missing/falsy.
 * The install id is a UUID4 persisted under ``CGX_CONFIG_DIR``.
-* The payload is the minimal {install_id, averix_version, event} dict
+* The payload is the minimal {install_id, cgx_version, event} dict
   with no extra fields that could leak PII.
 * Calls are at-most-once-per-process via the in-module latch.
 * Network errors never propagate to the caller.
@@ -55,6 +55,7 @@ def test_install_id_is_uuid_and_persisted(tmp_path):
 
 def test_ping_dispatches_minimal_payload(monkeypatch):
     monkeypatch.setenv("CGX_TELEMETRY", "1")
+    monkeypatch.setenv("CGX_TELEMETRY_URL", "https://example.invalid/ping")
     seen = {}
 
     def fake_post(url, payload, timeout=2.0):
@@ -71,13 +72,14 @@ def test_ping_dispatches_minimal_payload(monkeypatch):
     assert telemetry.ping() is True
     payload = seen["payload"]
     # Only the three documented fields are allowed.
-    assert set(payload.keys()) == {"install_id", "averix_version", "event"}
+    assert set(payload.keys()) == {"install_id", "cgx_version", "event"}
     assert payload["event"] == "startup"
     uuid.UUID(payload["install_id"])  # must parse
 
 
 def test_ping_is_at_most_once_per_process(monkeypatch):
     monkeypatch.setenv("CGX_TELEMETRY", "1")
+    monkeypatch.setenv("CGX_TELEMETRY_URL", "https://example.invalid/ping")
     monkeypatch.setattr(telemetry, "_post", lambda *a, **kw: None)
     monkeypatch.setattr(telemetry.threading, "Thread",
                         lambda target, args, daemon: _ImmediateThread(target, args))
@@ -87,6 +89,7 @@ def test_ping_is_at_most_once_per_process(monkeypatch):
 
 def test_post_errors_are_swallowed(monkeypatch):
     monkeypatch.setenv("CGX_TELEMETRY", "1")
+    monkeypatch.setenv("CGX_TELEMETRY_URL", "https://example.invalid/ping")
 
     def boom(*a, **kw):
         raise RuntimeError("network down")

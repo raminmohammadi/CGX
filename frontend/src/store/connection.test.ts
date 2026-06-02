@@ -27,7 +27,7 @@ beforeEach(() => {
 });
 
 const fakeStatus = {
-  app: "Averix",
+  app: "CGX",
   version: "0.2.0",
   ollama: { ok: true, base_url: "http://localhost:11434" },
   hardware: { ram_gb: 16, gpu_vram_gb: 8 },

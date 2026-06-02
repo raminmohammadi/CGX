@@ -1,0 +1,43 @@
+# Dependabot keeps the three dependency surfaces of CGX in lockstep:
+# the Python runtime/ML requirements, the React/Vite frontend, and the
+# GitHub Actions used by .github/workflows/*. Weekly cadence is enough
+# for a hobby/open-source cadence and keeps PR noise manageable.
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    labels: ["dependencies", "python"]
+    groups:
+      python-runtime:
+        patterns: ["*"]
+        exclude-patterns:
+          - "torch"
+          - "transformers"
+          - "sentence-transformers"
+      python-ml:
+        patterns:
+          - "torch"
+          - "transformers"
+          - "sentence-transformers"
+
+  - package-ecosystem: "npm"
+    directory: "/frontend"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    labels: ["dependencies", "frontend"]
+    groups:
+      frontend-runtime:
+        patterns: ["*"]
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    labels: ["dependencies", "ci"]

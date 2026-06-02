@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Ramin Mohammadi
+
 import numpy as np
 import re
 from typing import Any, Callable, Dict, List, Optional, Sequence

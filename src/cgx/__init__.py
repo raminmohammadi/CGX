@@ -1,9 +1,12 @@
-"""cgx — Code Graph eXplorer.
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Ramin Mohammadi
+
+"""cgx — Code Graph eXecution.
 
 This top-level module ensures the sibling ``skills`` package (which lives
 at the repo root alongside ``src/``) is importable even when cgx is run
 from an editable install whose .pth file only points at ``src/``. Without
-this bootstrap, ``import skills`` silently fails when ``averix-ui`` is
+this bootstrap, ``import skills`` silently fails when ``cgx-ui`` is
 launched from outside the repo root, which leaves every skill-detection
 call returning an empty list and lets the LLM substitute the wrong
 framework (e.g. Vue SFC syntax in a React .jsx file).

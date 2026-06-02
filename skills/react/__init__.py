@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Ramin Mohammadi
+
 """React frontend skill.
 
 Detects goals naming React (but not React Native), supplies a

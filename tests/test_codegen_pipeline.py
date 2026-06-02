@@ -185,7 +185,7 @@ def test_rollback_restores_existing_and_deletes_new(tmp_path: Path) -> None:
 
 def test_rollback_missing_backup_dir_errors(tmp_path: Path) -> None:
     _make_project(tmp_path)
-    out = rollback_from_backup(str(tmp_path), str(tmp_path / ".averix-backups" / "missing"))
+    out = rollback_from_backup(str(tmp_path), str(tmp_path / ".cgx-backups" / "missing"))
     assert out["restored_files"] == []
     assert out["deleted_files"] == []
     assert "does not exist" in (out.get("error") or "")
@@ -260,3 +260,103 @@ def test_run_pytest_paths_resolves_first_party_imports_without_packaging(
         f"pytest should import backend.* via PYTHONPATH; "
         f"stdout={outcome.stdout!r} stderr={outcome.stderr!r}"
     )
+
+
+
+# ---------------------------------------------------------------------------
+# env_manager: import-root → PyPI distribution-name resolution. A naive
+# split on "." reduces ``import google.generativeai`` to ``google``,
+# which is not a pip-installable distribution. The mapping translates
+# the dotted form to ``google-generativeai`` so preflight installs the
+# right wheel.
+# ---------------------------------------------------------------------------
+def test_extract_imports_python_captures_namespace_dotted_form():
+    from cgx.codegen.env_manager import _extract_imports_python
+
+    src = "import google.generativeai as genai\n"
+    roots = _extract_imports_python(src)
+    assert "google" in roots
+    assert "google.generativeai" in roots
+
+
+def test_extract_imports_python_captures_from_namespace_form():
+    from cgx.codegen.env_manager import _extract_imports_python
+
+    src = "from google.generativeai import GenerativeModel\n"
+    roots = _extract_imports_python(src)
+    assert "google" in roots
+    assert "google.generativeai" in roots
+
+
+def _force_import_miss(monkeypatch):
+    """Make ``find_missing_python_packages``'s import-probe always miss.
+
+    The function does a live ``__import__(name)`` to skip packages that
+    happen to be installed in the current interpreter. Tests need a
+    deterministic answer independent of which extras the contributor
+    has locally, so we stub the probe to raise ``ImportError`` for
+    every name.
+    """
+    import builtins
+    real = builtins.__import__
+
+    def _fake(name, *a, **kw):
+        # Allow the cgx.codegen.env_manager module's own ``import ast``
+        # / ``import json`` etc. to keep working — only fail on the
+        # third-party names the function probes for.
+        if name in {
+            "PIL", "cv2", "sklearn", "bs4", "yaml", "skimage",
+            "Crypto", "magic", "dateutil", "dotenv", "jose", "git",
+            "OpenSSL", "serial", "usb",
+            "google", "google.generativeai", "google.cloud",
+            "google.oauth2", "google.auth", "google.api_core",
+        }:
+            raise ImportError(name)
+        return real(name, *a, **kw)
+
+    monkeypatch.setattr(builtins, "__import__", _fake)
+
+
+def test_find_missing_packages_maps_google_generativeai(tmp_path, monkeypatch):
+    from cgx.codegen.env_manager import find_missing_python_packages
+
+    _force_import_miss(monkeypatch)
+    (tmp_path / "requirements.txt").write_text("", encoding="utf-8")
+    imports = {"google", "google.generativeai"}
+    missing = find_missing_python_packages(imports, str(tmp_path))
+    # Bare ``google`` namespace root is pruned; the dotted form resolves
+    # to the proper PyPI name.
+    assert "google" not in missing
+    assert "google-generativeai" in missing
+
+
+def test_find_missing_packages_maps_well_known_aliases(tmp_path, monkeypatch):
+    from cgx.codegen.env_manager import find_missing_python_packages
+
+    _force_import_miss(monkeypatch)
+    (tmp_path / "requirements.txt").write_text("", encoding="utf-8")
+    imports = {"PIL", "cv2", "sklearn", "bs4", "yaml"}
+    missing = find_missing_python_packages(imports, str(tmp_path))
+    # Every alias must be reported under its PyPI distribution name.
+    assert "Pillow" in missing
+    assert "opencv-python" in missing
+    assert "scikit-learn" in missing
+    assert "beautifulsoup4" in missing
+    assert "PyYAML" in missing
+    # And the import-time names must NOT appear (those aren't pip names).
+    assert "PIL" not in missing
+    assert "cv2" not in missing
+
+
+def test_find_missing_packages_respects_declared_pypi_name(tmp_path, monkeypatch):
+    from cgx.codegen.env_manager import find_missing_python_packages
+
+    _force_import_miss(monkeypatch)
+    # When the user already declared ``google-generativeai``, the agent
+    # must NOT re-install it on a subsequent run.
+    (tmp_path / "requirements.txt").write_text(
+        "google-generativeai>=0.3.0\n", encoding="utf-8",
+    )
+    imports = {"google", "google.generativeai"}
+    missing = find_missing_python_packages(imports, str(tmp_path))
+    assert "google-generativeai" not in missing

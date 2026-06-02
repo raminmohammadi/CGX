@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Ramin Mohammadi
+
 """Run impacted tests in a sandbox copy of the project.
 
 We do NOT execute tests in the user's working tree. Instead:
@@ -161,6 +164,84 @@ def _project_python_exe(project_root: Path) -> str:
     return sys.executable
 
 
+def ensure_project_venv(
+    project_root: str,
+    *,
+    timeout: float = 300.0,
+) -> str:
+    """Ensure ``project_root`` has a ``.venv`` with pytest + requirements installed.
+
+    Idempotent: when ``.venv`` or ``venv`` already exists, this still runs
+    ``pip install -r requirements.txt`` so newly-declared dependencies are
+    picked up; pip is a no-op when everything is already up to date. When
+    no venv exists yet, one is created at ``.venv`` first.
+
+    Returns the path to the venv's python interpreter; falls back to
+    ``sys.executable`` if creation fails (offline, missing ``venv`` module,
+    …) so the caller can still attempt to run tests.
+    """
+    root = Path(project_root).resolve()
+    if not root.is_dir():
+        return sys.executable
+
+    existing = _project_python_exe(root)
+    if existing != sys.executable:
+        python_exe = existing
+    else:
+        venv_dir = root / ".venv"
+        try:
+            result = subprocess.run(
+                [sys.executable, "-m", "venv", str(venv_dir)],
+                cwd=str(root), capture_output=True, timeout=timeout,
+            )
+        except Exception as exc:
+            logger.warning(
+                "codegen.test_runner: venv creation raised %s; "
+                "falling back to sys.executable", exc,
+            )
+            return sys.executable
+        candidate = venv_dir / "bin" / "python"
+        if result.returncode != 0 or not candidate.is_file():
+            logger.warning(
+                "codegen.test_runner: venv creation failed (rc=%d); "
+                "falling back to sys.executable", result.returncode,
+            )
+            return sys.executable
+        python_exe = str(candidate)
+        logger.info("codegen.test_runner: created project venv at %s", venv_dir)
+
+    pip_base = [python_exe, "-m", "pip", "install", "--quiet", "--no-input"]
+    try:
+        subprocess.run(pip_base + ["pytest"], cwd=str(root),
+                       capture_output=True, timeout=timeout)
+    except Exception as exc:
+        logger.debug("codegen.test_runner: pytest install raised %s", exc)
+    req_path = root / "requirements.txt"
+    if req_path.is_file():
+        logger.info(
+            "codegen.test_runner: installing requirements.txt into project venv"
+        )
+        try:
+            proc = subprocess.run(
+                pip_base + ["-r", str(req_path)],
+                cwd=str(root), capture_output=True, timeout=timeout,
+            )
+            if proc.returncode != 0:
+                logger.warning(
+                    "codegen.test_runner: pip install -r requirements.txt "
+                    "failed (rc=%d): %s",
+                    proc.returncode,
+                    (proc.stderr or b"").decode("utf-8", "ignore")[:300]
+                    if isinstance(proc.stderr, bytes) else (proc.stderr or "")[:300],
+                )
+        except Exception as exc:
+            logger.warning(
+                "codegen.test_runner: pip install -r requirements.txt raised %s",
+                exc,
+            )
+    return python_exe
+
+
 def _pytest_env(project_root: Path) -> Dict[str, str]:
     """Return ``os.environ`` plus a ``PYTHONPATH`` that includes ``project_root``.
 
@@ -248,7 +329,7 @@ def run_impacted_tests(
         logger.warning("codegen.test_runner: project_root not a directory: %s", src)
         return TestRunOutcome(ran=False, skipped_reason=f"project_root not a directory: {src}")
 
-    tmp = Path(tempfile.mkdtemp(prefix="averix_sandbox_"))
+    tmp = Path(tempfile.mkdtemp(prefix="cgx_sandbox_"))
     try:
         ignore = shutil.ignore_patterns(
             ".git", ".venv", "venv", "__pycache__", "node_modules",

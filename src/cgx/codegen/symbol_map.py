@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Ramin Mohammadi
+
 """Symbol table context for the agent's working memory.
 
 Builds a compressed map of available symbols from the JSONL records file

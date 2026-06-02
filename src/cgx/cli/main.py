@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Ramin Mohammadi
+
 # src/cgx/cli/main.py
 from __future__ import annotations
 
@@ -149,7 +152,7 @@ def main(argv: list[str] | None = None) -> None:
     p_q.set_defaults(func=_cmd_query)
 
     # serve
-    p_s = sub.add_parser("serve", help="Launch the Averix FastAPI + React web UI.")
+    p_s = sub.add_parser("serve", help="Launch the CGX FastAPI + React web UI.")
     p_s.add_argument("--host", default="127.0.0.1", help="Bind host (default: 127.0.0.1).")
     p_s.add_argument("--port", type=int, default=8765, help="Bind port (default: 8765).")
     p_s.add_argument("--no-browser", action="store_true",

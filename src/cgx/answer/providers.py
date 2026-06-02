@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Ramin Mohammadi
+
 # src/cgx/answer/providers.py
 from __future__ import annotations
 import logging
@@ -181,10 +184,16 @@ class OllamaProvider(LLMProvider):
             yield f"\n[stream error: {type(e).__name__}: {e}]"
 
 
+_MISSING_GEMINI_KEY_MSG = (
+    "Gemini API key not configured. Provide one via the UI profile, the "
+    "request body, or the GEMINI_API_KEY environment variable."
+)
+
+
 class GeminiProvider(LLMProvider):
     """Google Gemini via the official REST API (generativelanguage.googleapis.com).
 
-    Maps Averix's internal ``messages`` format to Gemini's ``contents`` +
+    Maps CGX's internal ``messages`` format to Gemini's ``contents`` +
     ``systemInstruction`` format so the orchestration layer stays provider-agnostic.
     """
 
@@ -211,7 +220,7 @@ class GeminiProvider(LLMProvider):
     def _map_messages(
         messages: List[Dict[str, str]],
     ) -> tuple:
-        """Split Averix messages into (system_text, gemini_contents)."""
+        """Split CGX messages into (system_text, gemini_contents)."""
         system_parts: List[str] = []
         contents: List[Dict] = []
         for msg in messages:
@@ -236,6 +245,12 @@ class GeminiProvider(LLMProvider):
         force_json: bool = True,
         **kwargs: Any,
     ) -> Dict[str, Any]:
+        if not self.api_key:
+            return {
+                "content": "",
+                "error": _MISSING_GEMINI_KEY_MSG,
+                "raw": "",
+            }
         system_text, contents = self._map_messages(messages)
         body: Dict[str, Any] = {
             "contents": contents,
@@ -282,10 +297,16 @@ class GeminiProvider(LLMProvider):
     def _scrub_secret(text: str) -> str:
         """Redact ``key=<value>`` query parameters so the API key never appears
         in logs or error payloads. Matches Gemini's URL-style key parameter
-        until the next ``&``, whitespace, or end-of-string."""
+        until the next ``&``, whitespace, or end-of-string. Empty values
+        are rewritten to ``<missing>`` so logs disambiguate a redacted key
+        from a request that never carried one."""
         if not text:
             return text
-        return re.sub(r"([?&]key=)[^&\s]+", r"\1<redacted>", text)
+
+        def _sub(m: "re.Match[str]") -> str:
+            return m.group(1) + ("<redacted>" if m.group(2) else "<missing>")
+
+        return re.sub(r"([?&]key=)([^&\s]*)", _sub, text)
 
     @staticmethod
     def _diagnose_empty_response(data: Any) -> str:
@@ -331,6 +352,9 @@ class GeminiProvider(LLMProvider):
         **kwargs: Any,
     ) -> Iterator[str]:
         """Stream via Gemini's streamGenerateContent SSE endpoint."""
+        if not self.api_key:
+            yield f"\n[stream error: {_MISSING_GEMINI_KEY_MSG}]"
+            return
         system_text, contents = self._map_messages(messages)
         body: Dict[str, Any] = {
             "contents": contents,

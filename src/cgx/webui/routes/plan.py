@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Ramin Mohammadi
+
 """Plan SSE route — streams sketch thoughts → final plan + diffs."""
 
 from __future__ import annotations

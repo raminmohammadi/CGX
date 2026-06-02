@@ -1,7 +1,7 @@
-// Minimal VS Code extension that hosts the Averix web UI inside a
+// Minimal VS Code extension that hosts the CGX web UI inside a
 // webview panel. The extension does NOT spawn the server; the user is
-// expected to run `averix-ui` (or `python app.py`) separately. The URL
-// is read from the `averix.ui.url` setting (default http://localhost:8765).
+// expected to run `cgx-ui` (or `python app.py`) separately. The URL
+// is read from the `cgx.ui.url` setting (default http://localhost:8765).
 
 import * as vscode from "vscode";
 
@@ -9,8 +9,8 @@ let currentPanel: vscode.WebviewPanel | undefined;
 
 export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
-    vscode.commands.registerCommand("averix.openUI", () => openOrFocus(context)),
-    vscode.commands.registerCommand("averix.refreshUI", () => {
+    vscode.commands.registerCommand("cgx.openUI", () => openOrFocus(context)),
+    vscode.commands.registerCommand("cgx.refreshUI", () => {
       if (currentPanel) {
         currentPanel.webview.html = renderHtml(currentUrl());
       }
@@ -24,7 +24,7 @@ export function deactivate(): void {
 }
 
 function currentUrl(): string {
-  const cfg = vscode.workspace.getConfiguration("averix");
+  const cfg = vscode.workspace.getConfiguration("cgx");
   return (cfg.get<string>("ui.url") || "http://localhost:8765").trim();
 }
 
@@ -35,13 +35,13 @@ function openOrFocus(context: vscode.ExtensionContext): void {
   }
   const url = currentUrl();
   currentPanel = vscode.window.createWebviewPanel(
-    "averixUI",
-    "Averix",
+    "cgxUI",
+    "CGX",
     vscode.ViewColumn.Active,
     {
       enableScripts: true,
       retainContextWhenHidden: true,
-      // The Averix server is reached over plain HTTP on localhost; we
+      // The CGX server is reached over plain HTTP on localhost; we
       // do not load any local resources, so no localResourceRoots are
       // declared (an empty list would block the iframe outright).
     }
@@ -53,7 +53,7 @@ function openOrFocus(context: vscode.ExtensionContext): void {
 }
 
 function renderHtml(url: string): string {
-  // The Averix UI is served as a full HTML document, so we frame it as
+  // The CGX UI is served as a full HTML document, so we frame it as
   // an iframe filling the panel. We escape the URL so a malicious
   // setting value can't break out of the attribute.
   const safe = url.replace(/"/g, "&quot;");
@@ -76,9 +76,9 @@ function renderHtml(url: string): string {
             referrerpolicy="no-referrer"></iframe>
     <noscript>
       <div class="err">
-        Averix needs scripts enabled. Configure the web UI URL via the
-        <code>averix.ui.url</code> setting and run
-        <code>averix-ui</code> in a terminal first.
+        CGX needs scripts enabled. Configure the web UI URL via the
+        <code>cgx.ui.url</code> setting and run
+        <code>cgx-ui</code> in a terminal first.
       </div>
     </noscript>
   </body>

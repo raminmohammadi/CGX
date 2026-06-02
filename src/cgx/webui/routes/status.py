@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Ramin Mohammadi
+
 """High-level workspace status used by the React TopBar.
 
 A single GET so the SPA can render its "is everything wired up?"

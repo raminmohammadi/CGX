@@ -1,7 +1,7 @@
 """Regression tests for graph.json load compatibility.
 
 ``networkx>=3.4`` flipped the default edges key in ``node_link_data`` from
-``"links"`` to ``"edges"``. The Averix loaders must accept both so previously
+``"links"`` to ``"edges"``. The CGX loaders must accept both so previously
 saved indices keep working and freshly written ones don't trigger a
 ``KeyError: 'links'`` warning.
 """

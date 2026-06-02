@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Ramin Mohammadi
+
 """SQLite persistence skill.
 
 An addon skill that composes with whatever backend skill is also

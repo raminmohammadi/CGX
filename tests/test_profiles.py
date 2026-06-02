@@ -63,3 +63,33 @@ def test_delete_profile_removes_secret(profiles_module):
     assert P.delete_profile("temp") is True
     assert P.get_profile("temp") is None
     assert P.load_api_key("temp") is None
+
+
+def test_resave_without_api_key_preserves_existing_secret(profiles_module):
+    """Editing a profile without re-typing the key must not orphan it.
+
+    Mirrors the upsert path the web UI takes when the user changes the
+    model or temperature on an existing profile and leaves the password
+    field blank: a fresh ``Profile`` is constructed with default
+    ``has_api_key=False`` and forwarded with ``api_key=None``. Prior to
+    the fix this silently flipped ``has_api_key`` to ``False`` and the
+    next ``provider_from_profile_name`` call sent an empty key.
+    """
+    P = profiles_module
+    P.save_profile(
+        P.Profile(name="gemini", kind="gemini", model="gemini-2.5-flash",
+                  base_url="https://generativelanguage.googleapis.com"),
+        api_key="AIza-original-secret",
+    )
+    # Edit-style re-save: fresh dataclass, no api_key supplied.
+    P.save_profile(
+        P.Profile(name="gemini", kind="gemini", model="gemini-2.5-pro",
+                  base_url="https://generativelanguage.googleapis.com",
+                  temperature=0.1),
+        api_key=None,
+    )
+    got = P.get_profile("gemini")
+    assert got is not None
+    assert got.model == "gemini-2.5-pro"
+    assert got.has_api_key is True
+    assert P.load_api_key("gemini") == "AIza-original-secret"

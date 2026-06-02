@@ -16,7 +16,7 @@ export default function IndexPage() {
   const { index: indexState, setIndex: setIndexState, appendIndexProgress, resetIndex } = useTasks();
   const { busy, progress, result, error } = indexState;
 
-  const [outDir, setOutDir] = useState("/tmp/averix_index");
+  const [outDir, setOutDir] = useState("/tmp/cgx_index");
   const [embedModel, setEmbedModel] = useState(index.embed_model);
   const [metric, setMetric] = useState("cosine");
   const [indexType, setIndexType] = useState("flat");
@@ -100,7 +100,7 @@ export default function IndexPage() {
   return (
     <div className="p-6 space-y-6 overflow-y-auto h-full max-w-4xl">
       <CardHeader
-        title="📚 Content-Addressed Embedding Cache"
+        title="Content-Addressed Embedding Cache"
         description="Tracks repository updates via SHA-256 validation mapping, processing only altered chunks."
         right={
           busy ? (

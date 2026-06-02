@@ -1,6 +1,6 @@
 # Architecture
 
-Averix is structured as a small set of cooperating layers under `cgx.*`.
+CGX is structured as a small set of cooperating layers under `cgx.*`.
 
 ## Layers
 
@@ -103,7 +103,7 @@ orchestration layer never knows which backend it is talking to.
 |---|---|---|
 | `OllamaProvider` | `"ollama"` | Local Ollama via `/api/chat`; JSON mode via `format: "json"`. |
 | `OpenAICompatProvider` | `"openai-compat"` or `"custom"` | Any `/v1/chat/completions`-compatible endpoint. Accepts `endpoint_path` to override the path suffix and `allow_no_auth=True` to skip Bearer auth (private subnets). |
-| `GeminiProvider` | `"gemini"` | Google Gemini via `generativelanguage.googleapis.com`. Maps Averix's `messages` to Gemini's `contents` + `systemInstruction`; merges consecutive same-role turns; uses `responseMimeType: "application/json"` for JSON mode; streams via `streamGenerateContent`. |
+| `GeminiProvider` | `"gemini"` | Google Gemini via `generativelanguage.googleapis.com`. Maps CGX's `messages` to Gemini's `contents` + `systemInstruction`; merges consecutive same-role turns; uses `responseMimeType: "application/json"` for JSON mode; streams via `streamGenerateContent`. |
 
 **Profile persistence**: `cgx.answer.profiles.Profile` stores `kind`,
 `model`, `base_url`, `temperature`, `num_predict`, `has_api_key`,
@@ -211,7 +211,7 @@ entry points:
      `fix the bug`, …); (d) a scaffold verb together with at least one
      supported, non-style skill firing via `skills.detect_skills` —
      the more precise of the verb-paired signals because it only
-     matches technologies Averix actually has dedicated handling for
+     matches technologies CGX actually has dedicated handling for
      (see the [Skills](#skills) section). The scaffold branch always
      emits a single `scaffold_manifest` task (the per-file `scaffold_file`
      tasks are injected at runtime by the Tracker from the manifest
@@ -296,7 +296,7 @@ entry points:
      passing files are written, failing files are skipped); pass when
      `applied_files` is non-empty and `failed_files` is empty.
      `smoke_ok` in the return value is `True` only when all files passed.
-     A per-run backup directory under `<project_root>/.averix-backups/`
+     A per-run backup directory under `<project_root>/.cgx-backups/`
      is created before the first overwrite and returned as
      `backup_dir`; the rollback REST route restores from it on demand.
    - `verify`: trusts pytest exit code directly; soft-pass on "no
@@ -449,7 +449,7 @@ task ends.
 
 `cgx.codegen.disk_apply.apply_diffs_to_disk` mirrors every file it is
 about to overwrite into a timestamped directory under
-`<project_root>/.averix-backups/<run_id>/` before writing. The path is
+`<project_root>/.cgx-backups/<run_id>/` before writing. The path is
 returned as `output["backup_dir"]` on the `apply` task and surfaced in
 the UI as an **Undo** button.
 
@@ -518,7 +518,7 @@ tab.
 `cgx.telemetry.ping()` is invoked once from `cgx.webui.launch.launch()`. It
 returns immediately unless `CGX_TELEMETRY=1` is set. The opt-in
 payload contains **only** a random install UUID (cached in
-`~/.cgx/install_id`) and the Averix package version — no prompts, no
+`~/.cgx/install_id`) and the CGX package version — no prompts, no
 code, no file paths, no model names, no PII. Implementation is ~50
 lines; review it before opting in.
 
@@ -573,8 +573,8 @@ have a running task and renders an animated spinner next to those tabs.
   (`pip install -e ".[keyring]"`) and otherwise in `~/.cgx/secrets.json`
   with `0600` permissions. They are never echoed back through tool output
   or LLM transcripts.
-- The VS Code extension scaffold (`extension/`) frames the Averix web UI
+- The VS Code extension scaffold (`extension/`) frames the CGX web UI
   in a webview with a tight CSP (`frame-src` restricted to
   `http://localhost:*` and `http://127.0.0.1:*`) and a sandboxed
-  iframe; the configured `averix.ui.url` value is HTML-escaped before
+  iframe; the configured `cgx.ui.url` value is HTML-escaped before
   interpolation.

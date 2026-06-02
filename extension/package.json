@@ -1,9 +1,9 @@
 {
-  "name": "averix",
-  "displayName": "Averix",
-  "description": "Open the Averix RAG UI inside a VS Code webview panel.",
+  "name": "cgx",
+  "displayName": "CGX",
+  "description": "Open the CGX RAG UI inside a VS Code webview panel.",
   "version": "0.0.1",
-  "publisher": "averix",
+  "publisher": "cgx",
   "private": true,
   "license": "MIT",
   "engines": {
@@ -17,23 +17,23 @@
   "contributes": {
     "commands": [
       {
-        "command": "averix.openUI",
-        "title": "Averix: Open UI",
-        "category": "Averix"
+        "command": "cgx.openUI",
+        "title": "CGX: Open UI",
+        "category": "CGX"
       },
       {
-        "command": "averix.refreshUI",
-        "title": "Averix: Reload UI",
-        "category": "Averix"
+        "command": "cgx.refreshUI",
+        "title": "CGX: Reload UI",
+        "category": "CGX"
       }
     ],
     "configuration": {
-      "title": "Averix",
+      "title": "CGX",
       "properties": {
-        "averix.ui.url": {
+        "cgx.ui.url": {
           "type": "string",
           "default": "http://localhost:8765",
-          "description": "URL of the running Averix web UI. Start the server with `averix-ui` or `python app.py` before opening the panel."
+          "description": "URL of the running CGX web UI. Start the server with `cgx-ui` or `python app.py` before opening the panel."
         }
       }
     }

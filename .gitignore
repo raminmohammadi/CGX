@@ -212,6 +212,6 @@ frontend/coverage/
 # VS Code extension build output
 extension/out/
 
-# Averix runtime artifacts
+# CGX runtime artifacts
 /cgx_index/
-src/averix.egg-info/
+src/cgx.egg-info/

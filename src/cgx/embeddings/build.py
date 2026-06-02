@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Ramin Mohammadi
+
 """Embedding builder.
 
 Heavy ML dependencies (``torch``, ``transformers``, ``sentence_transformers``)

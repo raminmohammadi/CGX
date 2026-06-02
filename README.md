@@ -1,6 +1,8 @@
-# Averix — Local-first Codebase RAG
+# CGX — Code Graph eXecution
 
-Averix indexes a code repository, retrieves grounded context via a hybrid
+**Local-first codebase RAG and self-testing code-generation platform.**
+
+CGX indexes a code repository, retrieves grounded context via a hybrid
 engine (semantic + lexical + graph), and asks a local or remote LLM to
 answer questions or produce **self-tested** code change plans. It is
 model-agnostic and ships with a React/Vite web UI served by a FastAPI
@@ -25,13 +27,13 @@ backend that streams progress over Server-Sent Events.
   code-gen tasks to plain Q&A for read-only goals, and the tracker
   streams live `task_progress` heartbeats so the UI never looks frozen on
   long LLM calls. See [docs/flowcharts.md](docs/flowcharts.md) for a visual.
-- 🏗️ **New project generation.** Give Averix a plain-language idea
+- 🏗️ **New project generation.** Give CGX a plain-language idea
   (e.g. *"create a FastAPI todo app"* or *"create a React calculator
   app"*), set a destination directory as Project Root, and the
   `scaffold_manifest → scaffold_file × N → apply → verify` chain
   generates a complete, working project from scratch — no existing
   codebase or index required. The `apply` step writes a per-run backup
-  mirror under `<project_root>/.averix-backups/` so the whole run can
+  mirror under `<project_root>/.cgx-backups/` so the whole run can
   be undone via `POST /api/rollback`.
 - 🧩 **Modular skills registry** (`skills/`). Each supported technology
   lives in its own folder (`skills/react/`, `skills/fastapi/`,
@@ -55,7 +57,7 @@ backend that streams progress over Server-Sent Events.
   being surfaced. The sandbox now auto-installs missing Python packages
   before running pytest (`cgx.codegen.env_manager`) so a model choosing
   a new library doesn't mask real failures.
-- 🗺️ **Symbol table context.** Before generating a change plan, Averix
+- 🗺️ **Symbol table context.** Before generating a change plan, CGX
   injects a compressed `# AVAILABLE CONTEXT` map of every symbol already
   defined in the indexed codebase (`cgx.codegen.symbol_map`), preventing
   local models from re-implementing helpers that already exist.
@@ -74,7 +76,7 @@ backend that streams progress over Server-Sent Events.
 - 👀 **Thought-process panel.** Live streaming of the model's reasoning
   sketch, followed by the final grounded answer.
 - 🧩 **VS Code extension scaffold** (`extension/`) that hosts the
-  Averix web UI inside an editor webview.
+  CGX web UI inside an editor webview.
 - 📋 **Task registry & cancel.** Every operation is tracked in
   `~/.cgx/tasks.db`; cancel any running task with
   `DELETE /api/tasks/{id}` or the in-UI Cancel button.
@@ -96,17 +98,17 @@ backend that streams progress over Server-Sent Events.
 
 ## Install
 
-Averix has a **small core** and a **separately-installable ML stack**. Pick
+CGX has a **small core** and a **separately-installable ML stack**. Pick
 the path that matches how you plan to use it.
 
 ### Core install (no torch)
 
-Use this if you'll point Averix at an Ollama server or an OpenAI-compatible
+Use this if you'll point CGX at an Ollama server or an OpenAI-compatible
 endpoint and supply your own embeddings via a BYO embedder callable.
 
 ```bash
 git clone <your fork>
-cd Averix
+cd cgx
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 pip install -e ".[codegen]"
@@ -119,7 +121,7 @@ box.
 
 ### Full install (with local embeddings)
 
-Use this if you want Averix to load the default Jina embedding model
+Use this if you want CGX to load the default Jina embedding model
 locally and/or run the optional cross-encoder reranker.
 
 ```bash
@@ -153,7 +155,7 @@ ollama pull qwen2.5-coder:3b
 ### UI (recommended)
 
 ```bash
-averix-ui            # after `pip install -e ".[ui]"`
+cgx-ui               # after `pip install -e ".[ui]"`
 # or
 python app.py
 ```
@@ -177,11 +179,11 @@ Tabs (left → right):
    thread). A **Stop** button halts the stream mid-flight; switching
    tabs preserves the answer in progress.
 4. **🛠️ Plan** — request a change plan; optionally tick *Validate diffs*
-   and *Run impacted tests* to have Averix self-check its own output
+   and *Run impacted tests* to have CGX self-check its own output
    before returning. The full self-test report renders inline. A
    **Cancel** button is available while planning is in progress; tab
    switching is non-destructive.
-5. **🤖 Agent** — give Averix a goal, watch the **Planner → Tracker →
+5. **🤖 Agent** — give CGX a goal, watch the **Planner → Tracker →
    Judge** loop decompose it into 1–5 atomic tasks, dispatch each task
    to a capability (`ask`, `plan`, `scaffold`, `search`, `summarize`,
    `apply`, `verify`), and judge the artefact against per-task criteria.
@@ -209,10 +211,10 @@ Tabs (left → right):
 ### CLI
 
 ```bash
-averix index --project-root /path/to/repo --out-dir /tmp/averix_index
-averix query --index-dir /tmp/averix_index/indices \
-             --records  /tmp/averix_index/records.jsonl \
-             --query "What does parse_codebase do?"
+cgx index --project-root /path/to/repo --out-dir /tmp/cgx_index
+cgx query --index-dir /tmp/cgx_index/indices \
+          --records  /tmp/cgx_index/records.jsonl \
+          --query "What does parse_codebase do?"
 ```
 
 ### Python
@@ -222,7 +224,7 @@ from cgx.pipeline.auto import run_index_auto, run_query_auto
 from cgx.answer.engine import answer_with_llm, generate_code_plan
 from cgx.answer.providers import OllamaProvider, GeminiProvider, OpenAICompatProvider
 
-run_index_auto(project_root="./", out_dir="/tmp/averix_index")
+run_index_auto(project_root="./", out_dir="/tmp/cgx_index")
 
 # Local Ollama
 prov = OllamaProvider(model="qwen2.5-coder:3b")
@@ -237,8 +239,8 @@ prov = OllamaProvider(model="qwen2.5-coder:3b")
 # )
 
 ans = answer_with_llm(
-    "/tmp/averix_index/indices",
-    "/tmp/averix_index/records.jsonl",
+    "/tmp/cgx_index/indices",
+    "/tmp/cgx_index/records.jsonl",
     "What does parse_codebase do?",
     prov,
 )
@@ -292,7 +294,7 @@ cfg = HybridConfig(enable_reranker=True, reranker_top_n=20, graph_bonus=0.3)
 ## Self-testing code generation
 
 When you tick **Validate diffs** in the Plan tab (or pass `self_test=True`
-to `generate_code_plan`), Averix will:
+to `generate_code_plan`), CGX will:
 
 1. Parse fenced ```diff path=...``` blocks from the model output.
 2. Dry-apply each diff in memory.
@@ -309,7 +311,7 @@ under the plan in the UI.
 ## Multi-agent orchestration
 
 For requests that don't fit into a single Ask or Plan round-trip,
-Averix ships a Planner → Tracker → Judge loop in `cgx.agents`:
+CGX ships a Planner → Tracker → Judge loop in `cgx.agents`:
 
 1. The **Planner** decomposes your goal into 1–5 ordered atomic
    `Task`s, each tagged with a short `name`, a `description`, a `kind`
@@ -349,8 +351,8 @@ prov = OllamaProvider(model="qwen2.5-coder:3b")
 for event in run_agent(
     goal="Add docstrings to every public function in cgx.parser",
     provider=prov,
-    index_dir="/tmp/averix_index/indices",
-    records_path="/tmp/averix_index/records.jsonl",
+    index_dir="/tmp/cgx_index/indices",
+    records_path="/tmp/cgx_index/records.jsonl",
     project_root="./",
     stop_on_fail=True,
     stream=True,
@@ -369,8 +371,8 @@ for event in run_agent(
 # stream=False (default) blocks until done and returns the final Plan.
 plan = run_agent(
     goal="Add docstrings to every public function in cgx.parser",
-    provider=prov, index_dir="/tmp/averix_index/indices",
-    records_path="/tmp/averix_index/records.jsonl",
+    provider=prov, index_dir="/tmp/cgx_index/indices",
+    records_path="/tmp/cgx_index/records.jsonl",
 )
 for task in plan.tasks:
     print(task.kind, task.status, task.output)
@@ -438,7 +440,7 @@ serving stale vectors against a different model.
 Inspect the hit/miss ratio:
 
 ```python
-result = run_index_auto(project_root="./", out_dir="/tmp/averix_index")
+result = run_index_auto(project_root="./", out_dir="/tmp/cgx_index")
 print(result["incremental"])         # True
 print(result["embedding_cache"])
 # {'intent': {'hits': 412, 'misses': 5, 'dim': 768},
@@ -448,7 +450,7 @@ print(result["embedding_cache"])
 Disable for a clean rebuild:
 
 ```python
-run_index_auto(project_root="./", out_dir="/tmp/averix_index", incremental=False)
+run_index_auto(project_root="./", out_dir="/tmp/cgx_index", incremental=False)
 ```
 
 ---
@@ -510,7 +512,7 @@ existing call sites keep their pre-feature behaviour.
 ## VS Code extension scaffold
 
 [`extension/`](extension/) is a minimal TypeScript extension that hosts
-the running Averix web UI inside a VS Code webview panel. It is **not**
+the running CGX web UI inside a VS Code webview panel. It is **not**
 packaged into a `.vsix` from the repo — build it locally:
 
 ```bash
@@ -520,10 +522,10 @@ npm run compile
 # then press F5 in VS Code to launch an Extension Development Host
 ```
 
-Commands contributed: **Averix: Open UI**, **Averix: Reload UI**.
-The server URL is read from the `averix.ui.url` setting (default
+Commands contributed: **CGX: Open UI**, **CGX: Reload UI**.
+The server URL is read from the `cgx.ui.url` setting (default
 `http://localhost:8765`). The extension does not spawn the server —
-start it with `averix-ui` (or `python app.py`) first.
+start it with `cgx-ui` (or `python app.py`) first.
 
 See [`extension/README.md`](extension/README.md) for the full setup.
 
@@ -537,7 +539,7 @@ See [`docs/architecture.md`](docs/architecture.md) for a deeper dive.
 
 ## Privacy & data flow
 
-Averix is built around **local-first** processing. The following table is
+CGX is built around **local-first** processing. The following table is
 the complete list of network egress paths in the product:
 
 | Activity                          | Network egress? | Where it goes                                     |
@@ -555,7 +557,7 @@ the complete list of network egress paths in the product:
 
 A single, anonymous startup ping is available for measuring active
 installs. It is **off by default** and contains *only* a random install
-UUID generated on first run and the Averix version — no prompts, no
+UUID generated on first run and the CGX version — no prompts, no
 code, no file paths, no model names, no PII.
 
 Enable:

@@ -1,4 +1,7 @@
-"""Code generation safety net for Averix.
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Ramin Mohammadi
+
+"""Code generation safety net for CGX.
 
 This subpackage validates LLM-generated changes before they touch a real repo:
 
@@ -29,6 +32,7 @@ from cgx.codegen.validate import (
 from cgx.codegen.test_runner import (
     TestRunOutcome,
     discover_all_tests,
+    ensure_project_venv,
     find_impacted_tests,
     run_impacted_tests,
     run_pytest_paths,
@@ -49,6 +53,7 @@ __all__ = [
     "validate_patch_results",
     "TestRunOutcome",
     "discover_all_tests",
+    "ensure_project_venv",
     "find_impacted_tests",
     "run_impacted_tests",
     "run_pytest_paths",

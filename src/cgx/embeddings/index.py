@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Ramin Mohammadi
+
 import numpy as np
 from cgx.logging_setup import get_logger
 logger = get_logger(__name__)
@@ -126,7 +129,7 @@ def build_faiss_index(
         else:
             norms = np.linalg.norm(X, axis=1)
             if np.max(np.abs(norms - 1.0)) > 5e-2:
-                print("build_faiss_index: warning: metric='cosine' but vectors do not appear normalized.")
+                logger.warning("build_faiss_index: metric='cosine' but vectors do not appear normalized.")
             normalized_used = False
 
     # ------------------------- index construction -------------------------
@@ -177,7 +180,7 @@ def build_faiss_index(
             if hasattr(base, "nprobe"):
                 base.nprobe = int(nprobe)
         except Exception as e:
-            print(f"build_faiss_index: GPU requested but unavailable; using CPU. ({e})")
+            logger.warning("build_faiss_index: GPU requested but unavailable; using CPU. (%s)", e)
             used_gpu = False
 
     # Wrap with ID map (IndexIDMap2 preferred)

@@ -1,4 +1,7 @@
-"""Shared helpers for the Averix web UI handlers (moved from cgx.ui)."""
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Ramin Mohammadi
+
+"""Shared helpers for the CGX web UI handlers."""
 
 from __future__ import annotations
 
@@ -92,7 +95,7 @@ def maybe_extract_zip(path: Optional[str]) -> Optional[str]:
     """Extract an uploaded ``.zip`` into a temp dir; return root path."""
     if not path or not os.path.exists(path):
         return None
-    tmpdir = tempfile.mkdtemp(prefix="averix_zip_")
+    tmpdir = tempfile.mkdtemp(prefix="cgx_zip_")
     with zipfile.ZipFile(path, "r") as zf:
         zf.extractall(tmpdir)
     entries = [p for p in Path(tmpdir).iterdir()]
