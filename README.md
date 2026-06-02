@@ -600,6 +600,3 @@ as a **two-job matrix**:
 ## License
 
 MIT.
-=======
-
->>>>>>> 7ec6828b50cdf926cc8d19ec8782ac48726093ce
