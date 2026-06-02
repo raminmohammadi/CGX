@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Microchip, RefreshCcw } from "lucide-react";
+import { AlertTriangle, CheckCircle, Microchip, RefreshCcw, XCircle } from "lucide-react";
 import { api, type HardwareMatrixResponse } from "../lib/api";
 import { Card, CardHeader } from "../components/Card";
 
@@ -31,7 +31,7 @@ export default function HardwarePage() {
   return (
     <div className="p-6 space-y-6 overflow-y-auto h-full max-w-6xl">
       <CardHeader
-        title="📊 Hardware-Aware Local Catalog"
+        title="Hardware-Aware Local Catalog"
         description="Cross-references localized system resources directly against 4-bit quantized GGUF inference thresholds."
         right={
           <button onClick={load} disabled={busy} className="av-btn-primary">
@@ -59,12 +59,12 @@ export default function HardwarePage() {
         <table className="w-full text-left text-xs font-mono">
           <thead className="bg-slate-950 text-slate-400 uppercase border-b border-white/5">
             <tr>
-              <th className="p-3 text-[10px]">Model Tag Target</th>
-              <th className="p-3 text-[10px]">Parameters</th>
+              <th className="p-3 text-[10px]">Model</th>
+              <th className="p-3 text-[10px]">Params</th>
               <th className="p-3 text-[10px]">Min RAM</th>
               <th className="p-3 text-[10px]">Rec VRAM</th>
               <th className="p-3 text-[10px]">Family</th>
-              <th className="p-3 text-[10px]">Fit Verdict Status</th>
+              <th className="p-3 text-[10px]">Fit</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-white/5 text-slate-300">
@@ -76,10 +76,13 @@ export default function HardwarePage() {
                 <td className="p-3">{r.rec_vram_gb.toFixed(1)} GB</td>
                 <td className="p-3 text-slate-400">{r.family}</td>
                 <td className={`p-3 font-medium ${fitColor(r.fit)}`}>
-                  {fitIcon(r.fit)} {r.fit}
-                  {r.notes && (
-                    <span className="text-slate-500 ml-2 text-[10px]">({r.notes})</span>
-                  )}
+                  <span className="flex items-center gap-1.5">
+                    <FitIcon fit={r.fit} />
+                    {r.fit}
+                    {r.notes && (
+                      <span className="text-slate-500 text-[10px]">({r.notes})</span>
+                    )}
+                  </span>
                 </td>
               </tr>
             ))}
@@ -95,7 +98,7 @@ export default function HardwarePage() {
       </div>
 
       <Card padded>
-        <CardHeader title="Local-First Engine Architecture Trade-offs" eyebrow="Matrix" />
+        <CardHeader title="Local-First vs Cloud Trade-offs" eyebrow="Matrix" />
         <div className="grid grid-cols-2 gap-3 text-xs">
           {data?.tradeoffs?.map((t) => (
             <div
@@ -114,7 +117,7 @@ export default function HardwarePage() {
               <span
                 className={`uppercase text-[10px] font-bold px-2 py-0.5 rounded border font-mono whitespace-nowrap ${winnerClasses(t.winner)}`}
               >
-                Winner: {t.winner}
+                {t.winner}
               </span>
             </div>
           ))}
@@ -154,15 +157,19 @@ function Stat({
 }
 
 function fitColor(fit: string): string {
-  if (fit.toLowerCase().includes("fits")) return "text-emerald-400";
-  if (fit.toLowerCase().includes("tight")) return "text-amber-400";
+  const f = fit.toLowerCase();
+  if (f.includes("fits")) return "text-emerald-400";
+  if (f.includes("tight")) return "text-amber-400";
   return "text-red-400";
 }
 
-function fitIcon(fit: string): string {
-  if (fit.toLowerCase().includes("fits")) return "✅";
-  if (fit.toLowerCase().includes("tight")) return "⚠️";
-  return "❌";
+function FitIcon({ fit }: { fit: string }) {
+  const f = fit.toLowerCase();
+  if (f.includes("fits"))
+    return <CheckCircle className="h-3.5 w-3.5 text-emerald-400 shrink-0" />;
+  if (f.includes("tight"))
+    return <AlertTriangle className="h-3.5 w-3.5 text-amber-400 shrink-0" />;
+  return <XCircle className="h-3.5 w-3.5 text-red-400 shrink-0" />;
 }
 
 function winnerClasses(winner: string): string {

@@ -367,3 +367,114 @@ def test_generate_single_scaffold_file_short_circuits_init_py():
     assert out["patch"], "patch must be non-empty for Judge to pass"
     assert out["content"].strip(), "content must be non-empty"
     assert "backend" in out["content"]
+
+
+
+# ---------------------------------------------------------------------------
+# _inject_python_package_inits: top-level src/ is a sys.path root in the
+# standard "src layout", not a package — so it must NOT get an
+# __init__.py. Subpackages under src/ still do.
+# ---------------------------------------------------------------------------
+def test_inject_python_package_inits_skips_top_level_src():
+    from cgx.answer.engine import _inject_python_package_inits
+    layers = [
+        {"name": "src", "files": [
+            {"path": "src/app.py", "description": "entry"},
+            {"path": "src/chat_manager.py", "description": "manager"},
+        ]},
+    ]
+    out = _inject_python_package_inits(layers)
+    paths = [f["path"] for lay in out for f in (lay.get("files") or [])]
+    assert "src/__init__.py" not in paths
+
+
+def test_inject_python_package_inits_marks_subpackages_under_src():
+    from cgx.answer.engine import _inject_python_package_inits
+    layers = [
+        {"name": "src", "files": [
+            {"path": "src/app.py", "description": "entry"},
+            {"path": "src/models/user.py", "description": "model"},
+            {"path": "src/services/db.py", "description": "service"},
+        ]},
+    ]
+    out = _inject_python_package_inits(layers)
+    paths = [f["path"] for lay in out for f in (lay.get("files") or [])]
+    assert "src/__init__.py" not in paths
+    # Subpackages still get their package marker.
+    assert "src/models/__init__.py" in paths
+    assert "src/services/__init__.py" in paths
+
+
+# ---------------------------------------------------------------------------
+# _inject_required_manifest_files: when a Python manifest places source
+# under src/, a root conftest.py is injected so pytest can import the
+# modules by their flat name.
+# ---------------------------------------------------------------------------
+def test_inject_required_files_adds_conftest_for_python_src_layout():
+    from cgx.answer.engine import _inject_required_manifest_files
+    layers = [
+        {"name": "core", "files": [
+            {"path": "src/app.py", "description": "entry"},
+        ]},
+        {"name": "tests", "files": [
+            {"path": "tests/test_app.py", "description": "test"},
+        ]},
+    ]
+    out = _inject_required_manifest_files(
+        layers, goal="Build a python web app", skill_names=["python"],
+    )
+    paths = [f["path"] for lay in out for f in (lay.get("files") or [])]
+    assert "conftest.py" in paths
+
+
+def test_inject_required_files_skips_conftest_when_no_src_python():
+    from cgx.answer.engine import _inject_required_manifest_files
+    # Python backend without src/ layout — no conftest.py needed because
+    # the existing pytest convention already handles backend/ imports.
+    layers = [
+        {"name": "backend", "files": [
+            {"path": "backend/main.py", "description": "entry"},
+        ]},
+    ]
+    out = _inject_required_manifest_files(
+        layers, goal="Build a python fastapi backend", skill_names=["python", "fastapi"],
+    )
+    paths = [f["path"] for lay in out for f in (lay.get("files") or [])]
+    assert "conftest.py" not in paths
+
+
+def test_inject_required_files_conftest_idempotent_when_already_present():
+    from cgx.answer.engine import _inject_required_manifest_files
+    layers = [
+        {"name": "core", "files": [
+            {"path": "src/app.py", "description": "entry"},
+            {"path": "conftest.py", "description": "user-provided bootstrap"},
+        ]},
+    ]
+    out = _inject_required_manifest_files(
+        layers, goal="python web app", skill_names=["python"],
+    )
+    paths = [f["path"] for lay in out for f in (lay.get("files") or [])]
+    assert paths.count("conftest.py") == 1
+
+
+# ---------------------------------------------------------------------------
+# generate_single_scaffold_file: conftest.py short-circuits the LLM and
+# emits a deterministic sys.path-bootstrap body.
+# ---------------------------------------------------------------------------
+def test_generate_single_scaffold_file_short_circuits_conftest():
+    from cgx.answer.engine import generate_single_scaffold_file
+
+    class _Boom:
+        def chat(self, *a, **kw):
+            raise AssertionError("provider must not be called for conftest.py")
+
+    out = generate_single_scaffold_file(
+        "conftest.py", "pytest bootstrap", _Boom(),
+    )
+    assert out["file"] == "conftest.py"
+    assert out["syntax_ok"] is True
+    assert out["patch"], "patch must be non-empty"
+    body = out["content"]
+    assert "sys.path.insert" in body
+    assert '"src"' in body or "'src'" in body

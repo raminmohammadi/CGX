@@ -28,6 +28,40 @@ logger = logging.getLogger(__name__)
 # Top-level names that are part of the Python standard library (3.10+).
 # This list covers the most common ones; anything importable that isn't
 # here will be caught by the live-import probe below.
+# Import-name → PyPI distribution-name overrides. Most packages can be
+# pip-installed under the same name they're imported as, but a handful
+# of common ones differ. Keys are either bare roots (``PIL``) or
+# top-two dotted segments for namespace packages (``google.generativeai``).
+_IMPORT_TO_PYPI: Dict[str, str] = {
+    "google.generativeai": "google-generativeai",
+    "google.cloud": "google-cloud",
+    "google.oauth2": "google-auth",
+    "google.auth": "google-auth",
+    "google.api_core": "google-api-core",
+    "PIL": "Pillow",
+    "cv2": "opencv-python",
+    "sklearn": "scikit-learn",
+    "skimage": "scikit-image",
+    "bs4": "beautifulsoup4",
+    "yaml": "PyYAML",
+    "Crypto": "pycryptodome",
+    "magic": "python-magic",
+    "dateutil": "python-dateutil",
+    "dotenv": "python-dotenv",
+    "jose": "python-jose",
+    "git": "GitPython",
+    "OpenSSL": "pyOpenSSL",
+    "serial": "pyserial",
+    "usb": "pyusb",
+}
+
+# Top-level names that are themselves namespace packages — pip-installing
+# the bare root is meaningless (no such PyPI distribution), so when a
+# dotted variant like ``google.generativeai`` is also seen in the source
+# the bare root is dropped before the missing-package probe.
+_NAMESPACE_ROOTS: frozenset = frozenset({"google", "azure"})
+
+
 _STDLIB_TOP = frozenset({
     "abc", "ast", "asyncio", "base64", "binascii", "builtins", "cgi",
     "collections", "concurrent", "configparser", "contextlib", "copy",
@@ -56,25 +90,41 @@ _STDLIB_TOP = frozenset({
 
 
 def _extract_imports_python(source: str) -> Set[str]:
-    """Return the top-level root names from a Python source string."""
+    """Return import names from a Python source string.
+
+    The result contains top-level roots (``streamlit``, ``google``) and,
+    for namespace packages listed in :data:`_NAMESPACE_ROOTS`, the
+    top-two dotted prefix as well (``google.generativeai``). The latter
+    is what downstream resolution maps to the proper PyPI distribution
+    name — the bare namespace root by itself isn't pip-installable.
+    """
     roots: Set[str] = set()
+
+    def _add(module: str) -> None:
+        if not module:
+            return
+        parts = module.split(".")
+        roots.add(parts[0])
+        if len(parts) >= 2 and parts[0] in _NAMESPACE_ROOTS:
+            roots.add(".".join(parts[:2]))
+
     try:
         tree = ast.parse(source)
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for alias in node.names:
-                    roots.add(alias.name.split(".")[0])
+                    _add(alias.name)
             elif isinstance(node, ast.ImportFrom):
                 if node.module and node.level == 0:
-                    roots.add(node.module.split(".")[0])
+                    _add(node.module)
     except SyntaxError:
-        # Fallback regex for files that haven't been fixed yet.
+        # Fallback regex for files that haven't been fixed yet. Captures
+        # dotted module names so namespace packages are still detected.
         for m in re.finditer(
-            r"^\s*(?:from\s+([\w]+)|import\s+([\w]+))", source, re.MULTILINE
+            r"^\s*(?:from\s+([\w.]+)|import\s+([\w.]+))", source, re.MULTILINE
         ):
-            root = m.group(1) or m.group(2)
-            if root:
-                roots.add(root)
+            mod = m.group(1) or m.group(2)
+            _add(mod or "")
     return roots
 
 
@@ -180,19 +230,44 @@ def find_missing_python_packages(
     Filters out stdlib modules, packages already declared in
     ``requirements.txt``, first-party project directories, and packages
     that are already importable in the current environment so we don't
-    re-install them.
+    re-install them. Import names that differ from their PyPI
+    distribution name (``google.generativeai`` → ``google-generativeai``,
+    ``PIL`` → ``Pillow``, …) are translated via :data:`_IMPORT_TO_PYPI`
+    before being reported as missing.
     """
     declared = _read_requirements(project_root)
+    # Drop bare namespace roots when a dotted variant is also present:
+    # ``import google.generativeai`` records both ``google`` and
+    # ``google.generativeai`` and we only want to install the latter.
+    dotted_roots = {n.split(".", 1)[0] for n in imports if "." in n}
+    pruned = {
+        n for n in imports
+        if not (n in _NAMESPACE_ROOTS and n in dotted_roots)
+    }
     missing: List[str] = []
-    for name in sorted(imports):
-        normalized = name.lower().replace("-", "_")
-        if normalized in _STDLIB_TOP:
+    seen_pypi: Set[str] = set()
+    for name in sorted(pruned):
+        root = name.split(".")[0]
+        # stdlib check operates on the root regardless of dotted form.
+        if root.lower().replace("-", "_") in _STDLIB_TOP:
             continue
+        # Resolve to the PyPI distribution name. Dotted names without a
+        # mapping aren't installable as-is (pip can't install
+        # ``google.generativeai`` literally) — skip them; the matching
+        # root entry will have been handled separately.
+        if name in _IMPORT_TO_PYPI:
+            pypi_name = _IMPORT_TO_PYPI[name]
+        elif "." in name:
+            continue
+        else:
+            pypi_name = name
+        normalized = pypi_name.lower().replace("-", "_")
         if normalized in declared:
             continue
         # Skip first-party project packages — the project's own top-level
         # folder is not a PyPI distribution and pip cannot install it.
-        if _is_local_package(name, project_root):
+        # Only meaningful for bare root names.
+        if "." not in name and _is_local_package(name, project_root):
             continue
         # Check if already importable (covers editable installs, etc.)
         try:
@@ -203,7 +278,10 @@ def find_missing_python_packages(
         except Exception:
             # Some packages have side effects on import; skip the probe.
             continue
-        missing.append(name)
+        if pypi_name in seen_pypi:
+            continue
+        seen_pypi.add(pypi_name)
+        missing.append(pypi_name)
     return missing
 
 

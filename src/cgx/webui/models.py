@@ -144,6 +144,7 @@ class StatusResponse(BaseModel):
 class ModelChoicesResponse(BaseModel):
     choices: List[str] = Field(default_factory=list)
     recommended_default: str = ""
+    installed: List[str] = Field(default_factory=list)
 
 
 class HardwareMatrixRow(BaseModel):

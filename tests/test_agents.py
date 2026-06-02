@@ -1328,12 +1328,12 @@ def test_plan_fix_index_available_false_for_missing_or_empty(tmp_path):
     assert _plan_fix_index_available(str(populated)) is True
 
 
-def test_run_agent_demotes_verify_failure_when_no_index_available(tmp_path):
+def test_run_agent_does_not_mask_verify_failure_when_no_index_available(tmp_path):
     """When a verify task fails and the FAISS index isn't available,
     the retry loop must NOT call ``plan_fix`` (which would crash on
-    missing ``meta.json``). Instead it should demote the verify
-    failure to SKIPPED so the run finishes cleanly with files
-    already on disk.
+    missing ``meta.json``), AND must NOT hide the failure by demoting
+    VERIFY to SKIPPED. The plan is returned with VERIFY still FAILED
+    so the caller (and user) sees the real test output.
     """
     from cgx.agents.loop import run_agent
 
@@ -1374,12 +1374,13 @@ def test_run_agent_demotes_verify_failure_when_no_index_available(tmp_path):
         stop_on_fail=False,
     )
     assert plan_fix_calls == [], "plan_fix must not be called without an index"
-    # The verify task in ``final`` should be SKIPPED (demoted), not FAILED.
+    # VERIFY must stay FAILED — the test ran, failed, and the caller must see
+    # the real outcome. Demoting to SKIPPED hides failures from the user.
     verifies = [t for t in final.tasks if t.kind == TaskKind.VERIFY]
     assert verifies, "plan should have at least one verify task"
-    assert any(t.status == TaskStatus.SKIPPED for t in verifies), (
-        "verify failure must be demoted to SKIPPED when plan_fix is unavailable; "
-        f"got statuses={[t.status for t in verifies]}"
+    assert any(t.status == TaskStatus.FAILED for t in verifies), (
+        "verify failure must remain FAILED (not hidden as SKIPPED) when "
+        f"plan_fix is unavailable; got statuses={[t.status for t in verifies]}"
     )
 
 

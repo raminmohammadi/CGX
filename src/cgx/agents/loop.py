@@ -69,7 +69,7 @@ def _build_default_capabilities(
         kw.setdefault("project_root", project_root)
         if project_root:
             kw.setdefault("self_test", True)
-            kw.setdefault("run_tests", False)
+            kw.setdefault("run_tests", True)
             kw.setdefault("max_retries", 1)
         # Phase 3: inject symbol map so the SLM knows what's already defined.
         if records_path and not kw.get("symbol_context"):
@@ -1365,28 +1365,30 @@ def _stream_with_retry(
             unrecoverable = _verify_failure_is_unrecoverable(
                 verify_failures, project_root,
             )
-            # When the FAISS index is missing (typical for a freshly-
-            # scaffolded user project), ``plan_fix`` would crash on
-            # ``meta.json`` before any retry work could happen, and the
-            # outer fallback would then trigger a full re-plan that
-            # restarts the whole scaffold from scratch. Treat that as
-            # unrecoverable too: the files are already on disk, so the
-            # right answer is to leave them for manual review rather
-            # than scaffold-storm the project.
             if not unrecoverable and not _plan_fix_index_available(index_dir):
-                unrecoverable = (
-                    "Verify failed but the retry planner has no search "
-                    "index for this project yet — leaving files on disk "
-                    "for manual review instead of regenerating everything."
+                # No retriever index: can't re-plan. Leave VERIFY as FAILED
+                # so the user sees the real test output rather than a
+                # misleading "skipped" badge. Just skip the retry attempt.
+                logger.info(
+                    "run_agent: verify failure on attempt %d — no index for "
+                    "re-planning; reporting failure as-is", attempt,
                 )
+                yield AgentEvent(
+                    type="retry_skipped",
+                    payload={"attempt": attempt, "reason": (
+                        "Tests failed — no search index available for re-planning. "
+                        "Review the test output above and fix manually."
+                    )},
+                )
+                return
             if unrecoverable:
                 logger.info(
                     "run_agent: verify failure on attempt %d is unrecoverable — "
                     "skipping re-plan (%s)", attempt, unrecoverable,
                 )
-                # Demote each failed VERIFY to SKIPPED so the UI doesn't
-                # flag the whole run as failed when the files are already
-                # on disk and the only issue was the test runner itself.
+                # Only demote to SKIPPED for true environmental failures
+                # (packaging issues, missing pytest, sandbox errors) where
+                # the test runner itself couldn't run — not for real failures.
                 demoted = _demote_unrecoverable_verify(current_plan, unrecoverable)
                 for entry in demoted:
                     yield AgentEvent(
@@ -1587,11 +1589,13 @@ def run_agent(
                 verify_failures, project_root,
             )
             if not unrecoverable and not _plan_fix_index_available(index_dir):
-                unrecoverable = (
-                    "Verify failed but the retry planner has no search "
-                    "index for this project yet — leaving files on disk "
-                    "for manual review instead of regenerating everything."
+                # No index: skip re-planning but leave VERIFY as FAILED so
+                # the caller sees the honest test outcome, not a hidden skip.
+                logger.info(
+                    "run_agent: verify failure — no index for re-planning; "
+                    "returning plan with VERIFY as FAILED"
                 )
+                return plan_obj
             if unrecoverable:
                 logger.info(
                     "run_agent: verify failure is unrecoverable — skipping retry (%s)",

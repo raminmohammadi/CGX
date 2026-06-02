@@ -13,8 +13,13 @@ from __future__ import annotations
 import time
 from typing import List, Optional
 
+import asyncio
+import json as _json
+import threading
+
 from fastapi import APIRouter
 from pydantic import BaseModel
+from sse_starlette.sse import EventSourceResponse
 
 from cgx.answer import ollama_discovery
 from cgx.answer.profiles import get_profile, load_api_key
@@ -103,14 +108,17 @@ def ping_provider(req: PingRequest) -> PingResponse:
 @router.get("/setup/models", response_model=ModelChoicesResponse)
 def models(base_url: str = "http://localhost:11434") -> ModelChoicesResponse:
     try:
+        installed_list = ollama_discovery.list_installed_models(base_url)
+        installed = [m["name"] for m in installed_list]
         choices = ollama_discovery.model_choices(base_url)
     except Exception:
+        installed = []
         choices = [tag for tag, *_ in ollama_discovery.RECOMMENDED_LADDER]
     try:
         default = ollama_discovery.recommend_default_model(base_url=base_url)
     except Exception:
         default = choices[0] if choices else "qwen2.5-coder:3b"
-    return ModelChoicesResponse(choices=choices, recommended_default=default)
+    return ModelChoicesResponse(choices=choices, recommended_default=default, installed=installed)
 
 
 @router.get("/setup/hardware", response_model=HardwareInfo)
@@ -240,6 +248,63 @@ def _pick_default(kind: str, choices: List[str]) -> str:
             if prefer in choices:
                 return prefer
     return choices[0]
+
+
+class PullRequest(BaseModel):
+    model: str
+    base_url: str = "http://localhost:11434"
+
+
+@router.post("/ollama/pull")
+async def ollama_pull(req: PullRequest) -> EventSourceResponse:
+    """Stream progress of `ollama pull <model>` as SSE events.
+
+    Each SSE event has name ``progress`` and a JSON payload matching the
+    Ollama pull NDJSON format: ``{status, digest?, total?, completed?}``.
+    A final ``done`` event is emitted when the stream closes.
+    """
+    import requests as _req
+
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue = asyncio.Queue(maxsize=256)
+    _SENTINEL = object()
+
+    def _worker() -> None:
+        base = (req.base_url or "http://localhost:11434").rstrip("/")
+        if base.endswith("/v1"):
+            base = base[:-3]
+        try:
+            with _req.post(
+                f"{base}/api/pull",
+                json={"model": req.model, "stream": True},
+                stream=True,
+                timeout=600,
+            ) as r:
+                r.raise_for_status()
+                for line in r.iter_lines():
+                    if line:
+                        loop.call_soon_threadsafe(queue.put_nowait, line)
+        except Exception as exc:
+            err = _json.dumps({"status": "error", "error": str(exc)[:300]}).encode()
+            loop.call_soon_threadsafe(queue.put_nowait, err)
+        finally:
+            loop.call_soon_threadsafe(queue.put_nowait, _SENTINEL)
+
+    threading.Thread(target=_worker, daemon=True, name="ollama-pull").start()
+
+    async def _gen():
+        while True:
+            item = await queue.get()
+            if item is _SENTINEL:
+                break
+            try:
+                data = _json.loads(item)
+                yield {"event": "progress", "data": _json.dumps(data)}
+            except Exception:
+                pass
+        yield {"event": "done", "data": "{}"}
+
+    return EventSourceResponse(_gen())
 
 
 @router.post("/setup/cloud_models", response_model=ModelChoicesResponse)

@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional
 
 # (name, params_b, min_ram_gb, recommended_vram_gb, ctx_window, family, notes)
 LOCAL_MODEL_CATALOG: List[Dict[str, Any]] = [
+    # ── Qwen Coder ──────────────────────────────────────────────────────
     {"name": "qwen2.5-coder:1.5b", "params_b": 1.5, "min_ram_gb": 4.0,
      "recommended_vram_gb": 2.0, "ctx_window": 32768, "family": "coder",
      "notes": "smallest viable coder; CPU-friendly"},
@@ -27,10 +28,38 @@ LOCAL_MODEL_CATALOG: List[Dict[str, Any]] = [
      "notes": "balanced default for code Q&A"},
     {"name": "qwen2.5-coder:7b-instruct", "params_b": 7.0, "min_ram_gb": 10.0,
      "recommended_vram_gb": 8.0, "ctx_window": 32768, "family": "coder",
-     "notes": "higher-quality coder; sweet spot on 16GB GPUs"},
+     "notes": "higher-quality coder; sweet spot on 16 GB GPUs"},
     {"name": "qwen2.5-coder:14b-instruct", "params_b": 14.0, "min_ram_gb": 20.0,
      "recommended_vram_gb": 16.0, "ctx_window": 32768, "family": "coder",
-     "notes": "near-cloud coder quality; needs ≥16GB VRAM"},
+     "notes": "near-cloud coder quality; needs >=16 GB VRAM"},
+    # ── DeepSeek Coder ──────────────────────────────────────────────────
+    {"name": "deepseek-coder:6.7b", "params_b": 6.7, "min_ram_gb": 10.0,
+     "recommended_vram_gb": 8.0, "ctx_window": 16384, "family": "coder",
+     "notes": "strong FIM; good code completion on 8 GB GPU"},
+    {"name": "deepseek-coder-v2:16b", "params_b": 16.0, "min_ram_gb": 20.0,
+     "recommended_vram_gb": 16.0, "ctx_window": 163840, "family": "coder",
+     "notes": "MoE architecture; very long context; needs >=16 GB VRAM"},
+    # ── DeepSeek R1 (reasoning) ─────────────────────────────────────────
+    {"name": "deepseek-r1:1.5b", "params_b": 1.5, "min_ram_gb": 4.0,
+     "recommended_vram_gb": 2.0, "ctx_window": 65536, "family": "reasoning",
+     "notes": "tiny reasoning model; runs on most laptops"},
+    {"name": "deepseek-r1:7b", "params_b": 7.0, "min_ram_gb": 10.0,
+     "recommended_vram_gb": 8.0, "ctx_window": 65536, "family": "reasoning",
+     "notes": "chain-of-thought reasoning; solid on 8 GB GPU"},
+    # ── Gemma (Google) ──────────────────────────────────────────────────
+    {"name": "gemma3:1b", "params_b": 1.0, "min_ram_gb": 3.0,
+     "recommended_vram_gb": 2.0, "ctx_window": 32768, "family": "general",
+     "notes": "ultra-light; runs CPU-only on any modern laptop"},
+    {"name": "gemma3:4b", "params_b": 4.0, "min_ram_gb": 6.0,
+     "recommended_vram_gb": 4.0, "ctx_window": 131072, "family": "general",
+     "notes": "capable laptop model with very long context"},
+    {"name": "gemma2:2b", "params_b": 2.0, "min_ram_gb": 4.0,
+     "recommended_vram_gb": 2.0, "ctx_window": 8192, "family": "general",
+     "notes": "efficient small model; good quality-per-GB"},
+    {"name": "gemma2:9b", "params_b": 9.0, "min_ram_gb": 12.0,
+     "recommended_vram_gb": 8.0, "ctx_window": 8192, "family": "general",
+     "notes": "high-quality general; sweet spot on 12 GB RAM"},
+    # ── General purpose ─────────────────────────────────────────────────
     {"name": "llama3.2:3b-instruct", "params_b": 3.0, "min_ram_gb": 6.0,
      "recommended_vram_gb": 4.0, "ctx_window": 131072, "family": "general",
      "notes": "long context, light general-purpose"},
@@ -66,17 +95,17 @@ def _verdict(entry: Dict[str, Any], hw: Dict[str, Any]) -> Dict[str, str]:
     vram = float(hw.get("gpu_vram_gb") or 0.0)
     rec_vram = float(entry["recommended_vram_gb"])
     if budget == 0:
-        return {"fit": "❓ unknown", "reason": "hardware probe returned no values"}
+        return {"fit": "unknown", "reason": "hardware probe returned no values"}
     if budget < min_ram * 0.9:
-        return {"fit": "❌ won't fit",
-                "reason": f"need ≥{min_ram:g} GB, have {budget:.1f} GB"}
+        return {"fit": "won't fit",
+                "reason": f"need >={min_ram:g} GB, have {budget:.1f} GB"}
     if vram and vram < rec_vram * 0.75:
-        return {"fit": "⚠️ tight",
-                "reason": f"≥{rec_vram:g} GB VRAM recommended, GPU has {vram:.1f} GB"}
+        return {"fit": "tight",
+                "reason": f">={rec_vram:g} GB VRAM recommended, GPU has {vram:.1f} GB"}
     if budget < min_ram * 1.2:
-        return {"fit": "⚠️ tight",
+        return {"fit": "tight",
                 "reason": f"within ~20% of the {min_ram:g} GB minimum"}
-    return {"fit": "✅ fits", "reason": f"budget {budget:.1f} GB ≥ {min_ram:g} GB"}
+    return {"fit": "fits", "reason": f"budget {budget:.1f} GB >= {min_ram:g} GB"}
 
 
 def compute_local_fit(hw: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
@@ -116,7 +145,7 @@ TRADEOFFS: List[Dict[str, str]] = [
      "cloud": "Pay-per-token; cost scales linearly with usage and context length.",
      "winner": "local"},
     {"dimension": "Quality ceiling",
-     "local": "Capped by what fits on your hardware (≈14B params on a 16 GB GPU).",
+     "local": "Capped by what fits on your hardware (approx 14B params on a 16 GB GPU).",
      "cloud": "Access to frontier models (100B+ params, long context, tool-use).",
      "winner": "cloud"},
     {"dimension": "Latency (cold)",
