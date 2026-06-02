@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 620" font-family="Inter, system-ui, -apple-system, Segoe UI, sans-serif">
-  <!-- Averix · Company / Security view -->
+  <!-- CGX · Company / Security view -->
   <defs>
     <linearGradient id="cbg" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0%" stop-color="#0f172a"/>
@@ -23,7 +23,7 @@
   </defs>
   <rect width="1080" height="620" fill="url(#cbg)"/>
 
-  <text x="40" y="44" font-size="22" font-weight="700" fill="#f1f5f9">Averix — Trust &amp; Data Boundaries</text>
+  <text x="40" y="44" font-size="22" font-weight="700" fill="#f1f5f9">CGX — Trust &amp; Data Boundaries</text>
   <text x="40" y="66" font-size="12.5" fill="#94a3b8">What stays on the machine, what (optionally) leaves, and where secrets live.</text>
 
   <!-- Local zone -->
@@ -72,7 +72,7 @@
       <text x="78" y="453" font-size="10.5" fill="#cbd5e1">~/.cgx/sessions/*.jsonl  (chat history)</text>
       <text x="78" y="469" font-size="10.5" fill="#cbd5e1">~/.cgx/tasks.db  (SQLite event registry)</text>
       <text x="78" y="485" font-size="10.5" fill="#cbd5e1">~/.cgx/profiles.json  ·  embedding cache</text>
-      <text x="78" y="501" font-size="10.5" fill="#cbd5e1">&lt;project&gt;/.averix-backups/  (apply rollback)</text>
+      <text x="78" y="501" font-size="10.5" fill="#cbd5e1">&lt;project&gt;/.cgx-backups/  (apply rollback)</text>
       <text x="78" y="517" font-size="10" fill="#6ee7b7">/api/tasks · /api/rollback (undo apply)</text>
       <text x="78" y="533" font-size="10" fill="#6ee7b7">No telemetry · Delete a session = delete a file.</text>
     </g>

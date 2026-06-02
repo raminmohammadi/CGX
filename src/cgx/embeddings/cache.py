@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Ramin Mohammadi
+
 """Content-addressed embedding cache for incremental indexing.
 
 The cache stores ``{sha256(corpus_text): np.ndarray}`` pairs on disk so

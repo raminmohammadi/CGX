@@ -1,6 +1,9 @@
-"""``averix-ui`` entrypoint — boot uvicorn + open the browser.
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Ramin Mohammadi
 
-Run with ``python app.py`` or ``averix-ui`` from a console script. The
+"""``cgx-ui`` entrypoint — boot uvicorn + open the browser.
+
+Run with ``python app.py`` or ``cgx-ui`` from a console script. The
 ``--no-browser`` flag is useful in containers and the development
 ``--reload`` flag turns on uvicorn auto-reload for local hacking on
 the FastAPI side. The React app uses its own Vite dev server on 5173
@@ -67,10 +70,10 @@ def _maybe_enable_hf_offline() -> None:
 
 def launch(**kwargs: Any) -> None:
     """Programmatic entry point used by ``app.py`` and the console script."""
-    parser = argparse.ArgumentParser(description="Averix web UI")
-    parser.add_argument("--host", default=os.environ.get("AVERIX_HOST", DEFAULT_HOST))
+    parser = argparse.ArgumentParser(description="CGX web UI")
+    parser.add_argument("--host", default=os.environ.get("CGX_HOST", DEFAULT_HOST))
     parser.add_argument("--port", type=int,
-                        default=int(os.environ.get("AVERIX_PORT", DEFAULT_PORT)))
+                        default=int(os.environ.get("CGX_PORT", DEFAULT_PORT)))
     parser.add_argument("--reload", action="store_true",
                         help="Enable uvicorn auto-reload (dev only).")
     parser.add_argument("--no-browser", action="store_true",
@@ -85,8 +88,8 @@ def launch(**kwargs: Any) -> None:
     setup_logging(level="INFO")
 
     import logging
-    log = logging.getLogger("averix.launch")
-    log.info("Averix starting on http://%s:%d/", host, port)
+    log = logging.getLogger("cgx.launch")
+    log.info("CGX starting on http://%s:%d/", host, port)
 
     _maybe_enable_hf_offline()
     if os.environ.get("HF_HUB_OFFLINE") == "1":

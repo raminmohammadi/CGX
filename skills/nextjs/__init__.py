@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Ramin Mohammadi
+
 """Next.js fullstack skill (App Router preferred).
 
 Detects ``next.js``/``nextjs`` mentions, supplies an App Router scaffold

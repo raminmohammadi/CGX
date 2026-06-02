@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Ramin Mohammadi
+
 # src/cgx/io/persist.py
 from __future__ import annotations
 

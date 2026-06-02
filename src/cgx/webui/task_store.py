@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Ramin Mohammadi
+
 """Lightweight SQLite-backed task registry.
 
 Each SSE request (ask, plan, agent, index) registers a task here before

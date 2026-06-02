@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Ramin Mohammadi
+
 """Session list / create / fetch / delete.
 
 Backed by :mod:`cgx.sessions` which persists conversation logs under

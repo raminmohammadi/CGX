@@ -51,7 +51,7 @@ describe("useWorkspace", () => {
       .setIndex({ embed_model: "BAAI/bge-small-en-v1.5" });
     const idx = useWorkspace.getState().index;
     expect(idx.embed_model).toBe("BAAI/bge-small-en-v1.5");
-    expect(idx.index_dir).toBe("/tmp/averix_index/indices");
+    expect(idx.index_dir).toBe("/tmp/cgx_index/indices");
   });
 
   it("setProjectRoot replaces the stored root", () => {

@@ -1,4 +1,7 @@
-"""Averix web UI — FastAPI backend + prebuilt React SPA.
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Ramin Mohammadi
+
+"""CGX web UI — FastAPI backend + prebuilt React SPA.
 
 The Python side here wraps the existing :mod:`cgx` engines (indexing,
 retrieval, answering, code planning, agent loop) behind a small REST +

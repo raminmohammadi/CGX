@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Ramin Mohammadi
+
 """Python command-line tool skill.
 
 Fires on goals describing a CLI / script / command-line tool written in

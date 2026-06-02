@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 1040" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace">
-  <!-- Averix · Developer Architecture: Planner → Tracker → Judge + Skills + Retry loop -->
+  <!-- CGX · Developer Architecture: Planner → Tracker → Judge + Skills + Retry loop -->
   <defs>
     <linearGradient id="dbg" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0%" stop-color="#0f172a"/>
@@ -32,7 +32,7 @@
   </defs>
   <rect width="1280" height="1040" fill="url(#dbg)"/>
 
-  <text x="40" y="44" font-family="Inter, sans-serif" font-size="22" font-weight="700" fill="#f1f5f9">Averix Agent Loop — Developer View</text>
+  <text x="40" y="44" font-family="Inter, sans-serif" font-size="22" font-weight="700" fill="#f1f5f9">CGX Agent Loop — Developer View</text>
   <text x="40" y="66" font-family="Inter, sans-serif" font-size="12" fill="#94a3b8">cgx.agents.run_agent  ·  goal → Planner (4-branch routing, skills attach) → Tracker → (capability + Judge)*  → SSE stream → React UI · failure-driven retry</text>
 
   <!-- UI side -->

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Ramin Mohammadi
+
 """Streaming handlers used by the SSE routes.
 
 Each handler is a blocking generator that yields ``(event_name, payload)``

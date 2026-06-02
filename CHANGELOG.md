@@ -36,7 +36,7 @@ All notable changes are documented here. Versions follow semver-ish.
   `content` payload that parses cleanly for known source extensions.
 - **`POST /api/rollback`** (`cgx.webui.routes.rollback`): REST endpoint
   that reverses the most recent `apply` run by reading the run's
-  backup mirror under `<project_root>/.averix-backups/<run_id>/`.
+  backup mirror under `<project_root>/.cgx-backups/<run_id>/`.
   Restores any files that existed before the run, deletes any files
   the `apply` step created from scratch, and returns
   `{restored_files, deleted_files, failed_files, error}`. The Agent
@@ -188,7 +188,7 @@ All notable changes are documented here. Versions follow semver-ish.
 #### Phase 5 — Universal LLM Provider (`cgx.answer.providers`, `cgx.answer.profiles`)
 - **`GeminiProvider`** (`cgx.answer.providers`): native Google Gemini
   provider via the `generativelanguage.googleapis.com` REST API.
-  - Maps Averix's `messages` list to Gemini's `contents` +
+  - Maps CGX's `messages` list to Gemini's `contents` +
     `systemInstruction` format, merging consecutive same-role turns to
     satisfy Gemini's alternating-turn requirement.
   - JSON mode via `responseMimeType: "application/json"`.
@@ -310,7 +310,7 @@ All notable changes are documented here. Versions follow semver-ish.
 
 ### Added
 - **`skills/` top-level package**: pluggable, per-technology modules that
-  centralize what Averix knows about each framework / runtime / library.
+  centralize what CGX knows about each framework / runtime / library.
   Every skill answers three orthogonal questions via the
   `skills.base.Skill` protocol: *does this goal involve me?*
   (`detect(goal) -> float`), *what should the LLM know to do my job
@@ -637,7 +637,7 @@ All notable changes are documented here. Versions follow semver-ish.
 - **Gradio UI overhaul** (`cgx.ui`): five-tab product layout (Setup,
   Index, Ask, Plan, Profiles), streaming thought-process panel, diff
   viewer, soft theme.
-- `averix-ui` console entry point.
+- `cgx-ui` console entry point.
 - `docs/architecture.md` and `docs/usage.md`.
 - GitHub Actions CI (`.github/workflows/ci.yml`) running pytest +
   py-compile on 3.10 / 3.11 / 3.12.
@@ -702,9 +702,9 @@ All notable changes are documented here. Versions follow semver-ish.
   cost, quality ceiling, latency, offline use, setup, and operational
   risk. Exported as `docs/hardware_matrix.json` for downstream tooling.
 - **VS Code extension scaffold** (`extension/`): minimal TypeScript
-  extension exposing **Averix: Open UI** / **Averix: Reload UI** that
+  extension exposing **CGX: Open UI** / **CGX: Reload UI** that
   host the running Gradio server in a webview panel. Server URL is
-  configurable via the `averix.ui.url` setting. Source-only scaffold;
+  configurable via the `cgx.ui.url` setting. Source-only scaffold;
   not packaged into a `.vsix` from the repo.
 
 ### Changed
@@ -712,10 +712,10 @@ All notable changes are documented here. Versions follow semver-ish.
   `sentence_transformers` / `transformers` at module load; they are
   loaded lazily inside `build_embeddings`. The UI and any BYO-embedder
   path now work on machines without the ML stack installed.
-- Removed the legacy `app_gradio_llm.py`; `cgx ui` / `averix-ui` /
+- Removed the legacy `app_gradio_llm.py`; `cgx ui` / `cgx-ui` /
   `app.py` all launch `cgx.ui.app.build_demo()` directly.
 - `pyproject.toml`: corrected package layout, declared new optional
-  extras (`codegen`, `keyring`, `dev`), added `averix-ui` script.
+  extras (`codegen`, `keyring`, `dev`), added `cgx-ui` script.
 - `OllamaProvider` default model is now `qwen2.5-coder:3b`.
 - `parse_codebase` honours `.gitignore`, default ignore globs, a 1 MB
   file-size cap, and skips symlinks by default.

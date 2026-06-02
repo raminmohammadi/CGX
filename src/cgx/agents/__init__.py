@@ -1,4 +1,7 @@
-"""Averix multi-agent orchestration.
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Ramin Mohammadi
+
+"""CGX multi-agent orchestration.
 
 Three logical roles cooperating on a user goal:
 

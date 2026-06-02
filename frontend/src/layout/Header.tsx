@@ -47,11 +47,11 @@ export default function Header() {
     >
       <div className="flex items-center space-x-3">
         <div className="h-7 w-7 bg-emerald-500 rounded flex items-center justify-center text-slate-950 font-bold text-sm shadow-md shadow-emerald-500/10">
-          A
+          C
         </div>
         <div className="flex items-baseline space-x-2">
           <span className="font-bold tracking-tight text-white text-base font-mono">
-            AVERIX
+            CGX
           </span>
           <span className="text-[10px] text-slate-500 font-mono">
             cgx.webui v{status?.version || "0.2.0"}

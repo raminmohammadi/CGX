@@ -1,7 +1,7 @@
 # Hardware compute matrix
 
 This document explains the static catalogue + trade-off table that
-backs the **📊 Hardware** tab in the Averix UI. Source of truth:
+backs the **📊 Hardware** tab in the CGX UI. Source of truth:
 
 - `src/cgx/answer/hardware_matrix.py` — the Python module
 - `docs/hardware_matrix.json` — same data, exported for tooling

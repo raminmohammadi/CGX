@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Ramin Mohammadi
+
 """Planner: decompose a user goal into a sequence of agent tasks.
 
 The Planner prefers the LLM for plan generation but always returns a

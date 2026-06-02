@@ -18,18 +18,18 @@ def test_catalog_is_non_empty_and_well_typed():
         assert required <= set(entry), f"missing fields in {entry}"
         assert isinstance(entry["params_b"], (int, float)) and entry["params_b"] > 0
         assert isinstance(entry["min_ram_gb"], (int, float)) and entry["min_ram_gb"] > 0
-        assert entry["family"] in {"coder", "general"}
+        assert entry["family"] in {"coder", "general", "reasoning"}
 
 
 def test_compute_local_fit_unknown_hardware_marks_all_unknown():
     rows = compute_local_fit({})
     assert rows, "expected at least one row"
-    assert all(r["fit"].startswith("❓") for r in rows)
+    assert all(r["fit"] == "unknown" for r in rows)
 
 
 def test_compute_local_fit_huge_machine_fits_everything():
     rows = compute_local_fit({"ram_gb": 256.0, "gpu_vram_gb": 80.0})
-    assert all(r["fit"].startswith("✅") for r in rows), \
+    assert all(r["fit"] == "fits" for r in rows), \
         f"expected all fits, got {[r['fit'] for r in rows]}"
 
 
@@ -38,15 +38,15 @@ def test_compute_local_fit_tiny_machine_rejects_large_models():
     rows = compute_local_fit({"ram_gb": 8.0, "gpu_vram_gb": 0.0})
     by_name = {r["model"]: r for r in rows}
     assert "qwen2.5-coder:14b-instruct" in by_name
-    assert by_name["qwen2.5-coder:14b-instruct"]["fit"].startswith("❌")
-    assert by_name["qwen2.5-coder:1.5b"]["fit"].startswith("✅")
+    assert by_name["qwen2.5-coder:14b-instruct"]["fit"] == "won't fit"
+    assert by_name["qwen2.5-coder:1.5b"]["fit"] == "fits"
 
 
 def test_compute_local_fit_tight_vram_flagged_as_tight():
     # 32 GB RAM (plenty) but a tiny 2 GB GPU — the 7B coder needs 8 GB VRAM.
     rows = compute_local_fit({"ram_gb": 32.0, "gpu_vram_gb": 2.0})
     by_name = {r["model"]: r for r in rows}
-    assert by_name["qwen2.5-coder:7b-instruct"]["fit"].startswith("⚠️")
+    assert by_name["qwen2.5-coder:7b-instruct"]["fit"] == "tight"
 
 
 def test_compute_local_fit_rows_sorted_by_params():

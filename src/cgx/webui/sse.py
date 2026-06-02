@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Ramin Mohammadi
+
 """SSE helpers shared by streaming routes.
 
 The streaming handlers in :mod:`cgx.webui.handlers` are blocking generators
@@ -60,25 +63,47 @@ async def bridge_generator(
 
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue = asyncio.Queue(maxsize=512)
+    # Signalled by the consumer when it stops reading (early break, error,
+    # client disconnect). The worker checks it before each push so we
+    # don't leave orphaned ``queue.put`` coroutines scheduled on a loop
+    # that's already tearing down.
+    consumer_done = threading.Event()
+
+    def _put(item: Any) -> bool:
+        """Push ``item`` onto the queue from the worker thread.
+
+        Uses ``run_coroutine_threadsafe`` so the worker thread blocks while
+        the queue is full instead of raising ``QueueFull`` (which is what
+        ``put_nowait`` does and what previously crashed the bridge on
+        chatty streams such as Ollama pull progress). Returns ``False``
+        when the consumer has stopped reading or the loop is gone, so the
+        worker can unwind cleanly.
+        """
+        if consumer_done.is_set():
+            return False
+        coro = queue.put(item)
+        try:
+            fut = asyncio.run_coroutine_threadsafe(coro, loop)
+            fut.result()
+            return True
+        except RuntimeError:
+            # Loop closed or stopped — consumer disconnected mid-stream.
+            coro.close()
+            return False
 
     def _worker() -> None:
         try:
             for item in gen_factory():
                 if cancel_event and cancel_event.is_set():
                     # Drain the generator without forwarding events.
-                    loop.call_soon_threadsafe(
-                        queue.put_nowait,
-                        ("cancelled", {"message": "Task cancelled by user"}),
-                    )
+                    _put(("cancelled", {"message": "Task cancelled by user"}))
                     break
-                loop.call_soon_threadsafe(queue.put_nowait, item)
+                if not _put(item):
+                    return
         except Exception as exc:
-            loop.call_soon_threadsafe(
-                queue.put_nowait,
-                {"__error__": f"{type(exc).__name__}: {exc}"},
-            )
+            _put({"__error__": f"{type(exc).__name__}: {exc}"})
         finally:
-            loop.call_soon_threadsafe(queue.put_nowait, _SENTINEL)
+            _put(_SENTINEL)
 
     thread = threading.Thread(target=_worker, name="sse-bridge", daemon=True)
     thread.start()
@@ -107,6 +132,15 @@ async def bridge_generator(
         logger.debug("sse bridge: stream complete task_id=%s", task_id)
         yield {"event": "done", "data": "{}"}
     finally:
+        # Tell the worker we're done so it stops scheduling ``queue.put``
+        # coroutines, then drain anything already in flight so no
+        # un-awaited coroutine survives loop teardown.
+        consumer_done.set()
+        while not queue.empty():
+            try:
+                queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
         if task_id:
             try:
                 task = _ts.get_task(task_id)

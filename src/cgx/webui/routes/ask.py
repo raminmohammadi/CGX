@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Ramin Mohammadi
+
 """Ask SSE route — streams intent → thought deltas → final answer."""
 
 from __future__ import annotations

@@ -1,4 +1,4 @@
-# Averix core runtime dependencies.
+# CGX core runtime dependencies.
 #
 # Prefer `pip install -e .[all]` (reads pyproject.toml) for development. This
 # file is the install path for environments that bootstrap from requirements.

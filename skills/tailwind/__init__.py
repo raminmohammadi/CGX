@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Ramin Mohammadi
+
 """Tailwind CSS styling skill.
 
 Tailwind is an addon: it composes with whatever frontend skill is also

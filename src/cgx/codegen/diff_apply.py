@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Ramin Mohammadi
+
 """Parse and apply unified diffs in memory.
 
 We deliberately do NOT touch the user's filesystem here. Callers receive the

@@ -185,7 +185,7 @@ def test_rollback_restores_existing_and_deletes_new(tmp_path: Path) -> None:
 
 def test_rollback_missing_backup_dir_errors(tmp_path: Path) -> None:
     _make_project(tmp_path)
-    out = rollback_from_backup(str(tmp_path), str(tmp_path / ".averix-backups" / "missing"))
+    out = rollback_from_backup(str(tmp_path), str(tmp_path / ".cgx-backups" / "missing"))
     assert out["restored_files"] == []
     assert out["deleted_files"] == []
     assert "does not exist" in (out.get("error") or "")

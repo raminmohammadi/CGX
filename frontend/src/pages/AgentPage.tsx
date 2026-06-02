@@ -367,7 +367,7 @@ export default function AgentPage() {
   return (
     <div className="p-6 space-y-6 overflow-y-auto h-full">
       <CardHeader
-        title="🤖 Multi-Agent Orchestration Tracker"
+        title="Multi-Agent Orchestration Tracker"
         description="Live execution pipeline traversing Planner generation, Tracker task dispatches, and structural Judge diagnostics."
         right={
           busy ? (

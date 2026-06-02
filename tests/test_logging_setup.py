@@ -42,7 +42,7 @@ def test_setup_logging_is_idempotent_for_stream_handlers():
 
 
 def test_setup_logging_adds_file_handler_when_logfile_given(tmp_path):
-    log_path = tmp_path / "nested" / "averix.log"
+    log_path = tmp_path / "nested" / "cgx.log"
     setup_logging(level="INFO", logfile=str(log_path))
     assert log_path.parent.exists()
     # File handler should exist on the root logger.

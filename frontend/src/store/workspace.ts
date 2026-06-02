@@ -34,8 +34,8 @@ const defaultProvider: ProviderConfig = {
 };
 
 const defaultIndex: IndexLocation = {
-  index_dir: "/tmp/averix_index/indices",
-  records: "/tmp/averix_index/records.jsonl",
+  index_dir: "/tmp/cgx_index/indices",
+  records: "/tmp/cgx_index/records.jsonl",
   embed_model: "jinaai/jina-embeddings-v2-base-code",
 };
 
@@ -67,6 +67,6 @@ export const useWorkspace = create<WorkspaceState>()(
           },
         })),
     }),
-    { name: "averix-workspace" },
+    { name: "cgx-workspace" },
   ),
 );

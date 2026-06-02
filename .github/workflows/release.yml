@@ -1,0 +1,117 @@
+name: Release
+
+# Build and publish the cgx distribution on every annotated tag matching
+# v*. The job is intentionally conservative: the sdist+wheel are always
+# built and attached to the GitHub Release, while the PyPI publish step
+# is opt-in via the ``release-pypi`` environment (configure trusted
+# publishing in repo settings to enable it).
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Tag or branch to build (defaults to current ref)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write   # required to attach artefacts to the release
+  id-token: write   # required for PyPI trusted publishing (OIDC)
+
+jobs:
+  build:
+    name: Build sdist + wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install build tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install build twine
+
+      - name: Build distributions
+        run: |
+          python -m build
+          ls -la dist/
+
+      - name: Verify metadata
+        run: |
+          python -m twine check dist/*
+
+      - name: Smoke-import from wheel
+        run: |
+          python -m venv /tmp/smoke
+          /tmp/smoke/bin/pip install --upgrade pip
+          /tmp/smoke/bin/pip install dist/*.whl
+          /tmp/smoke/bin/python - <<'PY'
+          import cgx, importlib
+          # Public surface should import without pulling the ML stack.
+          for mod in ("cgx", "cgx.cli.main", "cgx.answer.profiles",
+                      "cgx.agents.tracker", "skills"):
+              importlib.import_module(mod)
+          import importlib.util as u
+          for heavy in ("torch", "transformers", "sentence_transformers"):
+              assert u.find_spec(heavy) is None, f"{heavy} leaked into core wheel"
+          print("smoke OK:", cgx.__name__)
+          PY
+
+      - name: Upload build artefacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  github-release:
+    name: Attach to GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download build artefacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      - name: Create or update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+
+  pypi-publish:
+    name: Publish to PyPI (trusted publishing)
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment:
+      name: release-pypi
+      url: https://pypi.org/project/cgx/
+    steps:
+      - name: Download build artefacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+          skip-existing: true

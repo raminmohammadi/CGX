@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Ramin Mohammadi
+
 """Dynamic dependency management for the code generation sandbox.
 
 Before running pytest in a temp sandbox, scans the generated files for
@@ -85,7 +88,7 @@ _STDLIB_TOP = frozenset({
     "weakref", "webbrowser", "wsgiref", "xml", "xmlrpc", "zipfile",
     "zipimport", "zlib", "zoneinfo",
     # always treat the project itself as installed
-    "cgx", "averix",
+    "cgx",
 })
 
 

@@ -1,4 +1,4 @@
-# Averix optional ML extras.
+# CGX optional ML extras.
 #
 # Install with:    pip install -r requirements.txt -r requirements-ml.txt
 # Or via extras:   pip install -e .[embeddings]
@@ -12,7 +12,7 @@
 #
 # What you can skip this for:
 #   * Using a BYO embedder (any callable that returns vectors).
-#   * Running Averix purely against an Ollama or remote LLM endpoint.
+#   * Running CGX purely against an Ollama or remote LLM endpoint.
 #
 # Note: `torch` is ~700 MB; pick a CUDA/CPU build that matches your platform.
 # See https://pytorch.org/get-started/locally/ if the pin below doesn't apply.

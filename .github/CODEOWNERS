@@ -1,0 +1,27 @@
+# CGX code ownership.
+#
+# Each line maps a path pattern (relative to the repo root) to one or
+# more maintainers. Patterns are matched bottom-up; the last matching
+# rule wins. See:
+#   https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# Default reviewer for anything not matched by a more specific rule.
+*                                @raminmohammadi
+
+# Core runtime: requires review even on docs-only sweeps that touch the
+# package, because public-surface drift here breaks downstream users.
+/src/cgx/                        @raminmohammadi
+/skills/                         @raminmohammadi
+
+# Build, CI, and release plumbing.
+/.github/                        @raminmohammadi
+/pyproject.toml                  @raminmohammadi
+/requirements.txt                @raminmohammadi
+/requirements-ml.txt             @raminmohammadi
+
+# Frontend (Vite/React SPA bundled into src/cgx/webui/static/).
+/frontend/                       @raminmohammadi
+
+# Security-sensitive paths — credentials, profile store, scrubbers.
+/src/cgx/answer/profiles.py      @raminmohammadi
+/src/cgx/answer/providers.py     @raminmohammadi

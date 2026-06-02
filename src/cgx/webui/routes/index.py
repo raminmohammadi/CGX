@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Ramin Mohammadi
+
 """Index build: ZIP upload + SSE-streamed progress."""
 
 from __future__ import annotations
@@ -24,7 +27,7 @@ router = APIRouter(tags=["index"])
 async def upload_zip(file: UploadFile = File(...)) -> dict:
     if not file.filename:
         return {"error": "no filename"}
-    tmpdir = tempfile.mkdtemp(prefix="averix_upload_")
+    tmpdir = tempfile.mkdtemp(prefix="cgx_upload_")
     safe = f"{uuid.uuid4().hex[:8]}.zip"
     target = os.path.join(tmpdir, safe)
     with open(target, "wb") as f:

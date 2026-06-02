@@ -1,4 +1,7 @@
-"""FastAPI application factory for the Averix web UI.
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Ramin Mohammadi
+
+"""FastAPI application factory for the CGX web UI.
 
 Routes are split per-feature under :mod:`cgx.webui.routes`; this module
 just composes them, mounts the prebuilt React bundle from
@@ -42,7 +45,7 @@ ASSETS_DIR = STATIC_DIR / "assets"
 
 def create_app() -> FastAPI:
     app = FastAPI(
-        title="Averix",
+        title="CGX",
         description="Local-first codebase RAG — REST + SSE backend.",
         version="0.2.0",
         docs_url="/api/docs",
@@ -114,7 +117,7 @@ def _mount_spa(app: FastAPI) -> None:
             return FileResponse(str(STATIC_DIR / "index.html"))
         return JSONResponse(
             {
-                "detail": "Averix frontend bundle not found.",
+                "detail": "CGX frontend bundle not found.",
                 "fix": "Run `cd frontend && npm install && npm run build` "
                        "to produce src/cgx/webui/static/.",
             },

@@ -1,8 +1,11 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Ramin Mohammadi
+
 """High-level :func:`run_agent` entrypoint.
 
 Wires :class:`~cgx.agents.planner.Planner`,
 :class:`~cgx.agents.tracker.Tracker`, and
-:class:`~cgx.agents.judge.Judge` to the existing Averix capabilities:
+:class:`~cgx.agents.judge.Judge` to the existing CGX capabilities:
 
 * ``ask``      → :func:`cgx.answer.engine.answer_with_llm`
 * ``plan``     → :func:`cgx.answer.engine.generate_code_plan`
@@ -151,13 +154,25 @@ def _build_default_capabilities(
         if not project_root:
             raise ValueError("verify requires project_root to be set")
         from cgx.codegen.test_runner import (
-            discover_all_tests, run_pytest_paths, run_tests_on_disk,
+            discover_all_tests, ensure_project_venv,
+            run_pytest_paths, run_tests_on_disk,
         )
         changed = _changed_files_from_prior(prior)
 
+        # Phase 1: ensure the project has its own .venv with declared
+        # dependencies installed. Without this, pytest runs against
+        # CGX's own interpreter, which doesn't have the LLM-chosen
+        # libraries (e.g. google-generativeai) and tests die at collection.
+        project_python: Optional[str] = None
+        try:
+            project_python = ensure_project_venv(project_root)
+        except Exception as _e:
+            logger.debug("verify: ensure_project_venv skipped: %s", _e)
+
         # Phase 2: pre-flight dependency check — scan generated Python files
         # for imports that aren't in requirements.txt and auto-install them
-        # before running pytest, so ModuleNotFoundError doesn't mask real failures.
+        # into the project venv (NOT CGX's own), so ModuleNotFoundError
+        # doesn't mask real failures.
         py_files = [f for f in changed if f.endswith(".py")]
         if py_files:
             try:
@@ -166,7 +181,9 @@ def _build_default_capabilities(
                     os.path.join(project_root, f) if not os.path.isabs(f) else f
                     for f in py_files
                 ]
-                missing, results = preflight_install(abs_py, project_root)
+                missing, results = preflight_install(
+                    abs_py, project_root, python=project_python,
+                )
                 if missing:
                     logger.info(
                         "verify: preflight installed %d package(s): %s",

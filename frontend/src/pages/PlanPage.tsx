@@ -99,7 +99,7 @@ export default function PlanPage() {
   return (
     <div className="p-6 space-y-6 overflow-y-auto h-full max-w-5xl">
       <CardHeader
-        title="🛠️ Self-Testing Verification Loop"
+        title="Self-Testing Verification Loop"
         description="Executes isolated dry-run evaluations, verifying code change validity inside safe AST parsing environments."
         right={
           busy ? (

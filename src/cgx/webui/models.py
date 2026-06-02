@@ -1,4 +1,7 @@
-"""Pydantic request/response models for the Averix web UI.
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Ramin Mohammadi
+
+"""Pydantic request/response models for the CGX web UI.
 
 Every model here is the wire contract between the React frontend and
 the FastAPI backend. Optional fields keep the surface forgiving for the
@@ -33,8 +36,8 @@ class ProviderConfig(BaseModel):
 class IndexLocation(BaseModel):
     """Where the searchable index lives on disk."""
 
-    index_dir: str = "/tmp/averix_index/indices"
-    records: str = "/tmp/averix_index/records.jsonl"
+    index_dir: str = "/tmp/cgx_index/indices"
+    records: str = "/tmp/cgx_index/records.jsonl"
     embed_model: str = "jinaai/jina-embeddings-v2-base-code"
 
 
@@ -42,7 +45,7 @@ class IndexLocation(BaseModel):
 
 class IndexBuildRequest(BaseModel):
     project_root: Optional[str] = None
-    out_dir: str = "/tmp/averix_index"
+    out_dir: str = "/tmp/cgx_index"
     embed_model: str = "jinaai/jina-embeddings-v2-base-code"
     metric: str = "cosine"
     index_type: str = "flat"
@@ -131,7 +134,7 @@ class HardwareInfo(BaseModel):
 
 
 class StatusResponse(BaseModel):
-    app: str = "Averix"
+    app: str = "CGX"
     version: str = "0.2.0"
     ollama: Dict[str, Any] = Field(default_factory=dict)
     hardware: HardwareInfo = Field(default_factory=HardwareInfo)
@@ -145,6 +148,7 @@ class ModelChoicesResponse(BaseModel):
     choices: List[str] = Field(default_factory=list)
     recommended_default: str = ""
     installed: List[str] = Field(default_factory=list)
+    ollama_reachable: bool = False
 
 
 class HardwareMatrixRow(BaseModel):

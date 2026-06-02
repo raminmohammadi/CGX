@@ -3,14 +3,14 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "averix"
+name = "cgx"
 version = "0.2.0"
-description = "Averix — local-first codebase RAG with hybrid retrieval, multi-agent orchestration (Planner / Tracker / Judge), manifest-driven project scaffolding, and self-testing code generation."
+description = "CGX (Code Graph eXecution) — local-first codebase RAG with hybrid retrieval, multi-agent orchestration (Planner / Tracker / Judge), manifest-driven project scaffolding, and self-testing code generation."
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [{name = "Ramin Mohammadi"}]
-keywords = ["rag", "codebase", "retrieval", "llm", "ollama", "code-generation", "scaffold", "multi-agent", "averix"]
+keywords = ["rag", "codebase", "retrieval", "llm", "ollama", "code-generation", "scaffold", "multi-agent", "cgx"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Developers",
@@ -66,12 +66,11 @@ all = [
 ]
 
 [project.urls]
-Repository = "https://github.com/Averix/averix"
+Repository = "https://github.com/cgx-dev/cgx"
 
 [project.scripts]
-averix = "cgx.cli.main:main"
 cgx = "cgx.cli.main:main"
-averix-ui = "cgx.webui.launch:launch"
+cgx-ui = "cgx.webui.launch:launch"
 
 [tool.setuptools.packages.find]
 # Discover packages from both src/ (cgx and its subpackages) and the

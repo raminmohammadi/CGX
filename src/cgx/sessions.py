@@ -1,4 +1,7 @@
-"""Persistent chat sessions for Averix.
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Ramin Mohammadi
+
+"""Persistent chat sessions for CGX.
 
 Sessions are stored as append-only JSONL files under
 ``~/.cgx/sessions/<session_id>.jsonl``. Each line is a single message

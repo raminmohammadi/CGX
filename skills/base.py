@@ -1,6 +1,9 @@
-"""Core types for the Averix Skills system.
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Ramin Mohammadi
 
-A *skill* is a self-contained module bundling everything Averix needs to
+"""Core types for the CGX Skills system.
+
+A *skill* is a self-contained module bundling everything CGX needs to
 know about one technology (framework, runtime, library, toolchain).
 Every skill answers three orthogonal questions:
 
@@ -64,7 +67,7 @@ class SkillVerdict:
 
 
 class Skill(ABC):
-    """Base class for an Averix skill.
+    """Base class for a CGX skill.
 
     Subclasses set the class attributes (``name``, ``role``, ``aliases``)
     and override :meth:`detect`. Prompt fragments and validators are
