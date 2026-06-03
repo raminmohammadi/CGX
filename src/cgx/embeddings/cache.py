@@ -1,5 +1,4 @@
-# SPDX-License-Identifier: MIT
-# Copyright (c) 2026 Ramin Mohammadi
+
 
 """Content-addressed embedding cache for incremental indexing.
 

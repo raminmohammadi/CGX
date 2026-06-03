@@ -1,5 +1,4 @@
-# SPDX-License-Identifier: MIT
-# Copyright (c) 2026 Ramin Mohammadi
+
 
 """Planner: decompose a user goal into a sequence of agent tasks.
 

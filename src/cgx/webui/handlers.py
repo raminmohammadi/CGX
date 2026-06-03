@@ -1,5 +1,4 @@
-# SPDX-License-Identifier: MIT
-# Copyright (c) 2026 Ramin Mohammadi
+
 
 """Streaming handlers used by the SSE routes.
 
@@ -18,7 +17,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-from cgx.answer.engine import _get_system_prompt, answer_with_llm, generate_code_plan
+from cgx.answer.engine import answer_with_llm, generate_code_plan
 from cgx.answer.intent import detect_intent
 from cgx.pipeline.auto import run_index_auto, run_query_auto
 from cgx.webui.helpers import (
@@ -148,14 +147,24 @@ def stream_ask(
         yield "cancelled", {"message": "Cancelled"}
         return
 
-    sys_prompt = _get_system_prompt(mode)
+    # Plain-prose system prompt for the streaming "thought" sketch. The
+    # final grounded answer is produced by a separate call below which uses
+    # the intent-specific JSON-output system prompt; mixing the two here
+    # makes JSON-constrained models (e.g. Gemini) emit raw JSON during the
+    # thinking phase, which leaks into the UI's THINKING panel.
+    sketch_system = (
+        "You are a senior codebase assistant sketching out how you will "
+        "answer the user's question. Reply with brief PLAIN PROSE only — "
+        "no JSON, no markdown code fences, no citations, no final answer. "
+        "Keep it under five sentences and focus on what you'll look for "
+        "and how you'll structure the response."
+    )
     sketch_user = (
         f"QUESTION:\n{question}\n\nINTENT_MODE: {mode}\n\n"
-        "Think aloud briefly about how you will answer using the SOURCES "
-        "(we will produce a final grounded answer separately)."
+        "Briefly describe how you will approach this answer. Plain prose only."
     )
     messages = [
-        {"role": "system", "content": sys_prompt},
+        {"role": "system", "content": sketch_system},
         {"role": "user", "content": sketch_user},
     ]
 

@@ -1,6 +1,3 @@
-# SPDX-License-Identifier: MIT
-# Copyright (c) 2026 Ramin Mohammadi
-
 """CGX Skills — pluggable technology-specific knowledge bundles.
 
 A *skill* encapsulates everything CGX knows about one technology

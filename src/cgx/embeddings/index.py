@@ -1,5 +1,4 @@
-# SPDX-License-Identifier: MIT
-# Copyright (c) 2026 Ramin Mohammadi
+
 
 import numpy as np
 from cgx.logging_setup import get_logger

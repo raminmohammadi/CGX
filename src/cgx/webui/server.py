@@ -1,5 +1,4 @@
-# SPDX-License-Identifier: MIT
-# Copyright (c) 2026 Ramin Mohammadi
+
 
 """FastAPI application factory for the CGX web UI.
 

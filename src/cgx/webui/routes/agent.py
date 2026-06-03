@@ -1,5 +1,4 @@
-# SPDX-License-Identifier: MIT
-# Copyright (c) 2026 Ramin Mohammadi
+
 
 """Agent SSE route — streams Planner/Tracker/Judge events."""
 

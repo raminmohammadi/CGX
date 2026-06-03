@@ -204,9 +204,13 @@ export default function IndexPage() {
             <KV label="project_root" value={result.project_root} />
             <KV label="out_dir" value={result.out_dir} />
             {result.summary &&
-              Object.entries(result.summary).map(([k, v]) => (
-                <KV key={k} label={k} value={String(v)} />
-              ))}
+              Object.entries(result.summary).map(([k, v]) =>
+                isPlainObject(v) ? (
+                  <NestedKV key={k} label={k} obj={v as Record<string, any>} />
+                ) : (
+                  <KV key={k} label={k} value={formatPrimitive(v)} />
+                ),
+              )}
           </div>
         </Card>
       )}
@@ -236,6 +240,43 @@ function KV({ label, value }: { label: string; value: string }) {
     <div className="bg-slate-950 p-3 rounded border border-white/5 flex justify-between items-center gap-3">
       <span className="text-slate-500 truncate">{label}</span>
       <span className="text-slate-200 truncate text-right">{value}</span>
+    </div>
+  );
+}
+
+function isPlainObject(v: any): v is Record<string, any> {
+  return v !== null && typeof v === "object" && !Array.isArray(v);
+}
+
+function formatPrimitive(v: any): string {
+  if (v === null || v === undefined) return "—";
+  if (Array.isArray(v)) {
+    try { return JSON.stringify(v); } catch { return String(v); }
+  }
+  return String(v);
+}
+
+function NestedKV({ label, obj }: { label: string; obj: Record<string, any> }) {
+  return (
+    <div className="bg-slate-950 p-3 rounded border border-white/5 col-span-2">
+      <div className="text-slate-500 text-[10px] uppercase tracking-wider mb-2">{label}</div>
+      <div className="grid grid-cols-2 gap-2">
+        {Object.entries(obj).map(([sk, sv]) =>
+          isPlainObject(sv) ? (
+            <NestedKV key={sk} label={sk} obj={sv as Record<string, any>} />
+          ) : (
+            <div
+              key={sk}
+              className="flex justify-between items-center gap-2 px-2 py-1 rounded bg-slate-900/60 border border-white/5"
+            >
+              <span className="text-slate-500 truncate text-[10px]">{sk}</span>
+              <span className="text-slate-200 truncate text-right text-[10px]">
+                {formatPrimitive(sv)}
+              </span>
+            </div>
+          ),
+        )}
+      </div>
     </div>
   );
 }

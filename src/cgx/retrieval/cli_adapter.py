@@ -1,5 +1,4 @@
-# SPDX-License-Identifier: MIT
-# Copyright (c) 2026 Ramin Mohammadi
+
 
 # src/cgx/retrieval/cli_adapter.py
 from __future__ import annotations

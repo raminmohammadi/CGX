@@ -1,5 +1,4 @@
-# SPDX-License-Identifier: MIT
-# Copyright (c) 2026 Ramin Mohammadi
+
 
 """``cgx-ui`` entrypoint — boot uvicorn + open the browser.
 

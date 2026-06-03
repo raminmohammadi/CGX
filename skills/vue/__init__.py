@@ -1,5 +1,4 @@
-# SPDX-License-Identifier: MIT
-# Copyright (c) 2026 Ramin Mohammadi
+
 
 """Vue 3 frontend skill (with Nuxt detection as a co-mention)."""
 

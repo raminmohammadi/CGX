@@ -1,5 +1,4 @@
-# SPDX-License-Identifier: MIT
-# Copyright (c) 2026 Ramin Mohammadi
+
 
 """Python command-line tool skill.
 
@@ -22,8 +21,7 @@ _CLI_NOUNS = re.compile(
     r"\b(cli|command[\s-]*line|script|tool|utility)\b", re.IGNORECASE
 )
 _PYTHON_RE = re.compile(r"\bpython\b", re.IGNORECASE)
-# Frameworks that disqualify "this is a CLI" — those skills will fire
-# instead.
+# Frameworks that disqualify "this is a CLI" — those skills will fire instead.
 _WEB_RE = re.compile(
     r"\b(fastapi|flask|django|react|vue|next\.?js|express)\b", re.IGNORECASE
 )

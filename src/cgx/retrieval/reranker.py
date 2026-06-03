@@ -1,5 +1,4 @@
-# SPDX-License-Identifier: MIT
-# Copyright (c) 2026 Ramin Mohammadi
+
 
 """Optional cross-encoder reranker over the top-N RRF-fused chunks.
 

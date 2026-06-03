@@ -47,3 +47,13 @@ def test_short_acronym_still_classified_as_symbol():
 
 def test_dotted_reference_classified_as_symbol():
     assert detect_intent("explain module.func") == "symbol_explain"
+
+
+# Regression: a short ALLCAPS token that is the project's own name (e.g. "CGX")
+# must not force overview-shaped questions into the symbol_explain branch.
+def test_project_overview_phrasings_route_to_overview():
+    assert detect_intent("What is CGX project about?") == "overview"
+    assert detect_intent("what is cgx?") == "overview"
+    assert detect_intent("tell me about CGX") == "overview"
+    assert detect_intent("tell me about this project") == "overview"
+    assert detect_intent("project overview please") == "overview"

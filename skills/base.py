@@ -1,6 +1,3 @@
-# SPDX-License-Identifier: MIT
-# Copyright (c) 2026 Ramin Mohammadi
-
 """Core types for the CGX Skills system.
 
 A *skill* is a self-contained module bundling everything CGX needs to
@@ -53,10 +50,13 @@ class SkillVerdict:
     """Validation outcome from a skill's check on produced diffs.
 
     Mirrors :class:`cgx.agents.judge.Verdict` so the Judge can pass the
-    skill's verdict through verbatim. ``passed=False`` with the default
-    ``severity="error"`` short-circuits the Judge to FAIL with this
-    skill's rationale; ``severity="warning"`` is advisory only \u2014 the
-    Judge surfaces the rationale but does not fail the task on it.
+    skill's verdict through verbatim. 
+    
+    ``passed=False`` with the default ``severity="error"`` short-circuits
+    the Judge to FAIL with this skill's rationale; 
+    
+    ``severity="warning"`` is advisory only the Judge surfaces the rationale but does
+    not fail the task on it.
     """
 
     passed: bool

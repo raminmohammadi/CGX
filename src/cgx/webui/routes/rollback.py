@@ -1,5 +1,4 @@
-# SPDX-License-Identifier: MIT
-# Copyright (c) 2026 Ramin Mohammadi
+
 
 """Rollback REST route — undo a prior :func:`apply_diffs_to_disk` run.
 

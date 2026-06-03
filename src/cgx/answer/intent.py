@@ -1,5 +1,4 @@
-# SPDX-License-Identifier: MIT
-# Copyright (c) 2026 Ramin Mohammadi
+
 
 """
 Intent detection module for developer-style queries.
@@ -122,6 +121,37 @@ def detect_intent(question: str) -> Intent:
     # Code modification requests (broad; only after symbol-targeted branches)
     if any(k in ql for k in ["add ", "implement", "feature", "refactor", "plan ", "change ", "extend ", "modify", "introduce", "create a "]):
         return "change_plan"
+
+    # Overview-shaped phrasings about a project/repo/codebase as a whole.
+    # Must come before the fallback so short all-uppercase tokens (often the
+    # project's own name, e.g. "CGX") don't force symbol_explain.
+    if any(k in ql for k in [
+        "project about", "repo about", "codebase about",
+        "about this project", "about the project", "about this repo",
+        "about the repo", "about this codebase", "about the codebase",
+        "what is this project", "what is the project", "what is this repo",
+        "what is the repo", "what is this codebase", "what is the codebase",
+        "what's this project", "what's the project", "what's this repo",
+        "tell me about this", "tell me about the project",
+        "tell me about the repo", "tell me about the codebase",
+        "summarize the project", "summarize this project", "summarize the repo",
+        "project overview", "codebase overview", "repo summary",
+    ]):
+        return "overview"
+
+    # Bare "what is X" / "what is X about" / "tell me about X" where X is a
+    # short ALLCAPS acronym is almost always asking about the project as a
+    # whole rather than a specific symbol.
+    m = re.match(
+        r"^\s*(?:what\s+is|what's|tell\s+me\s+about)\s+([A-Za-z][A-Za-z0-9_]*)"
+        r"(?:\s+(?:about|project|repo|codebase))?\s*\??\s*$",
+        q,
+        flags=re.IGNORECASE,
+    )
+    if m:
+        tok = m.group(1)
+        if tok.isupper() and 2 <= len(tok) <= 6:
+            return "overview"
 
     # Fallback: prefer symbol_explain if a symbol is present, else overview
     if has_sym:

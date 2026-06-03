@@ -1,5 +1,4 @@
-# SPDX-License-Identifier: MIT
-# Copyright (c) 2026 Ramin Mohammadi
+
 
 from __future__ import annotations
 import logging
@@ -105,6 +104,28 @@ def _guess_root(indices: Dict[str, Any]) -> Optional[str]:
         return os.path.commonpath(paths)
     except Exception:
         return str(Path(paths[0]).parent)
+
+def _shorten_chunk_refs(text: str, root: Optional[str]) -> str:
+    """Rewrite ``[[<chunk_id>]]`` tokens in LLM output to drop the project-root
+    prefix so user-visible citations are compact and don't leak ``$HOME``.
+
+    Chunk ids are absolute paths internally (``/home/alice/repo/foo.py::cls::Bar``).
+    Citations in ``answer_md`` are rendered to the user verbatim, which makes
+    the prefix both noisy and a small privacy leak. Stripping is purely
+    cosmetic — ``citations`` and ``debug.sources`` still carry the full ids.
+    """
+    if not text or not root:
+        return text or ""
+    prefix = root.rstrip("/") + "/"
+
+    def _sub(m: "re.Match[str]") -> str:
+        inner = m.group(1)
+        if inner.startswith(prefix):
+            inner = inner[len(prefix):]
+        return f"[[{inner}]]"
+
+    return re.sub(r"\[\[([^\[\]]+)\]\]", _sub, text)
+
 
 def _trim(txt: Optional[str], max_chars: int) -> str:
     if txt is None:
@@ -790,6 +811,8 @@ def answer_with_llm(
     parsed.setdefault("suggested_changes", [])
     if "confidence" not in parsed or not isinstance(parsed["confidence"], (int, float)):
         parsed["confidence"] = 0.6 if parsed["citations"] else 0.4
+
+    parsed["answer_md"] = _shorten_chunk_refs(parsed.get("answer_md", ""), root)
 
     parsed["debug"] = {
         "mode": mode,
