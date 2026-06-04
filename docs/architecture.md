@@ -20,6 +20,7 @@ cgx.answer.profiles     — provider config + keyring-backed secret store
 cgx.answer.hardware_matrix — offline local-model catalogue + tradeoffs
 cgx.answer.ollama_discovery — installed-model listing + hardware probe
 cgx.codegen             — diff parse / dry-apply / syntax & test validation
+cgx.codegen.ast_insert  — AST-anchored insertion planner (sibling-anchor → PatchResult)
 cgx.codegen.disk_apply  — write applied diffs to disk + per-run backup mirror
 cgx.codegen.env_manager — pre-flight dependency scan, pip-install, requirements update
 cgx.codegen.symbol_map  — symbol-table context builder for working-memory injection
@@ -92,6 +93,41 @@ cgx.cli / cgx.webui     — terminal + FastAPI/React surfaces (uvicorn on :8765)
 
 The whole report is returned under `parsed["codegen_report"]` and rendered
 in the UI as a markdown table.
+
+## Structured AST insertion
+
+`cgx.codegen.ast_insert` provides an additive, AST-anchored alternative
+to text diffs for the common "insert a new def into this container after
+this sibling" case. The retrieval side already speaks in terms of
+containers and sibling anchors (`suggest_insertion_points` returns
+`{container_type, container_id, anchors}`), and this module bridges
+that signal into the same `PatchResult` shape that
+`apply_diffs_in_memory` and `validate_patch_results` consume:
+
+1. `AstInsertSpec(rel_path, code, class_name=None, anchor_symbol=None,
+   dedupe=True)` declares the target (module level or a named
+   top-level class) and the snippet to splice in.
+2. `plan_ast_insertion` reads the target file, parses it with the
+   stdlib `ast` module, locates the anchor sibling's `end_lineno`,
+   detects the container's body indentation, re-emits the snippet via
+   `ast.get_source_segment` so user-supplied comments and formatting
+   survive, and splices it in. The result is re-parsed before being
+   returned, so a broken splice produces `ok=False` rather than a
+   corrupted file. Nothing is written to disk.
+3. `plan_ast_insertion_from_suggestion(project_root, suggestion, code)`
+   accepts a single item from `suggest_insertion_points` directly,
+   resolves the `container_id` (including the `::class::<Name>`
+   suffix), and prefers the `similar_signature_neighbor` anchor over
+   the `likely_caller`.
+4. `build_unified_diff(patch_result)` renders the plan as a standard
+   unified diff so it routes back through `parse_fenced_diffs` /
+   `apply_diffs_to_disk` / `validate_patch_results` without any
+   special-casing.
+
+The module is purely additive: it does not modify any existing
+signature in `diff_apply`, `validate`, `disk_apply`, or
+`orchestrator`. Callers can keep using the text-diff path; the AST
+path is opt-in via the entry points above.
 
 ## LLM Providers
 

@@ -6,6 +6,28 @@ All notable changes are documented here. Versions follow semver-ish.
 
 ### Added
 
+- **`cgx.codegen.ast_insert`** — AST-anchored insertion planner that
+  bridges `cgx.retrieval.orchestrator.suggest_insertion_points` into the
+  existing `PatchResult` pipeline. Given an `AstInsertSpec(rel_path,
+  code, class_name=None, anchor_symbol=None)` (or a raw suggestion dict
+  via `plan_ast_insertion_from_suggestion`), the planner re-parses the
+  target file with the stdlib `ast` module, locates the anchor
+  sibling's `end_lineno`, auto-detects container body indentation, and
+  splices the snippet in. `ast.get_source_segment` plus a leading-comment
+  walker preserve user formatting and `#` comments. The result is
+  re-parsed before being returned, so a broken splice surfaces as
+  `ok=False` rather than a corrupted file; nothing is written to disk.
+  `build_unified_diff(patch_result)` renders the plan as a standard
+  unified diff so it routes back through `parse_fenced_diffs` /
+  `apply_diffs_to_disk` / `validate_patch_results` without any
+  special-casing. The module is purely additive — no existing
+  signature in `diff_apply`, `validate`, `disk_apply`, or
+  `orchestrator` was modified. Covered by `tests/test_ast_insert.py`
+  (12 cases: module-after-anchor, append-when-anchor-missing,
+  class-after-sibling-method, dedupe-no-op, non-`.py` rejection,
+  snippet `SyntaxError`, new-file creation, class-not-found,
+  leading-comment preservation, suggestion-bridge for class
+  containers, unified-diff round-trip, nested-class rejection).
 - **`TaskKind.SCAFFOLD_MANIFEST` and `TaskKind.SCAFFOLD_FILE`**
   (`cgx.agents.types`): the monolithic `scaffold` kind has been split
   into a two-stage pipeline. `scaffold_manifest` calls
