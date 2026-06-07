@@ -243,7 +243,7 @@ def _normalize_rel(path_str: str, root: Path) -> Path | None:
     anything that escapes the tree (``..``, absolute paths outside root).
     """
     s = (path_str or "").strip()
-    # Strip a single leading ``./`` (or repeated ``./`` segments) — but
+    # Strip a single leading ``./`` (or repeated ``./`` segments) -- but
     # never ``lstrip("./")`` which is a character-set strip and would
     # eat the leading ``/`` of an absolute path, turning ``/home/u/x.py``
     # into ``home/u/x.py`` and causing the writer to mirror the absolute
@@ -284,9 +284,9 @@ def rollback_from_backup(
     """Undo an earlier :func:`apply_diffs_to_disk` run.
 
     Walks every entry under ``backup_dir`` and either restores the
-    mirrored original to its project-relative location or — for files
+    mirrored original to its project-relative location or -- for files
     that were created by the apply (mirrored as ``<rel>.new`` empty
-    markers) — deletes the file the apply wrote.
+    markers) -- deletes the file the apply wrote.
 
     Parameters
     ----------

@@ -35,7 +35,7 @@ class _ScriptedProvider:
         self._replies = list(replies)
         self.calls: List[Dict[str, Any]] = []
 
-    def chat(self, *args, **kw):  # noqa: ANN001 — match LLMProvider duck type
+    def chat(self, *args, **kw):  # noqa: ANN001 -- match LLMProvider duck type
         # OllamaProvider.chat is called positionally or via messages kwarg.
         messages = kw.get("messages") if "messages" in kw else (args[0] if args else None)
         self.calls.append({"messages": messages,
@@ -51,7 +51,7 @@ def _events(stream) -> List[AgentEvent]:
 
 
 # ---------------------------------------------------------------------------
-# Scenario 1 — Multi-skill scaffold: React UI + FastAPI backend
+# Scenario 1 -- Multi-skill scaffold: React UI + FastAPI backend
 # ---------------------------------------------------------------------------
 def test_e2e_react_fastapi_calculator_scaffold(tmp_path):
     """*"create a React calculator with FastAPI backend"* runs end-to-end.
@@ -107,7 +107,7 @@ def test_e2e_react_fastapi_calculator_scaffold(tmp_path):
     attached = manifest_task.inputs.get("skills") or []
     assert "react" in attached and "fastapi" in attached, attached
 
-    # The Tracker injected one SCAFFOLD_FILE task per manifest file —
+    # The Tracker injected one SCAFFOLD_FILE task per manifest file --
     # 4 from the LLM manifest plus a deterministic ``backend/__init__.py``
     # package-marker injected by ``_inject_python_package_inits`` so
     # pytest can resolve ``from backend.main import …`` on disk.
@@ -132,7 +132,7 @@ def test_e2e_react_fastapi_calculator_scaffold(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Scenario 2 — Read-only goal must NOT scaffold or apply
+# Scenario 2 -- Read-only goal must NOT scaffold or apply
 # ---------------------------------------------------------------------------
 def test_e2e_readonly_goal_downgrades_to_ask_only():
     """A plain question never triggers SCAFFOLD/APPLY even with no index."""
@@ -145,13 +145,13 @@ def test_e2e_readonly_goal_downgrades_to_ask_only():
     )
     kinds = [t.kind for t in plan.tasks]
     assert kinds == [TaskKind.ASK]
-    # No project_root + no provider means ASK fails fast — but the kind
+    # No project_root + no provider means ASK fails fast -- but the kind
     # itself must be ASK; the failure is allowed.
     assert TaskKind.APPLY not in kinds and TaskKind.SCAFFOLD not in kinds
 
 
 # ---------------------------------------------------------------------------
-# Scenario 3 — Tech-paired scaffold goal still routes via _TECH_RE fallback
+# Scenario 3 -- Tech-paired scaffold goal still routes via _TECH_RE fallback
 # ---------------------------------------------------------------------------
 def test_e2e_unsupported_tech_routes_to_scaffold_via_regex():
     """Tkinter has no skill but the verb+tech regex still catches it."""
@@ -172,7 +172,7 @@ def test_e2e_unsupported_tech_routes_to_scaffold_via_regex():
 
 
 # ---------------------------------------------------------------------------
-# Scenario 4 — Goal-level skill detection on the manifest task
+# Scenario 4 -- Goal-level skill detection on the manifest task
 # ---------------------------------------------------------------------------
 def test_e2e_planner_attaches_goal_skills_to_manifest():
     """A React+FastAPI scaffold goal is collapsed to a single
@@ -216,7 +216,7 @@ def test_e2e_planner_falls_back_to_goal_skills_when_task_desc_is_generic():
 
 
 # ---------------------------------------------------------------------------
-# Scenario 5 — Change-goal: PLAN/APPLY/VERIFY chain with stub capabilities
+# Scenario 5 -- Change-goal: PLAN/APPLY/VERIFY chain with stub capabilities
 # ---------------------------------------------------------------------------
 def test_e2e_change_goal_runs_plan_apply_verify(tmp_path):
     """Change goal "add a function" runs the full plan→apply→verify chain
@@ -258,7 +258,7 @@ def test_e2e_change_goal_runs_plan_apply_verify(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Scenario 6 — Streaming run yields ordered AgentEvent timeline
+# Scenario 6 -- Streaming run yields ordered AgentEvent timeline
 # ---------------------------------------------------------------------------
 def test_e2e_streaming_emits_ordered_event_types(tmp_path):
     """``stream=True`` yields plan → task_start* → task_done* → summary."""
@@ -280,7 +280,7 @@ def test_e2e_streaming_emits_ordered_event_types(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Scenario 7 — Per-file scaffold tasks coordinate file layout
+# Scenario 7 -- Per-file scaffold tasks coordinate file layout
 # ---------------------------------------------------------------------------
 def test_e2e_per_file_scaffolds_share_layout_and_strip_project_prefix(tmp_path):
     """Stray project-name prefixes (``calculator/``) emitted by the LLM

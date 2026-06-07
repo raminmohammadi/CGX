@@ -29,7 +29,7 @@ class FastAPISkill(Skill):
 
     def scaffold_system_prompt(self) -> str:
         return (
-            "BACKEND — FastAPI service\n"
+            "BACKEND -- FastAPI service\n"
             "- Single application module at backend/main.py (or app/main.py) "
             "creating `app = FastAPI()` and exposing routes with "
             "`@app.get`/`@app.post`.\n"

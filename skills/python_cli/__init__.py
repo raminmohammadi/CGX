@@ -21,7 +21,7 @@ _CLI_NOUNS = re.compile(
     r"\b(cli|command[\s-]*line|script|tool|utility)\b", re.IGNORECASE
 )
 _PYTHON_RE = re.compile(r"\bpython\b", re.IGNORECASE)
-# Frameworks that disqualify "this is a CLI" — those skills will fire instead.
+# Frameworks that disqualify "this is a CLI" -- those skills will fire instead.
 _WEB_RE = re.compile(
     r"\b(fastapi|flask|django|react|vue|next\.?js|express)\b", re.IGNORECASE
 )
@@ -48,7 +48,7 @@ class PythonCliSkill(Skill):
 
     def scaffold_system_prompt(self) -> str:
         return (
-            "CLI — Python command-line tool\n"
+            "CLI -- Python command-line tool\n"
             "- Single entry script at src/<package>/cli.py (or just "
             "<package>/__main__.py) parsing args with `argparse`.\n"
             "- Provide a `main()` function returning an int exit code, and "

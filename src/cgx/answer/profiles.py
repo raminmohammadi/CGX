@@ -230,7 +230,7 @@ def save_profile(profile: Profile, api_key: Optional[str] = None) -> Profile:
         _store_secret(profile.name, api_key)
         has_key = True
     else:
-        # No new secret supplied — preserve any key already attached to
+        # No new secret supplied -- preserve any key already attached to
         # this profile name so an "edit profile" round-trip that doesn't
         # re-type the password doesn't silently orphan the stored key.
         # ``profile.has_api_key`` is honoured for callers that fully

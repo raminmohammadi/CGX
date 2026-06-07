@@ -29,7 +29,7 @@ class VueSkill(Skill):
 
     def scaffold_system_prompt(self) -> str:
         return (
-            "FRONTEND — Vue 3 project\n"
+            "FRONTEND -- Vue 3 project\n"
             "- Use Vite + Vue 3 with single-file components (.vue).\n"
             "- src/main.js mounts the app; src/App.vue is the root SFC; "
             "src/components/*.vue for individual pieces.\n"
@@ -61,7 +61,7 @@ class VueSkill(Skill):
         if non_meta and all(p.lower().endswith(".py") for p in non_meta):
             return SkillVerdict(
                 passed=False, confidence=0.9,
-                rationale=("Vue skill: every source file is Python — the "
+                rationale=("Vue skill: every source file is Python -- the "
                            "scaffold ignored the Vue requirement."),
             )
         return None

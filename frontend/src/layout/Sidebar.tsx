@@ -148,7 +148,7 @@ export default function Sidebar() {
           <div className="space-y-1 max-h-56 overflow-y-auto">
             {sessions.length === 0 && (
               <p className="text-[10px] text-slate-500 px-2 font-mono italic">
-                No sessions yet — your Ask turns will land here.
+                No sessions yet -- your Ask turns will land here.
               </p>
             )}
             {sessions.map((s) => (

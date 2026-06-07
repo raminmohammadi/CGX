@@ -43,7 +43,7 @@ def test_compute_local_fit_tiny_machine_rejects_large_models():
 
 
 def test_compute_local_fit_tight_vram_flagged_as_tight():
-    # 32 GB RAM (plenty) but a tiny 2 GB GPU — the 7B coder needs 8 GB VRAM.
+    # 32 GB RAM (plenty) but a tiny 2 GB GPU -- the 7B coder needs 8 GB VRAM.
     rows = compute_local_fit({"ram_gb": 32.0, "gpu_vram_gb": 2.0})
     by_name = {r["model"]: r for r in rows}
     assert by_name["qwen2.5-coder:7b-instruct"]["fit"] == "tight"

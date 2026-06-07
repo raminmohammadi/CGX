@@ -37,7 +37,7 @@ EMBED_MODEL_CATALOG: List[EmbedModel] = [
         dim=768,
         max_tokens=8192,
         size_gb=0.32,
-        description="Long-context code embedder. Default — small and fast.",
+        description="Long-context code embedder. Default -- small and fast.",
     ),
     EmbedModel(
         name="BAAI/bge-m3",

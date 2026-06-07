@@ -32,7 +32,7 @@
   </defs>
   <rect width="1280" height="1040" fill="url(#dbg)"/>
 
-  <text x="40" y="44" font-family="Inter, sans-serif" font-size="22" font-weight="700" fill="#f1f5f9">CGX Agent Loop — Developer View</text>
+  <text x="40" y="44" font-family="Inter, sans-serif" font-size="22" font-weight="700" fill="#f1f5f9">CGX Agent Loop -- Developer View</text>
   <text x="40" y="66" font-family="Inter, sans-serif" font-size="12" fill="#94a3b8">cgx.agents.run_agent  ·  goal → Planner (4-branch routing, skills attach) → Tracker → (capability + Judge)*  → SSE stream → React UI · failure-driven retry</text>
 
   <!-- UI side -->
@@ -83,7 +83,7 @@
     <text x="60" y="300" font-size="10.5" fill="#cbd5e1">Schema: {name, description, kind, criteria}</text>
     <text x="60" y="316" font-size="10.5" fill="#cbd5e1">kind ∈ {ask, plan, scaffold, scaffold_manifest,</text>
     <text x="60" y="330" font-size="10.5" fill="#cbd5e1">  scaffold_file, search, summarize, apply, verify, fill_logic}</text>
-    <text x="60" y="350" font-size="11" fill="#f59e0b">_enforce_kind_policy — 4 routing branches:</text>
+    <text x="60" y="350" font-size="11" fill="#f59e0b">_enforce_kind_policy -- 4 routing branches:</text>
     <text x="60" y="366" font-size="10.5" fill="#cbd5e1">  SCAFFOLD → [scaffold_manifest, apply, verify]</text>
     <text x="60" y="380" font-size="10.5" fill="#cbd5e1">    (manifest injects N scaffold_file tasks at runtime)</text>
     <text x="60" y="394" font-size="10.5" fill="#cbd5e1">  VERIFY-ONLY · READ-ONLY (plan→ask) · CHANGE-GOAL</text>
@@ -211,7 +211,7 @@
       <rect x="60" y="820" width="370" height="100" rx="10" fill="#0b1220" stroke="#f87171" stroke-opacity="0.6"/>
       <text x="78" y="842" font-size="11" font-weight="700" fill="#f87171">verify failure</text>
       <text x="78" y="860" font-size="10.5" fill="#cbd5e1">_diagnose_failure → import / syntax / logic</text>
-      <text x="78" y="876" font-size="10.5" fill="#cbd5e1">_extract_error_snippet — ±5 line window</text>
+      <text x="78" y="876" font-size="10.5" fill="#cbd5e1">_extract_error_snippet -- ±5 line window</text>
       <text x="78" y="892" font-size="10.5" fill="#cbd5e1">  with `# &lt;-- ERROR HERE` (10-line buffer)</text>
       <text x="78" y="908" font-size="10" fill="#94a3b8">_build_fix_goal names broken files only</text>
     </g>

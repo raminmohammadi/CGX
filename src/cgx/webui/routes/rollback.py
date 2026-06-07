@@ -1,6 +1,6 @@
 
 
-"""Rollback REST route — undo a prior :func:`apply_diffs_to_disk` run.
+"""Rollback REST route -- undo a prior :func:`apply_diffs_to_disk` run.
 
 The agent's APPLY task records its per-run backup directory in the
 response payload (``output.backup_dir``). The UI surfaces this path to

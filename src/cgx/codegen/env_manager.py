@@ -57,7 +57,7 @@ _IMPORT_TO_PYPI: Dict[str, str] = {
     "usb": "pyusb",
 }
 
-# Top-level names that are themselves namespace packages — pip-installing
+# Top-level names that are themselves namespace packages -- pip-installing
 # the bare root is meaningless (no such PyPI distribution), so when a
 # dotted variant like ``google.generativeai`` is also seen in the source
 # the bare root is dropped before the missing-package probe.
@@ -98,7 +98,7 @@ def _extract_imports_python(source: str) -> Set[str]:
     for namespace packages listed in :data:`_NAMESPACE_ROOTS`, the
     top-two dotted prefix as well (``google.generativeai``). The latter
     is what downstream resolution maps to the proper PyPI distribution
-    name — the bare namespace root by itself isn't pip-installable.
+    name -- the bare namespace root by itself isn't pip-installable.
     """
     roots: Set[str] = set()
 
@@ -255,7 +255,7 @@ def find_missing_python_packages(
             continue
         # Resolve to the PyPI distribution name. Dotted names without a
         # mapping aren't installable as-is (pip can't install
-        # ``google.generativeai`` literally) — skip them; the matching
+        # ``google.generativeai`` literally) -- skip them; the matching
         # root entry will have been handled separately.
         if name in _IMPORT_TO_PYPI:
             pypi_name = _IMPORT_TO_PYPI[name]
@@ -266,7 +266,7 @@ def find_missing_python_packages(
         normalized = pypi_name.lower().replace("-", "_")
         if normalized in declared:
             continue
-        # Skip first-party project packages — the project's own top-level
+        # Skip first-party project packages -- the project's own top-level
         # folder is not a PyPI distribution and pip cannot install it.
         # Only meaningful for bare root names.
         if "." not in name and _is_local_package(name, project_root):

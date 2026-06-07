@@ -83,7 +83,7 @@ const MODES: ModeOption[] = [
     id: "plan-only",
     icon: <ClipboardList className="h-4 w-4" />,
     title: "Plan only",
-    description: "Generate and visualise the plan — no code is changed.",
+    description: "Generate and visualise the plan -- no code is changed.",
   },
 ];
 
@@ -291,7 +291,7 @@ export default function AgentPage() {
     });
   };
 
-  /** Main start handler — branches based on the selected execution mode. */
+  /** Main start handler -- branches based on the selected execution mode. */
   const start = async () => {
     if (!goal.trim() || busy) return;
 
@@ -392,7 +392,7 @@ export default function AgentPage() {
               scratch, start your goal with{" "}
               <code className="text-slate-400 bg-white/5 px-1 rounded">"create a new …"</code>,{" "}
               <code className="text-slate-400 bg-white/5 px-1 rounded">"build a … from scratch"</code>,
-              or similar — no existing index needed.
+              or similar -- no existing index needed.
             </p>
           </Field>
           <Field label="Project root" className="col-span-2">
@@ -441,10 +441,10 @@ export default function AgentPage() {
           description="Structural verification of task outputs against criteria." />
       </div>
 
-      {/* ── Planner rationale — shown above the DAG whenever the planner returned one ── */}
+      {/* ── Planner rationale -- shown above the DAG whenever the planner returned one ── */}
       {rationale && <PlanRationaleCard rationale={rationale} />}
 
-      {/* ── DAG panel — shown as soon as we have a plan (any mode) ── */}
+      {/* ── DAG panel -- shown as soon as we have a plan (any mode) ── */}
       {showDag && (
         <PlanDAGPanel
           tasks={tasks}
@@ -455,7 +455,7 @@ export default function AgentPage() {
         />
       )}
 
-      {/* ── Detailed timeline — only visible once execution is underway ── */}
+      {/* ── Detailed timeline -- only visible once execution is underway ── */}
       {showTimeline && (
         <Card padded>
           <div className="flex items-start gap-3 mb-4">
@@ -668,7 +668,7 @@ function PlanDAGPanel({
         {awaitingApproval && executionMode === "review" && onApprove && (
           <div className="flex items-center gap-2">
             <span className="text-[11px] font-mono text-amber-400 animate-pulse">
-              Plan ready — review before executing
+              Plan ready -- review before executing
             </span>
             <button onClick={onApprove} className="av-btn-primary text-[11px]">
               <Play className="h-3 w-3" /> Approve &amp; Execute
@@ -678,7 +678,7 @@ function PlanDAGPanel({
 
         {awaitingApproval && executionMode === "plan-only" && (
           <span className="text-[11px] font-mono text-slate-500">
-            Dry run — no changes will be made
+            Dry run -- no changes will be made
           </span>
         )}
       </div>
@@ -1170,7 +1170,7 @@ function ApplyPanel({ output }: { output: TaskOutput }) {
               !projectRoot.trim()
                 ? "Set the project root in the workspace settings first."
                 : applied.length === 0
-                  ? "Nothing was applied — nothing to undo."
+                  ? "Nothing was applied -- nothing to undo."
                   : result
                     ? "Already rolled back."
                     : "Restore originals from the backup directory."
@@ -1414,7 +1414,7 @@ function TaskTimelineRow({ task, isLast }: { task: TaskRow; isLast: boolean }) {
                       ? `(${(task.judge.confidence * 100).toFixed(0)}%)`
                       : null,
                     task.judge.rationale && task.judge.rationale !== "No criteria specified."
-                      ? `— ${task.judge.rationale}`
+                      ? `-- ${task.judge.rationale}`
                       : null,
                   ]
                     .filter(Boolean)
@@ -1491,7 +1491,7 @@ function summarisePayload(p: any, ev: string): string {
     const title = p.name || p.task?.name || p.description || p.task?.description;
     const extra = p.summary || p.error || p.reason;
     const head = kind && title ? `${kind}: ${title}` : title || `task ${p.task_id || ""}`;
-    return extra ? `${head} — ${extra}` : head;
+    return extra ? `${head} -- ${extra}` : head;
   }
   if (ev === "task_progress") {
     const kind = p.kind || "";
@@ -1550,7 +1550,7 @@ function computeStages(tasks: TaskRow[], phase: string) {
   const anyJudge = tasks.some((t) => t.judge);
   // Judge is "running" only in the narrow window where a task just finished
   // (status === "done") but its judge verdict hasn't arrived yet.
-  // It is idle — "pending" — while tasks are still executing.
+  // It is idle -- "pending" -- while tasks are still executing.
   const anyDoneWithoutJudge = tasks.some((t) => t.status === "done" && !t.judge);
   const judgeState: "pending" | "running" | "done" | "failed" =
     anyFailed ? "failed" :

@@ -451,7 +451,7 @@ def add_code_nodes(G, chunks, indices):
         G.add_node(cid, **node_attrs)
         indices["id_to_chunk"][cid] = ch
 
-        # file -> entity (defines) — but skip for file chunks to avoid self-loop
+        # file -> entity (defines) -- but skip for file chunks to avoid self-loop
         if kind != "file" and cfile in G:
             G.add_edge(cfile, cid, type="defines")
 
@@ -477,7 +477,7 @@ def add_defines_edges(G, chunks):
       - class -> nested class
       - function/method -> lambda
     
-    Note: doesn’t need to add anything for non-nested classes — they’re already connected at the file level.
+    Note: doesn’t need to add anything for non-nested classes -- they’re already connected at the file level.
     
     Args:
         G (nx.Graph): The graph.
@@ -771,7 +771,7 @@ def add_attr_and_exception_edges(G, chunks):
                             G.add_node(attr_id, type="attribute", name=f"{cls}.{attr_root}", file=cfile, class_name=cls)
                         G.add_edge(cid, attr_id, type="reads_attr", detail=dotted)
                     except Exception:
-                        # Keep going—one malformed dotted path shouldn't kill others
+                        # Keep going--one malformed dotted path shouldn't kill others
                         continue
 
             # Writes

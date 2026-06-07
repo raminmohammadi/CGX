@@ -124,7 +124,7 @@ def test_planner_fallback_calculator_with_tech_routed_as_scaffold():
 def test_planner_existing_codebase_hint_keeps_change_goal_path():
     # 'add a React component to our existing app' must NOT be treated as
     # a scaffold goal even though it pairs a scaffold-friendly verb with
-    # a tech name — the "existing app" hint pins it to the change path.
+    # a tech name -- the "existing app" hint pins it to the change path.
     plan = Planner(provider=None).plan(
         "Add a React component to our existing app"
     )
@@ -188,7 +188,7 @@ def test_planner_trusts_llm_scaffold_tasks_for_ambiguous_goal():
              "kind": "scaffold"},
         ]}),
     }])
-    # "implement a chess engine" — no project noun, no tech in the regex,
+    # "implement a chess engine" -- no project noun, no tech in the regex,
     # but the LLM gave us scaffold tasks.
     plan = Planner(provider=provider).plan(
         "implement a chess engine that beats humans"
@@ -616,7 +616,7 @@ def test_judge_short_circuits_scaffold_on_structural_pass_without_calling_llm():
 
 def test_judge_still_fails_scaffold_with_tech_mismatch_via_structural():
     # The structural tech-match check must still hard-fail when a React
-    # goal was answered with Python-only files — this short-circuits
+    # goal was answered with Python-only files -- this short-circuits
     # before the LLM and triggers the planner's re-plan loop.
     task = Task(
         description="Generate React UI components",
@@ -748,7 +748,7 @@ def test_run_agent_retries_on_apply_failure():
         stop_on_fail=False,
     )
     assert attempt_counts["apply"] >= 2, (
-        "apply must be called at least twice — once for the original plan "
+        "apply must be called at least twice -- once for the original plan "
         "and once for the retry triggered by the apply failure"
     )
 
@@ -923,7 +923,7 @@ def test_partial_apply_writes_good_files_and_reports_bad(tmp_path):
         },
         {
             "file": "bad.py",
-            # Deliberately invalid Python — unterminated string.
+            # Deliberately invalid Python -- unterminated string.
             "patch": '--- /dev/null\n+++ b/bad.py\n@@ -0,0 +1,1 @@\n+x = "unterminated\n',
         },
     ]
@@ -1084,7 +1084,7 @@ def test_tracker_does_not_skip_scaffold_file_when_target_failed_previously():
 def test_plan_capability_strips_target_files_and_folds_into_task_text(monkeypatch):
     """``plan_fix`` attaches ``target_files`` / ``do_not_change`` to the PLAN
     task's inputs. The Tracker forwards inputs as **kwargs, but
-    ``generate_code_plan`` doesn't accept them — they must be stripped and
+    ``generate_code_plan`` doesn't accept them -- they must be stripped and
     folded into the task text rather than raising TypeError.
     """
     from cgx.agents.loop import _build_default_capabilities
@@ -1137,8 +1137,8 @@ def test_plan_capability_strips_target_files_and_folds_into_task_text(monkeypatc
 # ---------------------------------------------------------------------------
 def test_build_scaffold_retry_plan_emits_scaffold_apply_verify_only():
     """When a SCAFFOLD_FILE task fails (e.g. empty content), the retry plan
-    must regenerate the failed file via another SCAFFOLD_FILE task — never
-    a PLAN task — because PLAN's engine path reads a FAISS index that
+    must regenerate the failed file via another SCAFFOLD_FILE task -- never
+    a PLAN task -- because PLAN's engine path reads a FAISS index that
     doesn't exist for freshly-scaffolded user projects.
     """
     from cgx.agents.loop import _build_scaffold_retry_plan
@@ -1167,7 +1167,7 @@ def test_build_scaffold_retry_plan_emits_scaffold_apply_verify_only():
     kinds = [t.kind for t in retry.tasks]
     assert kinds == [TaskKind.SCAFFOLD_FILE, TaskKind.APPLY, TaskKind.VERIFY]
     assert TaskKind.PLAN not in kinds, (
-        "scaffold-retry plan must not emit a PLAN task — that would require "
+        "scaffold-retry plan must not emit a PLAN task -- that would require "
         "a FAISS retriever index that doesn't exist for fresh user projects."
     )
     scaffold = retry.tasks[0]
@@ -1218,7 +1218,7 @@ def test_run_agent_scaffold_file_retry_does_not_require_index(monkeypatch):
         return {"ran": True, "tests_passed": True, "returncode": 0,
                 "tests_selected": [], "stdout": "", "stderr": ""}
 
-    # If anything reaches the ``plan`` capability the test must fail —
+    # If anything reaches the ``plan`` capability the test must fail --
     # that's the path that crashed on the missing FAISS index.
     def plan_should_never_be_called(*a, **kw):
         raise AssertionError(
@@ -1374,7 +1374,7 @@ def test_run_agent_does_not_mask_verify_failure_when_no_index_available(tmp_path
         stop_on_fail=False,
     )
     assert plan_fix_calls == [], "plan_fix must not be called without an index"
-    # VERIFY must stay FAILED — the test ran, failed, and the caller must see
+    # VERIFY must stay FAILED -- the test ran, failed, and the caller must see
     # the real outcome. Demoting to SKIPPED hides failures from the user.
     verifies = [t for t in final.tasks if t.kind == TaskKind.VERIFY]
     assert verifies, "plan should have at least one verify task"

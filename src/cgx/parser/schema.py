@@ -1,6 +1,6 @@
 """Type definitions pinning the shape of parser output records.
 
-These TypedDicts document — but do not enforce at runtime — the chunk and
+These TypedDicts document -- but do not enforce at runtime -- the chunk and
 call-relation dicts emitted by :func:`cgx.parser.parse_codebase.parse_codebase`
 and consumed by the embeddings/retrieval/codegen layers.
 

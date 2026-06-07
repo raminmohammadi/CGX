@@ -47,7 +47,7 @@ def _has_symbol_token(q: str) -> bool:
     conceptual questions ("how does the world model encode images?") are not
     misclassified as ``symbol_explain``. A token counts as a symbol when it
     is quoted (``\`foo\``` / ``"foo"``), uses ``snake_case``, contains a
-    lower-to-upper transition (``CamelCase`` / ``camelCase`` — note that a
+    lower-to-upper transition (``CamelCase`` / ``camelCase`` -- note that a
     sentence-initial capital like ``How`` is intentionally **not** a match
     because it has no internal lower\u2192upper boundary), is a dotted
     reference (``mod.func``), or is a short all-uppercase acronym (``VAE``,

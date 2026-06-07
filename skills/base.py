@@ -4,15 +4,15 @@ A *skill* is a self-contained module bundling everything CGX needs to
 know about one technology (framework, runtime, library, toolchain).
 Every skill answers three orthogonal questions:
 
-1. **Does this goal involve me?** — :meth:`Skill.detect` returns a
+1. **Does this goal involve me?** -- :meth:`Skill.detect` returns a
    confidence in ``[0.0, 1.0]``. Scores above
    :data:`SKILL_DETECT_THRESHOLD` mark the skill as *active* for the
    current goal.
-2. **What should the LLM know to do my job well?** —
+2. **What should the LLM know to do my job well?** --
    :meth:`Skill.scaffold_system_prompt` and
    :meth:`Skill.plan_system_prompt` return small, composable prompt
    fragments that get concatenated into the relevant system message.
-3. **Did the produced output actually use me correctly?** —
+3. **Did the produced output actually use me correctly?** --
    :meth:`Skill.validate_scaffold` and :meth:`Skill.validate_plan`
    inspect the produced ``diffs`` and return a :class:`SkillVerdict`
    (or ``None`` for "no opinion").
@@ -71,7 +71,7 @@ class Skill(ABC):
 
     Subclasses set the class attributes (``name``, ``role``, ``aliases``)
     and override :meth:`detect`. Prompt fragments and validators are
-    optional — override only the ones that make sense for the technology.
+    optional -- override only the ones that make sense for the technology.
     """
 
     #: Stable, lower-snake identifier used in logs / task inputs.

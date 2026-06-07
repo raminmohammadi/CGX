@@ -4,9 +4,9 @@
 
 Two surfaces are produced:
 
-* :func:`status_rows` — table rows ``[#, kind, description, status, judge, ms]``
+* :func:`status_rows` -- table rows ``[#, kind, description, status, judge, ms]``
   consumed by the React task table on the Agent page.
-* :func:`render_graph_html` — a self-contained, dependency-free HTML chip
+* :func:`render_graph_html` -- a self-contained, dependency-free HTML chip
   flow that visualises the plan as a horizontal arrow chain.
 
 Both are pure functions over a :class:`~cgx.agents.types.Plan`; the

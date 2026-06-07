@@ -1,0 +1,6 @@
+import{n as e,t}from"./ui-BMWVX-UC.js";function n(e,t,n,i){let a=new AbortController;return{abort:()=>a.abort(),done:(async()=>{try{let i=await fetch(e,{method:`POST`,headers:{"content-type":`application/json`,accept:`text/event-stream`},body:JSON.stringify(t),signal:a.signal});if(!i.ok||!i.body)throw Error(`SSE ${e} → ${i.status}`);let o=i.body.getReader(),s=new TextDecoder,c=``;for(;;){let{value:e,done:t}=await o.read();if(t)break;c+=s.decode(e,{stream:!0}).replace(/\r\n/g,`
+`);let i;for(;(i=c.indexOf(`
+
+`))>=0;){let e=c.slice(0,i);c=c.slice(i+2),r(e,n)}}c.trim()&&r(c,n)}catch(e){if(e?.name===`AbortError`)return;i?.(e)}})()}}function r(e,t){let n=`message`,r=[];for(let t of e.split(`
+`)){let e=t.replace(/\r$/,``);!e||e.startsWith(`:`)||(e.startsWith(`event:`)?n=e.slice(6).trim():e.startsWith(`data:`)&&r.push(e.slice(5).trimStart()))}if(!r.length)return;let i=r.join(`
+`),a=i;try{a=JSON.parse(i)}catch{}t(n,a)}function i(...n){return t(e(n))}function a(e){if(!e)return``;let t=Math.max(0,Date.now()/1e3-e);return t<60?`just now`:t<3600?`${Math.floor(t/60)}m ago`:t<86400?`${Math.floor(t/3600)}h ago`:`${Math.floor(t/86400)}d ago`}export{a as n,n as r,i as t};

@@ -17,7 +17,7 @@ export default function PlanPage() {
   const { plan, setPlan, resetPlan } = useTasks();
   const { busy, thought, warning, planMd, diff, report, error } = plan;
 
-  // Form fields use local state — they're user input, not task output.
+  // Form fields use local state -- they're user input, not task output.
   const [task, setTask] = useState("");
   const [selfTest, setSelfTest] = useState(false);
   const [runTests, setRunTests] = useState(false);

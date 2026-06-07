@@ -29,7 +29,7 @@ class DjangoSkill(Skill):
 
     def scaffold_system_prompt(self) -> str:
         return (
-            "BACKEND — Django project\n"
+            "BACKEND -- Django project\n"
             "- Project layout: <project>/manage.py at root, <project>/<project>/"
             "settings.py + urls.py + wsgi.py for the site, one app folder per "
             "feature with models.py, views.py, urls.py, apps.py.\n"
@@ -49,7 +49,7 @@ class DjangoSkill(Skill):
             "When modifying a Django project:\n"
             "- New routes register in the relevant app's urls.py and are "
             "included from the project urls.py.\n"
-            "- Schema changes go through `python manage.py makemigrations` — "
+            "- Schema changes go through `python manage.py makemigrations` -- "
             "include the generated migration file in the plan.\n"
             "- Use the ORM (`Model.objects...`); avoid raw SQL unless the "
             "existing code already uses it."

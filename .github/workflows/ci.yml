@@ -40,7 +40,7 @@ jobs:
           for m in ("torch", "transformers", "sentence_transformers"):
               spec = importlib.util.find_spec(m)
               assert spec is None, f"{m} should not be installed in the core job (found at {spec.origin})"
-          print("OK: ML stack absent — lazy-import path will be exercised.")
+          print("OK: ML stack absent -- lazy-import path will be exercised.")
           PY
 
       - name: Compile-check sources
@@ -110,7 +110,7 @@ jobs:
         run: npm run build
 
       - name: Vitest
-        run: npm test -- --run
+        run: npm test
 
       - name: Assert build output present
         # The Vite build writes into ../src/cgx/webui/static/assets/ via the

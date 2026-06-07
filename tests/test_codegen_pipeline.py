@@ -302,7 +302,7 @@ def _force_import_miss(monkeypatch):
 
     def _fake(name, *a, **kw):
         # Allow the cgx.codegen.env_manager module's own ``import ast``
-        # / ``import json`` etc. to keep working — only fail on the
+        # / ``import json`` etc. to keep working -- only fail on the
         # third-party names the function probes for.
         if name in {
             "PIL", "cv2", "sklearn", "bs4", "yaml", "skimage",

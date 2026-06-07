@@ -4,10 +4,10 @@
 
 The retrieval orchestrator surfaces two kinds of hits in its top-K list:
 
-1. **Primary hits** — chunks that matched semantically or lexically (or were
+1. **Primary hits** -- chunks that matched semantically or lexically (or were
    the seeds for graph expansion). The LLM needs the full code body for
    these to ground its answer.
-2. **Graph neighbors** — chunks discovered by walking the call/import graph
+2. **Graph neighbors** -- chunks discovered by walking the call/import graph
    one or more hops from a primary hit. They typically don't need a full
    body in the prompt; a compact stub (``signature + doc_first_sentence +
    class_name``) is enough for the model to understand the structural
@@ -16,7 +16,7 @@ The retrieval orchestrator surfaces two kinds of hits in its top-K list:
 ``build_tiered_context`` splits a single hit list into those two tiers, sizes
 each tier against a budget provided by :func:`cgx.answer.model_caps.get_context_map_budget`,
 and returns a list of source dicts in the same shape as
-:func:`cgx.answer.engine._as_sources_with_meta` returns — plus a ``tier`` key
+:func:`cgx.answer.engine._as_sources_with_meta` returns -- plus a ``tier`` key
 so :func:`cgx.answer.engine._fmt_source` can render a hint to the model.
 
 The classifier rule is deterministic: a hit with
@@ -77,7 +77,7 @@ def classify_hits(
 def format_neighbor_stub(record: Optional[Dict[str, Any]], symbol: str) -> str:
     """Compose a neighbor stub from record fields.
 
-    Format: ``[class.]symbol(signature) — doc_first_sentence`` with each
+    Format: ``[class.]symbol(signature) -- doc_first_sentence`` with each
     component dropped silently when missing. Falls back to the symbol alone
     when no enrichment is available.
     """
@@ -93,7 +93,7 @@ def format_neighbor_stub(record: Optional[Dict[str, Any]], symbol: str) -> str:
         # them as bare ``(a, b)`` we still want a readable head.
         head = f"{head}{sig}" if sig.startswith("(") else f"{head} :: {sig}"
     if doc1:
-        head = f"{head} — {doc1}" if head else doc1
+        head = f"{head} -- {doc1}" if head else doc1
     return head
 
 

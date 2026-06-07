@@ -246,7 +246,7 @@ def _pytest_env(project_root: Path) -> Dict[str, str]:
 
     Freshly-scaffolded projects often lay code out as ``backend/`` + ``tests/``
     with no ``conftest.py``, ``pyproject.toml`` or ``setup.py`` declaring the
-    package roots — so pytest's automatic ``rootdir`` insertion isn't enough
+    package roots -- so pytest's automatic ``rootdir`` insertion isn't enough
     for first-party imports like ``from backend.calculator import …``. We
     prepend the project root (and ``project_root/src`` when present) to any
     existing ``PYTHONPATH`` so those imports resolve regardless of layout.

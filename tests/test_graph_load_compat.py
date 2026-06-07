@@ -29,7 +29,7 @@ def _make_graph() -> "nx.DiGraph":
 
 
 def test_load_graph_json_handles_modern_edges_key(tmp_path):
-    """Modern networkx writes the ``edges`` key — loader must accept it."""
+    """Modern networkx writes the ``edges`` key -- loader must accept it."""
     path = str(tmp_path / "graph.json")
     G = _make_graph()
     save_graph_json(G, path)

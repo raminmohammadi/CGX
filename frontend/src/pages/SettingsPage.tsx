@@ -103,7 +103,7 @@ export default function SettingsPage() {
 
   // Active-provider pull: module-level singleton (survives tab switches)
   const activePull = usePullState();
-  // Edit-modal pull: local state is fine — modal is always visible while pulling
+  // Edit-modal pull: local state is fine -- modal is always visible while pulling
   const [editPull, setEditPull] = useState<PullState | null>(null);
   const editPullRef = useRef<{ abort: () => void } | null>(null);
 
@@ -289,7 +289,7 @@ export default function SettingsPage() {
     }
   };
 
-  // Pull a model via Ollama — for the edit modal only (active-provider uses pullManager)
+  // Pull a model via Ollama -- for the edit modal only (active-provider uses pullManager)
   const startEditPull = (model: string, baseUrl: string, afterDone?: () => void) => {
     editPullRef.current?.abort();
     setEditPull({ model, status: "Connecting…", total: 0, completed: 0, done: false, error: null });
@@ -298,7 +298,7 @@ export default function SettingsPage() {
       baseUrl,
       (data) => {
         // Accept both {"status":"error","error":...} and the bare
-        // {"error":"..."} shape Ollama sometimes emits — the backend
+        // {"error":"..."} shape Ollama sometimes emits -- the backend
         // normalises the latter, but defense-in-depth means the UI
         // surfaces the failure even if the envelope drifts.
         const errMsg =
@@ -609,7 +609,7 @@ export default function SettingsPage() {
         />
         {profiles.length === 0 ? (
           <p className="text-xs text-slate-500 text-center py-4">
-            No saved profiles yet — click <strong>New profile</strong> above to save your current setup.
+            No saved profiles yet -- click <strong>New profile</strong> above to save your current setup.
           </p>
         ) : (
           <div className="mt-3 rounded-lg border border-white/5 overflow-hidden">
@@ -647,7 +647,7 @@ export default function SettingsPage() {
                             <ShieldCheck className="h-3 w-3" /> stored
                           </span>
                         ) : (
-                          <span className="text-slate-600">—</span>
+                          <span className="text-slate-600">--</span>
                         )}
                       </td>
                       <td className="px-3 py-2.5">
@@ -692,7 +692,7 @@ export default function SettingsPage() {
         </Card>
       )}
 
-      {/* ── Profile edit / new — modal overlay ── */}
+      {/* ── Profile edit / new -- modal overlay ── */}
       {edit && (
         <div
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
@@ -836,7 +836,7 @@ export default function SettingsPage() {
                       type="password"
                       value={edit.api_key}
                       placeholder={
-                        edit.allow_no_auth ? "skip — private subnet" : "sk-…"
+                        edit.allow_no_auth ? "skip -- private subnet" : "sk-…"
                       }
                       onChange={(e) => setEdit({ ...edit, api_key: e.target.value })}
                     />
@@ -933,7 +933,7 @@ function PullProgress({ pull, model }: { pull: PullState | null; model: string }
           : pull.done
           ? "Download complete"
           : pct !== null
-          ? `${pull.status} — ${pct}%`
+          ? `${pull.status} -- ${pct}%`
           : pull.status}
       </p>
     </div>
@@ -1003,7 +1003,7 @@ function KvRead({ label, value }: { label: string; value: string }) {
                    text-[11px] font-mono text-slate-300 select-text truncate"
         title={value}
       >
-        {value || <span className="text-slate-600">—</span>}
+        {value || <span className="text-slate-600">--</span>}
       </div>
     </div>
   );

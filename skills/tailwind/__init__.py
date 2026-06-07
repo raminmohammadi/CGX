@@ -30,7 +30,7 @@ class TailwindSkill(Skill):
 
     def scaffold_system_prompt(self) -> str:
         return (
-            "STYLE — Tailwind CSS\n"
+            "STYLE -- Tailwind CSS\n"
             "- Add a tailwind.config.js at project root with a `content` "
             "array covering `./index.html` and `./src/**/*.{js,jsx,ts,tsx,vue}`.\n"
             "- Add a postcss.config.js declaring `tailwindcss` and "
@@ -40,7 +40,7 @@ class TailwindSkill(Skill):
             "utilities;` and is imported from src/main.{js,jsx}.\n"
             "- package.json devDependencies must include `tailwindcss`, "
             "`postcss`, and `autoprefixer`.\n"
-            "- Use Tailwind utility classes in markup — do NOT also emit "
+            "- Use Tailwind utility classes in markup -- do NOT also emit "
             "redundant custom CSS for the same elements."
         )
 

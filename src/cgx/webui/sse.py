@@ -86,7 +86,7 @@ async def bridge_generator(
             fut.result()
             return True
         except RuntimeError:
-            # Loop closed or stopped — consumer disconnected mid-stream.
+            # Loop closed or stopped -- consumer disconnected mid-stream.
             coro.close()
             return False
 

@@ -35,7 +35,7 @@ export default function Header() {
     ? provider.model.length > 28
       ? provider.model.slice(0, 26) + "…"
       : provider.model
-    : "—";
+    : "--";
 
   const modeLabel = isLocal ? "Local / Air-Gapped" : "Cloud";
   const modeClass = isLocal ? "text-emerald-400" : "text-sky-400";

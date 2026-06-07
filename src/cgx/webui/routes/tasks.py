@@ -2,10 +2,10 @@
 
 """Task registry REST endpoints.
 
-GET  /api/tasks           — list recent tasks
-GET  /api/tasks/{id}      — get task record + status
-GET  /api/tasks/{id}/events — full event log for replay after tab switch
-DELETE /api/tasks/{id}    — cancel a running task
+GET  /api/tasks           -- list recent tasks
+GET  /api/tasks/{id}      -- get task record + status
+GET  /api/tasks/{id}/events -- full event log for replay after tab switch
+DELETE /api/tasks/{id}    -- cancel a running task
 """
 
 from __future__ import annotations

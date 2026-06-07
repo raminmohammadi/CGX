@@ -40,7 +40,7 @@ def build_faiss_index(
         - "ip"     -> raw inner product (no normalization)
     index : {"flat","ivf","hnsw"}, default "flat"
         - "flat": exact search (IndexFlat*)
-        - "ivf" : inverted lists (IndexIVFFlat) — must be trained
+        - "ivf" : inverted lists (IndexIVFFlat) -- must be trained
         - "hnsw": graph-based (IndexHNSWFlat)
     ids : np.ndarray[int64] | None
         Custom IDs to attach (length N). If None, uses [0..N-1].

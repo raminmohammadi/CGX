@@ -1,17 +1,17 @@
-# CGX — VS Code extension scaffold
+# CGX -- VS Code extension scaffold
 
 Hosts the CGX web UI inside a VS Code webview so you can ask
 questions about the open workspace without leaving the editor.
 
-This directory is a **scaffold only** — it is not packaged into a
+This directory is a **scaffold only** -- it is not packaged into a
 `.vsix` from the repo. Build it locally with the steps below.
 
 ## What it does
 
 - Registers two commands:
-  - **CGX: Open UI** — opens a webview panel pointing at the running
+  - **CGX: Open UI** -- opens a webview panel pointing at the running
     CGX server.
-  - **CGX: Reload UI** — re-renders the iframe (useful after
+  - **CGX: Reload UI** -- re-renders the iframe (useful after
     restarting the CGX server).
 - Reads the server URL from `cgx.ui.url` (default
   `http://localhost:8765`).

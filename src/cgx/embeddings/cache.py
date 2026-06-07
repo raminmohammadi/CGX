@@ -11,9 +11,9 @@ chunks miss the cache.
 On-disk layout (inside ``<out_dir>/<cache_filename>``)::
 
     embedding_cache.npz
-      ├── keys   : (N,) np.str_     — hex sha256 strings
+      ├── keys   : (N,) np.str_     -- hex sha256 strings
       ├── values : (N, D) np.float32 embeddings
-      └── meta   : () np.str_       — JSON-encoded {model_name, dim, normalize, version}
+      └── meta   : () np.str_       -- JSON-encoded {model_name, dim, normalize, version}
 
 If the model name / dim / normalisation flag stored in ``meta`` does not
 match the current invocation, the cache is treated as empty (the model

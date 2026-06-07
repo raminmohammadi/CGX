@@ -80,6 +80,6 @@ def test_hf_cache_root_defaults_to_user_cache(tmp_path, monkeypatch):
     monkeypatch.delenv("HF_HOME", raising=False)
     monkeypatch.delenv("HUGGINGFACE_HUB_CACHE", raising=False)
     root = cat._hf_cache_root()
-    # Default lives under ``~/.cache/huggingface/hub`` — only assert the suffix
+    # Default lives under ``~/.cache/huggingface/hub`` -- only assert the suffix
     # so the test doesn't depend on the runner's $HOME.
     assert root.parts[-3:] == (".cache", "huggingface", "hub")

@@ -337,7 +337,7 @@ def _compact_codegen_report(report: Dict[str, Any]) -> Dict[str, Any]:
 def _extract_display_output(task: Task) -> Dict[str, Any]:
     """Return the user-facing output fields for a completed task.
 
-    Only includes the fields the UI actually renders — keeps the SSE
+    Only includes the fields the UI actually renders -- keeps the SSE
     payload lean while giving the user something concrete to read.
     """
     out = task.output or {}

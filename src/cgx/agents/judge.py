@@ -2,7 +2,7 @@
 
 """Judge: validate a task's produced artifact against acceptance criteria.
 
-The Judge is deliberately conservative — it answers ``pass`` or ``fail``
+The Judge is deliberately conservative -- it answers ``pass`` or ``fail``
 with a short rationale and a confidence in [0.0, 1.0]. When an LLM is
 available it grounds its verdict in the artifact + criteria; otherwise
 it falls back to heuristic checks tied to the artifact's shape (answer
@@ -86,7 +86,7 @@ _BACKEND_FILE_EXTS: tuple = (
 
 # Language word in the goal → mandatory backend file extensions. Matched
 # as whole words. When a language word fires, the broad fallback above is
-# NOT used — the language constrains which extensions count as backend.
+# NOT used -- the language constrains which extensions count as backend.
 _LANGUAGE_BACKEND_EXTS: Dict[str, tuple] = {
     "python": (".py",),
     "node": (".js", ".ts", ".mjs"),
@@ -286,7 +286,7 @@ class Judge:
                         task.id, kind_val, struct.rationale[:160])
             return struct
         # SEARCH/APPLY/VERIFY/SCAFFOLD outcomes are decided by ground
-        # truth — hits exist or don't, files were written or weren't,
+        # truth -- hits exist or don't, files were written or weren't,
         # pytest's returncode is what it is, and a scaffold either
         # produced source files matching the requested stack or it
         # didn't. An LLM-judge handed these artifacts has nothing
@@ -342,7 +342,7 @@ class Judge:
                 or "@@" in joined
             )
             if not has_diff:
-                # Hard-fail only when both plan_md and diffs are absent — the
+                # Hard-fail only when both plan_md and diffs are absent -- the
                 # task produced nothing useful. When plan_md has content but no
                 # diffs (e.g. a local LLM that followed the plan format but not
                 # the diff format), fall through to the LLM judge so it can
@@ -352,7 +352,7 @@ class Judge:
                     return Verdict(verdict="fail", confidence=0.9,
                                    rationale="Plan output contains no recognisable diff block.",
                                    checked_criteria=ncrit)
-                return None  # plan_md present, no diffs — let LLM judge decide
+                return None  # plan_md present, no diffs -- let LLM judge decide
             # When the engine ran self-tests, trust the report verbatim.
             report = out.get("codegen_report") or {}
             if isinstance(report, dict):
@@ -391,7 +391,7 @@ class Judge:
                                rationale="Scaffold produced no files and no plan.",
                                checked_criteria=ncrit)
             if not diffs:
-                # Has plan_md but no files — let LLM judge assess.
+                # Has plan_md but no files -- let LLM judge assess.
                 return None
             # Run each active skill's structural validator. The first
             # failure short-circuits to a Judge FAIL with the skill's
@@ -425,7 +425,7 @@ class Judge:
             # Ground truth: diffs were produced and every active skill
             # either passed or abstained. Return a positive verdict so
             # the SCAFFOLD short-circuit in :meth:`judge` skips the LLM
-            # grader — small local models routinely fabricate
+            # grader -- small local models routinely fabricate
             # criteria-based fails ("doesn't include input fields")
             # against scaffolds that demonstrably satisfy them.
             base = f"Scaffold generated {len(diffs)} file(s) matching the requested stack."
@@ -490,7 +490,7 @@ class Judge:
             ran = bool(out.get("ran"))
             if not ran:
                 reason = str(out.get("skipped_reason") or "tests did not run")
-                # Treat a "no impacted tests" outcome as a soft pass — the
+                # Treat a "no impacted tests" outcome as a soft pass -- the
                 # change is just untested rather than wrong.
                 if "no impacted" in reason.lower() or "no tests" in reason.lower():
                     return Verdict(verdict="pass", confidence=0.6,
@@ -559,7 +559,7 @@ class Judge:
         kind_val = task.kind.value if task.kind else "?"
         artifact = self._render_artifact(task)
         # Include the user's original goal when the planner injected it on
-        # the task — a per-task description like "Generate React UI
+        # the task -- a per-task description like "Generate React UI
         # components" lacks the technology-stack context the judge needs to
         # decide whether functional criteria are met.
         goal = str((task.inputs or {}).get("goal") or "").strip()

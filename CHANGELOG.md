@@ -2,13 +2,13 @@
 
 All notable changes are documented here. Versions follow semver-ish.
 
-## Unreleased — Gemma 4 model family + pull-error fix
+## Unreleased -- Gemma 4 model family + pull-error fix
 
 ### Added
 
 - **Gemma 4 catalogue entries** (`cgx.answer.hardware_matrix.LOCAL_MODEL_CATALOG`):
   five rows covering the full Gemma 4 family as published on the
-  Ollama library — `gemma4:e2b` (~7.2 GB on disk, edge), `gemma4:e4b`
+  Ollama library -- `gemma4:e2b` (~7.2 GB on disk, edge), `gemma4:e4b`
   (~9.6 GB, also served as `gemma4:latest`), `gemma4:12b` (~7.6 GB,
   workstation dense), `gemma4:26b` (MoE, ~18 GB, 4B active per token),
   `gemma4:31b` (~20 GB, near-cloud quality). Context windows: 128K
@@ -44,7 +44,7 @@ All notable changes are documented here. Versions follow semver-ish.
 - **Ollama pull silently reported success on failure**. When the
   local Ollama instance returned a non-2xx for `/api/pull` (e.g.,
   HTTP 412 because the installed Ollama is older than the model's
-  manifest format — see ollama/ollama#15222 — or 404 for a typo'd
+  manifest format -- see ollama/ollama#15222 -- or 404 for a typo'd
   tag), the SSE stream emitted a single `status="error"` progress
   event followed by `done`, and the UI's close handler
   unconditionally wrote `done: true, status: "Download complete"`.
@@ -76,16 +76,16 @@ All notable changes are documented here. Versions follow semver-ish.
   new test files were added; `tests/test_hardware_matrix.py` was
   updated in place to reflect the family-grouped sort contract.
 
-## Unreleased — Retrieval & codegen pipeline overhaul (Phases 0–9)
+## Unreleased -- Retrieval & codegen pipeline overhaul (Phases 0–9)
 
 A 9-phase overhaul of the retrieval, parsing, and prompt-assembly
 layers. Behavior-preserving where noted; SLM-prompt and insertion
-output shapes changed in two phases. **Re-indexing required** — see
+output shapes changed in two phases. **Re-indexing required** -- see
 the *Schema version* note under **Changed**.
 
 ### Added
 
-- **Phase 1 — Symmetric sub-word tokenizer** (`cgx.retrieval.tokenize`):
+- **Phase 1 -- Symmetric sub-word tokenizer** (`cgx.retrieval.tokenize`):
   `split_identifier(name)` splits camelCase / PascalCase / snake_case /
   kebab-case identifiers into ordered sub-tokens; `expand_with_subwords
   (tokens, *, min_len=1)` is the dedup wrapper used on both sides of
@@ -93,14 +93,14 @@ the *Schema version* note under **Changed**.
   side, feeds `lexical_helpers.ngrams_*`) and
   `cgx.retrieval.orchestrator._tokenize_lc` /
   `_extract_symbol_tokens` (query side). Identifier matching is now
-  symmetric — a query for `parseConfig` hits records tokenized from
+  symmetric -- a query for `parseConfig` hits records tokenized from
   `parse_config` and vice-versa. Covered by `tests/test_tokenize.py`
   plus a camelCase ↔ snake_case integration assertion.
-- **Phase 3 — Tiered SLM context (Code Map)** (`cgx.answer.context_map`
+- **Phase 3 -- Tiered SLM context (Code Map)** (`cgx.answer.context_map`
   + `cgx.answer.model_caps.get_context_map_budget`): when the retriever
   surfaces graph-expanded neighbors (`provenance.graph_depth >= 1`),
-  the prompt SOURCES list is built as two tiers — full focus-windowed
-  bodies for primary hits, one-line `[class.]name(signature) — doc`
+  the prompt SOURCES list is built as two tiers -- full focus-windowed
+  bodies for primary hits, one-line `[class.]name(signature) -- doc`
   stubs for neighbors, tagged `tier=neighbor` in the prompt metadata.
   Budgets (`primary_chars`, `neighbor_chars`, `primary_max`,
   `neighbor_max`, `total_chars`) scale by the provider's model context
@@ -112,7 +112,7 @@ the *Schema version* note under **Changed**.
   `answer_with_llm` and `generate_code_plan` via the same
   `_has_neighbors` gate in `cgx.answer.engine`. Covered by
   `tests/test_context_map.py`.
-- **Phase 4 — Line-anchored insertion points**: every record now
+- **Phase 4 -- Line-anchored insertion points**: every record now
   carries `start_line`, `end_line`, and `col_offset` (mirrored from the
   parser chunk's AST node); see *Changed → Schema version* below.
   `cgx.retrieval.orchestrator.suggest_insertion_points` emits two new
@@ -125,7 +125,7 @@ the *Schema version* note under **Changed**.
   records. `tests/snapshots/suggest_insertion_points_shape.json`
   pins the new output shape; `tests/test_ast_insert.py` covers the
   line-anchored splice paths.
-- **Phase 6 — `CodeGraphBackend` facade** (`cgx.graph.backend`): a
+- **Phase 6 -- `CodeGraphBackend` facade** (`cgx.graph.backend`): a
   thin wrapper around the small set of `networkx` operations the
   retrieval and embeddings layers actually need
   (`has_node`, `successors`, `predecessors`, `undirected_neighbors`,
@@ -135,7 +135,7 @@ the *Schema version* note under **Changed**.
   now go through the facade; `build_graph`, graph visualization, and
   graph persistence still use raw `networkx` (no dependency change).
   Covered by `tests/test_graph_backend.py`.
-- **Phase 7 — Parser schema + `BaseParser` seam (Python-only)** —
+- **Phase 7 -- Parser schema + `BaseParser` seam (Python-only)** --
   `src/cgx/parser/schema.py` formalizes today's record shape via
   `CodeChunk`, `CallRelation`, and `ChunkType` `TypedDict`s, with
   `total=False` so the variable `meta` payloads keep their existing
@@ -145,20 +145,20 @@ the *Schema version* note under **Changed**.
   `extensions` tuple drives extension-based dispatch. `src/cgx/parser/
   python_parser.py` provides `PythonASTParser` and registers `.py`.
   `parse_codebase` was split into a project walker (registry dispatch,
-  ignore/safety knobs, cross-file post-processing — call-relation
+  ignore/safety knobs, cross-file post-processing -- call-relation
   dedup, `calls_out_top`, `called_by_count`) and a module-level
   `_parse_python_module` worker (file/module chunk emission + the
   existing AST `CodeVisitor`). The chunk and call-relation shapes are
-  byte-identical to before — `tests/test_schema_snapshots.py` still
-  passes — and the dispatcher silently skips files whose extension is
+  byte-identical to before -- `tests/test_schema_snapshots.py` still
+  passes -- and the dispatcher silently skips files whose extension is
   not registered (so `.py`-only behavior is preserved). Covered by
   `tests/test_parser_seam.py` (10 cases: ABC contract, registry shape,
   per-file output keys, syntax-error tolerance, worker-vs-parser
   equality, project-level aggregation, non-`.py` skip).
-- **Phase 9 — Reranker profile policy** — `cgx.answer.profiles.Profile`
+- **Phase 9 -- Reranker profile policy** -- `cgx.answer.profiles.Profile`
   gains an optional `enable_reranker: Optional[bool]` field. `None`
   (the default) means "auto" and resolves through
-  `default_reranker_for_kind(kind)` — `True` for cloud kinds
+  `default_reranker_for_kind(kind)` -- `True` for cloud kinds
   (`openai-compat`, `gemini`) and `False` for local / private kinds
   (`ollama`, `custom`). Explicit `True` / `False` on the profile wins.
   `resolve_enable_reranker(profile)` is the single public helper that
@@ -180,10 +180,10 @@ the *Schema version* note under **Changed**.
 
 - **Schema version: `SCHEMA_VERSION` bumped `1 → 3`** in
   `cgx.embeddings.records`. v2 (Phase 1) added the symmetric sub-word
-  tokenizer to the lexical / catalog pipeline — v1 records under-match
+  tokenizer to the lexical / catalog pipeline -- v1 records under-match
   partial-name queries. v3 (Phase 4) adds `start_line` / `end_line` /
   `col_offset` to every record so insertion planners can splice
-  without re-walking the AST — v2 records lack these fields.
+  without re-walking the AST -- v2 records lack these fields.
   **Re-index advisory**: indices built before this overhaul should be
   rebuilt by re-running `cgx index --project-root … --out-dir …` (or
   triggering *Re-index* from the UI). Readers detect a stale
@@ -198,22 +198,22 @@ the *Schema version* note under **Changed**.
   when records carry `start_line` / `end_line`; the existing AST-walk
   path is retained as a fallback for v2-and-older indices.
 
-### Internal (refactors, performance, test infrastructure — no public-API change)
+### Internal (refactors, performance, test infrastructure -- no public-API change)
 
-- **Phase 0 — Schema-version constant + golden-output snapshots**:
+- **Phase 0 -- Schema-version constant + golden-output snapshots**:
   added `SCHEMA_VERSION` to records / persisted manifests and
   `tests/test_schema_snapshots.py` with three pinned snapshots
   (record-keys, `suggest_insertion_points` shape, top-K hybrid
   retrieval over a synthetic repo). Subsequent phases land against
   these snapshots so any shape drift is caught immediately.
-- **Phase 2 — Parser helpers lifted to module scope**: `_build_file_
+- **Phase 2 -- Parser helpers lifted to module scope**: `_build_file_
   code_stub`, `_collect_top_level_members`, `_class_signature`, and
   the surrounding stub builders were hoisted out of the
   `parse_codebase` closure to module scope in
-  `cgx.parser.parse_codebase`. Pure refactor — no behavior change —
+  `cgx.parser.parse_codebase`. Pure refactor -- no behavior change --
   enabling unit-testing of the helpers in isolation
   (`tests/test_parser_helpers.py`) and the Phase 7 parser-seam split.
-- **Phase 5 — Exemplar-embedding LRU cache** in
+- **Phase 5 -- Exemplar-embedding LRU cache** in
   `cgx.retrieval.orchestrator`: `_build_exemplar_corpus(records,
   embedder)` is now memoised behind `_insertion_corpus_key` (keyed by
   records identity + `schema_version` + embedder fingerprint) with a
@@ -222,15 +222,15 @@ the *Schema version* note under **Changed**.
   `_clear_insertion_corpus_cache()` helper supports test teardown.
   Covered by `tests/test_insertion_cache.py` (corpus encoded once
   across repeat calls; cache invalidates on records-id change).
-- **Phase 8 — Optional Tree-sitter plugin: DROPPED**. Multi-language
+- **Phase 8 -- Optional Tree-sitter plugin: DROPPED**. Multi-language
   parsing deferred to a later cycle; Phase 7's parser registry already
   provides the seam.
 
-## Unreleased — Manifest-driven scaffolding, rollback API, refactor batches B1–B9
+## Unreleased -- Manifest-driven scaffolding, rollback API, refactor batches B1–B9
 
 ### Added
 
-- **`cgx.codegen.ast_insert`** — AST-anchored insertion planner that
+- **`cgx.codegen.ast_insert`** -- AST-anchored insertion planner that
   bridges `cgx.retrieval.orchestrator.suggest_insertion_points` into the
   existing `PatchResult` pipeline. Given an `AstInsertSpec(rel_path,
   code, class_name=None, anchor_symbol=None)` (or a raw suggestion dict
@@ -244,7 +244,7 @@ the *Schema version* note under **Changed**.
   `build_unified_diff(patch_result)` renders the plan as a standard
   unified diff so it routes back through `parse_fenced_diffs` /
   `apply_diffs_to_disk` / `validate_patch_results` without any
-  special-casing. The module is purely additive — no existing
+  special-casing. The module is purely additive -- no existing
   signature in `diff_apply`, `validate`, `disk_apply`, or
   `orchestrator` was modified. Covered by `tests/test_ast_insert.py`
   (12 cases: module-after-anchor, append-when-anchor-missing,
@@ -256,7 +256,7 @@ the *Schema version* note under **Changed**.
   (`cgx.agents.types`): the monolithic `scaffold` kind has been split
   into a two-stage pipeline. `scaffold_manifest` calls
   `plan_scaffold_manifest` (a cheap LLM call that returns only the
-  layered file list — no contents) and emits an `inject_tasks` payload;
+  layered file list -- no contents) and emits an `inject_tasks` payload;
   the Tracker injects one `scaffold_file` task per planned file into
   the plan immediately after, ordered layer-by-layer so dependency-heavy
   files (core types, utilities) are generated before the files that
@@ -316,50 +316,50 @@ the *Schema version* note under **Changed**.
 
 ### Refactored (batches B1–B9, no behaviour change)
 
-- **B1 — Lazy `cgx.webui` imports** (`src/cgx/webui/__init__.py`):
+- **B1 -- Lazy `cgx.webui` imports** (`src/cgx/webui/__init__.py`):
   module-level `from fastapi import …` removed; symbols re-exported
   via `__getattr__` so `from cgx.webui import task_store` works
   without the `[ui]` extra installed.
-- **B2 — Graph projection consolidation** (`src/cgx/graph/`):
+- **B2 -- Graph projection consolidation** (`src/cgx/graph/`):
   `projectors.py` deleted; the two duplicate projection helpers now
   live in a single `graph.aggregation` module imported by both
   `viz.visualize` and the webui graph route.
-- **B3 — Embeddings de-duplication**
+- **B3 -- Embeddings de-duplication**
   (`src/cgx/embeddings/helpers.py`, `views.py`): the duplicated
   `_attribute_roots_read` body in `views.py` is replaced with a
   re-export of the helpers-module implementation; single source of
   truth.
-- **B4 — Shared embedder loader** (new `cgx.embeddings.loader`, see
+- **B4 -- Shared embedder loader** (new `cgx.embeddings.loader`, see
   Added above): removes three near-identical `_load_embedder` copies
   from `cli.main`, `retrieval.cli_adapter`, and the webui handlers.
-- **B5 — Gradio drift cleanup**: removed stale references to the
+- **B5 -- Gradio drift cleanup**: removed stale references to the
   Gradio UI / port 7860 across `docs/`, `extension/`, `README.md`,
   and the React frontend (`frontend/src/layout/Header.tsx`); the
   product is React + FastAPI on port **8765** end-to-end.
-- **B6 — Judge logging hygiene** (`cgx.agents.judge`): noisy
+- **B6 -- Judge logging hygiene** (`cgx.agents.judge`): noisy
   per-criterion `print` calls replaced with structured `logger.debug`
   output gated by `CGX_LOG_LEVEL=DEBUG`.
-- **B7 — Targeted logging** (`cgx.answer.profiles`,
+- **B7 -- Targeted logging** (`cgx.answer.profiles`,
   `cgx.answer.ratelimit`, `cgx.answer.ollama_discovery`,
   `cgx.codegen.diff_apply`, `cgx.codegen.pipeline`,
   `cgx.codegen.test_runner`, `cgx.codegen.validate`,
   `cgx.sessions`): replaced ad-hoc `print` statements with
   module-scoped `logging.getLogger(__name__)` calls so operator
   diagnostics route through the standard logging configuration.
-- **B9 — `.gitignore` hygiene**: added `frontend/node_modules/`,
+- **B9 -- `.gitignore` hygiene**: added `frontend/node_modules/`,
   `extension/out/`, `frontend/dist/`, `frontend/.vite/`, and
   `cgx_index/` patterns; existing tracked artifacts left in place
   (untracking is a separate operator decision).
 
-## Unreleased — SLM-grade execution engine (Phases 1–5)
+## Unreleased -- SLM-grade execution engine (Phases 1–5)
 
 ### Added
 
-#### Phase 1 — Skeleton-and-Fill (`cgx.agents`)
+#### Phase 1 -- Skeleton-and-Fill (`cgx.agents`)
 - **`TaskKind.FILL_LOGIC`** (`cgx.agents.types`): new task kind for the
   second pass of the skeleton-and-fill pattern. The Tracker dispatches it
   to the `fill_logic` capability, which prompts the LLM to implement
-  exactly one empty function body at a time — keeping local 7B models
+  exactly one empty function body at a time -- keeping local 7B models
   well inside their reliable generation window.
 - **`fill_logic` capability** (`cgx.agents.loop._build_default_capabilities`):
   reads the target skeleton file from disk, calls the LLM with a tightly
@@ -370,24 +370,24 @@ the *Schema version* note under **Changed**.
   function_name, body_code, applied, syntax_ok}`.
 - **Tracker support for `FILL_LOGIC`** (`cgx.agents.tracker`):
   `_dispatch`, `_summarize_task_output`, and `_extract_display_output`
-  all handle the new kind — the timeline row shows
+  all handle the new kind -- the timeline row shows
   `fn_name() in file.py · stitched · syntax ok`.
 
-#### Phase 2 — Dynamic Dependency Management (`cgx.codegen.env_manager`)
+#### Phase 2 -- Dynamic Dependency Management (`cgx.codegen.env_manager`)
 - **New module `src/cgx/codegen/env_manager.py`**: full dependency
   management pipeline for the agent sandbox.
-  - `scan_file_imports(path)` — AST-based import extraction for `.py`
+  - `scan_file_imports(path)` -- AST-based import extraction for `.py`
     files; regex-based for `.js`/`.ts`/`.jsx`/`.tsx`.
-  - `scan_imports(file_paths)` — union of imports across a list of files.
-  - `find_missing_python_packages(imports, project_root)` — cross-refs
+  - `scan_imports(file_paths)` -- union of imports across a list of files.
+  - `find_missing_python_packages(imports, project_root)` -- cross-refs
     extracted roots against `requirements.txt`, then probes live
     importability; skips the full stdlib (50+ top-level names enumerated).
-  - `install_packages(packages, python)` — runs
+  - `install_packages(packages, python)` -- runs
     `pip install --quiet --no-input <pkg>` in the target Python
     interpreter (defaults to the current one); returns `{name: bool}`.
-  - `update_requirements(project_root, packages)` — appends newly
+  - `update_requirements(project_root, packages)` -- appends newly
     installed packages to `requirements.txt` idempotently.
-  - `preflight_install(generated_files, project_root)` — one-shot
+  - `preflight_install(generated_files, project_root)` -- one-shot
     convenience: scan → find missing → install → return results.
 - **Pre-flight hook in `verify` capability** (`cgx.agents.loop`): before
   running pytest the `verify` capability scans every `.py` file in the
@@ -396,32 +396,32 @@ the *Schema version* note under **Changed**.
   permanent. `ModuleNotFoundError` failures caused by the model choosing
   a new library no longer mask real logic failures.
 
-#### Phase 3 — Symbol Table Context (`cgx.codegen.symbol_map`)
+#### Phase 3 -- Symbol Table Context (`cgx.codegen.symbol_map`)
 - **New module `src/cgx/codegen/symbol_map.py`**: builds a compressed
   working-memory map of all symbols already defined in the indexed
   codebase.
-  - `build_symbol_map(records_path)` — reads the JSONL records file and
+  - `build_symbol_map(records_path)` -- reads the JSONL records file and
     returns `{relative_path: [symbol, …]}`, deduplicated and in
     definition order.
-  - `format_symbol_map(symbol_map)` — renders the map as a
+  - `format_symbol_map(symbol_map)` -- renders the map as a
     `# AVAILABLE CONTEXT (Do not redefine these):` prompt block capped
     at 60 files × 20 symbols each so the injected block stays small.
-  - `fetch_symbol_source(records_path, symbol_name)` — AST-RAG on demand:
+  - `fetch_symbol_source(records_path, symbol_name)` -- AST-RAG on demand:
     scans records to return the exact source text for a named symbol,
     used by the retry loop to inject the real signature when the model
     calls a function with the wrong arguments.
-  - `build_symbol_context_prompt(records_path)` — convenience wrapper;
+  - `build_symbol_context_prompt(records_path)` -- convenience wrapper;
     returns an empty string when the records file is absent.
 - **Symbol map injected into `plan` capability** (`cgx.agents.loop`):
   before calling `generate_code_plan` the capability builds the symbol
   map from `records_path` and passes it as `symbol_context`. Local models
   see what is already defined and stop redefining it.
 
-#### Phase 4 — Granular Error Slicing (`cgx.agents.loop`)
+#### Phase 4 -- Granular Error Slicing (`cgx.agents.loop`)
 - **`_extract_error_snippet(project_root, responsible_files, output)`**
   (`cgx.agents.loop`): parses the first line-number reference from a
   pytest traceback, opens the failing file, and returns a ±5-line window
-  around the error with an `# <-- ERROR HERE` marker — the "10-line
+  around the error with an `# <-- ERROR HERE` marker -- the "10-line
   buffer rule".
 - **Micro-targeted retry prompts** (`_build_fix_goal`): when an error
   snippet can be extracted, the retry goal presents it as a focused
@@ -431,7 +431,7 @@ the *Schema version* note under **Changed**.
   dumping the full 1 200-character pytest tail. The raw output is still
   appended as a fallback when no line number can be found.
 
-#### Phase 5 — Universal LLM Provider (`cgx.answer.providers`, `cgx.answer.profiles`)
+#### Phase 5 -- Universal LLM Provider (`cgx.answer.providers`, `cgx.answer.profiles`)
 - **`GeminiProvider`** (`cgx.answer.providers`): native Google Gemini
   provider via the `generativelanguage.googleapis.com` REST API.
   - Maps CGX's `messages` list to Gemini's `contents` +
@@ -470,7 +470,7 @@ the *Schema version* note under **Changed**.
     Base URL hidden for Gemini; Endpoint Path and *Skip auth* checkbox
     shown only for Custom.
   - **Live Ping button** on both the inline config card and the
-    profile edit form — displays `OK · <Nms>` in green or the error
+    profile edit form -- displays `OK · <Nms>` in green or the error
     message in red without leaving the form.
 - **Pydantic model updates** (`cgx.webui.models`): `ProviderConfig`,
   `ProfileUpsertRequest`, and `ProfileSummary` expose `endpoint_path`
@@ -487,58 +487,58 @@ the *Schema version* note under **Changed**.
 ### Changed
 - `_build_fix_goal` now injects a tight code snippet instead of a raw
   truncated log when a traceback line number can be resolved
-  (Phase 4 — see above).
+  (Phase 4 -- see above).
 - `verify` capability auto-installs missing Python packages before
-  running pytest (Phase 2 — see above).
+  running pytest (Phase 2 -- see above).
 - `plan` capability injects a symbol-context block from
   `build_symbol_context_prompt` when `records_path` is available
-  (Phase 3 — see above).
+  (Phase 3 -- see above).
 
 ---
 
-## Unreleased — Agent loop reliability: targeted retries, partial apply, cross-file coherence
+## Unreleased -- Agent loop reliability: targeted retries, partial apply, cross-file coherence
 
 ### Fixed
 
-- **Fix #3 — Apply failures now trigger recursive retry** (`cgx.agents.loop`):
+- **Fix #3 -- Apply failures now trigger recursive retry** (`cgx.agents.loop`):
   `_stream_with_retry` previously checked only verify and core failures when
   deciding whether to recurse.  Apply failures (smoke-check rejections) were
   silently ignored, causing the loop to exit after one attempt even when the
   re-plan's apply step also failed.  `apply_failures` is now included in the
   recursion condition.
 
-- **Fix #6 — Partial apply: passing files are always written** (`cgx.codegen.disk_apply`):
+- **Fix #6 -- Partial apply: passing files are always written** (`cgx.codegen.disk_apply`):
   `apply_diffs_to_disk` previously returned an early-exit error and wrote
   *nothing* if any file in the batch failed the smoke check.  It now writes
   every file that passes and records the failing ones in `failed_files`.
   `smoke_ok` is `True` only when all files passed.  Retries can therefore
-  target only the broken file(s) — already-correct files stay on disk.
+  target only the broken file(s) -- already-correct files stay on disk.
 
-- **Fix #5 — Cross-file coherence check** (`cgx.codegen.validate`):
+- **Fix #5 -- Cross-file coherence check** (`cgx.codegen.validate`):
   New `check_cross_file_coherence(patches, project_root)` function runs
   alongside the per-file syntax smoke test inside `apply_diffs_to_disk`.  It
   walks Python files in the patch batch, parses their `import` statements, and
   flags any `from X.Y import Z` where `X/Y.jsx`, `.tsx`, `.js`, or `.ts` is
   present in the same batch or on disk.  This catches the common
   mis-generation where a Python test does `from src.App import calculateResult`
-  but `src/App.jsx` is a React component — not a Python module.
+  but `src/App.jsx` is a React component -- not a Python module.
 
-- **Fix #4 — Failure diagnosis before re-planning** (`cgx.agents.loop`):
+- **Fix #4 -- Failure diagnosis before re-planning** (`cgx.agents.loop`):
   New `_diagnose_failure(failures)` classifies test output as
   `import_error`, `syntax_error`, `logic_error`, or `unknown`, extracts
   responsible file paths from tracebacks, detects language-mismatch cases
   (Python importing a JS/JSX module), and returns a structured dict that
   informs `_build_fix_goal`.
 
-- **Fix #2 — Targeted fix goals** (`cgx.agents.loop`):
+- **Fix #2 -- Targeted fix goals** (`cgx.agents.loop`):
   `_build_fix_goal` now uses the diagnosis to emit a *targeted* re-plan
   prompt: it names the specific broken files (from the traceback), tells
   the LLM not to change files that are already correct (read from
-  `plan.owned_files`), and — when a language mismatch is detected —
+  `plan.owned_files`), and -- when a language mismatch is detected --
   explicitly offers two remediation paths: create a Python backend module
   that the test can import, or replace the Python test with a JS test.
 
-- **Fix #1 — File manifest on `Plan`** (`cgx.agents.types`, `cgx.agents.tracker`):
+- **Fix #1 -- File manifest on `Plan`** (`cgx.agents.types`, `cgx.agents.tracker`):
   `Plan` now carries an `owned_files: dict[str, str]` field (path →
   `"applied"` | `"failed"`) that the Tracker populates after every `apply`
   task.  The retry loop reads this manifest to build the "DO NOT CHANGE"
@@ -552,7 +552,7 @@ the *Schema version* note under **Changed**.
   classification, targeted fix-goal construction, cross-file coherence
   detection, and partial-apply behaviour.
 
-## Unreleased — Skills package: modular tech-specific knowledge bundles
+## Unreleased -- Skills package: modular tech-specific knowledge bundles
 
 ### Added
 - **`skills/` top-level package**: pluggable, per-technology modules that
@@ -579,8 +579,8 @@ the *Schema version* note under **Changed**.
   and PLAN task now carries `task.inputs["skills"] = [<name>, ...]`
   so downstream capabilities receive deterministic technology context.
   A new `_goal_has_supported_skill(goal)` signal augments scaffold
-  detection — goals naming a supported technology route to SCAFFOLD
-  even when the noun regex doesn't fire — while the existing `_TECH_RE`
+  detection -- goals naming a supported technology route to SCAFFOLD
+  even when the noun regex doesn't fire -- while the existing `_TECH_RE`
   fallback keeps coverage for unsupported frameworks (Angular, Svelte,
   Tkinter, …). The kind-policy log line now reports
   `skills=[...]` alongside `regex=` / `llm=`.
@@ -612,7 +612,7 @@ the *Schema version* note under **Changed**.
   + sys.path are updated so `skills` is importable as a top-level
   package both for installed runs and in-repo tests.
 
-## Unreleased — Scaffold routing fix: tech-paired scaffold goals + judge artifact
+## Unreleased -- Scaffold routing fix: tech-paired scaffold goals + judge artifact
 
 ### Fixed
 - **Scaffold detection too narrow** (`cgx.agents.planner._SCAFFOLD_RE`,
@@ -653,7 +653,7 @@ the *Schema version* note under **Changed**.
   tech-paired scaffold detection, the LLM-scaffold-trust path, the
   existing-codebase exclusion, and the new SCAFFOLD artifact renderer.
 
-## Unreleased — Judge SCAFFOLD short-circuits on structural pass
+## Unreleased -- Judge SCAFFOLD short-circuits on structural pass
 
 ### Fixed
 - **Local 3-7B judge models hallucinate criteria fails on scaffolds**
@@ -661,7 +661,7 @@ the *Schema version* note under **Changed**.
   source-prioritized previews and goal context in the prompt, small
   local models (`qwen2.5-coder:3b`, etc.) routinely return high-
   confidence `fail` verdicts against scaffolds that demonstrably
-  satisfy their criteria — e.g. rejecting a calculator with
+  satisfy their criteria -- e.g. rejecting a calculator with
   `App.jsx` + `Calculator.js` + `Button.js` + FastAPI `main.py` because
   "doesn't include a calculator interface". This made the Tracker
   re-plan indefinitely. Following the same pattern already used for
@@ -673,7 +673,7 @@ the *Schema version* note under **Changed**.
   still hard-fails so genuine miss-targeted scaffolds still trigger
   a re-plan.
 
-## Unreleased — Judge scaffold preview: source-file priority + goal context
+## Unreleased -- Judge scaffold preview: source-file priority + goal context
 
 ### Fixed
 - **Double-truncated scaffold artifact** (`cgx.agents.judge`):
@@ -687,7 +687,7 @@ the *Schema version* note under **Changed**.
   `README.md` / `package.json` / `requirements.txt` ahead of the actual
   component code (`App.jsx`, `Calculator.js`, ...). The previewer iterated
   files in diff order so the 6-file preview budget was burned on
-  metadata before the source code was reached — leaving the judge unable
+  metadata before the source code was reached -- leaving the judge unable
   to verify functional criteria like *"supports +, −, ×, ÷"*. Files are
   now partitioned into source extensions (`.jsx/.tsx/.js/.ts/.py/.vue/
   .svelte/.go/.rs/.java/.kt/.rb/.php/.html/.css/.scss`) and previewed
@@ -700,7 +700,7 @@ the *Schema version* note under **Changed**.
   the judge prompt now surfaces it as a leading `USER GOAL:` block so
   the LLM grounds its verdict in the full request.
 
-## Unreleased — Scaffold prompt fix: frontend technology bias
+## Unreleased -- Scaffold prompt fix: frontend technology bias
 
 ### Fixed
 - **`_SCAFFOLD_SYSTEM` Python bias** (`cgx.answer.engine`): the scaffold
@@ -715,7 +715,7 @@ the *Schema version* note under **Changed**.
   to omit Python files entirely.
 - **`_SCAFFOLD_FREEFORM_SYSTEM` example bias** (`cgx.answer.engine`): the
   freeform fallback prompt's example fenced block was hardcoded as
-  `` ```python path=src/main.py `` — swapped to a language-neutral
+  `` ```python path=src/main.py `` -- swapped to a language-neutral
   `` ```<language> path=<relative/path/to/file> `` placeholder so the
   fallback path does not bias the model toward Python when JSON mode is
   unavailable.
@@ -725,17 +725,17 @@ the *Schema version* note under **Changed**.
   the requested technology. A React-specific check was added: when the
   task goal or description mentions "react", the judge now hard-fails
   (0.9 confidence) if no `.js`/`.jsx`/`.tsx`/`.ts` files are present or
-  if all non-config files are Python — producing a clear rationale that
+  if all non-config files are Python -- producing a clear rationale that
   triggers a proper retry with corrected instructions.
 
-## Unreleased — New-project scaffold, agent kind-policy fixes
+## Unreleased -- New-project scaffold, agent kind-policy fixes
 
 ### Added
 - **`TaskKind.SCAFFOLD`** (`cgx.agents.types`): new task kind that routes
   to `cgx.answer.engine.generate_project_scaffold`. The planner emits a
   `[scaffold, apply, verify]` chain whenever the goal describes a
   *new-project* request ("create a new FastAPI app", "build from scratch",
-  "generate a CLI tool", etc.). No existing index is required — the LLM
+  "generate a CLI tool", etc.). No existing index is required -- the LLM
   generates all files from a plain-language idea.
 - **`generate_project_scaffold(idea, provider)`** (`cgx.answer.engine`):
   LLM function that produces a complete project from a free-text idea.
@@ -772,12 +772,12 @@ the *Schema version* note under **Changed**.
   row and reuse the PLAN rendering for the diff viewer panel.
 - All relevant docstrings and module-level docs updated.
 
-## Unreleased — Observability, task registry, tab persistence, parallel execution
+## Unreleased -- Observability, task registry, tab persistence, parallel execution
 
 ### Added
 - **Startup logging** (`launch.py`): `setup_logging(INFO)` is now called once at
   process start so every major operation emits structured `[INFO]`/`[WARNING]`
-  lines to stdout — handlers (`ask`, `plan`, `agent`, `index`), tracker (each
+  lines to stdout -- handlers (`ask`, `plan`, `agent`, `index`), tracker (each
   `task_start` / `task_done` / `task_fail`), planner (LLM call, task count,
   fallback activation), and the SSE bridge.
 - **SQLite task registry** (`src/cgx/webui/task_store.py`): every SSE request
@@ -785,23 +785,23 @@ the *Schema version* note under **Changed**.
   All emitted SSE events are persisted per-task so the frontend can replay them
   on tab switch. An in-memory `threading.Event` per task supports cancellation.
 - **Task REST API** (`src/cgx/webui/routes/tasks.py`, mounted at `/api/tasks`):
-  - `GET /api/tasks` — list recent tasks (up to 50).
-  - `GET /api/tasks/{id}` — retrieve a single task record.
-  - `GET /api/tasks/{id}/events` — full persisted event log for replay.
-  - `DELETE /api/tasks/{id}` — cancel a running task (sets its `threading.Event`).
+  - `GET /api/tasks` -- list recent tasks (up to 50).
+  - `GET /api/tasks/{id}` -- retrieve a single task record.
+  - `GET /api/tasks/{id}/events` -- full persisted event log for replay.
+  - `DELETE /api/tasks/{id}` -- cancel a running task (sets its `threading.Event`).
 - **SSE bridge cancellation** (`src/cgx/webui/sse.py`): `bridge_generator()` now
   accepts `task_id` and `cancel_event` parameters. All handlers (`stream_ask`,
   `stream_plan`, `stream_agent`, `stream_index`) check `cancel_event.is_set()`
   at each yield point and terminate the stream cleanly when set.
 - **Cancel / Stop buttons**: every streaming page now renders an abort button
-  while busy — **Stop** on Ask, **Cancel** on Plan, Agent, and Index — that
+  while busy -- **Stop** on Ask, **Cancel** on Plan, Agent, and Index -- that
   closes the SSE connection and sets the cancel event.
 - **Tab persistence** (`frontend/src/store/tasks.ts`,
   `frontend/src/lib/connections.ts`):
-  - `tasks.ts` — Zustand store backed by `sessionStorage` that holds streaming
+  - `tasks.ts` -- Zustand store backed by `sessionStorage` that holds streaming
     state per page: agent (tasks / events / phase / summary), ask (messages),
     plan (thought / planMd / diff / report), index (progress / result).
-  - `connections.ts` — module-level `Map<string, SseConnection>` holding live
+  - `connections.ts` -- module-level `Map<string, SseConnection>` holding live
     SSE connections outside the React component lifecycle; switching tabs
     unmounts the component but leaves the SSE connection streaming and updating
     the Zustand store so state is fully intact on remount.
@@ -825,7 +825,7 @@ the *Schema version* note under **Changed**.
 - `HybridRetriever.search()` in `src/cgx/retrieval/orchestrator.py` now
   dispatches both ANN searches to threads rather than running them sequentially.
 
-## Unreleased — Agent loop polish
+## Unreleased -- Agent loop polish
 
 ### Added
 - **Planner kind-policy enforcement** (`cgx.agents.planner._enforce_kind_policy`):
@@ -859,7 +859,7 @@ the *Schema version* note under **Changed**.
 - `task_start` / `task_done` SSE payloads now carry `name` alongside
   `description`.
 
-## 0.2.0 — Phase 2 (current)
+## 0.2.0 -- Phase 2 (current)
 
 ### Added
 - **Self-testing code generation** (`cgx.codegen`): unified-diff parser,
@@ -900,7 +900,7 @@ the *Schema version* note under **Changed**.
   the model can't be loaded.
 - `HybridConfig.symbol_boost`, `graph_bonus`, `enable_reranker`,
   `reranker_model`, `reranker_top_n`, `reranker_weight`,
-  `expand_per_seed`, `relation_types` — previously hard-coded magic
+  `expand_per_seed`, `relation_types` -- previously hard-coded magic
   numbers are now tunable.
 - Rerank regression tests (`tests/test_rerank.py`) covering the
   graph-only-neighbor fix, config-driven boosts, and the cross-encoder

@@ -1,6 +1,6 @@
 # The CGX Agent
 
-This document describes the **agent layer** of CGX — the component that
+This document describes the **agent layer** of CGX -- the component that
 turns a single natural-language goal into an executed plan against a
 real codebase. It is intended for community contributors who want to
 understand how the agent works today and where it could be pushed
@@ -18,7 +18,7 @@ that operates strictly **local-first**.
 
 * **Single-actor, not multi-agent.** There is one logical agent. Inside
   it, three cooperating roles share the same process and the same LLM
-  provider — they are not independent agents communicating over a bus.
+  provider -- they are not independent agents communicating over a bus.
 * **Plan-and-execute, not ReAct.** A full plan is committed up front;
   the executor does not call the LLM mid-task to decide the next step.
   Retries re-enter the planner, they do not branch off it.
@@ -38,7 +38,7 @@ that operates strictly **local-first**.
 
 ---
 
-## 2. Architecture — Planner → Tracker → Judge
+## 2. Architecture -- Planner → Tracker → Judge
 
 ```
                    ┌─────────┐
@@ -53,13 +53,13 @@ that operates strictly **local-first**.
                 ┌───────┴────────┐
                 ▼                ▼
            AgentEvent…       ┌───────┐
-           (SSE stream)      │ Judge │ — verdict + rationale per task
+           (SSE stream)      │ Judge │ -- verdict + rationale per task
                              └───────┘
                         │
                   failures? ──▶ planner.plan_fix() ──▶ retry plan
 ```
 
-* **`Planner`** ([`planner.py`](../src/cgx/agents/planner.py)) — asks
+* **`Planner`** ([`planner.py`](../src/cgx/agents/planner.py)) -- asks
   the LLM for a strict-JSON plan (`{rationale, tasks:[{name,
   description, kind, criteria}]}`), then runs `_enforce_kind_policy()`
   to route the goal down one of four branches: **SCAFFOLD**,
@@ -68,13 +68,13 @@ that operates strictly **local-first**.
   unparseable output, a deterministic fallback consults
   `cgx.answer.intent.detect_intent` and emits a one-task plan that
   matches legacy single-shot behaviour.
-* **`Tracker`** ([`tracker.py`](../src/cgx/agents/tracker.py)) — index
+* **`Tracker`** ([`tracker.py`](../src/cgx/agents/tracker.py)) -- index
   loop over `plan.tasks` (so tasks injected mid-run, like
   `SCAFFOLD_MANIFEST` expanding into per-file tasks, are visited).
   Dispatches each task to its capability, emits heartbeats every
   `progress_interval` seconds while a capability is blocked, and
   persists `task.output` + `task.judge` back into the plan.
-* **`Judge`** ([`judge.py`](../src/cgx/agents/judge.py)) — validates
+* **`Judge`** ([`judge.py`](../src/cgx/agents/judge.py)) -- validates
   each completed task against its `criteria` list. LLM-grounded when a
   provider is available; otherwise heuristic (artifact shape +
   per-skill structural checks). Returns `{verdict, rationale,
@@ -110,7 +110,7 @@ capability in the default capability table built by
 | `apply`              | Write a prior `plan`/`scaffold` diff set to disk + smoke-test.       | `cgx.codegen.disk_apply.apply_diffs_to_disk` |
 | `verify`             | Run impacted (or all) pytest tests against the working tree.         | `cgx.codegen.test_runner.run_tests_on_disk` / `run_pytest_paths` |
 
-The kinds are intentionally **coarse** — each one is the cheapest
+The kinds are intentionally **coarse** -- each one is the cheapest
 unit of work that still produces a verifiable artifact. There is no
 "call this Python function" or "edit this hunk" primitive; the agent
 expresses fine-grained intent through the prompt to the underlying
@@ -149,7 +149,7 @@ The behavioural choices that distinguish the CGX agent from a generic
   lets the UI render the retrieval result.
 * **Verify is the contract.** Code-change goals always terminate in
   a `verify` task. The plan is only "complete" when `verify`
-  succeeds — or when its failure is classified as unrecoverable
+  succeeds -- or when its failure is classified as unrecoverable
   sandbox / `sys.path` noise (see §5).
 * **Errors are structured, not opaque.** Tracker exceptions are
   caught, surfaced as `task_failed` events, persisted on
@@ -234,14 +234,14 @@ diverge faster than they converge.
   ```
 
   Tests inject their own capability map to bypass the LLM and disk
-  entirely — see `tests/test_agents_*` and the example in
+  entirely -- see `tests/test_agents_*` and the example in
   [`docs/usage.md`](usage.md#programmatic-use).
 
 ---
 
 ## 7. Rooms for Improvement
 
-The current design is deliberately conservative — one actor, one
+The current design is deliberately conservative -- one actor, one
 plan, one retry, no live tool-calling. That makes the loop legible
 and reproducible, but it leaves clear headroom. The items below are
 the most impactful next steps the maintainers and community have
@@ -284,8 +284,8 @@ identified; contributions are welcome on any of them.
   full-file rewrites.
 * **Shell execution as a first-class capability.** `verify` runs
   pytest, but there is no general `run_command` kind. A sandboxed
-  shell capability — gated on a per-command allow-list and confined
-  to the project venv — would unlock `npm install`, `cargo check`,
+  shell capability -- gated on a per-command allow-list and confined
+  to the project venv -- would unlock `npm install`, `cargo check`,
   `tsc --noEmit`, and other language-native verifiers that are
   currently impossible to plan.
 * **HTTP / network capability.** Goals like "fetch the OpenAPI spec
@@ -315,7 +315,7 @@ identified; contributions are welcome on any of them.
   `rationale` but it is not currently validated. The Judge could
   cross-check that every claim in the rationale ("the goal needs a
   React UI, FastAPI backend, and pytest suite") matches at least
-  one task — catching planner hallucination at zero extra LLM cost.
+  one task -- catching planner hallucination at zero extra LLM cost.
 * **Goal disambiguation.** Ambiguous goals collapse to whatever the
   LLM picks. A pre-planner clarification step ("Did you mean to
   modify the existing project at `./` or to create a new project?")
@@ -383,12 +383,12 @@ identified; contributions are welcome on any of them.
 
 * **Structured event log on disk.** SSE events are streamed to the
   UI but not persisted. Writing them to `.cgx_runs/<plan_id>.jsonl`
-  would give users a complete replay log per run — essential for
+  would give users a complete replay log per run -- essential for
   bug reports and for the cross-run memory item above.
 * **Cost / token accounting.** There is no per-task token or
   wall-time accounting surfaced in the UI. Adding it would help
   users tell whether a slow run is dominated by planning, a single
-  scaffold call, or verify execution — and would let the planner
+  scaffold call, or verify execution -- and would let the planner
   cost-budget its own decomposition.
 * **Trace export.** OpenTelemetry-compatible trace export (opt-in,
   off by default to preserve the air-gapped guarantee) would let
@@ -409,7 +409,7 @@ easiest on-ramps are:
   `_build_default_capabilities`, and adding a Judge branch. The
   `fill_logic` capability is the most recent example of this
   pattern and is a good template.
-* Improve a **diagnoser** in `loop.py` — `_diagnose_failure` and
+* Improve a **diagnoser** in `loop.py` -- `_diagnose_failure` and
   `_extract_error_snippet` are pure functions over failure
   payloads, easy to unit-test, and produce immediate user-visible
   quality gains in the retry loop.

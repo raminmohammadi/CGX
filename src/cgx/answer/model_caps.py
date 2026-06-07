@@ -4,16 +4,16 @@
 
 Different LLMs have wildly different context windows (Gemini 2.5 Flash
 ~1M tokens, Qwen2.5-Coder 3B ~32K, Llama 3 ~8K). Callers that build long
-prompts — most notably the project scaffolder that embeds "already
-generated" files as context for each new sibling file — need to know
+prompts -- most notably the project scaffolder that embeds "already
+generated" files as context for each new sibling file -- need to know
 how much room they actually have so they neither overflow small local
 models nor waste capacity on large cloud ones.
 
 This module exposes a small, deliberately conservative registry plus
 two accessors:
 
-* :func:`get_model_context_window` — token count for a given model id.
-* :func:`get_summary_budget` — provider-aware ``max_chars`` /
+* :func:`get_model_context_window` -- token count for a given model id.
+* :func:`get_summary_budget` -- provider-aware ``max_chars`` /
   ``max_files`` / ``output_tokens`` triple to be used when building the
   "ALREADY GENERATED FILES" prompt block in
   :func:`cgx.answer.engine.generate_single_scaffold_file`.
@@ -130,9 +130,9 @@ def get_summary_budget(provider: Any) -> Dict[str, int]:
     """Return per-call prompt/response budgets scaled to the provider's model.
 
     Keys returned:
-      * ``max_chars``     — per-file summary char cap for prior-file context
-      * ``max_files``     — max number of prior files to include verbatim
-      * ``output_tokens`` — suggested ``max_tokens`` for the completion
+      * ``max_chars``     -- per-file summary char cap for prior-file context
+      * ``max_files``     -- max number of prior files to include verbatim
+      * ``output_tokens`` -- suggested ``max_tokens`` for the completion
 
     The tiers are coarse on purpose: any cloud-class model gets a generous
     budget, mid-size local models get a comfortable one, and tiny 8K-window
@@ -156,11 +156,11 @@ def get_context_map_budget(provider: Any) -> Dict[str, int]:
     magic numbers in the call sites.
 
     Keys returned:
-      * ``primary_chars``  — per-chunk char cap for primary (full-window) sources
-      * ``neighbor_chars`` — per-chunk char cap for neighbor stub sources
-      * ``primary_max``    — max number of primary chunks
-      * ``neighbor_max``   — max number of neighbor stubs
-      * ``total_chars``    — hard ceiling on the concatenated body text across tiers
+      * ``primary_chars``  -- per-chunk char cap for primary (full-window) sources
+      * ``neighbor_chars`` -- per-chunk char cap for neighbor stub sources
+      * ``primary_max``    -- max number of primary chunks
+      * ``neighbor_max``   -- max number of neighbor stubs
+      * ``total_chars``    -- hard ceiling on the concatenated body text across tiers
     """
     ctx = get_model_context_window(provider_model_name(provider))
     if ctx < 16_000:

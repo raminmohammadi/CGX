@@ -3,8 +3,8 @@
 A narrative tour of how the codebase actually works. Where
 [`architecture.md`](architecture.md) is a reference manual organised by
 module, and [`usage.md`](usage.md) is a how-to organised by task, this
-document follows a single request as it travels through CGX —
-from an unindexed working tree to a tested patch on disk — and explains
+document follows a single request as it travels through CGX --
+from an unindexed working tree to a tested patch on disk -- and explains
 why each layer exists.
 
 ![alt text](images/image.png)
@@ -15,7 +15,7 @@ end-to-end, read in order; each chapter assumes the one before it.
 
 ---
 
-## Chapter 1 — Why CGX exists
+## Chapter 1 -- Why CGX exists
 
 Modern code assistants live in the cloud. They are excellent at language
 modelling and abysmal at one thing that matters most to people who write
@@ -31,7 +31,7 @@ pipeline that runs on the developer's own machine and knows the whole
 codebase. The same machine parses the source, computes embeddings,
 serves the search index, runs the LLM (by default, through Ollama), and
 applies the resulting patch. Nothing has to leave the host, and when it
-does — because the user has explicitly configured a cloud provider —
+does -- because the user has explicitly configured a cloud provider --
 only the snippets and prompts required for the next turn are sent.
 
 ![alt text](images/chapter_1.png)
@@ -52,7 +52,7 @@ big one by feeding it sharper, smaller, more grounded prompts.
 
 ---
 
-## Chapter 2 — From repo to records
+## Chapter 2 -- From repo to records
 
 Indexing begins with `cgx.parser.parse_codebase`. The walker respects
 `.gitignore`, a user-supplied ignore-glob list, and a 1 MB file-size cap
@@ -71,7 +71,7 @@ source text of the chunk, the kind (`file`, `class`, `function`,
 per file (a *file stub* with module-level docstring and top-level
 member signatures), one per class (with method signatures), and one
 per function or method (with full body). This three-tier shape is what
-lets retrieval return a useful neighbourhood from a single hit — you can
+lets retrieval return a useful neighbourhood from a single hit -- you can
 walk from a function up to its class up to its file.
 
 ![alt text](images/chapter_2.png)
@@ -80,16 +80,16 @@ The Python parser is the canonical implementation. It uses the standard
 library `ast` module, lifts helpers like `_build_file_code_stub`,
 `_collect_top_level_members`, and `_class_signature` to module scope so
 they can be unit-tested, and never imports a third-party parsing library.
-That choice has consequences — CGX understands Python with surgical
-precision and other languages only by their file boundaries — but it
+That choice has consequences -- CGX understands Python with surgical
+precision and other languages only by their file boundaries -- but it
 keeps the install footprint tiny.
 
 After parsing comes the graph. `cgx.graph.build_graph.build_knowledge_graph`
 walks the chunk list once and emits four kinds of edges: `calls` (a
 function references another), `module` (a chunk belongs to a file),
 `attr` (an attribute access on a known symbol), and `defined_in`
-(a method belongs to a class). The graph is a NetworkX `DiGraph` —
-the only place in CGX that depends directly on NetworkX — and is
+(a method belongs to a class). The graph is a NetworkX `DiGraph` --
+the only place in CGX that depends directly on NetworkX -- and is
 persisted as JSON so reload is fast. Retrieval and embeddings never
 touch the raw `DiGraph`; they go through `cgx.graph.backend.CodeGraphBackend`,
 a small facade that exposes exactly the operations they need
@@ -119,14 +119,14 @@ that actually changed.
 
 ---
 
-## Chapter 3 — The retrieval pipeline
+## Chapter 3 -- The retrieval pipeline
 
 A query enters CGX through `cgx.retrieval.orchestrator.hybrid_retrieve_two_view`.
 Three independent retrievers run against the index in parallel.
 
 The first is *semantic* search. The query is embedded once with the
 same encoder that produced the corpus vectors, and the resulting vector
-is searched against both FAISS indices — the intent index returns
+is searched against both FAISS indices -- the intent index returns
 candidates whose docstring/name view sits close in vector space, the
 impl index returns candidates whose source view sits close. Two ranked
 lists come back.
@@ -136,7 +136,7 @@ lists come back.
 The second is *lexical* search. A BM25 ranker scores the query against
 the same chunks, treating their text as a bag of tokens. BM25 is
 useless at synonyms ("auth" vs "authentication") but unbeatable at
-exact-symbol recall — when the user types a function name verbatim,
+exact-symbol recall -- when the user types a function name verbatim,
 BM25 will find it whether the embedding model agrees or not.
 
 Both retrievers depend on a subtlety that took the project several
@@ -155,7 +155,7 @@ so a tokenizer change invalidates them automatically.
 
 The third retriever is *graph expansion*. The top-N candidates from
 the fused list are used as seeds, and `CodeGraphBackend` walks one
-hop out — calls, callers, classmates — to surface chunks that are
+hop out -- calls, callers, classmates -- to surface chunks that are
 relevant by structure rather than by text. A function and its only
 caller usually need to be read together; the graph layer makes sure
 they end up in the same result set even when the caller has no
@@ -174,7 +174,7 @@ After RRF, the orchestrator optionally hands the candidates to a
 cross-encoder *reranker* for a final, more expensive pass. Whether
 the reranker runs at all is a policy decision, not a per-query flag:
 `cgx.answer.profiles` resolves `enable_reranker = "auto"` against the
-provider type — local providers (Ollama, on-disk models) default to
+provider type -- local providers (Ollama, on-disk models) default to
 `False` because the whole point of a local stack is that nothing
 should require a separately-downloaded encoder; cloud providers
 default to `True` because the latency cost is dwarfed by the model
@@ -182,7 +182,7 @@ call that follows. Either setting can be overridden in the profile.
 
 ---
 
-## Chapter 4 — Assembling the prompt
+## Chapter 4 -- Assembling the prompt
 
 Retrieval returns a ranked list of chunks. Turning that into a prompt
 that fits in a 3B model's context window is the job of
@@ -191,7 +191,7 @@ that fits in a 3B model's context window is the job of
 The naïve approach is to concatenate the top-K chunks in full until the
 budget is exhausted. This works for cloud models and fails for local
 ones, because graph expansion deliberately pulls in chunks the user
-did not ask about — neighbours that provide structural context but
+did not ask about -- neighbours that provide structural context but
 whose bodies are mostly noise. A 3B model handed five full function
 bodies will weight all five equally and produce muddled answers.
 
@@ -203,7 +203,7 @@ result. `graph_depth == 0` hits are *primary*: they matched the query
 directly and their bodies are rendered in full (focus-windowed if
 they are oversized). `graph_depth >= 1` hits are *neighbours*: they
 were pulled in by graph expansion and are rendered as a compact stub
-of the form `[class.]name(signature) — first sentence of docstring`.
+of the form `[class.]name(signature) -- first sentence of docstring`.
 The neighbour entries also carry a `tier=neighbor` annotation so a
 sufficiently sophisticated downstream consumer can re-rank them.
 
@@ -215,20 +215,20 @@ tiers: below 16K, below 64K, below 200K, and 200K or more. A 3B model
 on a 32K-token window gets a tight budget that prioritises one or
 two full primaries and many small neighbour stubs; a frontier cloud
 model on a 1M-token window gets a generous budget that can afford
-several full primaries. The ordering is deterministic — primaries
-first, then neighbours, both in retrieval-rank order — so citations
+several full primaries. The ordering is deterministic -- primaries
+first, then neighbours, both in retrieval-rank order -- so citations
 remain stable across runs and the same query produces the same
 prompt.
 
 `cgx.answer.engine` activates the Code Map automatically: if any hit
 has `graph_depth >= 1`, the tiered builder runs; otherwise the engine
 falls back to the older full-body formatter. There is no flag to set
-and no user intervention required — the activation is purely a
+and no user intervention required -- the activation is purely a
 function of whether graph expansion contributed to the result set.
 
 ---
 
-## Chapter 5 — Talking to the model
+## Chapter 5 -- Talking to the model
 
 The prompt assembled by the Code Map is handed to a provider in
 `cgx.answer.providers`. Three are shipped: `OllamaProvider` for
@@ -243,7 +243,7 @@ interface so the engine never knows which one it is talking to.
 Two cross-cutting concerns wrap every provider call. The first is
 *rate limiting*. `cgx.answer.ratelimit` implements a token-bucket
 limiter plus an exponential-backoff retry for 429 and 5xx responses.
-The numbers — requests per second, max retries — come from the
+The numbers -- requests per second, max retries -- come from the
 profile, so a cloud account with a strict quota can throttle itself
 without leaking the quota into every call site.
 
@@ -277,9 +277,9 @@ them.*
 
 ---
 
-## Chapter 6 — Writing to disk
+## Chapter 6 -- Writing to disk
 
-The model returns a plan — free-form markdown wrapped around fenced
+The model returns a plan -- free-form markdown wrapped around fenced
 `diff path=...` blocks. `cgx.codegen.pipeline.validate_and_test`
 parses those blocks with `parse_fenced_diffs`, applies them in
 memory with `apply_diffs_in_memory`, runs each result through the
@@ -311,8 +311,8 @@ restoring them. The returned dict carries `applied_files`,
 the *Undo* button and `cgx.webui.routes.rollback` exposes
 `POST /api/rollback` to act on it.
 
-Where the plan describes an *insertion* — adding a new method to a
-class, adding a new import, splicing into a specific location —
+Where the plan describes an *insertion* -- adding a new method to a
+class, adding a new import, splicing into a specific location --
 `cgx.codegen.ast_insert` takes over. The orchestrator's
 `suggest_insertion_points` returns line-anchored candidates in the
 form `likely_caller_loc` and `similar_signature_neighbor_loc`,
@@ -330,7 +330,7 @@ packages, translates import names to PyPI distribution names where
 they differ (`PIL` → `Pillow`, `google.generativeai` →
 `google-generativeai`), and pip-installs any genuine misses into
 the project's environment. This means a plan that picks up a new
-dependency does not silently fail with `ImportError` — pytest
+dependency does not silently fail with `ImportError` -- pytest
 receives a working environment and the retry loop sees the *real*
 errors in the new code, not the missing-package noise.
 
@@ -342,7 +342,7 @@ calls `run_pytest_paths` against every discovered test file.
 
 ---
 
-## Chapter 7 — The agent
+## Chapter 7 -- The agent
 
 `cgx.agents.run_agent` ties the pieces of Chapter 6 to the prompt
 machinery of Chapter 5 with a three-component loop: Planner,
@@ -351,7 +351,7 @@ Tracker, Judge.
 ![alt text](images/chapter_7.png)
 
 The **Planner** (`cgx.agents.planner.Planner.plan`) takes a goal
-string and emits a `Plan` — an ordered list of `Task`s, each with
+string and emits a `Plan` -- an ordered list of `Task`s, each with
 a `kind`, a `description`, a `criteria` list the Judge will check,
 and an `inputs` dict the Tracker will hand to the capability. The
 Planner first retrieves a short candidate set against the index
@@ -368,16 +368,16 @@ The ten task kinds are: `ask`, `plan`, `scaffold`,
 `apply`, `verify`, and `fill_logic`. `_enforce_kind_policy` reads
 the goal and routes it down one of four branches. A *scaffold* goal
 (detected via the `_SCAFFOLD_RE` regex, a verb-plus-tech pairing
-through `_TECH_RE`, a skill match from `skills.detect_skills` —
+through `_TECH_RE`, a skill match from `skills.detect_skills` --
 the top-level `skills/` package that holds React, FastAPI, Flask,
 Django, Vue, Tailwind, SQLite, Next.js, Express, and python_cli
-templates — or a literal `scaffold` task from the LLM with no
+templates -- or a literal `scaffold` task from the LLM with no
 existing-codebase hint) becomes `[scaffold_manifest, apply, verify]`,
 where the
 manifest task's runtime output injects one `scaffold_file` task
 per planned file. A *verify-only* goal collapses to a single
 `verify` task. A *read-only* goal collapses to a single `ask` task.
-Every other goal — the ordinary "modify this code" case — seeds a
+Every other goal -- the ordinary "modify this code" case -- seeds a
 single `plan` task and the policy appends `apply` and `verify` so
 the chain always terminates with a real disk write and a real test
 gate. Sequential dependencies are wired between consecutive tasks
@@ -385,7 +385,7 @@ so the UI can render the execution DAG.
 
 The **Tracker** (`cgx.agents.tracker.Tracker`) is a state machine
 that walks the plan task by task. Each task is dispatched on a
-worker thread to its matching capability — `ask` to
+worker thread to its matching capability -- `ask` to
 `answer_with_llm`, `plan` to `generate_code_plan`, `apply` to
 `apply_diffs_to_disk`, `verify` to `run_tests_on_disk`, and so on.
 While a task runs, the Tracker emits a `task_progress` event every
@@ -405,9 +405,9 @@ short-circuits: a `search` task with `hits > 0` passes
 unconditionally; a `plan` task hard-fails only when both `plan_md`
 and `diffs` are absent; a `scaffold` task hard-fails only when no
 files were produced. For these ground-truth-shaped tasks an LLM
-judge would have nothing meaningful to add — pytest's return code
+judge would have nothing meaningful to add -- pytest's return code
 is what it is, and a scaffold either produced source files matching
-the requested stack or it didn't — so the Judge short-circuits
+the requested stack or it didn't -- so the Judge short-circuits
 with the structural verdict. For the remaining cases (an `ask`
 answer's quality, a `plan`'s reasoning) the Judge calls the LLM
 with a strict-JSON `{verdict, confidence, rationale}` prompt and
@@ -423,8 +423,8 @@ buffer rule*, with a `# <-- ERROR HERE` marker so the model cannot
 miss it), and emits a targeted re-plan goal that names exactly the
 broken files and tells the LLM not to touch the files already in
 `plan.owned_files`. `Planner.plan_fix` bypasses the kind-policy
-heuristics — they would route the retry back through SCAFFOLD and
-overwrite files that already passed — and emits the canonical
+heuristics -- they would route the retry back through SCAFFOLD and
+overwrite files that already passed -- and emits the canonical
 `[plan, apply, verify]` triple. Apply failures and Judge
 rejections trigger the same recursive retry, up to `max_retries`
 (default `1`). The loop emits a final `summary` event when it is
@@ -438,18 +438,18 @@ the final `Plan` after the loop has terminated.
 
 ---
 
-## Chapter 8 — The front door
+## Chapter 8 -- The front door
 
 The web UI is a FastAPI app composed in `cgx.webui.server.create_app`
 and served by `uvicorn` on `:8765`. Routes are split per feature
-under `cgx.webui.routes` — `ask`, `plan`, `agent`, `index`, `embed`,
+under `cgx.webui.routes` -- `ask`, `plan`, `agent`, `index`, `embed`,
 `hardware`, `sessions`, `tasks`, `rollback`, `setup`, `profiles`,
-`status` — and a single SPA fallback serves the prebuilt React
+`status` -- and a single SPA fallback serves the prebuilt React
 bundle from `cgx/webui/static` for every non-API URL so React
 Router's client-side routing works on a hard refresh.
 
-The three streaming endpoints — `POST /api/ask`, `POST /api/plan`,
-`POST /api/agent` — share a common pattern. Each registers a row
+The three streaming endpoints -- `POST /api/ask`, `POST /api/plan`,
+`POST /api/agent` -- share a common pattern. Each registers a row
 in the task store, calls the corresponding handler in
 `cgx.webui.handlers` to obtain a synchronous generator of events,
 and wraps that generator with `cgx.webui.sse.bridge_generator`
@@ -467,7 +467,7 @@ operation: `id`, `type` (`ask`/`plan`/`agent`/`index`), `status`
 timestamps, the request payload as JSON, and any error text.
 `task_events` records one row per SSE event with a foreign-key
 `task_id`, an `event_type`, the payload as JSON, and a wall-clock
-timestamp. The schema is plain — no migrations, no ORM — and the
+timestamp. The schema is plain -- no migrations, no ORM -- and the
 indexes are kept to one (`idx_task_events_task_id`) because
 replay reads are the only hot path.
 
@@ -493,13 +493,13 @@ files.
 
 ---
 
-## Chapter 9 — Choosing a model
+## Chapter 9 -- Choosing a model
 
 A user who has never run a local LLM has no way to know whether
 their machine will hold a 7B coder or only a 1.5B chat model.
 `cgx.answer.hardware_matrix` is a static, offline catalogue of
-locally-runnable models — Qwen Coder, Code Llama, Mistral,
-Phi, and friends — annotated with parameter count, minimum RAM,
+locally-runnable models -- Qwen Coder, Code Llama, Mistral,
+Phi, and friends -- annotated with parameter count, minimum RAM,
 recommended VRAM, and context window. `compute_local_fit(hw)`
 takes a hardware probe and returns a verdict per model (`fit`,
 `tight`, `unfit`) plus a reason, sorted by parameter count so the
@@ -517,14 +517,14 @@ hard-coded and the probe is a localhost call.
 
 ---
 
-## Chapter 10 — The trust model
+## Chapter 10 -- The trust model
 
 Everything in the chapters above can be summarised by one
 question: *where does my code go?* The answer in CGX is *nowhere,
 unless you ask it to*.
 
-By default the entire pipeline — parsing, embeddings, FAISS,
-retrieval, prompt assembly, LLM inference, codegen, tests —
+By default the entire pipeline -- parsing, embeddings, FAISS,
+retrieval, prompt assembly, LLM inference, codegen, tests --
 runs on the developer's host. The default provider is Ollama,
 which serves models over `localhost` and never makes outbound
 network calls. The embedding model is downloaded once by Hugging
@@ -536,8 +536,8 @@ indices and JSONL records live wherever the user pointed
 `cgx.telemetry` exposes an opt-in anonymous startup ping that
 is off until the user explicitly enables it.
 
-When a cloud provider is configured — OpenAI-compatible, Gemini,
-or anything served over `OpenAICompatProvider` — only the prompts
+When a cloud provider is configured -- OpenAI-compatible, Gemini,
+or anything served over `OpenAICompatProvider` -- only the prompts
 and snippets needed for the next turn leave the machine. The
 retrieval, the graph expansion, the Code Map assembly, the
 symbol-table context, and the codegen pipeline all run locally;
@@ -556,36 +556,36 @@ The user always has an exit door.
 
 ---
 
-## Chapter 11 — Reading the source
+## Chapter 11 -- Reading the source
 
 For someone landing on the repository for the first time, the
 fastest way to internalise the system is to read the modules in
 the order this book introduces them:
 
 1. `cgx/parser/parse_codebase.py` and `cgx/parser/python_parser.py`
-   — the ingestion entry point and the only registered parser.
-2. `cgx/embeddings/records.py` and `cgx/embeddings/cache.py` —
+   -- the ingestion entry point and the only registered parser.
+2. `cgx/embeddings/records.py` and `cgx/embeddings/cache.py` --
    the two-view corpus builder and the content-addressed cache.
-3. `cgx/graph/build_graph.py` and `cgx/graph/backend.py` — the
+3. `cgx/graph/build_graph.py` and `cgx/graph/backend.py` -- the
    raw NetworkX builder and the facade everyone else uses.
 4. `cgx/retrieval/orchestrator.py`, `cgx/retrieval/tokenize.py`,
-   and `cgx/retrieval/rrf.py` — semantic + lexical + graph fusion,
+   and `cgx/retrieval/rrf.py` -- semantic + lexical + graph fusion,
    the symmetric tokenizer, and the RRF formula.
-5. `cgx/answer/context_map.py` and `cgx/answer/model_caps.py` —
+5. `cgx/answer/context_map.py` and `cgx/answer/model_caps.py` --
    the tiered Code Map and its budget table.
 6. `cgx/answer/engine.py`, `cgx/answer/providers.py`, and
-   `cgx/answer/profiles.py` — the three glue modules between
+   `cgx/answer/profiles.py` -- the three glue modules between
    retrieval and the LLM.
 7. `cgx/codegen/pipeline.py`, `cgx/codegen/disk_apply.py`,
    `cgx/codegen/ast_insert.py`, `cgx/codegen/env_manager.py`, and
-   `cgx/codegen/symbol_map.py` — validate-and-test, the disk
+   `cgx/codegen/symbol_map.py` -- validate-and-test, the disk
    writer with backups, the line-anchored splicer, the preflight
    installer, and the AVAILABLE CONTEXT builder.
 8. `cgx/agents/planner.py`, `cgx/agents/tracker.py`,
-   `cgx/agents/judge.py`, and `cgx/agents/loop.py` — the three
+   `cgx/agents/judge.py`, and `cgx/agents/loop.py` -- the three
    components and the entry point that wires them.
 9. `cgx/webui/server.py`, `cgx/webui/handlers.py`,
-   `cgx/webui/sse.py`, and `cgx/webui/task_store.py` — the
+   `cgx/webui/sse.py`, and `cgx/webui/task_store.py` -- the
    FastAPI app, the SSE bridge, and the SQLite registry that
    makes tab-switch replay possible.
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 """
-S4 — Deterministic record builder and two-view embedding corpus.
+S4 -- Deterministic record builder and two-view embedding corpus.
 
 This module is ADDITIVE and safe: it does not modify existing parse/graph code or
 assume any embedding model. It turns your parsed chunks (+ optional graph) into:
@@ -59,7 +59,7 @@ logger = get_logger(__name__)
 # in a way that requires re-indexing. Readers should reject or rebuild caches
 # whose manifest schema_version is older than this value.
 #
-# v2: Symmetric sub-word tokenizer (cgx.retrieval.tokenize) — camelCase /
+# v2: Symmetric sub-word tokenizer (cgx.retrieval.tokenize) -- camelCase /
 #     PascalCase / snake_case identifiers now expand into their sub-words on
 #     BOTH the indexer side (_split_tokens -> lexical_helpers.ngrams_*) and
 #     the query side (_tokenize_lc, _extract_symbol_tokens). Records from

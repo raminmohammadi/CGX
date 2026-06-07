@@ -226,7 +226,7 @@ def test_generate_code_plan_without_self_test_has_no_codegen_report(mini_index):
         self_test=False,
         embedder=HashEmbedder(dim=32),
     )
-    # report_summary(None) must return None — no KeyError allowed
+    # report_summary(None) must return None -- no KeyError allowed
     from cgx.webui.helpers import report_summary
     assert report_summary(result.get("codegen_report")) is None
 

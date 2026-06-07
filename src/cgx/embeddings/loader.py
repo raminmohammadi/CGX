@@ -4,10 +4,10 @@
 
 Two entry points used by the CLI surfaces:
 
-* :func:`load_embedder_from_spec` — resolve a BYO embedder from a
+* :func:`load_embedder_from_spec` -- resolve a BYO embedder from a
   ``"module:attr"`` import spec (advanced users wiring in their own
   encoder). Honours the ``CGX_EMBEDDER_ALLOWLIST`` env var.
-* :func:`load_embedder_from_model` — build a thin ``.encode``-style
+* :func:`load_embedder_from_model` -- build a thin ``.encode``-style
   wrapper from a Hugging Face / Sentence-Transformers model name,
   reusing the cached model loaders in :mod:`cgx.embeddings.build` so
   repeated calls in the same process do not re-download or re-load
@@ -81,7 +81,7 @@ def load_embedder_from_model(
     instead of re-loading the model.
 
     The returned object exposes ``.encode(list[str]) -> np.ndarray``
-    of dtype ``float32``. Vectors are **not** normalised here — that
+    of dtype ``float32``. Vectors are **not** normalised here -- that
     is the caller's responsibility (the index pipelines apply L2
     normalisation downstream).
     """

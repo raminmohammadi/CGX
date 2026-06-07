@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CGX web UI launcher — boots the FastAPI + React stack."""
+"""CGX web UI launcher -- boots the FastAPI + React stack."""
 
 from __future__ import annotations
 

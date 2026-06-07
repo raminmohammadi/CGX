@@ -16,10 +16,10 @@ Design goals:
 
 Public API:
 
-* :class:`RateLimiter` — token bucket; call ``acquire()`` before a request.
-* :func:`should_retry(response)` — returns True for 429 + 5xx.
-* :func:`backoff_seconds(attempt, response=None)` — derives sleep.
-* :func:`request_with_retry(func, *, limiter, max_retries)` — wraps a
+* :class:`RateLimiter` -- token bucket; call ``acquire()`` before a request.
+* :func:`should_retry(response)` -- returns True for 429 + 5xx.
+* :func:`backoff_seconds(attempt, response=None)` -- derives sleep.
+* :func:`request_with_retry(func, *, limiter, max_retries)` -- wraps a
   callable that returns a ``requests.Response``.
 """
 
@@ -138,7 +138,7 @@ def request_with_retry(
                                attempt, type(e).__name__, e)
                 raise
             delay = backoff_seconds(attempt)
-            logger.info("ratelimit: attempt %d raised %s: %s — retrying in %.2fs",
+            logger.info("ratelimit: attempt %d raised %s: %s -- retrying in %.2fs",
                         attempt, type(e).__name__, e, delay)
             sleep(delay)
             continue
@@ -151,7 +151,7 @@ def request_with_retry(
         except Exception:
             retry_after = None
         delay = backoff_seconds(attempt, retry_after=retry_after)
-        logger.info("ratelimit: attempt %d returned status=%d — retrying in %.2fs "
+        logger.info("ratelimit: attempt %d returned status=%d -- retrying in %.2fs "
                     "(Retry-After=%r)", attempt, sc, delay, retry_after)
         sleep(delay)
     if last_exc is not None:

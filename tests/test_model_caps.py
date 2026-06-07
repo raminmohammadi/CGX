@@ -73,7 +73,7 @@ def test_provider_model_name_none_when_provider_or_model_missing():
 # get_summary_budget tiers
 # ---------------------------------------------------------------------------
 def test_budget_tier_tiny_local():
-    # Llama 3 base, Gemma — 8K window.
+    # Llama 3 base, Gemma -- 8K window.
     b = get_summary_budget(_Prov("llama3"))
     assert b == {"max_chars": 400, "max_files": 12, "output_tokens": 2_000}
 
@@ -85,13 +85,13 @@ def test_budget_tier_mid_local():
 
 
 def test_budget_tier_large_cloud():
-    # GPT-4o / Llama 3.1 — 128K.
+    # GPT-4o / Llama 3.1 -- 128K.
     b = get_summary_budget(_Prov("gpt-4o"))
     assert b == {"max_chars": 1_500, "max_files": 60, "output_tokens": 6_000}
 
 
 def test_budget_tier_huge_cloud():
-    # Gemini 2.5 — 1M, Claude — 200K. Both should land in the top tier.
+    # Gemini 2.5 -- 1M, Claude -- 200K. Both should land in the top tier.
     b_gem = get_summary_budget(_Prov("gemini-2.5-flash"))
     b_claude = get_summary_budget(_Prov("claude-3-5-sonnet"))
     assert b_gem == {"max_chars": 3_000, "max_files": 120,
@@ -118,7 +118,7 @@ class _RecordingProvider:
         self._content = content
         self.calls: List[Dict[str, Any]] = []
 
-    def chat(self, messages, **kw):  # noqa: ANN001 — duck type
+    def chat(self, messages, **kw):  # noqa: ANN001 -- duck type
         self.calls.append({"messages": messages, **kw})
         return {"content": self._content}
 

@@ -1,15 +1,15 @@
-"""CGX Skills — pluggable technology-specific knowledge bundles.
+"""CGX Skills -- pluggable technology-specific knowledge bundles.
 
 A *skill* encapsulates everything CGX knows about one technology
 (framework, language runtime, library, build tool). Skills are
 consulted by:
 
-* :mod:`cgx.agents.planner` — to decide whether a goal describes a
+* :mod:`cgx.agents.planner` -- to decide whether a goal describes a
   scaffold/change involving a known technology (the new
   scaffold-detection signal).
-* :mod:`cgx.answer.engine` — to compose technology-specific
+* :mod:`cgx.answer.engine` -- to compose technology-specific
   instructions into the LLM system prompt for scaffold + plan tasks.
-* :mod:`cgx.agents.judge` — to run technology-specific structural
+* :mod:`cgx.agents.judge` -- to run technology-specific structural
   checks on produced diffs.
 
 Skills are listed explicitly in :data:`SKILLS` so the surface is

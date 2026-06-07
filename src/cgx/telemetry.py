@@ -35,7 +35,7 @@ from typing import Optional
 CONFIG_DIR = Path(os.environ.get("CGX_CONFIG_DIR", str(Path.home() / ".cgx")))
 INSTALL_ID_PATH = CONFIG_DIR / "install_id"
 
-# Default endpoint is intentionally empty — telemetry is a self-hosted
+# Default endpoint is intentionally empty -- telemetry is a self-hosted
 # extension point. Set ``CGX_TELEMETRY_URL`` to your collector to enable.
 DEFAULT_ENDPOINT = ""
 

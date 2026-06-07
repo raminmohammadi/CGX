@@ -1,4 +1,4 @@
-"""Phase 9 — reranker profile policy.
+"""Phase 9 -- reranker profile policy.
 
 Covers:
 

@@ -60,7 +60,7 @@ def test_detect_react_native_does_not_fire_react():
 
 def test_detect_python_cli_skips_when_web_framework_mentioned():
     # A goal that names both "python CLI" and "FastAPI" should route to
-    # FastAPI, not the CLI skill — the CLI skill abstains on web mentions.
+    # FastAPI, not the CLI skill -- the CLI skill abstains on web mentions.
     detected = [s.name for s in skills.detect_skills(
         "build a python CLI tool that wraps a FastAPI service")]
     assert "fastapi" in detected

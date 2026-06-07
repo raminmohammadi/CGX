@@ -52,7 +52,7 @@ def test_load_jsonl_skips_non_dict_lines(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Indices (rows-only path — FAISS may be absent in test env)
+# Indices (rows-only path -- FAISS may be absent in test env)
 # ---------------------------------------------------------------------------
 def test_save_and_load_indices_writes_rows_and_meta(tmp_path):
     indices = {
@@ -115,7 +115,7 @@ def test_save_and_load_graph_json_roundtrips_nodes_and_edges(tmp_path):
 
 @pytest.mark.skipif(not _NX, reason="networkx not installed")
 def test_load_graph_json_supports_links_key_for_backwards_compat(tmp_path):
-    # Older artifacts use "links" instead of "edges" — both must load.
+    # Older artifacts use "links" instead of "edges" -- both must load.
     data = {
         "directed": True, "multigraph": False, "graph": {},
         "nodes": [{"id": "a"}, {"id": "b"}],

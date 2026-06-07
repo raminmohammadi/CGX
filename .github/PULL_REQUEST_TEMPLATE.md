@@ -1,6 +1,6 @@
 <!-- Thanks for contributing to CGX! Please keep PRs focused: one
 feature / fix / refactor per PR. The Skills Registry is the primary
-plug-and-play surface — see CONTRIBUTING.md for the protocol. -->
+plug-and-play surface -- see CONTRIBUTING.md for the protocol. -->
 
 ## Summary
 
@@ -25,7 +25,7 @@ Mirrors the contributor checklist in [`CONTRIBUTING.md`](../CONTRIBUTING.md):
 - [ ] New code paths include a test (skills, codegen, agents,
       retrieval, sessions, etc.).
 - [ ] No top-level imports of `torch`, `transformers`, or
-      `sentence_transformers` inside `src/cgx/` — keep them lazy
+      `sentence_transformers` inside `src/cgx/` -- keep them lazy
       inside function scopes so the core install stays torch-free.
 - [ ] No secrets (API keys, bearer tokens) appear in commits, logs,
       SSE payloads, or test fixtures.
@@ -39,4 +39,4 @@ Mirrors the contributor checklist in [`CONTRIBUTING.md`](../CONTRIBUTING.md):
 
 <!-- Drop UI screenshots, terminal output, or SSE traces here when
 they help reviewers understand the change. Never paste real API keys
-or production logs — scrub anything that looks like a credential. -->
+or production logs -- scrub anything that looks like a credential. -->
