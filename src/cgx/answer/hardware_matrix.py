@@ -2,7 +2,7 @@
 
 """Static hardware-vs-model matrix and local-vs-cloud trade-offs.
 
-The data here is intentionally offline — no network calls, no model
+The data here is intentionally offline -- no network calls, no model
 downloads. It augments :mod:`cgx.answer.ollama_discovery` (which holds a
 small "recommended ladder") with a wider catalogue of locally-runnable
 models so the UI can show users at a glance which models will fit on

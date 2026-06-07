@@ -55,7 +55,7 @@ def stream_index(
     metric: str, index_type: str, zip_path: Optional[str],
     cancel_event=None,
 ) -> Iterator[Event]:
-    """Index build — yields ``progress`` then a terminal ``result`` event."""
+    """Index build -- yields ``progress`` then a terminal ``result`` event."""
     logger.info("stream_index: starting project_root=%r out_dir=%r model=%s",
                 project_root, out_dir, embed_model)
     try:
@@ -154,7 +154,7 @@ def stream_ask(
     # thinking phase, which leaks into the UI's THINKING panel.
     sketch_system = (
         "You are a senior codebase assistant sketching out how you will "
-        "answer the user's question. Reply with brief PLAIN PROSE only — "
+        "answer the user's question. Reply with brief PLAIN PROSE only -- "
         "no JSON, no markdown code fences, no citations, no final answer. "
         "Keep it under five sentences and focus on what you'll look for "
         "and how you'll structure the response."

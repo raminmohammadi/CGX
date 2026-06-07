@@ -113,7 +113,7 @@ def test_unknown_kind_returns_empty():
 
 def test_gemini_http_error_falls_back_without_leaking_key():
     # An API call that 4xx's should never crash the endpoint nor expose the
-    # key — the dropdown stays populated from the static fallback.
+    # key -- the dropdown stays populated from the static fallback.
     err_resp = _FakeResp({}, status_code=404)
     err_resp.content = b""
     with patch("requests.get", return_value=err_resp):

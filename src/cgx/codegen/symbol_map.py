@@ -5,11 +5,11 @@
 Builds a compressed map of available symbols from the JSONL records file
 (the same artefact used by the retrieval layer) and provides:
 
-  1. :func:`build_symbol_map`   — file → [symbol, …] dictionary
-  2. :func:`format_symbol_map`  — compact prompt block injected before
+  1. :func:`build_symbol_map`   -- file → [symbol, …] dictionary
+  2. :func:`format_symbol_map`  -- compact prompt block injected before
                                   APPLY / FILL_LOGIC tasks so the SLM
                                   knows what is already defined
-  3. :func:`fetch_symbol_source` — AST-RAG on demand: returns the exact
+  3. :func:`fetch_symbol_source` -- AST-RAG on demand: returns the exact
                                   source snippet for a symbol when the
                                   retry loop catches a wrong-arguments
                                   failure

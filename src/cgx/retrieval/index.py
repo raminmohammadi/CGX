@@ -53,7 +53,7 @@ class ViewSlice:
       - ids:     np.ndarray[int64], FAISS ids aligned to rows (0..len(rows)-1)
       - index:   the ANN index returned by your builder
       - meta:    meta dict returned by your builder (metric, normalized flags, etc.)
-      - dim:     embedding dimension (if provided by meta) — optional
+      - dim:     embedding dimension (if provided by meta) -- optional
     """
     rows: List[Dict[str, Any]]
     ids: np.ndarray

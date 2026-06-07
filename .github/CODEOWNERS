@@ -22,6 +22,6 @@
 # Frontend (Vite/React SPA bundled into src/cgx/webui/static/).
 /frontend/                       @raminmohammadi
 
-# Security-sensitive paths — credentials, profile store, scrubbers.
+# Security-sensitive paths -- credentials, profile store, scrubbers.
 /src/cgx/answer/profiles.py      @raminmohammadi
 /src/cgx/answer/providers.py     @raminmohammadi

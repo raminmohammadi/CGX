@@ -136,7 +136,7 @@ def test_format_neighbor_stub_drops_missing_components():
     rec = {"name": "save", "signature": "(p)", "doc_first_sentence": ""}
     assert format_neighbor_stub(rec, "save") == "save(p)"
     rec = {"name": "save", "signature": "", "doc_first_sentence": "Persist data."}
-    assert format_neighbor_stub(rec, "save") == "save — Persist data."
+    assert format_neighbor_stub(rec, "save") == "save -- Persist data."
 
 
 def test_format_neighbor_stub_falls_back_to_symbol():
@@ -167,7 +167,7 @@ def test_load_records_by_id_missing_path_returns_empty():
 
 
 # ---------------------------------------------------------------------------
-# build_tiered_context — wiring & invariants
+# build_tiered_context -- wiring & invariants
 # ---------------------------------------------------------------------------
 def test_build_tiered_context_orders_primary_before_neighbor(synth_corpus):
     cmap, records, hits = synth_corpus

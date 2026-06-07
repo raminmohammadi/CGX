@@ -112,7 +112,7 @@ def _shorten_chunk_refs(text: str, root: Optional[str]) -> str:
     Chunk ids are absolute paths internally (``/home/alice/repo/foo.py::cls::Bar``).
     Citations in ``answer_md`` are rendered to the user verbatim, which makes
     the prefix both noisy and a small privacy leak. Stripping is purely
-    cosmetic — ``citations`` and ``debug.sources`` still carry the full ids.
+    cosmetic -- ``citations`` and ``debug.sources`` still carry the full ids.
     """
     if not text or not root:
         return text or ""
@@ -382,7 +382,7 @@ def _parse_plan_freeform(text: str) -> Dict[str, Any]:
     if m:
         plan_md = m.group(1).strip()
     else:
-        # No section header — strip fenced diff blocks and treat the rest as plan.
+        # No section header -- strip fenced diff blocks and treat the rest as plan.
         plan_md = _DIFF_FENCE_RE.sub("", text).strip()
 
     diffs: List[Dict[str, str]] = []
@@ -744,7 +744,7 @@ def answer_with_llm(
             focus_terms=focus_terms or None,
         )
 
-    # Require target coverage — only for symbol-targeted modes, and only when
+    # Require target coverage -- only for symbol-targeted modes, and only when
     # target was set by a real index match. Conceptual modes like ``howto`` /
     # ``overview`` / ``change_plan`` extract incidental tokens (e.g. ``encode``
     # from "how to encode images") that are best-effort focus hints, not
@@ -1172,22 +1172,22 @@ _SCAFFOLD_SYSTEM = (
     "  ],\n"
     '  "confidence": 0.8\n'
     "}\n\n"
-    "Path discipline (CRITICAL — read carefully):\n"
+    "Path discipline (CRITICAL -- read carefully):\n"
     "- The deployment directory IS the project root. Emit paths RELATIVE to it.\n"
     "- NEVER prepend a top-level project folder. WRONG: 'calculator/src/App.jsx', "
     "'my-project/backend/app.py'. RIGHT: 'src/App.jsx', 'backend/app.py'.\n"
     "- Use this canonical layout so sibling scaffold tasks (UI + backend + tests) "
     "share one coherent tree:\n"
-    "    src/        — frontend source OR main code for single-language projects\n"
-    "    backend/    — Python/Node backend service (only when the project has a "
+    "    src/        -- frontend source OR main code for single-language projects\n"
+    "    backend/    -- Python/Node backend service (only when the project has a "
     "separate backend distinct from the frontend in src/)\n"
-    "    tests/      — ALL test files live here (test_*.py for Python, *.test.jsx "
-    "or *.test.ts for JS/TS). REQUIRED — every scaffold MUST emit at least one "
+    "    tests/      -- ALL test files live here (test_*.py for Python, *.test.jsx "
+    "or *.test.ts for JS/TS). REQUIRED -- every scaffold MUST emit at least one "
     "test file covering its primary logic.\n"
-    "    public/     — static assets (index.html, favicons) for frontend projects\n"
+    "    public/     -- static assets (index.html, favicons) for frontend projects\n"
     "- All paths must be lowercase-with-underscores or kebab-case. No spaces.\n"
     "Requirements:\n"
-    "- content: complete, working file content — NOT stubs or placeholders\n"
+    "- content: complete, working file content -- NOT stubs or placeholders\n"
     "- CRITICAL: If the goal names a specific technology or framework (React, Vue, Angular, "
     "FastAPI, Flask, Django, Express, etc.), you MUST use ONLY that technology. "
     "Do NOT mix in other frameworks or substitute a different one.\n"
@@ -1205,7 +1205,7 @@ _SCAFFOLD_SYSTEM = (
     "  * Include src/index.js or src/main.jsx as the React/Vue entry point\n"
     "  * Tests go under tests/ as <Component>.test.jsx using Jest + "
     "@testing-library/react conventions.\n"
-    "  * Do NOT generate webpack.config.js, babel.config.js, or other build tooling — "
+    "  * Do NOT generate webpack.config.js, babel.config.js, or other build tooling -- "
     "use Create React App (react-scripts) or Vite conventions instead\n"
     "  * Do NOT include conftest.py, requirements.txt, or any Python files\n"
     "- For PYTHON projects only: include a conftest.py at the project root "
@@ -1214,7 +1214,7 @@ _SCAFFOLD_SYSTEM = (
     "  Test files must import from module names as they exist under src/ "
     "(e.g. 'from main import app', not 'from src.main import app').\n"
     "- Generate production-quality code with proper error handling and type hints where idiomatic.\n"
-    "- Do NOT use TODO, FIXME, or placeholder comments — write the real code.\n"
+    "- Do NOT use TODO, FIXME, or placeholder comments -- write the real code.\n"
     "- Do not include prose outside JSON.\n"
 )
 
@@ -1233,11 +1233,11 @@ _SCAFFOLD_FREEFORM_SYSTEM = (
     "- Paths are RELATIVE to the project root. NEVER prepend a top-level project "
     "folder. WRONG: 'calculator/src/App.jsx'. RIGHT: 'src/App.jsx'.\n"
     "- Canonical layout shared with sibling tasks: src/ (frontend or main code), "
-    "backend/ (Python backend when distinct), tests/ (REQUIRED — at least one "
+    "backend/ (Python backend when distinct), tests/ (REQUIRED -- at least one "
     "test file per scaffold), public/ (static assets).\n"
     "Rules:\n"
     "- Use any language tag (python, javascript, jsx, tsx, text, yaml, toml, etc.) followed by path=<relative/path>\n"
-    "- Generate complete, working code — not stubs\n"
+    "- Generate complete, working code -- not stubs\n"
     "- Include README.md and the appropriate dependency file for the technology\n"
     "- Emit at least one real test file under tests/ exercising the main logic.\n"
     "- Use relative POSIX paths only\n"
@@ -1291,7 +1291,7 @@ def _normalize_scaffold_path(path: str, existing_files: Optional[List[str]]) -> 
     if not path:
         return path
     # Strip a literal "./" prefix and leading slashes, but NOT a bare
-    # leading "." — otherwise dotfiles like ".env.example" / ".gitignore"
+    # leading "." -- otherwise dotfiles like ".env.example" / ".gitignore"
     # lose their leading dot and stop being dotfiles on disk.
     p = path.replace("\\", "/")
     while p.startswith("./"):
@@ -1374,7 +1374,7 @@ def _extension_content_mismatch(path: str, ext: str, content: str) -> Optional[s
         if has_vue_tpl or has_vue_import:
             return (f"{ext} file contains Vue SFC syntax "
                     "(<template> / import from 'vue').")
-        # A .jsx/.tsx file must look like React — at minimum it should
+        # A .jsx/.tsx file must look like React -- at minimum it should
         # mention React or export a component. A 3B model occasionally
         # emits a plain HTML document under .jsx; catch that.
         is_html_doc = lc.lstrip().startswith(("<!doctype", "<html"))
@@ -1383,7 +1383,7 @@ def _extension_content_mismatch(path: str, ext: str, content: str) -> Optional[s
             or has_react_jsx_export
             or "export default" in lc
             or "export {" in lc        # named exports: export { App }
-            or "return <" in lc        # JSX return statement — strong React indicator
+            or "return <" in lc        # JSX return statement -- strong React indicator
         )
         if is_html_doc or not has_react_signal:
             return (f".{ext} file does not look like React "
@@ -1426,7 +1426,7 @@ def _extension_content_mismatch(path: str, ext: str, content: str) -> Optional[s
                         "(document.*, addEventListener, …).")
     if ext in ("css", "scss", "sass", "less"):
         # The model occasionally leaks the file's extension as the first
-        # token (".css\nbody { … }"). Reject that pattern — a real
+        # token (".css\nbody { … }"). Reject that pattern -- a real
         # stylesheet starts with a selector, @rule, or a comment.
         stripped = content.lstrip()
         first_line = stripped.splitlines()[0].strip() if stripped else ""
@@ -1448,7 +1448,7 @@ def generate_project_scaffold(
     """Generate a complete new project from a plain-language idea.
 
     Unlike :func:`generate_code_plan`, this function does not need an
-    existing index — it generates all project files from scratch using
+    existing index -- it generates all project files from scratch using
     the LLM alone.  The returned ``diffs`` list uses ``--- /dev/null``
     new-file unified diffs so the existing ``apply_diffs_to_disk``
     pipeline can write them to ``project_root`` without any special
@@ -1514,7 +1514,7 @@ def generate_project_scaffold(
     else:
         parts.append(f"PROJECT IDEA:\n{idea_clean}")
     if existing_files:
-        # Cap the list — local models can't reason over 200+ paths and the
+        # Cap the list -- local models can't reason over 200+ paths and the
         # context window starts to crowd the actual instructions.
         listed = "\n".join(f"- {p}" for p in list(existing_files)[:60])
         parts.append(
@@ -1573,7 +1573,7 @@ def generate_project_scaffold(
 
 _MANIFEST_SYSTEM = (
     "You are a senior software architect planning a new project.\n\n"
-    "Your job is to OUTPUT ONLY A FILE MANIFEST — paths and one-line descriptions. "
+    "Your job is to OUTPUT ONLY A FILE MANIFEST -- paths and one-line descriptions. "
     "Do NOT write any file contents.\n\n"
     "Return strict JSON only:\n"
     "{\n"
@@ -1605,7 +1605,7 @@ def plan_scaffold_manifest(
     skills: Optional[List[str]] = None,
     existing_files: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """Return a file manifest for a new project — paths and descriptions only, no content.
+    """Return a file manifest for a new project -- paths and descriptions only, no content.
 
     This is the lightweight first step of the manifest-first scaffold flow.
     The returned ``layers`` list is consumed by ``loop.py`` to dynamically
@@ -1642,7 +1642,7 @@ def plan_scaffold_manifest(
         parts.append(f"PROJECT IDEA:\n{idea_clean}")
     if existing_files:
         listed = "\n".join(f"- {p}" for p in list(existing_files)[:60])
-        parts.append("EXISTING FILES (already planned — do NOT repeat):\n" + listed)
+        parts.append("EXISTING FILES (already planned -- do NOT repeat):\n" + listed)
 
     def _call(user_msg: str) -> Dict[str, Any]:
         # Manifest generation is a structural step validated by a
@@ -1660,7 +1660,7 @@ def plan_scaffold_manifest(
             force_json=True,
         )
         if isinstance(resp, dict) and resp.get("error"):
-            logger.warning("plan_scaffold_manifest: provider returned error — %s",
+            logger.warning("plan_scaffold_manifest: provider returned error -- %s",
                            resp.get("error"))
         raw = (resp or {}).get("content", "") if isinstance(resp, dict) else ""
         return _extract_json_object(raw) or {}
@@ -1683,7 +1683,7 @@ def plan_scaffold_manifest(
         retry_context = f"PROJECT IDEA:\n{idea_clean[:600]}"
         if existing_files:
             listed = "\n".join(f"- {p}" for p in list(existing_files)[:60])
-            retry_context += "\n\nEXISTING FILES (already planned — do NOT repeat):\n" + listed
+            retry_context += "\n\nEXISTING FILES (already planned -- do NOT repeat):\n" + listed
         parsed = _call(retry_context)
     if not parsed or not isinstance(parsed.get("layers"), list):
         # Fallback: a single generic layer so the flow can still proceed.
@@ -1810,7 +1810,7 @@ def _inject_python_package_inits(layers: List[Any]) -> List[Any]:
 
     Small models emit ``backend/calculator.py`` but forget the package
     marker, which makes ``from backend.calculator import add`` work only
-    under Python 3 namespace-package discovery — and pytest's rootdir
+    under Python 3 namespace-package discovery -- and pytest's rootdir
     inference fails on that path when no ``conftest.py`` is present.
     Adding an explicit ``__init__.py`` for every package directory
     turns the layout into regular packages so imports resolve reliably
@@ -1972,12 +1972,12 @@ _SINGLE_FILE_SYSTEM = (
     "Return strict JSON:\n"
     '{"content": "complete file content as a string"}\n\n'
     "Rules:\n"
-    "- Output the full file — no stubs, no placeholders, no ellipsis.\n"
+    "- Output the full file -- no stubs, no placeholders, no ellipsis.\n"
     "- Use imports consistent with what already exists in the project.\n"
     "- Do not repeat or regenerate any already-existing file.\n"
     "- The content MUST be functionally different from every file in "
     "ALREADY GENERATED FILES. Do NOT copy another file's body and rename "
-    "the export — write the unique content that fulfils THIS file's "
+    "the export -- write the unique content that fulfils THIS file's "
     "purpose. If the requested purpose duplicates an already-generated "
     "file, return {\"content\": \"\"} instead.\n"
     "- Satisfy the file's stated purpose exactly.\n"
@@ -1996,7 +1996,7 @@ _SINGLE_FILE_SYSTEM = (
     "`from src.models.user import User`.\n"
     "- Relative imports (`from .foo import bar`) are OK between modules in "
     "the same subpackage, but NEVER use them inside a script that may be "
-    "launched directly (streamlit run, python src/app.py, etc.) — those "
+    "launched directly (streamlit run, python src/app.py, etc.) -- those "
     "scripts run as __main__ and have no parent package.\n"
 )
 
@@ -2175,8 +2175,8 @@ def generate_single_scaffold_file(
 
     # Deterministic short-circuit for root-level ``conftest.py``: emitted
     # by ``_inject_required_manifest_files`` for Python projects that use
-    # the src/ layout. Its job is fixed and one-line — prepend src/ to
-    # sys.path — so we generate it without an LLM round-trip to avoid the
+    # the src/ layout. Its job is fixed and one-line -- prepend src/ to
+    # sys.path -- so we generate it without an LLM round-trip to avoid the
     # model writing test stubs into it or omitting the sys.path insert.
     if path == "conftest.py":
         content = (

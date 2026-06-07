@@ -3,7 +3,7 @@
 """Planner: decompose a user goal into a sequence of agent tasks.
 
 The Planner prefers the LLM for plan generation but always returns a
-useful plan even when no LLM is available — the deterministic fallback
+useful plan even when no LLM is available -- the deterministic fallback
 inspects the goal text via the existing intent classifier and emits a
 single-task plan that matches the legacy single-shot behaviour.
 """
@@ -49,8 +49,8 @@ def _detected_skill_names(goal: str) -> List[str]:
 def _goal_has_supported_skill(goal: str) -> bool:
     """True when at least one non-style skill fires on *goal*.
 
-    Style-only skills (Tailwind) cannot stand alone — they require a
-    frontend host — so they're not strong enough on their own to flip
+    Style-only skills (Tailwind) cannot stand alone -- they require a
+    frontend host -- so they're not strong enough on their own to flip
     the routing decision to SCAFFOLD.
     """
     if _skills is None or not goal:
@@ -78,25 +78,25 @@ SYSTEM_PROMPT = (
     "  ]\n"
     "}\n\n"
     "Task kinds (pick the cheapest that satisfies the goal):\n"
-    "- 'search'    — retrieve relevant code/files from the index. Use this "
+    "- 'search'    -- retrieve relevant code/files from the index. Use this "
     "first whenever the goal references a file, symbol, or behaviour to "
     "inspect.\n"
-    "- 'ask'       — answer a natural-language question grounded in the "
+    "- 'ask'       -- answer a natural-language question grounded in the "
     "indexed code. Use for 'what / how / why / where / explain / describe' "
     "goals.\n"
-    "- 'summarize' — condense the outputs of previous tasks into a brief "
+    "- 'summarize' -- condense the outputs of previous tasks into a brief "
     "human summary. Cheap; use as the final step for read-only goals.\n"
-    "- 'verify'    — run the project's pytest suite against the working "
+    "- 'verify'    -- run the project's pytest suite against the working "
     "tree and report pass/fail. Use when the goal asks to run tests / "
     "check whether tests pass / verify the suite, with no code change.\n"
-    "- 'plan'      — produce a code-change diff. ONLY use when the goal "
+    "- 'plan'      -- produce a code-change diff. ONLY use when the goal "
     "explicitly asks to add / implement / modify / refactor / fix / change "
     "/ update / remove / rename / replace / ensure / complete / fill code "
     "in an EXISTING codebase. "
     "NEVER use 'plan' for explanation, summarisation, or read-only "
-    "inspection — it is the most expensive kind and must not run unless "
+    "inspection -- it is the most expensive kind and must not run unless "
     "code is being written.\n"
-    "- 'scaffold'  — generate files for a brand-new project (no existing "
+    "- 'scaffold'  -- generate files for a brand-new project (no existing "
     "codebase). 'apply' and 'verify' are always appended automatically.\n"
     "  Simple projects (1–3 files total) → ONE scaffold task.\n"
     "  Complex projects (UI + backend + tests + config) → 2–4 scaffold "
@@ -751,7 +751,7 @@ class Planner:
             logger.warning("Planner: LLM returned non-dict response: %r", type(resp).__name__)
             return []
         if resp.get("error"):
-            logger.warning("Planner: LLM returned error — %s", resp.get("error"))
+            logger.warning("Planner: LLM returned error -- %s", resp.get("error"))
             return []
         data = _extract_json(str(resp.get("content") or ""))
         if not isinstance(data, dict):
@@ -787,7 +787,7 @@ class Planner:
 
         Read-only goals collapse to a single ``ask`` task; verify-only
         goals collapse to a single ``verify`` task; code-change goals
-        seed a single ``plan`` task — :meth:`_enforce_kind_policy` then
+        seed a single ``plan`` task -- :meth:`_enforce_kind_policy` then
         appends the ``apply`` and ``verify`` follow-ups so the chain
         always terminates with a real-disk write + test gate.
         """

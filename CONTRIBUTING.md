@@ -1,7 +1,7 @@
 # Contributing to CGX
 
 Thanks for your interest in CGX (Code Graph eXecution). This guide
-covers the day-to-day developer workflow and the **Skills Registry** —
+covers the day-to-day developer workflow and the **Skills Registry** --
 the primary, plug-and-play contribution surface.
 
 ## Local setup
@@ -21,13 +21,13 @@ reranker stack locally.
 
 ## Project layout
 
-- `src/cgx/` — runtime library (`agents/`, `answer/`, `codegen/`,
+- `src/cgx/` -- runtime library (`agents/`, `answer/`, `codegen/`,
   `embeddings/`, `retrieval/`, `pipeline/`, `webui/`, `cli/`).
-- `skills/` — pluggable per-technology bundles consumed by
+- `skills/` -- pluggable per-technology bundles consumed by
   `cgx.agents.planner`, `cgx.answer.engine`, and `cgx.agents.judge`.
-- `frontend/` — React/Vite SPA bundled into `src/cgx/webui/static/`.
-- `extension/` — VS Code webview extension scaffold.
-- `tests/` — pytest suite (mirrors `src/cgx/` package structure).
+- `frontend/` -- React/Vite SPA bundled into `src/cgx/webui/static/`.
+- `extension/` -- VS Code webview extension scaffold.
+- `tests/` -- pytest suite (mirrors `src/cgx/` package structure).
 
 ## Adding a new Skill
 
@@ -83,7 +83,7 @@ class SvelteSkill(Skill):
 Append an instance to `SKILLS` in
 [`skills/__init__.py`](skills/__init__.py); also import the class at
 the top of that file. The registry order only affects diagnostic
-logging — multi-skill goals (*"React UI + FastAPI backend"*) activate
+logging -- multi-skill goals (*"React UI + FastAPI backend"*) activate
 every matching skill.
 
 ### 3. Test the skill
@@ -102,7 +102,7 @@ Run `pytest tests/test_skills_<name>.py -q` before opening a PR.
 
 - **No agent-layer edits.** A new skill must not require changes to
   `cgx.agents.*` or `cgx.answer.engine`. If you find yourself doing
-  that, the abstraction is missing — open an issue first.
+  that, the abstraction is missing -- open an issue first.
 - **Validators are structural, not stylistic.** A failing verdict
   should mean *"the output cannot possibly satisfy this technology"*,
   not *"the code style is wrong"*. Use `severity="warning"` for
@@ -117,7 +117,7 @@ Run `pytest tests/test_skills_<name>.py -q` before opening a PR.
 - [ ] New code paths include a test (skills, codegen, agents,
   retrieval, sessions, etc.).
 - [ ] No top-level imports of `torch`, `transformers`, or
-  `sentence_transformers` inside `src/cgx/` — keep them lazy inside
+  `sentence_transformers` inside `src/cgx/` -- keep them lazy inside
   function scopes so the core install stays torch-free.
 - [ ] No secrets (API keys, bearer tokens) appear in commits,
   logs, SSE payloads, or test fixtures.
@@ -132,7 +132,7 @@ adding code that touches that path:
 
 - Never echo a secret value through a tool argument, log line, SSE
   payload, or error message.
-- Scrub Gemini-style `?key=...` URLs before propagating exceptions —
+- Scrub Gemini-style `?key=...` URLs before propagating exceptions --
   see `GeminiProvider._scrub_secret` in
   [`src/cgx/answer/providers.py`](src/cgx/answer/providers.py).
 - Use `os.open(..., 0o600)` (not `Path.write_text` followed by

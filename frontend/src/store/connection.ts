@@ -43,7 +43,7 @@ export const useConnection = create<ConnectionState>((set, get) => ({
     } catch (e: any) {
       const failures = get().consecutiveFailures + 1;
       set({
-        // One transient failure shouldn't show the banner — wait for two.
+        // One transient failure shouldn't show the banner -- wait for two.
         offline: failures >= 2,
         error: String(e?.message || e),
         lastCheck: Date.now(),
@@ -54,7 +54,7 @@ export const useConnection = create<ConnectionState>((set, get) => ({
   },
 }));
 
-// Module-level poller — owned by whichever component calls startConnectionPoller().
+// Module-level poller -- owned by whichever component calls startConnectionPoller().
 // We deliberately keep this outside React so StrictMode re-mounts don't double-poll.
 let pollerHandle: ReturnType<typeof setTimeout> | null = null;
 let pollerActive = false;
@@ -71,7 +71,7 @@ function scheduleNext() {
 
 export function startConnectionPoller(): () => void {
   if (pollerActive) {
-    // Already polling — just return a no-op disposer for the new caller.
+    // Already polling -- just return a no-op disposer for the new caller.
     return () => {};
   }
   pollerActive = true;

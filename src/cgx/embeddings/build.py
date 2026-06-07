@@ -4,7 +4,7 @@
 
 Heavy ML dependencies (``torch``, ``transformers``, ``sentence_transformers``)
 are imported lazily inside :func:`build_embeddings` so that simply importing
-this module — or any module that re-exports it (e.g. ``cgx.pipeline.auto``) —
+this module -- or any module that re-exports it (e.g. ``cgx.pipeline.auto``) --
 does not require the full ML stack. This keeps the UI and API-only providers
 usable on machines without a local embedder installed.
 """

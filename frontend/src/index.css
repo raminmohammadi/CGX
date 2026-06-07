@@ -1,6 +1,19 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
+@config "../tailwind.config.js";
+
+/* Custom utilities registered with the v4 `@utility` directive so that
+   the `.av-*-<variant>` classes below can `@apply` them. Putting them
+   inside `@layer components` (the v3 idiom) no longer works because v4
+   only permits `@apply` on first-party utilities or `@utility`-defined
+   names. */
+@utility av-pill {
+  @apply inline-flex items-center gap-1 px-2 py-0.5 rounded font-mono text-[10px] font-semibold;
+}
+
+@utility av-btn {
+  @apply inline-flex items-center gap-1.5 rounded text-xs font-semibold transition px-3 py-1.5
+         disabled:opacity-50 disabled:cursor-not-allowed;
+}
 
 @layer base {
   :root {
@@ -34,7 +47,7 @@
 }
 
 @layer components {
-  /* Premium minimal card border — picks up neon glow on focus-within. */
+  /* Premium minimal card border -- picks up neon glow on focus-within. */
   .av-card {
     @apply rounded-xl border border-muted bg-surface transition;
     transition: border-color 0.25s cubic-bezier(0.4, 0, 0.2, 1),
@@ -60,9 +73,6 @@
     color: #34d399;
   }
 
-  .av-pill {
-    @apply inline-flex items-center gap-1 px-2 py-0.5 rounded font-mono text-[10px] font-semibold;
-  }
   .av-pill-neon {
     @apply av-pill bg-emerald-500/10 text-emerald-400 border border-emerald-500/20;
   }
@@ -76,10 +86,6 @@
     @apply av-pill bg-slate-800 text-slate-400 border border-white/5;
   }
 
-  .av-btn {
-    @apply inline-flex items-center gap-1.5 rounded text-xs font-semibold transition px-3 py-1.5
-           disabled:opacity-50 disabled:cursor-not-allowed;
-  }
   .av-btn-primary {
     @apply av-btn bg-emerald-500 text-slate-950 hover:bg-emerald-400 font-bold;
   }
@@ -118,7 +124,7 @@
   50% { opacity: 1; transform: scale(1.1); }
 }
 
-/* Syntax-highlight overrides — keep contrast strong on dark base. */
+/* Syntax-highlight overrides -- keep contrast strong on dark base. */
 .hljs { background: transparent !important; color: #cbd5e1; }
 .hljs-keyword, .hljs-built_in { color: #c084fc; }
 .hljs-string { color: #6ee7b7; }

@@ -46,13 +46,13 @@ ASSETS_DIR = STATIC_DIR / "assets"
 def create_app() -> FastAPI:
     app = FastAPI(
         title="CGX",
-        description="Local-first codebase RAG — REST + SSE backend.",
+        description="Local-first codebase RAG -- REST + SSE backend.",
         version="0.2.0",
         docs_url="/api/docs",
         redoc_url=None,
     )
 
-    # CORS — permissive during Vite dev (localhost:5173). Production builds
+    # CORS -- permissive during Vite dev (localhost:5173). Production builds
     # are same-origin so CORS is a no-op there.
     dev_origins = [
         "http://localhost:5173",

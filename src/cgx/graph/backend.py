@@ -1,4 +1,4 @@
-"""CodeGraphBackend — thin typed facade over the nx ops used at query time.
+"""CodeGraphBackend -- thin typed facade over the nx ops used at query time.
 
 Retrieval (``cgx.retrieval.orchestrator``) and record assembly
 (``cgx.embeddings.helpers``) only consume a small, stable subset of the
@@ -14,7 +14,7 @@ NetworkX MultiDiGraph API:
 
 This module wraps that subset behind ``CodeGraphBackend`` so call sites
 have a single, typed surface to depend on. The wrapper holds the raw
-graph by reference — there is no copy and no new dependency. Graph
+graph by reference -- there is no copy and no new dependency. Graph
 construction, visualization, and persistence keep using ``networkx``
 directly, which is why ``cgx.graph.build_graph`` is untouched.
 """
@@ -75,7 +75,7 @@ class CodeGraphBackend:
         """Return a backend around ``G`` (or ``None`` when ``G`` is None).
 
         Idempotent: passing an existing ``CodeGraphBackend`` returns it
-        unchanged. This is the canonical entry point — every caller that
+        unchanged. This is the canonical entry point -- every caller that
         accepts ``G: Any`` should funnel through it before reading.
         """
         if G is None:

@@ -17,6 +17,12 @@ eggs/
 .eggs/
 lib/
 lib64/
+# Generic `lib/` above (from the standard Python .gitignore template) was
+# silently swallowing the frontend's source `lib/` directory, so CI's
+# checkout had no api.ts / sse.ts / utils.ts and `tsc -b` failed with
+# ~40 "Cannot find module '../lib/X'" errors. Re-include it explicitly.
+!frontend/src/lib/
+!frontend/src/lib/**
 parts/
 sdist/
 var/

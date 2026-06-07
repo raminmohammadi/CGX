@@ -33,10 +33,10 @@ def build_provider(
     """Construct a provider with per-call overrides for temperature/tokens.
 
     Supports four kinds:
-      - ``ollama``       — local Ollama server
-      - ``openai-compat``— OpenAI or any /v1/chat/completions-compatible API
-      - ``gemini``       — Google Gemini via REST
-      - ``custom``       — OpenAI-compatible with custom host, path, and optional auth-bypass
+      - ``ollama``       -- local Ollama server
+      - ``openai-compat``-- OpenAI or any /v1/chat/completions-compatible API
+      - ``gemini``       -- Google Gemini via REST
+      - ``custom``       -- OpenAI-compatible with custom host, path, and optional auth-bypass
     """
     ollama_opts: Dict[str, Any] = {"temperature": float(temperature),
                                    "num_predict": int(num_predict)}

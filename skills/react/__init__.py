@@ -36,7 +36,7 @@ class ReactSkill(Skill):
 
     def detect(self, goal: str) -> float:
         g = goal or ""
-        # React Native is a distinct ecosystem — don't fire on it.
+        # React Native is a distinct ecosystem -- don't fire on it.
         if _REACT_NATIVE_RE.search(g):
             return 0.0
         if _REACT_RE.search(g):
@@ -49,7 +49,7 @@ class ReactSkill(Skill):
 
     def scaffold_system_prompt(self) -> str:
         return (
-            "FRONTEND — React project\n"
+            "FRONTEND -- React project\n"
             "- Use a modern Vite-style layout: src/main.jsx mounts the app, "
             "src/App.jsx is the root component, src/components/*.jsx for "
             "individual UI pieces. No webpack/babel config files.\n"
@@ -94,7 +94,7 @@ class ReactSkill(Skill):
         if non_meta and all(p.lower().endswith(".py") for p in non_meta):
             return SkillVerdict(
                 passed=False, confidence=0.9,
-                rationale=("React skill: every source file is Python — the "
+                rationale=("React skill: every source file is Python -- the "
                            "scaffold ignored the React requirement."),
             )
         return None

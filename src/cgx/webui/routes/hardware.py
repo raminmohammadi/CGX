@@ -1,6 +1,6 @@
 
 
-"""Hardware page payload — model fit matrix + local-vs-cloud tradeoffs.
+"""Hardware page payload -- model fit matrix + local-vs-cloud tradeoffs.
 
 Stateless: every request re-detects RAM/VRAM and re-annotates the
 catalogue. Cheap because :mod:`cgx.answer.hardware_matrix` does no I/O.

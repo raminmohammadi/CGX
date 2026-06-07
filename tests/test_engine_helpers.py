@@ -105,7 +105,7 @@ class _OneShotProvider:
         self.content = content
         self.calls: List[Dict[str, Any]] = []
 
-    def chat(self, messages, **kw):  # noqa: ANN001 — duck type
+    def chat(self, messages, **kw):  # noqa: ANN001 -- duck type
         self.calls.append({"messages": messages, **kw})
         return {"content": self.content}
 
@@ -127,7 +127,7 @@ def test_generate_project_scaffold_skips_existing_and_lists_them_in_prompt():
     reply = json.dumps({
         "plan_md": "Backend",
         "files": [
-            # Already produced by sibling — must be dropped.
+            # Already produced by sibling -- must be dropped.
             {"path": "src/App.jsx", "content": "export default 1"},
             {"path": "backend/main.py", "content": "print('ok')"},
         ],
@@ -372,7 +372,7 @@ def test_generate_single_scaffold_file_short_circuits_init_py():
 
 # ---------------------------------------------------------------------------
 # _inject_python_package_inits: top-level src/ is a sys.path root in the
-# standard "src layout", not a package — so it must NOT get an
+# standard "src layout", not a package -- so it must NOT get an
 # __init__.py. Subpackages under src/ still do.
 # ---------------------------------------------------------------------------
 def test_inject_python_package_inits_skips_top_level_src():
@@ -429,7 +429,7 @@ def test_inject_required_files_adds_conftest_for_python_src_layout():
 
 def test_inject_required_files_skips_conftest_when_no_src_python():
     from cgx.answer.engine import _inject_required_manifest_files
-    # Python backend without src/ layout — no conftest.py needed because
+    # Python backend without src/ layout -- no conftest.py needed because
     # the existing pytest convention already handles backend/ imports.
     layers = [
         {"name": "backend", "files": [

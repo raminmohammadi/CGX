@@ -14,7 +14,7 @@ from cgx.logging_setup import get_logger
 
 logger = get_logger("parser")
 
-# Parser dispatch registry — populated at module import time once the
+# Parser dispatch registry -- populated at module import time once the
 # concrete parsers below have been defined (see ``_PARSER_REGISTRY``).
 # Each key is a lowercase file extension including the leading dot.
 _PARSER_REGISTRY: "Dict[str, Any]" = {}
@@ -1074,8 +1074,8 @@ def parse_codebase(
     Recursively traverses ``project_root``, dispatching each file to the
     parser registered for its extension in :data:`_PARSER_REGISTRY` (today
     only ``.py`` via :class:`PythonASTParser`). Per-file results are
-    concatenated and the cross-file post-processing — call-relation
-    deduplication and reverse-edge aggregation onto chunk metadata —
+    concatenated and the cross-file post-processing -- call-relation
+    deduplication and reverse-edge aggregation onto chunk metadata --
     runs at the end.
 
     Parameters

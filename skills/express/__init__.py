@@ -27,7 +27,7 @@ class ExpressSkill(Skill):
 
     def scaffold_system_prompt(self) -> str:
         return (
-            "BACKEND — Express.js (Node) service\n"
+            "BACKEND -- Express.js (Node) service\n"
             "- Single entry module at server/index.js (or src/server.js) "
             "creating `const app = express()` and listening on `process.env."
             "PORT || 3000`.\n"

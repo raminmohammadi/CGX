@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "cgx"
 version = "0.2.0"
-description = "CGX (Code Graph eXecution) — local-first codebase RAG with hybrid retrieval, multi-agent orchestration (Planner / Tracker / Judge), manifest-driven project scaffolding, and self-testing code generation."
+description = "CGX (Code Graph eXecution) -- local-first codebase RAG with hybrid retrieval, multi-agent orchestration (Planner / Tracker / Judge), manifest-driven project scaffolding, and self-testing code generation."
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
@@ -74,7 +74,7 @@ cgx-ui = "cgx.webui.launch:launch"
 
 [tool.setuptools.packages.find]
 # Discover packages from both src/ (cgx and its subpackages) and the
-# repo root (skills/ — top-level pluggable technology bundles).
+# repo root (skills/ -- top-level pluggable technology bundles).
 where = ["src", "."]
 include = ["cgx*", "skills*"]
 exclude = ["tests*", "frontend*", "extension*", "docs*", "notebooks*",

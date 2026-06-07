@@ -1,6 +1,6 @@
 
 
-"""Ask SSE route — streams intent → thought deltas → final answer."""
+"""Ask SSE route -- streams intent → thought deltas → final answer."""
 
 from __future__ import annotations
 

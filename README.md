@@ -1,4 +1,4 @@
-# CGX — Code Graph eXecution
+# CGX -- Code Graph eXecution
 
 **Local-first codebase RAG and self-testing code-generation platform.**
 
@@ -8,17 +8,17 @@ answer questions or produce **self-tested** code change plans. It is
 model-agnostic and ships with a React/Vite web UI served by a FastAPI
 backend that streams progress over Server-Sent Events.
 
-- 🔒 **Local-first.** Indexing, embedding, retrieval, sessions, and
+- **Local-first.** Indexing, embedding, retrieval, sessions, and
   telemetry **never leave the machine.** Works fully offline with
   [Ollama](https://ollama.com/).
-- 🔌 **Universal LLM provider.** Ollama (local), OpenAI-compatible
+- **Universal LLM provider.** Ollama (local), OpenAI-compatible
   endpoints, native **Google Gemini**, or any self-hosted server with a
-  custom IP, path, and optional auth-bypass — switchable from the Settings
+  custom IP, path, and optional auth-bypass -- switchable from the Settings
   tab with a live **Ping** latency check. API keys live in your OS keyring.
-- 🧠 **Hybrid retrieval.** Two-view semantic + BM25 + graph expansion,
+- **Hybrid retrieval.** Two-view semantic + BM25 + graph expansion,
   fused with Reciprocal Rank Fusion and an optional cross-encoder
   rerank.
-- 🤖 **Multi-agent orchestration.** A Planner / Tracker / Judge loop
+- **Multi-agent orchestration.** A Planner / Tracker / Judge loop
   decomposes complex requests into atomic tasks (`ask`, `plan`,
   `scaffold`, `scaffold_manifest`, `scaffold_file`, `search`, `summarize`,
   `apply`, `verify`, `fill_logic`) and validates each artefact before
@@ -27,63 +27,63 @@ backend that streams progress over Server-Sent Events.
   code-gen tasks to plain Q&A for read-only goals, and the tracker
   streams live `task_progress` heartbeats so the UI never looks frozen on
   long LLM calls. See [docs/flowcharts.md](docs/flowcharts.md) for a visual.
-- 🏗️ **New project generation.** Give CGX a plain-language idea
+- **New project generation.** Give CGX a plain-language idea
   (e.g. *"create a FastAPI todo app"* or *"create a React calculator
   app"*), set a destination directory as Project Root, and the
   `scaffold_manifest → scaffold_file × N → apply → verify` chain
-  generates a complete, working project from scratch — no existing
+  generates a complete, working project from scratch -- no existing
   codebase or index required. The `apply` step writes a per-run backup
   mirror under `<project_root>/.cgx-backups/` so the whole run can
   be undone via `POST /api/rollback`.
-- 🧩 **Modular skills registry** (`skills/`). Each supported technology
+- **Modular skills registry** (`skills/`). Each supported technology
   lives in its own folder (`skills/react/`, `skills/fastapi/`,
   `skills/nextjs/`, `skills/vue/`, `skills/tailwind/`, `skills/flask/`,
   `skills/django/`, `skills/express/`, `skills/python_cli/`,
   `skills/sqlite/`) and bundles three things: detection from the goal,
   the prompt fragment the LLM sees while generating, and a structural
   validator the Judge runs against the produced diffs. Multi-skill
-  goals compose naturally — *"React UI + FastAPI backend"* activates
+  goals compose naturally -- *"React UI + FastAPI backend"* activates
   both, so the scaffold prompt carries both layouts and the Judge
   refuses to silently pass an output that only honours one half. Adding
   a new framework is a single-folder change with no agent-layer edits.
   See [docs/usage.md](docs/usage.md#generating-a-new-project-from-scratch)
   for the full table and [docs/architecture.md](docs/architecture.md#skills)
   for the protocol.
-- 💬 **Persistent chat sessions.** Conversations are saved as JSONL
+- **Persistent chat sessions.** Conversations are saved as JSONL
   threads under `~/.cgx/sessions/`; resume them later from the Ask
   tab's session sidebar.
-- 🧪 **Self-testing code generation.** Diffs are parsed, syntax-checked,
+- **Self-testing code generation.** Diffs are parsed, syntax-checked,
   and optionally run against impacted pytest tests in a sandbox before
   being surfaced. The sandbox now auto-installs missing Python packages
   before running pytest (`cgx.codegen.env_manager`) so a model choosing
   a new library doesn't mask real failures.
-- 🗺️ **Symbol table context.** Before generating a change plan, CGX
+- **Symbol table context.** Before generating a change plan, CGX
   injects a compressed `# AVAILABLE CONTEXT` map of every symbol already
   defined in the indexed codebase (`cgx.codegen.symbol_map`), preventing
   local models from re-implementing helpers that already exist.
-- 🔬 **Granular error slicing.** Retry prompts include ±5 lines of source
+- **Granular error slicing.** Retry prompts include ±5 lines of source
   context around the first traceback line number rather than a raw
   1 200-character pytest dump, keeping small models focused on the precise
   failure site.
-- ⚡ **Incremental indexing.** A content-addressed embedding cache
+- **Incremental indexing.** A content-addressed embedding cache
   (per-view `.npz` keyed on sha256 of the corpus text) makes
   re-indexing a touched-only-a-few-files repo nearly instant.
-- 📊 **Hardware-aware model picker.** The Hardware tab reports
+- **Hardware-aware model picker.** The Hardware tab reports
   ✅/⚠️/❌ verdicts for ~8 local models against your detected RAM/VRAM
   and shows a local-vs-cloud trade-off table.
-- 🩹 **Client-side rate limiting + 429 retry** on every provider, with
+- **Client-side rate limiting + 429 retry** on every provider, with
   per-profile budgets persisted alongside the model config.
-- 👀 **Thought-process panel.** Live streaming of the model's reasoning
+- **Thought-process panel.** Live streaming of the model's reasoning
   sketch, followed by the final grounded answer.
-- 🧩 **VS Code extension scaffold** (`extension/`) that hosts the
+- **VS Code extension scaffold** (`extension/`) that hosts the
   CGX web UI inside an editor webview.
-- 📋 **Task registry & cancel.** Every operation is tracked in
+- **Task registry & cancel.** Every operation is tracked in
   `~/.cgx/tasks.db`; cancel any running task with
   `DELETE /api/tasks/{id}` or the in-UI Cancel button.
-- 🔴 **Cancel button on every tab.** Stop a streaming request mid-flight
+- **Cancel button on every tab.** Stop a streaming request mid-flight
   from Ask (Stop), Plan, Agent, or Index (Cancel).
-- 🔁 **Tab persistence.** Switching between tabs mid-task no longer loses
-  the running view — state is held in a session-scoped Zustand store
+- **Tab persistence.** Switching between tabs mid-task no longer loses
+  the running view -- state is held in a session-scoped Zustand store
   (`frontend/src/store/tasks.ts`) and the SSE stream continues in the
   background via `frontend/src/lib/connections.ts`.
 - 🖥️ **Terminal observability.** All operations emit structured
@@ -164,20 +164,20 @@ ollama pull qwen2.5-coder:3b
 
 ### Platform notes
 
-- **Linux** — no extra steps. NVIDIA users wanting GPU embeddings or
+- **Linux** -- no extra steps. NVIDIA users wanting GPU embeddings or
   rerank need a CUDA-enabled `torch` build; the default wheels from
   `requirements-ml.txt` install the CPU build, so pick the right
   `torch` from <https://pytorch.org/get-started/locally/> if you want
   CUDA.
-- **macOS — Intel** — CPU-only by default; same install path as Linux.
-- **macOS — Apple Silicon** — works natively on arm64. The embedding
+- **macOS -- Intel** -- CPU-only by default; same install path as Linux.
+- **macOS -- Apple Silicon** -- works natively on arm64. The embedding
   model loads on CPU by default; to use the Metal backend, install the
   ML extras and set `CGX_EMBED_DEVICE=mps` before launching:
   ```bash
   CGX_EMBED_DEVICE=mps cgx-ui
   ```
-  Ollama also runs natively on Apple Silicon — no Rosetta needed.
-- **Windows** — use PowerShell or `cmd.exe`. The venv activates with
+  Ollama also runs natively on Apple Silicon -- no Rosetta needed.
+- **Windows** -- use PowerShell or `cmd.exe`. The venv activates with
   `.venv\Scripts\Activate.ps1` (PowerShell) or `.venv\Scripts\activate.bat`
   (cmd). The CGX config directory resolves to `%USERPROFILE%\.cgx`
   (override with `CGX_CONFIG_DIR`). The `0600` file-permission fallback
@@ -212,7 +212,7 @@ cgx-ui --host 0.0.0.0 --port 8765
 CGX_HOST=0.0.0.0 CGX_PORT=8765 cgx-ui
 ```
 
-The server has **no built-in authentication** — anything that can
+The server has **no built-in authentication** -- anything that can
 reach the bound `host:port` can drive the agent loop, read sessions,
 and write to disk under the configured Project Root. Bind to a
 non-loopback address only on a trusted LAN/VPN (Tailscale, WireGuard,
@@ -222,28 +222,28 @@ public internet.
 
 Tabs (left → right):
 
-1. **⚙️ Setup** — choose a **Provider Type** (Ollama, OpenAI, Google
+1. **Setup** -- choose a **Provider Type** (Ollama, OpenAI, Google
    Gemini, or Custom Server), fill in the model and credentials, and click
    **Ping** to verify the connection with a live latency check. Detect
    hardware (RAM + GPU VRAM) and tune sampling parameters. Save named
    profiles; API keys are stored in your OS keyring.
-2. **📚 Index** — point at a project root or upload a `.zip`. Honours
+2. **Index** -- point at a project root or upload a `.zip`. Honours
    `.gitignore` and a 1 MB file-size cap; emits `indices/`,
    `records.jsonl`, `chunks.jsonl`, `graph.json` and per-view
    `emb_cache_<view>.npz` for incremental re-indexing. Intent and impl
    views are indexed in parallel. A **Cancel** button is available while
    indexing is in progress.
-3. **💬 Ask** — natural-language question with a streaming "thought
+3. **Ask** -- natural-language question with a streaming "thought
    process" panel and a final grounded answer. Sidebar holds the
    **session list** (➕ New / 🗑️ Delete / dropdown to resume an existing
    thread). A **Stop** button halts the stream mid-flight; switching
    tabs preserves the answer in progress.
-4. **🛠️ Plan** — request a change plan; optionally tick *Validate diffs*
+4. **Plan** -- request a change plan; optionally tick *Validate diffs*
    and *Run impacted tests* to have CGX self-check its own output
    before returning. The full self-test report renders inline. A
    **Cancel** button is available while planning is in progress; tab
    switching is non-destructive.
-5. **🤖 Agent** — give CGX a goal, watch the **Planner → Tracker →
+5. **Agent** -- give CGX a goal, watch the **Planner → Tracker →
    Judge** loop decompose it into 1–5 atomic tasks, dispatch each task
    to a capability (`ask`, `plan`, `scaffold`, `search`, `summarize`,
    `apply`, `verify`), and judge the artefact against per-task criteria.
@@ -254,13 +254,13 @@ Tabs (left → right):
    available while the loop is running; tab switching keeps the agent
    running and state is fully restored on return. The sidebar shows an
    animated spinner next to this tab while a task is active.
-6. **📊 Hardware** — click **Detect hardware** to annotate the local
+6. **Hardware** -- click **Detect hardware** to annotate the local
    model catalogue with ✅/⚠️/❌ fit verdicts against your machine. The
    second table shows the editorial local-vs-cloud trade-off across
    privacy, cost, quality ceiling, latency, offline use, setup effort,
    and operational risk. Pure-offline; no network calls fire from this
    tab.
-7. **👤 Profiles** — save provider configurations for any supported
+7. **Profiles** -- save provider configurations for any supported
    provider kind (`ollama`, `openai-compat`, `gemini`, `custom`). Custom
    profiles expose an **Endpoint Path** field and a **Skip auth** toggle
    for private-subnet servers. API keys are persisted in the OS keyring
@@ -314,12 +314,12 @@ print(ans["answer_md"])
 Three picture-first views of the same system live in
 [docs/flowcharts.md](docs/flowcharts.md):
 
-- **For users** ([flow_user.svg](docs/diagrams/flow_user.svg)) — the
+- **For users** ([flow_user.svg](docs/diagrams/flow_user.svg)) -- the
   install → index → ask/plan/agent → grounded-answer journey.
-- **For developers** ([flow_developer.svg](docs/diagrams/flow_developer.svg)) —
+- **For developers** ([flow_developer.svg](docs/diagrams/flow_developer.svg)) --
   the Planner → Tracker → Judge loop, the capability dispatch table,
   and the full SSE event timeline (including `task_progress`).
-- **For companies** ([flow_company.svg](docs/diagrams/flow_company.svg)) —
+- **For companies** ([flow_company.svg](docs/diagrams/flow_company.svg)) --
   trust boundaries: what stays on the local machine, where credentials
   live, and the single opt-in egress path to a remote LLM.
 
@@ -352,11 +352,11 @@ cfg = HybridConfig(enable_reranker=True, reranker_top_n=20, graph_bonus=0.3)
 When `graph_bonus > 0` surfaces neighbors of the top hits, the answer
 pipeline automatically switches to a **two-tier "Code Map" prompt**:
 direct matches keep their full code bodies, while graph-expanded
-neighbors collapse to one-line `name(signature) — docstring` stubs
+neighbors collapse to one-line `name(signature) -- docstring` stubs
 tagged `tier=neighbor`. This keeps small local models (3B/7B Ollama,
 etc.) from spending their entire context window on structural
 references they only need to *know about*. The per-tier budget scales
-by the provider's model window — see
+by the provider's model window -- see
 [docs/usage.md § Tiered SOURCES (Code Map)](docs/usage.md#tiered-sources-code-map)
 and the architecture doc for the full treatment.
 
@@ -418,7 +418,7 @@ from cgx.answer.providers import OllamaProvider
 
 prov = OllamaProvider(model="qwen2.5-coder:3b")
 
-# Modify an existing codebase — stream=True yields AgentEvent objects.
+# Modify an existing codebase -- stream=True yields AgentEvent objects.
 for event in run_agent(
     goal="Add docstrings to every public function in cgx.parser",
     provider=prov,
@@ -430,7 +430,7 @@ for event in run_agent(
 ):
     print(event.type, event.payload)
 
-# Generate a brand-new project — no index required.
+# Generate a brand-new project -- no index required.
 for event in run_agent(
     goal="Create a FastAPI todo app with SQLite and pytest tests",
     provider=prov,
@@ -458,9 +458,9 @@ table + DAG (`src/cgx/agents/viz.py`).
 
 The Ask tab's sidebar manages local conversation history:
 
-- **➕ New** — creates a session, returns a UUID, and starts an empty
+- **➕ New** -- creates a session, returns a UUID, and starts an empty
   thread.
-- **🗑️ Delete** — removes the selected session file.
+- **🗑️ Delete** -- removes the selected session file.
 - Selecting a session from the dropdown renders prior turns inline
   and routes new questions through that thread; user + assistant
   turns are appended automatically as the answer stream finishes.
@@ -505,7 +505,7 @@ FAISS indices:
 The cache stores `{sha256(corpus_text): np.ndarray}` pairs. Unchanged
 chunks reuse their cached vectors; only modified chunks reach the
 embedder. The cache is auto-invalidated when the embedding
-`model_name`, `dim`, or `normalize` flag changes — there is no risk of
+`model_name`, `dim`, or `normalize` flag changes -- there is no risk of
 serving stale vectors against a different model.
 
 Inspect the hit/miss ratio:
@@ -546,7 +546,7 @@ locally-runnable models against the RAM/VRAM detected by
 The second table shows the editorial local-vs-cloud trade-off across
 **privacy, marginal cost, quality ceiling, cold/warm latency,
 offline use, setup effort, and operational risk**. Every number is
-computed locally — opening this tab does **not** make any network
+computed locally -- opening this tab does **not** make any network
 call. The same data is exported as
 [`docs/hardware_matrix.json`](docs/hardware_matrix.json) for downstream
 tooling and documented in
@@ -584,7 +584,7 @@ existing call sites keep their pre-feature behaviour.
 
 [`extension/`](extension/) is a minimal TypeScript extension that hosts
 the running CGX web UI inside a VS Code webview panel. It is **not**
-packaged into a `.vsix` from the repo — build it locally:
+packaged into a `.vsix` from the repo -- build it locally:
 
 ```bash
 cd extension
@@ -595,7 +595,7 @@ npm run compile
 
 Commands contributed: **CGX: Open UI**, **CGX: Reload UI**.
 The server URL is read from the `cgx.ui.url` setting (default
-`http://localhost:8765`). The extension does not spawn the server —
+`http://localhost:8765`). The extension does not spawn the server --
 start it with `cgx-ui` (or `python app.py`) first.
 
 See [`extension/README.md`](extension/README.md) for the full setup.
@@ -618,7 +618,7 @@ the complete list of network egress paths in the product:
 | Parsing, embedding, indexing      | **No**          | All on-device.                                    |
 | Hybrid retrieval / reranking      | **No**          | All on-device.                                    |
 | Asking a question / planning code | Yes             | Only the LLM endpoint you configure.              |
-| Local LLM (default: Ollama)       | Yes (loopback)  | `http://localhost:11434` — never leaves your box. |
+| Local LLM (default: Ollama)       | Yes (loopback)  | `http://localhost:11434` -- never leaves your box. |
 | OpenAI-compatible providers       | Yes             | The exact base URL / endpoint path you configure. |
 | Google Gemini provider            | Yes             | `generativelanguage.googleapis.com` only.         |
 | Session history, profiles, cache  | **No**          | `~/.cgx/` (locked-down `0600` files).             |
@@ -627,7 +627,7 @@ the complete list of network egress paths in the product:
 ### Server access & secrets
 
 - **No authentication on the local API.** The FastAPI server does not
-  ship with login, tokens, or CSRF protection — any process that can
+  ship with login, tokens, or CSRF protection -- any process that can
   reach the bound `host:port` can drive the agent loop, read sessions,
   and write to disk under the configured Project Root. This is safe at
   the default `127.0.0.1:8765` loopback bind; do not bind to `0.0.0.0`
@@ -638,7 +638,7 @@ the complete list of network egress paths in the product:
   write inside the configured **Project Root**. Every overwrite is
   mirrored under `<project_root>/.cgx-backups/<run_id>/` and the whole
   run can be undone via `POST /api/rollback`. Set the Project Root
-  deliberately — a stray value lets the agent write anywhere the
+  deliberately -- a stray value lets the agent write anywhere the
   launching user can.
 - **Secrets at rest.** API keys go to the OS keyring when the
   `keyring` extra is installed: macOS **Keychain**, GNOME
@@ -655,7 +655,7 @@ the complete list of network egress paths in the product:
 
 A single, anonymous startup ping is available for measuring active
 installs. It is **off by default** and contains *only* a random install
-UUID generated on first run and the CGX version — no prompts, no
+UUID generated on first run and the CGX version -- no prompts, no
 code, no file paths, no model names, no PII.
 
 Enable:
@@ -687,10 +687,10 @@ each feature.
 CI is configured in [`.github/workflows/ci.yml`](.github/workflows/ci.yml)
 as a **two-job matrix**:
 
-- **core** — runs on Python 3.10 / 3.11 / 3.12 with only
+- **core** -- runs on Python 3.10 / 3.11 / 3.12 with only
   `requirements.txt`. Asserts the lazy-import path stays clean (no
   hard dependency on `torch`).
-- **ml** (optional) — installs `requirements-ml.txt` too and exercises
+- **ml** (optional) -- installs `requirements-ml.txt` too and exercises
   the embedding + reranker stack.
 
 ---

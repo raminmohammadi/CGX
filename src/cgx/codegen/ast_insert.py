@@ -58,7 +58,7 @@ class AstInsertSpec:
     ----------
     rel_path:
         Project-relative POSIX path of the file to modify. The file does
-        not need to exist yet — when absent the spec is treated as a
+        not need to exist yet -- when absent the spec is treated as a
         new-file create, mirroring :func:`apply_diffs_in_memory`'s
         ``is_new_file`` behaviour.
     code:
@@ -81,7 +81,7 @@ class AstInsertSpec:
         (``{"start_line", "end_line", "indent_col"}``) describing the
         sibling pointed to by ``anchor_symbol``. When present and the
         ``end_line`` falls inside the target file, the planner uses it
-        directly to compute the splice position and indent — avoiding a
+        directly to compute the splice position and indent -- avoiding a
         second AST walk for the anchor. Otherwise the AST-walk fallback
         in :func:`_module_insert_after_line` /
         :func:`_class_insert_after_line` is used.
@@ -326,7 +326,7 @@ def _class_insert_after_line(
     For a class with an empty body (``class Foo: ...``) we still return a
     valid line: the class' own ``end_lineno``. ``is_inside_class_body``
     is True when the splice point is between body members and False when
-    appending at end-of-class — relevant for whether the trailing blank
+    appending at end-of-class -- relevant for whether the trailing blank
     line is needed.
     """
     if anchor_symbol:
@@ -607,7 +607,7 @@ def plan_ast_insertion_from_suggestion(
     ``code`` is the Python snippet to splice in. The function picks the
     similar-signature neighbour as the preferred anchor (the same signal
     suggest_insertion_points ranks highest); falling back to the likely
-    caller if absent. Either may be ``None`` — in that case the snippet
+    caller if absent. Either may be ``None`` -- in that case the snippet
     is appended at the end of the container.
     """
     if not isinstance(suggestion, dict):

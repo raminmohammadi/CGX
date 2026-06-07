@@ -32,7 +32,7 @@ _DB_PATH = Path.home() / ".cgx" / "tasks.db"
 _lock = threading.Lock()
 _conn: Optional[sqlite3.Connection] = None
 
-# In-memory cancel events — not persisted, intentionally reset on server
+# In-memory cancel events -- not persisted, intentionally reset on server
 # restart (outstanding tasks from a previous run can't be cancelled anyway).
 _cancel_events: Dict[str, threading.Event] = {}
 

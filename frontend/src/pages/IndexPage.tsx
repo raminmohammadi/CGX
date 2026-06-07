@@ -149,7 +149,7 @@ export default function IndexPage() {
           <div>
             <span className="av-section-eyebrow block">Target Directory Path</span>
             <span className="text-xs text-slate-200 font-medium font-mono">
-              {projectRoot || zipName || "—"}
+              {projectRoot || zipName || "--"}
             </span>
           </div>
           <div className="flex gap-2">
@@ -357,7 +357,7 @@ function EmbedPullProgress({
           : pull.done
           ? "Download complete"
           : pct !== null
-          ? `${pull.status} — ${pct}% (${mb(pull.completed)} / ${mb(pull.total)} MB)`
+          ? `${pull.status} -- ${pct}% (${mb(pull.completed)} / ${mb(pull.total)} MB)`
           : pull.status}
       </p>
     </div>
@@ -378,7 +378,7 @@ function isPlainObject(v: any): v is Record<string, any> {
 }
 
 function formatPrimitive(v: any): string {
-  if (v === null || v === undefined) return "—";
+  if (v === null || v === undefined) return "--";
   if (Array.isArray(v)) {
     try { return JSON.stringify(v); } catch { return String(v); }
   }

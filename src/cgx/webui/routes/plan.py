@@ -1,6 +1,6 @@
 
 
-"""Plan SSE route — streams sketch thoughts → final plan + diffs."""
+"""Plan SSE route -- streams sketch thoughts → final plan + diffs."""
 
 from __future__ import annotations
 

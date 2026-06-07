@@ -311,10 +311,10 @@ class GeminiProvider(LLMProvider):
     def _diagnose_empty_response(data: Any) -> str:
         """Return a human-readable reason when the Gemini response carries no text.
 
-        Inspects the documented Gemini error/feedback shapes — top-level
+        Inspects the documented Gemini error/feedback shapes -- top-level
         ``error.message``, ``promptFeedback.blockReason``, the candidate's
         ``finishReason`` (``SAFETY`` / ``MAX_TOKENS`` / ``RECITATION`` /
-        ``OTHER``), and any non-``NEGLIGIBLE`` ``safetyRatings`` — so the
+        ``OTHER``), and any non-``NEGLIGIBLE`` ``safetyRatings`` -- so the
         caller can surface why the call produced no content instead of
         silently degrading to an empty plan.
         """

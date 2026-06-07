@@ -31,13 +31,13 @@ class SQLiteSkill(Skill):
 
     def scaffold_system_prompt(self) -> str:
         return (
-            "DATA — SQLite persistence\n"
+            "DATA -- SQLite persistence\n"
             "- Use the stdlib `sqlite3` module unless the goal explicitly "
             "asks for an ORM (SQLAlchemy / Django ORM / Tortoise).\n"
             "- Put schema setup (CREATE TABLE IF NOT EXISTS ...) in a "
             "single `init_db()` function the application calls at startup; "
             "don't sprinkle CREATE statements across modules.\n"
-            "- Parameterise every query with `?` placeholders — never "
+            "- Parameterise every query with `?` placeholders -- never "
             "string-format user input into SQL.\n"
             "- Use `with sqlite3.connect(path) as conn:` for transaction "
             "scoping, or an explicit `conn.commit()` after writes.\n"
@@ -49,7 +49,7 @@ class SQLiteSkill(Skill):
         return (
             "When modifying SQLite-backed code:\n"
             "- Schema changes go in `init_db()` (idempotent CREATE … IF "
-            "NOT EXISTS / ALTER TABLE) — keep them backward-compatible.\n"
+            "NOT EXISTS / ALTER TABLE) -- keep them backward-compatible.\n"
             "- All new queries must use `?` placeholders."
         )
 

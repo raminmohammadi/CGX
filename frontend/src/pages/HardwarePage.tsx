@@ -42,15 +42,15 @@ export default function HardwarePage() {
       />
 
       <div className="grid grid-cols-3 gap-3">
-        <Stat label="System RAM" value={ram != null ? `${ram.toFixed(1)} GB` : "—"} tone="emerald" />
+        <Stat label="System RAM" value={ram != null ? `${ram.toFixed(1)} GB` : "--"} tone="emerald" />
         <Stat
           label="GPU VRAM"
-          value={vram != null ? `${vram.toFixed(1)} GB` : "—"}
+          value={vram != null ? `${vram.toFixed(1)} GB` : "--"}
           tone={vram != null ? "emerald" : "slate"}
         />
         <Stat
           label="Catalog rows"
-          value={data ? `${data.rows.length}` : "—"}
+          value={data ? `${data.rows.length}` : "--"}
           tone="slate"
         />
       </div>

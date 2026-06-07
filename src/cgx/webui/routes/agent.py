@@ -1,6 +1,6 @@
 
 
-"""Agent SSE route — streams Planner/Tracker/Judge events."""
+"""Agent SSE route -- streams Planner/Tracker/Judge events."""
 
 from __future__ import annotations
 
@@ -62,7 +62,7 @@ async def agent(req: AgentRequest) -> EventSourceResponse:
 
 @router.post("/agent/plan")
 async def agent_plan_only(req: AgentRequest) -> Dict[str, Any]:
-    """Run the Planner only and return the plan as JSON — no task execution.
+    """Run the Planner only and return the plan as JSON -- no task execution.
 
     Used by the *Review plan* and *Plan only* execution modes in the UI
     so the DAG panel can be shown before the user commits to running the

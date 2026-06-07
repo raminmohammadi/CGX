@@ -216,6 +216,6 @@ def sort_model_choices_by_family(
     """Return ``names`` sorted to cluster related models together.
 
     Stable across runs (pure function of the inputs). Duplicates are
-    preserved — callers should de-dup upstream.
+    preserved -- callers should de-dup upstream.
     """
     return sorted(names, key=lambda n: _family_sort_key(n, params_lookup))

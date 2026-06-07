@@ -1,4 +1,4 @@
-# CGX — Flowcharts
+# CGX -- Flowcharts
 
 Three audience-specific views of the same system. Each SVG is hand-authored,
 scales cleanly, and renders inline on GitHub.
@@ -12,9 +12,9 @@ scales cleanly, and renders inline on GitHub.
 Install once, point CGX at a repo, then ask questions or request changes in
 plain English. The **Ask** tab returns a streaming, cited explanation; the
 **Plan** tab returns a self-tested code-change diff; the **Agent** tab handles
-larger goals — including generating brand-new projects from scratch — by
+larger goals -- including generating brand-new projects from scratch -- by
 decomposing them into 1–6 atomic tasks with live progress. Everything runs
-locally by default — cloud LLMs are strictly opt-in.
+locally by default -- cloud LLMs are strictly opt-in.
 
 ---
 
@@ -28,10 +28,10 @@ Planner asks the LLM for a strict-JSON
 `ask`, `plan`, `scaffold`, `scaffold_manifest`, `scaffold_file`,
 `search`, `summarize`, `apply`, `verify`, `fill_logic`) and applies
 `_enforce_kind_policy()` to route the goal down one of four branches:
-**SCAFFOLD** (new-project goals — detected via `_SCAFFOLD_RE`, a verb
+**SCAFFOLD** (new-project goals -- detected via `_SCAFFOLD_RE`, a verb
 paired with `_TECH_RE`, a verb paired with a supported skill from
 `skills.detect_skills`, or LLM-emitted `scaffold` tasks with no
-existing-codebase hint) — emits `[scaffold_manifest, apply, verify]`
+existing-codebase hint) -- emits `[scaffold_manifest, apply, verify]`
 where the manifest's runtime output injects one `scaffold_file` task
 per planned file before `apply` runs, **VERIFY-ONLY**, **READ-ONLY**
 (any `plan` task downgraded to `ask`), or **CHANGE-GOAL** (`apply` +
@@ -59,7 +59,7 @@ and PLAN it consults the active **skills/** validators (`react`,
 `python_cli`, `sqlite`); a failing `SkillVerdict` short-circuits to a
 Judge fail with the skill name prefixed (`[react] …`). A scaffold that
 passes structural + skill checks short-circuits to `pass` without
-invoking the LLM judge — small local models hallucinate criteria fails
+invoking the LLM judge -- small local models hallucinate criteria fails
 too often on demonstrably-correct scaffolds. When the LLM judge is
 invoked, the SCAFFOLD branch of `_render_artifact` exposes `plan_md`,
 the generated file list, and source-prioritised per-file previews
@@ -89,7 +89,7 @@ The notes below are a quick map from the diagram to the modules.
 The `search` box calls `cgx.pipeline.auto.run_query_auto`, which
 fans out two ANN queries (intent view + impl view) against FAISS,
 unions them with a BM25 lexical retriever, and fuses with Reciprocal
-Rank Fusion. Identifier matching is **symmetric** — both indexer
+Rank Fusion. Identifier matching is **symmetric** -- both indexer
 (`cgx.embeddings.helpers`) and query (`cgx.retrieval.orchestrator`)
 sides go through `cgx.retrieval.tokenize.split_identifier`, so a
 query for `parseConfig` and an index entry for `parse_config` agree.
@@ -111,7 +111,7 @@ SOURCES list with `cgx.answer.context_map.build_tiered_context`
 instead of the legacy single-tier builder. Direct matches keep their
 focus-windowed code body (the **primary tier**); graph-discovered
 neighbors collapse to one-line stubs of the form
-`[class.]name(signature) — doc_first_sentence`, tagged
+`[class.]name(signature) -- doc_first_sentence`, tagged
 `tier=neighbor` in the prompt metadata (the **neighbor tier**). The
 per-tier budget scales by the provider's model context window via
 `cgx.answer.model_caps.get_context_map_budget`, so small local
@@ -132,7 +132,7 @@ The parser side is fronted by a small registry
 via the `BaseParser` ABC in `cgx.parser.base`). The project walker
 in `parse_codebase` dispatches on file extension; non-`.py` files
 are silently skipped today. Adding a language later means writing a
-new `BaseParser` subclass and registering its extensions — no
+new `BaseParser` subclass and registering its extensions -- no
 changes to the orchestrator or codegen layers.
 
 ---
@@ -146,13 +146,13 @@ registry (`~/.cgx/tasks.db`), and the embedding cache all live on the
 local machine under `~/.cgx/` and `indices/`. The agent loop runs
 in-process and streams SSE over localhost; the task registry persists
 every event so the UI can replay a tab on remount and `DELETE
-/api/tasks/{id}` can cancel a running stream — there is no analytics
+/api/tasks/{id}` can cancel a running stream -- there is no analytics
 or telemetry channel. Credentials live in the OS keyring when
 available (`0600`-permissioned file fallback) and are never echoed to
 event payloads or tool-call arguments. The only opt-in egress is when
-a profile points at a remote provider — **OpenAI-compatible**, **Google
+a profile points at a remote provider -- **OpenAI-compatible**, **Google
 Gemini**, or a **custom** OpenAI-shape endpoint (with optional
-`allow_no_auth` for private subnets) — in which case the prompt plus
+`allow_no_auth` for private subnets) -- in which case the prompt plus
 the retrieved snippets are sent; the repository, indices, sessions,
 and task registry are not. `POST /api/provider/ping` performs a
 liveness check (e.g. Gemini `generateContent` with `maxOutputTokens:

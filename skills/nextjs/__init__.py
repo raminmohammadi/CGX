@@ -32,7 +32,7 @@ class NextJsSkill(Skill):
 
     def scaffold_system_prompt(self) -> str:
         return (
-            "FULLSTACK — Next.js project (App Router)\n"
+            "FULLSTACK -- Next.js project (App Router)\n"
             "- Use the App Router layout: app/layout.tsx (or .jsx) wraps "
             "every route; app/page.tsx is the index page; nested folders "
             "are nested routes.\n"
@@ -43,7 +43,7 @@ class NextJsSkill(Skill):
             "`build` → `next build`, `start` → `next start`.\n"
             "- next.config.js (or .mjs) at project root, even if empty.\n"
             "- tsconfig.json when generating TypeScript variants.\n"
-            "- Do NOT add webpack config — Next.js owns bundling.\n"
+            "- Do NOT add webpack config -- Next.js owns bundling.\n"
             "- Do NOT add a separate Vite/CRA setup."
         )
 
@@ -51,7 +51,7 @@ class NextJsSkill(Skill):
         return (
             "When modifying a Next.js project:\n"
             "- New pages go under app/<route>/page.tsx (App Router) or "
-            "pages/<route>.tsx (Pages Router) — match whichever the project "
+            "pages/<route>.tsx (Pages Router) -- match whichever the project "
             "already uses.\n"
             "- Server components by default; add 'use client' only when "
             "hooks or browser APIs are needed."

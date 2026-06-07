@@ -23,7 +23,7 @@
   </defs>
   <rect width="1080" height="620" fill="url(#cbg)"/>
 
-  <text x="40" y="44" font-size="22" font-weight="700" fill="#f1f5f9">CGX — Trust &amp; Data Boundaries</text>
+  <text x="40" y="44" font-size="22" font-weight="700" fill="#f1f5f9">CGX -- Trust &amp; Data Boundaries</text>
   <text x="40" y="66" font-size="12.5" fill="#94a3b8">What stays on the machine, what (optionally) leaves, and where secrets live.</text>
 
   <!-- Local zone -->

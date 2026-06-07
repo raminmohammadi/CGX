@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 """
-S4 — Deterministic record builder and two-view embedding corpus.
+S4 -- Deterministic record builder and two-view embedding corpus.
 
 This module is ADDITIVE and safe: it does not modify existing parse/graph code or
 assume any embedding model. It turns your parsed chunks (+ optional graph) into:

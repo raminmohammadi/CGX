@@ -14,7 +14,7 @@ Wires :class:`~cgx.agents.planner.Planner`,
 * ``apply``    → :func:`cgx.codegen.disk_apply.apply_diffs_to_disk`
 * ``verify``   → :func:`cgx.codegen.test_runner.run_tests_on_disk`
 
-``scaffold`` is the only capability that does **not** require an index —
+``scaffold`` is the only capability that does **not** require an index --
 it generates a brand-new project from a plain-language idea and stores
 its output as ``--- /dev/null`` new-file unified diffs so the ``apply``
 capability can write them to ``project_root`` without special handling.
@@ -50,7 +50,7 @@ def _build_default_capabilities(
     """Return capability callables backed by the real engine.
 
     Each capability tolerates ``index_dir`` / ``records_path`` being
-    ``None`` by raising ``ValueError`` — the Tracker will record the
+    ``None`` by raising ``ValueError`` -- the Tracker will record the
     failure and (by default) stop the plan.
     """
     def _need_index() -> None:
@@ -123,7 +123,7 @@ def _build_default_capabilities(
         return {"answer_md": str((resp or {}).get("content") or "")}
 
     def scaffold(task_text: str, **kw: Any) -> Dict[str, Any]:
-        # No index required — generates an entire project from scratch.
+        # No index required -- generates an entire project from scratch.
         from cgx.answer.engine import generate_project_scaffold
         kw.setdefault("project_root", project_root)
         # The tracker forwards prior task outputs to SCAFFOLD via the
@@ -168,7 +168,7 @@ def _build_default_capabilities(
         except Exception as _e:
             logger.debug("verify: ensure_project_venv skipped: %s", _e)
 
-        # Phase 2: pre-flight dependency check — scan generated Python files
+        # Phase 2: pre-flight dependency check -- scan generated Python files
         # for imports that aren't in requirements.txt and auto-install them
         # into the project venv (NOT CGX's own), so ModuleNotFoundError
         # doesn't mask real failures.
@@ -197,7 +197,7 @@ def _build_default_capabilities(
             except Exception as _e:
                 logger.debug("verify: preflight_install skipped: %s", _e)
 
-        # Standalone verify (no prior APPLY) — sweep all discovered tests.
+        # Standalone verify (no prior APPLY) -- sweep all discovered tests.
         mode = "impacted"
         if not changed:
             discovered = discover_all_tests(project_root)
@@ -304,7 +304,7 @@ def _build_default_capabilities(
 
         system = (
             "You are filling in a single function body. "
-            "Return ONLY the implementation code for the function body — "
+            "Return ONLY the implementation code for the function body -- "
             "no imports, no class definition, no other functions. "
             "The code must be indented correctly to fit inside the function. "
             "Do NOT include the `def` line itself."
@@ -562,7 +562,7 @@ def _verify_failure_is_unrecoverable(
     """Return a human reason when verify failed for reasons the LLM can't fix.
 
     Currently detects pytest collection errors (``rc == 2``) whose
-    ``ModuleNotFoundError`` names a first-party project directory — that
+    ``ModuleNotFoundError`` names a first-party project directory -- that
     is a ``sys.path`` / packaging problem in the sandbox, not a code
     issue the planner can repair by regenerating files. Returning a
     string short-circuits the re-plan loop with that message; returning
@@ -591,7 +591,7 @@ def _verify_failure_is_unrecoverable(
                 break
     if not local_hits:
         return None
-    # rc==2 is pytest's "collection / usage error" — distinguishes an
+    # rc==2 is pytest's "collection / usage error" -- distinguishes an
     # infrastructure import failure from a real test that just happens
     # to import a missing helper.
     is_collection_error = any(int(f.get("returncode") or 0) == 2 for f in failures)
@@ -601,7 +601,7 @@ def _verify_failure_is_unrecoverable(
     return (
         f"Verify failed because pytest could not import first-party module(s) "
         f"{names} from {root}. This is a sandbox sys.path / packaging issue, "
-        f"not a code generation issue — re-planning would not help."
+        f"not a code generation issue -- re-planning would not help."
     )
 
 
@@ -629,10 +629,10 @@ def _diagnose_failure(failures: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Parse test/apply failure output and return a structured diagnosis.
 
     Returns a dict with:
-      error_type  — "import_error" | "syntax_error" | "logic_error" | "unknown"
-      responsible_files — project-relative paths named in tracebacks
-      bad_imports — module names that failed to import
-      language_mismatch — True when a Python file imports a JS/JSX module
+      error_type  -- "import_error" | "syntax_error" | "logic_error" | "unknown"
+      responsible_files -- project-relative paths named in tracebacks
+      bad_imports -- module names that failed to import
+      language_mismatch -- True when a Python file imports a JS/JSX module
     """
     diagnosis: Dict[str, Any] = {
         "error_type": "unknown",
@@ -647,7 +647,7 @@ def _diagnose_failure(failures: List[Dict[str, Any]]) -> Dict[str, Any]:
         stderr = str(f.get("stderr_tail") or f.get("stderr") or "")
         combined = stdout + "\n" + stderr
 
-        # Classify error type — first match wins by priority.
+        # Classify error type -- first match wins by priority.
         if diagnosis["error_type"] == "unknown":
             if re.search(r"ModuleNotFoundError|ImportError", combined):
                 diagnosis["error_type"] = "import_error"
@@ -665,7 +665,7 @@ def _diagnose_failure(failures: List[Dict[str, Any]]) -> Dict[str, Any]:
         # Language mismatch: Python file tries to import a JS/JSX module.
         if re.search(r"imports.*from.*is a JavaScript/JSX file", combined):
             diagnosis["language_mismatch"] = True
-        # Also infer from module name — "src.App" when App.jsx is known pattern.
+        # Also infer from module name -- "src.App" when App.jsx is known pattern.
         for mod in diagnosis["bad_imports"]:
             mod_path = mod.replace(".", "/")
             if re.search(
@@ -755,7 +755,7 @@ def _build_fix_goal(original_goal: str, failures: List[Dict[str, Any]],
 
     Phase 4 enhancement: instead of feeding the full pytest traceback
     (which overloads small models), we extract the exact error line plus
-    5 lines of context above and below it — the "10-line buffer rule".
+    5 lines of context above and below it -- the "10-line buffer rule".
     """
     from cgx.agents.types import TaskKind
     applied: List[str] = []
@@ -780,7 +780,7 @@ def _build_fix_goal(original_goal: str, failures: List[Dict[str, Any]],
                     and fp not in broken]
     if broken:
         parts.append(
-            "TARGETED FIX — only regenerate these files (they caused the failure):\n"
+            "TARGETED FIX -- only regenerate these files (they caused the failure):\n"
             + "\n".join(f"  - {f}" for f in broken[:10])
         )
     if already_good:
@@ -805,7 +805,7 @@ def _build_fix_goal(original_goal: str, failures: List[Dict[str, Any]],
         bad = ", ".join(f"'{m}'" for m in diagnosis["bad_imports"][:5])
         if diagnosis["language_mismatch"]:
             parts.append(
-                f"ERROR TYPE: Python import failure — language mismatch detected.\n"
+                f"ERROR TYPE: Python import failure -- language mismatch detected.\n"
                 f"The module(s) {bad} cannot be imported because they resolve to "
                 f"JavaScript/JSX files, not Python modules.\n"
                 f"You MUST fix this by doing one of:\n"
@@ -826,11 +826,11 @@ def _build_fix_goal(original_goal: str, failures: List[Dict[str, Any]],
     elif etype == "syntax_error":
         parts.append(
             "ERROR TYPE: Syntax error in generated code.\n"
-            "Regenerate the failing file(s) with correct syntax — ensure all "
+            "Regenerate the failing file(s) with correct syntax -- ensure all "
             "brackets, quotes, and indentation are balanced and complete."
         )
 
-    # Phase 4: 10-line buffer — inject a tight snippet around the first error.
+    # Phase 4: 10-line buffer -- inject a tight snippet around the first error.
     # This replaces dumping the full raw traceback so small models stay focused.
     combined_for_snippet = "".join(
         str(f.get("stdout_tail") or "") + str(f.get("stderr_tail") or "")
@@ -942,7 +942,7 @@ def _build_apply_fix_goal(original_goal: str, apply_failures: List[Dict[str, Any
         "  • Unmatched brackets, parentheses, or braces\n"
         "  • Truncated function/class bodies\n"
         "  • Invalid escape sequences inside strings\n"
-        "Generate every file in full — do NOT truncate or abbreviate any section."
+        "Generate every file in full -- do NOT truncate or abbreviate any section."
     )
     if file_errors:
         parts.append("Specific errors to fix:\n" + "\n".join(file_errors))
@@ -973,7 +973,7 @@ def _demote_unrecoverable_verify(plan: Any, reason: str) -> List[Dict[str, Any]]
     """Convert FAILED VERIFY tasks to SKIPPED when the failure is environmental.
 
     An ``unrecoverable`` verify failure (sandbox missing pytest, container
-    timeout, etc.) doesn't mean the generated code is wrong — the files
+    timeout, etc.) doesn't mean the generated code is wrong -- the files
     were applied and the project is intact. Demoting the task lets the UI
     show *complete with warnings* instead of a red "failed" badge.
 
@@ -1124,7 +1124,7 @@ def _manifest_required_files_from_goal(goal: str) -> List[str]:
     Mirrors the exact tables in :mod:`cgx.agents.judge`
     (``_SKILL_REQUIRED_FILES``, ``_LANGUAGE_REQUIRED_FILES``,
     ``_LANGUAGE_BACKEND_EXTS``) so the retry prompt tells the model
-    precisely what to include — without depending on the judge's
+    precisely what to include -- without depending on the judge's
     rationale string format.
 
     This fixes the infinite-retry cycle where the model alternates
@@ -1167,7 +1167,7 @@ def _manifest_required_files_from_goal(goal: str) -> List[str]:
         _add("requirements.txt")
         _add("manage.py (Django entry)")
     elif re.search(r"\bpython\b", goal_low):
-        # Generic Python — require requirements.txt and an entry module
+        # Generic Python -- require requirements.txt and an entry module
         # when a "backend / server / api" keyword is also present.
         _add("requirements.txt")
         if any(kw in goal_low for kw in ("backend", "server", "api")):
@@ -1186,9 +1186,9 @@ def _build_core_fix_goal(original_goal: str, failures: List[Dict[str, Any]]) -> 
 
     For manifest failures the required-file list is derived in two ways:
     1. **Goal-text derivation** via :func:`_manifest_required_files_from_goal`
-       — mirrors the Judge's own tables so the model receives positive
+       -- mirrors the Judge's own tables so the model receives positive
        instructions ("include X") instead of a vague rejection sentence.
-    2. **Rationale parsing** — extracts filenames from the Judge's
+    2. **Rationale parsing** -- extracts filenames from the Judge's
        parenthetical format ("no packaging file (package.json)") and from
        the legacy "missing required files: X" pattern, as a supplementary
        signal.
@@ -1225,7 +1225,7 @@ def _build_core_fix_goal(original_goal: str, failures: List[Dict[str, Any]]) -> 
 
     parts: List[str] = [original_goal.strip()]
     if manifest_only:
-        # Derive required files directly from the goal text — this is more
+        # Derive required files directly from the goal text -- this is more
         # robust than parsing the judge rationale and ensures the model
         # always gets a positive "MUST INCLUDE X" instruction even when the
         # regex extraction finds nothing.
@@ -1301,7 +1301,7 @@ def _stream_with_retry(
         # Gather all classes of failure up-front so the priority order can
         # consider them together. Fix A makes SCAFFOLD_FILE failures "soft",
         # which means APPLY/VERIFY now run even when individual file
-        # generation tasks failed — so a verify failure here is often a
+        # generation tasks failed -- so a verify failure here is often a
         # *cascade* of an unfixed file, not an independent test bug.
         verify_failures = _extract_verify_failures(current_plan)
         core_failures   = _extract_core_failures(current_plan)
@@ -1337,7 +1337,7 @@ def _stream_with_retry(
         # Priority 1: SCAFFOLD_FILE soft-failures. These have a targeted
         # retry path (re-run only the failed SCAFFOLD_FILE tasks, then
         # APPLY+VERIFY) and are almost always the root cause when verify
-        # also failed — a missing or empty file breaks every downstream
+        # also failed -- a missing or empty file breaks every downstream
         # test run. The retry deliberately avoids ``plan_fix`` because
         # ``plan_fix`` emits a PLAN task whose engine requires the FAISS
         # retriever index, which doesn't exist for a freshly-scaffolded
@@ -1364,17 +1364,17 @@ def _stream_with_retry(
                                      "reason": unrecoverable},
                         )
             logger.info("run_agent: %d scaffold file failure(s) on attempt %d "
-                        "— regenerating only those files",
+                        "-- regenerating only those files",
                         len(scaffold_file_paths), attempt)
             fix_goal = _build_core_fix_goal(current_goal, core_failures)
             retry_reason = (
-                f"{len(scaffold_file_paths)} file(s) failed generation — "
+                f"{len(scaffold_file_paths)} file(s) failed generation -- "
                 "regenerating only those files"
             )
             broken_files = scaffold_file_paths
             use_fix_plan = True
             use_scaffold_retry = True
-        # Priority 2: test failures (VERIFY) — build a targeted fix goal.
+        # Priority 2: test failures (VERIFY) -- build a targeted fix goal.
         elif verify_failures:
             if not project_root:
                 return
@@ -1386,25 +1386,25 @@ def _stream_with_retry(
                 # so the user sees the real test output rather than a
                 # misleading "skipped" badge. Just skip the retry attempt.
                 logger.info(
-                    "run_agent: verify failure on attempt %d — no index for "
+                    "run_agent: verify failure on attempt %d -- no index for "
                     "re-planning; reporting failure as-is", attempt,
                 )
                 yield AgentEvent(
                     type="retry_skipped",
                     payload={"attempt": attempt, "reason": (
-                        "Tests failed — no search index available for re-planning. "
+                        "Tests failed -- no search index available for re-planning. "
                         "Review the test output above and fix manually."
                     )},
                 )
                 return
             if unrecoverable:
                 logger.info(
-                    "run_agent: verify failure on attempt %d is unrecoverable — "
+                    "run_agent: verify failure on attempt %d is unrecoverable -- "
                     "skipping re-plan (%s)", attempt, unrecoverable,
                 )
                 # Only demote to SKIPPED for true environmental failures
                 # (packaging issues, missing pytest, sandbox errors) where
-                # the test runner itself couldn't run — not for real failures.
+                # the test runner itself couldn't run -- not for real failures.
                 demoted = _demote_unrecoverable_verify(current_plan, unrecoverable)
                 for entry in demoted:
                     yield AgentEvent(
@@ -1433,37 +1433,37 @@ def _stream_with_retry(
                                  "skipped": skipped},
                     )
                 return
-            logger.info("run_agent: %d verify failure(s) on attempt %d — re-planning",
+            logger.info("run_agent: %d verify failure(s) on attempt %d -- re-planning",
                         len(verify_failures), attempt)
             fix_goal = _build_fix_goal(current_goal, verify_failures,
                                        current_plan, project_root)
-            retry_reason = f"{len(verify_failures)} test failure(s) detected — re-planning to fix"
+            retry_reason = f"{len(verify_failures)} test failure(s) detected -- re-planning to fix"
             broken_files = list(_diagnose_failure(verify_failures)["responsible_files"])
             use_fix_plan = True
-        # Priority 3: non-scaffold core failures (manifest / plan) — these
+        # Priority 3: non-scaffold core failures (manifest / plan) -- these
         # require a fresh full plan rather than a delta plan because the
         # upstream task that produces the file list is what's broken.
         elif core_failures:
-            logger.info("run_agent: %d core failure(s) on attempt %d — re-planning",
+            logger.info("run_agent: %d core failure(s) on attempt %d -- re-planning",
                         len(core_failures), attempt)
             fix_goal = _build_core_fix_goal(current_goal, core_failures)
-            retry_reason = f"{len(core_failures)} generation failure(s) — retrying with fixes"
+            retry_reason = f"{len(core_failures)} generation failure(s) -- retrying with fixes"
             broken_files = []
             use_fix_plan = False
         else:
             # Priority 4: apply failures (syntax / patch errors in generated
-            # files) — fires when scaffold/plan produced syntactically
+            # files) -- fires when scaffold/plan produced syntactically
             # invalid code that passed the in-pipeline check but was
             # rejected by apply's smoke test.
             apply_failures = _extract_apply_failures(current_plan)
             if not apply_failures:
                 return
-            logger.info("run_agent: %d apply failure(s) on attempt %d — regenerating",
+            logger.info("run_agent: %d apply failure(s) on attempt %d -- regenerating",
                         len(apply_failures), attempt)
             fix_goal = _build_apply_fix_goal(current_goal, apply_failures)
             retry_reason = (
                 f"{sum(len(f['failed_files']) for f in apply_failures)} file(s) had "
-                "syntax / patch errors — regenerating with fixes"
+                "syntax / patch errors -- regenerating with fixes"
             )
             broken_files = _apply_broken_files(apply_failures)
             # When the FAISS index is missing, ``plan_fix`` would crash;
@@ -1608,13 +1608,13 @@ def run_agent(
                 # No index: skip re-planning but leave VERIFY as FAILED so
                 # the caller sees the honest test outcome, not a hidden skip.
                 logger.info(
-                    "run_agent: verify failure — no index for re-planning; "
+                    "run_agent: verify failure -- no index for re-planning; "
                     "returning plan with VERIFY as FAILED"
                 )
                 return plan_obj
             if unrecoverable:
                 logger.info(
-                    "run_agent: verify failure is unrecoverable — skipping retry (%s)",
+                    "run_agent: verify failure is unrecoverable -- skipping retry (%s)",
                     unrecoverable,
                 )
                 _demote_unrecoverable_verify(plan_obj, unrecoverable)

@@ -5,44 +5,44 @@ CGX is structured as a small set of cooperating layers under `cgx.*`.
 ## Layers
 
 ```
-cgx.parser              — language-aware tree walker → chunk records
-cgx.parser.schema       — TypedDicts pinning the chunk + call-relation shapes
-cgx.parser.base         — BaseParser ABC; the per-language seam
-cgx.parser.python_parser — PythonASTParser; the only registered parser today
-cgx.parser.module_path  — repo-root-aware dotted-name resolver for imports
-cgx.graph               — NetworkX call/containment graph over chunks
-cgx.graph.aggregation   — node/edge projections consumed by retrieval + viz
-cgx.graph.backend       — CodeGraphBackend facade isolating retrieval from nx
-cgx.embeddings          — two-view (intent / impl) corpora, FAISS indices
-cgx.embeddings.loader   — shared embedder loaders (spec / model_name, lazy ML)
-cgx.embeddings.cache    — content-addressed embedding cache (.npz)
-cgx.retrieval           — hybrid retriever (semantic + BM25 + graph) + RRF
-cgx.retrieval.tokenize  — symmetric sub-word tokenizer (camelCase / snake_case)
-cgx.answer              — LLM providers, intent detection, prompt registry
-cgx.answer.context_map  — tiered ("Code Map") SOURCES builder for the prompt
-cgx.answer.model_caps   — model-window-aware budgets consumed by context_map
-cgx.answer.providers    — OllamaProvider, OpenAICompatProvider, GeminiProvider
-cgx.answer.ratelimit    — token-bucket limiter + 429/5xx retry
-cgx.answer.profiles     — provider config + keyring-backed secret store
-cgx.answer.hardware_matrix — offline local-model catalogue + tradeoffs
-cgx.answer.ollama_discovery — installed-model listing + hardware probe
-cgx.codegen             — diff parse / dry-apply / syntax & test validation
-cgx.codegen.ast_insert  — AST-anchored insertion planner (sibling-anchor → PatchResult)
-cgx.codegen.disk_apply  — write applied diffs to disk + per-run backup mirror
-cgx.codegen.env_manager — pre-flight dependency scan, pip-install, requirements update
-cgx.codegen.symbol_map  — symbol-table context builder for working-memory injection
-cgx.io.persist          — JSON/JSONL/FAISS writers shared by the index pipeline
-cgx.pipeline            — high-level orchestrators (run_index_auto, run_query_auto)
-cgx.agents              — Planner / Tracker / Judge multi-agent loop
-cgx.agents.viz          — DAG + status-table renderers for the Agent tab
-cgx.sessions            — append-only JSONL conversation store
-cgx.telemetry           — opt-in anonymous startup ping
-cgx.logging_setup       — shared setup_logging() invoked once from launch.py
-cgx.webui.task_store    — SQLite task registry + threading.Event cancel tokens
-cgx.webui.routes.tasks  — REST API for task list / get / event-replay / cancel
-cgx.webui.routes.rollback — POST /api/rollback restores from an apply backup dir
-cgx.webui.routes.setup  — discovery endpoints + POST /api/provider/ping
-cgx.cli / cgx.webui     — terminal + FastAPI/React surfaces (uvicorn on :8765)
+cgx.parser              -- language-aware tree walker → chunk records
+cgx.parser.schema       -- TypedDicts pinning the chunk + call-relation shapes
+cgx.parser.base         -- BaseParser ABC; the per-language seam
+cgx.parser.python_parser -- PythonASTParser; the only registered parser today
+cgx.parser.module_path  -- repo-root-aware dotted-name resolver for imports
+cgx.graph               -- NetworkX call/containment graph over chunks
+cgx.graph.aggregation   -- node/edge projections consumed by retrieval + viz
+cgx.graph.backend       -- CodeGraphBackend facade isolating retrieval from nx
+cgx.embeddings          -- two-view (intent / impl) corpora, FAISS indices
+cgx.embeddings.loader   -- shared embedder loaders (spec / model_name, lazy ML)
+cgx.embeddings.cache    -- content-addressed embedding cache (.npz)
+cgx.retrieval           -- hybrid retriever (semantic + BM25 + graph) + RRF
+cgx.retrieval.tokenize  -- symmetric sub-word tokenizer (camelCase / snake_case)
+cgx.answer              -- LLM providers, intent detection, prompt registry
+cgx.answer.context_map  -- tiered ("Code Map") SOURCES builder for the prompt
+cgx.answer.model_caps   -- model-window-aware budgets consumed by context_map
+cgx.answer.providers    -- OllamaProvider, OpenAICompatProvider, GeminiProvider
+cgx.answer.ratelimit    -- token-bucket limiter + 429/5xx retry
+cgx.answer.profiles     -- provider config + keyring-backed secret store
+cgx.answer.hardware_matrix -- offline local-model catalogue + tradeoffs
+cgx.answer.ollama_discovery -- installed-model listing + hardware probe
+cgx.codegen             -- diff parse / dry-apply / syntax & test validation
+cgx.codegen.ast_insert  -- AST-anchored insertion planner (sibling-anchor → PatchResult)
+cgx.codegen.disk_apply  -- write applied diffs to disk + per-run backup mirror
+cgx.codegen.env_manager -- pre-flight dependency scan, pip-install, requirements update
+cgx.codegen.symbol_map  -- symbol-table context builder for working-memory injection
+cgx.io.persist          -- JSON/JSONL/FAISS writers shared by the index pipeline
+cgx.pipeline            -- high-level orchestrators (run_index_auto, run_query_auto)
+cgx.agents              -- Planner / Tracker / Judge multi-agent loop
+cgx.agents.viz          -- DAG + status-table renderers for the Agent tab
+cgx.sessions            -- append-only JSONL conversation store
+cgx.telemetry           -- opt-in anonymous startup ping
+cgx.logging_setup       -- shared setup_logging() invoked once from launch.py
+cgx.webui.task_store    -- SQLite task registry + threading.Event cancel tokens
+cgx.webui.routes.tasks  -- REST API for task list / get / event-replay / cancel
+cgx.webui.routes.rollback -- POST /api/rollback restores from an apply backup dir
+cgx.webui.routes.setup  -- discovery endpoints + POST /api/provider/ping
+cgx.cli / cgx.webui     -- terminal + FastAPI/React surfaces (uvicorn on :8765)
 ```
 
 ## Data flow
@@ -53,8 +53,8 @@ cgx.cli / cgx.webui     — terminal + FastAPI/React surfaces (uvicorn on :8765)
    `attr` and `defined_in` edges.
 3. `make_index_records` materialises chunk records, then
    `prepare_embedding_corpus` builds two views:
-   - **intent** — NL-friendly summary (docstrings, names).
-   - **impl** — implementation text (signatures + bodies).
+   - **intent** -- NL-friendly summary (docstrings, names).
+   - **impl** -- implementation text (signatures + bodies).
 4. `build_embeddings` + `build_faiss_index` persist per-view ANN indices.
    Embeddings flow through a content-addressed cache
    (`cgx.embeddings.cache`, one `.npz` per view) keyed on the sha256 of
@@ -112,7 +112,7 @@ else (semantic match, BM25 match, symbol-boosted seed) is `primary`.
   char cap so the LLM has enough text to ground its answer or its
   diff.
 - **Neighbor** sources are rendered by `format_neighbor_stub` as
-  ``[class.]name(signature) — doc_first_sentence``. Each component is
+  ``[class.]name(signature) -- doc_first_sentence``. Each component is
   dropped silently when the record doesn't supply it (e.g. methods
   prepend their class, free functions don't). The signature, first-doc
   sentence, and parent class name are pulled from `records.jsonl` via
@@ -148,7 +148,7 @@ The five keys are consumed exactly once each by `build_tiered_context`:
 `primary_chars` and `primary_max` go through `_as_sources_with_meta`
 (per-chunk char window, total chunk count); `neighbor_chars` and
 `neighbor_max` cap the stub length and the neighbor count respectively;
-`total_chars` is enforced as a deterministic global ceiling — the
+`total_chars` is enforced as a deterministic global ceiling -- the
 builder walks the ordered list primary-first and drops trailing items
 once the cumulative `text` length would exceed the cap (the first item
 is always kept). Call sites never hard-code budget numbers; they always
@@ -160,7 +160,7 @@ list + provider pair and keeps citation indices stable across reruns.
 
 **Wiring**
 
-`cgx.answer.engine` activates the Code Map opportunistically — only
+`cgx.answer.engine` activates the Code Map opportunistically -- only
 when the retriever actually surfaced a neighbor. Both entry points
 share the same gate:
 
@@ -195,7 +195,7 @@ pre-Phase-3 prompt format.
 |-----------------------------------------------|---------|
 | `load_records_by_id(records_path)`            | Read `records.jsonl` and key it by `id`. Returns `{}` on missing / unreadable file (the caller treats absence as "no enrichment"). |
 | `classify_hits(hits)`                         | Split a hit list into `(primary, neighbors)` using the `graph_depth >= 1` rule. |
-| `format_neighbor_stub(record, symbol)`        | Compose the `[class.]name(signature) — doc_first_sentence` string with silent drop of missing parts. Pure: no I/O. |
+| `format_neighbor_stub(record, symbol)`        | Compose the `[class.]name(signature) -- doc_first_sentence` string with silent drop of missing parts. Pure: no I/O. |
 | `build_tiered_context(hits, cmap, records_by_id, *, budget, focus_terms=None)` | The full builder. Returns the final source-dict list, each carrying a `tier` key. |
 
 The module owns a lazy import of `engine._as_sources_with_meta` to
@@ -280,7 +280,7 @@ saved profile) goes through one factory.
 
 **Reranker policy** (`enable_reranker`): an `Optional[bool]` whose
 `None` value means "auto" and resolves through
-`default_reranker_for_kind(kind)` — cloud kinds (`openai-compat`,
+`default_reranker_for_kind(kind)` -- cloud kinds (`openai-compat`,
 `gemini`) opt in by default, local / private kinds (`ollama`, `custom`)
 opt out. Explicit `True` / `False` on the profile wins.
 `resolve_enable_reranker(profile)` is the single helper that returns
@@ -306,17 +306,17 @@ that is not listed in `requirements.txt`.
 
 **Pipeline** (called inside the `verify` capability before `pytest`):
 
-1. `scan_imports(generated_files)` — AST walk (`.py`) or regex
+1. `scan_imports(generated_files)` -- AST walk (`.py`) or regex
    (`.js`/`.ts`) to collect top-level import roots.
-2. `find_missing_python_packages(imports, project_root)` — cross-references
+2. `find_missing_python_packages(imports, project_root)` -- cross-references
    against `requirements.txt`; then probes live importability; skips the
    full CPython stdlib (50+ top-level names).
-3. `install_packages(packages)` — `pip install --quiet` per missing
+3. `install_packages(packages)` -- `pip install --quiet` per missing
    package; records success/failure per name.
 4. If tests pass, `update_requirements(project_root, installed)` appends
    new packages to `requirements.txt` idempotently.
 
-Failures are logged but never abort the test run — the model may have
+Failures are logged but never abort the test run -- the model may have
 misspelled the package name, in which case pytest still runs and gives
 the retry loop a real `ImportError` to diagnose.
 
@@ -353,7 +353,7 @@ and inject it into the re-try prompt.
 `answer_with_llm` / `generate_code_plan` / `generate_project_scaffold`
 entry points:
 
-1. **Planner** (`cgx.agents.planner.Planner`) — decomposes a user goal
+1. **Planner** (`cgx.agents.planner.Planner`) -- decomposes a user goal
    into an ordered list of atomic `Task`s. Prefers the LLM with a
    strict JSON schema (1–5 tasks, each with `name` (short title),
    `description` (imperative sentence),
@@ -372,7 +372,7 @@ entry points:
      runs, giving the UI per-file progress and letting each generation
      call stay focused on a single output. Detection
      accepts three independent signals (see `_goal_is_scaffold`):
-     (a) the `_SCAFFOLD_RE` regex — a scaffold verb (`create`,
+     (a) the `_SCAFFOLD_RE` regex -- a scaffold verb (`create`,
      `build`, `generate`, `scaffold`, `bootstrap`, `init`, …) within
      5 tokens of a project noun (`app`, `project`, `cli`, `tool`,
      `library`, `calculator`, `dashboard`, `todo`, `blog`, `game`,
@@ -384,12 +384,12 @@ entry points:
      `fastapi`, `flask`, `django`, `express`, `tkinter`, `pyqt`,
      `electron`, `streamlit`, `react native`, `flutter`, `rails`,
      `spring`, `python`, `typescript`, `rust`, `go`, `tailwind`,
-     etc.) — covers prompts like *"create a calculator using React"*;
+     etc.) -- covers prompts like *"create a calculator using React"*;
      (c) the LLM emitted at least one `scaffold` task and the goal
      has no existing-codebase hint (`_EXISTING_CODE_HINT_RE`:
      `existing`, `our app`, `legacy`, `refactor`, `modify`,
      `fix the bug`, …); (d) a scaffold verb together with at least one
-     supported, non-style skill firing via `skills.detect_skills` —
+     supported, non-style skill firing via `skills.detect_skills` --
      the more precise of the verb-paired signals because it only
      matches technologies CGX actually has dedicated handling for
      (see the [Skills](#skills) section). The scaffold branch always
@@ -413,7 +413,7 @@ entry points:
    (`Planner: kind-policy SCAFFOLD/VERIFY-ONLY/READ-ONLY/CHANGE-GOAL
    path`) so the operator can read the routing decision in the
    server terminal.
-2. **Tracker** (`cgx.agents.tracker.Tracker`) — drives the plan
+2. **Tracker** (`cgx.agents.tracker.Tracker`) -- drives the plan
    task-by-task, dispatching each kind to a caller-supplied capability
    callable (`ask`, `plan`, `scaffold`, `scaffold_manifest`,
    `scaffold_file`, `search`, `summarize`, `apply`, `verify`,
@@ -426,7 +426,7 @@ entry points:
    `description`, and `layer` from `task.inputs`. Each capability
    runs in a worker thread so the loop can emit a `task_progress`
    heartbeat every `progress_interval` seconds (default `2.0`) carrying
-   `{task_id, name, kind, elapsed}` — the UI uses this as a live
+   `{task_id, name, kind, elapsed}` -- the UI uses this as a live
    "running for Ns" counter. When a `scaffold_manifest` task returns
    an `inject_tasks` list, the Tracker splices those `scaffold_file`
    tasks into the plan immediately after the manifest task so the
@@ -438,7 +438,7 @@ entry points:
    `task_failed` / `task_skipped`. The full `AgentEvent` set is:
    `plan`, `task_start`, `task_progress`, `task_done`, `task_failed`,
    `task_skipped`, `judge`, `summary`.
-3. **Judge** (`cgx.agents.judge.Judge`) — validates each completed task
+3. **Judge** (`cgx.agents.judge.Judge`) -- validates each completed task
    against its criteria. Performs cheap structural short-circuits before
    optionally asking the LLM for a strict `{verdict, confidence,
    rationale}` JSON verdict. Per-kind rules:
@@ -454,7 +454,7 @@ entry points:
      short-circuits to a Judge fail with the skill's rationale
      prefixed by `[<skill>]` (e.g. `[react] React skill: scaffold has
      no .jsx/.tsx/.js/.ts files`). Skills that abstain or pass let
-     the Judge fall through to a structural pass — and from there to
+     the Judge fall through to a structural pass -- and from there to
      the SCAFFOLD short-circuit in `judge()` which skips the LLM
      grader entirely (local 3-7B judge models routinely fabricate
      criteria-based fails against scaffolds that demonstrably satisfy
@@ -466,13 +466,13 @@ entry points:
      small).
    - `scaffold_manifest`: hard-fail when the manifest is empty or has
      no relative paths; pass when at least one layer with one file is
-     returned (LLM judge skipped — the per-file `scaffold_file` tasks
+     returned (LLM judge skipped -- the per-file `scaffold_file` tasks
      carry their own verdicts).
    - `scaffold_file`: hard-fail when the generated file content is
      empty or only contains stubs; otherwise pass (the file's syntax
      is smoke-tested by `apply` downstream).
    - `search`: structural pass when `hits > 0` (LLM judge not invoked).
-   - `apply`: fail when `failed_files` is non-empty (partial write —
+   - `apply`: fail when `failed_files` is non-empty (partial write --
      passing files are written, failing files are skipped); pass when
      `applied_files` is non-empty and `failed_files` is empty.
      `smoke_ok` in the return value is `True` only when all files passed.
@@ -493,7 +493,7 @@ the event timeline.
 `_stream_with_retry` in `cgx.agents.loop` handles all failure paths in
 priority order and recurses up to `max_retries` times:
 
-1. **Verify failures** — test stdout/stderr is parsed by `_diagnose_failure`
+1. **Verify failures** -- test stdout/stderr is parsed by `_diagnose_failure`
    to classify the error type (`import_error`, `syntax_error`,
    `logic_error`, `unknown`) and extract responsible files from
    tracebacks. `_build_fix_goal` then emits a *targeted* re-plan goal
@@ -512,13 +512,13 @@ priority order and recurses up to `max_retries` times:
    as a focused `` ```python `` block instead of dumping the full log,
    keeping the prompt tight enough for 7B models to act on it precisely.
 
-2. **Apply failures** — when the smoke check or cross-file coherence
+2. **Apply failures** -- when the smoke check or cross-file coherence
    check rejects generated files, the failing-file list is forwarded to
    `_build_apply_fix_goal` which tells the LLM to regenerate only those
    files with valid syntax.  **Passing files are already on disk** so
    nothing already correct is lost. Apply failures trigger a recursive
    retry.
-3. **Scaffold / plan generation failures** — Judge rejections on the
+3. **Scaffold / plan generation failures** -- Judge rejections on the
    code-generation step trigger `_build_core_fix_goal`.
 
 ### Cross-file coherence check
@@ -538,7 +538,7 @@ diagnosis.
 failed the smoke check.  It now writes files that pass validation and
 records the ones that failed in `failed_files`.  `smoke_ok` is `True`
 only when every file passed.  This means a retry only needs to
-regenerate the failing file(s) — the correct files are already on disk.
+regenerate the failing file(s) -- the correct files are already on disk.
 
 The **SSE bridge** (`cgx.webui.sse.bridge_generator`) records every
 emitted `AgentEvent` into the task registry (`cgx.webui.task_store`) so
@@ -598,16 +598,16 @@ instance to `SKILLS`. No agent-layer changes are required.
 ## Task registry
 
 `cgx.webui.task_store` is a lightweight SQLite store (database at
-`~/.cgx/tasks.db`) that records every SSE operation — `ask`, `plan`,
-`agent`, and `index` — from the moment the request arrives to the final
+`~/.cgx/tasks.db`) that records every SSE operation -- `ask`, `plan`,
+`agent`, and `index` -- from the moment the request arrives to the final
 `done` / `error` event.
 
 **Schema** (simplified):
 
-- `tasks` table — one row per operation: `id` (UUID), `kind`, `status`
+- `tasks` table -- one row per operation: `id` (UUID), `kind`, `status`
   (`running` / `done` / `cancelled` / `error`), `created_at`,
   `updated_at`, `goal` / `query` text.
-- `task_events` table — one row per SSE event: `task_id`, `seq`,
+- `task_events` table -- one row per SSE event: `task_id`, `seq`,
   `event_type`, `payload` (JSON), `ts`.
 
 **Cancellation**: a module-level `dict[str, threading.Event]` maps each
@@ -644,9 +644,9 @@ delete files that did not exist before the run. The response is
 `cgx.sessions` is stdlib-only and stores conversation history under
 `~/.cgx/sessions/` (or `$CGX_CONFIG_DIR/sessions/`):
 
-- `index.json` — list of `SessionMeta(id, title, created_at, updated_at,
+- `index.json` -- list of `SessionMeta(id, title, created_at, updated_at,
   message_count)` headers.
-- `<uuid>.jsonl` — append-only message stream, one JSON object per line
+- `<uuid>.jsonl` -- append-only message stream, one JSON object per line
   with fields `role`, `content`, `at` (unix time), `meta`.
 
 All writes go through a temp file + `os.replace` for atomicity. The
@@ -660,11 +660,11 @@ never broken by a session-store I/O error.
 `cgx.answer.ratelimit` adds two primitives shared by every HTTP-backed
 provider:
 
-- `RateLimiter(rate, capacity)` — token bucket guarded by a
+- `RateLimiter(rate, capacity)` -- token bucket guarded by a
   `threading.Lock`. `acquire()` is called before each request;
   `rate <= 0` makes the limiter a no-op so the existing call sites
   keep their pre-feature behaviour when no profile config is set.
-- `request_with_retry(func, *, limiter, max_retries)` — wraps a
+- `request_with_retry(func, *, limiter, max_retries)` -- wraps a
   callable returning a `requests.Response`. Retries on HTTP **429**
   and **5xx** using exponential backoff with jitter, honouring the
   `Retry-After` header when present.
@@ -677,14 +677,14 @@ keep their per-tenant budget across sessions.
 
 `cgx.answer.hardware_matrix` is a pure-data offline module:
 
-- `LOCAL_MODEL_CATALOG` — 8 locally-runnable models with `name`,
+- `LOCAL_MODEL_CATALOG` -- 8 locally-runnable models with `name`,
   `params_b`, `min_ram_gb`, `recommended_vram_gb`, `ctx_window`,
   `family`, and a one-line `notes` blurb.
-- `compute_local_fit(hw)` — annotates the catalogue with a verdict
+- `compute_local_fit(hw)` -- annotates the catalogue with a verdict
   string (`✅ fits` / `⚠️ tight` / `❌ won't fit` / `❓ unknown`) and a
   `reason`. Uses an "effective budget" of
   `max(ram_gb, gpu_vram_gb * 2.0)` when a GPU is detected.
-- `TRADEOFFS` — eight editorial rows comparing local vs cloud across
+- `TRADEOFFS` -- eight editorial rows comparing local vs cloud across
   privacy, marginal cost, quality ceiling, cold + warm latency,
   offline use, setup effort, and operational risk.
 
@@ -698,7 +698,7 @@ tab.
 `cgx.telemetry.ping()` is invoked once from `cgx.webui.launch.launch()`. It
 returns immediately unless `CGX_TELEMETRY=1` is set. The opt-in
 payload contains **only** a random install UUID (cached in
-`~/.cgx/install_id`) and the CGX package version — no prompts, no
+`~/.cgx/install_id`) and the CGX package version -- no prompts, no
 code, no file paths, no model names, no PII. Implementation is ~50
 lines; review it before opting in.
 
@@ -726,14 +726,14 @@ configuration.
 The React frontend (`frontend/src/`) supplements the server-side layers
 with two client-side modules introduced for tab persistence:
 
-- **`frontend/src/store/tasks.ts`** — Zustand store backed by
+- **`frontend/src/store/tasks.ts`** -- Zustand store backed by
   `sessionStorage`. Holds the in-flight streaming state for each page:
   agent (tasks / events / phase / summary), ask (messages), plan
   (thought / planMd / diff / report), index (progress / result).
   Components read from this store on mount, so a previously running task
   is immediately visible when the user returns to a tab.
 
-- **`frontend/src/lib/connections.ts`** — module-level
+- **`frontend/src/lib/connections.ts`** -- module-level
   `Map<string, SseConnection>` that owns live SSE connections outside
   the React component lifecycle. When a component unmounts (tab switch),
   the connection continues streaming and writing into the Zustand store.

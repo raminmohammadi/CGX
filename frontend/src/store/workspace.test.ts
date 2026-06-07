@@ -11,7 +11,7 @@ beforeEach(() => {
   try {
     globalThis.localStorage?.clear();
   } catch {
-    /* opaque origin — ignore */
+    /* opaque origin -- ignore */
   }
   useWorkspace.setState(
     {

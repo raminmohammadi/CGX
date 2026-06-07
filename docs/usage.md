@@ -7,7 +7,7 @@ CGX splits dependencies into a **core** layer (always required) and an
 optional cross-encoder reranker).
 
 ```bash
-# Core only — small, no torch:
+# Core only -- small, no torch:
 pip install -r requirements.txt
 pip install -e ".[codegen]"
 
@@ -23,7 +23,7 @@ only when an embedding or reranker step is actually invoked.
 
 CGX supports four provider kinds, all configurable from the **⚙️ Setup**
 tab's **Provider Type** dropdown. A **Ping** button appears on both the
-inline config card and the profile edit form — it performs a live
+inline config card and the profile edit form -- it performs a live
 connection test and reports latency or the exact error message.
 
 ### Ollama (default, local)
@@ -63,10 +63,10 @@ prov = GeminiProvider(model="gemini-1.5-flash", api_key="YOUR_KEY")
 Set **Provider Type → Custom Server (OpenAI-Compatible)** to configure a
 self-hosted model endpoint:
 
-- **Host IP/URL** — e.g. `http://100.10.20.10:8080`
-- **Endpoint Path** — the exact path suffix, e.g. `/completion` or
+- **Host IP/URL** -- e.g. `http://100.10.20.10:8080`
+- **Endpoint Path** -- the exact path suffix, e.g. `/completion` or
   `/v1/chat/completions` (default)
-- **Bearer Token** — optional; leave blank and tick **Skip auth** for
+- **Bearer Token** -- optional; leave blank and tick **Skip auth** for
   servers on private subnets that do not require authentication
 
 ```python
@@ -108,7 +108,7 @@ emb_cache_impl.npz         # content-addressed embedding cache (impl view)
 `run_index_auto()` builds the intent-view and impl-view FAISS indices
 concurrently using a `ThreadPoolExecutor`, roughly halving indexing time
 on multi-core machines. `build_embeddings()` auto-detects the best
-available compute device at runtime (CUDA > MPS > CPU) — no manual
+available compute device at runtime (CUDA > MPS > CPU) -- no manual
 configuration is needed.
 
 The **Index** tab in the UI displays a **Cancel** button while indexing
@@ -131,7 +131,7 @@ print(result["embedding_cache"])
 ```
 
 The cache is invalidated automatically when the embedding `model_name`,
-`dim`, or `normalize` flag changes — there is no risk of serving stale
+`dim`, or `normalize` flag changes -- there is no risk of serving stale
 vectors against a different model.
 
 Force a clean rebuild:
@@ -157,7 +157,7 @@ debug payload) appears below it.
 
 A **Stop** button is visible while the stream is in progress; clicking
 it closes the SSE connection and cancels the running task. Switching to
-another tab mid-stream does **not** lose the answer — the connection
+another tab mid-stream does **not** lose the answer -- the connection
 keeps streaming in the background and the accumulated messages are
 restored when you return to the Ask tab.
 
@@ -166,9 +166,9 @@ restored when you return to the Ask tab.
 The **Plan** tab accepts a free-form task description. Recommended
 options:
 
-- ✅ **Validate diffs** — parses + dry-applies fenced diffs and runs
+- ✅ **Validate diffs** -- parses + dry-applies fenced diffs and runs
   `ast.parse` on each affected Python file.
-- ✅ **Run impacted tests** — copies the project into a sandbox,
+- ✅ **Run impacted tests** -- copies the project into a sandbox,
   materialises the diffs, and runs pytest scoped to the impacted files.
 
 Failures feed a one-shot retry. The full report is rendered as a
@@ -177,7 +177,7 @@ markdown table under the plan and is also available as
 
 A **Cancel** button is shown while planning is in progress; clicking it
 closes the SSE connection and terminates the backend stream. Tab
-switching is non-destructive — the plan output accumulated so far is
+switching is non-destructive -- the plan output accumulated so far is
 preserved in session state and displayed when you return.
 
 ## 5. Tune retrieval (optional)
@@ -189,10 +189,10 @@ Reciprocal Rank Fusion. The post-fusion rerank stage is controlled by
 ```python
 from cgx.retrieval.orchestrator import HybridConfig
 cfg = HybridConfig(
-    # graph-aware reranking — pulls in neighbors of top hits.
+    # graph-aware reranking -- pulls in neighbors of top hits.
     graph_depth=1,
     graph_bonus=0.2,        # set 0.0 to ignore graph-only neighbors
-    # symbol-match bonus — rewards files/funcs whose name appears
+    # symbol-match bonus -- rewards files/funcs whose name appears
     # verbatim in the query.
     symbol_boost=0.5,       # 0.0 disables
     # optional cross-encoder rerank over the top-N RRF hits.
@@ -205,7 +205,7 @@ cfg = HybridConfig(
 
 `enable_reranker=True` lazy-loads `sentence_transformers`. If the ML
 extras aren't installed, the call silently falls back to the RRF order
-— no crash, just no rerank. Install `requirements-ml.txt` to opt in.
+-- no crash, just no rerank. Install `requirements-ml.txt` to opt in.
 
 Each chunk's `provenance` dict in the search result records which signals
 fired (`semantic_intent`, `semantic_impl`, `lexical`, `graph_depth`,
@@ -219,17 +219,17 @@ callers, callees, or import-neighbors of the top hits, CGX switches the
 prompt-time SOURCES list to a **two-tier "Code Map"** instead of
 packing every chunk with a full code body:
 
-- **Primary tier** — chunks that matched directly (semantic / lexical /
+- **Primary tier** -- chunks that matched directly (semantic / lexical /
   symbol-boosted). Rendered with the focus-windowed code body, exactly
   as before.
-- **Neighbor tier** — chunks reached by walking the call/import graph
+- **Neighbor tier** -- chunks reached by walking the call/import graph
   one or more hops from a primary seed. Rendered as a one-line stub:
-  `[class.]name(signature) — first sentence of docstring`. Each part
+  `[class.]name(signature) -- first sentence of docstring`. Each part
   drops silently when the record doesn't carry it. The block is tagged
   `tier=neighbor` in the prompt metadata so the LLM treats it as a
   structural reference rather than the focal body.
 
-This kicks in automatically — there is no flag to flip. If a query's
+This kicks in automatically -- there is no flag to flip. If a query's
 top results don't trigger graph expansion (e.g. very short queries, or
 `graph_bonus=0.0`), the prompt falls back to the legacy single-tier
 SOURCES list and behaves bit-identically to earlier CGX versions.
@@ -242,7 +242,7 @@ still cite the chunk and reason about the call shape) while reserving
 the bulk of the window for the bodies that actually need to be read.
 
 The per-tier budget scales by the provider's advertised context
-window — see `get_context_map_budget` in
+window -- see `get_context_map_budget` in
 `src/cgx/answer/model_caps.py`. The defaults are:
 
 | Window         | Per primary chunk | Per neighbor stub | Max primary | Max neighbors | Total cap |
@@ -253,7 +253,7 @@ window — see `get_context_map_budget` in
 | ≥ 200 K        | 3 500 chars       | 520 chars         | 32          | 60            | 120 000   |
 
 Ordering is deterministic: primary first (in retrieval order), then
-neighbors. The total-chars cap is enforced as a hard ceiling — once
+neighbors. The total-chars cap is enforced as a hard ceiling -- once
 the cumulative body length would exceed it, trailing items are
 dropped, so citation indices stay stable across reruns.
 
@@ -267,7 +267,7 @@ API, and the engine-level activation gate.
 For requests that don't fit into a single Ask or Plan round-trip, the
 **🤖 Agent** tab runs a Planner → Tracker → Judge loop:
 
-A picture-first overview lives in [flowcharts.md](flowcharts.md) — the
+A picture-first overview lives in [flowcharts.md](flowcharts.md) -- the
 "general user" SVG matches the UI flow described below.
 
 1. **Planner** decomposes the goal into 1–6 ordered `Task`s with a short
@@ -363,7 +363,7 @@ for React can never silently pass a Python-only output.
 | `python_cli` | "python cli", "argparse cli", "command line tool"        | Entrypoint with `argparse` / `click` / `typer` |
 | `sqlite`     | "sqlite", "sqlite db", "sqlite storage"                  | `sqlite3` / `aiosqlite` import or `.db` reference |
 
-Multi-skill goals compose naturally — *"Create a calculator project
+Multi-skill goals compose naturally -- *"Create a calculator project
 with a React UI and a FastAPI backend"* activates both `react` and
 `fastapi`, so the LLM sees both prompt fragments and the Judge runs
 both validators against the produced diffs. To extend the registry,
@@ -374,14 +374,14 @@ full protocol.
 
 ### UI controls
 
-- **Goal** textbox — free-form English.
-- **Project Root** — destination directory for `apply` / `scaffold`.
-- **Stop on first failure** toggle — halts the loop on `task_failed`.
-- **Cancel** button — closes the SSE connection; partial event log preserved.
-- **Plan Tasks panel** — vertical rail showing status circle, bold name,
+- **Goal** textbox -- free-form English.
+- **Project Root** -- destination directory for `apply` / `scaffold`.
+- **Stop on first failure** toggle -- halts the loop on `task_failed`.
+- **Cancel** button -- closes the SSE connection; partial event log preserved.
+- **Plan Tasks panel** -- vertical rail showing status circle, bold name,
   elapsed-seconds badge, and Judge rationale per task.
-- **Live event log** — collapsible JSON stream of every `AgentEvent`.
-- **Tab persistence** — SSE stream continues in the background; state
+- **Live event log** -- collapsible JSON stream of every `AgentEvent`.
+- **Tab persistence** -- SSE stream continues in the background; state
   restored from Zustand on return.
 
 ### Programmatic use
@@ -404,7 +404,7 @@ for event in run_agent(
 ):
     print(event.type, event.payload)
 
-# Generate a brand-new project — no index required.
+# Generate a brand-new project -- no index required.
 for event in run_agent(
     goal="Create a FastAPI todo app with SQLite and pytest tests",
     provider=prov,
@@ -454,9 +454,9 @@ or degrade on large files.
 Instead of asking a small model to write a 300-line file in one shot, the
 planner can decompose generation into two phases:
 
-1. **Scaffold** — write the file structure (imports, class/function
+1. **Scaffold** -- write the file structure (imports, class/function
    signatures, `pass` stubs).
-2. **Fill** — one `fill_logic` task per empty function body, prompting
+2. **Fill** -- one `fill_logic` task per empty function body, prompting
    the model with *"Implement the body for `fn_name`. Return only the
    logic."*
 
@@ -483,7 +483,7 @@ requirements.txt updated: +bcrypt
 ```
 
 Failures (e.g. a misspelled package name) are logged but never abort
-the run — pytest still executes and gives the retry loop a real
+the run -- pytest still executes and gives the retry loop a real
 `ModuleNotFoundError` to diagnose rather than a false pass.
 
 ### Symbol Table Context (`cgx.codegen.symbol_map`)
@@ -538,7 +538,7 @@ The Ask tab's sidebar holds the local conversation store:
 - Selecting an entry from the dropdown renders prior turns inline.
 
 User and assistant turns are appended automatically as each answer
-stream finishes (failed answers — those starting with `ERROR` — are
+stream finishes (failed answers -- those starting with `ERROR` -- are
 not persisted). The `meta` blob on each assistant message captures the
 detected intent and the cited sources for later inspection.
 
@@ -569,7 +569,7 @@ either the index or a thread file.
 ## 9. Hardware-aware model picker (Hardware tab)
 
 Click **🧠 Detect hardware** to populate the local-model fit table.
-The computation is pure-local — it reads the RAM/VRAM detected by
+The computation is pure-local -- it reads the RAM/VRAM detected by
 `cgx.answer.ollama_discovery.detect_hardware()` and compares against
 the static catalogue in `cgx.answer.hardware_matrix.LOCAL_MODEL_CATALOG`.
 
@@ -579,7 +579,7 @@ Verdict semantics:
 |--------|-------------------------------------------------------------------|
 | ✅     | Budget ≥ 1.2× the model's minimum RAM and any GPU has ≥0.75× the recommended VRAM. |
 | ⚠️     | Within 20% of the minimum RAM, or GPU VRAM below the recommended threshold.        |
-| ❌     | Budget is less than 90% of the model's minimum RAM — won't fit.   |
+| ❌     | Budget is less than 90% of the model's minimum RAM -- won't fit.   |
 | ❓     | No RAM / VRAM detected; the verdict is suppressed.                |
 
 The "effective budget" used to compare against `min_ram_gb` is
@@ -590,7 +590,7 @@ The "effective budget" used to compare against `min_ram_gb` is
 The second table is the editorial **local vs cloud** trade-off across
 privacy, marginal cost, quality ceiling, cold and warm latency,
 offline use, setup effort, and operational risk. Every value is a
-short string and `winner ∈ {local, cloud, tie}` — see
+short string and `winner ∈ {local, cloud, tie}` -- see
 [`docs/hardware_matrix.md`](hardware_matrix.md) for the rationale
 behind each row.
 
@@ -602,7 +602,7 @@ downstream tooling.
 Every HTTP-backed provider (Ollama and OpenAI-compatible) goes through
 `cgx.answer.ratelimit`, which provides:
 
-- A thread-safe token-bucket limiter — `RateLimiter(rate=…)`. Set
+- A thread-safe token-bucket limiter -- `RateLimiter(rate=…)`. Set
   `rate=0` (or `None` at the profile level) to make it a no-op.
 - Exponential-backoff retry with jitter, honouring `Retry-After` when
   the server provides one. Triggers on **HTTP 429** and **5xx**.
@@ -629,7 +629,7 @@ applied transparently to every subsequent call.
 
 `cgx.telemetry` ships an ultra-light startup ping that exists solely
 to count active installs (MAU/DAU). It is **off by default** and emits
-*only* a random install UUID + the CGX version — no prompts, no
+*only* a random install UUID + the CGX version -- no prompts, no
 code, no file paths, no model names, no PII.
 
 Enable:
@@ -658,7 +658,7 @@ launch an Extension Development Host. Run **CGX: Open UI** from
 the command palette. The URL is read from the `cgx.ui.url` setting
 (default `http://localhost:8765`).
 
-The extension does *not* spawn the server — start it first with
+The extension does *not* spawn the server -- start it first with
 `cgx-ui` (or `python app.py`) from the repo root.
 
 To produce a `.vsix` for side-loading:
@@ -710,16 +710,16 @@ inspect or cancel tasks programmatically:
 |----------|---------------------------|------------------------------------------------------|
 | `GET`    | `/api/tasks`              | List up to 50 most-recent tasks (newest first).      |
 | `GET`    | `/api/tasks/{id}`         | Retrieve a single task record (status, kind, goal).  |
-| `GET`    | `/api/tasks/{id}/events`  | Full ordered event log — use this for tab replay.    |
+| `GET`    | `/api/tasks/{id}/events`  | Full ordered event log -- use this for tab replay.    |
 | `DELETE` | `/api/tasks/{id}`         | Cancel a running task; no-op if already completed.   |
 
-Example — cancel a running task:
+Example -- cancel a running task:
 
 ```bash
 curl -X DELETE http://localhost:8765/api/tasks/<task-id>
 ```
 
-Example — replay the event log after switching tabs:
+Example -- replay the event log after switching tabs:
 
 ```bash
 curl http://localhost:8765/api/tasks/<task-id>/events | jq '.[].event_type'
@@ -752,16 +752,16 @@ apply.
 
 ## 15. Safety defaults
 
-- **Plan tab** — CGX never writes to your project directory during
+- **Plan tab** -- CGX never writes to your project directory during
   plan generation. The "Run impacted tests" sandbox uses a temporary
   copy; disk writes only happen when you explicitly click **Apply**.
-- **Agent tab (apply / scaffold tasks)** — the `apply` task *does*
+- **Agent tab (apply / scaffold tasks)** -- the `apply` task *does*
   write diffs to `project_root`. A timestamped backup of every
   original file is created under `<project_root>/.cgx-backups/`
   before any file is overwritten, so you can roll back with
   `cgx.codegen.disk_apply.rollback_from_backup()` directly or via
   `POST /api/rollback` (see [Rollback an `apply` run](#rollback-an-apply-run)).
-- Embedder specs (`module:attr`) execute Python on import — only use
+- Embedder specs (`module:attr`) execute Python on import -- only use
   modules you trust.
 - API keys live in your OS keyring (or `~/.cgx/secrets.json` with
   `0600` permissions); they are never echoed back through the UI or

@@ -115,7 +115,7 @@ def ping_provider(req: PingRequest) -> PingResponse:
                 r = _req.options(f"{base}{path}", headers=headers, timeout=8)
             except Exception:
                 r = _req.head(base, headers=headers, timeout=8)
-            # Accept any response — a 405 (Method Not Allowed) still proves the server is up.
+            # Accept any response -- a 405 (Method Not Allowed) still proves the server is up.
             if r.status_code >= 500:
                 r.raise_for_status()
 
@@ -139,7 +139,7 @@ def models(base_url: str = "http://localhost:11434") -> ModelChoicesResponse:
         installed_list = ollama_discovery.list_installed_models(base_url)
         installed = [m["name"] for m in installed_list]
         # list_installed_models returns [] both when unreachable and when no
-        # models are installed — do a lightweight health check to distinguish.
+        # models are installed -- do a lightweight health check to distinguish.
         health = ollama_discovery.health_check(base_url)
         ollama_reachable = bool(health.get("ok"))
         choices = ollama_discovery.model_choices(base_url)
@@ -365,7 +365,7 @@ async def ollama_pull(req: PullRequest) -> EventSourceResponse:
                     # Inspect for terminal states so we can log a one-line
                     # summary on close. Ollama's NDJSON has two failure
                     # shapes: {"status":"error","error":...} and the
-                    # field-only {"error":"..."} — handle both.
+                    # field-only {"error":"..."} -- handle both.
                     try:
                         parsed = _json.loads(line)
                         if isinstance(parsed, dict):

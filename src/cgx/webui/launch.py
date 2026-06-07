@@ -1,6 +1,6 @@
 
 
-"""``cgx-ui`` entrypoint — boot uvicorn + open the browser.
+"""``cgx-ui`` entrypoint -- boot uvicorn + open the browser.
 
 Run with ``python app.py`` or ``cgx-ui`` from a console script. The
 ``--no-browser`` flag is useful in containers and the development

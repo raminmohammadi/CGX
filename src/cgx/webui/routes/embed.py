@@ -64,7 +64,7 @@ class EmbedPullRequest(BaseModel):
     model: str
 
 
-# Hugging Face siblings we never want to fetch — duplicate weights or runtime
+# Hugging Face siblings we never want to fetch -- duplicate weights or runtime
 # variants that sentence-transformers / transformers doesn't load.
 _SKIP_EXTS = (".onnx", ".gguf", ".mlpackage", ".msgpack", ".h5", ".tflite")
 
@@ -127,7 +127,7 @@ async def embed_pull(req: EmbedPullRequest) -> EventSourceResponse:
     ``pytorch_model.bin`` only downloads the safetensors copy.
     """
     if not find_by_name(req.model):
-        logger.info("embed_pull: %r not in catalog — proceeding anyway", req.model)
+        logger.info("embed_pull: %r not in catalog -- proceeding anyway", req.model)
 
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue = asyncio.Queue(maxsize=256)

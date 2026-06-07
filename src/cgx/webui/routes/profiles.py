@@ -1,6 +1,6 @@
 
 
-"""Profile CRUD — list / upsert / delete saved provider configurations.
+"""Profile CRUD -- list / upsert / delete saved provider configurations.
 
 API keys are sent in the upsert body and forwarded to
 :func:`cgx.answer.profiles.save_profile` which persists them via the OS
@@ -46,7 +46,7 @@ def upsert_profile(name: str, req: ProfileUpsertRequest) -> ProfileSummary:
     if not name.strip():
         raise HTTPException(status_code=400, detail="profile name is required")
     if req.name != name:
-        # Body and path name disagree — prefer the path for idempotency.
+        # Body and path name disagree -- prefer the path for idempotency.
         req = req.model_copy(update={"name": name})
     try:
         p = Profile(

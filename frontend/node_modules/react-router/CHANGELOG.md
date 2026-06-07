@@ -1,5 +1,14 @@
 # `react-router`
 
+## v7.17.0
+
+### Minor Changes
+
+- Ship a subset of the official documentation inside the `react-router` package ([#15121](https://github.com/remix-run/react-router/pull/15121))
+
+  - Markdown docs are now available in `node_modules/react-router/docs`, letting AI coding agents and the React Router agent skills read official docs locally
+  - Excludes auto-generated API docs (`api/`), `community/` content, and tutorials (`tutorials/`)
+
 ## v7.16.0
 
 ### Minor Changes
@@ -11,7 +20,6 @@
 - Disable manifest path when lazy route dicovery is disabled ([#15068](https://github.com/remix-run/react-router/pull/15068))
 
 - Fix browser URL creation to use the configured history window instead of the global window. ([#15066](https://github.com/remix-run/react-router/pull/15066))
-
   - Pass the history/router window through to `createBrowserURLImpl` so custom window contexts keep the correct URL origin.
 
 - Fix `useNavigation()` return type to preserve discriminated union across navigation states ([#15095](https://github.com/remix-run/react-router/pull/15095))

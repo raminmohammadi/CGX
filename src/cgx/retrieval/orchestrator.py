@@ -56,7 +56,7 @@ def _records_map(records: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
 #
 # suggest_insertion_points re-encodes the same per-records "name + docstring"
 # corpus on every call. For repeated queries against an unchanged records
-# list (the common interactive case) the matrix is invariant — only the
+# list (the common interactive case) the matrix is invariant -- only the
 # query embedding changes. We memoize ``(mat, ids)`` keyed by the records
 # list identity, its length, the schema_version of the first record, and
 # the embedder's object identity. The cache is bounded with FIFO eviction
@@ -262,7 +262,7 @@ def hybrid_retrieve_two_view(
     reranker_weight: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
-    Hybrid retrieval over two views (intent + impl), lexical, and graph—then fuse.
+    Hybrid retrieval over two views (intent + impl), lexical, and graph--then fuse.
     Nothing is optional; if a signal is unavailable, the step becomes a no-op.
 
     Parameters mirror the original API so existing callers (e.g., run_query_auto)
@@ -598,7 +598,7 @@ class HybridRetriever:
         lists_for_rrf: List[List[Dict[str, Any]]] = []
         provenance: Dict[str, Dict[str, Any]] = {}
 
-        # --- semantic per view (intent + impl) — run both views in parallel ---
+        # --- semantic per view (intent + impl) -- run both views in parallel ---
         available_views = [(v, k) for v, k in (("intent", cfg.k_intent), ("impl", cfg.k_impl))
                            if v in self.tv.available_views()]
 

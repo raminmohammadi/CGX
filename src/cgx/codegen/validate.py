@@ -108,7 +108,7 @@ def check_cross_file_coherence(
 
     Catches the common mis-generation where a Python test does
     ``from src.App import calculateResult`` but ``src/App.jsx`` is a React
-    component — not a Python module.  Checks both the in-batch file set and
+    component -- not a Python module.  Checks both the in-batch file set and
     (when *project_root* is given) existing files on disk.
     """
     # Only count successfully-applied patches as "in the batch".
