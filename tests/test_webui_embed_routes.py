@@ -79,6 +79,7 @@ async def _drain(response) -> List[Dict[str, Any]]:
 
 
 def test_embed_pull_streams_progress_and_done_on_success():
+    pytest.importorskip("huggingface_hub")
     siblings = [
         _sibling("config.json", 1_000),
         _sibling("tokenizer.json", 5_000),
@@ -130,6 +131,7 @@ def test_embed_pull_streams_progress_and_done_on_success():
 
 def test_prepare_and_restore_online_pull_round_trip(monkeypatch):
     """Pulls must override the launcher's offline mode then restore it."""
+    pytest.importorskip("huggingface_hub")
     monkeypatch.setenv("HF_HUB_OFFLINE", "1")
     monkeypatch.setenv("TRANSFORMERS_OFFLINE", "1")
     import huggingface_hub.constants as hc
@@ -151,6 +153,8 @@ def test_prepare_and_restore_online_pull_round_trip(monkeypatch):
 
 
 def test_embed_pull_emits_error_frame_when_hub_call_raises():
+    pytest.importorskip("huggingface_hub")
+
     class _BoomApi:
         def model_info(self, *_a, **_kw):
             raise RuntimeError("hub offline")
