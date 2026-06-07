@@ -278,6 +278,7 @@ def run_query_auto(
     use_lexical: bool = True,   # retained for API compatibility; hybrid ignores and uses lexical anyway
     single_view: Optional[str] = None,
     embedder: Optional[Any] = None,
+    enable_reranker: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """
     Load indices, records, chunks, and graph, then execute hybrid two-view retrieval
@@ -341,6 +342,7 @@ def run_query_auto(
         neighbor_depth=neighbor_depth,
         use_lexical=True,  # forced on
         lexical_index=lex_idx,
+        enable_reranker=enable_reranker,
     )
 
     hits = retrieval_out.get("hits", [])

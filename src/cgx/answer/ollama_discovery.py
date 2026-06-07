@@ -28,6 +28,8 @@ RECOMMENDED_LADDER: List[Tuple[str, float, float, str]] = [
     ("qwen2.5-coder:1.5b", 1.5, 4.0, "fast / low-RAM"),
     ("qwen2.5-coder:3b", 3.0, 6.0, "balanced default"),
     ("qwen2.5-coder:7b-instruct", 7.0, 10.0, "higher quality"),
+    ("gemma4:e2b", 2.0, 4.0, "general, QAT 4-bit, mobile/edge"),
+    ("gemma4:e4b", 4.0, 6.0, "general, QAT 4-bit, laptop sweet spot"),
     ("llama3.2:3b-instruct", 3.0, 6.0, "general"),
     ("llama3.1:8b-instruct", 8.0, 12.0, "general, higher quality"),
     ("qwen2.5:7b-instruct", 7.0, 10.0, "general"),

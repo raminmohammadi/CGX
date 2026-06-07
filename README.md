@@ -289,6 +289,17 @@ from cgx.retrieval.orchestrator import HybridConfig
 cfg = HybridConfig(enable_reranker=True, reranker_top_n=20, graph_bonus=0.3)
 ```
 
+When `graph_bonus > 0` surfaces neighbors of the top hits, the answer
+pipeline automatically switches to a **two-tier "Code Map" prompt**:
+direct matches keep their full code bodies, while graph-expanded
+neighbors collapse to one-line `name(signature) — docstring` stubs
+tagged `tier=neighbor`. This keeps small local models (3B/7B Ollama,
+etc.) from spending their entire context window on structural
+references they only need to *know about*. The per-tier budget scales
+by the provider's model window — see
+[docs/usage.md § Tiered SOURCES (Code Map)](docs/usage.md#tiered-sources-code-map)
+and the architecture doc for the full treatment.
+
 ---
 
 ## Self-testing code generation

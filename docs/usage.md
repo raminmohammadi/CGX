@@ -212,6 +212,56 @@ fired (`semantic_intent`, `semantic_impl`, `lexical`, `graph_depth`,
 `symbol_match`, `reranker_score`), so the **Ask** tab's "thought process"
 panel shows exactly why a chunk ranked where it did.
 
+### Tiered SOURCES (Code Map)
+
+When the retriever's graph expansion (`graph_depth >= 1`) pulls in
+callers, callees, or import-neighbors of the top hits, CGX switches the
+prompt-time SOURCES list to a **two-tier "Code Map"** instead of
+packing every chunk with a full code body:
+
+- **Primary tier** — chunks that matched directly (semantic / lexical /
+  symbol-boosted). Rendered with the focus-windowed code body, exactly
+  as before.
+- **Neighbor tier** — chunks reached by walking the call/import graph
+  one or more hops from a primary seed. Rendered as a one-line stub:
+  `[class.]name(signature) — first sentence of docstring`. Each part
+  drops silently when the record doesn't carry it. The block is tagged
+  `tier=neighbor` in the prompt metadata so the LLM treats it as a
+  structural reference rather than the focal body.
+
+This kicks in automatically — there is no flag to flip. If a query's
+top results don't trigger graph expansion (e.g. very short queries, or
+`graph_bonus=0.0`), the prompt falls back to the legacy single-tier
+SOURCES list and behaves bit-identically to earlier CGX versions.
+
+**Why it matters**: when running against a local 3B/7B model with a 16K
+or 32K context window, a half-dozen graph-expanded neighbors can blow
+the entire prompt budget on code that the model only needs to *know
+exists*. Stubs keep that structural context visible (the model can
+still cite the chunk and reason about the call shape) while reserving
+the bulk of the window for the bodies that actually need to be read.
+
+The per-tier budget scales by the provider's advertised context
+window — see `get_context_map_budget` in
+`src/cgx/answer/model_caps.py`. The defaults are:
+
+| Window         | Per primary chunk | Per neighbor stub | Max primary | Max neighbors | Total cap |
+|----------------|-------------------|-------------------|-------------|---------------|-----------|
+| < 16 K         | 900 chars         | 220 chars         | 8           | 12            | 6 000     |
+| < 64 K         | 1 400 chars       | 320 chars         | 12          | 24            | 18 000    |
+| < 200 K        | 2 200 chars       | 420 chars         | 20          | 40            | 48 000    |
+| ≥ 200 K        | 3 500 chars       | 520 chars         | 32          | 60            | 120 000   |
+
+Ordering is deterministic: primary first (in retrieval order), then
+neighbors. The total-chars cap is enforced as a hard ceiling — once
+the cumulative body length would exceed it, trailing items are
+dropped, so citation indices stay stable across reruns.
+
+The architecture doc has the full developer-facing treatment under
+[Tiered SLM context (Code Map)](architecture.md#tiered-slm-context-code-map),
+including the classifier rule, the `cgx.answer.context_map` public
+API, and the engine-level activation gate.
+
 ## 6. Multi-agent orchestration (Agent tab)
 
 For requests that don't fit into a single Ask or Plan round-trip, the

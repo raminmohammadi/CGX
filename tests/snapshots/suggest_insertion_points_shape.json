@@ -1,0 +1,12 @@
+{
+  "sample_keys": [
+    "[].anchors",
+    "[].anchors.likely_caller",
+    "[].anchors.likely_caller_loc",
+    "[].anchors.similar_signature_neighbor",
+    "[].anchors.similar_signature_neighbor_loc",
+    "[].container_id",
+    "[].container_type",
+    "[].score"
+  ]
+}

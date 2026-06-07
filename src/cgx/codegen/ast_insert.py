@@ -76,6 +76,15 @@ class AstInsertSpec:
     dedupe:
         When True (default), top-level defs from ``code`` whose ``name``
         already exists in the target container are skipped silently.
+    anchor_loc:
+        Optional line-anchor metadata carried by the v3 record schema
+        (``{"start_line", "end_line", "indent_col"}``) describing the
+        sibling pointed to by ``anchor_symbol``. When present and the
+        ``end_line`` falls inside the target file, the planner uses it
+        directly to compute the splice position and indent — avoiding a
+        second AST walk for the anchor. Otherwise the AST-walk fallback
+        in :func:`_module_insert_after_line` /
+        :func:`_class_insert_after_line` is used.
     """
 
     rel_path: str
@@ -83,6 +92,7 @@ class AstInsertSpec:
     class_name: Optional[str] = None
     anchor_symbol: Optional[str] = None
     dedupe: bool = True
+    anchor_loc: Optional[dict] = None
 
 
 @dataclass
@@ -411,6 +421,26 @@ def plan_ast_insertion(
 
 
 
+def _coerce_anchor_loc(loc: Optional[dict], total_lines: int) -> Optional[Tuple[int, int]]:
+    """Validate ``loc`` against the target file, returning ``(end_line, indent_col)``.
+
+    Returns ``None`` when ``loc`` is missing, malformed, or points outside
+    the file's line range. ``indent_col`` is clamped to ``>= 0``. The
+    caller is responsible for deciding whether to use the indent or
+    re-detect from the surrounding AST.
+    """
+    if not isinstance(loc, dict):
+        return None
+    try:
+        end_line = int(loc.get("end_line") or 0)
+        indent_col = int(loc.get("indent_col") or 0)
+    except (TypeError, ValueError):
+        return None
+    if end_line <= 0 or end_line > total_lines:
+        return None
+    return end_line, max(0, indent_col)
+
+
 def _plan_into_existing(
     rel: str,
     original: str,
@@ -420,6 +450,8 @@ def _plan_into_existing(
     dedented_source: str,
 ) -> PatchResult:
     """Splice ``parsed`` into ``original`` according to ``spec`` and verify."""
+    total_lines = len(original.splitlines())
+    anchor_loc = _coerce_anchor_loc(spec.anchor_loc, total_lines)
     if spec.class_name:
         cls = _find_class(tree, spec.class_name)
         if cls is None:
@@ -441,10 +473,26 @@ def _plan_into_existing(
                 ) if dropped else "ast_insert: snippet had no insertable defs",
             )
         snippet_text = _snippet_to_text(filtered, dedented_source)
-        indent = _detect_body_indent(cls.body, default=4)
-        indented = _indent_block(snippet_text, indent)
-        insert_after, _inside = _class_insert_after_line(cls, spec.anchor_symbol)
-        new_content = _splice_lines(original, insert_after, indented)
+        # Line-anchored fast path: trust the retrieval-time loc when it
+        # falls within the class body's line span; otherwise re-walk.
+        if anchor_loc is not None:
+            end_line, indent_col = anchor_loc
+            cls_start = int(getattr(cls, "lineno", 0) or 0)
+            cls_end = int(getattr(cls, "end_lineno", cls_start) or cls_start)
+            if cls_start <= end_line <= cls_end:
+                indent = indent_col if indent_col > 0 else _detect_body_indent(cls.body, default=4)
+                indented = _indent_block(snippet_text, indent)
+                new_content = _splice_lines(original, end_line, indented)
+            else:
+                indent = _detect_body_indent(cls.body, default=4)
+                indented = _indent_block(snippet_text, indent)
+                insert_after, _inside = _class_insert_after_line(cls, spec.anchor_symbol)
+                new_content = _splice_lines(original, insert_after, indented)
+        else:
+            indent = _detect_body_indent(cls.body, default=4)
+            indented = _indent_block(snippet_text, indent)
+            insert_after, _inside = _class_insert_after_line(cls, spec.anchor_symbol)
+            new_content = _splice_lines(original, insert_after, indented)
     else:
         existing = _existing_names_in_module(tree)
         filtered, dropped = (
@@ -460,8 +508,12 @@ def _plan_into_existing(
                 ) if dropped else "ast_insert: snippet had no insertable defs",
             )
         snippet_text = _snippet_to_text(filtered, dedented_source)
-        insert_after = _module_insert_after_line(tree, spec.anchor_symbol)
-        new_content = _splice_lines(original, insert_after, snippet_text)
+        if anchor_loc is not None:
+            end_line, _indent = anchor_loc
+            new_content = _splice_lines(original, end_line, snippet_text)
+        else:
+            insert_after = _module_insert_after_line(tree, spec.anchor_symbol)
+            new_content = _splice_lines(original, insert_after, snippet_text)
 
     # Re-parse the result to catch indentation / scoping errors before
     # any caller writes the file. This is the same safety net the rest
@@ -578,10 +630,18 @@ def plan_ast_insertion_from_suggestion(
             ),
         )
     anchors = suggestion.get("anchors") or {}
-    anchor_chunk = (
-        anchors.get("similar_signature_neighbor")
-        or anchors.get("likely_caller")
-    )
+    # Prefer similar-signature neighbour (the strongest ranking signal);
+    # fall back to likely_caller. Pull the matching ``*_loc`` so the
+    # planner can use the v3 line anchor when present.
+    if anchors.get("similar_signature_neighbor"):
+        anchor_chunk = anchors.get("similar_signature_neighbor")
+        anchor_loc = anchors.get("similar_signature_neighbor_loc")
+    elif anchors.get("likely_caller"):
+        anchor_chunk = anchors.get("likely_caller")
+        anchor_loc = anchors.get("likely_caller_loc")
+    else:
+        anchor_chunk = None
+        anchor_loc = None
     anchor_symbol = _anchor_symbol_from_chunk_id(anchor_chunk)
     spec = AstInsertSpec(
         rel_path=rel,
@@ -589,6 +649,7 @@ def plan_ast_insertion_from_suggestion(
         class_name=class_name,
         anchor_symbol=anchor_symbol,
         dedupe=dedupe,
+        anchor_loc=anchor_loc if isinstance(anchor_loc, dict) else None,
     )
     return plan_ast_insertion(project_root, spec)
 

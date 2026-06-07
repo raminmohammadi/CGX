@@ -24,6 +24,8 @@ import os
 import re
 import logging
 
+from cgx.retrieval.tokenize import tokenize_text
+
 logger = logging.getLogger(__name__)
 if not logger.handlers:
     _h = logging.StreamHandler()
@@ -33,7 +35,10 @@ logger.setLevel(logging.INFO)
 
 
 def _tokenize_lc(q: str) -> List[str]:
-    return [t for t in re.split(r"[^a-z0-9_]+", (q or "").lower()) if t]
+    # Symmetric with embeddings.helpers._split_tokens: identifier-aware
+    # camelCase / snake_case sub-word expansion so a query like "reconnect"
+    # can hit a chunk whose name is ``databaseReconnect``.
+    return tokenize_text(q, min_len=1)
 
 
 @dataclass
@@ -145,18 +150,31 @@ class LexicalIndex:
 # Path-keyed cache
 # ---------------------------
 
-# Module-level cache: (abs_path, mtime_ns, size_bytes) -> LexicalIndex.
+# Module-level cache: (abs_path, mtime_ns, size_bytes, schema_version) -> LexicalIndex.
 # Bounded size with simple FIFO eviction; queries are read-only so this is
-# safe across the FastAPI app or any in-process re-use.
-_LEX_CACHE: "Dict[Tuple[str, int, int], LexicalIndex]" = {}
+# safe across the FastAPI app or any in-process re-use. ``schema_version`` is
+# included in the key so a tokenizer/record-shape bump (see
+# ``cgx.embeddings.records.SCHEMA_VERSION``) automatically invalidates any
+# previously cached index even if the records.jsonl file path is reused.
+_LEX_CACHE: "Dict[Tuple[str, int, int, int], LexicalIndex]" = {}
 _LEX_CACHE_MAX = 4
 
 
-def _cache_key(path: str) -> Optional[Tuple[str, int, int]]:
+def _records_schema_version(records: List[Dict]) -> int:
+    for r in records:
+        if isinstance(r, dict):
+            v = r.get("schema_version")
+            if isinstance(v, int):
+                return v
+    return 0
+
+
+def _cache_key(path: str, schema_version: int) -> Optional[Tuple[str, int, int, int]]:
     try:
         ap = os.path.abspath(path)
         st = os.stat(ap)
-        return (ap, int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))), int(st.st_size))
+        mtime_ns = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)))
+        return (ap, mtime_ns, int(st.st_size), int(schema_version))
     except Exception:
         return None
 
@@ -164,11 +182,12 @@ def _cache_key(path: str) -> Optional[Tuple[str, int, int]]:
 def get_cached_lexical_index(records_path: str, records: List[Dict]) -> LexicalIndex:
     """
     Return a LexicalIndex for the given records, reusing a cached instance
-    when the underlying file (path + mtime + size) is unchanged.
+    when the underlying file (path + mtime + size + schema_version) is unchanged.
 
     Falls back to a fresh build (without caching) when the path is invalid.
     """
-    key = _cache_key(records_path) if records_path else None
+    sv = _records_schema_version(records)
+    key = _cache_key(records_path, sv) if records_path else None
     if key is not None:
         idx = _LEX_CACHE.get(key)
         if idx is not None:

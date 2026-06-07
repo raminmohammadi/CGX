@@ -49,10 +49,25 @@ def test_compute_local_fit_tight_vram_flagged_as_tight():
     assert by_name["qwen2.5-coder:7b-instruct"]["fit"] == "tight"
 
 
-def test_compute_local_fit_rows_sorted_by_params():
+def test_compute_local_fit_rows_grouped_by_family_then_params():
+    # Rows group by family (coder → general → reasoning) and ascend by
+    # params within each family.
     rows = compute_local_fit({"ram_gb": 64.0})
-    params = [r["params_b"] for r in rows]
-    assert params == sorted(params)
+    families = [r["family"] for r in rows]
+    # Each family appears as a contiguous run.
+    seen: list[str] = []
+    for f in families:
+        if not seen or seen[-1] != f:
+            seen.append(f)
+    assert len(seen) == len(set(seen)), \
+        f"families are not contiguous: {families}"
+    # Within each family, params_b ascend.
+    by_family: dict[str, list[float]] = {}
+    for r in rows:
+        by_family.setdefault(r["family"], []).append(r["params_b"])
+    for fam, params in by_family.items():
+        assert params == sorted(params), \
+            f"family {fam!r} not sorted by params: {params}"
 
 
 def test_compute_local_fit_row_shape_matches_catalog():

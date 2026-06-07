@@ -184,3 +184,101 @@ def test_container_id_rejects_nested_class(tmp_path: Path) -> None:
         str(tmp_path), suggestion, "def x(self):\n    pass\n",
     )
     assert not res.ok
+
+
+def test_line_anchored_class_insertion_uses_loc(tmp_path: Path) -> None:
+    """anchor_loc.end_line drives the splice without re-walking the AST."""
+    _write(tmp_path, "pkg/c.py", """
+        class Foo:
+            def one(self):
+                return 1
+
+            def three(self):
+                return 3
+    """)
+    # ``one`` ends at line 3 in the dedented source (1-indexed).
+    spec = AstInsertSpec(
+        rel_path="pkg/c.py",
+        code="def two(self):\n    return 2\n",
+        class_name="Foo",
+        anchor_symbol="one",
+        anchor_loc={"start_line": 2, "end_line": 3, "indent_col": 4},
+    )
+    res = plan_ast_insertion(str(tmp_path), spec)
+    assert res.ok, res.error
+    tree = ast.parse(res.new_content)
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef))
+    assert [getattr(n, "name", None) for n in cls.body] == ["one", "two", "three"]
+
+
+def test_line_anchored_module_insertion_uses_loc(tmp_path: Path) -> None:
+    _write(tmp_path, "pkg/mod.py", """
+        def alpha():
+            return 1
+
+
+        def gamma():
+            return 3
+    """)
+    # ``alpha`` body ends at line 2 in the dedented file.
+    spec = AstInsertSpec(
+        rel_path="pkg/mod.py",
+        code="def beta():\n    return 2\n",
+        anchor_symbol="alpha",
+        anchor_loc={"start_line": 1, "end_line": 2, "indent_col": 0},
+    )
+    res = plan_ast_insertion(str(tmp_path), spec)
+    assert res.ok and res.new_content
+    assert res.new_content.index("def alpha") < res.new_content.index("def beta")
+    assert res.new_content.index("def beta") < res.new_content.index("def gamma")
+    ast.parse(res.new_content)
+
+
+def test_line_anchored_out_of_range_falls_back(tmp_path: Path) -> None:
+    """An end_line beyond the file's line count must fall back to AST walk."""
+    _write(tmp_path, "pkg/c.py", """
+        class Foo:
+            def one(self):
+                return 1
+    """)
+    spec = AstInsertSpec(
+        rel_path="pkg/c.py",
+        code="def two(self):\n    return 2\n",
+        class_name="Foo",
+        anchor_symbol="one",
+        anchor_loc={"start_line": 999, "end_line": 999, "indent_col": 4},
+    )
+    res = plan_ast_insertion(str(tmp_path), spec)
+    assert res.ok, res.error
+    tree = ast.parse(res.new_content)
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef))
+    assert [getattr(n, "name", None) for n in cls.body] == ["one", "two"]
+
+
+def test_suggestion_bridge_threads_loc_through(tmp_path: Path) -> None:
+    """plan_ast_insertion_from_suggestion forwards similar_signature_neighbor_loc."""
+    target = _write(tmp_path, "pkg/c.py", """
+        class Bar:
+            def one(self):
+                return 1
+    """)
+    suggestion = {
+        "container_type": "class",
+        "container_id": f"{target}::class::Bar",
+        "anchors": {
+            "similar_signature_neighbor": f"{target}::method::Bar.one",
+            "similar_signature_neighbor_loc": {
+                "start_line": 2, "end_line": 3, "indent_col": 4,
+            },
+            "likely_caller": None,
+            "likely_caller_loc": None,
+        },
+        "score": 0.9,
+    }
+    res = plan_ast_insertion_from_suggestion(
+        str(tmp_path), suggestion, "def two(self):\n    return 2\n",
+    )
+    assert res.ok, res.error
+    tree = ast.parse(res.new_content)
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef))
+    assert [getattr(n, "name", None) for n in cls.body] == ["one", "two"]

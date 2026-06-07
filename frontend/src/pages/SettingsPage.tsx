@@ -297,6 +297,14 @@ export default function SettingsPage() {
       model,
       baseUrl,
       (data) => {
+        // Accept both {"status":"error","error":...} and the bare
+        // {"error":"..."} shape Ollama sometimes emits — the backend
+        // normalises the latter, but defense-in-depth means the UI
+        // surfaces the failure even if the envelope drifts.
+        const errMsg =
+          data.status === "error" || data.error
+            ? String(data.error || data.status || "pull failed")
+            : null;
         setEditPull((prev) =>
           prev
             ? {
@@ -304,13 +312,23 @@ export default function SettingsPage() {
                 status: data.status || prev.status,
                 total: data.total ?? prev.total,
                 completed: data.completed ?? prev.completed,
-                done: data.status === "success",
+                done: data.status === "success" || errMsg != null,
+                error: errMsg ?? prev.error,
               }
             : null,
         );
       },
       () => {
-        setEditPull((prev) => (prev ? { ...prev, done: true, status: "Download complete" } : null));
+        setEditPull((prev) => {
+          if (!prev) return null;
+          if (prev.error) return { ...prev, done: true };
+          if (prev.done) return { ...prev, status: "Download complete" };
+          return {
+            ...prev,
+            done: true,
+            error: "Pull ended without success; see Ollama logs.",
+          };
+        });
         afterDone?.();
       },
       (err) => {

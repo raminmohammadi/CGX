@@ -33,6 +33,23 @@ SECRETS_PATH = CONFIG_DIR / "secrets.json"
 KEYRING_SERVICE = "cgx"
 
 
+#: Provider kinds for which the cross-encoder reranker is enabled by default.
+#: Cloud endpoints don't pay a local ML-stack cost when an extra
+#: ``sentence_transformers`` call is made over a small candidate pool, so the
+#: extra ordering quality is worth the cost. Local kinds (``ollama``) and
+#: bring-your-own-server kinds (``custom``) stay off by default to honour the
+#: air-gapped / zero-extra-dep posture; users can still opt in per profile.
+_CLOUD_KINDS: tuple = ("openai-compat", "gemini")
+
+
+def default_reranker_for_kind(kind: str) -> bool:
+    """Return the per-kind default for ``enable_reranker``.
+
+    Cloud kinds default to ``True``; local / custom kinds default to ``False``.
+    """
+    return str(kind or "").lower() in _CLOUD_KINDS
+
+
 @dataclass
 class Profile:
     name: str
@@ -49,10 +66,28 @@ class Profile:
     # Phase 5: custom-server fields
     endpoint_path: str = "/v1/chat/completions"  # custom endpoint suffix
     allow_no_auth: bool = False  # skip Bearer auth for private-subnet servers
+    # Retrieval policy: opt the cross-encoder reranker on/off per profile.
+    # ``None`` means "use the kind-derived default" (see
+    # :func:`default_reranker_for_kind`); explicit ``True`` / ``False`` wins.
+    enable_reranker: Optional[bool] = None
 
     def to_public_dict(self) -> Dict[str, Any]:
         d = asdict(self)
         return d
+
+
+def resolve_enable_reranker(profile: "Profile") -> bool:
+    """Return the effective ``enable_reranker`` flag for a profile.
+
+    Honours an explicit boolean on the profile; otherwise falls back to the
+    per-kind default.
+    """
+    if profile is None:
+        return False
+    val = getattr(profile, "enable_reranker", None)
+    if isinstance(val, bool):
+        return val
+    return default_reranker_for_kind(getattr(profile, "kind", ""))
 
 
 def _ensure_dir() -> None:
@@ -160,6 +195,7 @@ def list_profiles() -> List[Profile]:
             continue
         rl = p.get("rate_limit")
         mr = p.get("max_retries")
+        er = p.get("enable_reranker")
         out.append(Profile(
             name=name,
             kind=str(p.get("kind", "ollama")),
@@ -172,6 +208,7 @@ def list_profiles() -> List[Profile]:
             max_retries=(int(mr) if isinstance(mr, (int, float)) and mr >= 0 else None),
             endpoint_path=str(p.get("endpoint_path", "/v1/chat/completions")),
             allow_no_auth=bool(p.get("allow_no_auth", False)),
+            enable_reranker=(bool(er) if isinstance(er, bool) else None),
         ))
     out.sort(key=lambda x: x.name.lower())
     return out
@@ -217,6 +254,8 @@ def save_profile(profile: Profile, api_key: Optional[str] = None) -> Profile:
         entry["rate_limit"] = float(profile.rate_limit)
     if profile.max_retries is not None:
         entry["max_retries"] = int(profile.max_retries)
+    if profile.enable_reranker is not None:
+        entry["enable_reranker"] = bool(profile.enable_reranker)
     profiles[profile.name] = entry
     raw["profiles"] = profiles
     _write_json(PROFILES_PATH, raw)

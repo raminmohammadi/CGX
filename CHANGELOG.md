@@ -2,6 +2,230 @@
 
 All notable changes are documented here. Versions follow semver-ish.
 
+## Unreleased — Gemma 4 model family + pull-error fix
+
+### Added
+
+- **Gemma 4 catalogue entries** (`cgx.answer.hardware_matrix.LOCAL_MODEL_CATALOG`):
+  five rows covering the full Gemma 4 family as published on the
+  Ollama library — `gemma4:e2b` (~7.2 GB on disk, edge), `gemma4:e4b`
+  (~9.6 GB, also served as `gemma4:latest`), `gemma4:12b` (~7.6 GB,
+  workstation dense), `gemma4:26b` (MoE, ~18 GB, 4B active per token),
+  `gemma4:31b` (~20 GB, near-cloud quality). Context windows: 128K
+  for E2B / E4B, 256K for 12B / 26B / 31B. Families:
+  E2B / E4B / 12B → `general`; 26B A4B / 31B → `reasoning`.
+- **`gemma4` family registered** in
+  `cgx.answer.model_caps._MODEL_CONTEXT_TOKENS` at 128_000 tokens.
+  Conservative on purpose: the family-prefix matcher routes every
+  `gemma4:*` Ollama tag to this entry, and 128K is the floor across
+  the family (E2B / E4B), so the prompt-budget tier selector in
+  `get_summary_budget` / `get_context_map_budget` never overflows the
+  smaller models even when the 12B / 26B / 31B variants actually
+  support 256K natively.
+- **Recommended ladder entries** in
+  `cgx.answer.ollama_discovery.RECOMMENDED_LADDER`: `gemma4:e2b` and
+  `gemma4:e4b` are surfaced as general-purpose alternatives in the
+  hardware-aware setup flow (`cgx.webui.routes.setup`) alongside the
+  existing Qwen Coder / Llama options.
+
+### Changed
+
+- **Hardware matrix sort order** (`compute_local_fit` in
+  `cgx.answer.hardware_matrix`): rows now group by `family`
+  (coder → general → reasoning) and ascend by `params_b` within each
+  family, so related models cluster on the Hardware page. Previous
+  order was by `params_b` globally. The corresponding test
+  (`tests/test_hardware_matrix.py
+  ::test_compute_local_fit_rows_grouped_by_family_then_params`)
+  was updated to assert the new contract.
+
+### Fixed
+
+- **Ollama pull silently reported success on failure**. When the
+  local Ollama instance returned a non-2xx for `/api/pull` (e.g.,
+  HTTP 412 because the installed Ollama is older than the model's
+  manifest format — see ollama/ollama#15222 — or 404 for a typo'd
+  tag), the SSE stream emitted a single `status="error"` progress
+  event followed by `done`, and the UI's close handler
+  unconditionally wrote `done: true, status: "Download complete"`.
+  The user saw a 2-second "successful" pull, then `ping` reported
+  the model as not installed. Three changes fix this:
+  - `cgx.webui.routes.setup.ollama_pull` now formats HTTP failures
+    explicitly (status code + truncated response body) instead of
+    relying on `raise_for_status` to box them as opaque exceptions,
+    so the UI sees `"ollama /api/pull returned HTTP 412 for
+    model='gemma4:12b': ..."` rather than just `"HTTPError"`.
+  - `frontend/src/lib/pullManager.ts` (`startPull`) and
+    `frontend/src/pages/SettingsPage.tsx` (`startEditPull`) both
+    detect `status === "error"` in the progress stream, capture
+    `data.error` into the `error` field, and refuse to overwrite an
+    existing error with `"Download complete"` in the close handler.
+    If the stream closes without ever reporting `status="success"`
+    *and* no error was emitted, the UI now flags
+    `"Pull ended without success; see Ollama logs."` rather than
+    falsely claiming completion. The existing `PullProgress`
+    sub-component already rendered `pull.error` in red, so the fix
+    surfaces immediately in both the active-provider card and the
+    edit-profile modal.
+
+### Notes
+
+- No re-index required; the changes are catalogue + capability data
+  plus surface-level pull-flow fixes.
+- Backend test suite: 474 passed (same as the prior baseline). No
+  new test files were added; `tests/test_hardware_matrix.py` was
+  updated in place to reflect the family-grouped sort contract.
+
+## Unreleased — Retrieval & codegen pipeline overhaul (Phases 0–9)
+
+A 9-phase overhaul of the retrieval, parsing, and prompt-assembly
+layers. Behavior-preserving where noted; SLM-prompt and insertion
+output shapes changed in two phases. **Re-indexing required** — see
+the *Schema version* note under **Changed**.
+
+### Added
+
+- **Phase 1 — Symmetric sub-word tokenizer** (`cgx.retrieval.tokenize`):
+  `split_identifier(name)` splits camelCase / PascalCase / snake_case /
+  kebab-case identifiers into ordered sub-tokens; `expand_with_subwords
+  (tokens, *, min_len=1)` is the dedup wrapper used on both sides of
+  retrieval. Wired into `cgx.embeddings.helpers._split_tokens` (indexer
+  side, feeds `lexical_helpers.ngrams_*`) and
+  `cgx.retrieval.orchestrator._tokenize_lc` /
+  `_extract_symbol_tokens` (query side). Identifier matching is now
+  symmetric — a query for `parseConfig` hits records tokenized from
+  `parse_config` and vice-versa. Covered by `tests/test_tokenize.py`
+  plus a camelCase ↔ snake_case integration assertion.
+- **Phase 3 — Tiered SLM context (Code Map)** (`cgx.answer.context_map`
+  + `cgx.answer.model_caps.get_context_map_budget`): when the retriever
+  surfaces graph-expanded neighbors (`provenance.graph_depth >= 1`),
+  the prompt SOURCES list is built as two tiers — full focus-windowed
+  bodies for primary hits, one-line `[class.]name(signature) — doc`
+  stubs for neighbors, tagged `tier=neighbor` in the prompt metadata.
+  Budgets (`primary_chars`, `neighbor_chars`, `primary_max`,
+  `neighbor_max`, `total_chars`) scale by the provider's model context
+  window (4 tiers at 16K / 64K / 200K boundaries). Activation is
+  automatic: queries whose hit list contains no graph-expanded chunks
+  fall back to the legacy single-tier builder, so existing prompts are
+  byte-identical. Public API: `load_records_by_id`, `classify_hits`,
+  `format_neighbor_stub`, `build_tiered_context`. Wired into both
+  `answer_with_llm` and `generate_code_plan` via the same
+  `_has_neighbors` gate in `cgx.answer.engine`. Covered by
+  `tests/test_context_map.py`.
+- **Phase 4 — Line-anchored insertion points**: every record now
+  carries `start_line`, `end_line`, and `col_offset` (mirrored from the
+  parser chunk's AST node); see *Changed → Schema version* below.
+  `cgx.retrieval.orchestrator.suggest_insertion_points` emits two new
+  per-container anchor fields, `likely_caller_loc` and
+  `similar_signature_neighbor_loc`, each shaped `{"start_line": int,
+  "end_line": int, "indent_col": int}` (or `None` when the anchor
+  chunk has no line info). `cgx.codegen.ast_insert` now prefers
+  line-anchored splice over the existing AST-walk path when the new
+  fields are present, falling back to AST-walk for legacy / v2
+  records. `tests/snapshots/suggest_insertion_points_shape.json`
+  pins the new output shape; `tests/test_ast_insert.py` covers the
+  line-anchored splice paths.
+- **Phase 6 — `CodeGraphBackend` facade** (`cgx.graph.backend`): a
+  thin wrapper around the small set of `networkx` operations the
+  retrieval and embeddings layers actually need
+  (`has_node`, `successors`, `predecessors`, `undirected_neighbors`,
+  `edge_attrs`, `node_attrs`, `bfs_distances`, plus a `wrap(G)` factory
+  that returns `None` when `G` is missing). `cgx.retrieval.orchestrator`
+  multi-hop expansion and `cgx.embeddings.helpers._neighbors_summary`
+  now go through the facade; `build_graph`, graph visualization, and
+  graph persistence still use raw `networkx` (no dependency change).
+  Covered by `tests/test_graph_backend.py`.
+- **Phase 7 — Parser schema + `BaseParser` seam (Python-only)** —
+  `src/cgx/parser/schema.py` formalizes today's record shape via
+  `CodeChunk`, `CallRelation`, and `ChunkType` `TypedDict`s, with
+  `total=False` so the variable `meta` payloads keep their existing
+  per-chunk-type contracts. `src/cgx/parser/base.py` introduces the
+  `BaseParser` ABC: a single `parse_file(filepath, source_code,
+  project_root) -> (chunks, call_relations)` method plus a lowercase
+  `extensions` tuple drives extension-based dispatch. `src/cgx/parser/
+  python_parser.py` provides `PythonASTParser` and registers `.py`.
+  `parse_codebase` was split into a project walker (registry dispatch,
+  ignore/safety knobs, cross-file post-processing — call-relation
+  dedup, `calls_out_top`, `called_by_count`) and a module-level
+  `_parse_python_module` worker (file/module chunk emission + the
+  existing AST `CodeVisitor`). The chunk and call-relation shapes are
+  byte-identical to before — `tests/test_schema_snapshots.py` still
+  passes — and the dispatcher silently skips files whose extension is
+  not registered (so `.py`-only behavior is preserved). Covered by
+  `tests/test_parser_seam.py` (10 cases: ABC contract, registry shape,
+  per-file output keys, syntax-error tolerance, worker-vs-parser
+  equality, project-level aggregation, non-`.py` skip).
+- **Phase 9 — Reranker profile policy** — `cgx.answer.profiles.Profile`
+  gains an optional `enable_reranker: Optional[bool]` field. `None`
+  (the default) means "auto" and resolves through
+  `default_reranker_for_kind(kind)` — `True` for cloud kinds
+  (`openai-compat`, `gemini`) and `False` for local / private kinds
+  (`ollama`, `custom`). Explicit `True` / `False` on the profile wins.
+  `resolve_enable_reranker(profile)` is the single public helper that
+  returns the effective flag, and the value is persisted by
+  `save_profile` / `list_profiles` only when set explicitly (so `None`
+  stays "auto" across edits). The flag threads through
+  `cgx.retrieval.orchestrator.hybrid_retrieve_two_view` (new kwargs:
+  `enable_reranker`, `reranker_model`, `reranker_top_n`,
+  `reranker_weight`) and `cgx.pipeline.auto.run_query_auto` (new kwarg:
+  `enable_reranker`) into `HybridConfig`. When unset on both layers the
+  pre-existing `HybridConfig` defaults (reranker off) are preserved.
+  Covered by `tests/test_reranker_profile.py` (15 cases: per-kind
+  defaults, explicit-overrides-kind, save/load round-trip incl. `None`
+  preserved, threading into `HybridConfig` for all three flag states,
+  reranker knobs propagation, deterministic RRF order when disabled,
+  cross-encoder reorders head when enabled).
+
+### Changed
+
+- **Schema version: `SCHEMA_VERSION` bumped `1 → 3`** in
+  `cgx.embeddings.records`. v2 (Phase 1) added the symmetric sub-word
+  tokenizer to the lexical / catalog pipeline — v1 records under-match
+  partial-name queries. v3 (Phase 4) adds `start_line` / `end_line` /
+  `col_offset` to every record so insertion planners can splice
+  without re-walking the AST — v2 records lack these fields.
+  **Re-index advisory**: indices built before this overhaul should be
+  rebuilt by re-running `cgx index --project-root … --out-dir …` (or
+  triggering *Re-index* from the UI). Readers detect a stale
+  `schema_version` on the persisted manifest and treat the cache as
+  invalid so a rebuild is the safe path.
+- **`suggest_insertion_points` output shape**: containers now expose
+  `likely_caller_loc` and `similar_signature_neighbor_loc` alongside
+  the existing `likely_caller` / `similar_signature_neighbor` chunk
+  ids; the snapshot in `tests/snapshots/suggest_insertion_points_shape
+  .json` documents the v3 shape.
+- **`cgx.codegen.ast_insert`** prefers the new line-anchored splice
+  when records carry `start_line` / `end_line`; the existing AST-walk
+  path is retained as a fallback for v2-and-older indices.
+
+### Internal (refactors, performance, test infrastructure — no public-API change)
+
+- **Phase 0 — Schema-version constant + golden-output snapshots**:
+  added `SCHEMA_VERSION` to records / persisted manifests and
+  `tests/test_schema_snapshots.py` with three pinned snapshots
+  (record-keys, `suggest_insertion_points` shape, top-K hybrid
+  retrieval over a synthetic repo). Subsequent phases land against
+  these snapshots so any shape drift is caught immediately.
+- **Phase 2 — Parser helpers lifted to module scope**: `_build_file_
+  code_stub`, `_collect_top_level_members`, `_class_signature`, and
+  the surrounding stub builders were hoisted out of the
+  `parse_codebase` closure to module scope in
+  `cgx.parser.parse_codebase`. Pure refactor — no behavior change —
+  enabling unit-testing of the helpers in isolation
+  (`tests/test_parser_helpers.py`) and the Phase 7 parser-seam split.
+- **Phase 5 — Exemplar-embedding LRU cache** in
+  `cgx.retrieval.orchestrator`: `_build_exemplar_corpus(records,
+  embedder)` is now memoised behind `_insertion_corpus_key` (keyed by
+  records identity + `schema_version` + embedder fingerprint) with a
+  bounded LRU. Repeat calls to `suggest_insertion_points` for the
+  same index reuse a single encoded corpus matrix. A
+  `_clear_insertion_corpus_cache()` helper supports test teardown.
+  Covered by `tests/test_insertion_cache.py` (corpus encoded once
+  across repeat calls; cache invalidates on records-id change).
+- **Phase 8 — Optional Tree-sitter plugin: DROPPED**. Multi-language
+  parsing deferred to a later cycle; Phase 7's parser registry already
+  provides the seam.
+
 ## Unreleased — Manifest-driven scaffolding, rollback API, refactor batches B1–B9
 
 ### Added

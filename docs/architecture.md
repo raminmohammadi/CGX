@@ -6,14 +6,21 @@ CGX is structured as a small set of cooperating layers under `cgx.*`.
 
 ```
 cgx.parser              — language-aware tree walker → chunk records
+cgx.parser.schema       — TypedDicts pinning the chunk + call-relation shapes
+cgx.parser.base         — BaseParser ABC; the per-language seam
+cgx.parser.python_parser — PythonASTParser; the only registered parser today
 cgx.parser.module_path  — repo-root-aware dotted-name resolver for imports
 cgx.graph               — NetworkX call/containment graph over chunks
 cgx.graph.aggregation   — node/edge projections consumed by retrieval + viz
+cgx.graph.backend       — CodeGraphBackend facade isolating retrieval from nx
 cgx.embeddings          — two-view (intent / impl) corpora, FAISS indices
 cgx.embeddings.loader   — shared embedder loaders (spec / model_name, lazy ML)
 cgx.embeddings.cache    — content-addressed embedding cache (.npz)
 cgx.retrieval           — hybrid retriever (semantic + BM25 + graph) + RRF
+cgx.retrieval.tokenize  — symmetric sub-word tokenizer (camelCase / snake_case)
 cgx.answer              — LLM providers, intent detection, prompt registry
+cgx.answer.context_map  — tiered ("Code Map") SOURCES builder for the prompt
+cgx.answer.model_caps   — model-window-aware budgets consumed by context_map
 cgx.answer.providers    — OllamaProvider, OpenAICompatProvider, GeminiProvider
 cgx.answer.ratelimit    — token-bucket limiter + 429/5xx retry
 cgx.answer.profiles     — provider config + keyring-backed secret store
@@ -75,8 +82,131 @@ cgx.cli / cgx.webui     — terminal + FastAPI/React surfaces (uvicorn on :8765)
 6. `answer_with_llm` selects an intent-conditioned system prompt
    (`SYSTEM_PROMPTS`), builds line-windowed SOURCES around the focus
    symbol, and asks the configured `LLMProvider` for a JSON answer.
+   When the retriever surfaced graph-expanded neighbors the prompt
+   SOURCES are built by `cgx.answer.context_map.build_tiered_context`
+   (see [Tiered SLM context (Code Map)](#tiered-slm-context-code-map))
+   so neighbor chunks contribute compact stubs instead of full bodies.
 7. `generate_code_plan` does the same but routes through a
    diff-aware retry loop in `cgx.codegen.pipeline.validate_and_test`.
+
+## Tiered SLM context (Code Map)
+
+`cgx.answer.context_map` builds the prompt-time SOURCES list as **two
+tiers** so that the small / mid-sized LLMs CGX targets locally
+(3B–8B Ollama models, etc.) don't have their entire context window
+consumed by graph-expanded neighbors that only need to be *named*, not
+*read*. The retriever already labels neighbors via
+`HybridRetriever._expand_multi_hop`, which writes
+`provenance.graph_depth = d` (1, 2, …) on every hit that was pulled in
+by walking the call/import graph from a primary seed; everything else
+is depth `0`.
+
+**Classification rule** (`classify_hits`): a hit with
+`provenance.graph_depth >= 1` goes into the `neighbor` tier; anything
+else (semantic match, BM25 match, symbol-boosted seed) is `primary`.
+
+**Tier shapes**
+
+- **Primary** sources reuse `engine._as_sources_with_meta` unchanged
+  and carry the focus-windowed code body. They get the larger per-chunk
+  char cap so the LLM has enough text to ground its answer or its
+  diff.
+- **Neighbor** sources are rendered by `format_neighbor_stub` as
+  ``[class.]name(signature) — doc_first_sentence``. Each component is
+  dropped silently when the record doesn't supply it (e.g. methods
+  prepend their class, free functions don't). The signature, first-doc
+  sentence, and parent class name are pulled from `records.jsonl` via
+  `load_records_by_id(records_path)`. If the record carries no
+  enrichment at all the stub falls back to a trimmed view-text slice
+  so the neighbor stays visible.
+
+Each emitted source dict carries the same keys as the legacy
+`_as_sources_with_meta` output (`chunk_id`, `path`, `kind`, `symbol`,
+`signature`, `start_line`, `end_line`, `parent_class_id`, `text`,
+`hit_meta`) **plus** a `tier` field of either `"primary"` or
+`"neighbor"`. `engine._fmt_source` consults `tier` and, when it equals
+`neighbor`, appends `tier=neighbor` to the bracketed metadata line so
+the LLM sees an explicit hint that the block is a structural reference,
+not the focal body.
+
+**Budget** (`cgx.answer.model_caps.get_context_map_budget`)
+
+`get_context_map_budget(provider)` returns a five-key dict scaled by
+the provider's model context window. The same window-resolution logic
+already used by `get_summary_budget` (small / mid / large / huge tiers
+at 16K / 64K / 200K boundaries) drives a separate, more generous set
+of numbers tuned for SOURCES rather than summary prose:
+
+| Window           | `primary_chars` | `neighbor_chars` | `primary_max` | `neighbor_max` | `total_chars` |
+|------------------|-----------------|------------------|---------------|----------------|---------------|
+| < 16 K (small)   | 900             | 220              | 8             | 12             | 6 000         |
+| < 64 K (mid)     | 1 400           | 320              | 12            | 24             | 18 000        |
+| < 200 K (large)  | 2 200           | 420              | 20            | 40             | 48 000        |
+| ≥ 200 K (huge)   | 3 500           | 520              | 32            | 60             | 120 000       |
+
+The five keys are consumed exactly once each by `build_tiered_context`:
+`primary_chars` and `primary_max` go through `_as_sources_with_meta`
+(per-chunk char window, total chunk count); `neighbor_chars` and
+`neighbor_max` cap the stub length and the neighbor count respectively;
+`total_chars` is enforced as a deterministic global ceiling — the
+builder walks the ordered list primary-first and drops trailing items
+once the cumulative `text` length would exceed the cap (the first item
+is always kept). Call sites never hard-code budget numbers; they always
+go through `get_context_map_budget(provider)`.
+
+**Ordering** is fixed: primary sources first (in retrieval order), then
+neighbor stubs. This makes the prompt deterministic for a given hit
+list + provider pair and keeps citation indices stable across reruns.
+
+**Wiring**
+
+`cgx.answer.engine` activates the Code Map opportunistically — only
+when the retriever actually surfaced a neighbor. Both entry points
+share the same gate:
+
+```python
+_has_neighbors = any(
+    int(((h.get("provenance") or {}) if isinstance(h, dict) else {})
+        .get("graph_depth", 0) or 0) >= 1
+    for h in hits
+)
+if _has_neighbors:
+    from cgx.answer.context_map import build_tiered_context, load_records_by_id
+    from cgx.answer.model_caps import get_context_map_budget
+    sources = build_tiered_context(
+        hits, cmap, load_records_by_id(records_path),
+        budget=get_context_map_budget(provider),
+        focus_terms=focus_terms or None,
+    )
+else:
+    sources = _as_sources_with_meta(hits, cmap, max_chunks=…, max_chars=…)
+```
+
+`answer_with_llm` runs this branch in the SOURCES-build phase (engine.py
+around line 730), and `generate_code_plan` runs the same branch
+unchanged (engine.py around line 915). When `_has_neighbors` is false
+the legacy single-tier builder is used, so questions whose hit list
+contains no graph-expanded chunks behave bit-identically to the
+pre-Phase-3 prompt format.
+
+**Public API** (`cgx.answer.context_map`)
+
+| Symbol                                        | Purpose |
+|-----------------------------------------------|---------|
+| `load_records_by_id(records_path)`            | Read `records.jsonl` and key it by `id`. Returns `{}` on missing / unreadable file (the caller treats absence as "no enrichment"). |
+| `classify_hits(hits)`                         | Split a hit list into `(primary, neighbors)` using the `graph_depth >= 1` rule. |
+| `format_neighbor_stub(record, symbol)`        | Compose the `[class.]name(signature) — doc_first_sentence` string with silent drop of missing parts. Pure: no I/O. |
+| `build_tiered_context(hits, cmap, records_by_id, *, budget, focus_terms=None)` | The full builder. Returns the final source-dict list, each carrying a `tier` key. |
+
+The module owns a lazy import of `engine._as_sources_with_meta` to
+avoid a load-time cycle (`engine` imports `context_map`, and
+`context_map` reuses the legacy primary-tier formatter from `engine`).
+
+**Tests**: `tests/test_context_map.py` exercises the classifier rule,
+the stub formatter (with and without each enrichment field), the
+budget contract (per-chunk char clipping, primary/neighbor caps,
+total-chars ceiling, ordering), and the engine-level branch
+(deterministic switch on `_has_neighbors`).
 
 ## Self-test loop
 
@@ -143,10 +273,24 @@ orchestration layer never knows which backend it is talking to.
 
 **Profile persistence**: `cgx.answer.profiles.Profile` stores `kind`,
 `model`, `base_url`, `temperature`, `num_predict`, `has_api_key`,
-`rate_limit`, `max_retries`, `endpoint_path`, and `allow_no_auth`.
-`build_provider` in `cgx.webui.helpers` instantiates the correct class
-from a profile so every code path (inline config, saved profile) goes
-through one factory.
+`rate_limit`, `max_retries`, `endpoint_path`, `allow_no_auth`, and
+`enable_reranker`. `build_provider` in `cgx.webui.helpers` instantiates
+the correct class from a profile so every code path (inline config,
+saved profile) goes through one factory.
+
+**Reranker policy** (`enable_reranker`): an `Optional[bool]` whose
+`None` value means "auto" and resolves through
+`default_reranker_for_kind(kind)` — cloud kinds (`openai-compat`,
+`gemini`) opt in by default, local / private kinds (`ollama`, `custom`)
+opt out. Explicit `True` / `False` on the profile wins.
+`resolve_enable_reranker(profile)` is the single helper that returns
+the effective flag. The value threads from `Profile` →
+`cgx.pipeline.auto.run_query_auto(enable_reranker=…)` →
+`cgx.retrieval.orchestrator.hybrid_retrieve_two_view(enable_reranker=…,
+reranker_model=…, reranker_top_n=…, reranker_weight=…)` →
+`HybridConfig`. `None` at the threading layer preserves the
+`HybridConfig` defaults (reranker off), so existing callers that don't
+pass the flag keep their pre-feature behaviour.
 
 **Live connection test** (`POST /api/provider/ping`): returns
 `{ok, latency_ms, error}` after hitting the provider's cheapest

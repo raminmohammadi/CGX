@@ -1,0 +1,7 @@
+{
+  "top3_relative_ids": [
+    "pkg/calc.py::class::Calculator",
+    "pkg/calc.py::method::Calculator.add",
+    "pkg/calc.py::method::Calculator.multiply"
+  ]
+}

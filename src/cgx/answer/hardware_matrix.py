@@ -48,7 +48,26 @@ LOCAL_MODEL_CATALOG: List[Dict[str, Any]] = [
     {"name": "deepseek-r1:7b", "params_b": 7.0, "min_ram_gb": 10.0,
      "recommended_vram_gb": 8.0, "ctx_window": 65536, "family": "reasoning",
      "notes": "chain-of-thought reasoning; solid on 8 GB GPU"},
-    # ── Gemma (Google) ──────────────────────────────────────────────────
+    # ── Gemma 4 (Google) ────────────────────────────────────────────────
+    # Sizes / contexts match the Ollama library page for ollama.com/library
+    # /gemma4 (E2B/E4B = 128K, 12B/26B-A4B/31B = 256K). E variants are
+    # "effective" parameter models for edge deployment.
+    {"name": "gemma4:e2b", "params_b": 2.0, "min_ram_gb": 8.0,
+     "recommended_vram_gb": 8.0, "ctx_window": 131072, "family": "general",
+     "notes": "Effective 2B; ~7.2 GB on disk; mobile/edge tier"},
+    {"name": "gemma4:e4b", "params_b": 4.0, "min_ram_gb": 12.0,
+     "recommended_vram_gb": 10.0, "ctx_window": 131072, "family": "general",
+     "notes": "Effective 4B (gemma4:latest alias); ~9.6 GB on disk"},
+    {"name": "gemma4:12b", "params_b": 12.0, "min_ram_gb": 10.0,
+     "recommended_vram_gb": 8.0, "ctx_window": 262144, "family": "general",
+     "notes": "Workstation dense; ~7.6 GB on disk at default quant"},
+    {"name": "gemma4:26b", "params_b": 26.0, "min_ram_gb": 22.0,
+     "recommended_vram_gb": 18.0, "ctx_window": 262144, "family": "reasoning",
+     "notes": "MoE (4B active/token); ~18 GB on disk"},
+    {"name": "gemma4:31b", "params_b": 31.0, "min_ram_gb": 24.0,
+     "recommended_vram_gb": 24.0, "ctx_window": 262144, "family": "reasoning",
+     "notes": "Dense; ~20 GB on disk; near-cloud quality"},
+    # ── Gemma 3 (Google) ────────────────────────────────────────────────
     {"name": "gemma3:1b", "params_b": 1.0, "min_ram_gb": 3.0,
      "recommended_vram_gb": 2.0, "ctx_window": 32768, "family": "general",
      "notes": "ultra-light; runs CPU-only on any modern laptop"},
@@ -113,8 +132,9 @@ def _verdict(entry: Dict[str, Any], hw: Dict[str, Any]) -> Dict[str, str]:
 def compute_local_fit(hw: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     """Annotate :data:`LOCAL_MODEL_CATALOG` with a fit verdict for ``hw``.
 
-    Returns a list of dicts ready for tabular display. Sorted by params
-    so the smallest models appear first.
+    Returns a list of dicts ready for tabular display. Rows are grouped
+    by ``family`` (coder → general → reasoning) and then sorted ascending
+    by ``params_b`` within each family.
     """
     hw = hw or {}
     rows: List[Dict[str, Any]] = []
@@ -131,7 +151,11 @@ def compute_local_fit(hw: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any
             "reason": v["reason"],
             "notes": entry["notes"],
         })
-    rows.sort(key=lambda r: (r["params_b"], r["model"]))
+    # Group by family, then ascending params within each family so related
+    # models cluster in the UI table.
+    _family_order = {"coder": 0, "general": 1, "reasoning": 2}
+    rows.sort(key=lambda r: (_family_order.get(r["family"], 99),
+                             r["params_b"], r["model"]))
     return rows
 
 
