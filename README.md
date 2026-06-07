@@ -101,6 +101,12 @@ backend that streams progress over Server-Sent Events.
 CGX has a **small core** and a **separately-installable ML stack**. Pick
 the path that matches how you plan to use it.
 
+CGX runs natively on **Linux**, **macOS** (Intel and Apple Silicon),
+and **Windows**, on Python 3.10 / 3.11 / 3.12. The only OS-specific
+step is venv activation; everything else (CLI, UI, indexing, agent
+loop) is identical across platforms. See [Platform notes](#platform-notes)
+for Apple Silicon (Metal) and Windows-specific paths.
+
 ### Core install (no torch)
 
 Use this if you'll point CGX at an Ollama server or an OpenAI-compatible
@@ -109,7 +115,14 @@ endpoint and supply your own embeddings via a BYO embedder callable.
 ```bash
 git clone <your fork>
 cd cgx
-python -m venv .venv && source .venv/bin/activate
+python -m venv .venv
+
+# Linux / macOS
+source .venv/bin/activate
+
+# Windows (PowerShell)
+# .venv\Scripts\Activate.ps1
+
 pip install -r requirements.txt
 pip install -e ".[codegen]"
 ```
@@ -122,7 +135,8 @@ box.
 ### Full install (with local embeddings)
 
 Use this if you want CGX to load the default Jina embedding model
-locally and/or run the optional cross-encoder reranker.
+locally and/or run the optional cross-encoder reranker. Activate the
+venv first as shown above, then:
 
 ```bash
 pip install -r requirements.txt -r requirements-ml.txt
@@ -148,6 +162,29 @@ Pull a small local model (recommended default):
 ollama pull qwen2.5-coder:3b
 ```
 
+### Platform notes
+
+- **Linux** — no extra steps. NVIDIA users wanting GPU embeddings or
+  rerank need a CUDA-enabled `torch` build; the default wheels from
+  `requirements-ml.txt` install the CPU build, so pick the right
+  `torch` from <https://pytorch.org/get-started/locally/> if you want
+  CUDA.
+- **macOS — Intel** — CPU-only by default; same install path as Linux.
+- **macOS — Apple Silicon** — works natively on arm64. The embedding
+  model loads on CPU by default; to use the Metal backend, install the
+  ML extras and set `CGX_EMBED_DEVICE=mps` before launching:
+  ```bash
+  CGX_EMBED_DEVICE=mps cgx-ui
+  ```
+  Ollama also runs natively on Apple Silicon — no Rosetta needed.
+- **Windows** — use PowerShell or `cmd.exe`. The venv activates with
+  `.venv\Scripts\Activate.ps1` (PowerShell) or `.venv\Scripts\activate.bat`
+  (cmd). The CGX config directory resolves to `%USERPROFILE%\.cgx`
+  (override with `CGX_CONFIG_DIR`). The `0600` file-permission fallback
+  used for `~/.cgx/secrets.json` is a POSIX no-op on NTFS, so install
+  the `keyring` extra (`pip install -e ".[keyring]"`) so API keys are
+  stored in Windows Credential Manager instead of a plain file.
+
 ---
 
 ## Quick start
@@ -158,7 +195,30 @@ ollama pull qwen2.5-coder:3b
 cgx-ui               # after `pip install -e ".[ui]"`
 # or
 python app.py
+# or via the unified CLI
+cgx serve
 ```
+
+### Binding & remote access
+
+`cgx-ui` (and `python app.py` / `cgx serve`) bind the FastAPI server
+to `127.0.0.1:8765` by default, so the UI is only reachable from the
+same host. Override with `--host` / `--port` flags or the `CGX_HOST` /
+`CGX_PORT` environment variables:
+
+```bash
+cgx-ui --host 0.0.0.0 --port 8765
+# or
+CGX_HOST=0.0.0.0 CGX_PORT=8765 cgx-ui
+```
+
+The server has **no built-in authentication** — anything that can
+reach the bound `host:port` can drive the agent loop, read sessions,
+and write to disk under the configured Project Root. Bind to a
+non-loopback address only on a trusted LAN/VPN (Tailscale, WireGuard,
+…) or behind a reverse proxy that adds auth (Caddy, nginx + basic
+auth, oauth2-proxy, …). Do not expose port 8765 directly to the
+public internet.
 
 Tabs (left → right):
 
@@ -288,6 +348,17 @@ back to the RRF order. Install it via `requirements-ml.txt` to opt in.
 from cgx.retrieval.orchestrator import HybridConfig
 cfg = HybridConfig(enable_reranker=True, reranker_top_n=20, graph_bonus=0.3)
 ```
+
+When `graph_bonus > 0` surfaces neighbors of the top hits, the answer
+pipeline automatically switches to a **two-tier "Code Map" prompt**:
+direct matches keep their full code bodies, while graph-expanded
+neighbors collapse to one-line `name(signature) — docstring` stubs
+tagged `tier=neighbor`. This keeps small local models (3B/7B Ollama,
+etc.) from spending their entire context window on structural
+references they only need to *know about*. The per-tier budget scales
+by the provider's model window — see
+[docs/usage.md § Tiered SOURCES (Code Map)](docs/usage.md#tiered-sources-code-map)
+and the architecture doc for the full treatment.
 
 ---
 
@@ -552,6 +623,33 @@ the complete list of network egress paths in the product:
 | Google Gemini provider            | Yes             | `generativelanguage.googleapis.com` only.         |
 | Session history, profiles, cache  | **No**          | `~/.cgx/` (locked-down `0600` files).             |
 | Anonymous startup telemetry       | **Opt-in**      | Disabled by default; see below.                   |
+
+### Server access & secrets
+
+- **No authentication on the local API.** The FastAPI server does not
+  ship with login, tokens, or CSRF protection — any process that can
+  reach the bound `host:port` can drive the agent loop, read sessions,
+  and write to disk under the configured Project Root. This is safe at
+  the default `127.0.0.1:8765` loopback bind; do not bind to `0.0.0.0`
+  (via `--host`, `CGX_HOST`, or otherwise) without putting an auth-
+  enforcing reverse proxy in front. See
+  [Binding & remote access](#binding--remote-access).
+- **Disk-writing capabilities.** `apply` and `scaffold_file` tasks
+  write inside the configured **Project Root**. Every overwrite is
+  mirrored under `<project_root>/.cgx-backups/<run_id>/` and the whole
+  run can be undone via `POST /api/rollback`. Set the Project Root
+  deliberately — a stray value lets the agent write anywhere the
+  launching user can.
+- **Secrets at rest.** API keys go to the OS keyring when the
+  `keyring` extra is installed: macOS **Keychain**, GNOME
+  **Keyring** / KDE **KWallet** on Linux, **Windows Credential
+  Manager** on Windows. The fallback is `~/.cgx/secrets.json` with
+  `0600` permissions on POSIX. On Windows NTFS the POSIX bits are not
+  enforced, so install the `keyring` extra for production use.
+- **Config directory hardening.** `~/.cgx/` is chmodded to `0700` on
+  POSIX once a profile is saved. Override the location on any OS with
+  the `CGX_CONFIG_DIR` environment variable; it resolves to
+  `%USERPROFILE%\.cgx` by default on Windows.
 
 ### Telemetry
 

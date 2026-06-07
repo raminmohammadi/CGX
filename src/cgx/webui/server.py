@@ -25,6 +25,7 @@ from fastapi.staticfiles import StaticFiles
 from cgx.webui.routes import (
     agent,
     ask,
+    embed,
     hardware,
     index as index_route,
     plan,
@@ -72,6 +73,7 @@ def create_app() -> FastAPI:
     app.include_router(sessions.router, prefix="/api")
     app.include_router(hardware.router, prefix="/api")
     app.include_router(index_route.router, prefix="/api")
+    app.include_router(embed.router, prefix="/api")
     app.include_router(ask.router, prefix="/api")
     app.include_router(plan.router, prefix="/api")
     app.include_router(agent.router, prefix="/api")
@@ -103,11 +105,17 @@ def _mount_spa(app: FastAPI) -> None:
         )
 
     # Serve any extra top-level static files (favicon, og:image, ...).
+    # Browsers implicitly hit /favicon.ico even when index.html points at an
+    # SVG icon, so fall back to favicon.svg with the right media type to
+    # avoid noisy 404s in the access log.
     @app.get("/favicon.ico", include_in_schema=False, response_model=None)
     def _favicon():
-        f = STATIC_DIR / "favicon.ico"
-        if f.exists():
-            return FileResponse(str(f))
+        ico = STATIC_DIR / "favicon.ico"
+        if ico.exists():
+            return FileResponse(str(ico))
+        svg = STATIC_DIR / "favicon.svg"
+        if svg.exists():
+            return FileResponse(str(svg), media_type="image/svg+xml")
         return JSONResponse({"detail": "no favicon"}, status_code=404)
 
     @app.get("/", include_in_schema=False, response_model=None)

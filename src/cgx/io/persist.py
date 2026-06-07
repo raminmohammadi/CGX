@@ -76,7 +76,11 @@ def save_indices(indices: Dict[str, Any], out_dir: str) -> None:
     """
     _ensure_dir(out_dir)
 
+    # Import here to avoid a hard cyclic dependency at module load time.
+    from cgx.embeddings.records import SCHEMA_VERSION
+
     meta = {
+        "schema_version": SCHEMA_VERSION,
         "metric": indices.get("metric"),
         "views": {},
     }

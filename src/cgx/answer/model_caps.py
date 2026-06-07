@@ -85,6 +85,7 @@ _MODEL_CONTEXT_TOKENS: Dict[str, int] = {
     "phi4":                       16_384,
     "gemma2":                      8_192,
     "gemma3":                    128_000,
+    "gemma4":                    128_000,
     "gemma":                       8_192,
     "starcoder2":                 16_384,
 }
@@ -145,3 +146,43 @@ def get_summary_budget(provider: Any) -> Dict[str, int]:
     if ctx < 200_000:
         return {"max_chars": 1_500, "max_files": 60, "output_tokens": 6_000}
     return {"max_chars": 3_000, "max_files": 120, "output_tokens": 8_000}
+
+
+def get_context_map_budget(provider: Any) -> Dict[str, int]:
+    """Return a tiered SLM context budget scaled to the provider's model.
+
+    Used by :func:`cgx.answer.context_map.build_tiered_context` to size the
+    primary (full-window) and neighbor (stub) tiers without hard-coded
+    magic numbers in the call sites.
+
+    Keys returned:
+      * ``primary_chars``  — per-chunk char cap for primary (full-window) sources
+      * ``neighbor_chars`` — per-chunk char cap for neighbor stub sources
+      * ``primary_max``    — max number of primary chunks
+      * ``neighbor_max``   — max number of neighbor stubs
+      * ``total_chars``    — hard ceiling on the concatenated body text across tiers
+    """
+    ctx = get_model_context_window(provider_model_name(provider))
+    if ctx < 16_000:
+        return {
+            "primary_chars": 900,  "neighbor_chars": 220,
+            "primary_max": 8,      "neighbor_max": 12,
+            "total_chars": 6_000,
+        }
+    if ctx < 64_000:
+        return {
+            "primary_chars": 1_400, "neighbor_chars": 320,
+            "primary_max": 12,      "neighbor_max": 24,
+            "total_chars": 18_000,
+        }
+    if ctx < 200_000:
+        return {
+            "primary_chars": 2_200, "neighbor_chars": 420,
+            "primary_max": 20,      "neighbor_max": 40,
+            "total_chars": 48_000,
+        }
+    return {
+        "primary_chars": 3_500, "neighbor_chars": 520,
+        "primary_max": 32,      "neighbor_max": 60,
+        "total_chars": 120_000,
+    }

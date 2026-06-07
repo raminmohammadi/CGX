@@ -54,6 +54,25 @@ from .views import (
 logger = get_logger(__name__)
 
 
+# Schema version for records and persisted index manifests.
+# Bumped whenever the record/chunk/lexical-helper shape or tokenizer changes
+# in a way that requires re-indexing. Readers should reject or rebuild caches
+# whose manifest schema_version is older than this value.
+#
+# v2: Symmetric sub-word tokenizer (cgx.retrieval.tokenize) — camelCase /
+#     PascalCase / snake_case identifiers now expand into their sub-words on
+#     BOTH the indexer side (_split_tokens -> lexical_helpers.ngrams_*) and
+#     the query side (_tokenize_lc, _extract_symbol_tokens). Records from
+#     v1 indices will under-match for partial-name queries and should be
+#     rebuilt.
+# v3: Line/column anchors persisted per record. Each record now carries
+#     start_line / end_line / col_offset (mirrored from the parser chunk)
+#     so downstream consumers (suggest_insertion_points, ast_insert) can
+#     splice code without re-walking the AST. v2 indices lack these
+#     fields; readers should rebuild.
+SCHEMA_VERSION = 3
+
+
 # ---------------------------
 # Public API
 # ---------------------------
@@ -185,6 +204,8 @@ def make_index_records(
             tok_impl = _estimate_tokens(v_impl)
 
             rec: Dict[str, Any] = {
+                # schema version (see SCHEMA_VERSION at module top)
+                "schema_version": SCHEMA_VERSION,
                 # identity & context
                 "id": cid,
                 "type": ctype,
@@ -195,6 +216,13 @@ def make_index_records(
                 "docstring": doc_full,
                 "doc_first_sentence": doc_first,
                 "module_path": ch.get("module_path"),  # for file chunks (S2)
+
+                # location anchors (v3): zero when the chunk source lacks AST
+                # span info (e.g. malformed nodes). Consumers should treat 0
+                # as "unknown" and fall back to AST walks.
+                "start_line": int(ch.get("start_line") or 0),
+                "end_line": int(ch.get("end_line") or 0),
+                "col_offset": int(ch.get("col_offset") or 0),
 
                 # graph anchors
                 "parent_file_id": parent_file_id,

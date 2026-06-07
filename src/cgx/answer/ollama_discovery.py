@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -28,6 +29,8 @@ RECOMMENDED_LADDER: List[Tuple[str, float, float, str]] = [
     ("qwen2.5-coder:1.5b", 1.5, 4.0, "fast / low-RAM"),
     ("qwen2.5-coder:3b", 3.0, 6.0, "balanced default"),
     ("qwen2.5-coder:7b-instruct", 7.0, 10.0, "higher quality"),
+    ("gemma4:e2b", 2.0, 4.0, "general, QAT 4-bit, mobile/edge"),
+    ("gemma4:e4b", 4.0, 6.0, "general, QAT 4-bit, laptop sweet spot"),
     ("llama3.2:3b-instruct", 3.0, 6.0, "general"),
     ("llama3.1:8b-instruct", 8.0, 12.0, "general, higher quality"),
     ("qwen2.5:7b-instruct", 7.0, 10.0, "general"),
@@ -151,3 +154,68 @@ def model_choices(base_url: str = DEFAULT_BASE_URL) -> List[str]:
             out.append(tag)
             seen.add(tag)
     return out
+
+
+# Regex: leading lowercase-letter run + optional dotted version digits.
+# Examples: "qwen2.5-coder" → ("qwen", "2.5"); "gemma4" → ("gemma", "4");
+# "deepseek-coder-v2" → ("deepseek", "") with sub="coder-v2".
+_PREFIX_VERSION_RE = re.compile(r"^([a-z]+)([\d.]*)", re.IGNORECASE)
+# Match a "<N>b" or "<N.M>b" size hint anywhere in the tag suffix.
+# Captures e.g. "7b", "1.5b", "e2b" (→ 2), "3.8b-mini-instruct" (→ 3.8).
+_SIZE_HINT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*b\b", re.IGNORECASE)
+
+
+def _family_sort_key(
+    name: str,
+    params_lookup: Optional[Dict[str, float]] = None,
+) -> Tuple[str, str, float, float, str]:
+    """Sort key that clusters models by family / version / size.
+
+    Returns ``(family_root, sub_family, version, params_b, name)`` so that
+    ``sorted(names, key=_family_sort_key)`` groups e.g. all ``gemma*``
+    together, then orders within the group by Gemma version (2 → 3 → 4),
+    then by parameter size, then alphabetically.
+
+    ``params_lookup`` lets callers supply an exact ``params_b`` per tag
+    (e.g. from :data:`cgx.answer.hardware_matrix.LOCAL_MODEL_CATALOG`);
+    when missing, the param count is parsed from the tag suffix
+    (``qwen2.5-coder:7b-instruct`` → 7.0) so installed-only models that
+    aren't in the catalogue still sort sensibly.
+    """
+    base = name.split(":", 1)[0]
+    suffix = name[len(base) + 1:] if ":" in name else ""
+
+    m = _PREFIX_VERSION_RE.match(base)
+    if m:
+        family_root = m.group(1).lower()
+        ver_str = m.group(2)
+        try:
+            version = float(ver_str) if ver_str else 0.0
+        except ValueError:
+            version = 0.0
+        sub_family = base[m.end():].lstrip("-").lower()
+    else:
+        family_root = base.lower()
+        version = 0.0
+        sub_family = ""
+
+    params: Optional[float] = None
+    if params_lookup is not None:
+        params = params_lookup.get(name)
+    if params is None:
+        sm = _SIZE_HINT_RE.search(suffix)
+        params = float(sm.group(1)) if sm else 0.0
+
+    return (family_root, sub_family, version, params, name)
+
+
+def sort_model_choices_by_family(
+    names: List[str],
+    params_lookup: Optional[Dict[str, float]] = None,
+) -> List[str]:
+    """Return ``names`` sorted to cluster related models together.
+
+    Stable across runs (pure function of the inputs). Duplicates are
+    preserved — callers should de-dup upstream.
+    """
+    return sorted(names, key=lambda n: _family_sort_key(n, params_lookup))

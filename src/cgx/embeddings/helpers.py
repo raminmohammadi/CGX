@@ -36,6 +36,8 @@ from cgx.embeddings.views import (
     build_implementation_view,
     _attribute_roots_read,  # canonical home; re-exported here for back-compat
 )
+from cgx.retrieval.tokenize import tokenize_text
+from cgx.graph.backend import CodeGraphBackend
 
 logger = get_logger(__name__)
 
@@ -78,15 +80,18 @@ def _lc(s: Optional[str]) -> str:
 
 def _split_tokens(s: str) -> List[str]:
     """
-    Split a string into tokens on non-alphanumeric characters.
+    Split a string into lower-cased tokens, expanding camelCase/snake_case
+    identifiers into their sub-words so the BM25 index can be probed by
+    partial names at query time.
 
-    Args:
-        s (str): Input string.
+    Example: ``"databaseReconnect parse_input_args"`` ->
+    ``["databasereconnect", "database", "reconnect",
+       "parse_input_args", "parse", "input", "args"]``.
 
-    Returns:
-        List[str]: Lowercased tokens, filtering out empties.
+    The original (lower-cased) form is always kept first so exact-name
+    matches are not weakened by the expansion.
     """
-    return [t for t in re.split(r"[^A-Za-z0-9_]+", s.lower()) if t]
+    return tokenize_text(s, min_len=1)
 
 def _ngrams(tokens: List[str], n: int) -> List[str]:
     """
@@ -189,7 +194,7 @@ def _defines_children_ids(G, node_id: str, limit: int = 10_000) -> List[str]:
     Collect children nodes defined by a given node.
 
     Args:
-        G: Graph object (networkx).
+        G: Graph object (networkx or CodeGraphBackend).
         node_id (str): Node identifier.
         limit (int): Maximum number of children.
 
@@ -197,21 +202,16 @@ def _defines_children_ids(G, node_id: str, limit: int = 10_000) -> List[str]:
         List[str]: Child node ids defined by this node.
     """
     out: List[str] = []
-    try:
-        if G is None or node_id not in G:
-            return out
-        cnt = 0
-        for succ in G.successors(node_id):
-            ed = G[node_id][succ]
-            etype = ed.get("type") if isinstance(ed, dict) and not any(isinstance(v, dict) for v in ed.values()) \
-                    else (list(ed.values())[0].get("type") if isinstance(ed, dict) and ed else None)
-            if etype == "defines":
-                out.append(succ)
-                cnt += 1
-                if cnt >= limit:
-                    break
-    except Exception:
+    backend = CodeGraphBackend.wrap(G)
+    if backend is None or not backend.has_node(node_id):
         return out
+    cnt = 0
+    for succ in backend.successors(node_id):
+        if backend.edge_attrs(node_id, succ).get("type") == "defines":
+            out.append(succ)
+            cnt += 1
+            if cnt >= limit:
+                break
     return out
 
 def _calls_out_ids(G, node_id: str) -> Tuple[List[str], List[str]]:
@@ -219,98 +219,77 @@ def _calls_out_ids(G, node_id: str) -> Tuple[List[str], List[str]]:
     Collect outgoing call targets from a node.
 
     Args:
-        G: Graph object (networkx).
+        G: Graph object (networkx or CodeGraphBackend).
         node_id (str): Node identifier.
 
     Returns:
-        Tuple[List[str], List[str]]: 
+        Tuple[List[str], List[str]]:
             - internal_targets: ids of project functions/methods/lambdas.
             - unresolved_names: unresolved function names.
     """
     internal: List[str] = []
     unresolved: List[str] = []
-    try:
-        if G is None or node_id not in G:
-            return internal, unresolved
-        for succ in G.successors(node_id):
-            ed = G[node_id][succ]
-            attrs = ed if isinstance(ed, dict) and not any(isinstance(v, dict) for v in ed.values()) \
-                    else (list(ed.values())[0] if isinstance(ed, dict) and ed else {})
-            if attrs.get("type") == "calls":
-                st = G.nodes[succ].get("type")
-                if attrs.get("internal") is True and st in {"function", "method", "lambda"}:
-                    internal.append(succ)
-                elif st == "unresolved":
-                    name = G.nodes[succ].get("name")
-                    if isinstance(name, str) and name:
-                        unresolved.append(name)
-        return sorted(set(internal)), sorted(set(unresolved))
-    except Exception:
+    backend = CodeGraphBackend.wrap(G)
+    if backend is None or not backend.has_node(node_id):
         return internal, unresolved
+    for succ in backend.successors(node_id):
+        attrs = backend.edge_attrs(node_id, succ)
+        if attrs.get("type") != "calls":
+            continue
+        node_attrs = backend.node_attrs(succ)
+        st = node_attrs.get("type")
+        if attrs.get("internal") is True and st in {"function", "method", "lambda"}:
+            internal.append(succ)
+        elif st == "unresolved":
+            name = node_attrs.get("name")
+            if isinstance(name, str) and name:
+                unresolved.append(name)
+    return sorted(set(internal)), sorted(set(unresolved))
 
 def _calls_degree(G, node_id: str) -> Tuple[int, int]:
     """
     Count number of incoming and outgoing call edges.
 
     Args:
-        G: Graph object (networkx).
+        G: Graph object (networkx or CodeGraphBackend).
         node_id (str): Node identifier.
 
     Returns:
         Tuple[int, int]: (calls_in_count, calls_out_count)
     """
-    cin = cout = 0
-    try:
-        if G is None or node_id not in G:
-            return 0, 0
-        for pred in G.predecessors(node_id):
-            ed = G[pred][node_id]
-            attrs = ed if isinstance(ed, dict) and not any(isinstance(v, dict) for v in ed.values()) \
-                    else (list(ed.values())[0] if isinstance(ed, dict) and ed else {})
-            if attrs.get("type") == "calls":
-                cin += 1
-        for succ in G.successors(node_id):
-            ed = G[node_id][succ]
-            attrs = ed if isinstance(ed, dict) and not any(isinstance(v, dict) for v in ed.values()) \
-                    else (list(ed.values())[0] if isinstance(ed, dict) and ed else {})
-            if attrs.get("type") == "calls":
-                cout += 1
-        return int(cin), int(cout)
-    except Exception:
+    backend = CodeGraphBackend.wrap(G)
+    if backend is None or not backend.has_node(node_id):
         return 0, 0
+    cin = cout = 0
+    for pred in backend.predecessors(node_id):
+        if backend.edge_attrs(pred, node_id).get("type") == "calls":
+            cin += 1
+    for succ in backend.successors(node_id):
+        if backend.edge_attrs(node_id, succ).get("type") == "calls":
+            cout += 1
+    return int(cin), int(cout)
 
 def _neighbors_summary(G, node_id: str, max_n: int = 64) -> List[Tuple[str, str]]:
     """
     Collect a deterministic summary of neighbors of a node.
 
     Args:
-        G: Graph object (networkx).
+        G: Graph object (networkx or CodeGraphBackend).
         node_id (str): Node identifier.
         max_n (int): Maximum neighbors to return.
 
     Returns:
         List[Tuple[str, str]]: List of (edge_type, neighbor_id) tuples.
     """
-    out: List[Tuple[str, str]] = []
-    try:
-        if G is None or node_id not in G:
-            return out
-        for u in G.predecessors(node_id):
-            ed = G[u][node_id]
-            attrs = ed if isinstance(ed, dict) and not any(isinstance(v, dict) for v in ed.values()) \
-                    else (list(ed.values())[0] if isinstance(ed, dict) and ed else {})
-            et = attrs.get("type", "")
-            out.append((et, u))
-        for v in G.successors(node_id):
-            ed = G[node_id][v]
-            attrs = ed if isinstance(ed, dict) and not any(isinstance(v2, dict) for v2 in ed.values()) \
-                    else (list(ed.values())[0] if isinstance(ed, dict) and ed else {})
-            et = attrs.get("type", "")
-            out.append((et, v))
-        out = sorted({(et, nid) for et, nid in out})[:max_n]
-        return out
-    except Exception:
-        return out
+    backend = CodeGraphBackend.wrap(G)
+    if backend is None or not backend.has_node(node_id):
+        return []
+    pairs: List[Tuple[str, str]] = []
+    for u in backend.predecessors(node_id):
+        pairs.append((backend.edge_attrs(u, node_id).get("type", ""), u))
+    for v in backend.successors(node_id):
+        pairs.append((backend.edge_attrs(node_id, v).get("type", ""), v))
+    return sorted({(et, nid) for et, nid in pairs})[:max_n]
 
 
 def _lexical_helpers(chunk: Dict[str, Any]) -> Dict[str, Any]:

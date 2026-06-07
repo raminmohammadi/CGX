@@ -27,7 +27,8 @@ from dataclasses import dataclass
 import math
 import re
 import numpy as np
-import networkx as nx  # REQUIRED: used by suggest_insertion_points()
+# networkx ops are funneled through CodeGraphBackend (see cgx.graph.backend)
+# so this module no longer touches the nx API directly.
 
 from cgx.logging_setup import get_logger
 logger = get_logger("orchestration")
@@ -37,6 +38,8 @@ from cgx.retrieval.ann_numpy import build_ann_index
 from cgx.retrieval.index import TwoViewIndex, ViewSlice
 from cgx.retrieval.lexical import LexicalIndex
 from cgx.retrieval.rrf import rrf_fuse
+from cgx.retrieval.tokenize import expand_with_subwords
+from cgx.graph.backend import CodeGraphBackend
 
 
 # ---------------------------
@@ -45,6 +48,76 @@ from cgx.retrieval.rrf import rrf_fuse
 
 def _records_map(records: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     return {str(r.get("id")): r for r in records if isinstance(r, dict) and r.get("id")}
+
+
+# ---------------------------
+# Insertion-point exemplar corpus cache
+# ---------------------------
+#
+# suggest_insertion_points re-encodes the same per-records "name + docstring"
+# corpus on every call. For repeated queries against an unchanged records
+# list (the common interactive case) the matrix is invariant — only the
+# query embedding changes. We memoize ``(mat, ids)`` keyed by the records
+# list identity, its length, the schema_version of the first record, and
+# the embedder's object identity. The cache is bounded with FIFO eviction
+# so long-running processes don't grow without bound.
+_INSERTION_CORPUS_CACHE_MAX = 8
+_INSERTION_CORPUS_CACHE: "Dict[Tuple[int, int, int, int], Tuple[Any, List[str]]]" = {}
+_INSERTION_CORPUS_ORDER: "List[Tuple[int, int, int, int]]" = []
+
+
+def _insertion_corpus_key(
+    records: List[Dict[str, Any]], embedder: Any,
+) -> Tuple[int, int, int, int]:
+    """Build a cheap, structural cache key for the exemplar corpus.
+
+    Uses :func:`id` on the records list + embedder rather than hashing
+    their contents; in-process callers that reuse the same objects hit
+    the cache, while a rebuilt records list naturally misses (its ``id``
+    differs and/or its length differs).
+    """
+    sv = 0
+    for r in records:
+        if isinstance(r, dict):
+            sv = int(r.get("schema_version") or 0)
+            break
+    return (id(records), len(records), sv, id(embedder))
+
+
+def _build_exemplar_corpus(
+    records: List[Dict[str, Any]], embedder: Any,
+) -> Tuple[Any, List[str]]:
+    """Encode the file/class ``name + docstring`` corpus once, with caching."""
+    key = _insertion_corpus_key(records, embedder)
+    cached = _INSERTION_CORPUS_CACHE.get(key)
+    if cached is not None:
+        return cached
+    texts: List[str] = []
+    ids: List[str] = []
+    for r in records:
+        if not isinstance(r, dict):
+            continue
+        if r.get("type") in {"file", "class"}:
+            desc = (r.get("name") or "") + " " + (r.get("docstring") or "")
+            if desc.strip():
+                texts.append(desc)
+                ids.append(r.get("id"))
+    if not texts:
+        mat = np.zeros((0, 0), dtype=np.float32)
+    else:
+        mat = embedder.encode(texts)
+    _INSERTION_CORPUS_CACHE[key] = (mat, ids)
+    _INSERTION_CORPUS_ORDER.append(key)
+    while len(_INSERTION_CORPUS_ORDER) > _INSERTION_CORPUS_CACHE_MAX:
+        evict = _INSERTION_CORPUS_ORDER.pop(0)
+        _INSERTION_CORPUS_CACHE.pop(evict, None)
+    return mat, ids
+
+
+def _clear_insertion_corpus_cache() -> None:
+    """Test hook: drop all cached exemplar corpora."""
+    _INSERTION_CORPUS_CACHE.clear()
+    _INSERTION_CORPUS_ORDER.clear()
 
 # Shared stopword set for filtering identifier-like tokens out of NL questions.
 # Kept here so both the engine and the orchestrator agree on what counts as a
@@ -80,19 +153,31 @@ def _extract_symbol_tokens(q: str) -> List[str]:
     q = q or ""
     quoted = re.findall(r"[`\"]([A-Za-z_][A-Za-z0-9_]*)[`\"]", q)
     bare = re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", q)
-    tokens: set[str] = set()
-    for t in quoted:
-        tokens.add(t.lower())
+    # Keep the raw (case-preserving) tokens first so split_identifier can see
+    # camel/Pascal boundaries; lower-casing + dedup happens inside
+    # ``expand_with_subwords``. Quoted tokens are intentionally not stopword-
+    # filtered (the user explicitly delimited them).
+    raw: List[str] = []
+    raw.extend(quoted)
     for t in bare:
         tl = t.lower()
         if len(tl) < _MIN_SYMBOL_LEN:
             continue
         if tl in SYMBOL_STOPWORDS:
             continue
-        tokens.add(tl)
-    out = list(tokens)
-    out.sort(key=lambda s: (-len(s), s))
-    return out
+        raw.append(t)
+    # Sub-word expansion (symmetric with the indexer): "databaseReconnect"
+    # produces ["databasereconnect", "database", "reconnect"] so partial-name
+    # queries can still hit BM25 postings and trigger symbol_boost on full
+    # '::'-segment matches of the chunk id.
+    expanded = expand_with_subwords(raw, min_len=_MIN_SYMBOL_LEN)
+    # Drop stopwords that may have leaked in via sub-word expansion (e.g.
+    # an identifier split that produces a generic word). Sub-words shorter
+    # than _MIN_SYMBOL_LEN were already filtered by ``expand_with_subwords``.
+    expanded = [t for t in expanded if t not in SYMBOL_STOPWORDS]
+    # Stable longest-first ordering for downstream regex/substring matching.
+    expanded.sort(key=lambda s: (-len(s), s))
+    return expanded
 
 
 def _cid_segments(cid: str) -> List[str]:
@@ -171,6 +256,10 @@ def hybrid_retrieve_two_view(
     neighbor_depth: int = 1,
     use_lexical: bool = True,  # kept for API compatibility; we always include lexical anyway
     lexical_index: Optional[LexicalIndex] = None,
+    enable_reranker: Optional[bool] = None,
+    reranker_model: Optional[str] = None,
+    reranker_top_n: Optional[int] = None,
+    reranker_weight: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
     Hybrid retrieval over two views (intent + impl), lexical, and graph—then fuse.
@@ -209,6 +298,16 @@ def hybrid_retrieve_two_view(
         agg_decay=0.75,
         agg_max_per_group=6,
     )
+    # Reranker knobs are opt-in: keep the dataclass defaults (disabled) unless
+    # the caller explicitly threads a profile-derived value through.
+    if enable_reranker is not None:
+        cfg.enable_reranker = bool(enable_reranker)
+    if reranker_model is not None:
+        cfg.reranker_model = str(reranker_model)
+    if reranker_top_n is not None:
+        cfg.reranker_top_n = int(reranker_top_n)
+    if reranker_weight is not None:
+        cfg.reranker_weight = float(reranker_weight)
 
     retriever = HybridRetriever(
         tv_index=tv,
@@ -418,25 +517,16 @@ class HybridRetriever:
           - "D" is not included because it is 3 hops away (> max_depth).
         """
         depths: Dict[str, int] = {}
-        if self.G is None or not seeds:
+        backend = CodeGraphBackend.wrap(self.G)
+        if backend is None or not seeds:
             return depths
-        q: List[Tuple[str, int]] = [(sid, 0) for sid in seeds if sid in self.G]
+        q: List[Tuple[str, int]] = [(sid, 0) for sid in seeds if backend.has_node(sid)]
         visited = set(sid for sid, _ in q)
         while q:
             nid, d = q.pop(0)
             if d >= max_depth:
                 continue
-            # undirected-style neighborhood
-            nbrs = []
-            try:
-                nbrs += list(self.G.successors(nid))
-            except Exception:
-                pass
-            try:
-                nbrs += list(self.G.predecessors(nid))
-            except Exception:
-                pass
-            for nbr in nbrs:
+            for nbr in backend.undirected_neighbors(nid):
                 if nbr in visited:
                     continue
                 visited.add(nbr)
@@ -1038,26 +1128,23 @@ def suggest_insertion_points(
     sem_scores: Dict[str, float] = {}
     if embedder is not None:
         q_emb = embedder.encode([query])[0]
-        texts, ids = [], []
-        for r in records:
-            if r.get("type") in {"file", "class"}:
-                desc = (r.get("name") or "") + " " + (r.get("docstring") or "")
-                if desc.strip():
-                    texts.append(desc)
-                    ids.append(r.get("id"))
-        if texts:
-            mat = embedder.encode(texts)
+        # The exemplar corpus (file/class name + docstring) only depends on
+        # the records list; cache it across repeated calls so a long-running
+        # interactive session doesn't re-encode it per query.
+        mat, ids = _build_exemplar_corpus(records, embedder)
+        if ids:
             sims = np.dot(mat, q_emb) / (np.linalg.norm(mat, axis=1) * np.linalg.norm(q_emb) + 1e-9)
             for i, rid in enumerate(ids):
                 sem_scores[rid] = float(sims[i])
 
     # graph proximity to exemplars
     graph_scores: Dict[str, float] = {}
-    if G is not None and exemplar_ids:
+    backend = CodeGraphBackend.wrap(G)
+    if backend is not None and exemplar_ids:
         for cid in exemplar_ids:
-            if cid not in G:
+            if not backend.has_node(cid):
                 continue
-            lengths = nx.single_source_shortest_path_length(G, cid, cutoff=2)
+            lengths = backend.bfs_distances(cid, cutoff=2)
             for nid, dist in lengths.items():
                 rec = rec_map.get(nid) or {}
                 parent = rec.get("parent_class_id") or rec.get("file")
@@ -1138,27 +1225,55 @@ def suggest_insertion_points(
                 best_id, best_sim = cid, sim
         return best_id
 
+    def _loc_for(cid: Optional[str]) -> Optional[Dict[str, int]]:
+        """Return start_line/end_line/indent_col from the record map (v3 schema).
+
+        Yields ``None`` when the chunk id is missing, unknown, or the record
+        has no usable line span (start_line == 0). Downstream consumers
+        (ast_insert) treat ``None`` as "no anchor" and fall back to AST walks.
+        """
+        if not cid:
+            return None
+        rr = rec_map.get(str(cid)) or {}
+        sl = int(rr.get("start_line") or 0)
+        el = int(rr.get("end_line") or 0)
+        if sl <= 0 or el <= 0:
+            return None
+        return {
+            "start_line": sl,
+            "end_line": el,
+            "indent_col": int(rr.get("col_offset") or 0),
+        }
+
     out: List[Dict[str, Any]] = []
     for rid, sc in class_ranked:
         kids = children_by_container.get(rid, [])
+        lc = _likely_caller(kids)
+        ss = _similar_signature_neighbor(kids)
         out.append({
             "container_type": "class",
             "container_id": rid,
             "score": float(sc),
             "anchors": {
-                "likely_caller": _likely_caller(kids),
-                "similar_signature_neighbor": _similar_signature_neighbor(kids),
+                "likely_caller": lc,
+                "likely_caller_loc": _loc_for(lc),
+                "similar_signature_neighbor": ss,
+                "similar_signature_neighbor_loc": _loc_for(ss),
             }
         })
     for rid, sc in file_ranked:
         kids = children_by_container.get(rid, [])
+        lc = _likely_caller(kids)
+        ss = _similar_signature_neighbor(kids)
         out.append({
             "container_type": "file",
             "container_id": rid,
             "score": float(sc),
             "anchors": {
-                "likely_caller": _likely_caller(kids),
-                "similar_signature_neighbor": _similar_signature_neighbor(kids),
+                "likely_caller": lc,
+                "likely_caller_loc": _loc_for(lc),
+                "similar_signature_neighbor": ss,
+                "similar_signature_neighbor_loc": _loc_for(ss),
             }
         })
 
@@ -1245,23 +1360,15 @@ def analyze_change_impact(
             _bump(f, 1.0, "seed_owner")
 
     # (3) graph walk (breadth-first) over chunks → accumulate owning files
-    if G is not None:
-        frontier = [(cid, 0) for cid in seeds if cid in G]
+    backend = CodeGraphBackend.wrap(G)
+    if backend is not None:
+        frontier = [(cid, 0) for cid in seeds if backend.has_node(cid)]
         visited = set([cid for cid, _ in frontier])
         while frontier:
             nid, d = frontier.pop(0)
             if d >= depth:
                 continue
-            nbrs = []
-            try:
-                nbrs += list(G.successors(nid))
-            except Exception:
-                pass
-            try:
-                nbrs += list(G.predecessors(nid))
-            except Exception:
-                pass
-            for nb in nbrs:
+            for nb in backend.undirected_neighbors(nid):
                 if nb in visited:
                     continue
                 visited.add(nb)

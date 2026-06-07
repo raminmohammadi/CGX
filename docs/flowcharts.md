@@ -79,6 +79,62 @@ persisted into the SQLite task registry (`~/.cgx/tasks.db`) for replay
 on tab switch. Every routing branch, skill attachment, and judge
 verdict is written to stdout as `[INFO]` log lines.
 
+### Inside the retrieval & codegen capabilities
+
+The boxes labelled **search / ask / plan** in the developer diagram
+hide a layered pipeline that is documented in detail in
+[architecture.md](architecture.md) and exercised by the test suite.
+The notes below are a quick map from the diagram to the modules.
+
+The `search` box calls `cgx.pipeline.auto.run_query_auto`, which
+fans out two ANN queries (intent view + impl view) against FAISS,
+unions them with a BM25 lexical retriever, and fuses with Reciprocal
+Rank Fusion. Identifier matching is **symmetric** — both indexer
+(`cgx.embeddings.helpers`) and query (`cgx.retrieval.orchestrator`)
+sides go through `cgx.retrieval.tokenize.split_identifier`, so a
+query for `parseConfig` and an index entry for `parse_config` agree.
+The fused head is optionally re-scored by a cross-encoder; the
+**reranker is automatically on for cloud profiles** (OpenAI-compat,
+Gemini) and off for local / air-gapped profiles, governed by
+`cgx.answer.profiles.resolve_enable_reranker`. Graph expansion
+walks one or two hops from the top hits via
+`cgx.graph.backend.CodeGraphBackend`, which is a thin facade over
+the small set of `networkx` operations the orchestrator actually
+needs (decoupling retrieval from the graph library so a future
+backend swap is local).
+
+The `ask` and `plan` boxes call `cgx.answer.engine.answer_with_llm`
+and `generate_code_plan` respectively. Both detect whether the
+retriever surfaced graph-expanded neighbors (any hit with
+`provenance.graph_depth >= 1`) and, when present, build the prompt
+SOURCES list with `cgx.answer.context_map.build_tiered_context`
+instead of the legacy single-tier builder. Direct matches keep their
+focus-windowed code body (the **primary tier**); graph-discovered
+neighbors collapse to one-line stubs of the form
+`[class.]name(signature) — doc_first_sentence`, tagged
+`tier=neighbor` in the prompt metadata (the **neighbor tier**). The
+per-tier budget scales by the provider's model context window via
+`cgx.answer.model_caps.get_context_map_budget`, so small local
+models don't spend their whole window on structural references they
+only need to *know* about.
+
+The `plan` box's diff-application stage routes through
+`cgx.codegen.ast_insert`, which can now prefer **line-anchored
+splicing** when records carry the new `start_line` / `end_line` /
+`col_offset` fields (schema v3) and falls back to its existing
+AST-walk path for older indices. The companion anchor fields
+`likely_caller_loc` and `similar_signature_neighbor_loc` are
+emitted by `cgx.retrieval.orchestrator.suggest_insertion_points`
+so an insertion target can be located without re-parsing the file.
+
+The parser side is fronted by a small registry
+(`cgx.parser.python_parser.PythonASTParser` registering for `.py`
+via the `BaseParser` ABC in `cgx.parser.base`). The project walker
+in `parse_codebase` dispatches on file extension; non-`.py` files
+are silently skipped today. Adding a language later means writing a
+new `BaseParser` subclass and registering its extensions — no
+changes to the orchestrator or codegen layers.
+
 ---
 
 ## For companies

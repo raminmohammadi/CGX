@@ -269,6 +269,9 @@ def _fmt_source(s: Dict[str, Any]) -> str:
     pcid = s.get("parent_class_id") or ""
     if pcid:
         extras.append(f"parent_class={pcid}")
+    tier = s.get("tier") or ""
+    if tier == "neighbor":
+        extras.append("tier=neighbor")
     if extras:
         head += "  [" + ", ".join(extras) + "]"
     body = s.get("text", "") or ""
@@ -575,7 +578,6 @@ def answer_with_llm(
     Retrieve context from indices/graph and ask the LLM to synthesize a grounded answer.
     """
     indices = load_indices(index_dir)
-    _ = load_jsonl(records_path) if records_path else None
     cmap = _chunk_map(indices)
 
     # Detect intent
@@ -716,13 +718,31 @@ def answer_with_llm(
     for t in symbols:
         if t and t not in focus_terms:
             focus_terms.append(t)
-    sources = _as_sources_with_meta(
-        merged_hits,
-        cmap,
-        max_chunks=40 if mode == "symbol_explain" else 24,
-        max_chars=max_chars,
-        focus_terms=focus_terms or None,
+
+    # When the orchestrator surfaced graph-expanded neighbors, switch to the
+    # tiered context builder so the prompt spends its budget on full bodies
+    # for primary hits and compact stubs for neighbors. Profile-driven
+    # budgets keep us off magic numbers per call site.
+    _has_neighbors = any(
+        int(((h.get("provenance") or {}) if isinstance(h, dict) else {}).get("graph_depth", 0) or 0) >= 1
+        for h in merged_hits
     )
+    if _has_neighbors:
+        from cgx.answer.context_map import build_tiered_context, load_records_by_id
+        from cgx.answer.model_caps import get_context_map_budget
+        budget = get_context_map_budget(provider)
+        sources = build_tiered_context(
+            merged_hits, cmap, load_records_by_id(records_path),
+            budget=budget, focus_terms=focus_terms or None,
+        )
+    else:
+        sources = _as_sources_with_meta(
+            merged_hits,
+            cmap,
+            max_chunks=40 if mode == "symbol_explain" else 24,
+            max_chars=max_chars,
+            focus_terms=focus_terms or None,
+        )
 
     # Require target coverage — only for symbol-targeted modes, and only when
     # target was set by a real index match. Conceptual modes like ``howto`` /
@@ -884,10 +904,26 @@ def generate_code_plan(
     indices = load_indices(index_dir)
     cmap = _chunk_map(indices)
     task_focus = _symbol_tokens(task or "")
-    sources = _as_sources_with_meta(
-        hits, cmap, max_chunks=24, max_chars=900,
-        focus_terms=task_focus or None,
+    # Tiered context kicks in when the orchestrator surfaced graph neighbors,
+    # so plan prompts spend their budget on full bodies for primary hits and
+    # compact stubs for graph-expanded neighbors.
+    _has_neighbors = any(
+        int(((h.get("provenance") or {}) if isinstance(h, dict) else {}).get("graph_depth", 0) or 0) >= 1
+        for h in hits
     )
+    if _has_neighbors:
+        from cgx.answer.context_map import build_tiered_context, load_records_by_id
+        from cgx.answer.model_caps import get_context_map_budget
+        budget = get_context_map_budget(provider)
+        sources = build_tiered_context(
+            hits, cmap, load_records_by_id(records_path),
+            budget=budget, focus_terms=task_focus or None,
+        )
+    else:
+        sources = _as_sources_with_meta(
+            hits, cmap, max_chunks=24, max_chars=900,
+            focus_terms=task_focus or None,
+        )
 
     SYSTEM2 = (
         "You are a principal engineer. Propose a step-by-step change plan and unified diffs "

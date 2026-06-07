@@ -1,13 +1,21 @@
 import { useEffect, useRef, useState } from "react";
-import { Database, HardDriveUpload, Play, RefreshCcw, Square } from "lucide-react";
-import { api } from "../lib/api";
+import { Check, Database, Download, HardDriveUpload, Play, RefreshCcw, Square, X } from "lucide-react";
+import { api, type EmbedModelInfo } from "../lib/api";
 import { streamSSE } from "../lib/sse";
 import { abortConnection, getConnection, setConnection } from "../lib/connections";
+import {
+  cancelEmbedPull,
+  startEmbedPull,
+  useEmbedPullState,
+  type EmbedPullState,
+} from "../lib/embedPullManager";
 import { useTasks } from "../store/tasks";
 import { useWorkspace } from "../store/workspace";
 import { Card, CardHeader } from "../components/Card";
 import { Field, Select, TextInput } from "../components/Input";
 import { Pill } from "../components/Pill";
+
+const CUSTOM_EMBED_KEY = "__custom__";
 
 const PAGE_KEY = "index";
 
@@ -24,13 +32,38 @@ export default function IndexPage() {
   const [zipName, setZipName] = useState<string | null>(null);
   const fileRef = useRef<HTMLInputElement | null>(null);
 
-  // On mount: clear busy if no live connection.
+  const [embedCatalog, setEmbedCatalog] = useState<EmbedModelInfo[]>([]);
+  const embedPull = useEmbedPullState();
+
+  const refreshEmbedCatalog = () =>
+    api
+      .embedModels()
+      .then((r) => setEmbedCatalog(r.choices))
+      .catch(() => {});
+
+  // On mount: clear busy if no live connection, and load the embed catalog.
   useEffect(() => {
     if (busy && !getConnection(PAGE_KEY)) {
       setIndexState({ busy: false });
     }
+    refreshEmbedCatalog();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // When a download completes, refresh the catalog so the "cached" badge updates.
+  useEffect(() => {
+    if (embedPull?.done && !embedPull.error) {
+      refreshEmbedCatalog();
+    }
+  }, [embedPull?.done, embedPull?.error]);
+
+  const selectedCatalogEntry = embedCatalog.find((m) => m.name === embedModel) || null;
+  const isCustomEmbed = embedModel !== "" && !selectedCatalogEntry && embedCatalog.length > 0;
+  const selectValue = isCustomEmbed ? CUSTOM_EMBED_KEY : embedModel;
+  const pulling =
+    !!embedPull && embedPull.model === embedModel && !embedPull.done && !embedPull.error;
+  const showPullBtn =
+    !!selectedCatalogEntry && !selectedCatalogEntry.cached && !pulling;
 
   const onUpload = async (f: File) => {
     setIndexState({ error: null });
@@ -161,7 +194,63 @@ export default function IndexPage() {
             <TextInput value={outDir} onChange={(e) => setOutDir(e.target.value)} />
           </Field>
           <Field label="Embed model">
-            <TextInput value={embedModel} onChange={(e) => setEmbedModel(e.target.value)} />
+            <div className="flex gap-2">
+              <Select
+                value={selectValue}
+                onChange={(e) => {
+                  const v = (e.target as any).value;
+                  if (v === CUSTOM_EMBED_KEY) {
+                    setEmbedModel("");
+                  } else {
+                    setEmbedModel(v);
+                  }
+                  cancelEmbedPull();
+                }}
+                className="flex-1"
+              >
+                {embedCatalog.map((m) => (
+                  <option key={m.name} value={m.name}>
+                    {m.label} · {m.size_gb}GB{m.cached ? " ✓" : ""}
+                  </option>
+                ))}
+                <option value={CUSTOM_EMBED_KEY}>Custom Hugging Face repo…</option>
+              </Select>
+              {pulling ? (
+                <button
+                  className="av-btn-ghost whitespace-nowrap"
+                  onClick={cancelEmbedPull}
+                >
+                  <X className="h-3 w-3" /> Cancel
+                </button>
+              ) : showPullBtn ? (
+                <button
+                  className="av-btn-ghost whitespace-nowrap"
+                  onClick={() => startEmbedPull(embedModel, refreshEmbedCatalog)}
+                  disabled={busy}
+                >
+                  <Download className="h-3 w-3" /> Pull
+                </button>
+              ) : selectedCatalogEntry?.cached ? (
+                <span className="flex items-center gap-1 text-[10px] text-emerald-400 font-mono px-2 self-center">
+                  <Check className="h-3 w-3" /> cached
+                </span>
+              ) : null}
+            </div>
+            {isCustomEmbed && (
+              <TextInput
+                value={embedModel}
+                placeholder="org/repo on huggingface.co"
+                onChange={(e) => setEmbedModel(e.target.value)}
+                className="mt-2"
+              />
+            )}
+            {selectedCatalogEntry && (
+              <p className="mt-1 text-[10px] text-slate-500 font-mono">
+                {selectedCatalogEntry.description} · dim {selectedCatalogEntry.dim} ·{" "}
+                {selectedCatalogEntry.max_tokens.toLocaleString()} tokens
+              </p>
+            )}
+            <EmbedPullProgress pull={embedPull} model={embedModel} />
           </Field>
           <Field label="Metric">
             <Select value={metric} onChange={(e) => setMetric((e.target as any).value)}>
@@ -231,6 +320,46 @@ export default function IndexPage() {
           <KV label="embed_model" value={index.embed_model} />
         </div>
       </Card>
+    </div>
+  );
+}
+
+function EmbedPullProgress({
+  pull,
+  model,
+}: {
+  pull: EmbedPullState | null;
+  model: string;
+}) {
+  if (!pull || pull.model !== model) return null;
+  const pct =
+    pull.total > 0 ? Math.min(100, Math.round((pull.completed / pull.total) * 100)) : null;
+  const mb = (b: number) => (b / (1024 * 1024)).toFixed(0);
+  return (
+    <div className="mt-1.5 space-y-1">
+      <div className="h-1 bg-slate-800 rounded-full overflow-hidden">
+        {pull.error ? (
+          <div className="h-full w-full bg-red-500/60" />
+        ) : pull.done ? (
+          <div className="h-full w-full bg-emerald-500" />
+        ) : pct !== null ? (
+          <div
+            className="h-full bg-emerald-500 transition-all duration-300"
+            style={{ width: `${pct}%` }}
+          />
+        ) : (
+          <div className="h-full w-1/3 bg-emerald-500/70 animate-pulse" />
+        )}
+      </div>
+      <p className={`text-[10px] font-mono ${pull.error ? "text-red-400" : "text-slate-400"}`}>
+        {pull.error
+          ? pull.error.slice(0, 120)
+          : pull.done
+          ? "Download complete"
+          : pct !== null
+          ? `${pull.status} — ${pct}% (${mb(pull.completed)} / ${mb(pull.total)} MB)`
+          : pull.status}
+      </p>
     </div>
   );
 }

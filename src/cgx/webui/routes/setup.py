@@ -17,6 +17,7 @@ from typing import List, Optional
 
 import asyncio
 import json as _json
+import logging
 import threading
 
 from fastapi import APIRouter
@@ -29,6 +30,7 @@ from cgx.answer.providers import GeminiProvider
 from cgx.webui.models import HardwareInfo, ModelChoicesResponse
 
 
+logger = logging.getLogger(__name__)
 router = APIRouter(tags=["setup"])
 
 
@@ -145,15 +147,22 @@ def models(base_url: str = "http://localhost:11434") -> ModelChoicesResponse:
         installed = []
         choices = [tag for tag, *_ in ollama_discovery.RECOMMENDED_LADDER]
 
-    # Merge the full hardware-catalog so every known local model appears in
-    # the presets dropdown (sorted by parameter count, smallest first).
+    # Merge the full hardware-catalog so every known local model appears
+    # in the presets dropdown.
     seen: set = set(choices)
-    catalog_by_size = sorted(LOCAL_MODEL_CATALOG, key=lambda m: m["params_b"])
-    for entry in catalog_by_size:
+    for entry in LOCAL_MODEL_CATALOG:
         name = entry["name"]
         if name not in seen:
             choices.append(name)
             seen.add(name)
+
+    # Cluster the dropdown by family / version / size so related models
+    # appear together (all gemma*, all qwen*, all llama* …) instead of
+    # interleaved by global parameter count. Catalog entries supply
+    # exact ``params_b`` for the size tiebreaker; installed-only tags
+    # fall back to the size-hint regex inside the helper.
+    params_lookup = {e["name"]: float(e["params_b"]) for e in LOCAL_MODEL_CATALOG}
+    choices = ollama_discovery.sort_model_choices_by_family(choices, params_lookup)
 
     try:
         default = ollama_discovery.recommend_default_model(base_url=base_url)
@@ -319,6 +328,10 @@ async def ollama_pull(req: PullRequest) -> EventSourceResponse:
         base = (req.base_url or "http://localhost:11434").rstrip("/")
         if base.endswith("/v1"):
             base = base[:-3]
+        logger.info("ollama_pull: starting model=%r base=%s", req.model, base)
+        line_count = 0
+        saw_success = False
+        saw_error: Optional[str] = None
         try:
             with _req.post(
                 f"{base}/api/pull",
@@ -326,14 +339,62 @@ async def ollama_pull(req: PullRequest) -> EventSourceResponse:
                 stream=True,
                 timeout=600,
             ) as r:
-                r.raise_for_status()
+                # Surface HTTP errors with status code + body so the UI can
+                # tell apart "tag not found" (404), "Ollama too old for this
+                # model manifest" (412), auth/network, etc. Plain raise_for
+                # _status loses that detail.
+                if r.status_code >= 400:
+                    body = ""
+                    try:
+                        body = r.text[:300]
+                    except Exception:
+                        pass
+                    msg = (f"ollama /api/pull returned HTTP {r.status_code}"
+                           f" for model={req.model!r}"
+                           + (f": {body}" if body else ""))
+                    logger.warning("ollama_pull: HTTP %s for model=%r body=%r",
+                                   r.status_code, req.model, body)
+                    err = _json.dumps({"status": "error",
+                                       "error": msg[:400]}).encode()
+                    loop.call_soon_threadsafe(queue.put_nowait, err)
+                    return
                 for line in r.iter_lines():
-                    if line:
-                        loop.call_soon_threadsafe(queue.put_nowait, line)
+                    if not line:
+                        continue
+                    line_count += 1
+                    # Inspect for terminal states so we can log a one-line
+                    # summary on close. Ollama's NDJSON has two failure
+                    # shapes: {"status":"error","error":...} and the
+                    # field-only {"error":"..."} — handle both.
+                    try:
+                        parsed = _json.loads(line)
+                        if isinstance(parsed, dict):
+                            if parsed.get("status") == "success":
+                                saw_success = True
+                            err_field = parsed.get("error")
+                            if err_field and saw_error is None:
+                                saw_error = str(err_field)[:300]
+                    except Exception:
+                        pass
+                    loop.call_soon_threadsafe(queue.put_nowait, line)
         except Exception as exc:
-            err = _json.dumps({"status": "error", "error": str(exc)[:300]}).encode()
+            logger.exception("ollama_pull: worker crashed model=%r", req.model)
+            err = _json.dumps({"status": "error",
+                               "error": f"{type(exc).__name__}: {exc}"[:300]
+                               }).encode()
             loop.call_soon_threadsafe(queue.put_nowait, err)
         finally:
+            if saw_error:
+                logger.warning("ollama_pull: finished model=%r lines=%d "
+                               "result=error err=%r",
+                               req.model, line_count, saw_error)
+            elif saw_success:
+                logger.info("ollama_pull: finished model=%r lines=%d "
+                            "result=success", req.model, line_count)
+            else:
+                logger.warning("ollama_pull: finished model=%r lines=%d "
+                               "result=incomplete (no success/error event)",
+                               req.model, line_count)
             loop.call_soon_threadsafe(queue.put_nowait, _SENTINEL)
 
     threading.Thread(target=_worker, daemon=True, name="ollama-pull").start()
@@ -345,9 +406,16 @@ async def ollama_pull(req: PullRequest) -> EventSourceResponse:
                 break
             try:
                 data = _json.loads(item)
+                # Normalise Ollama's bare-error shape ({"error": "..."}) into
+                # the same {"status":"error","error":...} envelope the rest
+                # of the stack expects, so the frontend's single error path
+                # catches both variants.
+                if (isinstance(data, dict) and data.get("error")
+                        and data.get("status") != "error"):
+                    data = {**data, "status": "error"}
                 yield {"event": "progress", "data": _json.dumps(data)}
             except Exception:
-                pass
+                logger.debug("ollama_pull: unparseable NDJSON line dropped")
         yield {"event": "done", "data": "{}"}
 
     return EventSourceResponse(_gen())
