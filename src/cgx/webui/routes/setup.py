@@ -147,15 +147,22 @@ def models(base_url: str = "http://localhost:11434") -> ModelChoicesResponse:
         installed = []
         choices = [tag for tag, *_ in ollama_discovery.RECOMMENDED_LADDER]
 
-    # Merge the full hardware-catalog so every known local model appears in
-    # the presets dropdown (sorted by parameter count, smallest first).
+    # Merge the full hardware-catalog so every known local model appears
+    # in the presets dropdown.
     seen: set = set(choices)
-    catalog_by_size = sorted(LOCAL_MODEL_CATALOG, key=lambda m: m["params_b"])
-    for entry in catalog_by_size:
+    for entry in LOCAL_MODEL_CATALOG:
         name = entry["name"]
         if name not in seen:
             choices.append(name)
             seen.add(name)
+
+    # Cluster the dropdown by family / version / size so related models
+    # appear together (all gemma*, all qwen*, all llama* …) instead of
+    # interleaved by global parameter count. Catalog entries supply
+    # exact ``params_b`` for the size tiebreaker; installed-only tags
+    # fall back to the size-hint regex inside the helper.
+    params_lookup = {e["name"]: float(e["params_b"]) for e in LOCAL_MODEL_CATALOG}
+    choices = ollama_discovery.sort_model_choices_by_family(choices, params_lookup)
 
     try:
         default = ollama_discovery.recommend_default_model(base_url=base_url)

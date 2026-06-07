@@ -85,3 +85,62 @@ def test_model_choices_dedups_and_orders(monkeypatch):
     # ladder appended without duplicating installed entries
     assert "qwen2.5-coder:1.5b" in choices
     assert choices.count("qwen2.5-coder:3b") == 1
+
+
+
+def test_sort_model_choices_clusters_by_family():
+    # Deliberately scrambled order spanning multiple families / versions.
+    names = [
+        "llama3.2:3b-instruct",
+        "gemma4:12b",
+        "qwen2.5-coder:7b-instruct",
+        "gemma2:2b",
+        "deepseek-r1:7b",
+        "gemma4:e2b",
+        "qwen2.5:7b-instruct",
+        "gemma3:1b",
+        "llama3.1:8b-instruct",
+        "deepseek-coder:6.7b",
+        "gemma4:e4b",
+        "qwen2.5-coder:1.5b",
+        "phi3.5:3.8b-mini-instruct",
+        "custom:latest",
+    ]
+    out = od.sort_model_choices_by_family(names)
+
+    # Each family appears as one contiguous run (no interleaving).
+    def _root(n: str) -> str:
+        import re
+        m = re.match(r"^([a-z]+)", n)
+        return m.group(1) if m else n
+    seen: list[str] = []
+    for n in out:
+        r = _root(n)
+        if not seen or seen[-1] != r:
+            seen.append(r)
+    assert len(seen) == len(set(seen)), \
+        f"families not contiguous in sorted output: {out}"
+
+    # All gemma variants together, ordered by version (2 → 3 → 4) then size.
+    gemma = [n for n in out if n.startswith("gemma")]
+    assert gemma == [
+        "gemma2:2b",
+        "gemma3:1b",
+        "gemma4:e2b",  # e2b → 2.0 via size-hint regex
+        "gemma4:e4b",  # e4b → 4.0
+        "gemma4:12b",
+    ], f"gemma order wrong: {gemma}"
+
+    # Within deepseek: alphabetical sub-family (coder before r1).
+    deepseek = [n for n in out if n.startswith("deepseek")]
+    assert deepseek == ["deepseek-coder:6.7b", "deepseek-r1:7b"]
+
+
+def test_sort_model_choices_uses_params_lookup_for_e_variants():
+    # When an explicit lookup is supplied, it overrides the size-hint regex.
+    names = ["gemma4:e2b", "gemma4:e4b", "gemma4:12b"]
+    out = od.sort_model_choices_by_family(
+        names,
+        {"gemma4:e2b": 2.0, "gemma4:e4b": 4.0, "gemma4:12b": 12.0},
+    )
+    assert out == ["gemma4:e2b", "gemma4:e4b", "gemma4:12b"]
