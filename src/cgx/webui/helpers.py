@@ -11,10 +11,32 @@ import zipfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from cgx.answer.model_caps import get_model_context_window
 from cgx.answer.profiles import Profile, get_profile, load_api_key
 from cgx.answer.providers import (
     GeminiProvider, LLMProvider, OllamaProvider, OpenAICompatProvider,
 )
+
+
+# Conservative auto-cap for the Ollama KV-cache. Ollama defaults to 2048-4096
+# without an explicit ``num_ctx``; bumping to 8K covers the common "tell me
+# about this project" round-trip without ballooning VRAM on 8 GB GPUs running
+# a 12 B model. Users can override per-profile to push higher when they have
+# the headroom.
+DEFAULT_OLLAMA_NUM_CTX_CAP = 8_192
+
+
+def _effective_ollama_num_ctx(model: str, override: Optional[int]) -> int:
+    """Resolve the ``num_ctx`` to send to Ollama for ``model``.
+
+    ``override`` wins when positive. Otherwise the model's registry-reported
+    window is clamped to :data:`DEFAULT_OLLAMA_NUM_CTX_CAP` so a 256 K-window
+    model doesn't accidentally force CPU offload on a modest GPU.
+    """
+    if override is not None and int(override) > 0:
+        return int(override)
+    window = get_model_context_window(model)
+    return min(int(window), DEFAULT_OLLAMA_NUM_CTX_CAP)
 
 
 def build_provider(
@@ -25,6 +47,7 @@ def build_provider(
     api_key: Optional[str] = None,
     temperature: float = 0.2,
     num_predict: int = 1024,
+    num_ctx: Optional[int] = None,
     rate_limit: Optional[float] = None,
     max_retries: Optional[int] = None,
     endpoint_path: str = "/v1/chat/completions",
@@ -50,6 +73,7 @@ def build_provider(
 
     if kind == "ollama":
         base = (base_url or "http://localhost:11434").replace("/v1", "").rstrip("/")
+        ollama_opts["num_ctx"] = _effective_ollama_num_ctx(model, num_ctx)
         return OllamaProvider(model=model, base_url=base,
                               extra_options=ollama_opts, **rl_kwargs)
 
@@ -83,6 +107,7 @@ def provider_from_profile_name(name: str) -> LLMProvider:
     return build_provider(
         kind=p.kind, model=p.model, base_url=p.base_url, api_key=api_key,
         temperature=p.temperature, num_predict=p.num_predict,
+        num_ctx=getattr(p, "num_ctx", None),
         rate_limit=getattr(p, "rate_limit", None),
         max_retries=getattr(p, "max_retries", None),
         endpoint_path=getattr(p, "endpoint_path", "/v1/chat/completions"),

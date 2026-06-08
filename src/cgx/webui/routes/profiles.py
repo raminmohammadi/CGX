@@ -31,6 +31,7 @@ def _to_summary(p: Profile) -> ProfileSummary:
         name=p.name, kind=p.kind, model=p.model, base_url=p.base_url,
         has_api_key=p.has_api_key, temperature=p.temperature,
         num_predict=p.num_predict,
+        num_ctx=getattr(p, "num_ctx", None),
         endpoint_path=getattr(p, "endpoint_path", "/v1/chat/completions"),
         allow_no_auth=bool(getattr(p, "allow_no_auth", False)),
     )
@@ -49,6 +50,7 @@ def upsert_profile(name: str, req: ProfileUpsertRequest) -> ProfileSummary:
         # Body and path name disagree -- prefer the path for idempotency.
         req = req.model_copy(update={"name": name})
     try:
+        nc = getattr(req, "num_ctx", None)
         p = Profile(
             name=req.name.strip(),
             kind=req.kind,
@@ -56,6 +58,7 @@ def upsert_profile(name: str, req: ProfileUpsertRequest) -> ProfileSummary:
             base_url=req.base_url.strip(),
             temperature=float(req.temperature),
             num_predict=int(req.num_predict),
+            num_ctx=(int(nc) if isinstance(nc, (int, float)) and nc > 0 else None),
             endpoint_path=getattr(req, "endpoint_path", "/v1/chat/completions") or "/v1/chat/completions",
             allow_no_auth=bool(getattr(req, "allow_no_auth", False)),
         )

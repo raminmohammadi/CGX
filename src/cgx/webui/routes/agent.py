@@ -41,6 +41,7 @@ async def agent(req: AgentRequest) -> EventSourceResponse:
             kind=pcfg.kind, model=pcfg.model, base_url=pcfg.base_url,
             api_key=pcfg.api_key, temperature=pcfg.temperature,
             num_predict=pcfg.num_predict,
+            num_ctx=getattr(pcfg, "num_ctx", None),
             project_root=req.project_root, stop_on_fail=req.stop_on_fail,
             endpoint_path=getattr(pcfg, "endpoint_path", "/v1/chat/completions"),
             allow_no_auth=bool(getattr(pcfg, "allow_no_auth", False)),
@@ -78,6 +79,7 @@ async def agent_plan_only(req: AgentRequest) -> Dict[str, Any]:
         kind=pcfg.kind, model=pcfg.model, base_url=pcfg.base_url,
         api_key=pcfg.api_key, temperature=pcfg.temperature,
         num_predict=pcfg.num_predict,
+        num_ctx=getattr(pcfg, "num_ctx", None),
         project_root=req.project_root,
     )
     return result

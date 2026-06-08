@@ -35,6 +35,15 @@ def get_status() -> StatusResponse:
         health = ollama_discovery.health_check()
     except Exception as e:
         health = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    # Surface the currently-resident models so the UI can render a "loaded
+    # model · ctx · GPU/CPU" pill. Only attempted when the server looks
+    # reachable to avoid pointless retry latency on a dead socket.
+    if health.get("ok"):
+        try:
+            health["running_models"] = ollama_discovery.list_running_models()
+        except Exception as e:
+            health["running_models"] = []
+            health.setdefault("running_models_error", f"{type(e).__name__}: {e}")
     try:
         hw = ollama_discovery.detect_hardware()
     except Exception:

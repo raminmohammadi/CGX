@@ -40,6 +40,7 @@ async def plan(req: PlanRequest) -> EventSourceResponse:
             kind=pcfg.kind, model=pcfg.model, base_url=pcfg.base_url,
             api_key=pcfg.api_key, temperature=pcfg.temperature,
             num_predict=pcfg.num_predict,
+            num_ctx=getattr(pcfg, "num_ctx", None),
             self_test=req.self_test, run_tests=req.run_tests,
             project_root=req.project_root,
             endpoint_path=getattr(pcfg, "endpoint_path", "/v1/chat/completions"),

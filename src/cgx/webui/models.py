@@ -28,6 +28,11 @@ class ProviderConfig(BaseModel):
     api_key: Optional[str] = None
     temperature: float = 0.2
     num_predict: int = 1024
+    # Ollama-only KV-cache context window override. ``None`` / ``0`` means
+    # "auto": ``build_provider`` derives a sensible value from the model's
+    # registry entry capped at ``DEFAULT_OLLAMA_NUM_CTX``. Other provider
+    # kinds ignore this field.
+    num_ctx: Optional[int] = None
     endpoint_path: str = "/v1/chat/completions"
     allow_no_auth: bool = False
 
@@ -85,6 +90,7 @@ class ProfileUpsertRequest(BaseModel):
     api_key: Optional[str] = None
     temperature: float = 0.2
     num_predict: int = 1024
+    num_ctx: Optional[int] = None
     endpoint_path: str = "/v1/chat/completions"
     allow_no_auth: bool = False
 
@@ -108,6 +114,7 @@ class ProfileSummary(BaseModel):
     has_api_key: bool
     temperature: float
     num_predict: int
+    num_ctx: Optional[int] = None
     endpoint_path: str = "/v1/chat/completions"
     allow_no_auth: bool = False
 
@@ -130,6 +137,14 @@ class SessionMessage(BaseModel):
 class HardwareInfo(BaseModel):
     ram_gb: Optional[float] = None
     gpu_vram_gb: Optional[float] = None
+    # Torch CUDA probe -- ``torch_installed`` is False on core-only installs;
+    # ``torch_cuda_warning`` is populated when nvidia-smi reports a GPU but
+    # ``torch.cuda.is_available()`` is False (usually a wheel/driver mismatch).
+    torch_installed: Optional[bool] = None
+    torch_cuda_available: Optional[bool] = None
+    torch_version: Optional[str] = None
+    torch_cuda_build: Optional[str] = None
+    torch_cuda_warning: Optional[str] = None
 
 
 class StatusResponse(BaseModel):

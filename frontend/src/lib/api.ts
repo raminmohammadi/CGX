@@ -12,6 +12,9 @@ export type ProviderConfig = {
   api_key?: string | null;
   temperature: number;
   num_predict: number;
+  // Ollama-only KV-cache window. ``null`` / undefined means "auto" (backend
+  // picks a sensible default capped at 8K). Other provider kinds ignore this.
+  num_ctx?: number | null;
   endpoint_path?: string;
   allow_no_auth?: boolean;
 };
@@ -30,8 +33,19 @@ export type ProfileSummary = {
   has_api_key: boolean;
   temperature: number;
   num_predict: number;
+  num_ctx?: number | null;
   endpoint_path?: string;
   allow_no_auth?: boolean;
+};
+
+export type RunningModel = {
+  name: string;
+  model?: string;
+  size?: number | null;
+  size_vram?: number | null;
+  context_length?: number | null;
+  expires_at?: string | null;
+  digest?: string | null;
 };
 
 export type PingResult = {
@@ -55,11 +69,28 @@ export type SessionMessage = {
   meta?: Record<string, any> | null;
 };
 
+export type HardwareInfo = {
+  ram_gb?: number | null;
+  gpu_vram_gb?: number | null;
+  // Torch CUDA probe surfaced by the backend so the Header can render an
+  // Embed pill / warning. ``torch_installed`` is null on core-only installs.
+  torch_installed?: boolean | null;
+  torch_cuda_available?: boolean | null;
+  torch_version?: string | null;
+  torch_cuda_build?: string | null;
+  torch_cuda_warning?: string | null;
+};
+
 export type StatusResponse = {
   app: string;
   version: string;
-  ollama: { ok?: boolean; error?: string; [k: string]: any };
-  hardware: { ram_gb?: number | null; gpu_vram_gb?: number | null };
+  ollama: {
+    ok?: boolean;
+    error?: string;
+    running_models?: RunningModel[];
+    [k: string]: any;
+  };
+  hardware: HardwareInfo;
   telemetry_enabled: boolean;
   profile_count: number;
   session_count: number;
@@ -86,7 +117,7 @@ export type TradeoffRow = {
 };
 
 export type HardwareMatrixResponse = {
-  hardware: { ram_gb?: number | null; gpu_vram_gb?: number | null };
+  hardware: HardwareInfo;
   rows: HardwareMatrixRow[];
   tradeoffs: TradeoffRow[];
 };
@@ -177,10 +208,7 @@ export const api = {
       body,
     ),
   hardwareMatrix: () => jsonReq<HardwareMatrixResponse>("/api/hardware/matrix"),
-  detectHardware: () =>
-    jsonReq<{ ram_gb?: number | null; gpu_vram_gb?: number | null }>(
-      "/api/setup/hardware",
-    ),
+  detectHardware: () => jsonReq<HardwareInfo>("/api/setup/hardware"),
 
   listSessions: () => jsonReq<SessionSummary[]>("/api/sessions"),
   createSession: (title?: string) =>

@@ -2,6 +2,7 @@ import { Cpu } from "lucide-react";
 import { useConnection } from "../store/connection";
 import { useWorkspace } from "../store/workspace";
 import { StatusDot } from "../components/Pill";
+import type { HardwareInfo, RunningModel } from "../lib/api";
 
 // Top platform header: brand + provider health pulse + mode badge.
 // Reads from the shared connection store and active workspace provider.
@@ -12,6 +13,59 @@ const PROVIDER_LABELS: Record<string, string> = {
   "openai-compat": "OpenAI",
   custom: "Custom",
 };
+
+// Render a token count as a short human label: 4096 → "4K", 131072 → "131K".
+function formatCtx(n: number | null | undefined): string {
+  if (!n || n <= 0) return "—";
+  if (n >= 1000) return `${Math.round(n / 1024)}K`;
+  return String(n);
+}
+
+// Classify Ollama placement from the two byte counts in /api/ps.
+function placementLabel(m: RunningModel): { label: string; tone: string } {
+  const total = Number(m.size || 0);
+  const vram = Number(m.size_vram || 0);
+  if (total > 0 && vram >= total) return { label: "GPU", tone: "text-emerald-300" };
+  if (vram === 0) return { label: "CPU", tone: "text-amber-300" };
+  const pct = total > 0 ? Math.round((vram / total) * 100) : 0;
+  return { label: `GPU ${pct}%`, tone: "text-amber-300" };
+}
+
+// Decide the Embed (torch/CUDA) pill state from the hardware probe.
+//   - returns null when torch isn't installed (core-only install -- nothing
+//     to surface; the user isn't running local embeddings)
+//   - "warn" when nvidia-smi sees a GPU but torch can't use it (the regression
+//     this whole check exists to catch)
+//   - "gpu" / "cpu" for the healthy cases
+function embedPillState(hw: HardwareInfo | undefined): {
+  tone: "neon" | "red" | "amber" | "slate";
+  label: string;
+  title: string;
+} | null {
+  if (!hw || hw.torch_installed !== true) return null;
+  if (hw.torch_cuda_warning) {
+    return {
+      tone: "red",
+      label: "Embed: CPU ⚠",
+      title: hw.torch_cuda_warning,
+    };
+  }
+  if (hw.torch_cuda_available) {
+    const buildTag = hw.torch_cuda_build ? ` (CUDA ${hw.torch_cuda_build})` : "";
+    return {
+      tone: "neon",
+      label: "Embed: GPU",
+      title: `torch ${hw.torch_version || "?"}${buildTag} -- embeddings run on the GPU`,
+    };
+  }
+  return {
+    tone: "slate",
+    label: "Embed: CPU",
+    title: hw.gpu_vram_gb
+      ? "torch is CPU-only despite a GPU being present"
+      : "No NVIDIA GPU detected; embeddings run on CPU",
+  };
+}
 
 export default function Header() {
   const status = useConnection((s) => s.status);
@@ -37,8 +91,32 @@ export default function Header() {
       : provider.model
     : "--";
 
+  // Match the active model against Ollama's currently-loaded set so the user
+  // can see at a glance whether their picked model is actually resident, with
+  // what effective context window and GPU/CPU placement.
+  const running = (status?.ollama?.running_models || []) as RunningModel[];
+  const activeRunning =
+    isLocal && provider.model
+      ? running.find(
+          (m) =>
+            (m.name || m.model || "").toLowerCase() ===
+            provider.model.toLowerCase(),
+        )
+      : undefined;
+  const placement = activeRunning ? placementLabel(activeRunning) : null;
+
   const modeLabel = isLocal ? "Local / Air-Gapped" : "Cloud";
   const modeClass = isLocal ? "text-emerald-400" : "text-sky-400";
+
+  const embedPill = embedPillState(status?.hardware);
+  const embedTextClass =
+    embedPill?.tone === "neon"
+      ? "text-emerald-300"
+      : embedPill?.tone === "red"
+        ? "text-red-300"
+        : embedPill?.tone === "amber"
+          ? "text-amber-300"
+          : "text-slate-400";
 
   return (
     <header
@@ -75,6 +153,41 @@ export default function Header() {
             </>
           )}
         </div>
+        {isLocal && ollamaOK && (
+          <div
+            className="flex items-center gap-2 bg-slate-950 px-2.5 py-1 rounded border border-white/5"
+            title={
+              activeRunning
+                ? `Loaded in Ollama · ctx ${activeRunning.context_length ?? "?"} · ${placement?.label}`
+                : "Active model is not currently resident in Ollama"
+            }
+          >
+            <StatusDot tone={activeRunning ? "neon" : "slate" as any} />
+            <span className="text-slate-400">
+              Loaded:{" "}
+              {activeRunning ? (
+                <>
+                  <span className="text-white">ctx {formatCtx(activeRunning.context_length)}</span>
+                  <span className="text-slate-700"> · </span>
+                  <span className={placement?.tone || "text-slate-300"}>
+                    {placement?.label}
+                  </span>
+                </>
+              ) : (
+                <span className="text-slate-500">idle</span>
+              )}
+            </span>
+          </div>
+        )}
+        {embedPill && (
+          <div
+            className="flex items-center gap-2 bg-slate-950 px-2.5 py-1 rounded border border-white/5"
+            title={embedPill.title}
+          >
+            <StatusDot tone={embedPill.tone as any} />
+            <span className={embedTextClass}>{embedPill.label}</span>
+          </div>
+        )}
         <div className="text-slate-400 flex items-center gap-1.5">
           <Cpu className="h-3.5 w-3.5 text-slate-600" /> Mode:{" "}
           <span className={modeClass}>{modeLabel}</span>

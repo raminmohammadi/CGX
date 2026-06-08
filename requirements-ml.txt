@@ -16,6 +16,22 @@
 #
 # Note: `torch` is ~700 MB; pick a CUDA/CPU build that matches your platform.
 # See https://pytorch.org/get-started/locally/ if the pin below doesn't apply.
+#
+# NVIDIA users: the wheel must match your driver, not just "be CUDA".
+# `pip install torch` on PyPI defaults to the newest CUDA series, which can
+# be ahead of your driver and silently falls back to CPU at runtime (only
+# visible via `torch.cuda.is_available()` returning False and a slow-feeling
+# embed/index pass). Pick the cuXXX channel that matches the "CUDA Version"
+# column shown by `nvidia-smi`, e.g.:
+#
+#   # Driver supports CUDA 12.8 (most 5xx series drivers today):
+#   pip install --index-url https://download.pytorch.org/whl/cu128 torch
+#
+#   # Driver supports CUDA 12.4 / 12.1 (older 5xx / 4xx series):
+#   pip install --index-url https://download.pytorch.org/whl/cu124 torch
+#   pip install --index-url https://download.pytorch.org/whl/cu121 torch
+#
+# CPU-only (any platform, no GPU): the default `pip install torch` is fine.
 
 sentence-transformers>=2.7
 transformers>=4.40,<6
