@@ -1,3 +1,5 @@
+[![CI](https://github.com/raminmohammadi/CGX/actions/workflows/ci.yml/badge.svg)](https://github.com/raminmohammadi/CGX/actions/workflows/ci.yml)
+
 # CGX -- Code Graph eXecution
 
 **Local-first codebase RAG and self-testing code-generation platform.**
