@@ -81,6 +81,49 @@ def health_check(base_url: str = DEFAULT_BASE_URL) -> Dict[str, Any]:
         return {"ok": False, "base_url": url, "error": f"{type(e).__name__}: {e}"}
 
 
+def list_running_models(base_url: str = DEFAULT_BASE_URL) -> List[Dict[str, Any]]:
+    """Return models currently resident in Ollama via ``GET /api/ps``.
+
+    Each entry exposes the bits the UI needs to render a "loaded model" pill:
+    name, effective ``context_length`` (Ollama's KV-cache for this load), the
+    ``size`` / ``size_vram`` byte counts (so the UI can compute the GPU/CPU
+    split), and the keep-alive ``expires_at`` timestamp. Returns ``[]`` if
+    the server is unreachable -- the SPA treats absence as "nothing loaded".
+    """
+    url = base_url.rstrip("/") + "/api/ps"
+    try:
+        r = requests.get(url, timeout=DEFAULT_TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        logger.info("ollama_discovery: list_running_models %s unreachable: %s: %s",
+                    url, type(e).__name__, e)
+        return []
+    models = data.get("models") if isinstance(data, dict) else None
+    if not isinstance(models, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    for m in models:
+        if not isinstance(m, dict):
+            continue
+        size = m.get("size")
+        size_vram = m.get("size_vram")
+        # Ollama reports total resident bytes and the slice resident on the
+        # GPU; when they're equal the model is fully on GPU, when size_vram
+        # is 0 it's CPU-only, otherwise it's a split. Surface the raw bytes
+        # and let the UI render the placement label.
+        out.append({
+            "name": m.get("name") or m.get("model") or "",
+            "model": m.get("model") or m.get("name") or "",
+            "size": size,
+            "size_vram": size_vram,
+            "context_length": m.get("context_length"),
+            "expires_at": m.get("expires_at"),
+            "digest": m.get("digest"),
+        })
+    return [m for m in out if m["name"]]
+
+
 def _detect_total_ram_gb() -> Optional[float]:
     try:
         meminfo = "/proc/meminfo"
@@ -116,12 +159,80 @@ def _detect_gpu_vram_gb() -> Optional[float]:
         return None
 
 
-def detect_hardware() -> Dict[str, Any]:
-    """Best-effort hardware probe used to pick a sensible default model."""
-    return {
-        "ram_gb": _detect_total_ram_gb(),
-        "gpu_vram_gb": _detect_gpu_vram_gb(),
+_TORCH_PROBE_CACHE: Optional[Dict[str, Any]] = None
+_TORCH_WARNING_LOGGED = False
+
+
+def _detect_torch_cuda() -> Dict[str, Any]:
+    """Probe torch's CUDA availability and cache the result for the process.
+
+    Importing ``torch`` is expensive (~1-2 s, hundreds of MB resident), so the
+    result is memoised and subsequent callers pay nothing. Returns ``installed
+    = False`` when torch is not on the path -- the UI then suppresses the
+    Embed pill instead of surfacing a misleading warning.
+    """
+    global _TORCH_PROBE_CACHE
+    if _TORCH_PROBE_CACHE is not None:
+        return _TORCH_PROBE_CACHE
+    info: Dict[str, Any] = {
+        "installed": False,
+        "cuda_available": False,
+        "torch_version": None,
+        "cuda_build": None,
+        "error": None,
     }
+    try:
+        import torch  # type: ignore
+        info["installed"] = True
+        info["torch_version"] = getattr(torch, "__version__", None)
+        info["cuda_build"] = getattr(getattr(torch, "version", None), "cuda", None)
+        try:
+            info["cuda_available"] = bool(torch.cuda.is_available())
+        except Exception as e:
+            info["error"] = f"{type(e).__name__}: {e}"
+    except ImportError:
+        pass
+    except Exception as e:
+        info["error"] = f"{type(e).__name__}: {e}"
+    _TORCH_PROBE_CACHE = info
+    return info
+
+
+def detect_hardware() -> Dict[str, Any]:
+    """Best-effort hardware probe used to pick a sensible default model.
+
+    Also reports whether torch can see CUDA -- mismatched wheels (e.g. a
+    cu130 wheel against a cu128 driver) silently fall back to CPU and the
+    only symptom is slow embedding/index passes, so we surface it as a
+    structured warning the UI can render.
+    """
+    global _TORCH_WARNING_LOGGED
+    vram = _detect_gpu_vram_gb()
+    torch_info = _detect_torch_cuda()
+    out: Dict[str, Any] = {
+        "ram_gb": _detect_total_ram_gb(),
+        "gpu_vram_gb": vram,
+        "torch_installed": torch_info["installed"],
+        "torch_cuda_available": torch_info["cuda_available"],
+        "torch_version": torch_info["torch_version"],
+        "torch_cuda_build": torch_info["cuda_build"],
+        "torch_cuda_warning": None,
+    }
+    if vram and torch_info["installed"] and not torch_info["cuda_available"]:
+        msg = (
+            "NVIDIA GPU detected but torch.cuda.is_available() is False; "
+            "embeddings will fall back to CPU (~10x slower). Reinstall a "
+            "torch wheel that matches your driver's CUDA series, e.g. "
+            "`pip install --index-url https://download.pytorch.org/whl/cu128 "
+            "torch` (adjust cu1XX to match nvidia-smi's CUDA Version column)."
+        )
+        if torch_info.get("error"):
+            msg += f" Torch reported: {torch_info['error']}"
+        out["torch_cuda_warning"] = msg
+        if not _TORCH_WARNING_LOGGED:
+            logger.warning("ollama_discovery: %s", msg)
+            _TORCH_WARNING_LOGGED = True
+    return out
 
 
 def recommend_default_model(installed: Optional[List[Dict[str, Any]]] = None,

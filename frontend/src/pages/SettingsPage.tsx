@@ -20,6 +20,7 @@ interface EditState {
   api_key: string;
   temperature: number;
   num_predict: number;
+  num_ctx: number | null;
   endpoint_path: string;
   allow_no_auth: boolean;
 }
@@ -69,6 +70,7 @@ const emptyEdit: EditState = {
   api_key: "",
   temperature: 0.2,
   num_predict: 1024,
+  num_ctx: null,
   endpoint_path: "/v1/chat/completions",
   allow_no_auth: false,
 };
@@ -222,6 +224,7 @@ export default function SettingsPage() {
       api_key: "",
       temperature: p.temperature,
       num_predict: p.num_predict,
+      num_ctx: p.num_ctx ?? null,
       endpoint_path: p.endpoint_path || "/v1/chat/completions",
       allow_no_auth: p.allow_no_auth ?? false,
     });
@@ -242,6 +245,7 @@ export default function SettingsPage() {
       api_key: (provider as any).api_key || "",
       temperature: provider.temperature,
       num_predict: provider.num_predict,
+      num_ctx: provider.num_ctx ?? null,
       endpoint_path: provider.endpoint_path || "/v1/chat/completions",
       allow_no_auth: provider.allow_no_auth ?? false,
     });
@@ -357,6 +361,7 @@ export default function SettingsPage() {
         api_key: edit.api_key || null,
         temperature: edit.temperature,
         num_predict: edit.num_predict,
+        num_ctx: edit.num_ctx,
         endpoint_path: edit.endpoint_path || "/v1/chat/completions",
         allow_no_auth: edit.allow_no_auth,
       });
@@ -596,6 +601,27 @@ export default function SettingsPage() {
               }
             />
           </Field>
+          {provider.kind === "ollama" && (
+            <Field
+              label="num_ctx (Ollama)"
+              hint="Blank = auto (registry value, capped at 8192). Raise only if you have VRAM headroom."
+            >
+              <NumberInput
+                step={1024}
+                min={0}
+                placeholder="auto"
+                value={provider.num_ctx ?? ""}
+                onChange={(e) => {
+                  const raw = e.target.value;
+                  const n = raw === "" ? null : Number(raw);
+                  setProvider({
+                    num_ctx: n !== null && n > 0 ? n : null,
+                    use_profile: false,
+                  });
+                }}
+              />
+            </Field>
+          )}
         </div>
         <PingBanner result={activePingResult} model={provider.model} />
       </Card>
@@ -888,6 +914,27 @@ export default function SettingsPage() {
                     }
                   />
                 </Field>
+                {edit.kind === "ollama" && (
+                  <Field
+                    label="num_ctx (Ollama)"
+                    hint="Blank = auto (capped at 8192). Raise only with VRAM headroom."
+                  >
+                    <NumberInput
+                      step={1024}
+                      min={0}
+                      placeholder="auto"
+                      value={edit.num_ctx ?? ""}
+                      onChange={(e) => {
+                        const raw = e.target.value;
+                        const n = raw === "" ? null : Number(raw);
+                        setEdit({
+                          ...edit,
+                          num_ctx: n !== null && n > 0 ? n : null,
+                        });
+                      }}
+                    />
+                  </Field>
+                )}
               </div>
 
               <PingBanner result={editPingResult} model={edit.model} className="mt-4" />

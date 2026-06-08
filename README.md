@@ -165,10 +165,21 @@ ollama pull qwen2.5-coder:3b
 ### Platform notes
 
 - **Linux** -- no extra steps. NVIDIA users wanting GPU embeddings or
-  rerank need a CUDA-enabled `torch` build; the default wheels from
-  `requirements-ml.txt` install the CPU build, so pick the right
-  `torch` from <https://pytorch.org/get-started/locally/> if you want
-  CUDA.
+  rerank need a CUDA-enabled `torch` build, **and the wheel's CUDA
+  series must match your driver**. The default `pip install torch`
+  from PyPI tracks the newest CUDA release, which is frequently ahead
+  of installed drivers and silently falls back to CPU at runtime.
+  Check `nvidia-smi`'s "CUDA Version" column, then install the
+  matching wheel:
+  ```bash
+  # Driver supports CUDA 12.8 (most 5xx series drivers):
+  pip install --index-url https://download.pytorch.org/whl/cu128 torch
+  # Older drivers: substitute cu124 / cu121 as appropriate. See
+  # https://pytorch.org/get-started/locally/ for the full matrix.
+  ```
+  Symptom of a mismatch: `torch.cuda.is_available()` is False despite
+  `nvidia-smi` reporting the GPU, embeddings run on CPU (~10x slower),
+  and the index metadata shows `used_gpu: false`.
 - **macOS -- Intel** -- CPU-only by default; same install path as Linux.
 - **macOS -- Apple Silicon** -- works natively on arm64. The embedding
   model loads on CPU by default; to use the Metal backend, install the

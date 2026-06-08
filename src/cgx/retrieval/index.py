@@ -1,5 +1,3 @@
-
-
 # src/cgx/retrieval/index.py
 from __future__ import annotations
 

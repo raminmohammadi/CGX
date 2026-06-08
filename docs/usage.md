@@ -19,6 +19,14 @@ The UI and the Ollama / remote-LLM answer paths run on the core install;
 `torch`, `transformers`, and `sentence_transformers` are imported lazily
 only when an embedding or reranker step is actually invoked.
 
+**NVIDIA / CUDA note.** `pip install torch` from PyPI tracks the newest
+CUDA series and frequently outruns the installed driver, in which case
+`torch.cuda.is_available()` returns False and embeddings silently fall
+back to CPU. Match the wheel to your driver's "CUDA Version" column
+from `nvidia-smi` -- e.g. `pip install --index-url
+https://download.pytorch.org/whl/cu128 torch` for a CUDA 12.8 driver.
+See `requirements-ml.txt` for the full recipe.
+
 ## 1. Pick a provider
 
 CGX supports four provider kinds, all configurable from the **⚙️ Setup**

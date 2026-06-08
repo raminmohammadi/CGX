@@ -58,6 +58,10 @@ class Profile:
     base_url: str
     temperature: float = 0.2
     num_predict: int = 1024
+    # Optional Ollama KV-cache override. ``None`` means "auto" (the web layer
+    # derives a sensible value from the model registry). Persisted as-is so a
+    # user override survives across restarts.
+    num_ctx: Optional[int] = None
     has_api_key: bool = False  # metadata only; never holds the key
     # Optional client-side rate limiting + retry, persisted with the profile so
     # cloud providers can keep their per-tenant limits without re-entering them.
@@ -196,6 +200,7 @@ def list_profiles() -> List[Profile]:
         rl = p.get("rate_limit")
         mr = p.get("max_retries")
         er = p.get("enable_reranker")
+        nc = p.get("num_ctx")
         out.append(Profile(
             name=name,
             kind=str(p.get("kind", "ollama")),
@@ -203,6 +208,7 @@ def list_profiles() -> List[Profile]:
             base_url=str(p.get("base_url", "")),
             temperature=float(p.get("temperature", 0.2)),
             num_predict=int(p.get("num_predict", 1024)),
+            num_ctx=(int(nc) if isinstance(nc, (int, float)) and nc > 0 else None),
             has_api_key=bool(p.get("has_api_key", False)),
             rate_limit=(float(rl) if isinstance(rl, (int, float)) and rl > 0 else None),
             max_retries=(int(mr) if isinstance(mr, (int, float)) and mr >= 0 else None),
@@ -250,6 +256,8 @@ def save_profile(profile: Profile, api_key: Optional[str] = None) -> Profile:
         "endpoint_path": profile.endpoint_path or "/v1/chat/completions",
         "allow_no_auth": bool(profile.allow_no_auth),
     }
+    if profile.num_ctx is not None and int(profile.num_ctx) > 0:
+        entry["num_ctx"] = int(profile.num_ctx)
     if profile.rate_limit is not None:
         entry["rate_limit"] = float(profile.rate_limit)
     if profile.max_retries is not None:

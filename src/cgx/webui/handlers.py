@@ -38,6 +38,7 @@ def _resolve_provider(
     *, use_profile: bool, profile_name: Optional[str],
     kind: str, model: str, base_url: str, api_key: Optional[str],
     temperature: float, num_predict: int,
+    num_ctx: Optional[int] = None,
     endpoint_path: str = "/v1/chat/completions",
     allow_no_auth: bool = False,
 ) -> Any:
@@ -45,7 +46,7 @@ def _resolve_provider(
         return provider_from_profile_name(profile_name)
     return build_provider(
         kind=kind, model=model, base_url=base_url, api_key=api_key or None,
-        temperature=temperature, num_predict=num_predict,
+        temperature=temperature, num_predict=num_predict, num_ctx=num_ctx,
         endpoint_path=endpoint_path, allow_no_auth=allow_no_auth,
     )
 
@@ -97,6 +98,7 @@ def stream_ask(
     *, index_dir: str, records: str, question: str, embed_model: str,
     use_profile: bool, profile_name: Optional[str], kind: str, model: str,
     base_url: str, api_key: Optional[str], temperature: float, num_predict: int,
+    num_ctx: Optional[int] = None,
     endpoint_path: str = "/v1/chat/completions", allow_no_auth: bool = False,
     cancel_event=None,
 ) -> Iterator[Event]:
@@ -106,7 +108,7 @@ def stream_ask(
         prov = _resolve_provider(
             use_profile=use_profile, profile_name=profile_name, kind=kind,
             model=model, base_url=base_url, api_key=api_key,
-            temperature=temperature, num_predict=num_predict,
+            temperature=temperature, num_predict=num_predict, num_ctx=num_ctx,
             endpoint_path=endpoint_path, allow_no_auth=allow_no_auth,
         )
     except Exception as e:
@@ -204,6 +206,7 @@ def stream_plan(
     use_profile: bool, profile_name: Optional[str], kind: str, model: str,
     base_url: str, api_key: Optional[str], temperature: float, num_predict: int,
     self_test: bool, run_tests: bool, project_root: Optional[str],
+    num_ctx: Optional[int] = None,
     endpoint_path: str = "/v1/chat/completions", allow_no_auth: bool = False,
     cancel_event=None,
 ) -> Iterator[Event]:
@@ -213,7 +216,7 @@ def stream_plan(
         prov = _resolve_provider(
             use_profile=use_profile, profile_name=profile_name, kind=kind,
             model=model, base_url=base_url, api_key=api_key,
-            temperature=temperature, num_predict=num_predict,
+            temperature=temperature, num_predict=num_predict, num_ctx=num_ctx,
             endpoint_path=endpoint_path, allow_no_auth=allow_no_auth,
         )
     except Exception as e:
@@ -283,6 +286,7 @@ def stream_agent(
     kind: str, model: str, base_url: str, api_key: Optional[str],
     temperature: float, num_predict: int, project_root: Optional[str],
     stop_on_fail: bool,
+    num_ctx: Optional[int] = None,
     endpoint_path: str = "/v1/chat/completions", allow_no_auth: bool = False,
     cancel_event=None,
 ) -> Iterator[Event]:
@@ -294,7 +298,7 @@ def stream_agent(
         prov = _resolve_provider(
             use_profile=use_profile, profile_name=profile_name, kind=kind,
             model=model, base_url=base_url, api_key=api_key,
-            temperature=temperature, num_predict=num_predict,
+            temperature=temperature, num_predict=num_predict, num_ctx=num_ctx,
             endpoint_path=endpoint_path, allow_no_auth=allow_no_auth,
         )
     except Exception as e:
@@ -353,6 +357,7 @@ def get_agent_plan(
     embed_model: str, use_profile: bool, profile_name: Optional[str],
     kind: str, model: str, base_url: str, api_key: Optional[str],
     temperature: float, num_predict: int, project_root: Optional[str],
+    num_ctx: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Run the Planner only and return the serialised plan (no task execution).
 
@@ -364,7 +369,7 @@ def get_agent_plan(
         prov = _resolve_provider(
             use_profile=use_profile, profile_name=profile_name, kind=kind,
             model=model, base_url=base_url, api_key=api_key,
-            temperature=temperature, num_predict=num_predict,
+            temperature=temperature, num_predict=num_predict, num_ctx=num_ctx,
         )
     except Exception as e:
         logger.error("get_agent_plan: provider init failed: %s", e)
