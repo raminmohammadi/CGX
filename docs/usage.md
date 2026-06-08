@@ -138,6 +138,25 @@ print(result["embedding_cache"])
 #  'impl':   {'hits': 410, 'misses': 7,  'dim': 768}}
 ```
 
+`hits` is the count of chunks served from the cache (the embedder is
+**not** called); `misses` is the count of new / changed chunks that
+were sent through the embedder and written back. `hits + misses`
+always equals the number of chunks in the view. The same numbers are
+also logged to the server, one line per view:
+
+```
+Embedding cache view=intent hits=412 misses=5
+Embedding cache view=impl   hits=410 misses=7
+```
+
+Expected ratios: a first-time index of a project is all misses; a
+re-index with no source changes is all hits (sub-second); a re-index
+after editing a handful of files lands in the high-99% hits range.
+
+> Not to be confused with retrieval `hits` (the top-k chunks returned
+> by a query). Cache `hits` measure index reuse; retrieval `hits`
+> measure search results -- same word, different layers.
+
 The cache is invalidated automatically when the embedding `model_name`,
 `dim`, or `normalize` flag changes -- there is no risk of serving stale
 vectors against a different model.
