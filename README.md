@@ -160,16 +160,18 @@ Open your browser to http://127.0.0.1:8765 to access the console. *(Note: The se
  2. **Index:** Go to the **Index** tab, point it at a project root (or upload a .zip), and trigger the build.
  3. **Ask/Plan:** Navigate to the **Ask** tab to query your codebase, or the **Plan** tab to have CGX generate self-tested code changes.
  4. **Agent:** Use the **🤖 Agent** tab to give CGX a high-level goal (e.g., *"create a FastAPI todo app"*) and watch it plan, scaffold, and verify the result.
+
 <details>
 <summary>📖 Click to view detailed UI Tab descriptions</summary>
- * **Setup:** Choose Provider Type, tune sampling parameters, and save profiles. API keys are stored in your OS keyring.
- * **Index:** Honours .gitignore and a 1 MB file-size cap. Emits files for incremental re-indexing.
- * **Ask:** Natural-language question with a streaming "thought process" panel. Sidebar holds persistent session history.
- * **Plan:** Request a change plan. Tick *Validate diffs* and *Run impacted tests* to have CGX self-check its own output.
- * **Agent:** Watch the Planner ➔ Tracker ➔ Judge loop decompose goals into atomic tasks.
- * **Hardware:** Detect hardware to see ✅/⚠️/❌ fit verdicts for local models against your RAM/VRAM.
- * **Profiles:** Save provider configurations with optional rate limits and retry logic.
-   </details>
+ 1. **Setup:** Choose Provider Type, tune sampling parameters, and save profiles. API keys are stored in your OS keyring.
+ 2. **Index:** Honours .gitignore and a 1 MB file-size cap. Emits files for incremental re-indexing.
+ 3. **Ask:** Natural-language question with a streaming "thought process" panel. Sidebar holds persistent session history.
+ 4. **Plan:** Request a change plan. Tick *Validate diffs* and *Run impacted tests* to have CGX self-check its own output.
+ 5. **Agent:** Watch the Planner ➔ Tracker ➔ Judge loop decompose goals into atomic tasks.
+ 6. **Hardware:** Detect hardware to see ✅/⚠️/❌ fit verdicts for local models against your RAM/VRAM.
+ 7. **Profiles:** Save provider configurations with optional rate limits and retry logic.
+</details>
+
 ### 2. CLI
 If you prefer the terminal, you can index and query directly:
 ```bash
