@@ -106,22 +106,6 @@ ollama pull qwen2.5-coder:3b
 
 ```
 
-## 🏁 Quick Start
-
-Once installed, spin up the platform with a single command:
-
-```bash
-# Launch the local web server and interface
-cgx serve
-```
-Open your browser to ⁠http://127.0.0.1:8765⁠ to access the console.
-Your First Run:
-
-1. Setup: Head to the Profiles tab, select Ollama or Gemini, and click Ping to verify connectivity.
-2. Index: Paste the absolute path of a local project root and trigger the index build.
-3. Ask: Query your codebase structure (e.g., "How does our authentication middleware parse JWTs?") to witness the streamed retrieval chain.
-
-
 ### Platform notes
 
 - **Linux** -- no extra steps. NVIDIA users wanting GPU embeddings or
@@ -157,6 +141,68 @@ Your First Run:
   stored in Windows Credential Manager instead of a plain file.
 
 ---
+
+## 🏁 Quick Start
+
+### 1. UI (Recommended)
+
+Once installed, spin up the platform with a single command:
+
+```bash
+cgx serve
+# or: cgx-ui
+# or: python app.py
+
+```
+Open your browser to http://127.0.0.1:8765 to access the console. *(Note: The server has no built-in auth and binds to localhost by default. Do not expose it to the public internet without a reverse proxy).*
+**Your First Run:**
+ 1. **Setup:** Head to the **Profiles** tab, select your provider (Ollama, Gemini, OpenAI, etc.), fill in your credentials, and click **Ping** to verify connectivity.
+ 2. **Index:** Go to the **Index** tab, point it at a project root (or upload a .zip), and trigger the build.
+ 3. **Ask/Plan:** Navigate to the **Ask** tab to query your codebase, or the **Plan** tab to have CGX generate self-tested code changes.
+ 4. **Agent:** Use the **🤖 Agent** tab to give CGX a high-level goal (e.g., *"create a FastAPI todo app"*) and watch it plan, scaffold, and verify the result.
+<details>
+<summary>📖 Click to view detailed UI Tab descriptions</summary>
+ * **Setup:** Choose Provider Type, tune sampling parameters, and save profiles. API keys are stored in your OS keyring.
+ * **Index:** Honours .gitignore and a 1 MB file-size cap. Emits files for incremental re-indexing.
+ * **Ask:** Natural-language question with a streaming "thought process" panel. Sidebar holds persistent session history.
+ * **Plan:** Request a change plan. Tick *Validate diffs* and *Run impacted tests* to have CGX self-check its own output.
+ * **Agent:** Watch the Planner ➔ Tracker ➔ Judge loop decompose goals into atomic tasks.
+ * **Hardware:** Detect hardware to see ✅/⚠️/❌ fit verdicts for local models against your RAM/VRAM.
+ * **Profiles:** Save provider configurations with optional rate limits and retry logic.
+   </details>
+### 2. CLI
+If you prefer the terminal, you can index and query directly:
+```bash
+cgx index --project-root /path/to/repo --out-dir /tmp/cgx_index
+cgx query --index-dir /tmp/cgx_index/indices \
+          --records  /tmp/cgx_index/records.jsonl \
+          --query "What does parse_codebase do?"
+
+```
+### 3. Python API
+You can also use CGX programmatically in your own scripts:
+```python
+from cgx.pipeline.auto import run_index_auto
+from cgx.answer.engine import answer_with_llm
+from cgx.answer.providers import OllamaProvider, GeminiProvider
+
+run_index_auto(project_root="./", out_dir="/tmp/cgx_index")
+
+# Local Ollama
+prov = OllamaProvider(model="qwen2.5-coder:3b")
+
+# Google Gemini
+# prov = GeminiProvider(model="gemini-1.5-flash", api_key="YOUR_KEY")
+
+ans = answer_with_llm(
+    "/tmp/cgx_index/indices",
+    "/tmp/cgx_index/records.jsonl",
+    "What does parse_codebase do?",
+    prov,
+)
+print(ans["answer_md"])
+
+```
 
 ## Quick start
 
