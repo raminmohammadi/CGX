@@ -163,6 +163,7 @@ Open your browser to http://127.0.0.1:8765 to access the console. *(Note: The se
 
 <details>
 <summary>📖 Click to view detailed UI Tab descriptions</summary>
+
  1. **Setup:** Choose Provider Type, tune sampling parameters, and save profiles. API keys are stored in your OS keyring.
  2. **Index:** Honours .gitignore and a 1 MB file-size cap. Emits files for incremental re-indexing.
  3. **Ask:** Natural-language question with a streaming "thought process" panel. Sidebar holds persistent session history.
