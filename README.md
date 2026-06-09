@@ -4,101 +4,37 @@
   <a href="LICENSE"><img src="https://img.shields.io/github/license/raminmohammadi/CGX?color=blue" alt="MIT License"></a>
 </p>
 
-# CGX -- Code Graph eXecution
+# CGX — Code Graph eXecution
 
-**Local-first codebase RAG and self-testing code-generation platform.**
+**Local-first codebase RAG and self-testing multi-agent code generation platform.**
 
-CGX indexes a code repository, retrieves grounded context via a hybrid
-engine (semantic + lexical + graph), and asks a local or remote LLM to
-answer questions or produce **self-tested** code change plans. It is
-model-agnostic and ships with a React/Vite web UI served by a FastAPI
-backend that streams progress over Server-Sent Events.
+CGX indexes your code repository, extracts context via a hybrid engine (semantic + lexical + import graph), and orchestrates local or remote LLMs to answer repository questions or deliver self-tested code change plans. It features a responsive React/Vite web UI served by a FastAPI backend streaming over Server-Sent Events (SSE).
 
-- **Local-first.** Indexing, embedding, retrieval, sessions, and
-  telemetry **never leave the machine.** Works fully offline with
-  [Ollama](https://ollama.com/).
-- **Universal LLM provider.** Ollama (local), OpenAI-compatible
-  endpoints, native **Google Gemini**, or any self-hosted server with a
-  custom IP, path, and optional auth-bypass -- switchable from the Settings
-  tab with a live **Ping** latency check. API keys live in your OS keyring.
-- **Hybrid retrieval.** Two-view semantic + BM25 + graph expansion,
-  fused with Reciprocal Rank Fusion and an optional cross-encoder
-  rerank.
-- **Multi-agent orchestration.** A Planner / Tracker / Judge loop
-  decomposes complex requests into atomic tasks (`ask`, `plan`,
-  `scaffold`, `scaffold_manifest`, `scaffold_file`, `search`, `summarize`,
-  `apply`, `verify`, `fill_logic`) and validates each artefact before
-  moving on (`cgx.agents`, **🤖 Agent** tab). The planner routes scaffold
-  goals through a manifest-then-per-file chain, downgrades expensive
-  code-gen tasks to plain Q&A for read-only goals, and the tracker
-  streams live `task_progress` heartbeats so the UI never looks frozen on
-  long LLM calls. See [docs/flowcharts.md](docs/flowcharts.md) for a visual.
-- **New project generation.** Give CGX a plain-language idea
-  (e.g. *"create a FastAPI todo app"* or *"create a React calculator
-  app"*), set a destination directory as Project Root, and the
-  `scaffold_manifest → scaffold_file × N → apply → verify` chain
-  generates a complete, working project from scratch -- no existing
-  codebase or index required. The `apply` step writes a per-run backup
-  mirror under `<project_root>/.cgx-backups/` so the whole run can
-  be undone via `POST /api/rollback`.
-- **Modular skills registry** (`skills/`). Each supported technology
-  lives in its own folder (`skills/react/`, `skills/fastapi/`,
-  `skills/nextjs/`, `skills/vue/`, `skills/tailwind/`, `skills/flask/`,
-  `skills/django/`, `skills/express/`, `skills/python_cli/`,
-  `skills/sqlite/`) and bundles three things: detection from the goal,
-  the prompt fragment the LLM sees while generating, and a structural
-  validator the Judge runs against the produced diffs. Multi-skill
-  goals compose naturally -- *"React UI + FastAPI backend"* activates
-  both, so the scaffold prompt carries both layouts and the Judge
-  refuses to silently pass an output that only honours one half. Adding
-  a new framework is a single-folder change with no agent-layer edits.
-  See [docs/usage.md](docs/usage.md#generating-a-new-project-from-scratch)
-  for the full table and [docs/architecture.md](docs/architecture.md#skills)
-  for the protocol.
-- **Persistent chat sessions.** Conversations are saved as JSONL
-  threads under `~/.cgx/sessions/`; resume them later from the Ask
-  tab's session sidebar.
-- **Self-testing code generation.** Diffs are parsed, syntax-checked,
-  and optionally run against impacted pytest tests in a sandbox before
-  being surfaced. The sandbox now auto-installs missing Python packages
-  before running pytest (`cgx.codegen.env_manager`) so a model choosing
-  a new library doesn't mask real failures.
-- **Symbol table context.** Before generating a change plan, CGX
-  injects a compressed `# AVAILABLE CONTEXT` map of every symbol already
-  defined in the indexed codebase (`cgx.codegen.symbol_map`), preventing
-  local models from re-implementing helpers that already exist.
-- **Granular error slicing.** Retry prompts include ±5 lines of source
-  context around the first traceback line number rather than a raw
-  1 200-character pytest dump, keeping small models focused on the precise
-  failure site.
-- **Incremental indexing.** A content-addressed embedding cache
-  (per-view `.npz` keyed on sha256 of the corpus text) makes
-  re-indexing a touched-only-a-few-files repo nearly instant.
-- **Hardware-aware model picker.** The Hardware tab reports
-  ✅/⚠️/❌ verdicts for ~8 local models against your detected RAM/VRAM
-  and shows a local-vs-cloud trade-off table.
-- **Client-side rate limiting + 429 retry** on every provider, with
-  per-profile budgets persisted alongside the model config.
-- **Thought-process panel.** Live streaming of the model's reasoning
-  sketch, followed by the final grounded answer.
-- **VS Code extension scaffold** (`extension/`) that hosts the
-  CGX web UI inside an editor webview.
-- **Task registry & cancel.** Every operation is tracked in
-  `~/.cgx/tasks.db`; cancel any running task with
-  `DELETE /api/tasks/{id}` or the in-UI Cancel button.
-- **Cancel button on every tab.** Stop a streaming request mid-flight
-  from Ask (Stop), Plan, Agent, or Index (Cancel).
-- **Tab persistence.** Switching between tabs mid-task no longer loses
-  the running view -- state is held in a session-scoped Zustand store
-  (`frontend/src/store/tasks.ts`) and the SSE stream continues in the
-  background via `frontend/src/lib/connections.ts`.
-- 🖥️ **Terminal observability.** All operations emit structured
-  `[INFO]`/`[WARNING]` log lines to stdout from startup
-  (`setup_logging(INFO)` in `launch.py`).
-- ⚡ **Parallel two-view execution.** FAISS index building
-  (`run_index_auto`) and semantic retrieval (`HybridRetriever.search`)
-  both run the intent and impl views concurrently via
-  `ThreadPoolExecutor`.
+
+
+## ⚡ Core Capabilities
+
+* **🔒 100% Local-First:** Indexing, embeddings, retrieval, session logs, and telemetry remain entirely on your local machine. Works seamlessly offline via [Ollama](https://ollama.com/).
+* **🤖 Multi-Agent Orchestration:** A deterministic `Planner ➔ Tracker ➔ Judge` execution loop decomposes complex engineering goals into atomic tasks (`ask`, `plan`, `scaffold`, `apply`, `verify`). 
+* **🛠️ Self-Testing Code Gen:** Diffs are parsed, dry-applied in memory, and verified through an isolated sandbox running `ast.parse` and impacted `pytest` files before being surfaced to the user.
+* **🧬 Graph-Expanded Hybrid RAG:** Fuses semantic vectors (FAISS) and lexical tokens (BM25) with an abstract syntax tree (AST) import/call graph expansion, ranked via Reciprocal Rank Fusion (RRF).
+* **🧩 Modular Skills Registry (`skills/`):** Technology-specific contexts (React, FastAPI, Tailwind, etc.) are completely isolated. Adding support for a new framework is a single-folder addition with zero edits required to the core agent loop.
+
+---
+
+## 🚀 Key Features
+
+<details>
+<summary>📖 View Full Feature Breakdown</summary>
+
+* **New Project Scaffolding:** Generate brand-new repositories from plain-language prompts using the `scaffold_manifest ➔ scaffold_file` chain. Includes automatic local backups under `.cgx-backups/` for instant rollbacks.
+* **Symbol Table Context Injection:** Compresses a structural map of existing codebase helper functions and types into the prompt window, preventing local models from writing redundant code.
+* **Hardware-Aware Model Selection:** On-device hardware evaluation flags local models (3B to 70B+) as ✅ *Fits*, ⚠️ *Tight*, or ❌ *Insufficient Memory* based on real-time RAM/VRAM checks.
+* **Incremental Indexing:** Content-addressed embedding cache (`.npz` files keyed on SHA-256 hashes) ensures re-indexing modified codebases takes milliseconds.
+* **Granular Traceback Slicing:** Automatically extracts $\pm$5 lines of surrounding context around test tracebacks, preventing small local contexts from being flooded with raw stdout noise.
+* **Robust Provider Engine:** Switch configurations dynamically in the UI with a live latency **Ping** feature. Integrates client-side token-bucket rate limiting and automatic 429 exponential backoffs.
+* **State & Stream Persistence:** Tab states are held in a global Zustand store; navigate between configuration, indexing, and chat interfaces without tearing down background SSE streams.
+</details>
 
 ---
 
