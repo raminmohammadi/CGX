@@ -664,6 +664,19 @@ as a **two-job matrix**:
 
 ---
 
+## 🤝 Contributing
+
+We welcome contributions of all sizes! The architecture of CGX is explicitly designed to make community contributions isolated and modular.
+
+### 💡 The Easiest Way to Contribute: Add a Skill
+If you want to add support for your favorite framework, language, or tool, you do not need to touch the core agent orchestration layer. Simply add a new folder to the `skills/` directory containing:
+1. **Detection rules** to identify when the skill is needed.
+2. **Prompt fragments** to guide model code generation.
+3. **Structural validators** for the code Judge to execute.
+
+See [docs/architecture.md#skills](docs/architecture.md#skills) for our plug-and-play skills protocol. For bugs, feature requests, or core engine patches, please refer to our [CONTRIBUTING.md](CONTRIBUTING.md) guide.
+
+
 ## License
 
 MIT.
