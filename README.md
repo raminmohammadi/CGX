@@ -104,6 +104,15 @@ Pull a small local model (recommended default):
 ollama pull qwen2.5-coder:3b
 ```
 
+## 🏁 Quick Start
+
+Once installed, spin up the platform with a single command:
+
+```bash
+# Launch the local web server and interface
+cgx serve
+```
+
 ### Platform notes
 
 - **Linux** -- no extra steps. NVIDIA users wanting GPU embeddings or
