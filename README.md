@@ -98,10 +98,12 @@ Optional extras:
 | `keyring`    | OS keyring for API-key storage                    |
 | `dev`        | `pytest`, `ruff`, `mypy`                          |
 
-Pull a small local model (recommended default):
+**Optional: Pulling a local model**
+You can pull a recommended small model (like `qwen2.5-coder:3b`) directly from the CGX UI later by clicking the **Pull** button in the Setup tab. Alternatively, you can pre-fetch it via the CLI:
 
 ```bash
 ollama pull qwen2.5-coder:3b
+
 ```
 
 ## 🏁 Quick Start
