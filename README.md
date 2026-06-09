@@ -112,6 +112,13 @@ Once installed, spin up the platform with a single command:
 # Launch the local web server and interface
 cgx serve
 ```
+Open your browser to ⁠http://127.0.0.1:8765⁠ to access the console.
+Your First Run:
+
+1. Setup: Head to the Profiles tab, select Ollama or Gemini, and click Ping to verify connectivity.
+2. Index: Paste the absolute path of a local project root and trigger the index build.
+3. Ask: Query your codebase structure (e.g., "How does our authentication middleware parse JWTs?") to witness the streamed retrieval chain.
+
 
 ### Platform notes
 
