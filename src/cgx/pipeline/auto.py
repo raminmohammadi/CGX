@@ -38,6 +38,7 @@ from cgx.retrieval.orchestrator import (
 )
 from cgx.io.persist import save_indices, load_indices, save_jsonl, load_jsonl
 from cgx.retrieval.lexical import get_cached_lexical_index
+from cgx.answer.scope import apply_scope_penalty
 
 # Graph persistence
 from networkx.readwrite import json_graph
@@ -279,6 +280,7 @@ def run_query_auto(
     single_view: Optional[str] = None,
     embedder: Optional[Any] = None,
     enable_reranker: Optional[bool] = None,
+    scope: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Load indices, records, chunks, and graph, then execute hybrid two-view retrieval
@@ -346,6 +348,10 @@ def run_query_auto(
     )
 
     hits = retrieval_out.get("hits", [])
+    if scope in {"src", "tests"}:
+        before = len(hits)
+        hits = apply_scope_penalty(hits, scope)
+        logger.info("run_query_auto: scope=%s applied soft penalty (n=%d)", scope, before)
     top_files = retrieval_out.get("top_files", [])
     top_classes = retrieval_out.get("top_classes", [])
 

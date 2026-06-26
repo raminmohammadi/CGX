@@ -1,5 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Bot, Brain, ChevronDown, Send, Square, TriangleAlert, User } from "lucide-react";
+import {
+  Bot, Brain, ChevronDown, PanelRightClose, PanelRightOpen, Sparkles,
+  Square, TriangleAlert, User,
+} from "lucide-react";
 import { api, type SessionMessage } from "../lib/api";
 import { streamSSE } from "../lib/sse";
 import { abortConnection, getConnection, setConnection } from "../lib/connections";
@@ -120,7 +123,20 @@ export default function AskPage() {
         } else if (ev === "thought_warning") {
           patchLast({ warning: String(data?.message || "") });
         } else if (ev === "intent") {
-          patchLast({ intent: { mode: String(data?.mode || "") } });
+          patchLast({
+            intent: {
+              mode: String(data?.mode || ""),
+              scope: data?.scope ? String(data.scope) : undefined,
+            },
+          });
+        } else if (ev === "answer_delta" && data?.delta) {
+          useTasks.setState((s) => {
+            const msgs = [...s.ask.messages];
+            const last = msgs[msgs.length - 1];
+            if (!last || last.role !== "assistant") return s;
+            msgs[msgs.length - 1] = { ...last, content: (last.content ?? "") + String(data.delta) };
+            return { ask: { ...s.ask, messages: msgs } };
+          });
         } else if (ev === "answer") {
           patchLast({
             content: String(data?.answer_md || ""),
@@ -163,40 +179,148 @@ export default function AskPage() {
     }
   };
 
+  const sources = lastAssistant?.sources || [];
+  const intent = lastAssistant?.intent;
+  const sourceCount = sources.length;
+
+  // Default-collapsed retrieval panel: most reads are answer-first, so keep
+  // the rank list one click away rather than always-on screen real estate.
+  const [showSources, setShowSources] = useState(false);
+
   return (
     <div className="flex h-full w-full p-4 gap-4 overflow-hidden">
-      <RetrievalPanel sources={lastAssistant?.sources || []} intent={lastAssistant?.intent} />
+      <div className="flex-1 flex flex-col bg-surface rounded-xl border border-muted overflow-hidden min-w-0">
+        <ChatHeader
+          intent={intent}
+          sourceCount={sourceCount}
+          showSources={showSources}
+          onToggleSources={() => setShowSources((v) => !v)}
+        />
 
-      <div className="flex-1 flex flex-col bg-surface rounded-xl border border-muted overflow-hidden">
-        <div ref={threadRef} className="flex-1 p-5 overflow-y-auto space-y-5 text-xs">
+        <div ref={threadRef} className="flex-1 px-6 py-5 overflow-y-auto space-y-6">
           {messages.length === 0 && <AskEmptyState />}
           {messages.map((m, i) => (
             <ChatBubble key={i} msg={m} />
           ))}
         </div>
 
-        <div className="p-3 border-t border-muted bg-slate-950">
-          <div className="rounded-lg bg-slate-900 border border-muted focus-within:border-emerald-500/50 focus-within:shadow-neon transition flex items-end gap-2 p-1.5">
-            <textarea
-              ref={draftRef}
-              defaultValue=""
-              onKeyDown={handleKey}
-              rows={1}
-              placeholder="Query code signatures, modules, or implementations..."
-              className="w-full bg-transparent outline-none text-xs text-white px-2 py-1.5 resize-none placeholder-slate-500 max-h-32"
-            />
-            {busy ? (
-              <button onClick={cancel} className="av-btn-ghost shrink-0">
-                <Square className="h-3 w-3" /> Stop
-              </button>
-            ) : (
-              <button onClick={send} className="av-btn-primary shrink-0">
-                <Send className="h-3 w-3" /> Ask
-              </button>
-            )}
-          </div>
-          {error && <p className="text-[10px] text-red-400 mt-2 font-mono">{error}</p>}
-        </div>
+        <AskBar
+          draftRef={draftRef}
+          busy={busy}
+          onSend={send}
+          onCancel={cancel}
+          onKeyDown={handleKey}
+          error={error}
+        />
+      </div>
+
+      {showSources && (
+        <RetrievalPanel
+          sources={sources}
+          intent={intent}
+          onClose={() => setShowSources(false)}
+        />
+      )}
+    </div>
+  );
+}
+
+function ChatHeader({
+  intent, sourceCount, showSources, onToggleSources,
+}: {
+  intent?: { mode?: string; scope?: string };
+  sourceCount: number;
+  showSources: boolean;
+  onToggleSources: () => void;
+}) {
+  return (
+    <div className="flex items-center justify-between px-5 py-2.5 border-b border-muted bg-slate-950/40">
+      <div className="flex items-center gap-2 min-w-0">
+        <span className="text-[10px] uppercase tracking-[0.18em] font-mono text-slate-500">
+          Grounded answer
+        </span>
+        {intent?.mode && <Pill tone="purple">{intent.mode}</Pill>}
+        {intent?.scope && <Pill tone="slate">scope: {intent.scope}</Pill>}
+      </div>
+      <button
+        onClick={onToggleSources}
+        className={
+          "inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-mono transition " +
+          (showSources
+            ? "bg-emerald-500/15 text-emerald-300 border border-emerald-500/30"
+            : "bg-slate-900 text-slate-400 border border-white/5 hover:text-emerald-300 hover:border-emerald-500/30")
+        }
+        title={showSources ? "Hide retrieval ranks" : "Show retrieval ranks"}
+      >
+        {showSources
+          ? <PanelRightClose className="h-3.5 w-3.5" />
+          : <PanelRightOpen className="h-3.5 w-3.5" />}
+        <span>Sources</span>
+        {sourceCount > 0 && (
+          <span className="px-1.5 py-px rounded-sm bg-emerald-500/20 text-emerald-300 text-[10px] font-semibold">
+            {sourceCount}
+          </span>
+        )}
+      </button>
+    </div>
+  );
+}
+
+function AskBar({
+  draftRef, busy, onSend, onCancel, onKeyDown, error,
+}: {
+  draftRef: React.RefObject<HTMLTextAreaElement | null>;
+  busy: boolean;
+  onSend: () => void;
+  onCancel: () => void;
+  onKeyDown: (e: React.KeyboardEvent<HTMLTextAreaElement>) => void;
+  error: string | null;
+}) {
+  return (
+    <div className="px-5 pt-3 pb-4 border-t border-muted bg-slate-950/60">
+      <div className="rounded-2xl bg-slate-900/80 border border-white/5
+                      focus-within:border-emerald-500/50 focus-within:shadow-neon
+                      transition flex items-end gap-3 px-4 py-3">
+        <Sparkles className="h-4 w-4 text-emerald-400/80 mt-1.5 shrink-0" />
+        <textarea
+          ref={draftRef}
+          defaultValue=""
+          onKeyDown={onKeyDown}
+          rows={2}
+          placeholder="Ask anything about this codebase — signatures, modules, behavior, change ideas…"
+          className="flex-1 bg-transparent outline-none text-sm text-white py-1
+                     resize-none placeholder-slate-500 max-h-48 leading-relaxed"
+        />
+        {busy ? (
+          <button
+            onClick={onCancel}
+            className="shrink-0 inline-flex items-center gap-1.5 px-4 py-2 rounded-xl
+                       bg-slate-800 text-slate-200 border border-white/10
+                       hover:bg-slate-700 transition text-sm font-medium"
+          >
+            <Square className="h-3.5 w-3.5" /> Stop
+          </button>
+        ) : (
+          <button
+            onClick={onSend}
+            className="shrink-0 inline-flex items-center gap-1.5 px-5 py-2 rounded-xl
+                       bg-emerald-500 text-slate-950 hover:bg-emerald-400
+                       transition text-sm font-bold shadow-[0_0_24px_-6px_rgba(16,185,129,0.6)]"
+          >
+            <Sparkles className="h-3.5 w-3.5" /> Ask
+          </button>
+        )}
+      </div>
+      <div className="flex items-center justify-between mt-1.5 px-1">
+        <p className="text-[10px] text-slate-500 font-mono">
+          <kbd className="px-1 py-px rounded bg-slate-900 border border-white/5 text-slate-400">Enter</kbd>
+          {" "}to send ·{" "}
+          <kbd className="px-1 py-px rounded bg-slate-900 border border-white/5 text-slate-400">Shift</kbd>
+          {" + "}
+          <kbd className="px-1 py-px rounded bg-slate-900 border border-white/5 text-slate-400">Enter</kbd>
+          {" "}for newline
+        </p>
+        {error && <p className="text-[10px] text-red-400 font-mono">{error}</p>}
       </div>
     </div>
   );
@@ -225,6 +349,7 @@ function ChatBubble({ msg }: { msg: ChatMsg }) {
         <div className="flex items-center gap-2">
           <p className="text-slate-400 text-[10px] font-mono">CGX Response</p>
           {msg.intent?.mode && <Pill tone="purple">{msg.intent.mode}</Pill>}
+          {msg.intent?.scope && <Pill tone="slate">scope: {msg.intent.scope}</Pill>}
         </div>
         {msg.thought && (
           <div className="rounded-lg border border-muted bg-slate-950/60 p-3 text-[11px] text-slate-400 font-mono whitespace-pre-wrap leading-relaxed">
@@ -254,7 +379,13 @@ function ChatBubble({ msg }: { msg: ChatMsg }) {
 
 const PAGE_SIZE = 10;
 
-function RetrievalPanel({ sources, intent }: { sources: any[]; intent?: { mode?: string } }) {
+function RetrievalPanel({
+  sources, intent, onClose,
+}: {
+  sources: any[];
+  intent?: { mode?: string; scope?: string };
+  onClose?: () => void;
+}) {
   const [showAll, setShowAll] = useState(false);
   useEffect(() => setShowAll(false), [sources]);
 
@@ -270,12 +401,33 @@ function RetrievalPanel({ sources, intent }: { sources: any[]; intent?: { mode?:
         <span className="flex items-center gap-1.5">
           <Brain className="h-3 w-3 text-emerald-400" /> Retrieval Ranks
         </span>
-        <span className="text-[9px] text-slate-500 lowercase">fused via rrf</span>
+        <span className="flex items-center gap-2">
+          <span className="text-[9px] text-slate-500 lowercase">fused via rrf</span>
+          {onClose && (
+            <button
+              onClick={onClose}
+              className="text-slate-500 hover:text-slate-200 transition"
+              title="Hide retrieval ranks"
+            >
+              <PanelRightClose className="h-3.5 w-3.5" />
+            </button>
+          )}
+        </span>
       </div>
       <div className="flex-1 p-3 font-mono text-[10px] space-y-1.5 overflow-y-auto bg-slate-950/20 text-slate-400">
-        {intent?.mode && (
+        {(intent?.mode || intent?.scope) && (
           <p className="text-emerald-300/80 text-[10px] mb-2">
-            intent: <span className="text-emerald-400">{intent.mode}</span>
+            {intent?.mode && (
+              <>
+                intent: <span className="text-emerald-400">{intent.mode}</span>
+              </>
+            )}
+            {intent?.mode && intent?.scope && <span className="text-slate-600"> · </span>}
+            {intent?.scope && (
+              <>
+                scope: <span className="text-slate-300">{intent.scope}</span>
+              </>
+            )}
           </p>
         )}
         {sources.length === 0 && (
@@ -320,12 +472,22 @@ function SourceRow({ src, rank }: { src: any; rank: number }) {
     : "";
   const score: number | null =
     typeof src?.score === "number" ? src.score
-      : typeof src?.hit_meta?.rrf_score === "number" ? src.hit_meta.rrf_score : null;
+      : typeof src?.hit_meta?.score === "number" ? src.hit_meta.score
+        : typeof src?.hit_meta?.rrf_score === "number" ? src.hit_meta.rrf_score : null;
+  const demoted = !!src?.hit_meta?.scope_demoted;
   const label = symbol || basename || `chunk ${rank}`;
   const sub = [symbol ? basename : "", lineRange].filter(Boolean).join("  ");
 
   return (
-    <div className="p-1.5 border border-white/5 rounded bg-slate-950/40 space-y-0.5">
+    <div
+      className={
+        "p-1.5 border rounded space-y-0.5 " +
+        (demoted
+          ? "border-amber-500/15 bg-amber-500/[0.03] opacity-60"
+          : "border-white/5 bg-slate-950/40")
+      }
+      title={demoted ? "Off-scope: score penalized for the detected query scope" : undefined}
+    >
       <div className="flex items-center gap-1.5 min-w-0">
         <span className="text-slate-600 shrink-0 text-[8px]">#{rank}</span>
         {kindLabel && (
@@ -333,9 +495,20 @@ function SourceRow({ src, rank }: { src: any; rank: number }) {
             {kindLabel}
           </span>
         )}
+        {demoted && (
+          <span className="text-[8px] uppercase tracking-wider font-mono text-amber-400/80 bg-amber-500/10 border border-amber-500/20 px-1 rounded shrink-0">
+            off-scope
+          </span>
+        )}
         <span className="font-medium text-slate-200 truncate flex-1 text-[10px]">{label}</span>
         {score !== null && (
-          <span className="text-[9px] text-emerald-400 shrink-0">{score.toFixed(3)}</span>
+          <span
+            className={
+              "text-[9px] shrink-0 " + (demoted ? "text-amber-400/70" : "text-emerald-400")
+            }
+          >
+            {score.toFixed(3)}
+          </span>
         )}
       </div>
       {sub && <p className="text-[8px] text-slate-500 truncate pl-4">{sub}</p>}

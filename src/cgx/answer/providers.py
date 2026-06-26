@@ -6,12 +6,25 @@ import logging
 import os
 import json
 import re
+import time
 from typing import Any, Dict, Iterator, List, Optional
 import requests  # intentionally re-exported; UI imports this to ensure dependency
 
-from cgx.answer.ratelimit import RateLimiter, request_with_retry
+from cgx.answer.ratelimit import RateLimiter, backoff_seconds, request_with_retry
 
 DEFAULT_TIMEOUT = float(os.environ.get("CGX_HTTP_TIMEOUT", "120"))
+
+# Transport-layer requests exceptions that are typically transient: a TLS
+# handshake hiccup, a proxy reset, or a momentary timeout. Re-attempting the
+# request with backoff is usually enough to recover. Server-side errors
+# (HTTPError on 4xx/5xx) are not in this set -- those are surfaced
+# immediately.
+_TRANSIENT_REQUESTS_EXC: tuple = (
+    requests.exceptions.SSLError,
+    requests.exceptions.ConnectionError,
+    requests.exceptions.Timeout,
+    requests.exceptions.ChunkedEncodingError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -350,10 +363,18 @@ class GeminiProvider(LLMProvider):
         max_tokens: Optional[int] = None,
         **kwargs: Any,
     ) -> Iterator[str]:
-        """Stream via Gemini's streamGenerateContent SSE endpoint."""
+        """Stream via Gemini's streamGenerateContent SSE endpoint.
+
+        On a transient transport error (TLS hiccup, connection reset, timeout)
+        the request is retried with exponential backoff up to ``max_retries``
+        times *before* any delta has been yielded. Once forwarding has begun,
+        replaying the request would duplicate downstream content, so a
+        mid-stream break instead raises a scrubbed ``RuntimeError`` that the
+        caller can surface as a clean warning. Hard HTTP errors (4xx/5xx) also
+        raise immediately rather than retry.
+        """
         if not self.api_key:
-            yield f"\n[stream error: {_MISSING_GEMINI_KEY_MSG}]"
-            return
+            raise RuntimeError(_MISSING_GEMINI_KEY_MSG)
         system_text, contents = self._map_messages(messages)
         body: Dict[str, Any] = {
             "contents": contents,
@@ -364,28 +385,55 @@ class GeminiProvider(LLMProvider):
         if max_tokens:
             body["generationConfig"]["maxOutputTokens"] = int(max_tokens)
         url = self._url("streamGenerateContent") + "&alt=sse"
-        try:
-            with requests.post(url, json=body, timeout=self.timeout, stream=True) as resp:
-                resp.raise_for_status()
-                for raw in resp.iter_lines(decode_unicode=True):
-                    if not raw:
-                        continue
-                    line = raw.strip()
-                    if line.startswith("data:"):
-                        line = line[5:].strip()
-                    if not line or line == "[DONE]":
-                        if line == "[DONE]":
-                            break
-                        continue
+
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                with requests.post(url, json=body, timeout=self.timeout, stream=True) as resp:
+                    resp.raise_for_status()
                     try:
-                        obj = json.loads(line)
-                        delta = obj["candidates"][0]["content"]["parts"][0]["text"]
-                        if delta:
-                            yield delta
-                    except Exception:
-                        continue
-        except Exception as e:
-            yield f"\n[stream error: {type(e).__name__}: {self._scrub_secret(str(e))}]"
+                        for raw in resp.iter_lines(decode_unicode=True):
+                            if not raw:
+                                continue
+                            line = raw.strip()
+                            if line.startswith("data:"):
+                                line = line[5:].strip()
+                            if not line or line == "[DONE]":
+                                if line == "[DONE]":
+                                    break
+                                continue
+                            try:
+                                obj = json.loads(line)
+                                delta = obj["candidates"][0]["content"]["parts"][0]["text"]
+                                if delta:
+                                    yield delta
+                            except Exception:
+                                continue
+                    except _TRANSIENT_REQUESTS_EXC as e:
+                        raise RuntimeError(
+                            "Gemini stream interrupted mid-response: "
+                            f"{type(e).__name__}: {self._scrub_secret(str(e))}"
+                        ) from e
+                return
+            except _TRANSIENT_REQUESTS_EXC as e:
+                if attempt > self._max_retries:
+                    raise RuntimeError(
+                        f"Gemini stream failed after {attempt} attempt(s): "
+                        f"{type(e).__name__}: {self._scrub_secret(str(e))}"
+                    ) from e
+                delay = backoff_seconds(attempt)
+                logger.info(
+                    "Gemini chat_stream: attempt %d raised %s -- retrying in %.2fs",
+                    attempt, type(e).__name__, delay,
+                )
+                time.sleep(delay)
+                continue
+            except requests.exceptions.HTTPError as e:
+                status = getattr(getattr(e, "response", None), "status_code", "?")
+                raise RuntimeError(
+                    f"Gemini stream HTTP {status}: {self._scrub_secret(str(e))}"
+                ) from e
 
 
 class OpenAICompatProvider(LLMProvider):

@@ -108,7 +108,7 @@ export interface ChatMsg {
   role: "user" | "assistant";
   content: string;
   sources?: any[];
-  intent?: { mode?: string };
+  intent?: { mode?: string; scope?: string };
   streaming?: boolean;
   thought?: string;
   warning?: string;

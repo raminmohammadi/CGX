@@ -3,7 +3,7 @@
 from __future__ import annotations
 import logging
 import os, json, re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 from pathlib import Path
 
 from cgx.io.persist import load_indices, load_jsonl
@@ -558,6 +558,18 @@ SYSTEM_PROMPTS: Dict[str, str] = {
         "claim with [[chunk_id]]. Return JSON keys: answer_md, citations, "
         "suggested_changes, confidence. No prose outside JSON. "
     ) + ALLOWED_CITATION_NOTE,
+    "qa": (
+        "You are a senior codebase assistant answering a specific question. "
+        "Use ONLY the SOURCES (and the optional README lead) to answer the "
+        "QUESTION directly. Do NOT impose a fixed section template -- pick "
+        "the shape that best fits the question (a short paragraph, a list, "
+        "a small table, or a brief code excerpt). Stay focused on what was "
+        "asked; do not pivot into a generic repo summary. Cite every "
+        "non-trivial claim with [[chunk_id]]. If SOURCES do not cover the "
+        "question, say so plainly and name what would be needed. Return JSON "
+        "keys: answer_md, citations, suggested_changes, confidence. No prose "
+        "outside JSON. "
+    ) + ALLOWED_CITATION_NOTE,
 }
 
 
@@ -565,45 +577,116 @@ def _get_system_prompt(mode: str) -> str:
     """Return the system prompt for ``mode`` with a safe fallback to SYSTEM."""
     return SYSTEM_PROMPTS.get(mode, SYSTEM)
 
-def answer_with_llm(
+
+# Streaming variants of the system prompts. JSON mode forces the whole
+# response to land as a single payload, which both delays first-token
+# emission and triggers the provider's read-timeout on slow local models.
+# Streaming asks for plain Markdown with inline ``[[chunk_id]]`` citations
+# so tokens can flow continuously and the UI can render incrementally.
+SYSTEM_STREAM = (
+    "You are a senior codebase assistant. Use ONLY the provided SOURCES to answer. "
+    "Cite facts inline with [[chunk_id]] markers exactly as they appear in SOURCES. "
+    "Be concise but complete. Reply in plain Markdown -- do NOT wrap your answer in JSON, "
+    "do NOT add a heading like '## Answer', and do NOT include external knowledge. "
+    "If information is missing, say what else is needed rather than inventing details."
+)
+
+
+SYSTEM_PROMPTS_STREAM: Dict[str, str] = {
+    "symbol_explain": (
+        "You are a senior code reviewer explaining a specific symbol. Use ONLY the SOURCES. "
+        "Reply in plain Markdown structured as: Purpose, Signature, Parameters, Returns, "
+        "Side effects, Key logic, Internal dependencies, Typical usage. Cite every "
+        "non-trivial claim inline with [[chunk_id]]. Do NOT wrap in JSON."
+    ),
+    "howto": (
+        "You are a pragmatic guide for using this codebase. Use ONLY the SOURCES. "
+        "Reply in plain Markdown: a short numbered procedure followed by a minimal code "
+        "example drawn from SOURCES. Cite each step with [[chunk_id]]. Do NOT wrap in JSON."
+    ),
+    "change_plan": (
+        "You are a principal engineer drafting a focused change plan. Use ONLY the SOURCES. "
+        "Reply in plain Markdown listing: Goal, Affected files, Step-by-step edits, "
+        "Tests to add/update, Risks. Cite each affected location with [[chunk_id]]. "
+        "Do NOT wrap in JSON."
+    ),
+    "symbol_location": (
+        "You are a precise locator. Use ONLY the SOURCES. Reply in plain Markdown listing "
+        "file paths and line ranges where the symbol is defined or primarily implemented, "
+        "one per line, each followed by a one-line rationale and a [[chunk_id]] citation."
+    ),
+    "line_number": (
+        "You are a precise locator for edit anchors. Use ONLY the SOURCES. Reply in plain "
+        "Markdown listing candidate (file, line_range) edit points with a one-line "
+        "justification and a [[chunk_id]] citation each."
+    ),
+    "overview": (
+        "You are a senior codebase assistant. Use ONLY the SOURCES (and the optional README "
+        "lead) to produce a concise repo overview in plain Markdown: Purpose, Major "
+        "components, How they fit together, Entry points. Cite each claim with [[chunk_id]]. "
+        "Do NOT wrap in JSON."
+    ),
+    "qa": (
+        "You are a senior codebase assistant answering a specific question. Use ONLY the "
+        "SOURCES (and the optional README lead) to answer the QUESTION directly in plain "
+        "Markdown. Do NOT impose a fixed section template (no forced Purpose / Components / "
+        "Entry-Points headings); pick the shape that best fits the question -- a short "
+        "paragraph, a list, a small table, or a brief code excerpt drawn from SOURCES. "
+        "Stay focused on what was asked; do not pivot into a generic repo summary. Cite "
+        "every non-trivial claim inline with [[chunk_id]]. If SOURCES do not cover the "
+        "question, say so plainly and name what would be needed. Do NOT wrap in JSON."
+    ),
+}
+
+
+def _get_stream_system_prompt(mode: str) -> str:
+    """Return the markdown-direct system prompt for ``mode`` (streaming path)."""
+    return SYSTEM_PROMPTS_STREAM.get(mode, SYSTEM_STREAM)
+
+
+def _prepare_answer_request(
     index_dir: str,
     records_path: str,
     question: str,
     provider: LLMProvider,
     *,
     top_k: int = 20,
-    hits: Optional[List[Dict[str, Any]]] = None
-) -> Dict[str, Any]:
-    """
-    Retrieve context from indices/graph and ask the LLM to synthesize a grounded answer.
+    hits: Optional[List[Dict[str, Any]]] = None,
+) -> Tuple[str, Dict[str, Any]]:
+    """Shared retrieval + prompt-context prep for sync and streaming answer paths.
+
+    Returns either ``('done', final_result)`` -- when an early-exit case
+    fires (no hits, missing target, graph-based callers/callees
+    short-circuit) -- or ``('ready', prep)`` where ``prep`` carries the
+    materials both :func:`answer_with_llm` and
+    :func:`answer_with_llm_stream` need: ``context`` (the user-role
+    message body), ``sources``, ``mode``, ``target``, ``target_matched``,
+    ``merged_hits``, ``root``, ``readme``.
+
+    Splitting this out keeps the JSON-postprocessing logic in the
+    blocking path and the token-streaming logic in the streaming path
+    from drifting apart.
     """
     indices = load_indices(index_dir)
     cmap = _chunk_map(indices)
 
-    # Detect intent
     mode = detect_intent(question)
 
     # --- Improved Target symbol detection ---
     symbols = _symbol_tokens(question)
     target = None
     target_matched = False
-    # 1. Prefer the first token that actually exists in the index
     for t in symbols:
         if _find_symbol_rows(indices, t):
             target = t
             target_matched = True
             break
-    # 2. If none matched, try reversed order (favor last tokens like "parse_codebase")
     if target is None and symbols:
         for t in reversed(symbols):
             if _find_symbol_rows(indices, t):
                 target = t
                 target_matched = True
                 break
-    # 3. As last resort, pick the last token instead of the first. This is a
-    #    best-effort focus hint only; the strict coverage gate below is skipped
-    #    when target_matched is False so general/module/concept questions still
-    #    reach the LLM with retrieval context.
     if target is None and symbols:
         target = symbols[-1]
 
@@ -631,15 +714,12 @@ def answer_with_llm(
                 if mode == "callers_list":
                     edges = list(G.in_edges(node, data=True))
                     header = f"Functions that call `{target}`"
-                    # neighbor is the source of an inbound edge
                     pairs = [(u, d) for (u, _v, d) in edges]
                 else:
                     edges = list(G.out_edges(node, data=True))
                     header = f"Functions called by `{target}`"
-                    # neighbor is the target of an outbound edge
                     pairs = [(v, d) for (_u, v, d) in edges]
                 for nbr, edata in pairs:
-                    # Edge data may itself be a dict-of-dicts (MultiDiGraph).
                     etype: Optional[str] = None
                     if isinstance(edata, dict):
                         if any(isinstance(v, dict) for v in edata.values()):
@@ -660,7 +740,7 @@ def answer_with_llm(
             results = []
         if results:
             sources = _as_sources_with_meta(results, cmap, max_chunks=40, max_chars=900)
-            return {
+            return "done", {
                 "answer_md": header + ":\n\n" + "\n".join(
                     f"- {s['symbol']} ({s['path']})" for s in sources
                 ),
@@ -699,7 +779,7 @@ def answer_with_llm(
             seen.add(cid); merged_hits.append(h)
 
     if not merged_hits:
-        return {
+        return "done", {
             "answer_md": (
                 "I couldn't locate matching symbols or chunks for this question in the current index. "
                 "Re-index the repo and try again, or provide the file containing the target function/class."
@@ -719,10 +799,6 @@ def answer_with_llm(
         if t and t not in focus_terms:
             focus_terms.append(t)
 
-    # When the orchestrator surfaced graph-expanded neighbors, switch to the
-    # tiered context builder so the prompt spends its budget on full bodies
-    # for primary hits and compact stubs for neighbors. Profile-driven
-    # budgets keep us off magic numbers per call site.
     _has_neighbors = any(
         int(((h.get("provenance") or {}) if isinstance(h, dict) else {}).get("graph_depth", 0) or 0) >= 1
         for h in merged_hits
@@ -744,18 +820,13 @@ def answer_with_llm(
             focus_terms=focus_terms or None,
         )
 
-    # Require target coverage -- only for symbol-targeted modes, and only when
-    # target was set by a real index match. Conceptual modes like ``howto`` /
-    # ``overview`` / ``change_plan`` extract incidental tokens (e.g. ``encode``
-    # from "how to encode images") that are best-effort focus hints, not
-    # mandatory symbols, so the gate would wrongly abstain on grounded sources.
     if target and target_matched and mode in _SYMBOL_TARGETED_MODES:
         covers = [
             s for s in sources
             if _symbol_covers_target(s.get("symbol", ""), s.get("chunk_id", ""), target)
         ]
         if not covers:
-            return {
+            return "done", {
                 "answer_md": (
                     f"I couldn't find the symbol `{target}` in the indexed chunks. "
                     "Please re-index or verify the symbol name/file."
@@ -783,9 +854,48 @@ def answer_with_llm(
         context += f"TARGET_SYMBOL: {target}\n\n"
     context += "SOURCES:\n" + "\n".join(_fmt_source(s) for s in sources)
 
+    return "ready", {
+        "context": context,
+        "sources": sources,
+        "mode": mode,
+        "target": target,
+        "target_matched": target_matched,
+        "merged_hits": merged_hits,
+        "root": root,
+        "readme": readme,
+    }
+
+
+def answer_with_llm(
+    index_dir: str,
+    records_path: str,
+    question: str,
+    provider: LLMProvider,
+    *,
+    top_k: int = 20,
+    hits: Optional[List[Dict[str, Any]]] = None
+) -> Dict[str, Any]:
+    """
+    Retrieve context from indices/graph and ask the LLM to synthesize a grounded answer.
+    """
+    kind, payload = _prepare_answer_request(
+        index_dir, records_path, question, provider,
+        top_k=top_k, hits=hits,
+    )
+    if kind == "done":
+        return payload
+
+    prep = payload
+    mode = prep["mode"]
+    target = prep["target"]
+    sources = prep["sources"]
+    merged_hits = prep["merged_hits"]
+    root = prep["root"]
+    readme = prep["readme"]
+
     messages = [
         {"role": "system", "content": _get_system_prompt(mode)},
-        {"role": "user", "content": context},
+        {"role": "user", "content": prep["context"]},
     ]
 
     resp = provider.chat(messages, temperature=0.2)
@@ -843,6 +953,113 @@ def answer_with_llm(
     }
 
     return parsed
+
+
+# Matches ``[[chunk_id]]`` citation tokens in streamed Markdown so the final
+# event can carry a structured ``citations`` list alongside the raw answer.
+_INLINE_CITATION_RE = re.compile(r"\[\[([^\[\]]+)\]\]")
+
+
+def answer_with_llm_stream(
+    index_dir: str,
+    records_path: str,
+    question: str,
+    provider: LLMProvider,
+    *,
+    top_k: int = 20,
+    hits: Optional[List[Dict[str, Any]]] = None,
+    temperature: float = 0.2,
+    max_tokens: Optional[int] = None,
+) -> Iterator[Tuple[str, Dict[str, Any]]]:
+    """Stream the grounded answer as ``(event, data)`` tuples.
+
+    Emits ``("answer_delta", {"delta": "..."})`` for each Markdown token
+    produced by ``provider.chat_stream``, and finally a single
+    ``("answer", {...})`` event whose payload matches the dict shape
+    returned by :func:`answer_with_llm` (``answer_md``, ``citations``,
+    ``suggested_changes``, ``confidence``, ``debug``).
+
+    Early-exit cases from :func:`_prepare_answer_request` (no hits,
+    missing target, graph-based callers/callees short-circuit) yield only
+    a final ``answer`` event with no deltas, matching the blocking path.
+    """
+    kind, payload = _prepare_answer_request(
+        index_dir, records_path, question, provider,
+        top_k=top_k, hits=hits,
+    )
+    if kind == "done":
+        yield "answer", payload
+        return
+
+    prep = payload
+    mode = prep["mode"]
+    target = prep["target"]
+    sources = prep["sources"]
+    merged_hits = prep["merged_hits"]
+    root = prep["root"]
+    readme = prep["readme"]
+
+    messages = [
+        {"role": "system", "content": _get_stream_system_prompt(mode)},
+        {"role": "user", "content": prep["context"]},
+    ]
+
+    chunks: List[str] = []
+    try:
+        for delta in provider.chat_stream(
+            messages,
+            temperature=float(temperature),
+            max_tokens=max_tokens,
+        ):
+            if not delta:
+                continue
+            chunks.append(delta)
+            yield "answer_delta", {"delta": delta}
+    except Exception as e:
+        logger.error("answer_with_llm_stream: chat_stream failed: %s", e)
+        yield "answer", {
+            "answer_md": f"_Stream error: {type(e).__name__}: {e}_",
+            "citations": [],
+            "suggested_changes": [],
+            "confidence": 0.0,
+            "debug": {
+                "mode": mode, "target_symbol": target,
+                "sources": sources, "hits": merged_hits,
+                "readme_included": bool(readme),
+                "stream_error": f"{type(e).__name__}: {e}",
+            },
+        }
+        return
+
+    answer_md = "".join(chunks).strip()
+    if not answer_md:
+        answer_md = (
+            "The provided SOURCES did not contain enough content to answer without guessing. "
+            "Please re-index or narrow the question to a specific file or snippet."
+        )
+
+    allowed_ids = [s["chunk_id"] for s in sources]
+    raw_cites = [{"chunk_id": m.group(1)} for m in _INLINE_CITATION_RE.finditer(answer_md)]
+    citations = _sanitize_citations(raw_cites, allowed_ids)
+
+    answer_md = _shorten_chunk_refs(answer_md, root)
+
+    yield "answer", {
+        "answer_md": answer_md,
+        "citations": citations,
+        "suggested_changes": [],
+        "confidence": 0.6 if citations else 0.4,
+        "debug": {
+            "mode": mode,
+            "target_symbol": target,
+            "sources": sources,
+            "hits": merged_hits,
+            "readme_included": bool(readme),
+            "streamed": True,
+        },
+    }
+
+
 
 
 def generate_code_plan(

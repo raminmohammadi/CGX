@@ -96,6 +96,26 @@ export default function PlanPage() {
     return out;
   })();
 
+  // Backend sends `report.summary` as a dict (n_targets, n_patches_ok, ...).
+  // Render it as a compact string so it doesn't blow up React (error #31).
+  const summaryText = (() => {
+    const s = report?.summary;
+    if (!s) return "diffs";
+    if (typeof s === "string") return s;
+    if (typeof s === "object") {
+      const n = (k: string) => (typeof s[k] === "number" ? s[k] : 0);
+      const parts: string[] = [];
+      if ("n_targets" in s) {
+        parts.push(`${n("n_patches_ok")}/${n("n_targets")} patches`);
+        if (n("n_syntax_failed") > 0) parts.push(`${n("n_syntax_failed")} syntax fail`);
+      }
+      if (s.tests_ran) parts.push(s.tests_passed ? "tests ok" : "tests fail");
+      if (s.empty_plan) parts.push("empty plan");
+      return parts.length ? parts.join(" · ") : "diffs";
+    }
+    return String(s);
+  })();
+
   return (
     <div className="p-6 space-y-6 overflow-y-auto h-full max-w-5xl">
       <CardHeader
@@ -198,7 +218,7 @@ export default function PlanPage() {
               <div className="flex items-center gap-2">
                 <Pill tone="neon">Parsed Codegen Report</Pill>
                 <span className="text-xs text-slate-300 font-mono">
-                  {report?.summary || "diffs"}
+                  {summaryText}
                 </span>
               </div>
               <div className="flex items-center gap-3 text-xs font-mono">

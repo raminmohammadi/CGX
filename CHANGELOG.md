@@ -2,6 +2,87 @@
 
 All notable changes are documented here. Versions follow semver-ish.
 
+## Unreleased -- Ask UI overhaul + Gemini stream resilience + patch context verification
+
+### Added
+
+- **Citation chips in rendered answers** (`frontend/src/components/Markdown.tsx`):
+  a new `preprocessCitations` step rewrites both `[[chunk_id]]` markers
+  (emitted by `cgx.answer.engine`) and single-bracket `[path::kind::name]`
+  variants into compact emerald `CitationChip` pills displaying just the
+  symbol name with the full id surfaced via tooltip. Previously these
+  markers rendered as raw bracketed text, which cluttered every paragraph
+  with long `[[/src/cgx/retrieval/lexical.py::method::LexicalIndex.search]]`
+  strings. No backend changes -- the structured `citations` array on the
+  response is untouched.
+- **Collapsible Sources panel** (`frontend/src/pages/AskPage.tsx`):
+  the retrieval-ranks column is now hidden by default behind a
+  `Sources (N)` toggle in the new `ChatHeader` strip. Clicking reveals
+  the existing `RetrievalPanel` as a right-hand drawer. Frees the main
+  reading area for the answer and matches the cleaner Odysseus-style
+  layout.
+- **Redesigned Ask bar** (`frontend/src/pages/AskPage.tsx`): taller
+  textarea, larger placeholder, emerald focus glow, icon prefix,
+  pill-shaped Ask button, and a `Enter to send · Shift+Enter for newline`
+  hint underneath. Markdown body typography in `Markdown.tsx` was also
+  refreshed (comfier reading size, tighter heading hierarchy, real card
+  around fenced code blocks).
+- **`_format_stream_failure` helper** (`cgx.webui.handlers`): centralised
+  formatter for `thought_warning` SSE payloads. `RuntimeError` messages
+  raised by providers (already pre-scrubbed) render without the redundant
+  class prefix; other exceptions keep `ClassName: msg` so the cause
+  remains visible. Used by both `stream_ask` and `stream_plan`.
+- **Regression tests for patch context verification**
+  (`tests/test_codegen_pipeline.py`): four new tests --
+  `test_apply_hunks_exact_match_applies`,
+  `test_apply_hunks_drifted_line_numbers_fuzzy_locates`,
+  `test_apply_hunks_hallucinated_context_is_rejected`,
+  `test_apply_hunks_ambiguous_match_is_rejected` -- pin the new
+  context-verification contract.
+
+### Changed
+
+- **`GeminiProvider.chat_stream` now retries transient transport errors**
+  (`cgx.answer.providers`). `SSLError`, `ConnectionError`, `Timeout`,
+  and `ChunkedEncodingError` raised *before* any delta has been yielded
+  are retried with exponential backoff up to `max_retries` times (default
+  3) via the existing `cgx.answer.ratelimit.backoff_seconds` helper. A
+  mid-stream break (after deltas have flowed) cannot be safely replayed
+  -- it would duplicate downstream content -- so it instead raises a
+  scrubbed `RuntimeError` the caller can surface as a clean warning.
+  Hard HTTP errors (4xx / 5xx) raise immediately with the status code
+  rather than retry. All error messages run through
+  `GeminiProvider._scrub_secret` so the API key cannot leak into UI
+  banners or logs. Previously a single TLS hiccup yielded
+  `[stream error: SSLError: ...]` into the planner-thinking pane and
+  killed the turn.
+
+### Fixed
+
+- **`cgx.codegen.diff_apply._apply_hunks` silently corrupted files when
+  the model emitted wrong line numbers or hallucinated context lines**.
+  The previous implementation treated `@@` line numbers as authoritative
+  and blindly overwrote `out[anchor:anchor+consumed]` with the post-image
+  without verifying that the pre-image actually matched the buffer.
+  Repro: a diff with `@@ -1,3 +1,3 @@` followed by context line
+  ` def NONEXISTENT_func():` (a function that doesn't exist in the file)
+  was reported as `ok=True` and silently replaced the real `def add()`,
+  producing invalid Python that then failed the downstream
+  `validate_patch_results` syntax check. The rewrite:
+  - Introduces `_build_hunk_images` which splits each hunk body into a
+    **pre-image** (context + deletion lines) and **post-image**
+    (context + addition lines).
+  - Introduces `_locate_pre_image` which locates the pre-image in the
+    working buffer using (1) the `@@` hint, (2) a ±50-line sliding
+    window, and (3) a global unique-match fallback. Ambiguous global
+    matches (more than one location matches) are rejected rather than
+    guessed.
+  - Hunks whose pre-image cannot be located are added to
+    `rejected_hunks` and the file content is **preserved
+    byte-for-byte**, so the downstream syntax validator now sees the
+    real failure ("partial apply" / "rejected hunk") instead of an
+    after-the-fact `SyntaxError` on corrupted output.
+
 ## Unreleased -- Gemma 4 model family + pull-error fix
 
 ### Added

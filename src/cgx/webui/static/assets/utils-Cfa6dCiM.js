@@ -1,4 +1,4 @@
-import{n as e,t}from"./ui-B7tx8Ls4.js";function n(e,t,n,i){let a=new AbortController;return{abort:()=>a.abort(),done:(async()=>{try{let i=await fetch(e,{method:`POST`,headers:{"content-type":`application/json`,accept:`text/event-stream`},body:JSON.stringify(t),signal:a.signal});if(!i.ok||!i.body)throw Error(`SSE ${e} → ${i.status}`);let o=i.body.getReader(),s=new TextDecoder,c=``;for(;;){let{value:e,done:t}=await o.read();if(t)break;c+=s.decode(e,{stream:!0}).replace(/\r\n/g,`
+import{n as e,t}from"./ui-KETn7wYg.js";function n(e,t,n,i){let a=new AbortController;return{abort:()=>a.abort(),done:(async()=>{try{let i=await fetch(e,{method:`POST`,headers:{"content-type":`application/json`,accept:`text/event-stream`},body:JSON.stringify(t),signal:a.signal});if(!i.ok||!i.body)throw Error(`SSE ${e} → ${i.status}`);let o=i.body.getReader(),s=new TextDecoder,c=``;for(;;){let{value:e,done:t}=await o.read();if(t)break;c+=s.decode(e,{stream:!0}).replace(/\r\n/g,`
 `);let i;for(;(i=c.indexOf(`
 
 `))>=0;){let e=c.slice(0,i);c=c.slice(i+2),r(e,n)}}c.trim()&&r(c,n)}catch(e){if(e?.name===`AbortError`)return;i?.(e)}})()}}function r(e,t){let n=`message`,r=[];for(let t of e.split(`

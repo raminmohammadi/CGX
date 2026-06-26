@@ -17,8 +17,9 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-from cgx.answer.engine import answer_with_llm, generate_code_plan
+from cgx.answer.engine import answer_with_llm_stream, generate_code_plan
 from cgx.answer.intent import detect_intent
+from cgx.answer.scope import resolve_scope_for_intent
 from cgx.pipeline.auto import run_index_auto, run_query_auto
 from cgx.webui.helpers import (
     build_provider,
@@ -32,6 +33,21 @@ from cgx.webui.helpers import (
 
 
 Event = Tuple[str, Dict[str, Any]]
+
+
+def _format_stream_failure(e: BaseException) -> str:
+    """Render an exception raised by ``provider.chat_stream`` for the
+    ``thought_warning`` UI banner.
+
+    Provider streaming paths now raise ``RuntimeError`` with a pre-scrubbed,
+    human-readable message (see :class:`GeminiProvider`); for those we drop
+    the redundant class prefix. Lower-level exceptions keep their class name
+    so the cause is still visible.
+    """
+    msg = (str(e) or "").strip()
+    if isinstance(e, RuntimeError) and msg:
+        return msg
+    return f"{type(e).__name__}: {msg or e!r}"
 
 
 def _resolve_provider(
@@ -121,8 +137,9 @@ def stream_ask(
         return
 
     mode = detect_intent(question or "")
-    logger.info("stream_ask: intent mode=%s", mode)
-    yield "intent", {"mode": mode}
+    scope = resolve_scope_for_intent(question or "", mode)
+    logger.info("stream_ask: intent mode=%s scope=%s", mode, scope)
+    yield "intent", {"mode": mode, "scope": scope}
 
     out_dir = Path(index_dir).parent
     chunks_path = str(out_dir / "chunks.jsonl")
@@ -136,6 +153,7 @@ def stream_ask(
             chunks_path=chunks_path if os.path.exists(chunks_path) else None,
             graph_path=graph_path if os.path.exists(graph_path) else None,
             top_k_per_view=20, neighbor_depth=1, use_lexical=True,
+            scope=scope,
         )
     except Exception as e:
         logger.error("stream_ask: retrieval failed: %s", e)
@@ -183,21 +201,41 @@ def stream_ask(
                 yield "thought", {"delta": delta}
     except Exception as e:
         logger.warning("stream_ask: thought stream unavailable: %s", e)
-        yield "thought_warning", {"message": f"stream unavailable: "
-                                             f"{type(e).__name__}: {e}"}
+        yield "thought_warning", {"message": _format_stream_failure(e)}
 
-    logger.info("stream_ask: thought complete (%d tokens), generating answer", thought_tokens)
+    logger.info("stream_ask: thought complete (%d tokens), streaming answer", thought_tokens)
+    answer_delta_tokens = 0
+    result: Optional[Dict[str, Any]] = None
     try:
-        result = answer_with_llm(index_dir, records, question, prov, hits=hits)
+        for ev, data in answer_with_llm_stream(
+            index_dir, records, question, prov,
+            hits=hits, temperature=float(temperature),
+            max_tokens=int(num_predict) if num_predict else None,
+        ):
+            if cancel_event and cancel_event.is_set():
+                yield "cancelled", {"message": "Cancelled during answer"}
+                return
+            if ev == "answer_delta":
+                answer_delta_tokens += 1
+                yield "answer_delta", {"delta": str(data.get("delta") or "")}
+            elif ev == "answer":
+                result = data
     except Exception as e:
-        logger.error("stream_ask: answer_with_llm failed: %s", e)
+        logger.error("stream_ask: answer_with_llm_stream failed: %s", e)
         yield "error", {"message": f"answer: {type(e).__name__}: {e}"}
+        return
+
+    if result is None:
+        yield "error", {"message": "answer: stream ended without final event"}
         return
 
     answer_md = stringify(result.get("answer_md", ""))
     sources = json_safe((result.get("debug") or {}).get("sources", []))
     meta = json_safe({k: v for k, v in result.items() if k != "debug"})
-    logger.info("stream_ask: answer ready len=%d sources=%d", len(answer_md), len(sources))
+    logger.info(
+        "stream_ask: answer ready len=%d sources=%d delta_tokens=%d",
+        len(answer_md), len(sources), answer_delta_tokens,
+    )
     yield "answer", {"answer_md": answer_md, "sources": sources, "meta": meta}
 
 
@@ -246,8 +284,7 @@ def stream_plan(
                 yield "thought", {"delta": delta}
     except Exception as e:
         logger.warning("stream_plan: thought stream unavailable: %s", e)
-        yield "thought_warning", {"message": f"stream unavailable: "
-                                             f"{type(e).__name__}: {e}"}
+        yield "thought_warning", {"message": _format_stream_failure(e)}
 
     if cancel_event and cancel_event.is_set():
         yield "cancelled", {"message": "Cancelled before codegen"}

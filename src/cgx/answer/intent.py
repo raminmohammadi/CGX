@@ -11,6 +11,9 @@ which metadata or graph traversal logic to emphasize.
 Supported modes
 ---------------
 - "overview"        : High-level summary of the repo.
+- "qa"              : General/conceptual question grounded in SOURCES, without
+                      a forced section template (default for natural-language
+                      questions that aren't symbol-, howto-, or change-shaped).
 - "change_plan"     : Requests about adding/refactoring/extending.
 - "howto"           : "How to" usage or workflow questions.
 - "symbol_explain"  : Explain a specific function/class in depth.
@@ -25,6 +28,7 @@ from typing import Literal
 
 Intent = Literal[
     "overview",
+    "qa",
     "change_plan",
     "howto",
     "symbol_explain",
@@ -79,7 +83,10 @@ def detect_intent(question: str) -> Intent:
     Returns
     -------
     Intent
-        One of the supported modes (default: "overview").
+        One of the supported modes. Empty input returns ``"overview"``; any
+        natural-language question that doesn't match a more specific rule
+        falls through to ``"qa"`` so the engine answers it directly instead
+        of forcing a templated repo overview.
 
     Notes
     -----
@@ -89,6 +96,8 @@ def detect_intent(question: str) -> Intent:
     is present.
     """
     q = (question or "").strip()
+    if not q:
+        return "overview"
     ql = q.lower()
     has_sym = _has_symbol_token(q)
 
@@ -110,21 +119,12 @@ def detect_intent(question: str) -> Intent:
     if any(k in ql for k in ["which line", "line number", "line should i change", "what line"]):
         return "line_number"
 
-    # Symbol explanation: explicit verbs + a symbol token
-    if has_sym and any(k in ql for k in ["what does", "explain", "describe", "purpose of", "what is the ", "how does"]):
-        return "symbol_explain"
-
-    # Usage / workflow questions (no concrete symbol target)
-    if any(k in ql for k in ["how do i", "how to ", "where to ", "how can i"]):
-        return "howto"
-
-    # Code modification requests (broad; only after symbol-targeted branches)
-    if any(k in ql for k in ["add ", "implement", "feature", "refactor", "plan ", "change ", "extend ", "modify", "introduce", "create a "]):
-        return "change_plan"
-
     # Overview-shaped phrasings about a project/repo/codebase as a whole.
-    # Must come before the fallback so short all-uppercase tokens (often the
-    # project's own name, e.g. "CGX") don't force symbol_explain.
+    # Must come BEFORE the symbol_explain branch so questions like
+    # "what is the CGX project about?" -- which contain both the
+    # "what is the " trigger AND a short ALLCAPS token -- still route
+    # to the high-level summary path rather than being treated as a
+    # request to explain a specific symbol.
     if any(k in ql for k in [
         "project about", "repo about", "codebase about",
         "about this project", "about the project", "about this repo",
@@ -138,6 +138,29 @@ def detect_intent(question: str) -> Intent:
         "project overview", "codebase overview", "repo summary",
     ]):
         return "overview"
+
+    # Also catch phrasings like "tell me about the CGX project" or
+    # "summarize the Foo codebase" where a project token sits between the
+    # verb phrase and the noun. Treat any "(tell me about|what is|summarize)
+    # ... (project|repo|codebase)" shape as an overview request -- the
+    # in-between token is the project's name, not a symbol to dissect.
+    if re.search(
+        r"\b(?:tell\s+me\s+about|what\s+is|what's|summari[sz]e)\b[^?.!]{0,40}\b(?:project|repo|codebase)\b",
+        ql,
+    ):
+        return "overview"
+
+    # Symbol explanation: explicit verbs + a symbol token
+    if has_sym and any(k in ql for k in ["what does", "explain", "describe", "purpose of", "what is the ", "how does"]):
+        return "symbol_explain"
+
+    # Usage / workflow questions (no concrete symbol target)
+    if any(k in ql for k in ["how do i", "how to ", "where to ", "how can i"]):
+        return "howto"
+
+    # Code modification requests (broad; only after symbol-targeted branches)
+    if any(k in ql for k in ["add ", "implement", "feature", "refactor", "plan ", "change ", "extend ", "modify", "introduce", "create a "]):
+        return "change_plan"
 
     # Bare "what is X" / "what is X about" / "tell me about X" where X is a
     # short ALLCAPS acronym is almost always asking about the project as a
@@ -153,7 +176,10 @@ def detect_intent(question: str) -> Intent:
         if tok.isupper() and 2 <= len(tok) <= 6:
             return "overview"
 
-    # Fallback: prefer symbol_explain if a symbol is present, else overview
+    # Fallback: prefer symbol_explain if a symbol is present, else qa.
+    # ``qa`` (not ``overview``) is the default so conceptual questions like
+    # "what indexing is being used?" get a focused answer instead of a
+    # templated Purpose/Components/Entry-Points sandwich.
     if has_sym:
         return "symbol_explain"
-    return "overview"
+    return "qa"
