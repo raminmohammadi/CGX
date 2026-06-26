@@ -227,6 +227,29 @@ _VERIFY_ONLY_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Phrases that signal an *exploratory* read-only goal -- the user is
+# asking for suggestions / ideas / forward-looking directions rather
+# than a factual lookup of what the code currently does. Answers to
+# these goals are inherently partly speculative, so the Judge should
+# not demand source citations for every suggestion.
+_EXPLORATORY_RE = re.compile(
+    r"\b("
+    # forward-looking verbs
+    r"improve|enhance|optimi[sz]e|"
+    # solicitations for ideas
+    r"suggest|recommend|propose|brainstorm|"
+    r"ideas?\s+(?:for|on|about|to)|"
+    # open-ended interrogatives
+    r"how\s+(?:can|could|might|should|would)\s+(?:i|we|you|one|the)|"
+    r"what\s+(?:are\s+)?(?:some\s+|other\s+)*"
+    r"(?:ways?|approaches?|options?|methods?|strategies?|techniques?|"
+    r"directions?|improvements?|alternatives?|possibilities)|"
+    r"alternative\s+(?:approach|method|way|technique|strategy)|"
+    r"explore|investigate|consider"
+    r")\b",
+    re.IGNORECASE,
+)
+
 
 def _goal_mentions_existing_code(goal: str) -> bool:
     """True when *goal* explicitly references an existing codebase / file.
@@ -302,6 +325,68 @@ def _goal_is_verify_only(goal: str) -> bool:
     if _goal_is_change(goal):
         return False
     return _VERIFY_ONLY_RE.search(goal) is not None
+
+
+def _goal_is_exploratory(goal: str) -> bool:
+    """True when *goal* asks for suggestions/ideas rather than a factual lookup.
+
+    Read-only goals like "improve indexing accuracy" or "what are some ways
+    to speed this up?" produce inherently speculative answers; the Judge
+    must not demand source citations for every forward-looking suggestion.
+    Code-change and verify-only goals are excluded so they keep their own
+    routing.
+    """
+    if not goal:
+        return False
+    if _goal_is_change(goal) or _goal_is_verify_only(goal):
+        return False
+    return _EXPLORATORY_RE.search(goal) is not None
+
+
+# Engine mode name used for exploratory ASK tasks. Defined here so the
+# planner, judge, and tests share a single source of truth.
+CLARIFY_PATHS_MODE = "clarify_paths"
+
+
+def _default_ask_criteria(goal: str, *, continuation: bool = False) -> List[str]:
+    """Default acceptance criteria for a read-only ASK task.
+
+    Exploratory goals (see :func:`_goal_is_exploratory`) get a
+    clarify-shaped criterion: the answer must enumerate multiple
+    concrete directions or ask the user to narrow the goal, rather
+    than asserting unverifiable speculation. All other read-only
+    goals keep the citation requirement so a factual answer is
+    grounded in the indexed codebase.
+
+    When ``continuation`` is True, the goal is treated as a narrowed
+    follow-up (the user has already replied to a previous clarify
+    ASK) so the clarify-shaped criterion is suppressed and the answer
+    is held to the standard citation requirement.
+    """
+    if not continuation and _goal_is_exploratory(goal):
+        return [
+            "Answer enumerates multiple concrete directions or asks a "
+            "clarifying question to narrow the open-ended goal.",
+        ]
+    return ["Answer cites at least one source from the indexed codebase."]
+
+
+def _ask_inputs_for_goal(
+    goal: str, base: Optional[Dict[str, Any]] = None,
+    *, continuation: bool = False,
+) -> Dict[str, Any]:
+    """Compose the ``inputs`` dict for a read-only ASK task.
+
+    Exploratory goals route through the engine's ``clarify_paths`` mode
+    so the answer enumerates options + asks a follow-up question rather
+    than producing a single grounded answer. Non-exploratory goals keep
+    whatever inputs the caller already had (typically empty).
+    """
+    inputs: Dict[str, Any] = dict(base or {})
+    if not continuation and _goal_is_exploratory(goal):
+        inputs.setdefault("mode_override", CLARIFY_PATHS_MODE)
+        inputs.setdefault("goal", goal.strip())
+    return inputs
 
 
 def _coerce_kind(raw: str) -> TaskKind:
@@ -435,26 +520,38 @@ class Planner:
         # prompt with real candidate paths from the index.
         self.retriever = retriever
 
-    def plan(self, goal: str) -> Plan:
+    def plan(self, goal: str, *, continuation: bool = False,
+             prior_goal: Optional[str] = None) -> Plan:
         if not goal or not goal.strip():
             raise ValueError("Planner.plan: goal must be non-empty")
-        logger.info("Planner.plan: starting goal=%r provider=%s retriever=%s",
+        # ``prior_goal`` is only meaningful when ``continuation`` is True:
+        # the user is replying to a previous clarify ASK and ``goal`` is the
+        # narrowed pick; ``prior_goal`` is the original open-ended request
+        # they're still trying to make progress on. Drop it otherwise so the
+        # LLM prompt isn't muddied with stale context.
+        carried_prior = (prior_goal or "").strip() if continuation else ""
+        logger.info("Planner.plan: starting goal=%r provider=%s retriever=%s "
+                    "continuation=%s prior_goal=%r",
                     goal[:80], type(self.provider).__name__ if self.provider else "None",
-                    "yes" if self.retriever else "no")
+                    "yes" if self.retriever else "no", bool(continuation),
+                    carried_prior[:60])
         candidates = self._retrieve_candidates(goal)
         tasks: List[Task]
         rationale_box: List[str] = []
         if self.provider is not None:
             logger.info("Planner: calling LLM for plan decomposition")
             tasks = self._llm_plan(goal, candidates=candidates,
-                                   rationale_box=rationale_box)
+                                   rationale_box=rationale_box,
+                                   prior_goal=carried_prior or None)
             logger.info("Planner: LLM returned %d tasks", len(tasks))
         else:
             tasks = []
         if not tasks:
             logger.info("Planner: using deterministic fallback plan")
-            tasks = self._fallback_plan(goal)
-        tasks = self._enforce_kind_policy(goal, tasks)
+            tasks = self._fallback_plan(goal, continuation=continuation)
+        tasks = self._enforce_kind_policy(goal, tasks, continuation=continuation)
+        if not continuation:
+            tasks = self._enforce_exploratory_clarification(goal, tasks)
         rationale = (rationale_box[0] if rationale_box
                      else _fallback_rationale(goal, tasks))
         plan = Plan(goal=goal.strip(),
@@ -546,30 +643,61 @@ class Planner:
         return plan
 
     def _retrieve_candidates(self, goal: str) -> List[str]:
-        """Call the optional retriever and return up to 8 candidate file paths."""
+        """Call the optional retriever and return up to 8 candidate file paths.
+
+        When the goal's scope resolves to ``"src"`` (production code), test
+        paths are dropped from ``top_files`` even though they may rank high
+        in the hybrid retriever's output. ``run_query_auto`` only soft-
+        penalises ``hits``; ``top_files`` aggregates per-file ranks before
+        the penalty is applied, so test files can still surface here and
+        mislead the LLM into building VERIFY tasks around unrelated test
+        modules.
+        """
         if self.retriever is None:
             return []
         try:
             result = self.retriever(goal)
         except Exception as e:
-            logger.warning("Planner: retriever failed: %s", e)
+            # Some failure modes (FAISS dim-mismatch assertions, KeyErrors with
+            # no message) produce a blank ``str(e)`` which hides the real cause
+            # in the logs. Surface type+repr so future debugging is possible.
+            logger.warning(
+                "Planner: retriever failed: %s: %r", type(e).__name__, e,
+            )
             return []
         if not isinstance(result, dict):
             return []
         top_files = result.get("top_files") or []
+        from cgx.answer.scope import detect_scope, _is_test_path
+        scope = detect_scope(goal)
         out: List[str] = []
+        dropped_tests = 0
         for f in top_files:
             if isinstance(f, dict):
                 fp = str(f.get("file") or f.get("path") or "").strip()
-                if fp:
-                    out.append(fp)
-            elif isinstance(f, str) and f.strip():
-                out.append(f.strip())
+            elif isinstance(f, str):
+                fp = f.strip()
+            else:
+                continue
+            if not fp:
+                continue
+            if scope == "src" and _is_test_path(fp):
+                dropped_tests += 1
+                continue
+            out.append(fp)
             if len(out) >= 8:
                 break
+        if dropped_tests:
+            logger.info(
+                "Planner: dropped %d test-path candidate(s) for scope=src",
+                dropped_tests,
+            )
         return out
 
-    def _enforce_kind_policy(self, goal: str, tasks: List[Task]) -> List[Task]:
+    def _enforce_kind_policy(
+        self, goal: str, tasks: List[Task],
+        *, continuation: bool = False,
+    ) -> List[Task]:
         """Coerce LLM-emitted tasks into the operational kind contract.
 
         Three policies are enforced:
@@ -653,22 +781,31 @@ class Planner:
             ))
             return kept
         if not _goal_is_change(goal):
-            logger.info("Planner: kind-policy READ-ONLY path (downgrading plan→ask)")
             out: List[Task] = []
+            rewrote = 0
             for t in tasks:
                 if t.kind not in (TaskKind.PLAN, TaskKind.APPLY, TaskKind.VERIFY):
                     out.append(t)
                     continue
-                criteria = list(t.criteria) if t.criteria else [
-                    "Answer cites at least one source from the indexed codebase."
-                ]
+                rewrote += 1
+                criteria = (list(t.criteria) if t.criteria
+                            else _default_ask_criteria(
+                                goal, continuation=continuation))
                 out.append(Task(
                     description=t.description,
                     kind=TaskKind.ASK,
                     name=t.name or _derive_name("", t.description),
-                    inputs=dict(t.inputs),
+                    inputs=_ask_inputs_for_goal(
+                        goal, t.inputs, continuation=continuation),
                     criteria=criteria,
                 ))
+            if rewrote:
+                logger.info(
+                    "Planner: kind-policy READ-ONLY path (downgraded %d "
+                    "plan/apply/verify task(s) → ask)", rewrote)
+            else:
+                logger.info(
+                    "Planner: kind-policy READ-ONLY path (no rewriting needed)")
             return out
         detected = _detected_skill_names(goal)
         logger.info(
@@ -718,17 +855,112 @@ class Planner:
         ))
         return filtered
 
+    def _enforce_exploratory_clarification(
+        self, goal: str, tasks: List[Task],
+    ) -> List[Task]:
+        """Reshape an exploratory plan so it terminates in one clarify ASK.
+
+        ``_fallback_plan`` already terminates exploratory goals in an ASK
+        carrying ``mode_override="clarify_paths"``. LLM-emitted plans for
+        the same goals are inconsistent and routinely break the contract
+        in three ways at once:
+
+        * A mid-plan ``SUMMARIZE`` describes the existing code rather
+          than recommending directions; the LLM-judge correctly fails
+          it, which halts the plan before the terminal ASK ever runs.
+        * Multiple ASK tasks chained at the tail duplicate work and
+          waste tokens; only the last one needs to enumerate options.
+        * A terminal ASK without ``mode_override`` falls back to the
+          engine's default intent prompt instead of ``clarify_paths``.
+
+        Policy applied here (all SEARCH tasks are kept verbatim because
+        they're cheap retrieval that grounds the final ASK via
+        ``_prior_outputs``):
+
+        1. Drop every ``SUMMARIZE`` task.
+        2. Drop every ASK that isn't the terminal task; the trailing
+           clarify ASK consumes prior search outputs and supersedes
+           any earlier descriptive ASK.
+        3. Ensure the result ends in exactly one ASK with
+           ``mode_override="clarify_paths"`` -- stamping an existing
+           terminal ASK in place when present, otherwise appending a
+           fresh one. The appended ASK's description is inherited from
+           the dropped terminal (if any) so the UI keeps a meaningful
+           title, and falls back to the goal text.
+
+        Non-exploratory goals are left untouched.
+        """
+        if not _goal_is_exploratory(goal) or not tasks:
+            return tasks
+        goal_clean = goal.strip()
+        original_kinds = [t.kind.value for t in tasks]
+        # Step 1+2: keep non-ASK, non-SUMMARIZE tasks (mostly SEARCH /
+        # PLAN-already-downgraded-to-ASK won't appear here because
+        # `_enforce_kind_policy` ran first and turned plan/apply/verify
+        # into ASK). We track the terminal task separately so we can
+        # inherit its description if it carried something distinctive.
+        kept: List[Task] = []
+        for t in tasks[:-1]:
+            if t.kind == TaskKind.SUMMARIZE:
+                continue
+            if t.kind == TaskKind.ASK:
+                continue
+            kept.append(t)
+        terminal = tasks[-1]
+        # Step 3: derive the terminal clarify ASK. Stamp in place when
+        # the LLM already chose ASK; otherwise compose a fresh one and
+        # carry the dropped task's description forward when useful.
+        if terminal.kind == TaskKind.ASK:
+            if (terminal.inputs or {}).get("mode_override") != CLARIFY_PATHS_MODE:
+                terminal.inputs = _ask_inputs_for_goal(goal, terminal.inputs)
+                if not terminal.criteria:
+                    terminal.criteria = _default_ask_criteria(goal)
+            kept.append(terminal)
+        else:
+            kept.append(Task(
+                description=(terminal.description or goal_clean),
+                kind=TaskKind.ASK,
+                name=_derive_name("", goal_clean),
+                inputs=_ask_inputs_for_goal(goal_clean),
+                criteria=_default_ask_criteria(goal_clean),
+            ))
+        new_kinds = [t.kind.value for t in kept]
+        if new_kinds != original_kinds:
+            logger.info(
+                "Planner: exploratory contract: %s → %s",
+                original_kinds, new_kinds)
+        return kept
+
     def _llm_plan(self, goal: str, *,
                   candidates: Optional[List[str]] = None,
-                  rationale_box: Optional[List[str]] = None) -> List[Task]:
+                  rationale_box: Optional[List[str]] = None,
+                  prior_goal: Optional[str] = None) -> List[Task]:
         """Call the LLM and return the parsed tasks.
 
         When ``rationale_box`` is supplied, the model-provided
         ``rationale`` (if any) is appended to it so :meth:`plan` can
         attach it to the :class:`Plan` without changing the function's
         primary return shape.
+
+        When ``prior_goal`` is supplied, the user's broader objective is
+        prepended to the prompt so the LLM keeps the narrowed follow-up
+        anchored in the original request rather than drifting into a
+        generic deep-dive on whatever the user clicked.
         """
-        user_parts = [f"Goal:\n{goal.strip()}"]
+        user_parts: List[str] = []
+        prior = (prior_goal or "").strip()
+        if prior:
+            user_parts.append(
+                "Original user objective (the broader goal the user is "
+                "still trying to achieve; keep the plan aligned with "
+                f"this):\n{prior}"
+            )
+            user_parts.append(
+                "Narrowed follow-up the user picked to focus on next "
+                f"(treat as the immediate goal):\n{goal.strip()}"
+            )
+        else:
+            user_parts.append(f"Goal:\n{goal.strip()}")
         if candidates:
             user_parts.append(
                 "Candidate files surfaced by the index (prefer these when "
@@ -782,14 +1014,25 @@ class Planner:
             ))
         return out
 
-    def _fallback_plan(self, goal: str) -> List[Task]:
+    def _fallback_plan(
+        self, goal: str, *, continuation: bool = False,
+    ) -> List[Task]:
         """Deterministic plan when no LLM is available.
 
-        Read-only goals collapse to a single ``ask`` task; verify-only
-        goals collapse to a single ``verify`` task; code-change goals
-        seed a single ``plan`` task -- :meth:`_enforce_kind_policy` then
-        appends the ``apply`` and ``verify`` follow-ups so the chain
-        always terminates with a real-disk write + test gate.
+        Routing summary:
+        * Scaffold goals → ``[scaffold_manifest]``; the file-content
+          tasks are injected at runtime by the manifest capability.
+        * Verify-only goals → ``[verify]``.
+        * Code-change goals → ``[plan]``; :meth:`_enforce_kind_policy`
+          appends ``apply``+``verify`` so the chain always terminates
+          with a real-disk write + test gate.
+        * Exploratory read-only goals (see :func:`_goal_is_exploratory`)
+          → ``[search, ask]`` so the UI shows a visible investigation
+          step before the clarification, and the ASK can ground its
+          enumerated options in the search's hits. Suppressed when
+          ``continuation`` is True (the user is replying to a prior
+          clarify ASK and expects a focused answer).
+        * Plain read-only goals → ``[ask]``.
         """
         goal_clean = goal.strip()
         if _goal_is_scaffold(goal):
@@ -817,9 +1060,27 @@ class Planner:
                 criteria=["Diff is syntactically valid.",
                           "Diff targets the files implicated by the goal."],
             )]
+        if not continuation and _goal_is_exploratory(goal_clean):
+            return [
+                Task(
+                    description=goal_clean,
+                    kind=TaskKind.SEARCH,
+                    name="Locate relevant code",
+                    inputs={"goal": goal_clean},
+                    criteria=["Search returns at least one indexed hit."],
+                ),
+                Task(
+                    description=goal_clean,
+                    kind=TaskKind.ASK,
+                    name=_derive_name("", goal_clean),
+                    inputs=_ask_inputs_for_goal(goal_clean),
+                    criteria=_default_ask_criteria(goal_clean),
+                ),
+            ]
         return [Task(
             description=goal_clean,
             kind=TaskKind.ASK,
             name=_derive_name("", goal_clean),
-            criteria=["Answer cites at least one source from the indexed codebase."],
+            inputs=_ask_inputs_for_goal(goal_clean, continuation=continuation),
+            criteria=_default_ask_criteria(goal_clean, continuation=continuation),
         )]

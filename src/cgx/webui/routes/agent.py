@@ -46,6 +46,8 @@ async def agent(req: AgentRequest) -> EventSourceResponse:
             endpoint_path=getattr(pcfg, "endpoint_path", "/v1/chat/completions"),
             allow_no_auth=bool(getattr(pcfg, "allow_no_auth", False)),
             cancel_event=cancel_event,
+            continuation=bool(req.continuation),
+            prior_goal=req.prior_goal,
         )
 
     def to_event(item):

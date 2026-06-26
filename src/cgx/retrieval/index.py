@@ -223,10 +223,28 @@ class TwoViewIndex:
 
         Q = self.encode_query(embedder, query, l2_normalize=(normalize_query if normalize_query is not None else (m in {"cosine", "ip"})), metric=m)
 
+        # Pre-flight dim check: FAISS raises an empty-message AssertionError
+        # when the query vector dimensionality does not match the index, which
+        # hides the real failure (usually: the query embedder is a different
+        # model than the one the index was built with). Verify up front so the
+        # error message names the actual problem.
+        index_dim = int(getattr(vs.index, "d", -1) or -1)
+        query_dim = int(Q.shape[1])
+        if index_dim > 0 and query_dim != index_dim:
+            raise RuntimeError(
+                f"search_view: query embedding dim ({query_dim}) does not "
+                f"match index dim ({index_dim}) for view='{view}'. The query "
+                f"embedder is likely a different model than the one used to "
+                f"build the index."
+            )
+
         try:
             D, I = vs.index.search(Q, int(top_k))
         except Exception as e:
-            raise RuntimeError(f"search_view: index.search failed for view='{view}': {e}") from e
+            raise RuntimeError(
+                f"search_view: index.search failed for view='{view}': "
+                f"{type(e).__name__}: {e!r}"
+            ) from e
 
         distances = D[0]
         indices   = I[0]

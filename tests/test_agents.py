@@ -394,6 +394,444 @@ def test_planner_derives_name_from_description_when_missing():
 
 
 # ---------------------------------------------------------------------------
+# Planner: exploratory goals get softened ASK criteria so the Judge does not
+# penalise speculative suggestions for forward-looking read-only questions
+# like "improve X" / "what are some ways to ...?".
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("goal", [
+    "improve the indexing methods used in this project to improve accuracy",
+    "suggest ways to speed up the retrieval pipeline",
+    "what are some other approaches to ranking we could try?",
+    "how could we enhance the embedding quality?",
+    "recommend optimizations for the planner",
+    "brainstorm ideas for improving the agent loop",
+    "explore alternative methods for chunk scoring",
+])
+def test_fallback_plan_softens_ask_criteria_for_exploratory_goal(goal):
+    plan = Planner(provider=None).plan(goal)
+    # Exploratory goals expand to [SEARCH, ASK] so the UI shows a
+    # visible investigation step before the clarification.
+    assert [t.kind for t in plan.tasks] == [TaskKind.SEARCH, TaskKind.ASK]
+    t = plan.tasks[-1]
+    joined = " ".join(t.criteria).lower()
+    assert "cites" not in joined and "citation" not in joined, (
+        f"exploratory goal must not seed the citation criterion: {t.criteria!r}"
+    )
+    assert any("suggest" in c.lower() or "concrete" in c.lower()
+               for c in t.criteria), (
+        f"exploratory goal should seed a suggestion-style criterion: {t.criteria!r}"
+    )
+
+
+@pytest.mark.parametrize("goal", [
+    "where is the auth module defined?",
+    "what does parse_codebase return?",
+    "explain how the rerank pipeline works",
+    "describe the HybridRetriever class",
+])
+def test_fallback_plan_keeps_citation_criterion_for_factual_goal(goal):
+    plan = Planner(provider=None).plan(goal)
+    assert len(plan.tasks) == 1
+    t = plan.tasks[0]
+    assert t.kind == TaskKind.ASK
+    joined = " ".join(t.criteria).lower()
+    assert "cite" in joined, (
+        f"factual goal should keep the citation criterion: {t.criteria!r}"
+    )
+
+
+def test_planner_downgrade_uses_softened_criteria_for_exploratory_goal():
+    # The LLM emitted a plan task with no criteria for an exploratory
+    # read-only goal. The READ-ONLY kind-policy downgrade should seed
+    # the suggestion-style criterion rather than the strict citation
+    # one so the Judge accepts speculative answers.
+    provider = _StubProvider([{
+        "content": json.dumps({"tasks": [
+            {"description": "Outline improvements to the indexing layer",
+             "kind": "plan"},
+        ]}),
+    }])
+    plan = Planner(provider=provider).plan(
+        "improve the indexing methods to improve accuracy")
+    assert [t.kind for t in plan.tasks] == [TaskKind.ASK]
+    joined = " ".join(plan.tasks[0].criteria).lower()
+    assert "cite" not in joined, (
+        "downgraded ASK for exploratory goal must drop citation criterion: "
+        f"{plan.tasks[0].criteria!r}"
+    )
+
+
+def test_goal_is_exploratory_excludes_change_and_verify_goals():
+    # Defensive: change verbs and verify-only phrasing must NOT be
+    # classified as exploratory, even when they incidentally mention
+    # words that overlap with the exploratory vocabulary.
+    from cgx.agents.planner import _goal_is_exploratory
+    assert not _goal_is_exploratory("add a CSV export function")
+    assert not _goal_is_exploratory("run the tests")
+    assert not _goal_is_exploratory("do the tests pass?")
+
+
+def test_fallback_plan_routes_exploratory_ask_through_clarify_paths_mode():
+    # Exploratory goals must seed ``mode_override="clarify_paths"`` on the
+    # ASK task's inputs so the answer engine swaps to the multi-option
+    # prompt instead of the default citation-grounded one. The fallback
+    # also fronts the ASK with a SEARCH so retrieval results are visible
+    # in the UI and reusable by the ASK via ``_prior_outputs``.
+    from cgx.agents.planner import CLARIFY_PATHS_MODE
+    plan = Planner(provider=None).plan(
+        "improve the indexing methods used in this project to improve accuracy")
+    assert [t.kind for t in plan.tasks] == [TaskKind.SEARCH, TaskKind.ASK]
+    ask_task = plan.tasks[-1]
+    assert ask_task.inputs.get("mode_override") == CLARIFY_PATHS_MODE
+    assert ask_task.inputs.get("goal"), \
+        "exploratory ASK should carry the user goal"
+    # The SEARCH task should be wired as a dependency of the ASK so the
+    # tracker forwards its hits via ``_prior_outputs``.
+    assert ask_task.dependencies == [plan.tasks[0].id]
+
+
+def test_fallback_plan_omits_mode_override_for_factual_goal():
+    # Factual read-only goals must keep the default engine intent
+    # detection: the clarify_paths override must NOT leak onto them.
+    plan = Planner(provider=None).plan("what does parse_codebase return?")
+    assert len(plan.tasks) == 1
+    t = plan.tasks[0]
+    assert t.kind == TaskKind.ASK
+    assert "mode_override" not in t.inputs
+
+
+def test_planner_downgrade_propagates_clarify_paths_mode():
+    # READ-ONLY kind-policy downgrade (plan→ask) must also stamp the
+    # exploratory ASK with the clarify_paths mode override.
+    from cgx.agents.planner import CLARIFY_PATHS_MODE
+    provider = _StubProvider([{
+        "content": json.dumps({"tasks": [
+            {"description": "Outline improvements to the indexing layer",
+             "kind": "plan"},
+        ]}),
+    }])
+    plan = Planner(provider=provider).plan(
+        "improve the indexing methods to improve accuracy")
+    assert [t.kind for t in plan.tasks] == [TaskKind.ASK]
+    assert plan.tasks[0].inputs.get("mode_override") == CLARIFY_PATHS_MODE
+
+
+def test_planner_rewrites_terminal_summarize_to_clarify_ask_for_exploratory_goal():
+    # LLM planners routinely terminate exploratory goals in a SUMMARIZE
+    # task (which describes existing code) instead of an ASK in
+    # clarify_paths mode (which enumerates directions + asks a follow-up).
+    # The planner must rewrite the terminal task so the contract for
+    # exploratory goals is enforced regardless of which path produced
+    # the plan.
+    from cgx.agents.planner import CLARIFY_PATHS_MODE
+    provider = _StubProvider([{
+        "content": json.dumps({"tasks": [
+            {"description": "Locate the indexing components", "kind": "search"},
+            {"description": "Locate the retrieval components", "kind": "search"},
+            {"description": "Summarize the relevant code", "kind": "summarize"},
+        ]}),
+    }])
+    plan = Planner(provider=provider).plan(
+        "improve the indexing strategy to increase retrieval accuracy")
+    kinds = [t.kind for t in plan.tasks]
+    assert kinds[:2] == [TaskKind.SEARCH, TaskKind.SEARCH]
+    assert kinds[-1] == TaskKind.ASK, (
+        f"exploratory plan must terminate in ASK, got {kinds}")
+    terminal = plan.tasks[-1]
+    assert terminal.inputs.get("mode_override") == CLARIFY_PATHS_MODE
+    assert terminal.criteria, "rewritten clarify ASK must carry criteria"
+
+
+def test_planner_stamps_clarify_paths_on_terminal_plain_ask_for_exploratory_goal():
+    # When the LLM emits a non-clarify ASK as the terminal task for an
+    # exploratory goal, the planner must stamp ``mode_override`` onto it
+    # in place so the engine swaps to the multi-option prompt. The
+    # original description is preserved -- only the inputs/criteria are
+    # upgraded.
+    from cgx.agents.planner import CLARIFY_PATHS_MODE
+    provider = _StubProvider([{
+        "content": json.dumps({"tasks": [
+            {"description": "Locate the indexing components", "kind": "search"},
+            {"description": "Explain the current indexing approach", "kind": "ask"},
+        ]}),
+    }])
+    plan = Planner(provider=provider).plan(
+        "improve the indexing strategy to increase retrieval accuracy")
+    assert [t.kind for t in plan.tasks] == [TaskKind.SEARCH, TaskKind.ASK]
+    terminal = plan.tasks[-1]
+    assert terminal.inputs.get("mode_override") == CLARIFY_PATHS_MODE
+    assert terminal.inputs.get("goal"), \
+        "stamping must also carry the goal text for the engine"
+    assert "Explain the current indexing approach" in terminal.description
+
+
+def test_planner_strips_mid_plan_summarize_and_collapses_tail_asks_for_exploratory_goal():
+    # Production case observed with gemma3:4b: the LLM emitted
+    # ``[search, search, summarize, plan, search]`` for an exploratory
+    # goal. ``_enforce_kind_policy`` downgrades ``plan`` → ``ask``,
+    # leaving ``[search, search, summarize, ask, search]``. Without
+    # mid-plan summarize stripping the chain halts on the LLM-judge
+    # fail of the SUMMARIZE before the terminal ASK ever runs, and
+    # with naive terminal-only rewriting the tail becomes
+    # ``[..., ask, ask]`` with a stale SUMMARIZE still in the middle.
+    # The exploratory contract must produce a single clarify ASK at
+    # the tail with no SUMMARIZE anywhere.
+    from cgx.agents.planner import CLARIFY_PATHS_MODE
+    provider = _StubProvider([{
+        "content": json.dumps({"tasks": [
+            {"description": "Search index.py for retrieval logic", "kind": "search"},
+            {"description": "Search orchestrator.py for retrieval flow", "kind": "search"},
+            {"description": "Summarize indexing strategies", "kind": "summarize"},
+            {"description": "Outline ways to improve indexing", "kind": "plan"},
+            {"description": "Search for embedding model choices", "kind": "search"},
+        ]}),
+    }])
+    plan = Planner(provider=provider).plan(
+        "I want to improve the indexing strategy to increase retrieval accuracy")
+    kinds = [t.kind for t in plan.tasks]
+    assert TaskKind.SUMMARIZE not in kinds, (
+        f"exploratory plan must drop SUMMARIZE, got {kinds}")
+    assert kinds[-1] == TaskKind.ASK
+    assert sum(1 for k in kinds if k == TaskKind.ASK) == 1, (
+        f"exploratory plan must end in exactly one ASK, got {kinds}")
+    terminal = plan.tasks[-1]
+    assert terminal.inputs.get("mode_override") == CLARIFY_PATHS_MODE
+
+
+def test_planner_does_not_rewrite_terminal_summarize_for_factual_goal():
+    # Factual read-only goals are NOT exploratory; a terminal SUMMARIZE
+    # is legitimate ("summarize what parse_codebase does") and must not
+    # be rewritten into a clarify ASK.
+    from cgx.agents.planner import CLARIFY_PATHS_MODE
+    provider = _StubProvider([{
+        "content": json.dumps({"tasks": [
+            {"description": "Locate parse_codebase", "kind": "search"},
+            {"description": "Summarize what parse_codebase does", "kind": "summarize"},
+        ]}),
+    }])
+    plan = Planner(provider=provider).plan("what does parse_codebase do?")
+    kinds = [t.kind for t in plan.tasks]
+    assert kinds == [TaskKind.SEARCH, TaskKind.SUMMARIZE]
+    for t in plan.tasks:
+        assert (t.inputs or {}).get("mode_override") != CLARIFY_PATHS_MODE
+
+
+def test_judge_clarify_paths_accepts_enumerated_answer():
+    # Clarify-mode ASK answers that enumerate options (>=2 items) AND/OR
+    # ask a follow-up question must pass the structural check without
+    # needing an LLM grader. Citation requirement does NOT apply here.
+    from cgx.agents.planner import CLARIFY_PATHS_MODE
+    task = Task(
+        description="improve the indexing methods",
+        kind=TaskKind.ASK,
+        criteria=["Answer enumerates multiple concrete directions or asks "
+                  "a clarifying question to narrow the open-ended goal."],
+        inputs={"mode_override": CLARIFY_PATHS_MODE,
+                "goal": "improve the indexing methods"},
+    )
+    task.output = {"answer_md": (
+        "You'd like to improve indexing accuracy.\n\n"
+        "1. Swap FAISS flat for HNSW with higher M.\n"
+        "2. Add a rerank pass over the top 50 candidates.\n"
+        "3. Try a stronger embedding model.\n\n"
+        "Which constraint matters most: accuracy, latency, or memory?"
+    )}
+    v = Judge(provider=None).judge(task)
+    assert v.passed
+    assert "enumerates" in v.rationale.lower()
+
+
+def test_judge_clarify_paths_rejects_flat_answer_without_options():
+    # A clarify-mode ASK that returns a single prose paragraph with no
+    # enumeration AND no follow-up question fails the structural check.
+    # ``suggested_changes`` must also be absent/empty for this to fail --
+    # see ``test_judge_clarify_paths_accepts_suggested_changes_as_options``
+    # for the case where the LLM splits options into that key.
+    from cgx.agents.planner import CLARIFY_PATHS_MODE
+    task = Task(
+        description="improve the indexing methods",
+        kind=TaskKind.ASK,
+        criteria=["Answer enumerates multiple concrete directions or asks "
+                  "a clarifying question to narrow the open-ended goal."],
+        inputs={"mode_override": CLARIFY_PATHS_MODE,
+                "goal": "improve the indexing methods"},
+    )
+    task.output = {"answer_md": (
+        "Indexing accuracy depends on the embedding model and the FAISS "
+        "configuration used in this project."
+    )}
+    v = Judge(provider=None).judge(task)
+    assert not v.passed
+    assert "clarification" in v.rationale.lower()
+
+
+def test_judge_clarify_paths_accepts_suggested_changes_as_options():
+    # Small models (e.g. gemma3:4b) routinely split the clarify_paths
+    # shape across keys -- prose in ``answer_md`` and the enumerated
+    # directions in ``suggested_changes``. The structural check must
+    # honour either location so the deliberately-produced clarification
+    # isn't rejected for being in the "wrong" key.
+    from cgx.agents.planner import CLARIFY_PATHS_MODE
+    task = Task(
+        description="improve the indexing methods",
+        kind=TaskKind.ASK,
+        criteria=["Answer enumerates multiple concrete directions or asks "
+                  "a clarifying question to narrow the open-ended goal."],
+        inputs={"mode_override": CLARIFY_PATHS_MODE,
+                "goal": "improve the indexing methods"},
+    )
+    task.output = {
+        "answer_md": (
+            "Indexing accuracy depends on the embedding model and the "
+            "FAISS configuration used in this project."
+        ),
+        "suggested_changes": [
+            "Investigate the reranker.py component.",
+            "Analyze the FAISS index building parameters.",
+            "Examine the hybrid retrieval pipeline.",
+            "Evaluate the TwoViewIndex.search_view method.",
+        ],
+    }
+    v = Judge(provider=None).judge(task)
+    assert v.passed
+    assert "4" in v.rationale or "option" in v.rationale.lower()
+
+
+def test_engine_answer_accepts_mode_override_and_extra_kwargs():
+    # The engine's answer entrypoints must accept ``mode_override`` and
+    # tolerate agent-only inputs (e.g. ``goal``) without raising. We hit
+    # the signature directly with a stubbed retrieval shortcut rather
+    # than building a full index.
+    import inspect
+    from cgx.answer.engine import answer_with_llm, answer_with_llm_stream
+    sig = inspect.signature(answer_with_llm)
+    assert "mode_override" in sig.parameters
+    stream_sig = inspect.signature(answer_with_llm_stream)
+    assert "mode_override" in stream_sig.parameters
+
+
+def test_extract_prior_search_hits_returns_most_recent_search():
+    # The helper used by the ASK capability wrapper must walk
+    # prior_outputs in reverse so the SEARCH closest to the ASK wins
+    # when the planner chained multiple search steps.
+    from cgx.agents.loop import _extract_prior_search_hits
+    older = {"hits": [{"chunk_id": "a", "score": 0.5}]}
+    newer = {"hits": [{"chunk_id": "b", "score": 0.9}]}
+    irrelevant = {"answer_md": "...", "citations": []}
+    hits = _extract_prior_search_hits([older, irrelevant, newer])
+    assert [h["chunk_id"] for h in hits] == ["b"]
+
+
+def test_extract_prior_search_hits_returns_empty_when_no_search():
+    # ASK-only or scaffold-only prior outputs must not be mistaken for
+    # a SEARCH result. Returning [] lets the engine fall through to its
+    # own retrieval path unchanged.
+    from cgx.agents.loop import _extract_prior_search_hits
+    assert _extract_prior_search_hits([{"answer_md": "..."}]) == []
+    assert _extract_prior_search_hits([]) == []
+    assert _extract_prior_search_hits([{"hits": []}]) == []
+
+
+def test_search_capability_strips_agent_only_inputs(tmp_path, monkeypatch):
+    # The Planner stamps ``inputs={"goal": ...}`` on exploratory SEARCH
+    # tasks, but ``run_query_auto`` doesn't accept ``goal``. The search
+    # wrapper must drop those agent-only keys before forwarding so the
+    # SEARCH task doesn't fail with TypeError mid-plan.
+    from cgx.agents.loop import _build_default_capabilities
+    captured: Dict[str, Any] = {}
+
+    def fake_run_query_auto(index_dir, records_path, query, **kw):
+        captured["query"] = query
+        captured["kw"] = kw
+        return {"hits": [{"chunk_id": "x", "score": 1.0}]}
+
+    monkeypatch.setattr(
+        "cgx.pipeline.auto.run_query_auto", fake_run_query_auto)
+    # Pretend the index exists so ``_need_index`` doesn't trip.
+    idx = tmp_path / "indices"
+    idx.mkdir()
+    rec = tmp_path / "records.jsonl"
+    rec.write_text("")
+
+    caps = _build_default_capabilities(
+        index_dir=str(idx), records_path=str(rec), provider=None,
+        project_root=None,
+    )
+    out = caps["search"](
+        "improve indexing",
+        goal="improve indexing",
+        mode_override="clarify_paths",
+        _prior_outputs=[],
+    )
+    assert out["hits"], "search wrapper should forward retrieval output"
+    assert "goal" not in captured["kw"]
+    assert "mode_override" not in captured["kw"]
+    assert "_prior_outputs" not in captured["kw"]
+
+
+def test_search_capability_forwards_embed_model(tmp_path, monkeypatch):
+    # The SEARCH capability must honour the embedder the index was
+    # built with. Without forwarding ``embed_model`` the retriever
+    # silently falls back to its default (Jina, 768-dim) and the
+    # FAISS pre-flight check trips on indices built with BGE-M3.
+    from cgx.agents.loop import _build_default_capabilities
+    captured: Dict[str, Any] = {}
+
+    def fake_run_query_auto(index_dir, records_path, query, **kw):
+        captured["kw"] = kw
+        return {"hits": []}
+
+    monkeypatch.setattr(
+        "cgx.pipeline.auto.run_query_auto", fake_run_query_auto)
+    idx = tmp_path / "indices"
+    idx.mkdir()
+    rec = tmp_path / "records.jsonl"
+    rec.write_text("")
+
+    caps = _build_default_capabilities(
+        index_dir=str(idx), records_path=str(rec), provider=None,
+        project_root=None, embed_model="BAAI/bge-m3",
+    )
+    caps["search"]("improve indexing")
+    assert captured["kw"].get("model_name") == "BAAI/bge-m3"
+
+
+def test_tracker_forwards_prior_search_hits_to_ask_capability():
+    # End-to-end: a [SEARCH, ASK] plan must reach the ASK capability
+    # with the SEARCH's hits attached via ``_prior_outputs``. Use a
+    # stub capability set so we don't need the real engine wired up.
+    from cgx.agents.types import Plan
+    captured: Dict[str, Any] = {}
+
+    def fake_search(query, **kw):
+        return {"hits": [{"chunk_id": "src/x.py::foo", "score": 0.9}]}
+
+    def fake_ask(question, **kw):
+        captured["question"] = question
+        captured["prior_outputs"] = kw.get("_prior_outputs")
+        captured["inputs"] = {k: v for k, v in kw.items()
+                              if not k.startswith("_")}
+        return {"answer_md": "ok", "citations": []}
+
+    plan = Plan(goal="improve indexing", tasks=[
+        Task(description="improve indexing", kind=TaskKind.SEARCH,
+             criteria=["hits"]),
+        Task(description="improve indexing", kind=TaskKind.ASK,
+             inputs={"mode_override": "clarify_paths"},
+             criteria=["enumerates options"]),
+    ])
+    tracker = Tracker(
+        capabilities={"search": fake_search, "ask": fake_ask},
+        progress_interval=0,
+    )
+    list(tracker.stream(plan))
+    prior = captured.get("prior_outputs") or []
+    assert any(("hits" in (o or {})) for o in prior), (
+        f"ASK capability did not receive prior SEARCH outputs: {prior!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Tracker progress events
 # ---------------------------------------------------------------------------
 def test_tracker_emits_task_progress_for_slow_capability():
@@ -1438,3 +1876,130 @@ def test_run_agent_routes_apply_failure_through_scaffold_retry_when_no_index(tmp
     assert apply_count["n"] >= 2, (
         "apply must run at least twice (original + scaffold-retry plan's apply)"
     )
+
+
+
+# ---------------------------------------------------------------------------
+# Planner retriever: embed_model propagation (regression for the empty-error
+# "search_view: index.search failed for view='intent':" warning, which fired
+# whenever ``run_agent`` was called for an index built with a different
+# embedding model than ``run_query_auto``'s default).
+# ---------------------------------------------------------------------------
+def test_build_default_retriever_forwards_embed_model(monkeypatch, tmp_path):
+    from cgx.agents.loop import _build_default_retriever
+    records = tmp_path / "records.jsonl"
+    records.write_text("")
+    index_dir = tmp_path / "indices"
+    index_dir.mkdir()
+
+    captured: Dict[str, Any] = {}
+
+    def fake_run_query_auto(**kwargs: Any) -> Dict[str, Any]:
+        captured.update(kwargs)
+        return {"hits": [], "top_files": []}
+
+    monkeypatch.setattr(
+        "cgx.pipeline.auto.run_query_auto", fake_run_query_auto,
+    )
+    retr = _build_default_retriever(
+        str(index_dir), str(records), embed_model="BAAI/bge-m3",
+    )
+    assert retr is not None
+    retr("anything")
+    assert captured.get("model_name") == "BAAI/bge-m3"
+
+
+def test_build_default_retriever_omits_model_when_unset(monkeypatch, tmp_path):
+    # No embed_model -> do NOT inject model_name; run_query_auto's own
+    # default applies. This preserves backward compatibility for callers
+    # that don't know which model the index was built with.
+    from cgx.agents.loop import _build_default_retriever
+    records = tmp_path / "records.jsonl"
+    records.write_text("")
+    index_dir = tmp_path / "indices"
+    index_dir.mkdir()
+
+    captured: Dict[str, Any] = {}
+
+    def fake_run_query_auto(**kwargs: Any) -> Dict[str, Any]:
+        captured.update(kwargs)
+        return {"hits": [], "top_files": []}
+
+    monkeypatch.setattr(
+        "cgx.pipeline.auto.run_query_auto", fake_run_query_auto,
+    )
+    retr = _build_default_retriever(str(index_dir), str(records))
+    assert retr is not None
+    retr("anything")
+    assert "model_name" not in captured
+
+
+def test_run_agent_forwards_embed_model_to_planner_retriever(
+    monkeypatch, tmp_path,
+):
+    records = tmp_path / "records.jsonl"
+    records.write_text("")
+    index_dir = tmp_path / "indices"
+    index_dir.mkdir()
+
+    captured: Dict[str, Any] = {}
+
+    def fake_run_query_auto(**kwargs: Any) -> Dict[str, Any]:
+        captured.update(kwargs)
+        return {"hits": [], "top_files": []}
+
+    monkeypatch.setattr(
+        "cgx.pipeline.auto.run_query_auto", fake_run_query_auto,
+    )
+
+    # Force the planner down its retrieval path: a provider that returns
+    # zero tasks triggers _retrieve_candidates inside the deterministic
+    # fallback. We don't care about the plan shape here, only that the
+    # retriever was called with the propagated embed_model.
+    plan = run_agent(
+        "Improve indexing accuracy",
+        provider=None,
+        index_dir=str(index_dir),
+        records_path=str(records),
+        embed_model="BAAI/bge-m3",
+        capabilities={"ask": lambda q, **_: {"answer_md": "ok"}},
+    )
+    assert isinstance(plan, Plan)
+    assert captured.get("model_name") == "BAAI/bge-m3", (
+        "run_agent must forward embed_model to the planner's retriever"
+    )
+
+
+def test_search_view_dim_mismatch_raises_clear_error():
+    # Regression: previously a query embedder with a different output dim
+    # than the FAISS index triggered an empty-message AssertionError inside
+    # ``vs.index.search``, wrapped in ``RuntimeError(... : '')``. The
+    # pre-flight check must raise a human-readable RuntimeError naming both
+    # dims so log readers can identify the model mismatch.
+    import numpy as np
+
+    from cgx.retrieval.index import TwoViewIndex, ViewSlice
+
+    class _FakeIndex:
+        d = 1024  # index built with a 1024-dim model (e.g. BGE-M3)
+
+        def search(self, Q, k):  # pragma: no cover - must not be reached
+            raise AssertionError()  # empty-message: the historical failure
+
+    class _FakeEmbedder:
+        def encode(self, texts):
+            # 768-dim, simulating a different model (e.g. Jina v2 base code)
+            return np.zeros((len(list(texts)), 768), dtype=np.float32)
+
+    tvi = TwoViewIndex()
+    tvi._intent = ViewSlice(
+        rows=[], ids=np.zeros((0,), dtype=np.int64),
+        index=_FakeIndex(), meta={"metric": "cosine"}, dim=1024,
+    )
+
+    with pytest.raises(RuntimeError) as ei:
+        tvi.search_view("intent", "any query", embedder=_FakeEmbedder(), top_k=5)
+    msg = str(ei.value)
+    assert "768" in msg and "1024" in msg
+    assert "intent" in msg
+

@@ -570,6 +570,23 @@ SYSTEM_PROMPTS: Dict[str, str] = {
         "keys: answer_md, citations, suggested_changes, confidence. No prose "
         "outside JSON. "
     ) + ALLOWED_CITATION_NOTE,
+    "clarify_paths": (
+        "You are a senior codebase assistant responding to an OPEN-ENDED goal "
+        "(e.g. 'improve X', 'suggest ways to Y'). The user has not yet picked "
+        "a direction, so your job is NOT to commit to a single answer -- it "
+        "is to help them choose. Use the SOURCES to ground your suggestions "
+        "in this specific codebase, but do not pretend to know which path "
+        "they want. Structure answer_md as: (1) a one-sentence restatement "
+        "of the goal as you understand it; (2) a numbered list of 3-5 "
+        "concrete directions the user could pursue, each with a short "
+        "rationale and -- when supported by SOURCES -- a [[chunk_id]] "
+        "citation pointing to the component it would touch; (3) a single "
+        "follow-up question asking which direction to pursue or what "
+        "constraint matters most (accuracy/latency/code-size/etc.). "
+        "Do NOT propose code edits and do NOT invent components absent "
+        "from SOURCES. Return JSON keys: answer_md, citations, "
+        "suggested_changes, confidence. No prose outside JSON. "
+    ) + ALLOWED_CITATION_NOTE,
 }
 
 
@@ -636,6 +653,18 @@ SYSTEM_PROMPTS_STREAM: Dict[str, str] = {
         "every non-trivial claim inline with [[chunk_id]]. If SOURCES do not cover the "
         "question, say so plainly and name what would be needed. Do NOT wrap in JSON."
     ),
+    "clarify_paths": (
+        "You are a senior codebase assistant responding to an OPEN-ENDED goal (e.g. "
+        "'improve X', 'suggest ways to Y'). Your job is NOT to commit to a single answer "
+        "-- it is to help the user choose a direction. Use the SOURCES to ground "
+        "suggestions in this codebase. Reply in plain Markdown structured as: (1) a "
+        "one-sentence restatement of the goal as you understand it; (2) a numbered list "
+        "of 3-5 concrete directions, each with a short rationale and -- when supported "
+        "by SOURCES -- an inline [[chunk_id]] citation pointing to the component it "
+        "would touch; (3) one follow-up question asking which direction to pursue or "
+        "what constraint matters most. Do NOT propose code edits and do NOT invent "
+        "components absent from SOURCES. Do NOT wrap in JSON."
+    ),
 }
 
 
@@ -652,6 +681,7 @@ def _prepare_answer_request(
     *,
     top_k: int = 20,
     hits: Optional[List[Dict[str, Any]]] = None,
+    mode_override: Optional[str] = None,
 ) -> Tuple[str, Dict[str, Any]]:
     """Shared retrieval + prompt-context prep for sync and streaming answer paths.
 
@@ -663,6 +693,11 @@ def _prepare_answer_request(
     message body), ``sources``, ``mode``, ``target``, ``target_matched``,
     ``merged_hits``, ``root``, ``readme``.
 
+    ``mode_override`` lets the caller force a specific prompt mode
+    (e.g. ``"clarify_paths"`` for exploratory agent goals) instead of
+    running :func:`detect_intent` on the question. Unknown modes fall
+    back to the default SYSTEM prompt via :func:`_get_system_prompt`.
+
     Splitting this out keeps the JSON-postprocessing logic in the
     blocking path and the token-streaming logic in the streaming path
     from drifting apart.
@@ -670,7 +705,7 @@ def _prepare_answer_request(
     indices = load_indices(index_dir)
     cmap = _chunk_map(indices)
 
-    mode = detect_intent(question)
+    mode = mode_override if mode_override else detect_intent(question)
 
     # --- Improved Target symbol detection ---
     symbols = _symbol_tokens(question)
@@ -866,6 +901,320 @@ def _prepare_answer_request(
     }
 
 
+# ---------------- clarify_paths: structured generation ----------------
+#
+# Small JSON-mode models (e.g. gemma3:4b via Ollama ``format: "json"``)
+# routinely collapse the multi-section ``clarify_paths`` ``answer_md``
+# contract into a single hallucinated paragraph that ignores SOURCES
+# entirely. The cause is structural, not a prompting tweak: a freeform
+# ``answer_md`` string is the easiest slot to fill, so the model fills
+# only that and skips the requested enumeration. The functions below
+# replace single-shot freeform generation with a typed-slot contract:
+# pre-clustered CANDIDATES from the indexed sources, an ``options`` array
+# with required ``chunk_id`` values drawn from those candidates,
+# validation + one retry on insufficient enumeration, and deterministic
+# Markdown rendering from the validated structure. The model selects
+# from a closed set; it does not invent the list.
+
+
+def _clarify_candidates_from_sources(
+    sources: List[Dict[str, Any]], *, max_candidates: int = 8,
+) -> List[Dict[str, Any]]:
+    """Group ``sources`` by file path into compact candidate components.
+
+    Retrieval already ordered ``sources`` by relevance, so the first
+    occurrence of each path wins. Each candidate exposes the single
+    ``chunk_id`` the LLM should cite plus a short list of distinct
+    symbol names seen in that file -- enough context for the model to
+    write a 1-2 sentence rationale without needing the full code body.
+    """
+    by_path: Dict[str, Dict[str, Any]] = {}
+    for s in sources or []:
+        path = str(s.get("path") or "")
+        if not path:
+            continue
+        if path not in by_path:
+            by_path[path] = {
+                "path": path,
+                "chunk_id": str(s.get("chunk_id") or ""),
+                "symbols": [],
+            }
+        sym = str(s.get("symbol") or "").strip()
+        if sym and sym not in by_path[path]["symbols"]:
+            by_path[path]["symbols"].append(sym)
+    return [c for c in by_path.values() if c["chunk_id"]][:max_candidates]
+
+
+def _render_clarify_markdown(
+    restatement: str,
+    options: List[Dict[str, Any]],
+    follow_up_question: str,
+) -> str:
+    """Assemble the user-facing ``answer_md`` from structured slots.
+
+    Rendering happens deterministically here -- not inside the LLM --
+    so the three-section contract (restatement / numbered options /
+    follow-up question) is guaranteed regardless of how flaky the
+    model's structured output was.
+    """
+    parts: List[str] = []
+    if restatement:
+        parts.append(restatement.strip())
+        parts.append("")
+    parts.append("**Possible directions:**")
+    for i, opt in enumerate(options, 1):
+        title = (opt.get("title") or "").strip() or "Investigate this component"
+        rationale = (opt.get("rationale") or "").strip()
+        line = f"{i}. **{title}**"
+        if rationale:
+            line += f" — {rationale}"
+        cid = (opt.get("chunk_id") or "").strip()
+        if cid:
+            line += f" [[{cid}]]"
+        parts.append(line)
+    if follow_up_question:
+        parts.append("")
+        parts.append(f"_{follow_up_question.strip()}_")
+    return "\n".join(parts).strip()
+
+
+def _validate_clarify_options(
+    raw: Any, candidates: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Coerce the LLM's ``options`` payload into a clean, deduped list.
+
+    Drops entries whose ``chunk_id`` is missing or absent from
+    ``candidates``, dedupes by chunk_id (so the model can't pad the list
+    with the same component twice), and caps at 5. Empty rationales and
+    titles are kept so the renderer can fall back to placeholders.
+    """
+    allowed = {c["chunk_id"] for c in candidates}
+    out: List[Dict[str, Any]] = []
+    seen: set = set()
+    if not isinstance(raw, list):
+        return out
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        cid = str(entry.get("chunk_id") or "").strip()
+        if not cid or cid not in allowed or cid in seen:
+            continue
+        seen.add(cid)
+        out.append({
+            "title": str(entry.get("title") or "").strip(),
+            "rationale": str(entry.get("rationale") or "").strip(),
+            "chunk_id": cid,
+        })
+        if len(out) >= 5:
+            break
+    return out
+
+
+def _clarify_system_prompt() -> str:
+    return (
+        "You are a senior engineer triaging an OPEN-ENDED user goal "
+        "against a specific codebase. Return STRICT JSON with these keys "
+        "and NO prose outside JSON:\n"
+        "  - restatement: one sentence paraphrasing the goal\n"
+        "  - options: array of 3 to 5 objects, each with:\n"
+        "      - title: short imperative phrase (4-10 words)\n"
+        "      - rationale: 1-2 sentences explaining the direction, "
+        "grounded in the chosen CANDIDATE\n"
+        "      - chunk_id: the chunk_id of the CANDIDATE this option "
+        "touches (verbatim, copied from CANDIDATES)\n"
+        "  - follow_up_question: one clarifying question to narrow "
+        "the choice (e.g. accuracy vs latency vs code-size)\n"
+        "Rules:\n"
+        "- options MUST have between 3 and 5 entries; pad with the most "
+        "promising candidates when unsure.\n"
+        "- Each chunk_id MUST appear verbatim in CANDIDATES below.\n"
+        "- Different options SHOULD touch different components when "
+        "candidates allow it.\n"
+        "- Do NOT invent components absent from CANDIDATES and do NOT "
+        "propose code edits."
+    )
+
+
+def _clarify_user_message(
+    goal: str,
+    candidates: List[Dict[str, Any]],
+    sources: List[Dict[str, Any]],
+    retry_hint: Optional[str] = None,
+) -> str:
+    cand_lines: List[str] = []
+    for c in candidates:
+        syms = ", ".join(c.get("symbols") or [])
+        line = f"- chunk_id={c['chunk_id']}\n    path={c['path']}"
+        if syms:
+            line += f"\n    symbols=[{syms}]"
+        cand_lines.append(line)
+    cand_block = "\n".join(cand_lines) if cand_lines else "(no candidates)"
+    src_block = "\n".join(_fmt_source(s) for s in (sources or [])[:8])
+    parts = [
+        f"GOAL:\n{goal.strip()}",
+        f"CANDIDATES:\n{cand_block}",
+        f"SOURCES (excerpts):\n{src_block}" if src_block else "",
+    ]
+    if retry_hint:
+        parts.append(f"RETRY GUIDANCE:\n{retry_hint.strip()}")
+    return "\n\n".join(p for p in parts if p)
+
+
+def _call_clarify_llm(
+    provider: LLMProvider,
+    goal: str,
+    candidates: List[Dict[str, Any]],
+    sources: List[Dict[str, Any]],
+    retry_hint: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Single LLM round-trip for the structured clarify_paths schema.
+
+    Mirrors the reformat-retry pattern used elsewhere in this module so
+    a single transient JSON-shape miss doesn't abort the whole flow.
+    Returns the parsed object (may be empty on hard failure).
+    """
+    messages = [
+        {"role": "system", "content": _clarify_system_prompt()},
+        {"role": "user", "content": _clarify_user_message(
+            goal, candidates, sources, retry_hint)},
+    ]
+    resp = provider.chat(messages, temperature=0.2)
+    content = (resp.get("content") or "").strip()
+    parsed = _extract_json_object(content)
+    if not parsed or not isinstance(parsed, dict):
+        messages.append({"role": "assistant", "content": content})
+        messages.append({"role": "user", "content": (
+            "Reformat your previous reply as STRICT JSON exactly matching "
+            "the schema (restatement / options[] / follow_up_question). "
+            "No prose outside JSON.")})
+        resp2 = provider.chat(messages, temperature=0)
+        parsed = _extract_json_object((resp2.get("content") or "")) or {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _answer_clarify_paths(
+    prep: Dict[str, Any],
+    question: str,
+    provider: LLMProvider,
+    root: Optional[str],
+) -> Dict[str, Any]:
+    """Structured generation path for the ``clarify_paths`` mode.
+
+    Replaces the generic single-shot ``answer_md`` flow when the agent
+    forces ``mode_override="clarify_paths"``. The contract is:
+
+    * Cluster ``prep["sources"]`` into candidate components keyed by
+      file path; the model picks from this closed set instead of
+      inventing items.
+    * Call the LLM with a typed-slot schema (``restatement``,
+      ``options[]`` with ``chunk_id`` ∈ CANDIDATES, ``follow_up_question``).
+    * Validate the returned options; retry once with explicit feedback
+      when fewer than three survive validation.
+    * Synthesize the remaining slots deterministically from the top
+      candidates so the user never sees an empty list when retrieval
+      itself succeeded.
+    * Render the final ``answer_md`` here -- not in the LLM -- so the
+      three-section shape is guaranteed.
+    """
+    sources: List[Dict[str, Any]] = prep.get("sources") or []
+    merged_hits: List[Dict[str, Any]] = prep.get("merged_hits") or []
+    candidates = _clarify_candidates_from_sources(sources)
+
+    if not candidates:
+        # Retrieval surfaced nothing usable; degrade gracefully rather
+        # than asking the model to invent components.
+        return {
+            "answer_md": (
+                "I don't have enough indexed context to suggest concrete "
+                "directions for that goal yet. Re-index the repository or "
+                "narrow the goal to a specific module/file."),
+            "citations": [],
+            "suggested_changes": [],
+            "confidence": 0.2,
+            "debug": {
+                "mode": "clarify_paths", "sources": sources,
+                "hits": merged_hits, "candidates": [],
+                "options_count": 0,
+            },
+        }
+
+    parsed = _call_clarify_llm(provider, question, candidates, sources)
+    options = _validate_clarify_options(parsed.get("options"), candidates)
+
+    if len(options) < 3:
+        retry_hint = (
+            f"Your previous reply produced {len(options)} valid option(s). "
+            f"Return between 3 and 5 options; each option's chunk_id MUST "
+            f"appear verbatim in CANDIDATES, and different options should "
+            f"touch different components when possible.")
+        parsed_retry = _call_clarify_llm(
+            provider, question, candidates, sources, retry_hint=retry_hint)
+        retry_opts = _validate_clarify_options(
+            parsed_retry.get("options"), candidates)
+        if len(retry_opts) > len(options):
+            options = retry_opts
+            parsed = parsed_retry
+
+    # Deterministic backfill from candidates so the user always sees at
+    # least three concrete pointers when retrieval worked, even if the
+    # model failed twice in a row to fill the slots.
+    if len(options) < 3:
+        seen = {o.get("chunk_id") for o in options}
+        for c in candidates:
+            if len(options) >= 3:
+                break
+            cid = c["chunk_id"]
+            if cid in seen:
+                continue
+            label = (c.get("symbols") or [None])[0]
+            if not label:
+                label = Path(c["path"]).stem or "this component"
+            options.append({
+                "title": f"Review {label}",
+                "rationale": (
+                    f"Investigate `{c['path']}` for changes relevant to "
+                    f"the goal."),
+                "chunk_id": cid,
+            })
+
+    restatement = str(parsed.get("restatement") or "").strip()
+    if not restatement:
+        restatement = f"Goal restated: {question.strip()}"
+    follow_up = str(parsed.get("follow_up_question") or "").strip()
+    if not follow_up:
+        follow_up = (
+            "Which of these directions should we pursue first, or is there "
+            "a constraint (accuracy / latency / code-size / risk) that "
+            "should drive the choice?")
+
+    answer_md = _render_clarify_markdown(restatement, options, follow_up)
+    answer_md = _shorten_chunk_refs(answer_md, root)
+
+    allowed_ids = [s.get("chunk_id") for s in sources]
+    citations = _sanitize_citations(
+        [{"chunk_id": o["chunk_id"]} for o in options if o.get("chunk_id")],
+        allowed_ids,
+    )
+
+    return {
+        "answer_md": answer_md,
+        "citations": citations,
+        "suggested_changes": [],
+        "confidence": 0.7 if len(options) >= 3 else 0.4,
+        "debug": {
+            "mode": "clarify_paths",
+            "sources": sources,
+            "hits": merged_hits,
+            "candidates": candidates,
+            "options": options,
+            "restatement": restatement,
+            "follow_up_question": follow_up,
+            "options_count": len(options),
+            "follow_up_present": True,
+        },
+    }
+
+
 def answer_with_llm(
     index_dir: str,
     records_path: str,
@@ -873,14 +1222,21 @@ def answer_with_llm(
     provider: LLMProvider,
     *,
     top_k: int = 20,
-    hits: Optional[List[Dict[str, Any]]] = None
+    hits: Optional[List[Dict[str, Any]]] = None,
+    mode_override: Optional[str] = None,
+    **_ignored: Any,
 ) -> Dict[str, Any]:
     """
     Retrieve context from indices/graph and ask the LLM to synthesize a grounded answer.
+
+    ``mode_override`` lets the agent loop force a specific prompt mode
+    (e.g. ``"clarify_paths"``) regardless of the question's surface form.
+    Extra kwargs are accepted and ignored so task-level ``inputs`` dicts
+    can carry agent-only hints (``goal``, …) without breaking the call.
     """
     kind, payload = _prepare_answer_request(
         index_dir, records_path, question, provider,
-        top_k=top_k, hits=hits,
+        top_k=top_k, hits=hits, mode_override=mode_override,
     )
     if kind == "done":
         return payload
@@ -892,6 +1248,16 @@ def answer_with_llm(
     merged_hits = prep["merged_hits"]
     root = prep["root"]
     readme = prep["readme"]
+
+    # ``clarify_paths`` uses a structured-slot contract (typed options[]
+    # validated against candidate components) instead of asking the
+    # model to freeform a multi-section ``answer_md``. Small models in
+    # JSON mode collapse the freeform variant into one paragraph that
+    # ignores SOURCES; the structured path renders the final Markdown
+    # deterministically from validated slots so the three-section shape
+    # is guaranteed.
+    if mode == "clarify_paths":
+        return _answer_clarify_paths(prep, question, provider, root)
 
     messages = [
         {"role": "system", "content": _get_system_prompt(mode)},
@@ -970,6 +1336,8 @@ def answer_with_llm_stream(
     hits: Optional[List[Dict[str, Any]]] = None,
     temperature: float = 0.2,
     max_tokens: Optional[int] = None,
+    mode_override: Optional[str] = None,
+    **_ignored: Any,
 ) -> Iterator[Tuple[str, Dict[str, Any]]]:
     """Stream the grounded answer as ``(event, data)`` tuples.
 
@@ -985,7 +1353,7 @@ def answer_with_llm_stream(
     """
     kind, payload = _prepare_answer_request(
         index_dir, records_path, question, provider,
-        top_k=top_k, hits=hits,
+        top_k=top_k, hits=hits, mode_override=mode_override,
     )
     if kind == "done":
         yield "answer", payload

@@ -80,6 +80,15 @@ class AgentRequest(BaseModel):
     stop_on_fail: bool = True
     index: IndexLocation = Field(default_factory=IndexLocation)
     provider: ProviderConfig = Field(default_factory=ProviderConfig)
+    # ``continuation`` signals the user is following up on a previous
+    # exploratory ASK (a ``clarify_paths`` reply) so the Planner should
+    # treat ``goal`` as a narrowed request rather than re-triggering the
+    # exploratory-clarification rewrite. ``prior_goal`` is the original
+    # open-ended request that produced the clarification; the Planner
+    # weaves it into the LLM prompt when ``continuation`` is True so the
+    # narrowed follow-up stays anchored in the broader objective.
+    continuation: bool = False
+    prior_goal: Optional[str] = None
 
 
 class ProfileUpsertRequest(BaseModel):

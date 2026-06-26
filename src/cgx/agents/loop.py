@@ -46,12 +46,18 @@ def _build_default_capabilities(
     index_dir: Optional[str],
     records_path: Optional[str],
     project_root: Optional[str],
+    embed_model: Optional[str] = None,
 ) -> Dict[str, Callable[..., Dict[str, Any]]]:
     """Return capability callables backed by the real engine.
 
     Each capability tolerates ``index_dir`` / ``records_path`` being
     ``None`` by raising ``ValueError`` -- the Tracker will record the
     failure and (by default) stop the plan.
+
+    ``embed_model`` is forwarded to the SEARCH capability so its
+    ``run_query_auto`` call uses the same embedder the index was built
+    with; without it the retriever silently falls back to its default
+    and tripping the pre-flight dim check.
     """
     def _need_index() -> None:
         if not index_dir or not records_path:
@@ -60,6 +66,13 @@ def _build_default_capabilities(
     def ask(question: str, **kw: Any) -> Dict[str, Any]:
         _need_index()
         from cgx.answer.engine import answer_with_llm
+        # Reuse a preceding SEARCH's hits when the planner chained
+        # [SEARCH, ASK] so we don't trigger a redundant retrieval.
+        prior = kw.pop("_prior_outputs", None) or []
+        if prior and "hits" not in kw:
+            prior_hits = _extract_prior_search_hits(prior)
+            if prior_hits:
+                kw["hits"] = prior_hits
         return answer_with_llm(index_dir, records_path, question, provider, **kw)
 
     def plan(task_text: str, **kw: Any) -> Dict[str, Any]:
@@ -106,6 +119,17 @@ def _build_default_capabilities(
     def search(query: str, **kw: Any) -> Dict[str, Any]:
         _need_index()
         from cgx.pipeline.auto import run_query_auto
+        # Drop agent-only inputs the planner may stamp on SEARCH tasks
+        # (e.g. ``goal``, ``mode_override``) before forwarding to the
+        # retrieval pipeline, which only accepts its own kwargs.
+        kw.pop("_prior_outputs", None)
+        kw.pop("goal", None)
+        kw.pop("mode_override", None)
+        # Honour the index's embedder. Without this, run_query_auto's
+        # default (Jina, 768-dim) silently mismatches indices built
+        # with BGE-M3 (1024-dim) and the pre-flight dim check trips.
+        if embed_model and "model_name" not in kw:
+            kw["model_name"] = embed_model
         return run_query_auto(index_dir, records_path, query, **kw)
 
     def summarize(prior: List[Dict[str, Any]], **kw: Any) -> Dict[str, Any]:
@@ -380,6 +404,25 @@ def _build_default_capabilities(
             "fill_logic": fill_logic}
 
 
+def _extract_prior_search_hits(
+    prior: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Return the most recent SEARCH task's hits, or an empty list.
+
+    Walks ``prior`` in reverse so the closest SEARCH ahead of the ASK
+    wins when the planner chained multiple search steps. Hit dicts are
+    forwarded verbatim because :func:`answer_with_llm` already accepts
+    the canonical ``{"chunk_id", "score", ...}`` shape.
+    """
+    for o in reversed(prior or []):
+        if not isinstance(o, dict):
+            continue
+        hits = o.get("hits")
+        if isinstance(hits, list) and hits:
+            return [h for h in hits if isinstance(h, dict)]
+    return []
+
+
 def _scaffold_existing_files(prior: List[Dict[str, Any]]) -> List[str]:
     """Return the ordered list of file paths produced by prior SCAFFOLD tasks.
 
@@ -513,12 +556,17 @@ def _changed_files_from_prior(prior: List[Dict[str, Any]]) -> List[str]:
 
 def _build_default_retriever(
     index_dir: Optional[str], records_path: Optional[str],
+    *,
+    embed_model: Optional[str] = None,
 ) -> Optional[Callable[[str], Dict[str, Any]]]:
     """Return a Planner-compatible retriever bound to the project's index.
 
     Returns ``None`` when an index isn't configured so the Planner falls
     back to LLM-only decomposition rather than failing on the first
-    query call.
+    query call. ``embed_model`` must match the model the index was built
+    with -- when omitted, ``run_query_auto`` falls back to its own default,
+    which silently mismatches indices built with a different embedder
+    (FAISS then asserts on dim and the planner sees an empty error).
     """
     if not index_dir or not records_path:
         return None
@@ -527,10 +575,18 @@ def _build_default_retriever(
 
     def _retrieve(goal: str) -> Dict[str, Any]:
         from cgx.pipeline.auto import run_query_auto
-        return run_query_auto(
+        from cgx.answer.scope import detect_scope
+        kwargs: Dict[str, Any] = dict(
             index_dir=index_dir, records_path=records_path, query=goal,
             top_k_per_view=10, neighbor_depth=1, use_lexical=True,
+            # Soft-penalise off-scope hits so production goals don't get
+            # grounded in test stubs. ``top_files`` is filtered separately
+            # inside the Planner since it isn't affected by this penalty.
+            scope=detect_scope(goal),
         )
+        if embed_model:
+            kwargs["model_name"] = embed_model
+        return run_query_auto(**kwargs)
 
     return _retrieve
 
@@ -1527,6 +1583,9 @@ def run_agent(
     stream: bool = False,
     progress_interval: float = 2.0,
     max_retries: int = 1,
+    embed_model: Optional[str] = None,
+    continuation: bool = False,
+    prior_goal: Optional[str] = None,
 ) -> Any:
     """Run a Planner → Tracker → Judge loop for ``goal``.
 
@@ -1555,13 +1614,27 @@ def run_agent(
         return the final :class:`Plan` after running to completion.
     """
     if planner is None:
-        retriever = _build_default_retriever(index_dir, records_path)
+        retriever = _build_default_retriever(
+            index_dir, records_path, embed_model=embed_model,
+        )
         planner = Planner(provider=provider, retriever=retriever)
-    plan_obj: Plan = planner.plan(goal)
+    # Only forward the optional kwargs when set, so callers that inject a
+    # planner stub with a narrower ``plan(goal)`` signature (e.g. unit
+    # tests) keep working in the default non-continuation path.
+    plan_kwargs: Dict[str, Any] = {}
+    if continuation:
+        plan_kwargs["continuation"] = True
+    if prior_goal and prior_goal.strip():
+        plan_kwargs["prior_goal"] = prior_goal
+    plan_obj: Plan = (
+        planner.plan(goal, **plan_kwargs) if plan_kwargs
+        else planner.plan(goal)
+    )
     if capabilities is None:
         capabilities = _build_default_capabilities(
             provider=provider, index_dir=index_dir,
             records_path=records_path, project_root=project_root,
+            embed_model=embed_model,
         )
     judge = judge if judge is not None else Judge(provider=provider)
     tracker = Tracker(capabilities=capabilities, judge=judge,

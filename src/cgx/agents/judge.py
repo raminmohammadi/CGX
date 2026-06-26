@@ -233,6 +233,27 @@ SYSTEM_PROMPT = (
 )
 
 
+# Match a leading enumeration marker on a Markdown line: ordered (``1.``,
+# ``2)`` etc.), unordered bullet (``- ``, ``* ``, ``• ``), or ``#``-style
+# heading. Used by the clarify_paths structural check.
+_ENUM_LINE_RE = re.compile(
+    r"^\s*(?:[0-9]{1,2}[.)]|[-*•]|#{1,6})\s+\S",
+    re.MULTILINE,
+)
+
+
+def _is_clarify_ask(task: Task) -> bool:
+    """True when ``task`` is an ASK routed through the clarify_paths mode.
+
+    The planner attaches ``inputs["mode_override"] == "clarify_paths"`` to
+    every exploratory ASK; the Judge uses that flag to swap the citation
+    requirement for a lightweight structural enumeration check.
+    """
+    if task.kind != TaskKind.ASK:
+        return False
+    return str((task.inputs or {}).get("mode_override") or "") == "clarify_paths"
+
+
 @dataclass
 class Verdict:
     verdict: str         # "pass" | "fail"
@@ -297,9 +318,10 @@ class Judge:
         # models are especially prone to this; short-circuit on a
         # structural pass for these kinds.
         if (struct is not None and struct.passed
-                and task.kind in (TaskKind.SEARCH, TaskKind.APPLY,
-                                  TaskKind.VERIFY, TaskKind.SCAFFOLD,
-                                  TaskKind.SCAFFOLD_MANIFEST, TaskKind.SCAFFOLD_FILE)):
+                and (task.kind in (TaskKind.SEARCH, TaskKind.APPLY,
+                                   TaskKind.VERIFY, TaskKind.SCAFFOLD,
+                                   TaskKind.SCAFFOLD_MANIFEST, TaskKind.SCAFFOLD_FILE)
+                     or _is_clarify_ask(task))):
             logger.info("Judge: structural PASS short-circuit id=%s kind=%s "
                         "(skipping LLM grader)", task.id, kind_val)
             return struct
@@ -441,6 +463,38 @@ class Judge:
                 return Verdict(verdict="fail", confidence=0.9,
                                rationale="Answer is empty.",
                                checked_criteria=ncrit)
+            # Clarify-paths ASK: the planner asked the engine to enumerate
+            # options + a follow-up question rather than produce a grounded
+            # answer. Validate the *shape* (>=2 enumerated items or an
+            # explicit follow-up question) and trust it; the LLM grader
+            # would otherwise reject for "lacks citations" and waste the
+            # clarification we deliberately produced. Small models like
+            # gemma3:4b often split the structure across keys -- prose in
+            # ``answer_md`` and the enumerated directions in
+            # ``suggested_changes`` -- so count both as evidence of a
+            # well-formed clarification.
+            if _is_clarify_ask(task):
+                enum_count = len(_ENUM_LINE_RE.findall(answer))
+                suggestions = out.get("suggested_changes") or []
+                if isinstance(suggestions, list):
+                    enum_count += sum(1 for s in suggestions if str(s).strip())
+                has_question = "?" in answer
+                if enum_count >= 2 or has_question:
+                    return Verdict(
+                        verdict="pass", confidence=0.8,
+                        rationale=(
+                            f"Clarification answer enumerates {enum_count} "
+                            "option(s)" + (" and asks a follow-up question."
+                                           if has_question else ".")
+                        ),
+                        checked_criteria=ncrit,
+                    )
+                return Verdict(
+                    verdict="fail", confidence=0.85,
+                    rationale=("Clarification answer neither enumerates "
+                               "options nor asks a follow-up question."),
+                    checked_criteria=ncrit,
+                )
             return None
         if task.kind == TaskKind.SEARCH:
             hits = out.get("hits") or []

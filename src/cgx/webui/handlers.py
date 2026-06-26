@@ -326,6 +326,8 @@ def stream_agent(
     num_ctx: Optional[int] = None,
     endpoint_path: str = "/v1/chat/completions", allow_no_auth: bool = False,
     cancel_event=None,
+    continuation: bool = False,
+    prior_goal: Optional[str] = None,
 ) -> Iterator[Event]:
     """Bridge the Planner → Tracker → Judge loop into typed UI events."""
     from cgx.agents import run_agent
@@ -356,7 +358,9 @@ def stream_agent(
     # "Planning…" instead of an empty stream during that window.
     yield "status", {"phase": "planning", "message": "Generating task plan…"}
 
-    logger.info("stream_agent: calling run_agent (planner will block on LLM)")
+    logger.info("stream_agent: calling run_agent (planner will block on LLM) "
+                "continuation=%s prior_goal=%r",
+                bool(continuation), (prior_goal or "")[:60])
     try:
         events_iter = run_agent(
             goal, provider=prov,
@@ -368,6 +372,14 @@ def stream_agent(
             # Allow two re-plan cycles so a failed manifest or apply step
             # can be revisited (default of 1 only covers a single retry).
             max_retries=2,
+            # Without this the planner's retriever falls back to the default
+            # embedder name in run_query_auto, which silently mismatches the
+            # FAISS dim of an index built with a different model (BGE-M3,
+            # Jina, etc.). Forward the model the UI picked so the planner
+            # actually gets retrieval results.
+            embed_model=embed_model or None,
+            continuation=bool(continuation),
+            prior_goal=prior_goal,
         )
     except Exception as e:
         logger.error("stream_agent: run_agent init failed: %s", e)

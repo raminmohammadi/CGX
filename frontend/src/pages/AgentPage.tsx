@@ -26,6 +26,7 @@ import {
   type ExecutionMode,
   type TaskRow,
   type TaskOutput,
+  type ClarifyOption,
   type RawEvent,
   type CodegenReportSummary,
 } from "../store/tasks";
@@ -118,8 +119,20 @@ export default function AgentPage() {
 
   // ── execution helpers ──────────────────────────────────────────────────────
 
-  /** Wire up the SSE stream and update state incrementally. */
-  const startExecution = () => {
+  /** Wire up the SSE stream and update state incrementally.
+   *
+   * ``opts.continuation`` signals the backend Planner that this run is
+   * a follow-up to a prior clarify_paths ASK and should not re-trigger
+   * the exploratory clarification rewrite. ``opts.goalOverride`` lets
+   * the reply box submit the typed text without relying on a separate
+   * setAgent({goal}) → render cycle. */
+  const startExecution = (opts?: {
+    goalOverride?: string;
+    continuation?: boolean;
+    priorGoal?: string | null;
+  }) => {
+    const effectiveGoal = (opts?.goalOverride ?? goal).trim();
+    const continuation = !!opts?.continuation;
     setAgent({
       busy: true,
       error: null,
@@ -130,13 +143,22 @@ export default function AgentPage() {
       rationale: "",
       phase: "planning",
       awaitingApproval: false,
+      ...(opts?.goalOverride !== undefined ? { goal: effectiveGoal } : {}),
     });
     setLiveProgress({});
     abortConnection(PAGE_KEY);
 
     const conn = streamSSE(
       "/api/agent",
-      { goal, project_root: projectRoot || null, stop_on_fail: stopOnFail, index, provider },
+      {
+        goal: effectiveGoal,
+        project_root: projectRoot || null,
+        stop_on_fail: stopOnFail,
+        index,
+        provider,
+        continuation,
+        prior_goal: opts?.priorGoal ?? null,
+      },
       (ev, data) => {
         if (ev === "done") return;
 
@@ -353,6 +375,22 @@ export default function AgentPage() {
     startExecution();
   };
 
+  /** Re-run the agent with a focused reply to a prior clarify_paths ASK.
+   *
+   * Captures the current ``planTitle`` (the goal the agent was working
+   * on when it asked for clarification) as ``prior_goal`` and submits
+   * the reply text as the new ``goal`` with ``continuation=true`` so
+   * the Planner skips the exploratory rewrite. */
+  const sendReply = (replyText: string) => {
+    const text = replyText.trim();
+    if (!text || busy) return;
+    startExecution({
+      goalOverride: text,
+      continuation: true,
+      priorGoal: planTitle || goal || null,
+    });
+  };
+
   const stop = async () => {
     abortConnection(PAGE_KEY);
     setAgent({ busy: false });
@@ -465,7 +503,12 @@ export default function AgentPage() {
               <p className="text-sm text-slate-200 font-medium">{planTitle}</p>
             </div>
           </div>
-          <PlanTasksDropdown tasks={tasks} phase={phase} />
+          <PlanTasksDropdown
+            tasks={tasks}
+            phase={phase}
+            onReply={sendReply}
+            replyDisabled={busy}
+          />
         </Card>
       )}
 
@@ -912,9 +955,13 @@ function StageCard({
 function PlanTasksDropdown({
   tasks,
   phase,
+  onReply,
+  replyDisabled,
 }: {
   tasks: TaskRow[];
   phase: string;
+  onReply?: (replyText: string) => void;
+  replyDisabled?: boolean;
 }) {
   const total = tasks.length;
   const running = tasks.some((t) => t.status === "running");
@@ -968,7 +1015,12 @@ function PlanTasksDropdown({
                   <div className="flex-1 h-px bg-amber-500/20" />
                 </div>
               )}
-              <TaskTimelineRow task={t} isLast={i === tasks.length - 1} />
+              <TaskTimelineRow
+                task={t}
+                isLast={i === tasks.length - 1}
+                onReply={onReply}
+                replyDisabled={replyDisabled}
+              />
             </div>
           ))}
         </div>
@@ -986,7 +1038,17 @@ function TaskStatusIcon({ status }: { status: TaskRow["status"] }) {
   return <Circle className={`${base} text-slate-500`} />;
 }
 
-function TaskOutputPanel({ output, kind }: { output: TaskOutput; kind: string }) {
+function TaskOutputPanel({
+  output,
+  kind,
+  onReply,
+  replyDisabled,
+}: {
+  output: TaskOutput;
+  kind: string;
+  onReply?: (replyText: string) => void;
+  replyDisabled?: boolean;
+}) {
   if (kind === "plan" || kind === "scaffold") {
     const emptyLabel = kind === "scaffold"
       ? "No files were generated."
@@ -1009,11 +1071,25 @@ function TaskOutputPanel({ output, kind }: { output: TaskOutput; kind: string })
     );
   }
   if (kind === "ask") {
-    return output.answer_md ? (
-      <div className="mt-3 rounded-xl border border-white/5 bg-slate-950 p-4">
-        <Markdown text={output.answer_md} />
+    if (!output.answer_md && !output.debug?.options?.length) return null;
+    const isClarify = output.debug?.mode === "clarify_paths";
+    return (
+      <div className="mt-3 space-y-3">
+        {output.answer_md && (
+          <div className="rounded-xl border border-white/5 bg-slate-950 p-4">
+            <Markdown text={output.answer_md} />
+          </div>
+        )}
+        {isClarify && onReply && (
+          <AgentClarifyReply
+            options={output.debug?.options || []}
+            followUpQuestion={output.debug?.follow_up_question}
+            onSend={onReply}
+            disabled={!!replyDisabled}
+          />
+        )}
       </div>
-    ) : null;
+    );
   }
   if (kind === "search" && output.top_files?.length) {
     return (
@@ -1069,6 +1145,103 @@ function TaskOutputPanel({ output, kind }: { output: TaskOutput; kind: string })
     );
   }
   return null;
+}
+
+// ─── clarify-paths reply UI ───────────────────────────────────────────────────
+
+/** Reply box rendered under a clarify_paths ASK output.
+ *
+ * Lets the user pick one of the agent-proposed directions (or type a
+ * freeform refinement) and re-launch the agent in *continuation* mode
+ * so the Planner treats the reply as a narrowed follow-up to the
+ * original exploratory goal rather than another open-ended request. */
+function AgentClarifyReply({
+  options,
+  followUpQuestion,
+  onSend,
+  disabled,
+}: {
+  options: ClarifyOption[];
+  followUpQuestion?: string;
+  onSend: (replyText: string) => void;
+  disabled: boolean;
+}) {
+  const [text, setText] = useState("");
+  const [sent, setSent] = useState(false);
+  // Clicking a chip is a single-step commit: it builds the narrowed goal
+  // and fires it straight at the agent. The freeform textarea below is
+  // only for users who want to write their own reply instead of picking
+  // a pre-cooked direction.
+  const sendOption = (opt: ClarifyOption) => {
+    if (disabled || sent) return;
+    const title = (opt.title || "").trim();
+    const cid = (opt.chunk_id || "").trim();
+    const tail = cid ? ` (anchor: [[${cid}]])` : "";
+    const reply = title
+      ? `Focus on: ${title}${tail}. Treat this as the narrowed goal.`
+      : cid
+        ? `Focus on [[${cid}]]. Treat this as the narrowed goal.`
+        : "";
+    if (!reply) return;
+    setSent(true);
+    onSend(reply);
+  };
+  const submitFreeform = () => {
+    const t = text.trim();
+    if (!t || disabled || sent) return;
+    setSent(true);
+    onSend(t);
+  };
+  const lock = disabled || sent;
+  return (
+    <div className="rounded-xl border border-purple-500/30 bg-purple-950/20 p-4 space-y-3">
+      <p className="text-[10px] uppercase tracking-wider font-mono text-purple-300">
+        Pick a direction (one click) or type your own
+      </p>
+      {options.length > 0 && (
+        <div className="flex flex-wrap gap-2">
+          {options.map((opt, i) => (
+            <button
+              key={`${opt.chunk_id || i}-${i}`}
+              type="button"
+              disabled={lock}
+              onClick={() => sendOption(opt)}
+              className="px-2 py-1 rounded-md border border-purple-500/30 bg-purple-900/30 text-[11px] text-purple-200 hover:bg-purple-900/60 disabled:opacity-50 disabled:cursor-not-allowed text-left max-w-full"
+              title={opt.rationale || opt.title}
+            >
+              <span className="font-mono text-purple-400 mr-1">{i + 1}.</span>
+              <span className="truncate inline-block max-w-[28rem] align-middle">
+                {opt.title || opt.chunk_id || "option"}
+              </span>
+            </button>
+          ))}
+        </div>
+      )}
+      {followUpQuestion && (
+        <p className="text-[11px] text-purple-200/80 italic">
+          {followUpQuestion}
+        </p>
+      )}
+      <TextArea
+        rows={3}
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        placeholder="Or write your own narrowed goal here, then press Send reply."
+        disabled={lock}
+      />
+      <div className="flex justify-end">
+        <button
+          type="button"
+          onClick={submitFreeform}
+          disabled={lock || !text.trim()}
+          className="av-btn-primary"
+        >
+          <Play className="h-3 w-3" />
+          {sent ? "Sent…" : disabled ? "Running…" : "Send reply"}
+        </button>
+      </div>
+    </div>
+  );
 }
 
 function ApplyPanel({ output }: { output: TaskOutput }) {
@@ -1334,7 +1507,17 @@ function CodegenReportPanel({ report }: { report: CodegenReportSummary }) {
   );
 }
 
-function TaskTimelineRow({ task, isLast }: { task: TaskRow; isLast: boolean }) {
+function TaskTimelineRow({
+  task,
+  isLast,
+  onReply,
+  replyDisabled,
+}: {
+  task: TaskRow;
+  isLast: boolean;
+  onReply?: (replyText: string) => void;
+  replyDisabled?: boolean;
+}) {
   const [expanded, setExpanded] = useState(
     task.status === "done" || task.status === "failed",
   );
@@ -1424,7 +1607,12 @@ function TaskTimelineRow({ task, isLast }: { task: TaskRow; isLast: boolean }) {
           </p>
         )}
         {hasOutput && expanded && task.output && (
-          <TaskOutputPanel output={task.output} kind={task.kind} />
+          <TaskOutputPanel
+            output={task.output}
+            kind={task.kind}
+            onReply={onReply}
+            replyDisabled={replyDisabled}
+          />
         )}
       </div>
     </div>
