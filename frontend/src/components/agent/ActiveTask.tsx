@@ -19,6 +19,13 @@ export interface ActiveTaskProps {
 
 export function ActiveTaskPanel(props: ActiveTaskProps) {
   const { task, artifacts, decisions, onDecide, pending } = props;
+  // Resolve the linked artifact once: every ASK_USER input carries the
+  // upstream artifact id under a kind-specific key. Hook runs every
+  // render so it must stay above any early return.
+  const linked = useMemo(
+    () => (task ? resolveLinkedArtifact(task, artifacts) : null),
+    [task, artifacts],
+  );
   if (task === null) {
     return (
       <div className="text-[12px] text-slate-500 font-mono italic px-4 py-8 text-center">
@@ -26,12 +33,6 @@ export function ActiveTaskPanel(props: ActiveTaskProps) {
       </div>
     );
   }
-  // Resolve the linked artifact once: every ASK_USER input carries the
-  // upstream artifact id under a kind-specific key.
-  const linked = useMemo(
-    () => resolveLinkedArtifact(task, artifacts),
-    [task, artifacts],
-  );
   const resolvedDecision = decisions.find(
     (d) => d.resolved_task_id === task.task_id,
   );

@@ -30,10 +30,23 @@ backend that streams progress over Server-Sent Events.
   - **Greenfield mode** (empty / non-indexed project root, or
     user-selected): `CLARIFY_REQUIREMENTS →
     ASK_USER(clarify_answers) → DECOMPOSE →
-    ASK_USER(approve_plan) → SCAFFOLD → APPLY → VERIFY`. The
-    agent asks 3–6 clarification questions, plans a layered file
-    manifest, generates each file with cross-file context, and
-    only writes to disk after the user approves the plan.
+    ASK_USER(approve_plan) → SCAFFOLD → APPLY → BOOTSTRAP_ENV →
+    VERIFY`. The agent asks 3–6 clarification questions, plans a
+    layered file manifest, generates each file with cross-file
+    context, and only writes to disk after the user approves the
+    plan. `BOOTSTRAP_ENV` then provisions a project-local `.venv`
+    and installs both declared and detected-undeclared
+    dependencies before `VERIFY` runs pytest inside that venv, so
+    "Flask wasn't installed" reads as a collection error on the
+    `BUILD_REPORT` rather than masquerading as a test failure.
+    A failed `VERIFY` in greenfield mode spawns a `REPAIR` task
+    that classifies the failure (v1: pytest-style class missing
+    `unittest.TestCase`; `ModuleNotFoundError` for a project-root
+    module; `fixture '<name>' not found` whose definition lives in
+    another test file) and emits a `REPAIR_PLAN` the shared
+    `APPLY` executor can write; the loop is capped at 2 attempts
+    and gated by a failure-signature hash, so repeated failures
+    escalate to `ASK_USER` instead of looping.
 
   Each direction the user picks is recorded as a structured
   `Decision`; nothing reaches disk without an explicit approval
@@ -456,8 +469,15 @@ EXPLORE -> ASK_USER(choose_path)
 # Greenfield mode (empty / non-indexed project root)
 CLARIFY_REQUIREMENTS -> ASK_USER(clarify_answers)
                           -> DECOMPOSE -> ASK_USER(approve_plan)
-                                            -> SCAFFOLD -> APPLY -> VERIFY
-                                            -> (reject halts the loop)
+                                            -> SCAFFOLD -> APPLY
+                                                 -> BOOTSTRAP_ENV -> VERIFY <---+
+                                            -> (reject halts the loop)        |
+                                                                              | (greenfield
+                                                                              | fixable
+# Autonomous repair (greenfield only; <= 2 attempts, signature-gated)         | failures)
+VERIFY (fail) -> REPAIR -> APPLY (skips BOOTSTRAP_ENV) -> VERIFY -------------+
+              \ (empty plan)
+               -> ASK_USER(freeform)
 ```
 
 Three modules own every transition:
@@ -472,8 +492,8 @@ Three modules own every transition:
 * `cgx.session.tasks.*` -- one registered executor per `TaskKind`:
   explore-mode (`EXPLORE`, `INVESTIGATE`, `RECOMMEND`,
   `PLAN_CHANGE`), greenfield-mode (`CLARIFY_REQUIREMENTS`,
-  `DECOMPOSE`, `SCAFFOLD`), and shared (`APPLY`, `VERIFY`,
-  `ASK_USER`).
+  `DECOMPOSE`, `SCAFFOLD`, `BOOTSTRAP_ENV`, `REPAIR`), and shared
+  (`APPLY`, `VERIFY`, `ASK_USER`).
 
 The HTTP surface is JSON-only at `/api/agent-session/*` (create /
 list / get / message / decision / delete). Mutating endpoints

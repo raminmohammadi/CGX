@@ -98,7 +98,9 @@ Task kinds (`TaskKind`):
 | `SCAFFOLD`              | Walks the `WORK_PLAN` layers, calls `generate_single_scaffold_file` per entry while accumulating sibling-file context, emits `SCAFFOLD_PATCHES`. *(greenfield mode)* |
 | `PLAN_CHANGE`           | Turn an approved recommendation into a unified-diff change plan; produces a `CODE_CHANGE_PLAN`. *(explore mode)* |
 | `APPLY`                 | Write an approved plan's (or scaffold's) diffs to disk; produces `APPLIED_CHANGES` (with `backup_dir`). |
-| `VERIFY`                | Run impacted tests against the working tree; produces a `VERIFY_REPORT`. Skips cleanly in greenfield mode when no tests have been discovered yet. |
+| `BOOTSTRAP_ENV`         | Provision a project-local `.venv`, install declared requirements, and preflight-install undeclared imports found in the applied files; produces a `BUILD_REPORT` carrying `project_type`, `venv_path`, `python_exe`, `installed_from`, `installed_packages`, `failed_installs`, an `outcome` token (`succeeded` / `failed` / `no_venv` / `skipped` / `partial`), and a `style_issues` list populated by an AST lint over the applied test files (catches `self.assert*` calls in non-`TestCase` classes ahead of `VERIFY`; informational, does not change the outcome). *(greenfield mode)* |
+| `VERIFY`                | Run impacted tests against the working tree; produces a `VERIFY_REPORT` whose `outcome` token classifies pytest's exit code (`passed` / `assertions_failed` / `collection_error` / `no_tests_collected` / `timeout` / `pytest_missing` / `skipped`). Uses `BUILD_REPORT.python_exe` when available so pytest runs inside the project venv, not CGX's interpreter. The report also carries a `failure_signature` (sha1 of outcome + returncode + first error line) used by the autonomous repair loop. |
+| `REPAIR`                | Classify a failed `VERIFY` and emit a typed `REPAIR_PLAN` (diffs + rationale + located classes). v1 ships three deterministic, LLM-free classifications: `unittest_pytest_mix` (rewrite class header to inherit `unittest.TestCase`), `missing_module_pythonpath` (create/extend project-root `conftest.py` so pytest can resolve scaffolded packages), and `missing_fixture` (hoist an `@pytest.fixture` definition into `tests/conftest.py` or project-root `conftest.py` so the test can discover it). Unknown failures yield an empty plan that escalates to `ASK_USER`. Greenfield-only; capped at 2 attempts per session and gated by `failure_signature` to break flapping loops. |
 | `ASK_USER`              | Structured pause; carries an `expected_kind` indicating which decision contract the UI must satisfy. |
 | `SEARCH` / `SUMMARIZE`  | Utility kinds the router may interleave. |
 
@@ -130,8 +132,19 @@ Three entry points cover every transition:
   - Greenfield loop: `CLARIFY_REQUIREMENTS → ASK_USER(clarify_answers)`,
     `DECOMPOSE → ASK_USER(approve_plan)`,
     `SCAFFOLD → APPLY` (with `mode=greenfield` threaded into the
-    APPLY inputs so VERIFY skips when no tests exist),
-    `APPLY → VERIFY`.
+    APPLY inputs),
+    `APPLY → BOOTSTRAP_ENV` (greenfield-only edge, threading
+    `apply_artifact_id` and `scaffold_artifact_id` through inputs),
+    `BOOTSTRAP_ENV → VERIFY` (threading `build_artifact_id`).
+    Explore mode keeps the direct `APPLY → VERIFY` edge.
+  - Repair loop (greenfield only): `VERIFY (assertions_failed |
+    collection_error) → REPAIR` (when `repair_attempt < 2` and the
+    new `failure_signature` is not in `prior_failure_signatures`);
+    `REPAIR (can_apply) → APPLY` (carrying `build_artifact_id`
+    forward so BOOTSTRAP_ENV is skipped); `REPAIR (empty plan) →
+    ASK_USER(freeform)`. The cycle re-enters `VERIFY` and either
+    terminates (`passed`) or escalates once the budget / signature
+    guard fires.
 * `on_decision_recorded(session, decision, tasks)` -- user resolved
   an `ASK_USER` via a typed `Decision`. The router records the
   decision, attaches it to the ASK_USER, marks the ASK_USER `DONE`,
@@ -236,12 +249,35 @@ store; the React UI renders each as a node in the task tree.
    under a session-tagged backup directory. Successors carry
    `mode=greenfield` in their inputs.
 
-7. `VERIFY` is the same executor as the explore loop, but when
-   `mode=greenfield` it does not treat *"no tests discovered"* as a
-   failure: it emits a `VERIFY_REPORT` with `ran=False` and a
-   `skipped_reason` so the UI can mark the loop terminal-clean.
+7. `BOOTSTRAP_ENV` provisions a project-local runtime. For Python
+   projects (detected via `requirements.txt` / `pyproject.toml` /
+   `setup.{py,cfg}`) it calls
+   `cgx.codegen.test_runner.ensure_project_venv` to create or
+   refresh `.venv` and pip-install declared requirements, then
+   `cgx.codegen.env_manager.preflight_install` to detect undeclared
+   top-level imports in the applied files and install them into the
+   same venv; successful adds are appended back to
+   `requirements.txt` via `update_requirements` so the manifest
+   stays in sync. The executor emits a `BUILD_REPORT` artifact with
+   the venv path, the manifests installed from, the list of
+   preflight-installed and failed packages, and a single `outcome`
+   token the UI surfaces as a coloured badge.  Non-Python projects
+   short-circuit with `outcome=skipped` so the loop still reaches
+   `VERIFY`.
 
-Two router-level guardrails keep the loop honest:
+8. `VERIFY` is the same executor as the explore loop, but it now
+   classifies pytest's exit code into an explicit `outcome` token
+   (`passed` / `assertions_failed` / `collection_error` /
+   `no_tests_collected` / `timeout` / `pytest_missing` / `skipped`)
+   and reads `python_exe` from the upstream `BUILD_REPORT` when
+   present, so a `ModuleNotFoundError: flask` shows up as
+   `collection_error` (environment misconfiguration) rather than
+   masquerading as a real test failure. When `mode=greenfield` and
+   no tests have been discovered yet the report carries
+   `ran=False` with a `skipped_reason` so the UI marks the loop
+   terminal-clean.
+
+Three router-level guardrails keep the loop honest:
 
 * The `ASK(approve_plan)` checkpoint is mandatory. Even if the
   manifest looks great, the user has to confirm before any file is
@@ -251,6 +287,19 @@ Two router-level guardrails keep the loop honest:
   surfaces a `SCAFFOLD_PATCHES` artifact -- the `failed` list is
   preserved so the UI can show which file slipped and the user can
   choose whether to apply the partial scaffold or restart.
+* `BOOTSTRAP_ENV` is isolated from `VERIFY`: environment failures
+  surface as `outcome=failed` / `no_venv` on the `BUILD_REPORT`,
+  with a `pip_log_tail` for diagnosis, rather than as opaque
+  test-collection errors downstream.
+* The autonomous `REPAIR` cycle is greenfield-only and bounded by
+  two orthogonal guards. The retry budget (`repair_attempt` capped
+  at 2) prevents the loop from monopolising the session. The
+  progress detector (a sha1 over the verify outcome, returncode,
+  and first error line, tracked in `prior_failure_signatures` on
+  every downstream task) refuses a second attempt when the
+  signature matches a prior failure, so a fix that "succeeds"
+  but leaves the same crash in place escalates to `ASK_USER`
+  instead of looping forever.
 
 ### 1A.7 Persistence
 
@@ -323,7 +372,13 @@ components live under `frontend/src/components/agent/`:
 
 Selection and active-session id are persisted to `localStorage` via
 `frontend/src/store/agentSession.ts` (Zustand + `persist`) so a tab
-switch / reload comes back to the same view.
+switch / reload comes back to the same view. `AgentPage.loadState`
+catches the typed `ApiError` exported from `frontend/src/lib/api.ts`
+and, on `status === 404` for the active id, clears the persisted
+`activeId` / `selectedTaskId` and refreshes the sidebar -- so a
+session deleted out-of-band or a `project_root` swap to a different
+SQLite file lands the user on the launcher instead of re-firing the
+same 404 on every mount.
 
 ### 1A.10 Where to look for what
 

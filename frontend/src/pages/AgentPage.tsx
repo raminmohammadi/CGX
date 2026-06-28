@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  api,
+  api, ApiError,
   type AgentSessionState, type AgentSessionSummary,
 } from "../lib/api";
 import { useWorkspace } from "../store/workspace";
@@ -37,9 +37,22 @@ export default function AgentPage() {
       setState(s);
       setError(null);
     } catch (e) {
+      // A 404 on the active id means the persisted localStorage entry
+      // points at a session that no longer exists (project root changed,
+      // db recreated, session deleted out-of-band). Clear the stale id
+      // and refresh the sidebar so the launcher takes over instead of
+      // re-firing the same 404 on every reload.
+      if (e instanceof ApiError && e.status === 404) {
+        setActiveId(null);
+        setSelectedTaskId(null);
+        setState(null);
+        setError(null);
+        void refreshSessions();
+        return;
+      }
       setError(String((e as Error)?.message || e));
     }
-  }, [projectRoot]);
+  }, [projectRoot, refreshSessions, setActiveId, setSelectedTaskId]);
 
   useEffect(() => { refreshSessions(); }, [refreshSessions]);
   useEffect(() => {

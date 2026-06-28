@@ -380,15 +380,22 @@ def run_pytest_paths(
     *,
     timeout_seconds: float = 180.0,
     extra_pytest_args: Iterable[str] = ("-q", "--no-header"),
+    python_exe: Optional[str] = None,
 ) -> TestRunOutcome:
-    """Run pytest on an explicit list of test files against ``project_root``."""
+    """Run pytest on an explicit list of test files against ``project_root``.
+
+    When ``python_exe`` is supplied (e.g. the venv python recorded in a
+    BUILD_REPORT artifact), that interpreter is used directly so tests
+    run against the project's bootstrapped environment rather than the
+    host's. Otherwise we auto-detect via ``_project_python_exe``.
+    """
     root = Path(project_root).resolve()
     if not root.is_dir():
         return TestRunOutcome(ran=False, skipped_reason=f"project_root not a directory: {root}")
     tests = list(test_paths)
     if not tests:
         return TestRunOutcome(ran=False, skipped_reason="no tests located")
-    python_exe = _project_python_exe(root)
+    python_exe = python_exe or _project_python_exe(root)
     cmd = [python_exe, "-m", "pytest", *list(extra_pytest_args), *tests]
     try:
         proc = subprocess.run(
@@ -415,11 +422,14 @@ def run_tests_on_disk(
     *,
     timeout_seconds: float = 180.0,
     extra_pytest_args: Iterable[str] = ("-q", "--no-header"),
+    python_exe: Optional[str] = None,
 ) -> TestRunOutcome:
     """Run impacted tests directly against ``project_root`` (no sandbox copy).
 
     Used by the agent's ``verify`` capability after a real-disk write so
-    the user gets feedback grounded in the actual working tree.
+    the user gets feedback grounded in the actual working tree. The
+    ``python_exe`` override is honoured so VERIFY can target the venv
+    BOOTSTRAP_ENV provisioned upstream.
     """
     root = Path(project_root).resolve()
     if not root.is_dir():
@@ -434,4 +444,5 @@ def run_tests_on_disk(
     return run_pytest_paths(
         str(root), tests,
         timeout_seconds=timeout_seconds, extra_pytest_args=extra_pytest_args,
+        python_exe=python_exe,
     )

@@ -154,6 +154,8 @@ export type TaskKind =
   | "clarify_requirements"
   | "decompose"
   | "scaffold"
+  | "bootstrap_env"
+  | "repair"
   | "summarize";
 
 export type TaskNodeStatus =
@@ -175,7 +177,9 @@ export type ArtifactKind =
   | "session_digest"
   | "requirements_sheet"
   | "work_plan"
-  | "scaffold_patches";
+  | "scaffold_patches"
+  | "build_report"
+  | "repair_plan";
 
 export type FactKind = "file" | "symbol" | "parameter" | "anchor";
 
@@ -262,6 +266,23 @@ export interface AgentSessionState {
   decisions: DecisionDTO[];
 }
 
+// Typed error thrown by ``jsonReq`` whenever the response is not 2xx.
+// Callers can ``instanceof ApiError`` and branch on ``status`` to react
+// to specific failures (e.g. 404 on a session id means the persisted
+// active id is stale and should be cleared rather than retried).
+export class ApiError extends Error {
+  readonly status: number;
+  readonly path: string;
+  readonly body: string;
+  constructor(method: string, path: string, status: number, body: string) {
+    super(`${method} ${path} → ${status}: ${body.slice(0, 200)}`);
+    this.name = "ApiError";
+    this.status = status;
+    this.path = path;
+    this.body = body;
+  }
+}
+
 async function jsonReq<T>(
   path: string,
   method: "GET" | "POST" | "PUT" | "DELETE" = "GET",
@@ -274,7 +295,7 @@ async function jsonReq<T>(
   });
   if (!res.ok) {
     const text = await res.text().catch(() => "");
-    throw new Error(`${method} ${path} → ${res.status}: ${text.slice(0, 200)}`);
+    throw new ApiError(method, path, res.status, text);
   }
   return res.json() as Promise<T>;
 }

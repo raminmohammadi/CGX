@@ -920,6 +920,229 @@ def test_router_verify_completion_has_no_successor():
     assert creates == []
 
 
+def test_router_greenfield_apply_completion_spawns_bootstrap_env():
+    """In greenfield mode, APPLY -> BOOTSTRAP_ENV (not VERIFY directly).
+
+    The router branches on ``parent.inputs['mode']`` so explore-mode
+    APPLY still goes straight to VERIFY (covered by the test above).
+    """
+    from cgx.session.models import SessionMode
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    ap = TaskNode.new(session.session_id, TaskKind.APPLY, "apply",
+                      inputs={"plan_artifact_id": "art_plan",
+                              "scaffold_artifact_id": "art_scaffold",
+                              "prior_goal": "g",
+                              "mode": SessionMode.GREENFIELD.value})
+    ap.produced_artifact_id = "art_applied"
+    ap.status = TaskNodeStatus.DONE
+    plan = Router().on_task_completed(
+        session=session, completed=ap, tasks=[ap])
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    assert len(creates) == 1
+    boot = creates[0].task
+    assert boot.kind is TaskKind.BOOTSTRAP_ENV
+    assert boot.parent_task_id == ap.task_id
+    assert boot.inputs["apply_artifact_id"] == "art_applied"
+    assert boot.inputs["scaffold_artifact_id"] == "art_scaffold"
+    assert boot.inputs["mode"] == "greenfield"
+
+
+def test_router_bootstrap_env_completion_spawns_verify():
+    """BOOTSTRAP_ENV finishes -> VERIFY runs with the build_artifact_id."""
+    from cgx.session.models import SessionMode
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    boot = TaskNode.new(
+        session.session_id, TaskKind.BOOTSTRAP_ENV, "bootstrap",
+        inputs={"apply_artifact_id": "art_applied",
+                "scaffold_artifact_id": "art_scaffold",
+                "prior_goal": "g",
+                "mode": SessionMode.GREENFIELD.value})
+    boot.produced_artifact_id = "art_build"
+    boot.status = TaskNodeStatus.DONE
+    plan = Router().on_task_completed(
+        session=session, completed=boot, tasks=[boot])
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    assert len(creates) == 1
+    ver = creates[0].task
+    assert ver.kind is TaskKind.VERIFY
+    assert ver.parent_task_id == boot.task_id
+    assert ver.inputs["build_artifact_id"] == "art_build"
+    assert ver.inputs["apply_artifact_id"] == "art_applied"
+    assert ver.inputs["mode"] == "greenfield"
+
+
+# --------------------- repair-loop router transitions ---------------------
+
+def _greenfield_failed_verify(*, signature: str, outcome: str = "assertions_failed",
+                              repair_attempt: int = 0, prior: list | None = None,
+                              session=None) -> TaskNode:
+    """Build a DONE VERIFY task that the repair successor should react to."""
+    from cgx.session.models import SessionMode
+    sess = session or Session.new("g", mode=SessionMode.GREENFIELD)
+    ver = TaskNode.new(
+        sess.session_id, TaskKind.VERIFY, "verify",
+        inputs={"apply_artifact_id": "art_applied",
+                "build_artifact_id": "art_build",
+                "mode": SessionMode.GREENFIELD.value,
+                "repair_attempt": repair_attempt,
+                "prior_failure_signatures": list(prior or [])})
+    ver.produced_artifact_id = "art_verify"
+    ver.outputs = {"outcome": outcome, "failure_signature": signature,
+                   "returncode": 1}
+    ver.status = TaskNodeStatus.DONE
+    return ver
+
+
+def test_router_greenfield_verify_failure_spawns_repair():
+    """A fixable VERIFY failure in greenfield -> REPAIR with carried inputs."""
+    from cgx.session.models import SessionMode
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    ver = _greenfield_failed_verify(signature="abc123", session=session)
+    plan = Router().on_task_completed(
+        session=session, completed=ver, tasks=[ver])
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    assert len(creates) == 1
+    rep = creates[0].task
+    assert rep.kind is TaskKind.REPAIR
+    assert rep.parent_task_id == ver.task_id
+    assert rep.inputs["verify_artifact_id"] == "art_verify"
+    assert rep.inputs["build_artifact_id"] == "art_build"
+    assert rep.inputs["mode"] == "greenfield"
+    assert rep.inputs["repair_attempt"] == 1
+    assert "abc123" in rep.inputs["prior_failure_signatures"]
+
+
+def test_router_explore_verify_failure_does_not_spawn_repair():
+    """REPAIR is greenfield-only; explore-mode VERIFY failures are terminal."""
+    session = Session.new("g")
+    ver = TaskNode.new(
+        session.session_id, TaskKind.VERIFY, "verify",
+        inputs={"mode": "explore"})
+    ver.outputs = {"outcome": "assertions_failed",
+                   "failure_signature": "x", "returncode": 1}
+    ver.status = TaskNodeStatus.DONE
+    plan = Router().on_task_completed(
+        session=session, completed=ver, tasks=[ver])
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    assert creates == []
+
+
+def test_router_verify_passed_has_no_successor():
+    """A passing VERIFY in greenfield is terminal -- no REPAIR spawn."""
+    from cgx.session.models import SessionMode
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    ver = TaskNode.new(
+        session.session_id, TaskKind.VERIFY, "verify",
+        inputs={"mode": SessionMode.GREENFIELD.value})
+    ver.outputs = {"outcome": "passed", "failure_signature": "p",
+                   "returncode": 0}
+    ver.status = TaskNodeStatus.DONE
+    plan = Router().on_task_completed(
+        session=session, completed=ver, tasks=[ver])
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    assert creates == []
+
+
+def test_router_verify_repeat_signature_refuses_repair():
+    """Progress detector: same signature twice -> no REPAIR (loop guard)."""
+    from cgx.session.models import SessionMode
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    ver = _greenfield_failed_verify(
+        signature="dup", repair_attempt=1, prior=["dup"], session=session)
+    plan = Router().on_task_completed(
+        session=session, completed=ver, tasks=[ver])
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    assert creates == []
+
+
+def test_router_verify_exceeds_budget_refuses_repair():
+    """Retry budget exhausted (>= 2 attempts) -> no REPAIR (loop guard)."""
+    from cgx.session.models import SessionMode
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    ver = _greenfield_failed_verify(
+        signature="new", repair_attempt=2, prior=["old1", "old2"],
+        session=session)
+    plan = Router().on_task_completed(
+        session=session, completed=ver, tasks=[ver])
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    assert creates == []
+
+
+def test_router_repair_with_diffs_spawns_apply():
+    """REPAIR producing diffs -> APPLY carrying build_artifact_id + attempt."""
+    from cgx.session.models import SessionMode
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    rep = TaskNode.new(
+        session.session_id, TaskKind.REPAIR, "repair",
+        inputs={"verify_artifact_id": "art_verify",
+                "build_artifact_id": "art_build",
+                "mode": SessionMode.GREENFIELD.value,
+                "repair_attempt": 1,
+                "prior_failure_signatures": ["abc123"]})
+    rep.produced_artifact_id = "art_repair_plan"
+    rep.outputs = {"can_apply": True, "classification": "unittest_pytest_mix",
+                   "failure_signature": "abc123", "repair_attempt": 1,
+                   "diff_count": 2}
+    rep.status = TaskNodeStatus.DONE
+    plan = Router().on_task_completed(
+        session=session, completed=rep, tasks=[rep])
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    assert len(creates) == 1
+    ap = creates[0].task
+    assert ap.kind is TaskKind.APPLY
+    assert ap.parent_task_id == rep.task_id
+    assert ap.inputs["plan_artifact_id"] == "art_repair_plan"
+    assert ap.inputs["build_artifact_id"] == "art_build"
+    assert ap.inputs["repair_attempt"] == 1
+
+
+def test_router_repair_without_diffs_spawns_ask_user():
+    """REPAIR with empty plan -> ASK_USER (escalation, no APPLY)."""
+    from cgx.session.models import SessionMode
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    rep = TaskNode.new(
+        session.session_id, TaskKind.REPAIR, "repair",
+        inputs={"verify_artifact_id": "art_verify",
+                "mode": SessionMode.GREENFIELD.value,
+                "repair_attempt": 1})
+    rep.produced_artifact_id = "art_repair_plan"
+    rep.outputs = {"can_apply": False, "classification": "unknown",
+                   "failure_signature": "abc123", "diff_count": 0}
+    rep.status = TaskNodeStatus.DONE
+    plan = Router().on_task_completed(
+        session=session, completed=rep, tasks=[rep])
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    assert len(creates) == 1
+    ask = creates[0].task
+    assert ask.kind is TaskKind.ASK_USER
+    assert ask.inputs["expected_kind"] == DecisionKind.FREEFORM.value
+    assert ask.inputs["classification"] == "unknown"
+
+
+def test_router_apply_from_repair_skips_bootstrap():
+    """APPLY carrying build_artifact_id (from REPAIR) -> VERIFY (no BOOTSTRAP)."""
+    from cgx.session.models import SessionMode
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    ap = TaskNode.new(
+        session.session_id, TaskKind.APPLY, "apply",
+        inputs={"plan_artifact_id": "art_repair_plan",
+                "build_artifact_id": "art_build",
+                "mode": SessionMode.GREENFIELD.value,
+                "repair_attempt": 1,
+                "prior_failure_signatures": ["abc123"]})
+    ap.produced_artifact_id = "art_applied_repair"
+    ap.status = TaskNodeStatus.DONE
+    plan = Router().on_task_completed(
+        session=session, completed=ap, tasks=[ap])
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    assert len(creates) == 1
+    ver = creates[0].task
+    assert ver.kind is TaskKind.VERIFY
+    assert ver.inputs["build_artifact_id"] == "art_build"
+    assert ver.inputs["repair_attempt"] == 1
+    assert ver.inputs["prior_failure_signatures"] == ["abc123"]
+
+
 # --------------------- build_decision validation ---------------------
 
 def test_build_decision_rejects_choose_recommendation_with_bad_kind():
@@ -1700,6 +1923,187 @@ def test_scaffold_executor_records_partial_failure(store, monkeypatch):
     assert "RuntimeError" in failed[0]["error"]
 
 
+# --------------------- BOOTSTRAP_ENV executor unit tests ---------------------
+
+def test_bootstrap_env_requires_project_root():
+    from cgx.session.tasks.bootstrap_env import run_bootstrap_env
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    t = TaskNode.new(session.session_id, TaskKind.BOOTSTRAP_ENV, "boot",
+                     inputs={})
+    result = run_bootstrap_env(t, ExecutorDeps(store=object()))
+    assert result.failure and "project_root" in result.failure
+
+
+def test_bootstrap_env_skips_non_python_project(tmp_path, store):
+    """No manifest -> project_type=unknown -> outcome=skipped, no venv work."""
+    from cgx.session.tasks.bootstrap_env import run_bootstrap_env
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    t = TaskNode.new(session.session_id, TaskKind.BOOTSTRAP_ENV, "boot",
+                     inputs={"mode": SessionMode.GREENFIELD.value})
+    result = run_bootstrap_env(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    assert result.failure is None
+    assert result.outputs["outcome"] == "skipped"
+    assert result.outputs["project_type"] == "unknown"
+    assert result.artifact.kind is ArtifactKind.BUILD_REPORT
+    assert result.artifact.content["venv_path"] is None
+    assert "non-python" in (result.artifact.content.get("note") or "")
+
+
+def test_bootstrap_env_provisions_venv_and_records_preflight(
+        tmp_path, store, monkeypatch):
+    """Happy path: requirements.txt present -> venv ready, preflight clean."""
+    from cgx.session.tasks.bootstrap_env import run_bootstrap_env
+    (tmp_path / "requirements.txt").write_text("flask\n", encoding="utf-8")
+    (tmp_path / ".venv" / "bin").mkdir(parents=True)
+    venv_python = tmp_path / ".venv" / "bin" / "python"
+    venv_python.write_text("")
+    venv_python.chmod(0o755)
+
+    apply_art = Artifact.new(
+        "sess_x", "task_apply", ArtifactKind.APPLIED_CHANGES,
+        {"applied_files": ["app.py"], "failed_files": []})
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    apply_art.session_id = session.session_id
+    store.save_artifact(apply_art)
+
+    monkeypatch.setattr("cgx.codegen.test_runner.ensure_project_venv",
+                        lambda root, timeout=300.0: str(venv_python))
+    monkeypatch.setattr(
+        "cgx.codegen.env_manager.preflight_install",
+        lambda files, root, python=None: (["requests"], {"requests": True}))
+    captured: dict = {}
+    monkeypatch.setattr(
+        "cgx.codegen.env_manager.update_requirements",
+        lambda root, pkgs: captured.setdefault("pkgs", list(pkgs)))
+
+    t = TaskNode.new(session.session_id, TaskKind.BOOTSTRAP_ENV, "boot",
+                     inputs={"apply_artifact_id": apply_art.artifact_id,
+                             "mode": SessionMode.GREENFIELD.value})
+    result = run_bootstrap_env(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    assert result.failure is None
+    assert result.outputs["outcome"] == "succeeded"
+    assert result.outputs["venv_path"] == str(tmp_path / ".venv")
+    assert result.outputs["installed_count"] == 1
+    assert result.outputs["failed_count"] == 0
+    assert captured["pkgs"] == ["requests"]
+    content = result.artifact.content
+    assert content["installed_packages"] == ["requests"]
+    assert content["failed_installs"] == []
+    assert "requirements.txt" in content["installed_from"]
+    assert content["applied_files"] == ["app.py"]
+
+
+def test_bootstrap_env_surfaces_install_failures(tmp_path, store, monkeypatch):
+    """A failed preflight install -> outcome=failed, executor reports failure."""
+    from cgx.session.tasks.bootstrap_env import run_bootstrap_env
+    (tmp_path / "requirements.txt").write_text("flask\n", encoding="utf-8")
+    (tmp_path / ".venv" / "bin").mkdir(parents=True)
+    venv_python = tmp_path / ".venv" / "bin" / "python"
+    venv_python.write_text("")
+    venv_python.chmod(0o755)
+
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    monkeypatch.setattr("cgx.codegen.test_runner.ensure_project_venv",
+                        lambda root, timeout=300.0: str(venv_python))
+    monkeypatch.setattr(
+        "cgx.codegen.env_manager.preflight_install",
+        lambda files, root, python=None: (
+            ["nonexistent-xyz"], {"nonexistent-xyz": False}))
+    monkeypatch.setattr(
+        "cgx.codegen.env_manager.update_requirements",
+        lambda root, pkgs: None)
+
+    t = TaskNode.new(session.session_id, TaskKind.BOOTSTRAP_ENV, "boot",
+                     inputs={"applied_files": ["app.py"],
+                             "mode": SessionMode.GREENFIELD.value})
+    result = run_bootstrap_env(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    assert result.outputs["outcome"] == "failed"
+    assert result.outputs["failed_count"] == 1
+    assert result.failure and "nonexistent-xyz" in result.failure
+    assert result.artifact.content["failed_installs"] == ["nonexistent-xyz"]
+
+
+def test_bootstrap_env_no_venv_when_host_interpreter_returned(
+        tmp_path, store, monkeypatch):
+    """ensure_project_venv falling back to host sys.executable -> no_venv."""
+    import sys
+    from cgx.session.tasks.bootstrap_env import run_bootstrap_env
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n",
+                                             encoding="utf-8")
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    monkeypatch.setattr("cgx.codegen.test_runner.ensure_project_venv",
+                        lambda root, timeout=300.0: sys.executable)
+    monkeypatch.setattr(
+        "cgx.codegen.env_manager.preflight_install",
+        lambda files, root, python=None: ([], {}))
+    monkeypatch.setattr(
+        "cgx.codegen.env_manager.update_requirements",
+        lambda root, pkgs: None)
+
+    t = TaskNode.new(session.session_id, TaskKind.BOOTSTRAP_ENV, "boot",
+                     inputs={"applied_files": [],
+                             "mode": SessionMode.GREENFIELD.value})
+    result = run_bootstrap_env(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    assert result.failure is None
+    assert result.outputs["outcome"] == "no_venv"
+    assert result.artifact.content["venv_path"] is None
+
+
+def test_bootstrap_env_resolves_applied_files_from_scaffold_artifact(
+        tmp_path, store, monkeypatch):
+    """When only scaffold_artifact_id is given, generated[].file is used."""
+    from cgx.session.tasks.bootstrap_env import run_bootstrap_env
+    (tmp_path / "requirements.txt").write_text("", encoding="utf-8")
+    (tmp_path / ".venv" / "bin").mkdir(parents=True)
+    venv_python = tmp_path / ".venv" / "bin" / "python"
+    venv_python.write_text("")
+    venv_python.chmod(0o755)
+
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    scaffold_art = Artifact.new(
+        session.session_id, "task_sc", ArtifactKind.SCAFFOLD_PATCHES,
+        {"generated": [{"file": "app.py", "bytes": 12, "layer": "app"},
+                       {"file": "tests/test_app.py", "bytes": 30,
+                        "layer": "tests"}],
+         "failed": [], "diffs": []})
+    store.save_artifact(scaffold_art)
+
+    seen: dict = {}
+
+    def fake_preflight(files, root, python=None):
+        seen["files"] = list(files)
+        return ([], {})
+
+    monkeypatch.setattr("cgx.codegen.test_runner.ensure_project_venv",
+                        lambda root, timeout=300.0: str(venv_python))
+    monkeypatch.setattr("cgx.codegen.env_manager.preflight_install",
+                        fake_preflight)
+    monkeypatch.setattr("cgx.codegen.env_manager.update_requirements",
+                        lambda root, pkgs: None)
+
+    t = TaskNode.new(
+        session.session_id, TaskKind.BOOTSTRAP_ENV, "boot",
+        inputs={"scaffold_artifact_id": scaffold_art.artifact_id,
+                "mode": SessionMode.GREENFIELD.value})
+    result = run_bootstrap_env(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    assert result.outputs["outcome"] == "succeeded"
+    # Files are passed through as absolute paths under tmp_path.
+    assert seen["files"] == [str(tmp_path / "app.py"),
+                             str(tmp_path / "tests/test_app.py")]
+    assert result.artifact.content["applied_files"] == \
+        ["app.py", "tests/test_app.py"]
+
+
 # --------------------- runner integration (stub executors) ---------------------
 
 def _install_stub_clarify():
@@ -1803,9 +2207,12 @@ def _install_stub_verify_greenfield():
                 "apply_artifact_id": task.inputs.get("apply_artifact_id"),
                 "scaffold_artifact_id":
                     task.inputs.get("scaffold_artifact_id"),
+                "build_artifact_id":
+                    task.inputs.get("build_artifact_id"),
                 "mode": task.inputs.get("mode") or "greenfield",
                 "changed_files": ["app.py"],
                 "ran": False, "tests_passed": False,
+                "outcome": "skipped",
                 "returncode": 0, "tests_selected": [],
                 "stdout": "", "stderr": "",
                 "skipped_reason": "no tests discovered",
@@ -1813,7 +2220,40 @@ def _install_stub_verify_greenfield():
         return ExecutorResult(
             outputs={"verify_artifact_id": artifact.artifact_id,
                      "ran": False, "tests_passed": False,
+                     "outcome": "skipped",
                      "tests_selected_count": 0},
+            artifact=artifact)
+
+
+def _install_stub_bootstrap_env_greenfield():
+    @register_executor(TaskKind.BOOTSTRAP_ENV)
+    def _stub(task, deps):
+        artifact = Artifact.new(
+            session_id=task.session_id,
+            produced_by_task_id=task.task_id,
+            kind=ArtifactKind.BUILD_REPORT,
+            content={
+                "apply_artifact_id": task.inputs.get("apply_artifact_id"),
+                "scaffold_artifact_id":
+                    task.inputs.get("scaffold_artifact_id"),
+                "project_type": "python",
+                "venv_path": "/tmp/proj/.venv",
+                "python_exe": "/tmp/proj/.venv/bin/python",
+                "installed_from": ["requirements.txt"],
+                "installed_packages": [],
+                "failed_installs": [],
+                "outcome": "succeeded",
+                "pip_log_tail": "",
+                "applied_files": ["app.py"],
+            })
+        return ExecutorResult(
+            outputs={"build_artifact_id": artifact.artifact_id,
+                     "outcome": "succeeded",
+                     "project_type": "python",
+                     "venv_path": "/tmp/proj/.venv",
+                     "python_exe": "/tmp/proj/.venv/bin/python",
+                     "installed_count": 0,
+                     "failed_count": 0},
             artifact=artifact)
 
 
@@ -1827,6 +2267,7 @@ def test_runner_full_greenfield_loop(store):
     _install_stub_decompose()
     _install_stub_scaffold()
     _install_stub_apply_greenfield()
+    _install_stub_bootstrap_env_greenfield()
     _install_stub_verify_greenfield()
     runner = SessionRunner(store)
     session = runner.start_session(
@@ -1893,26 +2334,36 @@ def test_runner_full_greenfield_loop(store):
     assert apply_t.inputs["scaffold_artifact_id"]
     assert apply_t.inputs["mode"] == "greenfield"
 
-    # 8. APPLY runs -> spawns VERIFY.
+    # 8. APPLY runs -> spawns BOOTSTRAP_ENV (greenfield-only edge).
+    runner.run_next(session_id=session.session_id, deps=ExecutorDeps())
+    boot_t = next(t for t in store.list_tasks(session.session_id)
+                  if t.kind is TaskKind.BOOTSTRAP_ENV)
+    assert boot_t.status is TaskNodeStatus.READY
+    assert boot_t.inputs["apply_artifact_id"]
+    assert boot_t.inputs["mode"] == "greenfield"
+
+    # 9. BOOTSTRAP_ENV runs -> spawns VERIFY with build_artifact_id.
     runner.run_next(session_id=session.session_id, deps=ExecutorDeps())
     verify_t = next(t for t in store.list_tasks(session.session_id)
                     if t.kind is TaskKind.VERIFY)
     assert verify_t.status is TaskNodeStatus.READY
+    assert verify_t.inputs["build_artifact_id"]
 
-    # 9. VERIFY runs -> terminal.
+    # 10. VERIFY runs -> terminal.
     runner.run_next(session_id=session.session_id, deps=ExecutorDeps())
     verify_after = store.get_task(verify_t.task_id)
     assert verify_after.status is TaskNodeStatus.DONE
     assert runner.run_next(
         session_id=session.session_id, deps=ExecutorDeps()) is None
 
-    # All five greenfield artifacts present + clean separation from
+    # All six greenfield artifacts present + clean separation from
     # the explore-loop kinds.
     kinds = {a.kind for a in store.list_artifacts(session.session_id)}
     assert ArtifactKind.REQUIREMENTS_SHEET in kinds
     assert ArtifactKind.WORK_PLAN in kinds
     assert ArtifactKind.SCAFFOLD_PATCHES in kinds
     assert ArtifactKind.APPLIED_CHANGES in kinds
+    assert ArtifactKind.BUILD_REPORT in kinds
     assert ArtifactKind.VERIFY_REPORT in kinds
     assert ArtifactKind.DIRECTIONS_LIST not in kinds
 
@@ -1954,3 +2405,722 @@ def test_runner_greenfield_reject_plan_halts_loop(store):
     assert not [t for t in tasks if t.kind is TaskKind.VERIFY]
     approve_after = store.get_task(approve_ask.task_id)
     assert approve_after.status is TaskNodeStatus.DONE
+
+
+
+# --------------------- repair module unit tests ---------------------
+
+def test_classify_unittest_pytest_mix_from_traceback():
+    """assertLogs AttributeError in pytest output -> unittest_pytest_mix."""
+    from cgx.session.repair.classify import classify_verify_report
+    content = {
+        "outcome": "assertions_failed",
+        "returncode": 1,
+        "stdout": (
+            "FAILED tests/test_app.py::TestThing::test_logs - "
+            "AttributeError: 'TestThing' object has no attribute 'assertLogs'"
+        ),
+        "stderr": "",
+    }
+    assert classify_verify_report(content) == "unittest_pytest_mix"
+
+
+def test_classify_unknown_for_plain_assertion_failure():
+    """A regular assert failure has no auto-repair -> unknown."""
+    from cgx.session.repair.classify import classify_verify_report
+    content = {
+        "outcome": "assertions_failed",
+        "returncode": 1,
+        "stdout": "E   assert 1 == 2\nE    +  where 1 = compute()",
+        "stderr": "",
+    }
+    assert classify_verify_report(content) == "unknown"
+
+
+def test_classify_skipped_outcomes_are_unknown():
+    """Skipped / no_tests / pytest_missing are env problems, not REPAIR."""
+    from cgx.session.repair.classify import classify_verify_report
+    for outcome in ("passed", "skipped", "no_tests_collected", "pytest_missing"):
+        assert classify_verify_report(
+            {"outcome": outcome, "stdout": ""}) == "unknown"
+
+
+def test_failure_signature_stable_across_runs():
+    """Same outcome + rc + first error line -> same signature."""
+    from cgx.session.repair.classify import failure_signature
+    a = {"outcome": "assertions_failed", "returncode": 1,
+         "stdout": "E   AttributeError: 'X' object has no attribute 'assertLogs'\n"
+                   "duration 0.42s"}
+    b = {"outcome": "assertions_failed", "returncode": 1,
+         "stdout": "E   AttributeError: 'X' object has no attribute 'assertLogs'\n"
+                   "duration 0.87s"}
+    assert failure_signature(a) == failure_signature(b)
+
+
+def test_failure_signature_differs_on_different_error():
+    from cgx.session.repair.classify import failure_signature
+    a = {"outcome": "assertions_failed", "returncode": 1,
+         "stdout": "E   AttributeError: ... 'assertLogs'"}
+    b = {"outcome": "assertions_failed", "returncode": 1,
+         "stdout": "E   AssertionError: 1 == 2"}
+    assert failure_signature(a) != failure_signature(b)
+
+
+def test_locate_unittest_pytest_mix_finds_offending_class(tmp_path: Path):
+    from cgx.session.repair.locate import locate_unittest_pytest_mix
+    rel = "tests/test_app.py"
+    (tmp_path / "tests").mkdir()
+    (tmp_path / rel).write_text(
+        "class TestThing:\n"
+        "    def test_logs(self):\n"
+        "        with self.assertLogs('x'):\n"
+        "            pass\n",
+        encoding="utf-8",
+    )
+    locs = locate_unittest_pytest_mix(tmp_path, [rel])
+    assert len(locs) == 1
+    assert locs[0].rel_path == rel
+    assert locs[0].class_name == "TestThing"
+    assert "assertLogs" in locs[0].helpers
+
+
+def test_locate_skips_class_already_inheriting_testcase(tmp_path: Path):
+    from cgx.session.repair.locate import locate_unittest_pytest_mix
+    rel = "tests/test_ok.py"
+    (tmp_path / "tests").mkdir()
+    (tmp_path / rel).write_text(
+        "import unittest\n"
+        "class TestOk(unittest.TestCase):\n"
+        "    def test_logs(self):\n"
+        "        with self.assertLogs('x'):\n"
+        "            pass\n",
+        encoding="utf-8",
+    )
+    assert locate_unittest_pytest_mix(tmp_path, [rel]) == []
+
+
+def test_propose_unittest_pytest_mix_generates_diff(tmp_path: Path):
+    from cgx.session.repair.locate import locate_unittest_pytest_mix
+    from cgx.session.repair.propose import propose_unittest_pytest_mix
+    rel = "tests/test_app.py"
+    (tmp_path / "tests").mkdir()
+    (tmp_path / rel).write_text(
+        "class TestThing:\n"
+        "    def test_logs(self):\n"
+        "        with self.assertLogs('x'):\n"
+        "            pass\n",
+        encoding="utf-8",
+    )
+    locs = locate_unittest_pytest_mix(tmp_path, [rel])
+    diffs = propose_unittest_pytest_mix(tmp_path, locs)
+    assert len(diffs) == 1
+    assert diffs[0]["file"] == rel
+    patch = diffs[0]["patch"]
+    assert patch.startswith("--- a/tests/test_app.py")
+    assert "+++ b/tests/test_app.py" in patch
+    assert "class TestThing(unittest.TestCase):" in patch
+    assert "+import unittest" in patch
+
+
+def test_propose_preserves_existing_bases(tmp_path: Path):
+    """class Foo(Mixin): -> class Foo(Mixin, unittest.TestCase):"""
+    from cgx.session.repair.locate import StyleMixLocation
+    from cgx.session.repair.propose import propose_unittest_pytest_mix
+    rel = "tests/test_app.py"
+    (tmp_path / "tests").mkdir()
+    (tmp_path / rel).write_text(
+        "import unittest\n"
+        "class Mixin: pass\n"
+        "class TestThing(Mixin):\n"
+        "    def t(self): self.assertEqual(1, 1)\n",
+        encoding="utf-8",
+    )
+    locs = [StyleMixLocation(
+        rel_path=rel, class_name="TestThing", class_lineno=3,
+        helpers=frozenset({"assertEqual"}))]
+    diffs = propose_unittest_pytest_mix(tmp_path, locs)
+    assert len(diffs) == 1
+    assert "class TestThing(Mixin, unittest.TestCase):" in diffs[0]["patch"]
+
+
+def test_repair_executor_emits_repair_plan_artifact(store, tmp_path: Path):
+    """End-to-end: failing VERIFY_REPORT -> REPAIR task -> REPAIR_PLAN diffs."""
+    from cgx.session.tasks import repair as _repair_module  # noqa: F401
+    rel = "tests/test_app.py"
+    (tmp_path / "tests").mkdir()
+    (tmp_path / rel).write_text(
+        "class TestThing:\n"
+        "    def test_logs(self):\n"
+        "        with self.assertLogs('x'):\n"
+        "            pass\n",
+        encoding="utf-8",
+    )
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    verify_task = TaskNode.new(
+        session.session_id, TaskKind.VERIFY, "verify",
+        inputs={"mode": SessionMode.GREENFIELD.value})
+    verify_artifact = Artifact.new(
+        session_id=session.session_id,
+        produced_by_task_id=verify_task.task_id,
+        kind=ArtifactKind.VERIFY_REPORT,
+        content={
+            "outcome": "assertions_failed",
+            "returncode": 1,
+            "changed_files": [rel],
+            "tests_selected": [rel],
+            "stdout": "AttributeError: 'TestThing' object has no attribute 'assertLogs'",
+            "stderr": "",
+        })
+    store.save_task(verify_task)
+    store.save_artifact(verify_artifact)
+    repair_task = TaskNode.new(
+        session.session_id, TaskKind.REPAIR, "repair",
+        inputs={"verify_artifact_id": verify_artifact.artifact_id,
+                "mode": SessionMode.GREENFIELD.value,
+                "repair_attempt": 1})
+    deps = ExecutorDeps(project_root=str(tmp_path), store=store)
+    from cgx.session.tasks.base import _REGISTRY
+    result = _REGISTRY[TaskKind.REPAIR](repair_task, deps)
+    assert result.failure is None
+    assert result.artifact is not None
+    assert result.artifact.kind is ArtifactKind.REPAIR_PLAN
+    assert result.outputs["classification"] == "unittest_pytest_mix"
+    assert result.outputs["can_apply"] is True
+    assert result.outputs["diff_count"] >= 1
+
+
+def test_repair_executor_emits_empty_plan_for_unknown(store, tmp_path: Path):
+    """Unclassifiable failure -> empty diffs + can_apply False (router escalates)."""
+    from cgx.session.tasks import repair as _repair_module  # noqa: F401
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    verify_task = TaskNode.new(
+        session.session_id, TaskKind.VERIFY, "verify", inputs={})
+    verify_artifact = Artifact.new(
+        session_id=session.session_id,
+        produced_by_task_id=verify_task.task_id,
+        kind=ArtifactKind.VERIFY_REPORT,
+        content={"outcome": "assertions_failed", "returncode": 1,
+                 "stdout": "E   assert 1 == 2", "stderr": ""})
+    store.save_task(verify_task)
+    store.save_artifact(verify_artifact)
+    repair_task = TaskNode.new(
+        session.session_id, TaskKind.REPAIR, "repair",
+        inputs={"verify_artifact_id": verify_artifact.artifact_id,
+                "mode": SessionMode.GREENFIELD.value,
+                "repair_attempt": 1})
+    deps = ExecutorDeps(project_root=str(tmp_path), store=store)
+    from cgx.session.tasks.base import _REGISTRY
+    result = _REGISTRY[TaskKind.REPAIR](repair_task, deps)
+    assert result.failure is None
+    assert result.outputs["classification"] == "unknown"
+    assert result.outputs["can_apply"] is False
+    assert result.outputs["diff_count"] == 0
+
+
+def test_classify_missing_module_pythonpath_from_collection_error():
+    """ModuleNotFoundError during collection -> missing_module_pythonpath."""
+    from cgx.session.repair.classify import classify_verify_report
+    content = {
+        "outcome": "collection_error",
+        "returncode": 2,
+        "stdout": (
+            "ImportError while importing test module 'tests/test_app.py'.\n"
+            "tests/test_app.py:1: in <module>\n"
+            "    from app import create_app\n"
+            "E   ModuleNotFoundError: No module named 'app'\n"),
+        "stderr": "",
+    }
+    assert classify_verify_report(content) == "missing_module_pythonpath"
+
+
+def test_missing_module_names_extracts_dotted_targets():
+    """Dotted module paths from pytest output are deduped + order-preserved."""
+    from cgx.session.repair.classify import missing_module_names
+    content = {"stdout": (
+        "E   ModuleNotFoundError: No module named 'app'\n"
+        "E   ModuleNotFoundError: No module named 'api.routes'\n"
+        "E   ModuleNotFoundError: No module named 'app'\n")}
+    assert missing_module_names(content) == ("app", "api.routes")
+
+
+def test_locate_missing_module_pythonpath_resolves_project_dir(tmp_path: Path):
+    """Top-level module exists on disk -> location returned."""
+    from cgx.session.repair.locate import locate_missing_module_pythonpath
+    (tmp_path / "app").mkdir()
+    (tmp_path / "app" / "__init__.py").write_text("", encoding="utf-8")
+    content = {"stdout": "E   ModuleNotFoundError: No module named 'app'\n"}
+    locs = locate_missing_module_pythonpath(tmp_path, content)
+    assert len(locs) == 1
+    assert locs[0].top_level == "app"
+    assert locs[0].resolved_path == "app"
+
+
+def test_locate_missing_module_pythonpath_resolves_sibling_file(tmp_path: Path):
+    """A sibling ``foo.py`` counts as a resolvable module."""
+    from cgx.session.repair.locate import locate_missing_module_pythonpath
+    (tmp_path / "foo.py").write_text("def bar(): return 1\n", encoding="utf-8")
+    content = {"stdout": "E   ModuleNotFoundError: No module named 'foo'\n"}
+    locs = locate_missing_module_pythonpath(tmp_path, content)
+    assert len(locs) == 1
+    assert locs[0].resolved_path == "foo.py"
+
+
+def test_locate_missing_module_pythonpath_skips_third_party(tmp_path: Path):
+    """A module that doesn't exist on disk is BOOTSTRAP_ENV's problem, not ours."""
+    from cgx.session.repair.locate import locate_missing_module_pythonpath
+    content = {"stdout": "E   ModuleNotFoundError: No module named 'flask'\n"}
+    assert locate_missing_module_pythonpath(tmp_path, content) == []
+
+
+def test_propose_missing_module_pythonpath_creates_new_conftest(tmp_path: Path):
+    """No conftest.py at root -> diff creates one with sys.path snippet."""
+    from cgx.session.repair.locate import MissingPythonpathLocation
+    from cgx.session.repair.propose import propose_missing_module_pythonpath
+    locs = [MissingPythonpathLocation(
+        module_name="app", top_level="app", resolved_path="app")]
+    diffs = propose_missing_module_pythonpath(tmp_path, locs)
+    assert len(diffs) == 1
+    assert diffs[0]["file"] == "conftest.py"
+    patch = diffs[0]["patch"]
+    assert "sys.path.insert(0, str(_HERE))" in patch
+    assert "cgx-repair: missing_module_pythonpath" in patch
+
+
+def test_propose_missing_module_pythonpath_prepends_existing_conftest(tmp_path: Path):
+    """Existing conftest.py without the marker -> snippet is prepended."""
+    from cgx.session.repair.locate import MissingPythonpathLocation
+    from cgx.session.repair.propose import propose_missing_module_pythonpath
+    (tmp_path / "conftest.py").write_text(
+        "import pytest\n\n\n@pytest.fixture\ndef widget():\n    return 42\n",
+        encoding="utf-8")
+    locs = [MissingPythonpathLocation(
+        module_name="app", top_level="app", resolved_path="app")]
+    diffs = propose_missing_module_pythonpath(tmp_path, locs)
+    assert len(diffs) == 1
+    patch = diffs[0]["patch"]
+    assert "import pytest" in patch
+    assert "sys.path.insert(0, str(_HERE))" in patch
+
+
+def test_propose_missing_module_pythonpath_no_op_when_marker_present(tmp_path: Path):
+    """Repair already applied -> empty diffs (router will escalate)."""
+    from cgx.session.repair.locate import MissingPythonpathLocation
+    from cgx.session.repair.propose import propose_missing_module_pythonpath
+    (tmp_path / "conftest.py").write_text(
+        "# cgx-repair: missing_module_pythonpath\nimport sys\n",
+        encoding="utf-8")
+    locs = [MissingPythonpathLocation(
+        module_name="app", top_level="app", resolved_path="app")]
+    assert propose_missing_module_pythonpath(tmp_path, locs) == []
+
+
+def test_repair_executor_emits_pythonpath_plan(store, tmp_path: Path):
+    """End-to-end: ModuleNotFoundError VERIFY_REPORT -> conftest.py diff."""
+    from cgx.session.tasks import repair as _repair_module  # noqa: F401
+    (tmp_path / "app").mkdir()
+    (tmp_path / "app" / "__init__.py").write_text("", encoding="utf-8")
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    verify_task = TaskNode.new(
+        session.session_id, TaskKind.VERIFY, "verify",
+        inputs={"mode": SessionMode.GREENFIELD.value})
+    verify_artifact = Artifact.new(
+        session_id=session.session_id,
+        produced_by_task_id=verify_task.task_id,
+        kind=ArtifactKind.VERIFY_REPORT,
+        content={
+            "outcome": "collection_error",
+            "returncode": 2,
+            "stdout": "E   ModuleNotFoundError: No module named 'app'\n",
+            "stderr": "",
+        })
+    verify_task.produced_artifact_id = verify_artifact.artifact_id
+    verify_task.status = TaskNodeStatus.DONE
+    store.save_task(verify_task)
+    store.save_artifact(verify_artifact)
+    repair_task = TaskNode.new(
+        session.session_id, TaskKind.REPAIR, "repair",
+        inputs={"verify_artifact_id": verify_artifact.artifact_id,
+                "mode": SessionMode.GREENFIELD.value,
+                "repair_attempt": 1})
+    deps = ExecutorDeps(project_root=str(tmp_path), store=store)
+    from cgx.session.tasks.base import _REGISTRY
+    result = _REGISTRY[TaskKind.REPAIR](repair_task, deps)
+    assert result.failure is None
+    assert result.artifact is not None
+    assert result.artifact.kind is ArtifactKind.REPAIR_PLAN
+    assert result.outputs["classification"] == "missing_module_pythonpath"
+    assert result.outputs["can_apply"] is True
+    assert result.outputs["diff_count"] == 1
+    diffs = result.artifact.content["diffs"]
+    assert diffs[0]["file"] == "conftest.py"
+
+
+def test_classify_missing_fixture_from_pytest_traceback():
+    """``fixture '<name>' not found`` -> missing_fixture classification."""
+    from cgx.session.repair.classify import classify_verify_report
+    content = {
+        "outcome": "collection_error",
+        "returncode": 2,
+        "stdout": (
+            "tests/test_widget.py:7: in test_widget\n"
+            "    assert client.get('/')\n"
+            "E       fixture 'client' not found\n"),
+        "stderr": "",
+    }
+    assert classify_verify_report(content) == "missing_fixture"
+
+
+def test_missing_fixture_names_extracts_targets_in_order():
+    """Names from the traceback are deduped and order-preserving."""
+    from cgx.session.repair.classify import missing_fixture_names
+    content = {"stdout": (
+        "E       fixture 'client' not found\n"
+        "E       fixture 'db' not found\n"
+        "E       fixture 'client' not found\n")}
+    assert missing_fixture_names(content) == ("client", "db")
+
+
+def test_locate_missing_fixture_finds_hoist_candidate(tmp_path: Path):
+    """Locator picks up @pytest.fixture defs in test files."""
+    from cgx.session.repair.locate import locate_missing_fixture
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_one.py").write_text(
+        "import pytest\n\n@pytest.fixture\ndef client():\n    return object()\n",
+        encoding="utf-8")
+    content = {"stdout": "E       fixture 'client' not found\n"}
+    locs = locate_missing_fixture(tmp_path, content)
+    assert len(locs) == 1
+    assert locs[0].fixture_name == "client"
+    assert locs[0].source_rel_path == "tests/test_one.py"
+    assert locs[0].target_rel_path == "tests/conftest.py"
+
+
+def test_locate_missing_fixture_accepts_imported_decorator(tmp_path: Path):
+    """``from pytest import fixture`` + ``@fixture`` is recognised."""
+    from cgx.session.repair.locate import locate_missing_fixture
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_one.py").write_text(
+        "from pytest import fixture\n\n@fixture(scope='module')\n"
+        "def client():\n    return 1\n",
+        encoding="utf-8")
+    content = {"stdout": "E       fixture 'client' not found\n"}
+    locs = locate_missing_fixture(tmp_path, content)
+    assert len(locs) == 1
+    assert locs[0].fixture_name == "client"
+
+
+def test_locate_missing_fixture_skips_when_no_definition(tmp_path: Path):
+    """Unknown fixture with no on-disk def returns an empty list."""
+    from cgx.session.repair.locate import locate_missing_fixture
+    (tmp_path / "tests").mkdir()
+    content = {"stdout": "E       fixture 'ghost' not found\n"}
+    assert locate_missing_fixture(tmp_path, content) == []
+
+
+def test_locate_missing_fixture_skips_venv_subtree(tmp_path: Path):
+    """Fixtures inside ``.venv`` must not be hoisted into conftest."""
+    from cgx.session.repair.locate import locate_missing_fixture
+    (tmp_path / ".venv" / "site-packages" / "pkg").mkdir(parents=True)
+    (tmp_path / ".venv" / "site-packages" / "pkg" / "__init__.py").write_text(
+        "import pytest\n\n@pytest.fixture\ndef client():\n    return 1\n",
+        encoding="utf-8")
+    content = {"stdout": "E       fixture 'client' not found\n"}
+    assert locate_missing_fixture(tmp_path, content) == []
+
+
+def test_locate_missing_fixture_target_falls_back_to_root(tmp_path: Path):
+    """Without a ``tests/`` dir the hoist target is the project-root conftest."""
+    from cgx.session.repair.locate import locate_missing_fixture
+    (tmp_path / "support.py").write_text(
+        "import pytest\n\n@pytest.fixture\ndef client():\n    return 1\n",
+        encoding="utf-8")
+    content = {"stdout": "E       fixture 'client' not found\n"}
+    locs = locate_missing_fixture(tmp_path, content)
+    assert len(locs) == 1
+    assert locs[0].target_rel_path == "conftest.py"
+
+
+def test_propose_missing_fixture_creates_conftest_with_hoisted_def(tmp_path: Path):
+    """No existing conftest -> diff creates one with the fixture + pytest import."""
+    from cgx.session.repair.locate import MissingFixtureLocation
+    from cgx.session.repair.propose import propose_missing_fixture
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_one.py").write_text(
+        "import pytest\n\n@pytest.fixture\ndef client():\n    return 'live'\n",
+        encoding="utf-8")
+    loc = MissingFixtureLocation(
+        fixture_name="client",
+        source_rel_path="tests/test_one.py",
+        source_lineno=3,
+        source_end_lineno=5,
+        target_rel_path="tests/conftest.py",
+    )
+    diffs = propose_missing_fixture(tmp_path, [loc])
+    assert len(diffs) == 1
+    assert diffs[0]["file"] == "tests/conftest.py"
+    patch = diffs[0]["patch"]
+    assert "import pytest" in patch
+    assert "# cgx-repair: missing_fixture client" in patch
+    assert "def client():" in patch
+    assert "return 'live'" in patch
+
+
+def test_propose_missing_fixture_no_op_when_marker_present(tmp_path: Path):
+    """Already-hoisted fixture -> empty diffs (router escalates)."""
+    from cgx.session.repair.locate import MissingFixtureLocation
+    from cgx.session.repair.propose import propose_missing_fixture
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "conftest.py").write_text(
+        "import pytest\n\n# cgx-repair: missing_fixture client\n"
+        "@pytest.fixture\ndef client():\n    return 1\n",
+        encoding="utf-8")
+    (tmp_path / "tests" / "test_one.py").write_text(
+        "import pytest\n\n@pytest.fixture\ndef client():\n    return 1\n",
+        encoding="utf-8")
+    loc = MissingFixtureLocation(
+        fixture_name="client",
+        source_rel_path="tests/test_one.py",
+        source_lineno=3,
+        source_end_lineno=5,
+        target_rel_path="tests/conftest.py",
+    )
+    assert propose_missing_fixture(tmp_path, [loc]) == []
+
+
+def test_repair_executor_emits_missing_fixture_plan(store, tmp_path: Path):
+    """End-to-end: fixture-not-found VERIFY_REPORT -> conftest hoist diff."""
+    from cgx.session.tasks import repair as _repair_module  # noqa: F401
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_widget.py").write_text(
+        "import pytest\n\n@pytest.fixture\ndef client():\n    return object()\n"
+        "\ndef test_widget(client):\n    assert client is not None\n",
+        encoding="utf-8")
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    verify_task = TaskNode.new(
+        session.session_id, TaskKind.VERIFY, "verify",
+        inputs={"mode": SessionMode.GREENFIELD.value})
+    verify_artifact = Artifact.new(
+        session_id=session.session_id,
+        produced_by_task_id=verify_task.task_id,
+        kind=ArtifactKind.VERIFY_REPORT,
+        content={
+            "outcome": "collection_error",
+            "returncode": 2,
+            "stdout": "E       fixture 'client' not found\n",
+            "stderr": "",
+        })
+    verify_task.produced_artifact_id = verify_artifact.artifact_id
+    verify_task.status = TaskNodeStatus.DONE
+    store.save_task(verify_task)
+    store.save_artifact(verify_artifact)
+    repair_task = TaskNode.new(
+        session.session_id, TaskKind.REPAIR, "repair",
+        inputs={"verify_artifact_id": verify_artifact.artifact_id,
+                "mode": SessionMode.GREENFIELD.value,
+                "repair_attempt": 1})
+    deps = ExecutorDeps(project_root=str(tmp_path), store=store)
+    from cgx.session.tasks.base import _REGISTRY
+    result = _REGISTRY[TaskKind.REPAIR](repair_task, deps)
+    assert result.failure is None
+    assert result.artifact is not None
+    assert result.outputs["classification"] == "missing_fixture"
+    assert result.outputs["can_apply"] is True
+    assert result.outputs["diff_count"] == 1
+    diffs = result.artifact.content["diffs"]
+    assert diffs[0]["file"] == "tests/conftest.py"
+
+
+def test_lint_test_style_returns_jsonable_issues(tmp_path: Path):
+    """The preflight lint surfaces the same classes the REPAIR locator does."""
+    from cgx.session.repair.locate import lint_test_style
+    rel = "tests/test_app.py"
+    (tmp_path / "tests").mkdir()
+    (tmp_path / rel).write_text(
+        "class TestThing:\n"
+        "    def test_logs(self):\n"
+        "        with self.assertLogs('x'):\n"
+        "            pass\n",
+        encoding="utf-8",
+    )
+    issues = lint_test_style(tmp_path, [rel])
+    assert len(issues) == 1
+    issue = issues[0]
+    assert issue["kind"] == "unittest_pytest_mix"
+    assert issue["file"] == rel
+    assert issue["class_name"] == "TestThing"
+    assert "assertLogs" in issue["helpers"]
+
+
+def test_bootstrap_env_attaches_style_issues_to_build_report(tmp_path: Path, store):
+    """BOOTSTRAP_ENV runs the style lint over applied test files."""
+    from cgx.session.tasks import bootstrap_env as _bs_module  # noqa: F401
+    (tmp_path / "requirements.txt").write_text("", encoding="utf-8")
+    (tmp_path / "tests").mkdir()
+    rel_test = "tests/test_app.py"
+    (tmp_path / rel_test).write_text(
+        "class TestThing:\n"
+        "    def test_logs(self):\n"
+        "        with self.assertLogs('x'):\n"
+        "            pass\n",
+        encoding="utf-8",
+    )
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    apply_artifact = Artifact.new(
+        session_id=session.session_id,
+        produced_by_task_id="t_apply",
+        kind=ArtifactKind.APPLIED_CHANGES,
+        content={"applied_files": [rel_test]},
+    )
+    store.save_artifact(apply_artifact)
+    bs_task = TaskNode.new(
+        session.session_id, TaskKind.BOOTSTRAP_ENV, "bootstrap",
+        inputs={"mode": SessionMode.GREENFIELD.value,
+                "apply_artifact_id": apply_artifact.artifact_id,
+                "timeout_seconds": 5.0})
+    deps = ExecutorDeps(project_root=str(tmp_path), store=store)
+    from cgx.session.tasks.base import _REGISTRY
+    result = _REGISTRY[TaskKind.BOOTSTRAP_ENV](bs_task, deps)
+    assert result.artifact is not None
+    assert result.artifact.kind is ArtifactKind.BUILD_REPORT
+    issues = result.artifact.content.get("style_issues") or []
+    assert len(issues) == 1
+    assert issues[0]["file"] == rel_test
+    assert issues[0]["class_name"] == "TestThing"
+    assert result.outputs.get("style_issue_count") == 1
+
+
+def test_bootstrap_env_style_issues_empty_when_no_test_files(tmp_path: Path, store):
+    """Applied files with no test modules -> empty style_issues, count 0."""
+    from cgx.session.tasks import bootstrap_env as _bs_module  # noqa: F401
+    (tmp_path / "requirements.txt").write_text("", encoding="utf-8")
+    (tmp_path / "app.py").write_text("def f(): return 1\n", encoding="utf-8")
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    apply_artifact = Artifact.new(
+        session_id=session.session_id,
+        produced_by_task_id="t_apply",
+        kind=ArtifactKind.APPLIED_CHANGES,
+        content={"applied_files": ["app.py"]},
+    )
+    store.save_artifact(apply_artifact)
+    bs_task = TaskNode.new(
+        session.session_id, TaskKind.BOOTSTRAP_ENV, "bootstrap",
+        inputs={"mode": SessionMode.GREENFIELD.value,
+                "apply_artifact_id": apply_artifact.artifact_id,
+                "timeout_seconds": 5.0})
+    deps = ExecutorDeps(project_root=str(tmp_path), store=store)
+    from cgx.session.tasks.base import _REGISTRY
+    result = _REGISTRY[TaskKind.BOOTSTRAP_ENV](bs_task, deps)
+    assert result.artifact is not None
+    assert result.artifact.content.get("style_issues") == []
+    assert result.outputs.get("style_issue_count") == 0
+
+
+
+def test_repair_loop_smoke_on_disk_unittest_pytest_mix(tmp_path: Path, store):
+    """End-to-end smoke: VERIFY (fail) -> REPAIR -> apply on disk -> valid file.
+
+    Drives the repair pipeline against a real on-disk file rather than
+    mocked artifacts: the REPAIR executor produces a unified diff that
+    the shared APPLY writer (``apply_diffs_to_disk``) writes to disk,
+    after which the file must parse, inherit ``unittest.TestCase``, and
+    import ``unittest`` at module level. This locks the moving parts
+    (classify -> locate -> propose -> diff_apply -> disk_apply) against
+    the wire format they hand off through.
+    """
+    import ast
+    import importlib.util
+    import sys
+
+    from cgx.codegen.disk_apply import apply_diffs_to_disk
+    from cgx.session.tasks import repair as _repair_module  # noqa: F401
+    from cgx.session.tasks.base import _REGISTRY
+
+    rel = "tests/test_widget.py"
+    (tmp_path / "tests").mkdir()
+    (tmp_path / rel).write_text(
+        '"""Generated test module."""\n'
+        "\n"
+        "class TestWidget:\n"
+        "    def test_logs(self):\n"
+        "        with self.assertLogs('x'):\n"
+        "            pass\n"
+        "\n"
+        "    def test_equal(self):\n"
+        "        self.assertEqual(1 + 1, 2)\n",
+        encoding="utf-8",
+    )
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    verify_task = TaskNode.new(
+        session.session_id, TaskKind.VERIFY, "verify",
+        inputs={"mode": SessionMode.GREENFIELD.value})
+    verify_artifact = Artifact.new(
+        session_id=session.session_id,
+        produced_by_task_id=verify_task.task_id,
+        kind=ArtifactKind.VERIFY_REPORT,
+        content={
+            "outcome": "assertions_failed",
+            "returncode": 1,
+            "changed_files": [rel],
+            "stdout": (
+                "AttributeError: 'TestWidget' object has no "
+                "attribute 'assertLogs'\n"),
+            "stderr": "",
+        })
+    verify_task.produced_artifact_id = verify_artifact.artifact_id
+    verify_task.status = TaskNodeStatus.DONE
+    store.save_task(verify_task)
+    store.save_artifact(verify_artifact)
+    repair_task = TaskNode.new(
+        session.session_id, TaskKind.REPAIR, "repair",
+        inputs={"verify_artifact_id": verify_artifact.artifact_id,
+                "mode": SessionMode.GREENFIELD.value,
+                "repair_attempt": 1})
+    deps = ExecutorDeps(project_root=str(tmp_path), store=store)
+    result = _REGISTRY[TaskKind.REPAIR](repair_task, deps)
+    assert result.failure is None
+    assert result.artifact is not None
+    assert result.outputs["classification"] == "unittest_pytest_mix"
+    assert result.outputs["can_apply"] is True
+
+    diffs = result.artifact.content["diffs"]
+    apply_result = apply_diffs_to_disk(str(tmp_path), diffs)
+    assert not apply_result.get("failed_files"), apply_result
+    assert rel in apply_result.get("applied_files", [])
+
+    fixed = (tmp_path / rel).read_text(encoding="utf-8")
+    # Parses cleanly.
+    tree = ast.parse(fixed)
+    # Class header inherits unittest.TestCase (preserving structure).
+    class_def = next(n for n in tree.body if isinstance(n, ast.ClassDef))
+    base_names = [
+        ast.unparse(b) if hasattr(ast, "unparse") else getattr(b, "id", "")
+        for b in class_def.bases
+    ]
+    assert any("unittest.TestCase" in n or n == "TestCase" for n in base_names), (
+        base_names)
+    # Module gained an ``import unittest`` statement.
+    assert any(isinstance(n, ast.Import)
+               and any(a.name == "unittest" for a in n.names)
+               for n in tree.body)
+    # And the rewritten file actually imports / instantiates -- proving
+    # the repair produced runnable Python, not just plausible-looking text.
+    mod_name = f"_repair_smoke_{tmp_path.name.replace('-', '_')}"
+    spec = importlib.util.spec_from_file_location(mod_name, tmp_path / rel)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+        instance = module.TestWidget()
+        assert hasattr(instance, "assertLogs"), (
+            "TestWidget should now inherit unittest.TestCase helpers")
+    finally:
+        sys.modules.pop(mod_name, None)
+
+

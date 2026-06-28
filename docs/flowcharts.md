@@ -172,9 +172,11 @@ overridden via the launcher) determines which root task is seeded:
   file with cross-file context, and only then writes anything to
   disk.
 
-Both loops converge on the shared `APPLY → VERIFY` tail, and every
-`ASK_USER` in either path is a structured checkpoint, not a freeform
-prompt.
+Both loops converge on a shared write-loop tail. Explore mode goes
+directly `APPLY → VERIFY`; greenfield mode inserts a
+`BOOTSTRAP_ENV` step in between so the project's runtime is
+provisioned before pytest runs. Every `ASK_USER` in either path is a
+structured checkpoint, not a freeform prompt.
 
 ### Explore loop
 
@@ -226,8 +228,11 @@ prompt.
                           |
                           v
                       +--------+
-                      | VERIFY |  pytest on impacted tests
-                      +--------+    -> VERIFY_REPORT artifact
+                      | VERIFY |  pytest on impacted tests; classifies
+                      +--------+    rc into outcome (passed |
+                                    assertions_failed |
+                                    collection_error | ...)
+                                    -> VERIFY_REPORT artifact
 ```
 
 ### Greenfield loop
@@ -268,9 +273,76 @@ prompt.
                        +-------+  mode=greenfield
                             |
                             v
+                  +-----------------+
+                  | BOOTSTRAP_ENV   |  create/refresh .venv, install
+                  +-----------------+  requirements.txt, preflight
+                            |          undeclared imports
+                            |          -> BUILD_REPORT artifact
+                            v          (outcome=succeeded|failed|
+                       +--------+        no_venv|skipped|partial)
+                       | VERIFY |  pytest inside the project venv
+                       +--------+   (uses BUILD_REPORT.python_exe);
+                                    classifies rc into outcome; in
+                                    greenfield with no tests yet
+                                    -> ran=False + skipped_reason
+```
+
+### Autonomous repair loop (greenfield only)
+
+When a greenfield `VERIFY` ends with `outcome=assertions_failed` or
+`collection_error`, the router fires a deterministic repair cycle
+before declaring the session stuck. The cycle is capped at 2
+attempts and gated by a failure-signature hash so flapping fixes
+escalate to `ASK_USER` instead of looping:
+
+```
                        +--------+
-                       | VERIFY |  pytest if tests discovered, else
-                       +--------+   ran=False + skipped_reason
+                       | VERIFY |  outcome in {assertions_failed,
+                       +--------+               collection_error}
+                            |     failure_signature recorded on the report
+                            v
+                       +--------+
+                       | REPAIR |  classify_verify_report (regex over
+                       +--------+   pytest traceback) ->
+                            |       classification token (v1:
+                            |       unittest_pytest_mix |
+                            |       missing_module_pythonpath |
+                            |       missing_fixture |
+                            |       unknown)
+                            |     unittest_pytest_mix:
+                            |       locate_unittest_pytest_mix (AST walk
+                            |       of changed/selected test files) ->
+                            |       propose_unittest_pytest_mix (rewrite
+                            |       class header to inherit
+                            |       unittest.TestCase + insert import)
+                            |     missing_module_pythonpath:
+                            |       locate_missing_module_pythonpath
+                            |       (match ModuleNotFoundError targets
+                            |       to project-root files/dirs) ->
+                            |       propose_missing_module_pythonpath
+                            |       (create/prepend project-root
+                            |       conftest.py with sys.path entry)
+                            |     missing_fixture:
+                            |       locate_missing_fixture (project-wide
+                            |       AST scan for @pytest.fixture defs
+                            v       matching the missing names) ->
+                       can_apply?    propose_missing_fixture (hoist the
+                       /       \     def into tests/conftest.py or root
+                  yes /         \    conftest.py with idempotent marker)
+                     |           \ no -> empty diffs
+                     v           v
+                +-------+    +-------------------------+
+                | APPLY |    | ASK_USER(freeform)      |  escalation:
+                +-------+    +-------------------------+   carries the
+                    |   carries build_artifact_id              classification
+                    |   forward, so BOOTSTRAP_ENV is           + rationale
+                    v   skipped on this pass
+                +--------+
+                | VERIFY |  re-runs pytest in the project venv.
+                +--------+  Same loop guards:
+                              - repair_attempt >= 2 -> terminal
+                              - new failure_signature in
+                                prior_failure_signatures -> terminal
 ```
 
 Three pieces of code own every transition:
