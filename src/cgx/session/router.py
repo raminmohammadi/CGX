@@ -171,7 +171,46 @@ def _plan_change_to_ask(parent: TaskNode) -> List[TaskNode]:
 
 
 def _apply_to_verify(parent: TaskNode) -> List[TaskNode]:
-    """Spawn the ``VERIFY`` follow-up for a finished APPLY."""
+    """Spawn the post-APPLY successor.
+
+    Greenfield projects need a runtime environment before pytest can
+    even collect: a freshly-scaffolded Flask app has nothing installed
+    yet, so VERIFY would always fail at collection time. We splice
+    BOOTSTRAP_ENV in between -- it provisions ``.venv`` and installs
+    declared + dynamically-imported dependencies, then its own
+    successor (see :func:`_bootstrap_to_verify`) spawns VERIFY.
+
+    Explore-mode sessions keep the direct APPLY -> VERIFY edge: the
+    working tree's runtime is the user's existing venv, not something
+    we manage.
+
+    Repair cycles in greenfield mode also skip BOOTSTRAP_ENV: the venv
+    has already been provisioned in the original pass, and the upstream
+    REPAIR carries the prior ``build_artifact_id`` forward through
+    APPLY.inputs. Re-bootstrapping would just spend time reinstalling
+    the same packages.
+    """
+    mode = str(parent.inputs.get("mode") or "").strip()
+    has_build_artifact = bool(
+        str(parent.inputs.get("build_artifact_id") or "").strip())
+    repair_attempt = int(parent.inputs.get("repair_attempt") or 0)
+    if mode == SessionMode.GREENFIELD.value and not has_build_artifact:
+        return [TaskNode.new(
+            session_id=parent.session_id,
+            kind=TaskKind.BOOTSTRAP_ENV,
+            name="Bootstrap project environment",
+            description=("Create a project venv and install declared + "
+                         "undeclared dependencies so VERIFY can run."),
+            parent_task_id=parent.task_id,
+            inputs={
+                "apply_artifact_id": parent.produced_artifact_id,
+                "plan_artifact_id": parent.inputs.get("plan_artifact_id"),
+                "scaffold_artifact_id":
+                    parent.inputs.get("scaffold_artifact_id"),
+                "prior_goal": parent.inputs.get("prior_goal"),
+                "mode": mode,
+            },
+        )]
     return [TaskNode.new(
         session_id=parent.session_id,
         kind=TaskKind.VERIFY,
@@ -183,6 +222,36 @@ def _apply_to_verify(parent: TaskNode) -> List[TaskNode]:
             "apply_artifact_id": parent.produced_artifact_id,
             "plan_artifact_id": parent.inputs.get("plan_artifact_id"),
             "scaffold_artifact_id": parent.inputs.get("scaffold_artifact_id"),
+            "build_artifact_id": parent.inputs.get("build_artifact_id"),
+            "prior_goal": parent.inputs.get("prior_goal"),
+            "mode": parent.inputs.get("mode"),
+            "repair_attempt": repair_attempt,
+            "prior_failure_signatures":
+                list(parent.inputs.get("prior_failure_signatures") or []),
+        },
+    )]
+
+
+def _bootstrap_to_verify(parent: TaskNode) -> List[TaskNode]:
+    """Spawn VERIFY once the project environment is provisioned.
+
+    Always runs in greenfield mode (the only path that creates a
+    BOOTSTRAP_ENV node). VERIFY reads the BUILD_REPORT to pick the
+    project venv's python for the pytest subprocess.
+    """
+    return [TaskNode.new(
+        session_id=parent.session_id,
+        kind=TaskKind.VERIFY,
+        name="Verify applied changes",
+        description=("Run tests under the project's bootstrapped venv "
+                     "to validate the applied changes."),
+        parent_task_id=parent.task_id,
+        inputs={
+            "build_artifact_id": parent.produced_artifact_id,
+            "apply_artifact_id": parent.inputs.get("apply_artifact_id"),
+            "plan_artifact_id": parent.inputs.get("plan_artifact_id"),
+            "scaffold_artifact_id":
+                parent.inputs.get("scaffold_artifact_id"),
             "prior_goal": parent.inputs.get("prior_goal"),
             "mode": parent.inputs.get("mode"),
         },
@@ -225,6 +294,124 @@ def _decompose_to_ask(parent: TaskNode) -> List[TaskNode]:
     )]
 
 
+_REPAIR_BUDGET = 2
+
+
+# Outcomes that REPAIR knows how to attempt a fix for. ``passed``,
+# ``skipped``, and ``no_tests_collected`` are terminal -- they're not
+# failures. ``pytest_missing`` is BOOTSTRAP_ENV's job, not REPAIR's.
+_REPAIRABLE_VERIFY_OUTCOMES = frozenset({
+    "assertions_failed",
+    "collection_error",
+})
+
+
+def _verify_to_repair_or_terminal(parent: TaskNode) -> List[TaskNode]:
+    """Spawn REPAIR after a fixable VERIFY failure; otherwise terminal.
+
+    Triggers only in greenfield mode (auto-apply is part of the
+    greenfield contract; explore-mode write loops keep their existing
+    approval gates). The progress detector reads
+    ``prior_failure_signatures`` off the parent: if the just-finished
+    VERIFY's signature already appears in the list, the loop is
+    flapping and we refuse to spawn another REPAIR.
+
+    The retry budget is :data:`_REPAIR_BUDGET` attempts. The attempt
+    counter lives in ``parent.inputs["repair_attempt"]`` (incremented by
+    the REPAIR -> APPLY -> VERIFY chain), so the router can read it
+    without walking the task tree.
+    """
+    mode = str(parent.inputs.get("mode") or "").strip()
+    if mode != SessionMode.GREENFIELD.value:
+        return []
+    outputs = parent.outputs or {}
+    outcome = str(outputs.get("outcome") or "").strip()
+    if outcome not in _REPAIRABLE_VERIFY_OUTCOMES:
+        return []
+    repair_attempt = int(parent.inputs.get("repair_attempt") or 0)
+    if repair_attempt >= _REPAIR_BUDGET:
+        return []
+    # Read the VERIFY_REPORT's failure_signature lazily by deferring to
+    # the classifier; the router stays free of I/O by using a precomputed
+    # signature stashed by the runner-style ``outputs``. Falls back to a
+    # ``returncode``+ ``outcome`` composite so a missing signature still
+    # gives the progress detector a stable token to compare.
+    new_signature = str(outputs.get("failure_signature") or "").strip()
+    if not new_signature:
+        new_signature = f"{outcome}|rc={outputs.get('returncode')}"
+    prior = list(parent.inputs.get("prior_failure_signatures") or [])
+    if new_signature in prior:
+        return []
+    verify_artifact_id = parent.produced_artifact_id
+    return [TaskNode.new(
+        session_id=parent.session_id,
+        kind=TaskKind.REPAIR,
+        name="Repair failed verification",
+        description=("Classify the upstream VERIFY failure and propose a "
+                     "targeted patch the shared APPLY executor can write."),
+        parent_task_id=parent.task_id,
+        inputs={
+            "verify_artifact_id": verify_artifact_id,
+            "build_artifact_id": parent.inputs.get("build_artifact_id"),
+            "apply_artifact_id": parent.inputs.get("apply_artifact_id"),
+            "prior_goal": parent.inputs.get("prior_goal"),
+            "mode": mode,
+            "repair_attempt": repair_attempt + 1,
+            "prior_failure_signatures": prior + [new_signature],
+        },
+    )]
+
+
+def _repair_to_apply_or_ask(parent: TaskNode) -> List[TaskNode]:
+    """Spawn APPLY when REPAIR produced diffs; otherwise ASK_USER.
+
+    The empty-diff path fires when classification returned ``unknown``
+    or the locator could not pin the failure to a concrete span. The
+    user-facing ASK_USER carries the classification + rationale so the
+    operator can decide whether to edit the failing file by hand,
+    abandon the session, or post a fresh objective.
+    """
+    outputs = parent.outputs or {}
+    can_apply = bool(outputs.get("can_apply"))
+    classification = str(outputs.get("classification") or "unknown")
+    signature = str(outputs.get("failure_signature") or "")
+    attempt = int(outputs.get("repair_attempt")
+                  or parent.inputs.get("repair_attempt") or 1)
+    prior = list(parent.inputs.get("prior_failure_signatures") or [])
+    if not can_apply:
+        return [TaskNode.new(
+            session_id=parent.session_id,
+            kind=TaskKind.ASK_USER,
+            name="Repair could not produce a patch",
+            description=("Automated repair did not yield a diff; review "
+                         "the rationale and decide how to proceed."),
+            parent_task_id=parent.task_id,
+            inputs={
+                "expected_kind": DecisionKind.FREEFORM.value,
+                "repair_artifact_id": parent.produced_artifact_id,
+                "classification": classification,
+                "prior_goal": parent.inputs.get("prior_goal"),
+            },
+        )]
+    return [TaskNode.new(
+        session_id=parent.session_id,
+        kind=TaskKind.APPLY,
+        name="Apply repair patch",
+        description=("Write the auto-generated repair diffs to the "
+                     "working tree."),
+        parent_task_id=parent.task_id,
+        inputs={
+            "plan_artifact_id": parent.produced_artifact_id,
+            "build_artifact_id": parent.inputs.get("build_artifact_id"),
+            "prior_goal": parent.inputs.get("prior_goal"),
+            "mode": parent.inputs.get("mode"),
+            "repair_attempt": attempt,
+            "prior_failure_signatures": (
+                prior if signature in prior else prior + [signature]),
+        },
+    )]
+
+
 def _scaffold_to_apply(parent: TaskNode) -> List[TaskNode]:
     """Spawn the APPLY follow-up for a finished SCAFFOLD."""
     return [TaskNode.new(
@@ -244,8 +431,9 @@ def _scaffold_to_apply(parent: TaskNode) -> List[TaskNode]:
 
 
 # Maps the parent's kind to a function that produces the successor
-# tasks. Greenfield kinds (CLARIFY_REQUIREMENTS, DECOMPOSE, SCAFFOLD)
-# chain to ASK_USER / APPLY respectively. VERIFY is terminal.
+# tasks. Greenfield kinds (CLARIFY_REQUIREMENTS, DECOMPOSE, SCAFFOLD,
+# BOOTSTRAP_ENV) chain to ASK_USER / APPLY / VERIFY respectively.
+# VERIFY is terminal.
 TASK_SUCCESSOR = {
     TaskKind.EXPLORE: _explore_to_ask,
     TaskKind.INVESTIGATE: _investigate_to_recommend,
@@ -255,6 +443,9 @@ TASK_SUCCESSOR = {
     TaskKind.CLARIFY_REQUIREMENTS: _clarify_requirements_to_ask,
     TaskKind.DECOMPOSE: _decompose_to_ask,
     TaskKind.SCAFFOLD: _scaffold_to_apply,
+    TaskKind.BOOTSTRAP_ENV: _bootstrap_to_verify,
+    TaskKind.VERIFY: _verify_to_repair_or_terminal,
+    TaskKind.REPAIR: _repair_to_apply_or_ask,
 }
 
 

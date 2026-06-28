@@ -20,6 +20,8 @@ const KIND_META: Record<TaskKind, { badge: string; label: string }> = {
   clarify_requirements:  { badge: "bg-emerald-900/80 text-emerald-300", label: "clarify" },
   decompose:             { badge: "bg-teal-900/80 text-teal-300",       label: "decompose" },
   scaffold:              { badge: "bg-lime-900/80 text-lime-300",       label: "scaffold" },
+  bootstrap_env:         { badge: "bg-amber-900/80 text-amber-300",     label: "bootstrap" },
+  repair:                { badge: "bg-rose-900/80 text-rose-300",       label: "repair" },
 };
 
 function StatusIcon({ status }: { status: TaskNodeStatus }) {

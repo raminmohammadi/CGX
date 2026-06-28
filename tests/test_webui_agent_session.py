@@ -466,17 +466,40 @@ def _install_greenfield_stubs() -> None:
             outputs={"apply_artifact_id": art.artifact_id,
                      "applied_count": 1, "failed_count": 0}, artifact=art)
 
+    @register_executor(TaskKind.BOOTSTRAP_ENV)
+    def _bootstrap(task, deps):
+        art = Artifact.new(
+            task.session_id, task.task_id, ArtifactKind.BUILD_REPORT,
+            {"apply_artifact_id": task.inputs.get("apply_artifact_id"),
+             "project_type": "python",
+             "venv_path": "/tmp/p/.venv",
+             "python_exe": "/tmp/p/.venv/bin/python",
+             "installed_from": ["requirements.txt"],
+             "installed_packages": [], "failed_installs": [],
+             "outcome": "succeeded", "pip_log_tail": "",
+             "applied_files": ["app.py"]})
+        return ExecutorResult(
+            outputs={"build_artifact_id": art.artifact_id,
+                     "outcome": "succeeded", "project_type": "python",
+                     "venv_path": "/tmp/p/.venv",
+                     "python_exe": "/tmp/p/.venv/bin/python",
+                     "installed_count": 0, "failed_count": 0},
+            artifact=art)
+
     @register_executor(TaskKind.VERIFY)
     def _verify(task, deps):
         # Greenfield: no tests yet, so VERIFY emits a skipped report.
         art = Artifact.new(
             task.session_id, task.task_id, ArtifactKind.VERIFY_REPORT,
             {"ran": False, "tests_passed": False, "returncode": 0,
+             "outcome": "skipped",
              "mode": task.inputs.get("mode") or "greenfield",
+             "build_artifact_id": task.inputs.get("build_artifact_id"),
              "skipped_reason": "no tests discovered"})
         return ExecutorResult(
             outputs={"verify_artifact_id": art.artifact_id,
-                     "ran": False, "tests_passed": False}, artifact=art)
+                     "ran": False, "tests_passed": False,
+                     "outcome": "skipped"}, artifact=art)
 
 
 def test_create_greenfield_session_auto_detects_empty_root(
@@ -544,7 +567,7 @@ def test_full_greenfield_loop_via_http(
     assert approve is not None and approve["status"] == "in_progress"
     assert approve["inputs"].get("work_plan_artifact_id")
 
-    # 3. Approve plan -> SCAFFOLD -> APPLY -> VERIFY (terminal).
+    # 3. Approve plan -> SCAFFOLD -> APPLY -> BOOTSTRAP_ENV -> VERIFY.
     state = client.decision(sid, task_id=approve["task_id"],
                             chosen={"approved": True},
                             run_initial_task=True)
@@ -553,12 +576,17 @@ def test_full_greenfield_loop_via_http(
     apply_t = _find_task(state, kind="apply")
     assert apply_t is not None and apply_t["status"] == "done"
     assert apply_t["inputs"].get("mode") == "greenfield"
+    boot_t = _find_task(state, kind="bootstrap_env")
+    assert boot_t is not None and boot_t["status"] == "done"
+    assert boot_t["inputs"].get("apply_artifact_id")
     verify_t = _find_task(state, kind="verify")
     assert verify_t is not None and verify_t["status"] == "done"
+    assert verify_t["inputs"].get("build_artifact_id")
 
     kinds = {a["kind"] for a in state["artifacts"]}
     assert {"requirements_sheet", "work_plan", "scaffold_patches",
-            "applied_changes", "verify_report"}.issubset(kinds)
+            "applied_changes", "build_report",
+            "verify_report"}.issubset(kinds)
     assert "directions_list" not in kinds
 
 

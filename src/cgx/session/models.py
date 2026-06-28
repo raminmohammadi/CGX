@@ -60,8 +60,14 @@ class TaskKind(str, enum.Enum):
     ASK_USER is the structured-pause primitive; SEARCH/SUMMARIZE are
     utility kinds the router may interleave.
 
-    Greenfield kinds (CLARIFY_REQUIREMENTS, DECOMPOSE, SCAFFOLD) drive
-    the new-project path that spawns when ``Session.mode == 'greenfield'``.
+    Greenfield kinds (CLARIFY_REQUIREMENTS, DECOMPOSE, SCAFFOLD,
+    BOOTSTRAP_ENV) drive the new-project path that spawns when
+    ``Session.mode == 'greenfield'``.
+
+    REPAIR is the auto-correction kind: spawned after a VERIFY that
+    failed with a classifiable cause (e.g. unittest/pytest helper
+    mismatch). It emits a typed plan; the existing APPLY executor
+    consumes it like any other diff source.
     """
     EXPLORE = "explore"
     INVESTIGATE = "investigate"
@@ -75,6 +81,8 @@ class TaskKind(str, enum.Enum):
     CLARIFY_REQUIREMENTS = "clarify_requirements"
     DECOMPOSE = "decompose"
     SCAFFOLD = "scaffold"
+    BOOTSTRAP_ENV = "bootstrap_env"
+    REPAIR = "repair"
 
 
 class FactKind(str, enum.Enum):
@@ -95,6 +103,8 @@ class ArtifactKind(str, enum.Enum):
     REQUIREMENTS_SHEET = "requirements_sheet"
     WORK_PLAN = "work_plan"
     SCAFFOLD_PATCHES = "scaffold_patches"
+    BUILD_REPORT = "build_report"
+    REPAIR_PLAN = "repair_plan"
 
 
 class DecisionKind(str, enum.Enum):

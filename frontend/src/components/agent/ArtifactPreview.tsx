@@ -28,6 +28,8 @@ function Body({ artifact }: { artifact: ArtifactDTO }) {
   if (artifact.kind === "requirements_sheet") return <RequirementsBody c={c} />;
   if (artifact.kind === "work_plan") return <WorkPlanBody c={c} />;
   if (artifact.kind === "scaffold_patches") return <ScaffoldPatchesBody c={c} />;
+  if (artifact.kind === "build_report") return <BuildReportBody c={c} />;
+  if (artifact.kind === "repair_plan") return <RepairPlanBody c={c} />;
   return <pre className="text-[11px] font-mono text-slate-300 whitespace-pre-wrap break-words">{JSON.stringify(c, null, 2)}</pre>;
 }
 
@@ -130,23 +132,101 @@ function AppliedBody({ c }: { c: any }) {
   );
 }
 
+// Tailwind palette per verify outcome token. Mirrors the backend's
+// VERIFY_OUTCOMES tuple so each classification gets a stable colour.
+const VERIFY_OUTCOME_META: Record<string, { tone: string; label: string }> = {
+  passed:              { tone: "text-emerald-400", label: "tests passed" },
+  assertions_failed:   { tone: "text-red-400",     label: "assertions failed" },
+  collection_error:    { tone: "text-amber-400",   label: "collection error" },
+  no_tests_collected:  { tone: "text-slate-400",   label: "no tests collected" },
+  timeout:             { tone: "text-amber-400",   label: "timeout" },
+  pytest_missing:      { tone: "text-amber-400",   label: "pytest missing" },
+  skipped:             { tone: "text-slate-400",   label: "skipped" },
+};
+
 function VerifyBody({ c }: { c: any }) {
-  const passed = Boolean(c.tests_passed);
   const ran = Boolean(c.ran);
+  const outcome = String(c.outcome || (ran ? (c.tests_passed ? "passed" : "assertions_failed") : "skipped"));
+  const meta = VERIFY_OUTCOME_META[outcome] ?? { tone: "text-slate-400", label: outcome };
   return (
     <div className="space-y-2 text-[11px] font-mono">
       <p className="text-slate-300">
-        {ran
-          ? (passed
-              ? <span className="text-emerald-400">tests passed</span>
-              : <span className="text-red-400">tests failed (rc={c.returncode})</span>)
-          : <span className="text-slate-400">tests skipped: {String(c.skipped_reason || "n/a")}</span>}
+        <span className={meta.tone}>{meta.label}</span>
+        {ran && <span className="text-slate-500"> · rc={c.returncode}</span>}
+        {!ran && c.skipped_reason && <span className="text-slate-500"> · {String(c.skipped_reason)}</span>}
         {Array.isArray(c.tests_selected) && c.tests_selected.length > 0 &&
           <span className="text-slate-500"> · {c.tests_selected.length} selected</span>}
       </p>
       {c.stdout && (
         <pre className="bg-slate-950 border border-white/5 rounded p-2 text-slate-300 max-h-60 overflow-y-auto whitespace-pre-wrap">
           {String(c.stdout).slice(-4000)}
+        </pre>
+      )}
+    </div>
+  );
+}
+
+const BUILD_OUTCOME_META: Record<string, { tone: string; label: string }> = {
+  succeeded: { tone: "text-emerald-400", label: "venv ready" },
+  failed:    { tone: "text-red-400",     label: "install failures" },
+  no_venv:   { tone: "text-amber-400",   label: "host interpreter (no venv)" },
+  skipped:   { tone: "text-slate-400",   label: "skipped (non-python)" },
+  partial:   { tone: "text-amber-400",   label: "partial" },
+};
+
+function BuildReportBody({ c }: { c: any }) {
+  const outcome = String(c.outcome || "skipped");
+  const meta = BUILD_OUTCOME_META[outcome] ?? { tone: "text-slate-400", label: outcome };
+  const installed: string[] = c.installed_packages || [];
+  const failed: string[] = c.failed_installs || [];
+  const manifests: string[] = c.installed_from || [];
+  return (
+    <div className="space-y-2 text-[11px] font-mono">
+      <p className="text-slate-300">
+        <span className={meta.tone}>{meta.label}</span>
+        <span className="text-slate-500"> · {String(c.project_type || "unknown")}</span>
+        {c.venv_path && <span className="text-slate-500"> · {String(c.venv_path)}</span>}
+      </p>
+      {manifests.length > 0 && (
+        <p className="text-slate-500">manifests: {manifests.join(", ")}</p>
+      )}
+      {installed.length > 0 && (
+        <div>
+          <p className="text-slate-400">preflight-installed ({installed.length}):</p>
+          <ul className="pl-3 list-disc text-emerald-300">
+            {installed.map((p) => <li key={p}>{p}</li>)}
+          </ul>
+        </div>
+      )}
+      {failed.length > 0 && (
+        <div>
+          <p className="text-slate-400">failed installs ({failed.length}):</p>
+          <ul className="pl-3 list-disc text-red-300">
+            {failed.map((p) => <li key={p}>{p}</li>)}
+          </ul>
+        </div>
+      )}
+      {Array.isArray(c.style_issues) && c.style_issues.length > 0 && (
+        <div>
+          <p className="text-amber-300">test-style issues ({c.style_issues.length}):</p>
+          <ul className="pl-3 list-disc text-amber-200/90">
+            {c.style_issues.map((i: any, idx: number) => (
+              <li key={idx}>
+                <span className="text-slate-300">{String(i.file)}</span>
+                <span className="text-slate-500">:{String(i.lineno)}</span>{" "}
+                <span className="text-slate-400">{String(i.class_name)}</span>
+                {i.kind && <span className="text-slate-500"> · {String(i.kind)}</span>}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {c.note && (
+        <p className="text-slate-500 italic">{String(c.note)}</p>
+      )}
+      {c.pip_log_tail && (
+        <pre className="bg-slate-950 border border-white/5 rounded p-2 text-slate-300 max-h-40 overflow-y-auto whitespace-pre-wrap">
+          {String(c.pip_log_tail).slice(-2000)}
         </pre>
       )}
     </div>
@@ -244,6 +324,57 @@ function ScaffoldPatchesBody({ c }: { c: any }) {
           {failed.map((f, i) => (
             <li key={i}>{String(f.file)} — {String(f.error)}</li>
           ))}
+        </ul>
+      )}
+      {diffs.length > 0 && (
+        <DiffView diff={diffs.map((d) => d.patch).join("\n")} />
+      )}
+    </div>
+  );
+}
+
+
+const REPAIR_CLASSIFICATION_META: Record<string, { tone: string; label: string }> = {
+  unittest_pytest_mix:       { tone: "text-amber-400", label: "unittest/pytest mix" },
+  missing_module_pythonpath: { tone: "text-sky-400",   label: "missing module · pythonpath" },
+  missing_fixture:           { tone: "text-emerald-400", label: "missing fixture · hoist" },
+  unknown:                   { tone: "text-slate-400", label: "unclassified" },
+};
+
+function RepairPlanBody({ c }: { c: any }) {
+  const classification = String(c.classification || "unknown");
+  const meta = REPAIR_CLASSIFICATION_META[classification]
+    ?? { tone: "text-slate-400", label: classification };
+  const diffs: { file: string; patch: string }[] = c.diffs || [];
+  const locations: any[] = c.locations || [];
+  const attempt = Number(c.repair_attempt || 0);
+  const rationale = String(c.rationale || "");
+  return (
+    <div className="space-y-2 text-[11px] font-mono">
+      <p className="text-slate-300">
+        <span className={meta.tone}>{meta.label}</span>
+        {attempt > 0 && <span className="text-slate-500"> · attempt {attempt}</span>}
+        <span className="text-slate-500"> · {diffs.length} diff{diffs.length === 1 ? "" : "s"}</span>
+      </p>
+      {rationale && (
+        <p className="text-slate-400 italic whitespace-pre-wrap">{rationale}</p>
+      )}
+      {locations.length > 0 && (
+        <ul className="space-y-0.5 pl-3 text-slate-300 list-disc">
+          {locations.map((loc, i) => {
+            const label = loc.class_name ?? loc.fixture_name ?? loc.module_name ?? null;
+            return (
+              <li key={i}>
+                <span className="text-slate-100">{String(loc.file)}</span>
+                {label && <span className="text-slate-500"> · {String(label)}</span>}
+                {loc.lineno != null && <span className="text-slate-500"> · L{Number(loc.lineno)}</span>}
+                {loc.target && <span className="text-slate-500"> → {String(loc.target)}</span>}
+                {Array.isArray(loc.helpers) && loc.helpers.length > 0 && (
+                  <span className="text-slate-500"> · {loc.helpers.slice(0, 4).join(", ")}{loc.helpers.length > 4 ? "..." : ""}</span>
+                )}
+              </li>
+            );
+          })}
         </ul>
       )}
       {diffs.length > 0 && (

@@ -15,8 +15,23 @@ route are untouched, so existing scripted callers keep working.
 A follow-up greenfield extension lets the same session backbone
 scaffold **new projects from scratch** when no index is available --
 `CLARIFY_REQUIREMENTS -> ASK(clarify_answers) -> DECOMPOSE ->
-ASK(approve_plan) -> SCAFFOLD -> APPLY -> VERIFY` -- selected
-automatically by `Session.mode` (`explore` vs `greenfield`).
+ASK(approve_plan) -> SCAFFOLD -> APPLY -> BOOTSTRAP_ENV -> VERIFY` --
+selected automatically by `Session.mode` (`explore` vs `greenfield`).
+Greenfield projects now go through a dedicated `BOOTSTRAP_ENV` step
+that provisions a project-local `.venv`, installs declared
+requirements, and preflight-installs undeclared imports before
+`VERIFY` runs, so pytest no longer fails to collect because Flask /
+FastAPI weren't installed in CGX's own interpreter.
+
+A second follow-up adds an **autonomous repair loop**: a failed
+`VERIFY` in greenfield mode now spawns a `REPAIR` task that
+classifies the failure (e.g. mixing `self.assertLogs` into a
+pytest-style class with no `unittest.TestCase` base) and emits a
+typed `REPAIR_PLAN` whose diffs the shared `APPLY` executor writes;
+the router then re-runs `VERIFY` (skipping `BOOTSTRAP_ENV`, since the
+venv is already up). The cycle is capped at 2 attempts and gated by
+a failure-signature hash, so repeating failures escalate to
+`ASK_USER` instead of looping.
 
 ### Added
 
@@ -99,6 +114,153 @@ automatically by `Session.mode` (`explore` vs `greenfield`).
   string) lets callers pin the mode explicitly; when absent the
   server runs `detect_mode` against the supplied `project_root` and
   index location and persists the decision on `Session.mode`.
+- **`BOOTSTRAP_ENV` task kind + `BUILD_REPORT` artifact** -- new
+  `cgx.session.tasks.bootstrap_env` executor sits between `APPLY`
+  and `VERIFY` in the greenfield loop. It detects the project type
+  (currently `python` via `requirements.txt` / `pyproject.toml` /
+  `setup.{py,cfg}` -- everything else short-circuits with
+  `outcome=skipped`), calls
+  `cgx.codegen.test_runner.ensure_project_venv` to create/refresh
+  `.venv` and install declared deps, then calls
+  `cgx.codegen.env_manager.preflight_install` to pip-install
+  undeclared top-level imports found in the applied files and
+  appends successful adds to `requirements.txt` via
+  `update_requirements`. The `BUILD_REPORT` artifact carries
+  `project_type`, `venv_path`, `python_exe`, `installed_from`,
+  `installed_packages`, `failed_installs`, `outcome`
+  (`succeeded` / `failed` / `no_venv` / `skipped` / `partial`),
+  `pip_log_tail`, and `applied_files`. The `Router` now wires
+  `APPLY -> BOOTSTRAP_ENV -> VERIFY` for greenfield sessions while
+  explore mode keeps the direct `APPLY -> VERIFY` edge; downstream
+  `VERIFY` reads `python_exe` from the `BUILD_REPORT` so pytest
+  runs inside the project venv.
+- **`VERIFY` outcome classification** -- `VERIFY_REPORT` now
+  carries an `outcome` token (`passed`, `assertions_failed`,
+  `collection_error`, `no_tests_collected`, `timeout`,
+  `pytest_missing`, `skipped`) derived from pytest's exit code
+  plus stderr inspection. `run_pytest_paths` accepts an explicit
+  `python_exe` override so the verifier no longer silently falls
+  back to the host interpreter. The frontend `VerifyBody` renders
+  the outcome as a coloured badge instead of a generic
+  "tests failed (rc=N)" line, so collection errors (missing deps)
+  are distinguishable from real assertion failures at a glance.
+- **`SCAFFOLD` prompt hardening for web frameworks** -- the
+  `_SINGLE_FILE_SYSTEM` prompt in `cgx.answer.engine` now
+  instructs the model to exercise Flask / FastAPI / Starlette /
+  Django apps through `app.test_client()` / `TestClient(app)` /
+  `Client()` and to import the application from project source --
+  never to bind a real port, spawn subprocesses, or rely on
+  `requests`/`httpx` against `localhost`. This keeps the
+  greenfield `VERIFY` step self-contained.
+- **Frontend `BuildReportBody`** --
+  `frontend/src/components/agent/ArtifactPreview.tsx` renders the
+  new `build_report` artifact (outcome badge, project type, venv
+  path, manifests, preflight-installed and failed-install lists,
+  optional pip log tail). `TaskTree.tsx` ships a
+  `bootstrap` badge (amber) for the new task kind. The
+  `TaskKind` / `ArtifactKind` unions in `frontend/src/lib/api.ts`
+  include `"bootstrap_env"` and `"build_report"`.
+- **`REPAIR` task kind + `REPAIR_PLAN` artifact** -- new
+  `cgx.session.tasks.repair` executor wires an autonomous repair
+  cycle on top of the greenfield loop. After a failing `VERIFY`
+  (`outcome` in `{assertions_failed, collection_error}`), the
+  router spawns a `REPAIR` task whose executor:
+  (1) reads the upstream `VERIFY_REPORT`,
+  (2) classifies the failure via the deterministic, LLM-free
+  `cgx.session.repair.classify` module (v1 ships
+  `unittest_pytest_mix`: AttributeError on a `self.assert*` helper
+  used inside a pytest-style class that does not inherit from
+  `unittest.TestCase`),
+  (3) walks the candidate test files with
+  `cgx.session.repair.locate` (AST scan for offending
+  `ClassDef`s + the `self.<helper>` calls they reference), and
+  (4) emits a unified-diff patch via
+  `cgx.session.repair.propose` that rewrites the class header to
+  inherit `unittest.TestCase` (preserving any existing bases) and
+  inserts `import unittest` if missing. The artifact content is
+  `{classification, failure_signature, repair_attempt, rationale,
+  locations, diffs}` shaped to drop straight into the shared `APPLY`
+  executor. Router edges: `VERIFY (fixable) -> REPAIR -> APPLY
+  (with build_artifact_id carried forward, so BOOTSTRAP_ENV is
+  skipped) -> VERIFY`. Empty plans (classification `unknown`)
+  escalate to `ASK_USER(freeform)` instead of looping. The cycle is
+  capped at 2 attempts via `repair_attempt` and gated by
+  `prior_failure_signatures` (`sha1` of outcome + returncode +
+  first error line), so a flapping fix that keeps producing the
+  same failure breaks the loop on the second pass. Tests cover
+  the classifier (positive + negative + signature stability), the
+  locator (find / skip-when-TestCase / preserve bases), the
+  proposer (diff shape + unittest import insertion), the executor
+  (end-to-end with stub store), and all router transitions
+  (`VERIFY -> REPAIR`, explore-mode no-op, signature loop guard,
+  budget exhaustion, `REPAIR -> APPLY`, `REPAIR -> ASK_USER`,
+  `APPLY (from repair) -> VERIFY skipping BOOTSTRAP_ENV`).
+- **Frontend `RepairPlanBody`** --
+  `frontend/src/components/agent/ArtifactPreview.tsx` renders the
+  new `repair_plan` artifact (classification badge, repair attempt
+  counter, rationale, located classes + helpers, and the proposed
+  diff via the shared `DiffView`). `TaskTree.tsx` ships a `repair`
+  badge (rose) for the new task kind. The `TaskKind` /
+  `ArtifactKind` unions in `frontend/src/lib/api.ts` include
+  `"repair"` and `"repair_plan"`.
+- **Second `REPAIR` classification: `missing_module_pythonpath`** --
+  `cgx.session.repair.classify` now recognises pytest collection
+  errors of the form `ModuleNotFoundError: No module named '<name>'`
+  where `<name>` maps to a project-root sibling (a `.py` file or a
+  directory containing `__init__.py` / `.py` files). The locator
+  (`locate_missing_module_pythonpath`) filters out third-party
+  modules that belong to `BOOTSTRAP_ENV`. The proposer
+  (`propose_missing_module_pythonpath`) emits a unified diff that
+  creates (or prepends to) a project-root `conftest.py` carrying a
+  marker comment + `sys.path.insert(0, str(Path(__file__).parent))`,
+  so pytest can resolve scaffolded packages on the next pass. A
+  marker check makes the propose a no-op when the fix has already
+  been applied (the router then escalates to `ASK_USER`).
+- **Third `REPAIR` classification: `missing_fixture`** --
+  `cgx.session.repair.classify` now recognises the pytest collection
+  error `fixture '<name>' not found`. The locator
+  (`locate_missing_fixture`) walks every `.py` file under
+  `project_root` (skipping `.venv`, `__pycache__`, dotfile dirs, and
+  the build/cache subtrees listed in `_FIXTURE_SCAN_SKIP_DIRS`),
+  parses each one, and records the first top-level
+  `@pytest.fixture`-decorated `FunctionDef` / `AsyncFunctionDef` whose
+  name matches a missing fixture. Accepts the bare attribute form
+  (`@pytest.fixture` / `@pytest.fixture(...)`) and the imported form
+  (`@fixture` / `@fixture(...)`). The proposer
+  (`propose_missing_fixture`) hoists the verbatim source span
+  (decorators + def + body) into `tests/conftest.py` when a `tests/`
+  directory exists at the root, else into project-root `conftest.py`,
+  adding `import pytest` if missing and wrapping each hoisted fixture
+  in a `# cgx-repair: missing_fixture <name>` marker so a second pass
+  is a no-op. Empty diffs (no on-disk definition found, or markers
+  already present) escalate to `ASK_USER` via the router. The
+  `RepairPlanBody` UI gains a metadata entry for the new
+  classification and a generalised location renderer that falls back
+  through `class_name` / `fixture_name` / `module_name` and shows the
+  hoist target (`→ tests/conftest.py`).
+- **`BOOTSTRAP_ENV` preflight test-style lint** --
+  `cgx.session.tasks.bootstrap_env` now runs
+  `cgx.session.repair.locate.lint_test_style` over the
+  applied test files (paths starting with `tests/` or basenames
+  starting with `test_`) after `preflight_install`. The
+  `BUILD_REPORT` artifact gains a `style_issues` list (`{kind, file,
+  class_name, lineno, helpers}`) and the executor outputs include
+  `style_issue_count`. The lint is informational -- it does not
+  change the `outcome` token; REPAIR still owns the actual fix --
+  but the issue list surfaces in the UI before VERIFY runs so the
+  user sees a named reason instead of waiting for the AttributeError
+  on the next pass. `BuildReportBody` in `ArtifactPreview.tsx`
+  renders the list in an amber section under the manifests block.
+- **Stale-session recovery on the Agent page** --
+  `frontend/src/lib/api.ts` now exports a typed `ApiError` (with
+  `status`, `path`, `body`) that `jsonReq` throws on non-2xx
+  responses instead of a generic `Error`. `AgentPage.tsx`'s
+  `loadState` catches `ApiError` with `status === 404` on the
+  active session id, clears the persisted `activeId` /
+  `selectedTaskId` from the `cgx-agent-session` zustand store, and
+  refreshes the sidebar so the launcher takes over -- previously a
+  deleted-out-of-band or project-root-swapped session id stuck in
+  `localStorage` would re-fire the same 404 on every mount.
 
 ### Changed
 
@@ -107,12 +269,18 @@ automatically by `Session.mode` (`explore` vs `greenfield`).
   scans `task.inputs` for any `*_artifact_id` key so new flows
   (`requirements_artifact_id`, `work_plan_artifact_id`,
   `scaffold_patches_artifact_id`, ...) pick up automatically.
+- **`VERIFY_REPORT.content` + `outputs`** -- both now carry a
+  `failure_signature` (sha1, 16 hex chars) so the router's progress
+  detector can compare attempts without re-reading the artifact.
 
 ### Docs
 
 - `docs/Agent.md`, `docs/architecture.md`, `docs/flowcharts.md`,
   `docs/usage.md`, and `README.md` document the greenfield loop, the
-  mode auto-detection rules, and the new API field.
+  mode auto-detection rules, the new API field, the
+  `BOOTSTRAP_ENV` step (with the `BUILD_REPORT` artifact shape and
+  the `VERIFY` outcome enum), and the autonomous `REPAIR` cycle
+  (classification taxonomy, retry budget, progress detector).
 
 ### Added
 

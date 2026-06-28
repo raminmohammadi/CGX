@@ -366,7 +366,17 @@ CLARIFY_REQUIREMENTS -> ASK_USER(clarify_answers)
                                               SCAFFOLD     (loop halts;
                                                   |         no files written)
                                                   v
-                                              APPLY -> VERIFY
+                                              APPLY
+                                                  |
+                                                  v
+                                          BOOTSTRAP_ENV
+                                                  |
+                                                  v
+                                              VERIFY <----+
+                                                  |       |
+                                                  v       | (fixable failure,
+                                              REPAIR -----+  attempt < 2,
+                                                              new signature)
 ```
 
 `CLARIFY_REQUIREMENTS` emits 3–6 clarification questions about the
@@ -383,9 +393,85 @@ accumulating sibling-file context (so cross-file imports resolve
 correctly), captures per-file failures into a `failed` list, and
 emits a `SCAFFOLD_PATCHES` artifact. The shared `APPLY` executor
 accepts either a `CODE_CHANGE_PLAN` (explore) or `SCAFFOLD_PATCHES`
-(greenfield), and `VERIFY` reports `ran=False` with a
-`skipped_reason` when no tests have been discovered yet rather than
-failing the greenfield run.
+(greenfield). In greenfield mode a `BOOTSTRAP_ENV` step then
+provisions a project-local `.venv` (via
+`cgx.codegen.test_runner.ensure_project_venv`), installs declared
+requirements, and preflight-installs any undeclared top-level
+imports found in the applied files (successful adds are appended
+back to `requirements.txt`); the resulting `BUILD_REPORT` artifact
+carries the venv path, the manifests installed from, the list of
+installed/failed packages, and an `outcome` token
+(`succeeded` / `failed` / `no_venv` / `skipped` / `partial`).
+`VERIFY` then runs pytest inside that venv and classifies the exit
+code into an `outcome` token (`passed` / `assertions_failed` /
+`collection_error` / `no_tests_collected` / `timeout` /
+`pytest_missing` / `skipped`) so a missing dependency reads as
+"collection error" instead of an unexplained test failure; when no
+tests have been discovered yet `VERIFY` reports `ran=False` with a
+`skipped_reason` rather than failing the run. The report also
+carries a `failure_signature` (sha1 of outcome + returncode + first
+error line) which the autonomous repair loop uses as a progress
+detector.
+
+If `VERIFY` ends with `outcome=assertions_failed` or
+`collection_error` in greenfield mode, the router spawns a `REPAIR`
+task that runs a deterministic, LLM-free classifier
+(`cgx.session.repair.classify`) against the captured pytest output.
+v1 recognises three classifications:
+
+* `unittest_pytest_mix` -- scaffolded tests call `self.assertLogs` /
+  `self.assertEqual` / etc. on a class that does not inherit from
+  `unittest.TestCase`. The locator walks the changed test files
+  with an AST scan; the proposer rewrites each offending class
+  header to inherit `unittest.TestCase` (preserving any existing
+  bases) and inserts `import unittest` if missing.
+* `missing_module_pythonpath` -- pytest reports
+  `ModuleNotFoundError: No module named '<name>'` during collection
+  and `<name>` resolves to a project-root sibling (a `.py` file or
+  a directory containing `__init__.py` / `.py` files). Third-party
+  packages with no matching project file are skipped (that's
+  `BOOTSTRAP_ENV`'s domain). The proposer creates (or prepends to)
+  a `<project_root>/conftest.py` carrying a marker comment plus a
+  `sys.path.insert(0, str(Path(__file__).parent))` snippet so pytest
+  can resolve the scaffolded package on the next pass; a marker
+  check makes the proposer idempotent (re-running it after a
+  successful fix yields zero diffs, which escalates the loop to
+  `ASK_USER` instead of repeating).
+* `missing_fixture` -- pytest reports `fixture '<name>' not found`
+  during collection. The locator scans every `.py` file under the
+  project root (skipping `.venv`, `__pycache__`, dotfile directories,
+  and the well-known build / cache subtrees) for a top-level
+  `@pytest.fixture`-decorated function whose name matches; the bare
+  attribute decorator (`@pytest.fixture` / `@pytest.fixture(...)`) and
+  the imported form (`@fixture` / `@fixture(...)`) are both accepted.
+  When a definition is found, the proposer hoists the verbatim source
+  span (decorators + def + body) into `tests/conftest.py` when a
+  `tests/` directory exists at the project root, otherwise into
+  `<project_root>/conftest.py`, adding `import pytest` if missing and
+  wrapping each hoisted def in a `# cgx-repair: missing_fixture
+  <name>` marker so a second pass is a no-op. When no on-disk
+  definition exists the diffs are empty and the router escalates to
+  `ASK_USER` -- a fixture nobody wrote isn't something the loop can
+  invent without an LLM.
+
+The executor emits a `REPAIR_PLAN` artifact shaped exactly like a
+`CODE_CHANGE_PLAN`. The shared `APPLY` executor consumes it,
+carries the `build_artifact_id` forward (so `BOOTSTRAP_ENV` is
+skipped on the repair pass), and re-runs `VERIFY`. The cycle is
+capped at two attempts and refuses to retry when the new
+`failure_signature` matches one already seen on the chain, so a
+fix that "succeeds" without actually resolving the failure
+escalates to a freeform `ASK_USER` instead of looping.
+
+`BOOTSTRAP_ENV` runs a complementary preflight test-style lint
+(`cgx.session.repair.locate.lint_test_style`) after
+`preflight_install`: it AST-scans the applied test files (paths
+starting with `tests/` or basenames starting with `test_`) for the
+same `unittest_pytest_mix` pattern and attaches a `style_issues`
+list to the `BUILD_REPORT` artifact. The lint is informational --
+it does not change the bootstrap outcome -- but the UI renders the
+list under the manifests block so the user sees a named issue
+before `VERIFY` runs, even though `REPAIR` will still auto-fix it.
 
 ### UI controls
 
@@ -394,7 +480,13 @@ failing the greenfield run.
   `DELETE /api/agent-session/{sid}` (confirms first) and removes the
   whole aggregate. Persisted to `localStorage` under
   `cgx-agent-session` so a tab switch / reload returns to the same
-  session and the same selected task.
+  session and the same selected task. If the persisted active id
+  no longer exists on the backend (session deleted out-of-band,
+  project root switched to a different SQLite file) the page's
+  state-load hook catches the typed `ApiError` with `status === 404`,
+  clears the stale id from the store, refreshes the sidebar, and
+  drops the user on the launcher -- no manual `localStorage` reset
+  required.
 - **Task tree** -- hierarchical DAG keyed on `parent_task_id`.
   Status icons: `pending` / `ready` / `in_progress` (spinner) /
   `done` (check) / `failed` (cross). Depth-based indentation; the

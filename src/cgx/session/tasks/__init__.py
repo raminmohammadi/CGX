@@ -34,6 +34,8 @@ from cgx.session.tasks import verify as _verify  # noqa: F401
 from cgx.session.tasks import clarify_requirements as _clarify_requirements  # noqa: F401
 from cgx.session.tasks import decompose as _decompose  # noqa: F401
 from cgx.session.tasks import scaffold as _scaffold  # noqa: F401
+from cgx.session.tasks import bootstrap_env as _bootstrap_env  # noqa: F401
+from cgx.session.tasks import repair as _repair  # noqa: F401
 
 __all__ = [
     "ExecutorDeps",
