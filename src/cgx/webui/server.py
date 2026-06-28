@@ -24,6 +24,7 @@ from fastapi.staticfiles import StaticFiles
 
 from cgx.webui.routes import (
     agent,
+    agent_session,
     ask,
     embed,
     hardware,
@@ -77,6 +78,7 @@ def create_app() -> FastAPI:
     app.include_router(ask.router, prefix="/api")
     app.include_router(plan.router, prefix="/api")
     app.include_router(agent.router, prefix="/api")
+    app.include_router(agent_session.router, prefix="/api")
     app.include_router(tasks.router, prefix="/api")
     app.include_router(rollback.router, prefix="/api")
 

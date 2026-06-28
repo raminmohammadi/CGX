@@ -18,15 +18,42 @@ backend that streams progress over Server-Sent Events.
 - **Hybrid retrieval.** Two-view semantic + BM25 + graph expansion,
   fused with Reciprocal Rank Fusion and an optional cross-encoder
   rerank.
-- **Multi-agent orchestration.** A Planner / Tracker / Judge loop
-  decomposes complex requests into atomic tasks (`ask`, `plan`,
-  `scaffold`, `scaffold_manifest`, `scaffold_file`, `search`, `summarize`,
-  `apply`, `verify`, `fill_logic`) and validates each artefact before
-  moving on (`cgx.agents`, **🤖 Agent** tab). The planner routes scaffold
-  goals through a manifest-then-per-file chain, downgrades expensive
-  code-gen tasks to plain Q&A for read-only goals, and the tracker
-  streams live `task_progress` heartbeats so the UI never looks frozen on
-  long LLM calls. See [docs/flowcharts.md](docs/flowcharts.md) for a visual.
+- **Session-based Agent (default `/agent`).** A persistent,
+  session-shaped orchestrator (`cgx.session`) progresses one task at
+  a time and pauses at every branch for a typed human decision. The
+  loop has two shapes auto-selected (and user-overridable) by
+  `cgx.session.mode.detect_mode`:
+  - **Explore mode** (existing codebase with an index):
+    `EXPLORE → ASK_USER(choose_path) → INVESTIGATE → RECOMMEND →
+    ASK_USER(choose_recommendation) → PLAN_CHANGE →
+    ASK_USER(approve) → APPLY → VERIFY`.
+  - **Greenfield mode** (empty / non-indexed project root, or
+    user-selected): `CLARIFY_REQUIREMENTS →
+    ASK_USER(clarify_answers) → DECOMPOSE →
+    ASK_USER(approve_plan) → SCAFFOLD → APPLY → VERIFY`. The
+    agent asks 3–6 clarification questions, plans a layered file
+    manifest, generates each file with cross-file context, and
+    only writes to disk after the user approves the plan.
+
+  Each direction the user picks is recorded as a structured
+  `Decision`; nothing reaches disk without an explicit approval
+  checkpoint. Session state lives in
+  `<project_root>/.cgx/sessions.db` (SQLite, one row per
+  task/fact/artifact/decision), so a session can be resumed days
+  later. See the **🤖 Agent** tab and
+  [docs/flowcharts.md § Session-shaped write loop](docs/flowcharts.md#session-shaped-write-loop-agent).
+- **Legacy batch agent (`/agent-legacy`).** The original
+  Planner / Tracker / Judge loop is preserved for fire-and-forget
+  goals and new-project scaffolds. It decomposes a request into
+  atomic tasks (`ask`, `plan`, `scaffold`, `scaffold_manifest`,
+  `scaffold_file`, `search`, `summarize`, `apply`, `verify`,
+  `fill_logic`) and validates each artefact before moving on
+  (`cgx.agents`). The planner routes scaffold goals through a
+  manifest-then-per-file chain, downgrades expensive code-gen tasks
+  to plain Q&A for read-only goals, and the tracker streams live
+  `task_progress` heartbeats so the UI never looks frozen on long
+  LLM calls. Still the entry point exposed by the `cgx agent` CLI
+  and by `cgx.agents.run_agent`.
 - **New project generation.** Give CGX a plain-language idea
   (e.g. *"create a FastAPI todo app"* or *"create a React calculator
   app"*), set a destination directory as Project Root, and the
@@ -254,17 +281,30 @@ Tabs (left → right):
    before returning. The full self-test report renders inline. A
    **Cancel** button is available while planning is in progress; tab
    switching is non-destructive.
-5. **Agent** -- give CGX a goal, watch the **Planner → Tracker →
-   Judge** loop decompose it into 1–5 atomic tasks, dispatch each task
-   to a capability (`ask`, `plan`, `scaffold`, `search`, `summarize`,
-   `apply`, `verify`), and judge the artefact against per-task criteria.
-   For goals like *"create a new FastAPI project"* the planner emits a
-   `scaffold → apply → verify` chain that generates a complete project
-   from scratch in the Project Root directory. Live event log,
-   task-status table, and DAG view of the plan. A **Cancel** button is
-   available while the loop is running; tab switching keeps the agent
-   running and state is fully restored on return. The sidebar shows an
-   animated spinner next to this tab while a task is active.
+5. **Agent** (`/agent`) -- the **session-based** view. Start a
+   session with an objective, pick a **mode** (auto / explore /
+   greenfield -- *auto* defers to `detect_mode`), and watch the
+   agent walk the appropriate chain. Explore mode runs
+   `EXPLORE → INVESTIGATE → RECOMMEND → PLAN_CHANGE → APPLY →
+   VERIFY` against an existing codebase; greenfield mode runs
+   `CLARIFY_REQUIREMENTS → DECOMPOSE → SCAFFOLD → APPLY → VERIFY`
+   to bootstrap a new project. Both pause at every branch for a
+   typed choice. The task tree shows the full DAG with status
+   icons, depth-based indentation, and a side panel surfacing the
+   Knowledge Base (facts) and Artifacts (`DIRECTIONS_LIST`,
+   `FINDINGS_BUNDLE`, `RECOMMENDATION_LIST`, `CODE_CHANGE_PLAN`,
+   `REQUIREMENTS_SHEET`, `WORK_PLAN`, `SCAFFOLD_PATCHES`,
+   `APPLIED_CHANGES`, `VERIFY_REPORT`). Nothing reaches disk until
+   you tick the approval checkpoint, and an `Undo` button rolls
+   the run back via `POST /api/rollback`. Session state is
+   persisted to `<project_root>/.cgx/sessions.db`; the active
+   session id and selection are persisted client-side so a tab
+   switch / reload resumes the same view. The original batch
+   Planner → Tracker → Judge loop is preserved at
+   **`/agent-legacy`** -- pick it from the sidebar (or reach it
+   via the `cgx agent` CLI) for one-shot goals where you want a
+   single fire-and-forget run with no checkpoints. Both views
+   surface a **Cancel** button on long-running tasks.
 6. **Hardware** -- click **Detect hardware** to annotate the local
    model catalogue with ✅/⚠️/❌ fit verdicts against your machine. The
    second table shows the editorial local-vs-cloud trade-off across
@@ -390,10 +430,100 @@ under the plan in the UI.
 
 ---
 
-## Multi-agent orchestration
+## Session-based Agent (`/agent`)
 
-For requests that don't fit into a single Ask or Plan round-trip,
-CGX ships a Planner → Tracker → Judge loop in `cgx.agents`:
+The default Agent tab drives a **persistent, session-shaped** loop
+defined in `cgx.session`. Every interaction belongs to a `Session`
+whose state survives process restarts under
+`<project_root>/.cgx/sessions.db`. A session walks one of two
+chains -- the **mode** is auto-detected by
+`cgx.session.mode.detect_mode` at session creation (or set
+explicitly via the launcher / API), and dictates which root task
+the router seeds. Both shapes pause at every `ASK_USER` for a typed
+user decision:
+
+```
+# Explore mode (existing codebase + FAISS index)
+EXPLORE -> ASK_USER(choose_path)
+              -> INVESTIGATE -> RECOMMEND -> ASK_USER(choose_recommendation)
+                                                -> investigate_more (loop)
+                                                -> plan_change
+                                                     -> PLAN_CHANGE
+                                                        -> ASK_USER(approve)
+                                                           -> APPLY -> VERIFY
+                                                -> ask_followup / done
+
+# Greenfield mode (empty / non-indexed project root)
+CLARIFY_REQUIREMENTS -> ASK_USER(clarify_answers)
+                          -> DECOMPOSE -> ASK_USER(approve_plan)
+                                            -> SCAFFOLD -> APPLY -> VERIFY
+                                            -> (reject halts the loop)
+```
+
+Three modules own every transition:
+
+* `cgx.session.router.Router` -- pure-Python deterministic state
+  machine. No LLM calls, no I/O; returns a typed `RouterPlan` of
+  `CreateTask` / `UpdateTaskStatus` / `RecordDecision` /
+  `AttachDecisionToTask` actions. Reads `session.mode` to choose
+  the root task and the `TASK_SUCCESSOR` chain.
+* `cgx.session.runner.SessionRunner` -- per-session lock, executor
+  dispatch, failure handling, persistence sequencing.
+* `cgx.session.tasks.*` -- one registered executor per `TaskKind`:
+  explore-mode (`EXPLORE`, `INVESTIGATE`, `RECOMMEND`,
+  `PLAN_CHANGE`), greenfield-mode (`CLARIFY_REQUIREMENTS`,
+  `DECOMPOSE`, `SCAFFOLD`), and shared (`APPLY`, `VERIFY`,
+  `ASK_USER`).
+
+The HTTP surface is JSON-only at `/api/agent-session/*` (create /
+list / get / message / decision / delete). Mutating endpoints
+return the full `AgentSessionState` snapshot so the React UI
+re-renders the tree in one round-trip; `DELETE /api/agent-session/
+{sid}` discards a session and its aggregate (`ON DELETE CASCADE`)
+and returns `{deleted: sid}`. The UI polls
+`GET /api/agent-session/{sid}` while a non-`ASK_USER` task is in
+flight.
+
+Drive it programmatically (no UI required):
+
+```python
+from cgx.answer.providers import OllamaProvider
+from cgx.session import SessionRunner, SessionStore
+from cgx.session.models import Decision, DecisionKind
+import cgx.session.tasks  # noqa: F401 -- registers executors
+from cgx.session.tasks.base import ExecutorDeps
+
+store = SessionStore(project_root="/path/to/proj")
+runner = SessionRunner(store)
+session = runner.start_session(
+    objective="how should we refactor the parser layer?",
+    project_root="/path/to/proj",
+)
+deps = ExecutorDeps(
+    project_root="/path/to/proj",
+    index_dir="/tmp/cgx_index/indices",
+    records_path="/tmp/cgx_index/records.jsonl",
+    provider=OllamaProvider(model="qwen2.5-coder:3b"),
+    store=store,
+)
+task = runner.run_next(session_id=session.session_id, deps=deps)
+# `task` is now an ASK_USER waiting on a `choose_path` decision.
+```
+
+See [docs/Agent.md](docs/Agent.md), [docs/usage.md](docs/usage.md#6-session-based-agent-agent),
+and [docs/flowcharts.md](docs/flowcharts.md#session-shaped-write-loop-agent)
+for full reference.
+
+---
+
+## Legacy batch agent (`/agent-legacy`)
+
+For one-shot goals -- *"add docstrings to every public function in
+`cgx.parser`"*, *"create a FastAPI todo app with SQLite and pytest
+tests"* -- the original Planner → Tracker → Judge loop is preserved
+at `/agent-legacy` (and via the `cgx agent` CLI). It is also the
+only path that runs the new-project scaffold pipeline
+(`scaffold_manifest → scaffold_file × N → apply → verify`).
 
 1. The **Planner** decomposes your goal into 1–5 ordered atomic
    `Task`s, each tagged with a short `name`, a `description`, a `kind`
@@ -421,7 +551,8 @@ CGX ships a Planner → Tracker → Judge loop in `cgx.agents`:
    before optionally asking the LLM for a strict
    `{verdict, confidence, rationale}` JSON.
 
-Use it from the **🤖 Agent** tab, or programmatically:
+Use it from the **🤖 Agent** tab's **`/agent-legacy`** view, or
+programmatically:
 
 ```python
 from cgx.agents import run_agent
@@ -460,8 +591,8 @@ for task in plan.tasks:
     print(task.kind, task.status, task.output)
 ```
 
-The Agent tab renders the same `AgentEvent` stream as a live status
-table + DAG (`src/cgx/agents/viz.py`).
+The `/agent-legacy` view renders the same `AgentEvent` stream as a
+live status table + DAG (`src/cgx/agents/viz.py`).
 
 ---
 

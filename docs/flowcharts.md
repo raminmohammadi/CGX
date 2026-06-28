@@ -11,16 +11,33 @@ scales cleanly, and renders inline on GitHub.
 
 Install once, point CGX at a repo, then ask questions or request changes in
 plain English. The **Ask** tab returns a streaming, cited explanation; the
-**Plan** tab returns a self-tested code-change diff; the **Agent** tab handles
-larger goals -- including generating brand-new projects from scratch -- by
-decomposing them into 1–6 atomic tasks with live progress. Everything runs
-locally by default -- cloud LLMs are strictly opt-in.
+**Plan** tab returns a self-tested code-change diff; the **Agent** tab
+(`/agent`) now drives a **persistent, session-shaped** loop with two
+modes: **explore** surveys an existing codebase, surfaces typed
+options, asks the user to pick a direction at every branch, and only
+commits a change after an explicit approval checkpoint; **greenfield**
+scaffolds a brand-new project from scratch -- the agent asks
+clarification questions, proposes a layered file manifest, generates
+each file with cross-file context, and only writes to disk after the
+user approves the plan. The
+[session-shaped write loop](#session-shaped-write-loop-agent) below
+walks through both modes. The original one-shot Planner → Tracker →
+Judge view (still useful for fire-and-forget goals) is preserved at
+`/agent-legacy`. Everything runs locally by default -- cloud LLMs are
+strictly opt-in.
 
 ---
 
 ## For developers
 
 ![CGX developer flow](diagrams/flow_developer.svg)
+
+> The developer SVG above describes the **legacy batch agent** that
+> still backs `/agent-legacy` and the `cgx agent` CLI. The default
+> `/agent` route in the UI is now driven by the
+> [session-shaped write loop](#session-shaped-write-loop-agent)
+> described below; the two loops coexist and share the underlying
+> retrieval / codegen / provider stacks.
 
 `cgx.agents.run_agent` wires the **Planner → Tracker → Judge** loop. The
 Planner asks the LLM for a strict-JSON
@@ -137,17 +154,206 @@ changes to the orchestrator or codegen layers.
 
 ---
 
+## Session-shaped write loop (`/agent`)
+
+The default Agent UI is backed by `cgx.session`, a stateful
+orchestrator that progresses one task at a time and pauses at every
+branch for a typed human decision. Two loop shapes share the same
+runner / store / decision plumbing -- the **mode** chosen at session
+creation (auto-detected by `cgx.session.mode.detect_mode`, or
+overridden via the launcher) determines which root task is seeded:
+
+* **explore** mode -- the project root exists with a usable FAISS
+  index. The session walks the retrieval-grounded flow that surveys
+  candidates and modifies existing code.
+* **greenfield** mode -- the project root is missing, empty, or has
+  no index. The session walks a goal-driven scaffold flow that
+  clarifies requirements, plans the file manifest, generates each
+  file with cross-file context, and only then writes anything to
+  disk.
+
+Both loops converge on the shared `APPLY → VERIFY` tail, and every
+`ASK_USER` in either path is a structured checkpoint, not a freeform
+prompt.
+
+### Explore loop
+
+```
+                       user message
+                            |
+                            v
+                     +-----------+      (no tasks yet -> spawn root)
+                     |  EXPLORE  |  produces DIRECTIONS_LIST artifact
+                     +-----------+         + one ANCHOR fact per option
+                            |
+                            v
+                +-------------------------+
+                | ASK_USER(choose_path)   |   <-- waits for user pick
+                +-------------------------+
+                            |
+                            v
+                    +---------------+
+                    |  INVESTIGATE  |  anchored retrieval ->
+                    +---------------+    FINDINGS_BUNDLE artifact
+                            |
+                            v
+                    +---------------+
+                    |   RECOMMEND   |  typed RECOMMENDATION_LIST
+                    +---------------+    (kind per recommendation:
+                            |              investigate_more |
+                            v              plan_change      |
+            +-----------------------------+ ask_followup    |
+            | ASK_USER(choose_           | done)
+            |   recommendation)           |
+            +-----------------------------+
+                |       |        |          |
+   investigate_more  plan_change |  ask_followup / done
+                |       |        |          |
+                v       v        v          v
+       (loop back)  +-----------+  ASK_USER(   (no successor;
+                    |PLAN_CHANGE|  freeform)    a new user message
+                    +-----------+               spawns a sibling
+                          |                     EXPLORE)
+                          v
+                +--------------------+
+                | ASK_USER(approve)  |
+                +--------------------+
+                  approved=true | approved=false
+                          v        |
+                      +-------+    (no successor)
+                      | APPLY |  writes diffs to disk +
+                      +-------+   per-run .cgx-backups mirror
+                          |
+                          v
+                      +--------+
+                      | VERIFY |  pytest on impacted tests
+                      +--------+    -> VERIFY_REPORT artifact
+```
+
+### Greenfield loop
+
+```
+                       user message
+                            |
+                            v
+              +------------------------------+
+              |   CLARIFY_REQUIREMENTS       |  3-6 questions emitted
+              +------------------------------+    (LLM, with deterministic
+                            |                     fallback bank)
+                            v                  -> REQUIREMENTS_SHEET
+              +------------------------------+
+              | ASK_USER(clarify_answers)    |  <-- one textarea/question;
+              +------------------------------+      answers folded into goal
+                            |
+                            v
+                  +-------------------+
+                  |    DECOMPOSE      |  plan_scaffold_manifest ->
+                  +-------------------+   WORK_PLAN artifact
+                            |              (plan_md + layered file list)
+                            v
+              +------------------------------+
+              |  ASK_USER(approve_plan)      |  <-- [Approve & Scaffold |
+              +------------------------------+      Reject]
+                approved=true | approved=false
+                            v        |
+                  +-------------------+   (no successor; loop halts,
+                  |    SCAFFOLD       |    no files written)
+                  +-------------------+
+                            |   per-file generate_single_scaffold_file,
+                            |   accumulates sibling context;
+                            |   failures captured in `failed[]`
+                            v -> SCAFFOLD_PATCHES artifact
+                       +-------+
+                       | APPLY |  same writer as explore; inputs carry
+                       +-------+  mode=greenfield
+                            |
+                            v
+                       +--------+
+                       | VERIFY |  pytest if tests discovered, else
+                       +--------+   ran=False + skipped_reason
+```
+
+Three pieces of code own every transition:
+
+* **`cgx.session.router.Router`** is pure Python with no LLM calls
+  and no I/O. Every transition is one of three entry points
+  (`on_user_message`, `on_task_completed`, `on_decision_recorded`)
+  that returns a `RouterPlan` of typed actions (`CreateTask`,
+  `UpdateTaskStatus`, `RecordDecision`, `AttachDecisionToTask`). The
+  successor for any non-ASK kind comes from the `TASK_SUCCESSOR`
+  dispatch table; the successor for an `ASK_USER` is driven by the
+  shape of the resolving `Decision`.
+* **`cgx.session.runner.SessionRunner`** is the orchestrator the
+  HTTP routes call. It sequences router plans through the store,
+  acquires a per-session lock so concurrent requests can't interleave
+  half-applied plans, dispatches each `READY` task to its registered
+  executor, and centralises failure handling (missing executor /
+  uncaught exception → task transitions to `FAILED` with a helpful
+  message; facts surfaced before the error are still persisted).
+* **`cgx.session.tasks.*`** are the per-`TaskKind` executors. Pure
+  functions `(TaskNode, ExecutorDeps) -> ExecutorResult`; the runner
+  persists their `outputs`, `facts`, and `artifact` after the call so
+  executors are unit-testable without a database.
+
+The HTTP surface (`/api/agent-session`) is JSON-only with six
+endpoints (create / list / get / message / decision / delete).
+Mutating endpoints return the full `AgentSessionState` snapshot, so
+the React UI re-renders the whole tree in one round-trip; `DELETE`
+returns `{deleted: sid}` and the UI refreshes the session list.
+While a task is
+`IN_PROGRESS` (other than an `ASK_USER`) the UI polls
+`GET /api/agent-session/{sid}` until it pauses. Sessions persist to
+`<project_root>/.cgx/sessions.db` (one SQLite file per project root,
+WAL mode, JSON-blob rows with indexed columns).
+
+The decision contract is pinned by `build_decision` in
+`cgx.session.tasks.ask`: `choose_path` requires `anchor_chunk_id`,
+`choose_recommendation` requires `kind ∈ {investigate_more,
+plan_change, ask_followup, done}` (and `anchor_chunk_id` when
+`kind=investigate_more`), `approve` requires `approved: bool`,
+`clarify_answers` requires a non-empty `answers` dict keyed by
+question id, `approve_plan` requires `approved: bool`, `freeform`
+requires only `text`. A mismatch returns HTTP `400` without spawning
+a successor task, so the frontend can surface the exact failure and
+let the user resubmit.
+
+Where to look in the repo:
+
+| Concern                  | Module |
+|--------------------------|--------|
+| State / data model       | `src/cgx/session/models.py` |
+| Mode auto-detection      | `src/cgx/session/mode.py :: detect_mode` |
+| Transitions              | `src/cgx/session/router.py` |
+| Orchestrator             | `src/cgx/session/runner.py` |
+| Persistence              | `src/cgx/session/store.py` |
+| Explore executors        | `src/cgx/session/tasks/{explore,investigate,recommend,plan_change}.py` |
+| Greenfield executors     | `src/cgx/session/tasks/{clarify_requirements,decompose,scaffold}.py` |
+| Shared write executors   | `src/cgx/session/tasks/{apply,verify,ask}.py` |
+| Decision validation      | `src/cgx/session/tasks/ask.py :: build_decision` |
+| HTTP routes              | `src/cgx/webui/routes/agent_session.py` |
+| Wire models              | `src/cgx/webui/models.py :: AgentSession*` |
+| Frontend page            | `frontend/src/pages/AgentPage.tsx` + `frontend/src/components/agent/` |
+| Integration tests        | `tests/test_webui_agent_session.py`, `tests/test_session.py` |
+
+---
+
 ## For companies
 
 ![CGX trust boundaries](diagrams/flow_company.svg)
 
-Source code, embeddings, FAISS indices, chat sessions, the SQLite task
-registry (`~/.cgx/tasks.db`), and the embedding cache all live on the
-local machine under `~/.cgx/` and `indices/`. The agent loop runs
-in-process and streams SSE over localhost; the task registry persists
-every event so the UI can replay a tab on remount and `DELETE
-/api/tasks/{id}` can cancel a running stream -- there is no analytics
-or telemetry channel. Credentials live in the OS keyring when
+Source code, embeddings, FAISS indices, chat sessions, the SQLite
+task registry (`~/.cgx/tasks.db`), the session-based agent's
+persistent state (`<project_root>/.cgx/sessions.db`, or
+`~/.cgx/sessions.db` when no project root is configured), and the
+embedding cache all live on the local machine under `~/.cgx/` and
+`indices/`. The legacy batch agent streams SSE over localhost and
+persists every event into the task registry so the UI can replay a
+tab on remount and `DELETE /api/tasks/{id}` can cancel a running
+stream; the session-based agent at `/api/agent-session/*` is
+JSON-only and writes every task, fact, artifact, and decision into
+`sessions.db` so a session can be resumed days later without an
+intervening process surviving. Neither surface has an analytics or
+telemetry channel. Credentials live in the OS keyring when
 available (`0600`-permissioned file fallback) and are never echoed to
 event payloads or tool-call arguments. The only opt-in egress is when
 a profile points at a remote provider -- **OpenAI-compatible**, **Google
