@@ -30,6 +30,7 @@ from cgx.session.repair.classify import (
     failure_signature,
     missing_fixture_names,
     missing_module_names,
+    third_party_import_breaks,
 )
 
 __all__ = [
@@ -39,4 +40,5 @@ __all__ = [
     "failure_signature",
     "missing_fixture_names",
     "missing_module_names",
+    "third_party_import_breaks",
 ]

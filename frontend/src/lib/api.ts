@@ -179,9 +179,12 @@ export type ArtifactKind =
   | "work_plan"
   | "scaffold_patches"
   | "build_report"
-  | "repair_plan";
+  | "repair_plan"
+  | "smoke_report"
+  | "api_check_report";
 
-export type FactKind = "file" | "symbol" | "parameter" | "anchor";
+export type FactKind =
+  | "file" | "symbol" | "parameter" | "anchor" | "llm_call";
 
 export type DecisionKind =
   | "choose_path"

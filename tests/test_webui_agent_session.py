@@ -486,6 +486,36 @@ def _install_greenfield_stubs() -> None:
                      "installed_count": 0, "failed_count": 0},
             artifact=art)
 
+    @register_executor(TaskKind.API_CHECK)
+    def _api_check(task, deps):
+        art = Artifact.new(
+            task.session_id, task.task_id, ArtifactKind.API_CHECK_REPORT,
+            {"build_artifact_id": task.inputs.get("build_artifact_id"),
+             "applied_files": ["app.py"], "references": [],
+             "outcome": "skipped", "failed_references": [],
+             "failure_signature": "", "probe_error": None})
+        return ExecutorResult(
+            outputs={"api_check_artifact_id": art.artifact_id,
+                     "outcome": "skipped",
+                     "failed_count": 0, "checked_count": 0,
+                     "failure_signature": ""},
+            artifact=art)
+
+    @register_executor(TaskKind.SMOKE)
+    def _smoke(task, deps):
+        art = Artifact.new(
+            task.session_id, task.task_id, ArtifactKind.SMOKE_REPORT,
+            {"build_artifact_id": task.inputs.get("build_artifact_id"),
+             "applied_files": ["app.py"], "modules": [],
+             "outcome": "skipped", "failed_modules": [],
+             "failure_signature": ""})
+        return ExecutorResult(
+            outputs={"smoke_artifact_id": art.artifact_id,
+                     "outcome": "skipped",
+                     "failed_count": 0, "tested_count": 0,
+                     "failure_signature": ""},
+            artifact=art)
+
     @register_executor(TaskKind.VERIFY)
     def _verify(task, deps):
         # Greenfield: no tests yet, so VERIFY emits a skipped report.
@@ -579,14 +609,20 @@ def test_full_greenfield_loop_via_http(
     boot_t = _find_task(state, kind="bootstrap_env")
     assert boot_t is not None and boot_t["status"] == "done"
     assert boot_t["inputs"].get("apply_artifact_id")
+    api_t = _find_task(state, kind="api_check")
+    assert api_t is not None and api_t["status"] == "done"
+    assert api_t["inputs"].get("build_artifact_id")
+    smoke_t = _find_task(state, kind="smoke")
+    assert smoke_t is not None and smoke_t["status"] == "done"
+    assert smoke_t["inputs"].get("build_artifact_id")
     verify_t = _find_task(state, kind="verify")
     assert verify_t is not None and verify_t["status"] == "done"
     assert verify_t["inputs"].get("build_artifact_id")
 
     kinds = {a["kind"] for a in state["artifacts"]}
     assert {"requirements_sheet", "work_plan", "scaffold_patches",
-            "applied_changes", "build_report",
-            "verify_report"}.issubset(kinds)
+            "applied_changes", "build_report", "api_check_report",
+            "smoke_report", "verify_report"}.issubset(kinds)
     assert "directions_list" not in kinds
 
 

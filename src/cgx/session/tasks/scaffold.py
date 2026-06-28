@@ -25,6 +25,8 @@ from cgx.session.models import (
     TaskKind,
     TaskNode,
 )
+from cgx.session.repair.pypi_client import PyPIClient
+from cgx.session.scaffold_validate import validate_scaffold_diffs
 from cgx.session.tasks.base import (
     ExecutorDeps,
     ExecutorResult,
@@ -59,6 +61,25 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     if not layers:
         return ExecutorResult(
             failure="SCAFFOLD: work plan carries no layers")
+
+    # Phase 6.1: when REPAIR routed a regenerate verdict here, fold the
+    # accumulated constraint payloads into the goal so the per-file
+    # generator sees the prior-failure context. Each entry is a small
+    # ``{kind, rationale, ...}`` dict shaped by the classifier; the
+    # join keeps the prompt human-readable without leaking JSON syntax.
+    regenerate_constraints = task.inputs.get("regenerate_constraints")
+    if isinstance(regenerate_constraints, list) and regenerate_constraints:
+        goal = _augment_goal_with_constraints(goal, regenerate_constraints)
+
+    # Phase 7.1: pull matching cross-session lessons (recorded after
+    # prior REPAIR -> VERIFY-pass cycles) and inject them as additional
+    # constraints. Scored by stack overlap + objective-keyword overlap;
+    # noop when the store is empty so the happy path stays unchanged.
+    lesson_constraints = _lessons_as_constraints(goal, content)
+    if lesson_constraints:
+        goal = _augment_goal_with_constraints(goal, lesson_constraints,
+                                              header="Lessons from prior "
+                                              "sessions to apply:")
 
     # Lazy import: drags the scaffold prompt templates.
     from cgx.answer.engine import generate_single_scaffold_file
@@ -122,6 +143,23 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         return ExecutorResult(
             failure="SCAFFOLD: every file generation failed")
 
+    # Phase 4.1: tighten upper bounds on known-fragile peers using the
+    # consumer's PyPI ``requires_dist`` *before* APPLY writes the file.
+    # Network / fetch failures degrade to no-op (returns the original
+    # diffs and empty adjustments) so SCAFFOLD never blocks on PyPI.
+    pin_adjustments: List[Dict[str, Any]] = []
+    try:
+        pypi_client = _resolve_pypi_client(deps)
+        file_contents = {e["path"]: e["content"]
+                         for e in existing_with_content
+                         if e.get("path") and isinstance(e.get("content"), str)}
+        diffs, _, pin_adjustments = validate_scaffold_diffs(
+            diffs, file_contents, pypi_client=pypi_client)
+    except Exception:  # pragma: no cover - defensive: validator is best-effort
+        logger.exception(
+            "SCAFFOLD: pin validator raised; emitting unmodified diffs")
+        pin_adjustments = []
+
     artifact = Artifact.new(
         session_id=task.session_id,
         produced_by_task_id=task.task_id,
@@ -133,6 +171,7 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             "diffs": diffs,
             "generated": generated,
             "failed": failed,
+            "pin_adjustments": pin_adjustments,
         },
     )
     return ExecutorResult(
@@ -140,6 +179,99 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             "scaffold_artifact_id": artifact.artifact_id,
             "generated_count": len(generated),
             "failed_count": len(failed),
+            "pin_adjustments_count": len(pin_adjustments),
         },
         artifact=artifact,
     )
+
+
+def _resolve_pypi_client(deps: ExecutorDeps) -> PyPIClient:
+    """Return the injected PyPI client, or build a default."""
+    injected = (deps.extra or {}).get("pypi_client")
+    if isinstance(injected, PyPIClient):
+        return injected
+    return PyPIClient()
+
+
+def _augment_goal_with_constraints(
+        goal: str, constraints: List[Dict[str, Any]],
+        *, header: str = "Prior-attempt failures to avoid this time:") -> str:
+    """Append ``constraints`` to ``goal`` under ``header`` as a bulleted tail.
+
+    Each entry is rendered as ``- <kind>: <rationale>`` so the LLM
+    sees the failure as a structured caveat rather than free-form
+    context. The original goal is preserved verbatim; the tail is
+    delimited by a blank line + header so prompt-builders that split on
+    line ranges keep working. The header is configurable so Phase 7.1
+    lessons can re-use the same shape with a clearer call-out.
+    """
+    lines = ["", header]
+    for entry in constraints:
+        if not isinstance(entry, dict):
+            continue
+        kind = str(entry.get("kind") or "constraint").strip()
+        rationale = str(entry.get("rationale") or "").strip()
+        if rationale:
+            lines.append(f"- {kind}: {rationale}")
+        else:
+            lines.append(f"- {kind}")
+    if len(lines) == 2:
+        return goal
+    return f"{goal}\n" + "\n".join(lines) if goal else "\n".join(lines[1:])
+
+
+def _lessons_as_constraints(
+        goal: str, work_plan: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Translate matching :mod:`cgx.session.lessons` records into constraint dicts.
+
+    Best-effort: any failure in the lesson store (missing file, OS
+    error, malformed JSON) is swallowed by the underlying
+    :func:`relevant_lessons` and surfaces here as an empty list.
+    """
+    from cgx.session.lessons import relevant_lessons
+
+    stack = _extract_stack_packages(work_plan)
+    try:
+        lessons = relevant_lessons(objective=goal, stack=stack, limit=3)
+    except Exception as exc:  # pragma: no cover - best effort
+        logger.warning("scaffold: relevant_lessons failed: %s", exc)
+        return []
+    out: List[Dict[str, Any]] = []
+    for lesson in lessons:
+        cls = str(lesson.get("classification") or "lesson").strip()
+        sig = str(lesson.get("trigger_signature") or "").strip()
+        fix = lesson.get("applied_fix") or {}
+        files = fix.get("files") or []
+        files_part = (f" (touched {', '.join(files[:3])}"
+                      f"{'...' if len(files) > 3 else ''})") if files else ""
+        rationale = (
+            f"A previous session hit {sig!r} and fixed it via "
+            f"{fix.get('strategy') or 'patch'}{files_part}; avoid the "
+            "same trigger here.")
+        out.append({"kind": f"lesson:{cls}", "rationale": rationale})
+    return out
+
+
+def _extract_stack_packages(work_plan: Dict[str, Any]) -> List[str]:
+    """Return the package list a SCAFFOLD goal is targeting.
+
+    Reads from ``requirements_pins`` first (the curated list a DECOMPOSE
+    leaves on the WORK_PLAN) and falls back to the layer-derived
+    ``pins`` field; either way the result is a list of bare package
+    names with no version specifier.
+    """
+    out: List[str] = []
+    for key in ("requirements_pins", "pins", "stack"):
+        pins = work_plan.get(key)
+        if isinstance(pins, list):
+            for entry in pins:
+                if isinstance(entry, str):
+                    name = entry.split("==")[0].split(">=")[0]
+                    name = name.split("<")[0].split(";")[0].strip()
+                    if name:
+                        out.append(name)
+                elif isinstance(entry, dict):
+                    name = str(entry.get("name") or "").strip()
+                    if name:
+                        out.append(name)
+    return out

@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 from cgx.session.models import (
     Decision,
@@ -37,10 +37,12 @@ from cgx.session.router import (
     AttachDecisionToTask,
     CreateTask,
     RecordDecision,
+    RecordLesson,
     Router,
     RouterPlan,
     UpdateTaskStatus,
 )
+from cgx.session.agent_log import log_event
 from cgx.session.store import SessionStore
 from cgx.session.tasks.base import ExecutorDeps, ExecutorResult, dispatch
 
@@ -157,24 +159,57 @@ class SessionRunner:
         task.status = TaskNodeStatus.IN_PROGRESS
         task.started_at = time.time()
         self._store.save_task(task)
+        log_event(session.project_root, "task_started",
+                  session_id=session.session_id, task_id=task.task_id,
+                  kind=task.kind.value, name=task.name)
 
+        provider = getattr(deps, "provider", None)
+        traced = provider is not None and hasattr(provider, "bind") \
+            and hasattr(provider, "drain")
+        if traced:
+            provider.bind(session.session_id, task.task_id)
         try:
-            result = dispatch(task, deps)
-        except LookupError as exc:
-            logger.warning("runner: %s", exc)
-            return self._mark_failed(task, str(exc))
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.exception("runner: executor crashed")
-            return self._mark_failed(
-                task, f"{type(exc).__name__}: {exc}")
+            try:
+                result = dispatch(task, deps)
+            except LookupError as exc:
+                logger.warning("runner: %s", exc)
+                log_event(session.project_root, "executor_missing",
+                          session_id=session.session_id,
+                          task_id=task.task_id,
+                          kind=task.kind.value, error=str(exc))
+                if traced:
+                    for fact in provider.drain():
+                        self._store.add_fact(fact)
+                return self._mark_failed(session, task, str(exc))
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.exception("runner: executor crashed")
+                log_event(session.project_root, "executor_crashed",
+                          session_id=session.session_id,
+                          task_id=task.task_id,
+                          kind=task.kind.value,
+                          exc_type=type(exc).__name__, error=str(exc))
+                if traced:
+                    for fact in provider.drain():
+                        self._store.add_fact(fact)
+                return self._mark_failed(
+                    session, task, f"{type(exc).__name__}: {exc}")
+        finally:
+            if traced:
+                provider.unbind()
 
         # Persist facts even on failure -- they're append-only context
-        # that may help the user diagnose what went wrong.
+        # that may help the user diagnose what went wrong. Tracing facts
+        # are drained from the provider after the executor returns so
+        # both executor-emitted facts and LLM-call facts land in the
+        # same persistence loop.
+        if traced:
+            for fact in provider.drain():
+                self._store.add_fact(fact)
         for fact in result.facts:
             self._store.add_fact(fact)
 
         if result.failure:
-            return self._mark_failed(task, result.failure)
+            return self._mark_failed(session, task, result.failure)
 
         if result.artifact is not None:
             self._store.save_artifact(result.artifact)
@@ -185,11 +220,20 @@ class SessionRunner:
         if task.kind is TaskKind.ASK_USER:
             # Stays IN_PROGRESS until apply_decision posts a Decision.
             self._store.save_task(task)
+            log_event(session.project_root, "task_waiting_user",
+                      session_id=session.session_id, task_id=task.task_id,
+                      kind=task.kind.value)
             return task
 
         task.status = TaskNodeStatus.DONE
         task.completed_at = time.time()
         self._store.save_task(task)
+        log_event(session.project_root, "task_completed",
+                  session_id=session.session_id, task_id=task.task_id,
+                  kind=task.kind.value,
+                  artifact_id=task.produced_artifact_id,
+                  duration_ms=int(((task.completed_at or 0.0)
+                                   - (task.started_at or 0.0)) * 1000))
 
         tasks_after = self._store.list_tasks(session.session_id)
         successor_plan = self._router.on_task_completed(
@@ -197,11 +241,15 @@ class SessionRunner:
         self._apply_plan(session, successor_plan)
         return task
 
-    def _mark_failed(self, task: TaskNode, message: str) -> TaskNode:
+    def _mark_failed(self, session: Session, task: TaskNode,
+                     message: str) -> TaskNode:
         task.status = TaskNodeStatus.FAILED
         task.error = message
         task.completed_at = time.time()
         self._store.save_task(task)
+        log_event(session.project_root, "task_failed",
+                  session_id=session.session_id, task_id=task.task_id,
+                  kind=task.kind.value, error=message)
         return task
 
     def _apply_plan(self, session: Session, plan: RouterPlan) -> None:
@@ -239,6 +287,62 @@ class SessionRunner:
                 if action.status is TaskNodeStatus.DONE:
                     t.completed_at = time.time()
                 self._store.save_task(t)
+            elif isinstance(action, RecordLesson):
+                self._record_lesson(session, action)
             else:  # pragma: no cover - exhaustive at the type level
                 logger.warning("runner: unknown action %r", action)
+
+    def _record_lesson(self, session: Session,
+                       action: RecordLesson) -> None:
+        """Resolve a :class:`RecordLesson` action into a lessons.jsonl row.
+
+        Best-effort: missing artifacts, malformed REPAIR_PLAN content,
+        or disk failures are logged and swallowed so a learning hiccup
+        cannot break the rest of the router plan.
+        """
+        from cgx.session.lessons import (
+            extract_objective_keywords,
+            record_lesson,
+        )
+
+        repair = self._store.get_task(action.repair_task_id)
+        if repair is None or not repair.produced_artifact_id:
+            return
+        plan_artifact = self._store.get_artifact(repair.produced_artifact_id)
+        if plan_artifact is None:
+            return
+        content = plan_artifact.content or {}
+        signature = str(content.get("failure_signature") or "").strip()
+        classification = str(content.get("classification") or "").strip()
+        if not signature or not classification:
+            return
+        diffs = content.get("diffs") or []
+        applied_fix: Dict[str, Any] = {
+            "strategy": content.get("strategy") or (
+                "patch" if diffs else "regenerate"),
+            "diff_count": len(diffs) if isinstance(diffs, list) else 0,
+            "files": sorted({d.get("file") for d in diffs
+                             if isinstance(d, dict) and d.get("file")})
+            if isinstance(diffs, list) else [],
+            "extra_constraints": content.get("extra_constraints") or {},
+        }
+        scope: Dict[str, Any] = {}
+        if action.scaffold_task_id:
+            scaffold = self._store.get_task(action.scaffold_task_id)
+            if scaffold is not None:
+                goal = (scaffold.inputs or {}).get("prior_goal") or ""
+                scope["objective_keywords"] = extract_objective_keywords(goal)
+                pkgs = (scaffold.inputs or {}).get("stack_packages") or []
+                if isinstance(pkgs, list):
+                    scope["stack"] = [str(p) for p in pkgs]
+        try:
+            record_lesson(
+                trigger_signature=signature,
+                classification=classification,
+                applied_fix=applied_fix,
+                scope=scope,
+                session_id=session.session_id,
+            )
+        except Exception as exc:  # pragma: no cover - best effort
+            logger.warning("runner: record_lesson failed: %s", exc)
 

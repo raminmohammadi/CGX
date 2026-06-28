@@ -27,7 +27,12 @@ visible.
 from __future__ import annotations
 
 import logging
-from typing import Any, List, Optional, Tuple
+import os
+import shlex
+import tempfile
+import xml.etree.ElementTree as ET
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from cgx.session.models import (
     Artifact,
@@ -77,20 +82,37 @@ def run_verify(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     from cgx.codegen.test_runner import run_tests_on_disk
 
     timeout = float(task.inputs.get("timeout_seconds") or 180.0)
+    # Allocate a junitxml sink so the classifier can consume structured
+    # failure records instead of re-parsing pytest's stdout. ``-rN`` keeps
+    # the short summary off (we already have the XML); ``--tb=long`` makes
+    # the rendered traceback usable when a human opens the artifact.
+    junit_fd, junit_path = tempfile.mkstemp(prefix="cgx_junit_", suffix=".xml")
+    os.close(junit_fd)
+    extra_pytest_args = (
+        "-q", "--no-header", "-rN", "--tb=long",
+        f"--junitxml={junit_path}",
+    )
     try:
         outcome = run_tests_on_disk(
             deps.project_root, changed_files,
             timeout_seconds=timeout,
             python_exe=python_exe,
+            extra_pytest_args=extra_pytest_args,
         )
     except Exception as exc:
         logger.exception("VERIFY: run_tests_on_disk crashed")
+        _unlink_quiet(junit_path)
         return ExecutorResult(
             failure=f"verify failed: {type(exc).__name__}: {exc}")
+
+    failures = _parse_junit_failures(junit_path)
+    _unlink_quiet(junit_path)
 
     tests_passed = bool(outcome.ran and outcome.returncode == 0)
     verify_outcome = _classify_outcome(outcome)
     mode = str(task.inputs.get("mode") or "explore").strip() or "explore"
+    reproduce_cmd = _build_reproduce_cmd(
+        deps.project_root, python_exe, list(outcome.tests_selected))
     content = {
         "apply_artifact_id": task.inputs.get("apply_artifact_id"),
         "plan_artifact_id": task.inputs.get("plan_artifact_id"),
@@ -107,6 +129,8 @@ def run_verify(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         "stdout": outcome.stdout or "",
         "stderr": outcome.stderr or "",
         "skipped_reason": outcome.skipped_reason,
+        "reproduce_cmd": reproduce_cmd,
+        "failures": failures,
     }
     # Pre-compute the repair-loop signature here (rather than in the
     # router) so the deterministic Router stays IO-free; the value is
@@ -211,3 +235,88 @@ def _classify_outcome(outcome: Any) -> str:
     if rc == 124:
         return "timeout"
     return "collection_error"
+
+
+def _build_reproduce_cmd(project_root: str,
+                         python_exe: Optional[str],
+                         tests_selected: Sequence[str]) -> Optional[str]:
+    """Return a single shell line that re-runs the exact pytest invocation.
+
+    Mirrors the cwd, interpreter and extra args used by
+    :func:`cgx.codegen.test_runner.run_pytest_paths` -- including the
+    auto-detected venv python when the caller didn't pin one -- so a
+    developer can paste the line into a terminal and reproduce the
+    failure verbatim. Returns ``None`` when no tests were selected
+    (nothing meaningful to reproduce).
+    """
+    if not tests_selected:
+        return None
+    # Late import to avoid a top-level dep cycle through test_runner's
+    # subprocess + pytest discovery.
+    from cgx.codegen.test_runner import _project_python_exe
+    root = Path(project_root).resolve()
+    py = python_exe or _project_python_exe(root)
+    rel_tests: List[str] = []
+    for t in tests_selected:
+        p = Path(t)
+        try:
+            rel_tests.append(str(p.resolve().relative_to(root)))
+        except (ValueError, OSError):
+            rel_tests.append(str(p))
+    parts = [shlex.quote(py), "-m", "pytest", "-q", "--no-header",
+             *(shlex.quote(t) for t in rel_tests)]
+    return f"cd {shlex.quote(str(root))} && " + " ".join(parts)
+
+
+
+def _parse_junit_failures(junit_path: str) -> List[Dict[str, str]]:
+    """Return structured failure / error records from a JUnit XML file.
+
+    Pytest writes one ``<testcase>`` element per collected test under
+    ``--junitxml``; failures carry a nested ``<failure>`` (assertion
+    failed) and errors a ``<error>`` (collection / setup / teardown
+    crash). For each, we extract the ``classname.name`` nodeid, the
+    type / message attributes, and the captured traceback text so the
+    classifier can pattern-match on import errors, name errors etc.
+    without re-parsing the human-oriented stdout.
+
+    Returns an empty list when the file is missing, empty, or unparsable
+    -- VERIFY still records ``stdout`` / ``stderr`` for the human view.
+    """
+    try:
+        if not junit_path or not os.path.isfile(junit_path):
+            return []
+        if os.path.getsize(junit_path) == 0:
+            return []
+        tree = ET.parse(junit_path)
+    except (ET.ParseError, OSError) as exc:
+        logger.debug("VERIFY: junitxml parse failed: %s", exc)
+        return []
+    failures: List[Dict[str, str]] = []
+    for case in tree.iter("testcase"):
+        for tag in ("failure", "error"):
+            node = case.find(tag)
+            if node is None:
+                continue
+            classname = case.get("classname") or ""
+            name = case.get("name") or ""
+            if classname and name:
+                nodeid = f"{classname}::{name}"
+            else:
+                nodeid = classname or name or ""
+            failures.append({
+                "nodeid": nodeid,
+                "kind": tag,
+                "type": node.get("type") or "",
+                "message": node.get("message") or "",
+                "traceback": (node.text or "").strip(),
+            })
+    return failures
+
+
+def _unlink_quiet(path: str) -> None:
+    """Best-effort unlink; swallow ENOENT and permission errors."""
+    try:
+        os.unlink(path)
+    except OSError:
+        pass

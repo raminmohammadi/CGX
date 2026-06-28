@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Iterable, List, Optional, Union
+from typing import Dict, Iterable, List, Optional, Union
 
 from cgx.session.models import (
     Decision,
@@ -70,8 +70,21 @@ class AttachDecisionToTask:
     decision_id: str
 
 
+@dataclass
+class RecordLesson:
+    """Persist a successful REPAIR -> VERIFY-pass pair as a cross-session lesson.
+
+    The router emits this when a VERIFY succeeds with a REPAIR on the
+    ancestor chain (Phase 7.1). The runner resolves the artifacts and
+    writes via :func:`cgx.session.lessons.record_lesson`.
+    """
+    verify_task_id: str
+    repair_task_id: str
+    scaffold_task_id: Optional[str] = None
+
+
 RouterAction = Union[CreateTask, UpdateTaskStatus, RecordDecision,
-                     AttachDecisionToTask]
+                     AttachDecisionToTask, RecordLesson]
 
 
 @dataclass
@@ -232,19 +245,23 @@ def _apply_to_verify(parent: TaskNode) -> List[TaskNode]:
     )]
 
 
-def _bootstrap_to_verify(parent: TaskNode) -> List[TaskNode]:
-    """Spawn VERIFY once the project environment is provisioned.
+def _bootstrap_to_api_check(parent: TaskNode) -> List[TaskNode]:
+    """Spawn API_CHECK once the project environment is provisioned.
 
     Always runs in greenfield mode (the only path that creates a
-    BOOTSTRAP_ENV node). VERIFY reads the BUILD_REPORT to pick the
-    project venv's python for the pytest subprocess.
+    BOOTSTRAP_ENV node). API_CHECK statically walks the applied files
+    and resolves every third-party ``from <pkg> import <name>`` and
+    aliased ``pkg.attr`` access under the bootstrapped venv. Its
+    successor (see :func:`_api_check_to_smoke_or_repair`) then chains
+    SMOKE on pass / skip, or REPAIR on a hallucinated symbol.
     """
     return [TaskNode.new(
         session_id=parent.session_id,
-        kind=TaskKind.VERIFY,
-        name="Verify applied changes",
-        description=("Run tests under the project's bootstrapped venv "
-                     "to validate the applied changes."),
+        kind=TaskKind.API_CHECK,
+        name="Probe third-party API references",
+        description=("Resolve every third-party symbol the applied files "
+                     "reference under the bootstrapped venv to fail fast "
+                     "on hallucinated names before SMOKE/VERIFY."),
         parent_task_id=parent.task_id,
         inputs={
             "build_artifact_id": parent.produced_artifact_id,
@@ -254,6 +271,154 @@ def _bootstrap_to_verify(parent: TaskNode) -> List[TaskNode]:
                 parent.inputs.get("scaffold_artifact_id"),
             "prior_goal": parent.inputs.get("prior_goal"),
             "mode": parent.inputs.get("mode"),
+            "prior_failure_signatures":
+                list(parent.inputs.get("prior_failure_signatures") or []),
+            "repair_attempt": int(parent.inputs.get("repair_attempt") or 0),
+        },
+    )]
+
+
+# Outcomes that REPAIR knows how to attempt a fix for on an API_CHECK
+# report. Only ``failed`` is repairable; ``passed`` and ``skipped``
+# chain to SMOKE.
+_REPAIRABLE_API_CHECK_OUTCOMES = frozenset({"failed"})
+
+
+def _api_check_to_smoke_or_repair(parent: TaskNode) -> List[TaskNode]:
+    """Spawn SMOKE on a clean API_CHECK; REPAIR on a hallucinated symbol.
+
+    Mirrors :func:`_smoke_to_verify_or_repair`: ``passed`` / ``skipped``
+    hand off to SMOKE with the API_CHECK report carried forward;
+    ``failed`` routes to REPAIR with the API_CHECK_REPORT as the source
+    artifact, gated by the shared retry budget + flap detector.
+    """
+    outputs = parent.outputs or {}
+    outcome = str(outputs.get("outcome") or "").strip()
+    mode = str(parent.inputs.get("mode") or "").strip()
+    if outcome not in _REPAIRABLE_API_CHECK_OUTCOMES:
+        return [TaskNode.new(
+            session_id=parent.session_id,
+            kind=TaskKind.SMOKE,
+            name="Smoke-test environment imports",
+            description=("Import each third-party top-level package the "
+                         "applied files declare to fail fast on dependency "
+                         "breakage before VERIFY runs pytest."),
+            parent_task_id=parent.task_id,
+            inputs={
+                "build_artifact_id": parent.inputs.get("build_artifact_id"),
+                "api_check_artifact_id": parent.produced_artifact_id,
+                "apply_artifact_id": parent.inputs.get("apply_artifact_id"),
+                "plan_artifact_id": parent.inputs.get("plan_artifact_id"),
+                "scaffold_artifact_id":
+                    parent.inputs.get("scaffold_artifact_id"),
+                "prior_goal": parent.inputs.get("prior_goal"),
+                "mode": mode,
+                "prior_failure_signatures":
+                    list(parent.inputs.get("prior_failure_signatures")
+                         or []),
+                "repair_attempt":
+                    int(parent.inputs.get("repair_attempt") or 0),
+            },
+        )]
+    if mode != SessionMode.GREENFIELD.value:
+        return []
+    repair_attempt = int(parent.inputs.get("repair_attempt") or 0)
+    if repair_attempt >= _REPAIR_BUDGET:
+        return []
+    new_signature = str(outputs.get("failure_signature") or "").strip()
+    if not new_signature:
+        failed = outputs.get("failed_count")
+        new_signature = f"api_check_failed|count={failed}"
+    prior = list(parent.inputs.get("prior_failure_signatures") or [])
+    if new_signature in prior:
+        return []
+    return [TaskNode.new(
+        session_id=parent.session_id,
+        kind=TaskKind.REPAIR,
+        name="Repair hallucinated API references",
+        description=("Classify the upstream API_CHECK failure and propose "
+                     "a targeted patch (typically a rename, an import "
+                     "rewrite, or a dependency pin) the shared APPLY "
+                     "executor can write."),
+        parent_task_id=parent.task_id,
+        inputs={
+            "api_check_artifact_id": parent.produced_artifact_id,
+            "build_artifact_id": parent.inputs.get("build_artifact_id"),
+            "apply_artifact_id": parent.inputs.get("apply_artifact_id"),
+            "prior_goal": parent.inputs.get("prior_goal"),
+            "mode": mode,
+            "repair_attempt": repair_attempt + 1,
+            "prior_failure_signatures": prior + [new_signature],
+        },
+    )]
+
+
+# Outcomes that REPAIR knows how to attempt a fix for on a SMOKE_REPORT.
+# Only ``failed`` is repairable; ``passed`` and ``skipped`` chain to VERIFY.
+_REPAIRABLE_SMOKE_OUTCOMES = frozenset({"failed"})
+
+
+def _smoke_to_verify_or_repair(parent: TaskNode) -> List[TaskNode]:
+    """Spawn VERIFY on a clean smoke run; REPAIR on an import failure.
+
+    SMOKE only runs in greenfield mode (it's only ever spawned by
+    :func:`_bootstrap_to_smoke`). On ``passed`` / ``skipped`` we hand
+    off to VERIFY with the same inputs we would have forwarded from
+    BOOTSTRAP_ENV. On ``failed`` -- a third-party import broke under
+    the bootstrapped venv -- we route to REPAIR with the SMOKE_REPORT
+    as the source artifact, gated by the same retry budget and
+    flap-detector used by the VERIFY-driven repair loop.
+    """
+    outputs = parent.outputs or {}
+    outcome = str(outputs.get("outcome") or "").strip()
+    mode = str(parent.inputs.get("mode") or "").strip()
+    if outcome not in _REPAIRABLE_SMOKE_OUTCOMES:
+        return [TaskNode.new(
+            session_id=parent.session_id,
+            kind=TaskKind.VERIFY,
+            name="Verify applied changes",
+            description=("Run tests under the project's bootstrapped venv "
+                         "to validate the applied changes."),
+            parent_task_id=parent.task_id,
+            inputs={
+                "build_artifact_id": parent.inputs.get("build_artifact_id"),
+                "smoke_artifact_id": parent.produced_artifact_id,
+                "apply_artifact_id": parent.inputs.get("apply_artifact_id"),
+                "plan_artifact_id": parent.inputs.get("plan_artifact_id"),
+                "scaffold_artifact_id":
+                    parent.inputs.get("scaffold_artifact_id"),
+                "prior_goal": parent.inputs.get("prior_goal"),
+                "mode": mode,
+            },
+        )]
+    if mode != SessionMode.GREENFIELD.value:
+        return []
+    repair_attempt = int(parent.inputs.get("repair_attempt") or 0)
+    if repair_attempt >= _REPAIR_BUDGET:
+        return []
+    new_signature = str(outputs.get("failure_signature") or "").strip()
+    if not new_signature:
+        failed = outputs.get("failed_count")
+        new_signature = f"smoke_failed|count={failed}"
+    prior = list(parent.inputs.get("prior_failure_signatures") or [])
+    if new_signature in prior:
+        return []
+    return [TaskNode.new(
+        session_id=parent.session_id,
+        kind=TaskKind.REPAIR,
+        name="Repair failed smoke imports",
+        description=("Classify the upstream SMOKE import failure and "
+                     "propose a targeted patch (typically a dependency "
+                     "pin) the shared APPLY executor can write."),
+        parent_task_id=parent.task_id,
+        inputs={
+            "smoke_artifact_id": parent.produced_artifact_id,
+            "build_artifact_id": parent.inputs.get("build_artifact_id"),
+            "apply_artifact_id": parent.inputs.get("apply_artifact_id"),
+            "prior_goal": parent.inputs.get("prior_goal"),
+            "mode": mode,
+            "repair_attempt": repair_attempt + 1,
+            "prior_failure_signatures": prior + [new_signature],
         },
     )]
 
@@ -295,6 +460,13 @@ def _decompose_to_ask(parent: TaskNode) -> List[TaskNode]:
 
 
 _REPAIR_BUDGET = 2
+
+# Maximum number of regenerate attempts per SCAFFOLD ancestor chain.
+# One full re-scaffold is enough to incorporate the failure-derived
+# constraints; two would risk a regenerate loop and waste tokens. When
+# the budget is exhausted the regenerate branch falls back to the
+# patch branch's ASK_USER escalation.
+_REGENERATE_BUDGET = 1
 
 
 # Outcomes that REPAIR knows how to attempt a fix for. ``passed``,
@@ -443,7 +615,9 @@ TASK_SUCCESSOR = {
     TaskKind.CLARIFY_REQUIREMENTS: _clarify_requirements_to_ask,
     TaskKind.DECOMPOSE: _decompose_to_ask,
     TaskKind.SCAFFOLD: _scaffold_to_apply,
-    TaskKind.BOOTSTRAP_ENV: _bootstrap_to_verify,
+    TaskKind.BOOTSTRAP_ENV: _bootstrap_to_api_check,
+    TaskKind.API_CHECK: _api_check_to_smoke_or_repair,
+    TaskKind.SMOKE: _smoke_to_verify_or_repair,
     TaskKind.VERIFY: _verify_to_repair_or_terminal,
     TaskKind.REPAIR: _repair_to_apply_or_ask,
 }
@@ -493,8 +667,21 @@ class Router:
         missing entry is a no-op (used for terminal kinds like
         ``VERIFY`` or for kinds whose successor lives in a later
         phase).
+
+        Phase 6.1 splices a special branch *before* the table lookup:
+        when a finished REPAIR carries ``outputs.strategy=='regenerate'``
+        and a SCAFFOLD ancestor exists within budget, the router walks
+        the chain, marks the abandoned subtree, and re-queues a fresh
+        SCAFFOLD instead of taking the patch path.
         """
         plan = RouterPlan()
+        if completed.kind is TaskKind.REPAIR:
+            regen_actions = _repair_regenerate_actions(completed, tasks)
+            if regen_actions:
+                plan.actions.extend(regen_actions)
+                return plan
+        if completed.kind is TaskKind.VERIFY:
+            plan.actions.extend(_verify_lesson_actions(completed, tasks))
         spawn = TASK_SUCCESSOR.get(completed.kind)
         if spawn is None:
             return plan
@@ -529,6 +716,128 @@ class Router:
 
 
 # --------------------- helpers ---------------------
+
+def _repair_regenerate_actions(completed: TaskNode,
+                               tasks: List[TaskNode]) -> List[RouterAction]:
+    """Return the router actions that execute a regenerate verdict.
+
+    A regenerate verdict (set by the REPAIR executor when patching is
+    impossible or too large to be safe) tells the router to abandon
+    the failing subtree under the nearest SCAFFOLD ancestor and
+    re-queue a fresh SCAFFOLD with the constraint payload folded into
+    its inputs. The dispatcher in :meth:`Router.on_task_completed`
+    falls back to the regular patch / ASK_USER table-driven path when
+    this function returns an empty list, so the four early-exit cases
+    below (wrong strategy, no SCAFFOLD ancestor, budget exhausted, or
+    nothing to abandon) degrade gracefully.
+    """
+    from cgx.session.repair.propose import propose_regenerate  # local import: dep direction
+
+    outputs = completed.outputs or {}
+    strategy = str(outputs.get("strategy") or "").strip()
+    if strategy != "regenerate":
+        return []
+    extra_constraints = outputs.get("extra_constraints")
+    if not isinstance(extra_constraints, dict):
+        extra_constraints = {}
+    scaffold = _find_scaffold_ancestor(completed, tasks)
+    if scaffold is None:
+        return []
+    prior_regens = int(scaffold.inputs.get("regenerate_attempt") or 0)
+    if prior_regens >= _REGENERATE_BUDGET:
+        return []
+    abandon_targets = _collect_descendants(scaffold.task_id, tasks)
+    actions: List[RouterAction] = []
+    skip_states = {TaskNodeStatus.DONE, TaskNodeStatus.FAILED,
+                   TaskNodeStatus.ABANDONED}
+    for t in abandon_targets:
+        if t.status in skip_states:
+            continue
+        actions.append(UpdateTaskStatus(
+            task_id=t.task_id, status=TaskNodeStatus.ABANDONED))
+    new_scaffold = propose_regenerate(scaffold, extra_constraints)
+    actions.append(CreateTask(new_scaffold))
+    return actions
+
+
+def _verify_lesson_actions(completed: TaskNode,
+                           tasks: List[TaskNode]) -> List[RouterAction]:
+    """Emit :class:`RecordLesson` when a VERIFY-pass repairs a prior failure.
+
+    Phase 7.1: a VERIFY whose outputs say ``outcome=passed`` and whose
+    ancestor chain includes a REPAIR is, by construction, a successful
+    repair cycle -- the REPAIR's diff (or its regenerate's fresh
+    SCAFFOLD output) is what brought the test suite back to green. We
+    surface that pair to the runner via a single :class:`RecordLesson`
+    action carrying the VERIFY id, the REPAIR id (most recent ancestor),
+    and the SCAFFOLD id if one exists on the chain (used as the
+    lesson's ``scope`` provenance).
+    """
+    outputs = completed.outputs or {}
+    outcome = str(outputs.get("outcome") or "").strip()
+    if outcome != "passed":
+        return []
+    by_id = {t.task_id: t for t in tasks}
+    repair: Optional[TaskNode] = None
+    scaffold: Optional[TaskNode] = None
+    cur_id = completed.parent_task_id
+    visited: set = set()
+    while cur_id and cur_id not in visited:
+        visited.add(cur_id)
+        cur = by_id.get(cur_id)
+        if cur is None:
+            break
+        if repair is None and cur.kind is TaskKind.REPAIR:
+            repair = cur
+        if scaffold is None and cur.kind is TaskKind.SCAFFOLD:
+            scaffold = cur
+        cur_id = cur.parent_task_id
+    if repair is None:
+        return []
+    return [RecordLesson(
+        verify_task_id=completed.task_id,
+        repair_task_id=repair.task_id,
+        scaffold_task_id=scaffold.task_id if scaffold else None,
+    )]
+
+
+def _find_scaffold_ancestor(start: TaskNode,
+                            tasks: List[TaskNode]) -> Optional[TaskNode]:
+    """Walk up ``parent_task_id`` chain to the nearest SCAFFOLD task."""
+    by_id = {t.task_id: t for t in tasks}
+    visited: set = set()
+    cur_id = start.parent_task_id
+    while cur_id and cur_id not in visited:
+        visited.add(cur_id)
+        cur = by_id.get(cur_id)
+        if cur is None:
+            return None
+        if cur.kind is TaskKind.SCAFFOLD:
+            return cur
+        cur_id = cur.parent_task_id
+    return None
+
+
+def _collect_descendants(root_task_id: str,
+                         tasks: List[TaskNode]) -> List[TaskNode]:
+    """Return every task whose ancestor chain includes ``root_task_id``.
+
+    Bread-first walk over ``parent_task_id`` edges; the root itself is
+    not included in the result -- only its successors are abandoned.
+    """
+    children_by_parent: Dict[str, List[TaskNode]] = {}
+    for t in tasks:
+        if t.parent_task_id:
+            children_by_parent.setdefault(t.parent_task_id, []).append(t)
+    out: List[TaskNode] = []
+    queue: List[str] = [root_task_id]
+    while queue:
+        pid = queue.pop(0)
+        for child in children_by_parent.get(pid, []):
+            out.append(child)
+            queue.append(child.task_id)
+    return out
+
 
 def _make_root(session: Session, message: str) -> TaskNode:
     """Pick the root task kind based on the session's mode."""

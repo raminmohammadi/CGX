@@ -129,6 +129,7 @@ export function LiveView({
               task={focused ?? null}
               artifacts={state.artifacts}
               decisions={state.decisions}
+              facts={state.facts}
               onDecide={onDecide}
               pending={pending}
             />

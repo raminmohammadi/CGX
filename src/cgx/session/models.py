@@ -82,6 +82,8 @@ class TaskKind(str, enum.Enum):
     DECOMPOSE = "decompose"
     SCAFFOLD = "scaffold"
     BOOTSTRAP_ENV = "bootstrap_env"
+    API_CHECK = "api_check"
+    SMOKE = "smoke"
     REPAIR = "repair"
 
 
@@ -90,6 +92,7 @@ class FactKind(str, enum.Enum):
     SYMBOL = "symbol"
     PARAMETER = "parameter"
     ANCHOR = "anchor"
+    LLM_CALL = "llm_call"
 
 
 class ArtifactKind(str, enum.Enum):
@@ -104,6 +107,8 @@ class ArtifactKind(str, enum.Enum):
     WORK_PLAN = "work_plan"
     SCAFFOLD_PATCHES = "scaffold_patches"
     BUILD_REPORT = "build_report"
+    API_CHECK_REPORT = "api_check_report"
+    SMOKE_REPORT = "smoke_report"
     REPAIR_PLAN = "repair_plan"
 
 

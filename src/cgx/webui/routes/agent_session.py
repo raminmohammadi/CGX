@@ -31,6 +31,7 @@ from fastapi import APIRouter, HTTPException, Query
 # Importing the tasks package side-effect-registers Phase 1 executors.
 from cgx.session import tasks as _tasks  # noqa: F401
 from cgx.session import SessionRunner, SessionStore
+from cgx.session.llm_trace import TracingProvider
 from cgx.session.mode import detect_mode
 from cgx.session.models import SessionMode
 from cgx.session.tasks.ask import build_decision
@@ -81,6 +82,12 @@ def _build_deps(req_provider, req_index, project_root: Optional[str],
                               "/v1/chat/completions"),
         allow_no_auth=bool(getattr(req_provider, "allow_no_auth", False)),
     )
+    # Wrap with TracingProvider so every chat / chat_stream invocation
+    # the executor makes lands as an LLM_CALL fact attributed to the
+    # producing task (Phase 5.1). Untraced providers (already wrapped
+    # in nested calls) are passed through unchanged.
+    if provider is not None and not isinstance(provider, TracingProvider):
+        provider = TracingProvider(provider)
     return ExecutorDeps(
         project_root=project_root,
         index_dir=req_index.index_dir,
@@ -109,12 +116,15 @@ def _snapshot(runner: SessionRunner, session_id: str) -> AgentSessionState:
 
 
 async def _drain_ready(runner: SessionRunner, session_id: str,
-                       deps: ExecutorDeps, *, max_steps: int = 4) -> None:
+                       deps: ExecutorDeps, *, max_steps: int = 6) -> None:
     """Synchronously execute READY tasks until none remain or budget exhausts.
 
     Capped at ``max_steps`` so a runaway router doesn't peg the request
     thread. ASK_USER tasks intentionally stop the loop -- they go to
-    IN_PROGRESS rather than DONE.
+    IN_PROGRESS rather than DONE. The greenfield write loop spawns up
+    to five tasks per decision (SCAFFOLD -> APPLY -> BOOTSTRAP_ENV ->
+    SMOKE -> VERIFY), so the default budget is sized to cover it with
+    one step of headroom.
     """
     for _ in range(max_steps):
         task = await asyncio.to_thread(

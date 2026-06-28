@@ -15,15 +15,21 @@ wasn't installed". Concretely:
   packages missing from ``requirements.txt`` (via
   :func:`cgx.codegen.env_manager.preflight_install`); successful adds
   are appended to ``requirements.txt`` so the manifest stays in sync.
+* Snapshot the resolved venv contents via ``pip freeze --all`` so
+  downstream REPAIR can reason about *resolved* dependency versions
+  (e.g. detect a Flask 2.1 + Werkzeug 3 mismatch) rather than guess
+  from an ImportError traceback alone.
 
 Emits a :data:`ArtifactKind.BUILD_REPORT` artifact carrying the venv
 path, the manifests installed from, the dynamically-installed packages,
-any failures, and a tail of pip's stderr for the UI to surface.
+the resolved-package snapshot, any failures, and a tail of pip's
+stderr for the UI to surface.
 """
 
 from __future__ import annotations
 
 import logging
+import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -68,6 +74,7 @@ def run_bootstrap_env(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             failed_installs={}, outcome="skipped",
             pip_log_tail="", applied_files=applied_files,
             style_issues=[],
+            resolved_packages=[], pip_freeze_text="",
             note="non-python project: no venv provisioned",
         )
         return ExecutorResult(
@@ -115,6 +122,17 @@ def run_bootstrap_env(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
 
     style_issues = _preflight_test_style_lint(root, applied_files)
 
+    # Snapshot the fully-resolved venv contents so REPAIR can diagnose
+    # transitive-dep failures without re-running pip. Best-effort: a
+    # freeze failure must not fail BOOTSTRAP, so we record empty fields
+    # and move on. Only runs when we actually have a project venv --
+    # ``no_venv`` falls back to host interpreter and freezing that
+    # would leak unrelated packages into the report.
+    resolved_packages: List[Dict[str, str]] = []
+    pip_freeze_text = ""
+    if venv_path is not None and python_exe:
+        resolved_packages, pip_freeze_text = _capture_pip_freeze(python_exe)
+
     outcome = _classify_outcome(
         venv_path=venv_path, failed_installs=failed_installs)
     artifact = _build_artifact(
@@ -123,7 +141,10 @@ def run_bootstrap_env(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         installed_packages=installed_packages,
         failed_installs=failed_installs, outcome=outcome,
         pip_log_tail=pip_log_tail, applied_files=applied_files,
-        style_issues=style_issues, note=None,
+        style_issues=style_issues,
+        resolved_packages=resolved_packages,
+        pip_freeze_text=pip_freeze_text,
+        note=None,
     )
     failure: Optional[str] = None
     if outcome == "failed":
@@ -238,6 +259,8 @@ def _build_artifact(
     pip_log_tail: str,
     applied_files: List[str],
     style_issues: List[Dict[str, Any]],
+    resolved_packages: List[Dict[str, str]],
+    pip_freeze_text: str,
     note: Optional[str],
 ) -> Artifact:
     """Construct the ``BUILD_REPORT`` artifact for this bootstrap run."""
@@ -254,6 +277,8 @@ def _build_artifact(
         "pip_log_tail": pip_log_tail or "",
         "applied_files": list(applied_files),
         "style_issues": list(style_issues),
+        "resolved_packages": list(resolved_packages),
+        "pip_freeze_text": pip_freeze_text or "",
     }
     if note:
         content["note"] = note
@@ -263,6 +288,97 @@ def _build_artifact(
         kind=ArtifactKind.BUILD_REPORT,
         content=content,
     )
+
+
+# --------------------- pip freeze capture ---------------------
+
+def _capture_pip_freeze(
+    python_exe: str,
+    *,
+    timeout: float = 30.0,
+) -> Tuple[List[Dict[str, str]], str]:
+    """Run ``pip freeze --all`` and return ``(parsed, raw_text)``.
+
+    Best-effort by design: any subprocess failure, non-zero return
+    code, decode error, or parse error collapses to ``([], "")`` so a
+    busted venv never fails the BOOTSTRAP step. The ``--all`` flag
+    includes pip / setuptools / wheel which a downstream classifier
+    needs to spot e.g. setuptools-version-driven import breaks.
+
+    Parsed entries are ``{"name": <canonical>, "version": <str>}`` --
+    name lowercased and PEP 503-normalised so REPAIR can match by
+    distribution key without worrying about case or ``_`` vs ``-``.
+    Editable / VCS / URL / file installs (lines without ``==``) are
+    skipped from the parsed list but kept verbatim in ``raw_text``.
+    """
+    try:
+        proc = subprocess.run(
+            [python_exe, "-m", "pip", "freeze", "--all"],
+            capture_output=True, timeout=timeout,
+        )
+    except Exception as exc:
+        logger.warning(
+            "BOOTSTRAP_ENV: pip freeze raised %s: %s",
+            type(exc).__name__, exc)
+        return [], ""
+    if proc.returncode != 0:
+        logger.warning(
+            "BOOTSTRAP_ENV: pip freeze exited rc=%d", proc.returncode)
+        return [], ""
+    try:
+        raw_text = (proc.stdout or b"").decode("utf-8", "replace")
+    except Exception:
+        return [], ""
+    return _parse_pip_freeze(raw_text), raw_text
+
+
+def _parse_pip_freeze(text: str) -> List[Dict[str, str]]:
+    """Parse ``pip freeze`` output into ``[{name, version}, ...]``.
+
+    Only handles canonical ``name==version`` lines; ``-e ...``,
+    ``pkg @ url``, and comment lines are skipped. Names are
+    normalised per PEP 503 (lowercased, ``_`` and ``.`` collapsed to
+    ``-``) so lookups match what PyPI exposes at
+    ``/pypi/{name}/{version}/json``.
+    """
+    out: List[Dict[str, str]] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or line.startswith("-"):
+            continue
+        if "==" not in line:
+            continue
+        name, _, version = line.partition("==")
+        name = name.strip()
+        version = version.strip().split(" ")[0]
+        if not name or not version:
+            continue
+        canonical = _canonicalise_name(name)
+        out.append({"name": canonical, "version": version})
+    return out
+
+
+def _canonicalise_name(name: str) -> str:
+    """PEP 503-style name normalisation: lowercase + ``_.`` -> ``-``."""
+    lowered = name.lower()
+    buf = []
+    for ch in lowered:
+        if ch in ("_", "."):
+            buf.append("-")
+        else:
+            buf.append(ch)
+    # Collapse runs of ``-`` so e.g. ``Foo._bar`` -> ``foo-bar``.
+    out = []
+    prev_dash = False
+    for ch in buf:
+        if ch == "-":
+            if prev_dash:
+                continue
+            prev_dash = True
+        else:
+            prev_dash = False
+        out.append(ch)
+    return "".join(out).strip("-")
 
 
 def _preflight_test_style_lint(

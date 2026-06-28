@@ -16,14 +16,17 @@ from __future__ import annotations
 
 import difflib
 import re
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from cgx.session.models import TaskKind, TaskNode
 from cgx.session.repair.locate import (
     MissingFixtureLocation,
     MissingPythonpathLocation,
     StyleMixLocation,
 )
+from cgx.session.repair.pypi_client import PyPIClient
 
 
 def propose_unittest_pytest_mix(
@@ -219,6 +222,331 @@ def propose_missing_module_pythonpath(
     if not patch:
         return []
     return [{"file": rel_path, "patch": patch}]
+
+
+# Window we treat as "contemporaneous" when picking a peer version by
+# release date. Most upstream / peer projects ship coordinated minor
+# bumps within ~two months, and stretching wider risks proposing a peer
+# that didn't exist yet when the consumer's release was tagged.
+_PEER_RELEASE_WINDOW = timedelta(days=60)
+
+
+def propose_third_party_pin(
+    project_root: Path,
+    content: Dict[str, Any],
+    *,
+    pairs: Sequence[Tuple[str, str]],
+    installed_packages: Dict[str, str],
+    pypi_client: PyPIClient,
+) -> Tuple[List[Dict[str, str]], List[Dict[str, Any]]]:
+    """Emit a ``requirements.txt`` diff that pins broken third-party peers.
+
+    For each ``(symbol, broken_pkg)`` pair, walk the failure traceback
+    to find the *consumer* package (whichever installed distribution's
+    ``site-packages`` dir contains the topmost frame outside the test
+    code). Then query PyPI for the consumer's ``requires_dist`` and any
+    declared upper bound on ``broken_pkg``. When no declared upper
+    bound exists, fall back to picking the highest ``broken_pkg``
+    version whose ``upload_time`` is within
+    :data:`_PEER_RELEASE_WINDOW` of the consumer's release.
+
+    Returns ``(diffs, decisions)`` where ``decisions`` is a list of
+    structured ``{symbol, broken_pkg, consumer, reason, pin}`` records
+    surfaced on the REPAIR_PLAN so the user can see *why* a version
+    was chosen. ``diffs`` is empty when no pair could be resolved.
+    """
+    if not pairs or not installed_packages:
+        return [], []
+    decisions: List[Dict[str, Any]] = []
+    new_pins: Dict[str, str] = {}
+    seen_brokens: set = set()
+    for symbol, broken_pkg in pairs:
+        broken_key = broken_pkg.lower().replace("_", "-")
+        if broken_key in seen_brokens:
+            continue
+        seen_brokens.add(broken_key)
+        if broken_key not in installed_packages:
+            decisions.append({
+                "symbol": symbol, "broken_pkg": broken_pkg,
+                "reason": "broken package not in BUILD_REPORT; skipped",
+            })
+            continue
+        consumer = _detect_consumer(content, broken_key, installed_packages)
+        if not consumer:
+            decisions.append({
+                "symbol": symbol, "broken_pkg": broken_pkg,
+                "reason": "consumer package not detected in traceback",
+            })
+            continue
+        consumer_version = installed_packages.get(consumer.lower())
+        pin, reason = _resolve_peer_pin(
+            pypi_client, consumer, consumer_version or "",
+            broken_pkg, broken_key, installed_packages,
+        )
+        decisions.append({
+            "symbol": symbol, "broken_pkg": broken_pkg,
+            "consumer": consumer, "consumer_version": consumer_version,
+            "reason": reason, "pin": pin,
+        })
+        if pin:
+            new_pins[broken_key] = pin
+    if not new_pins:
+        return [], decisions
+    diffs = _build_requirements_diff(project_root, new_pins)
+    return diffs, decisions
+
+
+def _detect_consumer(content: Dict[str, Any], broken_key: str,
+                     installed_packages: Dict[str, str]) -> Optional[str]:
+    """Return the installed package whose code triggered the ImportError.
+
+    Scans every ``failures[].traceback`` blob for ``site-packages/<x>/``
+    references, picks the first ``<x>`` that's installed and isn't the
+    broken package itself. Returns ``None`` when no traceback is
+    available or none of the candidates are tracked in BUILD_REPORT.
+    """
+    failures = content.get("failures") or []
+    if not isinstance(failures, list):
+        return None
+    pattern = re.compile(r"site-packages/([A-Za-z_][A-Za-z0-9_]*)/")
+    for fail in failures:
+        if not isinstance(fail, dict):
+            continue
+        tb = fail.get("traceback") or ""
+        if not isinstance(tb, str):
+            continue
+        for m in pattern.finditer(tb):
+            name = m.group(1).lower().replace("_", "-")
+            if name == broken_key:
+                continue
+            if name in installed_packages:
+                return name
+    return None
+
+
+def _resolve_peer_pin(
+    pypi: PyPIClient, consumer: str, consumer_version: str,
+    broken_pkg: str, broken_key: str,
+    installed_packages: Dict[str, str],
+) -> Tuple[Optional[str], str]:
+    """Return ``(pin_string, reason)`` for the broken peer.
+
+    Strategy, in priority order:
+
+    1. Look at the consumer's ``info.requires_dist``; if it names the
+       peer with any version constraint, reuse that constraint verbatim.
+    2. Otherwise, find the highest peer version whose upload time is
+       within :data:`_PEER_RELEASE_WINDOW` of the consumer's release.
+    3. If neither path produces a candidate, return ``(None, reason)``.
+    """
+    if not consumer_version:
+        return None, f"no installed version of consumer {consumer!r}"
+    consumer_meta = pypi.get_release(consumer, consumer_version)
+    if consumer_meta:
+        constraint = _peer_constraint_from_requires_dist(
+            consumer_meta.get("info") or {}, broken_key)
+        if constraint:
+            return constraint, (
+                f"reused declared peer constraint from "
+                f"{consumer}=={consumer_version}.requires_dist")
+    consumer_release_at = _earliest_upload_time(
+        (consumer_meta or {}).get("urls") or [])
+    if consumer_release_at is None:
+        return None, (f"PyPI metadata for {consumer}=={consumer_version} "
+                      "lacked upload timestamps")
+    peer_meta = pypi.get_package(broken_pkg)
+    if peer_meta is None:
+        return None, f"could not fetch PyPI metadata for {broken_pkg!r}"
+    best = _pick_contemporary_version(
+        peer_meta.get("releases") or {}, consumer_release_at)
+    if not best:
+        return None, (f"no {broken_pkg} version released within "
+                      f"{_PEER_RELEASE_WINDOW.days}d of "
+                      f"{consumer}=={consumer_version}")
+    return (f"{broken_pkg}=={best}",
+            f"highest {broken_pkg} release within "
+            f"{_PEER_RELEASE_WINDOW.days}d of "
+            f"{consumer}=={consumer_version}")
+
+
+def _peer_constraint_from_requires_dist(
+        info: Dict[str, Any], broken_key: str) -> Optional[str]:
+    """Pull a peer pin out of a release's ``requires_dist`` list."""
+    reqs = info.get("requires_dist") or []
+    if not isinstance(reqs, list):
+        return None
+    for raw in reqs:
+        if not isinstance(raw, str):
+            continue
+        head = raw.split(";", 1)[0].strip()
+        if not head:
+            continue
+        m = re.match(r"^([A-Za-z][A-Za-z0-9_.\-]*)\s*(.*)$", head)
+        if not m:
+            continue
+        name = m.group(1).lower().replace("_", "-")
+        if name != broken_key:
+            continue
+        rest = m.group(2).strip()
+        if not rest:
+            continue
+        return f"{m.group(1)}{rest}"
+    return None
+
+
+def _earliest_upload_time(urls: Iterable[Any]) -> Optional[datetime]:
+    """Return the earliest ``upload_time_iso_8601`` across release files."""
+    best: Optional[datetime] = None
+    for entry in urls:
+        if not isinstance(entry, dict):
+            continue
+        ts = entry.get("upload_time_iso_8601") or entry.get("upload_time")
+        parsed = _parse_pypi_timestamp(ts) if isinstance(ts, str) else None
+        if parsed is None:
+            continue
+        if best is None or parsed < best:
+            best = parsed
+    return best
+
+
+def _pick_contemporary_version(
+        releases: Dict[str, Any], reference: datetime) -> Optional[str]:
+    """Return the highest version whose upload was within the window."""
+    candidates: List[Tuple[Tuple[int, ...], str]] = []
+    lower = reference - _PEER_RELEASE_WINDOW
+    upper = reference + _PEER_RELEASE_WINDOW
+    for version, files in releases.items():
+        if not isinstance(files, list) or not files:
+            continue
+        upload = _earliest_upload_time(files)
+        if upload is None or not (lower <= upload <= upper):
+            continue
+        parsed = _parse_version_tuple(version)
+        if parsed is None:
+            continue
+        candidates.append((parsed, version))
+    if not candidates:
+        return None
+    candidates.sort()
+    return candidates[-1][1]
+
+
+def _parse_pypi_timestamp(ts: str) -> Optional[datetime]:
+    """Parse PyPI's ISO-8601 timestamps (with or without trailing ``Z``)."""
+    if not ts:
+        return None
+    raw = ts.replace("Z", "+00:00") if ts.endswith("Z") else ts
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _parse_version_tuple(version: str) -> Optional[Tuple[int, ...]]:
+    """Best-effort numeric-tuple parse for ordering PyPI versions.
+
+    Skips pre/dev/rc releases (anything with a non-numeric component
+    after the first non-numeric segment) to keep the proposer
+    conservative -- pinning a release candidate would surprise users.
+    """
+    if not version or any(c in version for c in ("a", "b", "rc", "dev")):
+        return None
+    parts: List[int] = []
+    for chunk in version.split("."):
+        if not chunk.isdigit():
+            return None
+        parts.append(int(chunk))
+    return tuple(parts) if parts else None
+
+
+def _build_requirements_diff(
+        project_root: Path,
+        new_pins: Dict[str, str]) -> List[Dict[str, str]]:
+    """Return a unified diff against ``requirements.txt`` adding pins.
+
+    Existing lines for the same package (case-insensitive) are replaced;
+    missing pins are appended. The file is created if it doesn't exist.
+    """
+    rel_path = "requirements.txt"
+    req_path = Path(project_root).resolve() / rel_path
+    try:
+        original = req_path.read_text(encoding="utf-8") if req_path.exists() else ""
+    except (OSError, UnicodeDecodeError):
+        original = ""
+    lines = original.splitlines(keepends=True)
+    remaining = dict(new_pins)
+    pkg_line_re = re.compile(r"^\s*([A-Za-z][A-Za-z0-9_.\-]*)")
+    for idx, raw in enumerate(lines):
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        m = pkg_line_re.match(stripped)
+        if not m:
+            continue
+        key = m.group(1).lower().replace("_", "-")
+        if key in remaining:
+            replacement = remaining.pop(key) + "\n"
+            lines[idx] = replacement
+    if remaining:
+        if lines and not lines[-1].endswith("\n"):
+            lines[-1] = lines[-1] + "\n"
+        for key in sorted(remaining):
+            lines.append(remaining[key] + "\n")
+    modified = "".join(lines)
+    patch = _unified_diff(rel_path, original, modified)
+    if not patch:
+        return []
+    return [{"file": rel_path, "patch": patch}]
+
+
+def propose_regenerate(
+    scaffold_task: TaskNode,
+    new_constraints: Dict[str, Any],
+) -> TaskNode:
+    """Return a sibling SCAFFOLD task with ``new_constraints`` folded in.
+
+    Mirrors ``scaffold_task``'s session / parent / description so the
+    new SCAFFOLD slots into the same chain the previous one occupied
+    after the router marks the abandoned subtree. The original
+    ``inputs`` are copied verbatim, then three keys are added or
+    extended:
+
+    * ``regenerate_constraints`` -- the running list of structured
+      constraint dicts collected across regenerate attempts. Each entry
+      typically carries ``{kind, rationale, ...}`` shaped by the
+      classifier (e.g. ``third_party_pin_conflict`` with the failing
+      pairs and the candidate pins that didn't work). SCAFFOLD's prompt
+      builder reads this list to inject prior-constraint warnings.
+    * ``regenerate_attempt`` -- incremented monotonically so the router
+      can cap the loop via :data:`_REGENERATE_BUDGET`.
+    * ``regenerated_from_task_id`` -- back-pointer to the SCAFFOLD that
+      was abandoned, useful for the UI and for cross-session learning
+      (Phase 7).
+
+    The function is intentionally pure: it does no I/O and returns a
+    fresh :class:`TaskNode` the router can wrap in a ``CreateTask``
+    alongside the matching ``UpdateTaskStatus(ABANDONED)`` actions for
+    the descendants.
+    """
+    inputs = dict(scaffold_task.inputs)
+    prior_constraints = list(inputs.get("regenerate_constraints") or [])
+    if isinstance(new_constraints, dict) and new_constraints:
+        prior_constraints.append(dict(new_constraints))
+    inputs["regenerate_constraints"] = prior_constraints
+    inputs["regenerate_attempt"] = (
+        int(inputs.get("regenerate_attempt") or 0) + 1)
+    inputs["regenerated_from_task_id"] = scaffold_task.task_id
+    return TaskNode.new(
+        session_id=scaffold_task.session_id,
+        kind=TaskKind.SCAFFOLD,
+        name=f"{scaffold_task.name} (regenerated)",
+        description=scaffold_task.description,
+        parent_task_id=scaffold_task.parent_task_id,
+        inputs=inputs,
+    )
 
 
 # --------------------- helpers ---------------------
