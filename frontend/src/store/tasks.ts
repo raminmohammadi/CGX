@@ -47,12 +47,30 @@ export interface CodegenReportSummary {
   };
 }
 
+export interface ClarifyOption {
+  title: string;
+  rationale: string;
+  chunk_id: string;
+}
+
+export interface TaskOutputDebug {
+  mode?: string;
+  options?: ClarifyOption[];
+  follow_up_question?: string;
+  restatement?: string;
+}
+
 export interface TaskOutput {
   plan_md?: string;
   diffs?: { file: string; patch: string }[];
   codegen_report?: CodegenReportSummary;
   answer_md?: string;
   top_files?: { file: string; score: number }[];
+  // ── ask task ──
+  citations?: { chunk_id: string }[];
+  confidence?: number;
+  suggested_changes?: any[];
+  debug?: TaskOutputDebug;
   // ── apply task ──
   applied_files?: string[];
   failed_files?: { file: string; error: string }[];
@@ -108,7 +126,7 @@ export interface ChatMsg {
   role: "user" | "assistant";
   content: string;
   sources?: any[];
-  intent?: { mode?: string };
+  intent?: { mode?: string; scope?: string };
   streaming?: boolean;
   thought?: string;
   warning?: string;

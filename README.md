@@ -1,40 +1,125 @@
-<p align="center">
-  <a href="https://github.com/raminmohammadi/CGX/actions/workflows/ci.yml?branch=main"><img src="https://github.com/raminmohammadi/CGX/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI status"></a>
-  <a href="https://github.com/raminmohammadi/CGX/releases"><img src="https://img.shields.io/github/v/release/raminmohammadi/CGX?label=RELEASE" alt="GitHub release"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/github/license/raminmohammadi/CGX?color=blue" alt="MIT License"></a>
-</p>
+# CGX -- Code Graph eXecution
 
-# CGX — Code Graph eXecution
+**Local-first codebase RAG and self-testing code-generation platform.**
 
-**Local-first codebase RAG and self-testing multi-agent code generation platform.**
+CGX indexes a code repository, retrieves grounded context via a hybrid
+engine (semantic + lexical + graph), and asks a local or remote LLM to
+answer questions or produce **self-tested** code change plans. It is
+model-agnostic and ships with a React/Vite web UI served by a FastAPI
+backend that streams progress over Server-Sent Events.
 
-CGX indexes your code repository, extracts context via a hybrid engine (semantic + lexical + import graph), and orchestrates local or remote LLMs to answer repository questions or deliver self-tested code change plans. It features a responsive React/Vite web UI served by a FastAPI backend streaming over Server-Sent Events (SSE).
+- **Local-first.** Indexing, embedding, retrieval, sessions, and
+  telemetry **never leave the machine.** Works fully offline with
+  [Ollama](https://ollama.com/).
+- **Universal LLM provider.** Ollama (local), OpenAI-compatible
+  endpoints, native **Google Gemini**, or any self-hosted server with a
+  custom IP, path, and optional auth-bypass -- switchable from the Settings
+  tab with a live **Ping** latency check. API keys live in your OS keyring.
+- **Hybrid retrieval.** Two-view semantic + BM25 + graph expansion,
+  fused with Reciprocal Rank Fusion and an optional cross-encoder
+  rerank.
+- **Session-based Agent (default `/agent`).** A persistent,
+  session-shaped orchestrator (`cgx.session`) progresses one task at
+  a time and pauses at every branch for a typed human decision. The
+  loop has two shapes auto-selected (and user-overridable) by
+  `cgx.session.mode.detect_mode`:
+  - **Explore mode** (existing codebase with an index):
+    `EXPLORE → ASK_USER(choose_path) → INVESTIGATE → RECOMMEND →
+    ASK_USER(choose_recommendation) → PLAN_CHANGE →
+    ASK_USER(approve) → APPLY → VERIFY`.
+  - **Greenfield mode** (empty / non-indexed project root, or
+    user-selected): `CLARIFY_REQUIREMENTS →
+    ASK_USER(clarify_answers) → DECOMPOSE →
+    ASK_USER(approve_plan) → SCAFFOLD → APPLY → VERIFY`. The
+    agent asks 3–6 clarification questions, plans a layered file
+    manifest, generates each file with cross-file context, and
+    only writes to disk after the user approves the plan.
 
-
-
-## ⚡ Core Capabilities
-
-* **🔒 100% Local-First:** Indexing, embeddings, retrieval, session logs, and telemetry remain entirely on your local machine. Works seamlessly offline via [Ollama](https://ollama.com/).
-* **🤖 Multi-Agent Orchestration:** A deterministic `Planner ➔ Tracker ➔ Judge` execution loop decomposes complex engineering goals into atomic tasks (`ask`, `plan`, `scaffold`, `apply`, `verify`). 
-* **🛠️ Self-Testing Code Gen:** Diffs are parsed, dry-applied in memory, and verified through an isolated sandbox running `ast.parse` and impacted `pytest` files before being surfaced to the user.
-* **🧬 Graph-Expanded Hybrid RAG:** Fuses semantic vectors (FAISS) and lexical tokens (BM25) with an abstract syntax tree (AST) import/call graph expansion, ranked via Reciprocal Rank Fusion (RRF).
-* **🧩 Modular Skills Registry (`skills/`):** Technology-specific contexts (React, FastAPI, Tailwind, etc.) are completely isolated. Adding support for a new framework is a single-folder addition with zero edits required to the core agent loop.
-
----
-
-## 🚀 Key Features
-
-<details>
-<summary>📖 View Full Feature Breakdown</summary>
-
-* **New Project Scaffolding:** Generate brand-new repositories from plain-language prompts using the `scaffold_manifest ➔ scaffold_file` chain. Includes automatic local backups under `.cgx-backups/` for instant rollbacks.
-* **Symbol Table Context Injection:** Compresses a structural map of existing codebase helper functions and types into the prompt window, preventing local models from writing redundant code.
-* **Hardware-Aware Model Selection:** On-device hardware evaluation flags local models (3B to 70B+) as ✅ *Fits*, ⚠️ *Tight*, or ❌ *Insufficient Memory* based on real-time RAM/VRAM checks.
-* **Incremental Indexing:** Content-addressed embedding cache (`.npz` files keyed on SHA-256 hashes) ensures re-indexing modified codebases takes milliseconds.
-* **Granular Traceback Slicing:** Automatically extracts $\pm$5 lines of surrounding context around test tracebacks, preventing small local contexts from being flooded with raw stdout noise.
-* **Robust Provider Engine:** Switch configurations dynamically in the UI with a live latency **Ping** feature. Integrates client-side token-bucket rate limiting and automatic 429 exponential backoffs.
-* **State & Stream Persistence:** Tab states are held in a global Zustand store; navigate between configuration, indexing, and chat interfaces without tearing down background SSE streams.
-</details>
+  Each direction the user picks is recorded as a structured
+  `Decision`; nothing reaches disk without an explicit approval
+  checkpoint. Session state lives in
+  `<project_root>/.cgx/sessions.db` (SQLite, one row per
+  task/fact/artifact/decision), so a session can be resumed days
+  later. See the **🤖 Agent** tab and
+  [docs/flowcharts.md § Session-shaped write loop](docs/flowcharts.md#session-shaped-write-loop-agent).
+- **Legacy batch agent (`/agent-legacy`).** The original
+  Planner / Tracker / Judge loop is preserved for fire-and-forget
+  goals and new-project scaffolds. It decomposes a request into
+  atomic tasks (`ask`, `plan`, `scaffold`, `scaffold_manifest`,
+  `scaffold_file`, `search`, `summarize`, `apply`, `verify`,
+  `fill_logic`) and validates each artefact before moving on
+  (`cgx.agents`). The planner routes scaffold goals through a
+  manifest-then-per-file chain, downgrades expensive code-gen tasks
+  to plain Q&A for read-only goals, and the tracker streams live
+  `task_progress` heartbeats so the UI never looks frozen on long
+  LLM calls. Still the entry point exposed by the `cgx agent` CLI
+  and by `cgx.agents.run_agent`.
+- **New project generation.** Give CGX a plain-language idea
+  (e.g. *"create a FastAPI todo app"* or *"create a React calculator
+  app"*), set a destination directory as Project Root, and the
+  `scaffold_manifest → scaffold_file × N → apply → verify` chain
+  generates a complete, working project from scratch -- no existing
+  codebase or index required. The `apply` step writes a per-run backup
+  mirror under `<project_root>/.cgx-backups/` so the whole run can
+  be undone via `POST /api/rollback`.
+- **Modular skills registry** (`skills/`). Each supported technology
+  lives in its own folder (`skills/react/`, `skills/fastapi/`,
+  `skills/nextjs/`, `skills/vue/`, `skills/tailwind/`, `skills/flask/`,
+  `skills/django/`, `skills/express/`, `skills/python_cli/`,
+  `skills/sqlite/`) and bundles three things: detection from the goal,
+  the prompt fragment the LLM sees while generating, and a structural
+  validator the Judge runs against the produced diffs. Multi-skill
+  goals compose naturally -- *"React UI + FastAPI backend"* activates
+  both, so the scaffold prompt carries both layouts and the Judge
+  refuses to silently pass an output that only honours one half. Adding
+  a new framework is a single-folder change with no agent-layer edits.
+  See [docs/usage.md](docs/usage.md#generating-a-new-project-from-scratch)
+  for the full table and [docs/architecture.md](docs/architecture.md#skills)
+  for the protocol.
+- **Persistent chat sessions.** Conversations are saved as JSONL
+  threads under `~/.cgx/sessions/`; resume them later from the Ask
+  tab's session sidebar.
+- **Self-testing code generation.** Diffs are parsed, syntax-checked,
+  and optionally run against impacted pytest tests in a sandbox before
+  being surfaced. The sandbox now auto-installs missing Python packages
+  before running pytest (`cgx.codegen.env_manager`) so a model choosing
+  a new library doesn't mask real failures.
+- **Symbol table context.** Before generating a change plan, CGX
+  injects a compressed `# AVAILABLE CONTEXT` map of every symbol already
+  defined in the indexed codebase (`cgx.codegen.symbol_map`), preventing
+  local models from re-implementing helpers that already exist.
+- **Granular error slicing.** Retry prompts include ±5 lines of source
+  context around the first traceback line number rather than a raw
+  1 200-character pytest dump, keeping small models focused on the precise
+  failure site.
+- **Incremental indexing.** A content-addressed embedding cache
+  (per-view `.npz` keyed on sha256 of the corpus text) makes
+  re-indexing a touched-only-a-few-files repo nearly instant.
+- **Hardware-aware model picker.** The Hardware tab reports
+  ✅/⚠️/❌ verdicts for ~8 local models against your detected RAM/VRAM
+  and shows a local-vs-cloud trade-off table.
+- **Client-side rate limiting + 429 retry** on every provider, with
+  per-profile budgets persisted alongside the model config.
+- **Thought-process panel.** Live streaming of the model's reasoning
+  sketch, followed by the final grounded answer.
+- **VS Code extension scaffold** (`extension/`) that hosts the
+  CGX web UI inside an editor webview.
+- **Task registry & cancel.** Every operation is tracked in
+  `~/.cgx/tasks.db`; cancel any running task with
+  `DELETE /api/tasks/{id}` or the in-UI Cancel button.
+- **Cancel button on every tab.** Stop a streaming request mid-flight
+  from Ask (Stop), Plan, Agent, or Index (Cancel).
+- **Tab persistence.** Switching between tabs mid-task no longer loses
+  the running view -- state is held in a session-scoped Zustand store
+  (`frontend/src/store/tasks.ts`) and the SSE stream continues in the
+  background via `frontend/src/lib/connections.ts`.
+- 🖥️ **Terminal observability.** All operations emit structured
+  `[INFO]`/`[WARNING]` log lines to stdout from startup
+  (`setup_logging(INFO)` in `launch.py`).
+- ⚡ **Parallel two-view execution.** FAISS index building
+  (`run_index_auto`) and semantic retrieval (`HybridRetriever.search`)
+  both run the intent and impl views concurrently via
+  `ThreadPoolExecutor`.
 
 ---
 
@@ -98,12 +183,10 @@ Optional extras:
 | `keyring`    | OS keyring for API-key storage                    |
 | `dev`        | `pytest`, `ruff`, `mypy`                          |
 
-**Optional: Pulling a local model**
-You can pull a recommended small model (like `qwen2.5-coder:3b`) directly from the CGX UI later by clicking the **Pull** button in the Setup tab. Alternatively, you can pre-fetch it via the CLI:
+Pull a small local model (recommended default):
 
 ```bash
 ollama pull qwen2.5-coder:3b
-
 ```
 
 ### Platform notes
@@ -142,25 +225,17 @@ ollama pull qwen2.5-coder:3b
 
 ---
 
-## 🏁 Quick Start
+## Quick start
 
-### 1. UI (Recommended)
-
-Once installed, spin up the platform with a single command:
+### UI (recommended)
 
 ```bash
+cgx-ui               # after `pip install -e ".[ui]"`
+# or
+python app.py
+# or via the unified CLI
 cgx serve
-# or: cgx-ui
-# or: python app.py
-
 ```
-
-Open your browser to http://127.0.0.1:8765 to access the console. *(Note: The server has no built-in auth and binds to localhost by default. Do not expose it to the public internet without a reverse proxy).*
-**Your First Run:**
- 1. **Setup:** Head to the **Profiles** tab, select your provider (Ollama, Gemini, OpenAI, etc.), fill in your credentials, and click **Ping** to verify connectivity.
- 2. **Index:** Go to the **Index** tab, point it at a project root (or upload a .zip), and trigger the build.
- 3. **Ask/Plan:** Navigate to the **Ask** tab to query your codebase, or the **Plan** tab to have CGX generate self-tested code changes.
- 4. **Agent:** Use the **🤖 Agent** tab to give CGX a high-level goal (e.g., *"create a FastAPI todo app"*) and watch it plan, scaffold, and verify the result.
 
 ### Binding & remote access
 
@@ -183,9 +258,7 @@ non-loopback address only on a trusted LAN/VPN (Tailscale, WireGuard,
 auth, oauth2-proxy, …). Do not expose port 8765 directly to the
 public internet.
 
-
-<details>
-<summary>📖 Click to view detailed UI Tab descriptions</summary>
+Tabs (left → right):
 
 1. **Setup** -- choose a **Provider Type** (Ollama, OpenAI, Google
    Gemini, or Custom Server), fill in the model and credentials, and click
@@ -208,17 +281,30 @@ public internet.
    before returning. The full self-test report renders inline. A
    **Cancel** button is available while planning is in progress; tab
    switching is non-destructive.
-5. **Agent** -- give CGX a goal, watch the **Planner → Tracker →
-   Judge** loop decompose it into 1–5 atomic tasks, dispatch each task
-   to a capability (`ask`, `plan`, `scaffold`, `search`, `summarize`,
-   `apply`, `verify`), and judge the artefact against per-task criteria.
-   For goals like *"create a new FastAPI project"* the planner emits a
-   `scaffold → apply → verify` chain that generates a complete project
-   from scratch in the Project Root directory. Live event log,
-   task-status table, and DAG view of the plan. A **Cancel** button is
-   available while the loop is running; tab switching keeps the agent
-   running and state is fully restored on return. The sidebar shows an
-   animated spinner next to this tab while a task is active.
+5. **Agent** (`/agent`) -- the **session-based** view. Start a
+   session with an objective, pick a **mode** (auto / explore /
+   greenfield -- *auto* defers to `detect_mode`), and watch the
+   agent walk the appropriate chain. Explore mode runs
+   `EXPLORE → INVESTIGATE → RECOMMEND → PLAN_CHANGE → APPLY →
+   VERIFY` against an existing codebase; greenfield mode runs
+   `CLARIFY_REQUIREMENTS → DECOMPOSE → SCAFFOLD → APPLY → VERIFY`
+   to bootstrap a new project. Both pause at every branch for a
+   typed choice. The task tree shows the full DAG with status
+   icons, depth-based indentation, and a side panel surfacing the
+   Knowledge Base (facts) and Artifacts (`DIRECTIONS_LIST`,
+   `FINDINGS_BUNDLE`, `RECOMMENDATION_LIST`, `CODE_CHANGE_PLAN`,
+   `REQUIREMENTS_SHEET`, `WORK_PLAN`, `SCAFFOLD_PATCHES`,
+   `APPLIED_CHANGES`, `VERIFY_REPORT`). Nothing reaches disk until
+   you tick the approval checkpoint, and an `Undo` button rolls
+   the run back via `POST /api/rollback`. Session state is
+   persisted to `<project_root>/.cgx/sessions.db`; the active
+   session id and selection are persisted client-side so a tab
+   switch / reload resumes the same view. The original batch
+   Planner → Tracker → Judge loop is preserved at
+   **`/agent-legacy`** -- pick it from the sidebar (or reach it
+   via the `cgx agent` CLI) for one-shot goals where you want a
+   single fire-and-forget run with no checkpoints. Both views
+   surface a **Cancel** button on long-running tasks.
 6. **Hardware** -- click **Detect hardware** to annotate the local
    model catalogue with ✅/⚠️/❌ fit verdicts against your machine. The
    second table shows the editorial local-vs-cloud trade-off across
@@ -233,23 +319,21 @@ public internet.
    `~/.cgx/`. Optional per-profile `rate_limit` (req/sec) and
    `max_retries` apply automatically to every call made by that profile.
 
-</details>
+### CLI
 
-### 2. CLI
-If you prefer the terminal, you can index and query directly:
 ```bash
 cgx index --project-root /path/to/repo --out-dir /tmp/cgx_index
 cgx query --index-dir /tmp/cgx_index/indices \
           --records  /tmp/cgx_index/records.jsonl \
           --query "What does parse_codebase do?"
-
 ```
-### 3. Python API
-You can also use CGX programmatically in your own scripts:
+
+### Python
+
 ```python
-from cgx.pipeline.auto import run_index_auto
-from cgx.answer.engine import answer_with_llm
-from cgx.answer.providers import OllamaProvider, GeminiProvider
+from cgx.pipeline.auto import run_index_auto, run_query_auto
+from cgx.answer.engine import answer_with_llm, generate_code_plan
+from cgx.answer.providers import OllamaProvider, GeminiProvider, OpenAICompatProvider
 
 run_index_auto(project_root="./", out_dir="/tmp/cgx_index")
 
@@ -259,6 +343,12 @@ prov = OllamaProvider(model="qwen2.5-coder:3b")
 # Google Gemini
 # prov = GeminiProvider(model="gemini-1.5-flash", api_key="YOUR_KEY")
 
+# Custom self-hosted server (no auth, non-standard path)
+# prov = OpenAICompatProvider(
+#     model="my-model", base_url="http://100.10.20.10:8080",
+#     endpoint_path="/completion", allow_no_auth=True,
+# )
+
 ans = answer_with_llm(
     "/tmp/cgx_index/indices",
     "/tmp/cgx_index/records.jsonl",
@@ -266,7 +356,6 @@ ans = answer_with_llm(
     prov,
 )
 print(ans["answer_md"])
-
 ```
 
 ---
@@ -341,10 +430,100 @@ under the plan in the UI.
 
 ---
 
-## Multi-agent orchestration
+## Session-based Agent (`/agent`)
 
-For requests that don't fit into a single Ask or Plan round-trip,
-CGX ships a Planner → Tracker → Judge loop in `cgx.agents`:
+The default Agent tab drives a **persistent, session-shaped** loop
+defined in `cgx.session`. Every interaction belongs to a `Session`
+whose state survives process restarts under
+`<project_root>/.cgx/sessions.db`. A session walks one of two
+chains -- the **mode** is auto-detected by
+`cgx.session.mode.detect_mode` at session creation (or set
+explicitly via the launcher / API), and dictates which root task
+the router seeds. Both shapes pause at every `ASK_USER` for a typed
+user decision:
+
+```
+# Explore mode (existing codebase + FAISS index)
+EXPLORE -> ASK_USER(choose_path)
+              -> INVESTIGATE -> RECOMMEND -> ASK_USER(choose_recommendation)
+                                                -> investigate_more (loop)
+                                                -> plan_change
+                                                     -> PLAN_CHANGE
+                                                        -> ASK_USER(approve)
+                                                           -> APPLY -> VERIFY
+                                                -> ask_followup / done
+
+# Greenfield mode (empty / non-indexed project root)
+CLARIFY_REQUIREMENTS -> ASK_USER(clarify_answers)
+                          -> DECOMPOSE -> ASK_USER(approve_plan)
+                                            -> SCAFFOLD -> APPLY -> VERIFY
+                                            -> (reject halts the loop)
+```
+
+Three modules own every transition:
+
+* `cgx.session.router.Router` -- pure-Python deterministic state
+  machine. No LLM calls, no I/O; returns a typed `RouterPlan` of
+  `CreateTask` / `UpdateTaskStatus` / `RecordDecision` /
+  `AttachDecisionToTask` actions. Reads `session.mode` to choose
+  the root task and the `TASK_SUCCESSOR` chain.
+* `cgx.session.runner.SessionRunner` -- per-session lock, executor
+  dispatch, failure handling, persistence sequencing.
+* `cgx.session.tasks.*` -- one registered executor per `TaskKind`:
+  explore-mode (`EXPLORE`, `INVESTIGATE`, `RECOMMEND`,
+  `PLAN_CHANGE`), greenfield-mode (`CLARIFY_REQUIREMENTS`,
+  `DECOMPOSE`, `SCAFFOLD`), and shared (`APPLY`, `VERIFY`,
+  `ASK_USER`).
+
+The HTTP surface is JSON-only at `/api/agent-session/*` (create /
+list / get / message / decision / delete). Mutating endpoints
+return the full `AgentSessionState` snapshot so the React UI
+re-renders the tree in one round-trip; `DELETE /api/agent-session/
+{sid}` discards a session and its aggregate (`ON DELETE CASCADE`)
+and returns `{deleted: sid}`. The UI polls
+`GET /api/agent-session/{sid}` while a non-`ASK_USER` task is in
+flight.
+
+Drive it programmatically (no UI required):
+
+```python
+from cgx.answer.providers import OllamaProvider
+from cgx.session import SessionRunner, SessionStore
+from cgx.session.models import Decision, DecisionKind
+import cgx.session.tasks  # noqa: F401 -- registers executors
+from cgx.session.tasks.base import ExecutorDeps
+
+store = SessionStore(project_root="/path/to/proj")
+runner = SessionRunner(store)
+session = runner.start_session(
+    objective="how should we refactor the parser layer?",
+    project_root="/path/to/proj",
+)
+deps = ExecutorDeps(
+    project_root="/path/to/proj",
+    index_dir="/tmp/cgx_index/indices",
+    records_path="/tmp/cgx_index/records.jsonl",
+    provider=OllamaProvider(model="qwen2.5-coder:3b"),
+    store=store,
+)
+task = runner.run_next(session_id=session.session_id, deps=deps)
+# `task` is now an ASK_USER waiting on a `choose_path` decision.
+```
+
+See [docs/Agent.md](docs/Agent.md), [docs/usage.md](docs/usage.md#6-session-based-agent-agent),
+and [docs/flowcharts.md](docs/flowcharts.md#session-shaped-write-loop-agent)
+for full reference.
+
+---
+
+## Legacy batch agent (`/agent-legacy`)
+
+For one-shot goals -- *"add docstrings to every public function in
+`cgx.parser`"*, *"create a FastAPI todo app with SQLite and pytest
+tests"* -- the original Planner → Tracker → Judge loop is preserved
+at `/agent-legacy` (and via the `cgx agent` CLI). It is also the
+only path that runs the new-project scaffold pipeline
+(`scaffold_manifest → scaffold_file × N → apply → verify`).
 
 1. The **Planner** decomposes your goal into 1–5 ordered atomic
    `Task`s, each tagged with a short `name`, a `description`, a `kind`
@@ -372,7 +551,8 @@ CGX ships a Planner → Tracker → Judge loop in `cgx.agents`:
    before optionally asking the LLM for a strict
    `{verdict, confidence, rationale}` JSON.
 
-Use it from the **🤖 Agent** tab, or programmatically:
+Use it from the **🤖 Agent** tab's **`/agent-legacy`** view, or
+programmatically:
 
 ```python
 from cgx.agents import run_agent
@@ -411,8 +591,8 @@ for task in plan.tasks:
     print(task.kind, task.status, task.output)
 ```
 
-The Agent tab renders the same `AgentEvent` stream as a live status
-table + DAG (`src/cgx/agents/viz.py`).
+The `/agent-legacy` view renders the same `AgentEvent` stream as a
+live status table + DAG (`src/cgx/agents/viz.py`).
 
 ---
 
@@ -656,19 +836,6 @@ as a **two-job matrix**:
   the embedding + reranker stack.
 
 ---
-
-## 🤝 Contributing
-
-We welcome contributions of all sizes! The architecture of CGX is explicitly designed to make community contributions isolated and modular.
-
-### 💡 The Easiest Way to Contribute: Add a Skill
-If you want to add support for your favorite framework, language, or tool, you do not need to touch the core agent orchestration layer. Simply add a new folder to the `skills/` directory containing:
-1. **Detection rules** to identify when the skill is needed.
-2. **Prompt fragments** to guide model code generation.
-3. **Structural validators** for the code Judge to execute.
-
-See [docs/architecture.md#skills](docs/architecture.md#skills) for our plug-and-play skills protocol. For bugs, feature requests, or core engine patches, please refer to our [CONTRIBUTING.md](CONTRIBUTING.md) guide.
-
 
 ## License
 

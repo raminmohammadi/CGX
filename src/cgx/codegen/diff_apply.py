@@ -102,19 +102,93 @@ def _read_file(project_root: str, rel_path: str) -> Optional[str]:
         return None
 
 
+def _build_hunk_images(body: List[str]) -> Tuple[List[str], List[str]]:
+    """Split a hunk body into the pre-image (lines expected in the source)
+    and the post-image (lines the source should be replaced with).
+
+    ``" "`` lines contribute to both; ``"-"`` lines appear only in the
+    pre-image; ``"+"`` lines appear only in the post-image. ``"\\ No newline
+    at end of file"`` markers and other non-diff lines are ignored.
+    """
+    pre: List[str] = []
+    post: List[str] = []
+    for ln in body:
+        if not ln:
+            # A blank line inside a hunk body is a context line for an empty
+            # source line -- unified diff requires a leading space, but some
+            # models drop it. Treat as context on both sides.
+            pre.append("")
+            post.append("")
+            continue
+        tag, rest = ln[0], ln[1:]
+        if tag == " ":
+            pre.append(rest)
+            post.append(rest)
+        elif tag == "-":
+            pre.append(rest)
+        elif tag == "+":
+            post.append(rest)
+        # any other leading char (e.g. "\") is metadata; skip.
+    return pre, post
+
+
+def _locate_pre_image(
+    buf: List[str], pre: List[str], hint: int, *, window: int = 50
+) -> Optional[int]:
+    """Find the index in ``buf`` at which ``pre`` matches exactly.
+
+    Tries, in order:
+
+    1. The hinted index supplied by the @@ header (adjusted by prior offsets).
+    2. A sliding-window scan ±``window`` lines around the hint.
+    3. A whole-buffer scan, but only accepted when the match is unique.
+
+    Returns the start index or ``None`` if nothing matches uniquely.
+    An empty ``pre`` (pure insertion hunk) returns ``hint`` clamped to
+    ``[0, len(buf)]``.
+    """
+    n_pre = len(pre)
+    if n_pre == 0:
+        return max(0, min(hint, len(buf)))
+    if n_pre > len(buf):
+        return None
+
+    def _matches_at(i: int) -> bool:
+        return 0 <= i <= len(buf) - n_pre and buf[i:i + n_pre] == pre
+
+    if _matches_at(hint):
+        return hint
+    for delta in range(1, window + 1):
+        for cand in (hint - delta, hint + delta):
+            if _matches_at(cand):
+                return cand
+    # Global unique-match fallback.
+    matches: List[int] = []
+    for i in range(0, len(buf) - n_pre + 1):
+        if buf[i:i + n_pre] == pre:
+            matches.append(i)
+            if len(matches) > 1:
+                return None
+    return matches[0] if len(matches) == 1 else None
+
+
 def _apply_hunks(original: str, hunks: List[List[str]]) -> Tuple[Optional[str], List[str]]:
     """Apply hunk bodies (lists of diff lines starting at the line after @@).
 
-    Returns ``(new_text, rejected_hunk_strings)``. If any hunk fails to match,
-    that hunk is skipped and reported in the rejected list; remaining hunks
-    are still attempted on the original text so the caller gets best-effort
-    output. For strict apply, callers should treat any rejected hunk as a
-    failure.
+    Each hunk is located by matching its pre-image (context + deletion lines)
+    against the working buffer. The @@ line numbers are only used as a hint;
+    if they drift, a windowed scan and then a unique-match global scan are
+    tried before giving up. Hunks whose pre-image cannot be located, or whose
+    location is ambiguous, are reported in the rejected list and left
+    unapplied -- this prevents the silent structural overwrite that would
+    otherwise corrupt the file when a model emits wrong line numbers or
+    hallucinated context.
+
+    Returns ``(new_text, rejected_hunk_strings)``.
     """
     src_lines = original.splitlines(keepends=False)
     out: List[str] = list(src_lines)
     rejected: List[str] = []
-    # We apply sequentially with an offset that tracks net insertions/deletions.
     offset = 0
     for hunk in hunks:
         header = hunk[0]
@@ -124,33 +198,18 @@ def _apply_hunks(original: str, hunks: List[List[str]]) -> Tuple[Optional[str], 
             continue
         old_start = int(m.group(1))
         body = hunk[1:]
-        context_before: List[str] = []
-        for ln in body:
-            if ln.startswith(" "):
-                context_before.append(ln[1:])
-            elif ln.startswith("-"):
-                context_before.append(ln[1:])
-            elif ln.startswith("+"):
-                break
-            else:
-                # Unexpected line; treat as context for resilience.
-                context_before.append(ln)
-        anchor = old_start - 1 + offset
-        if anchor < 0 or anchor > len(out):
+        pre, post = _build_hunk_images(body)
+        hint = max(0, old_start - 1 + offset)
+        loc = _locate_pre_image(out, pre, hint)
+        if loc is None:
+            logger.info(
+                "codegen.diff_apply: rejecting hunk -- pre-image not found "
+                "(hint=%d, pre_lines=%d)", hint, len(pre),
+            )
             rejected.append("\n".join(hunk))
             continue
-        new_block: List[str] = []
-        consumed = 0
-        for ln in body:
-            if ln.startswith(" "):
-                new_block.append(ln[1:]); consumed += 1
-            elif ln.startswith("-"):
-                consumed += 1
-            elif ln.startswith("+"):
-                new_block.append(ln[1:])
-            # ignore other markers (\ No newline at end of file)
-        out[anchor:anchor + consumed] = new_block
-        offset += len(new_block) - consumed
+        out[loc:loc + len(pre)] = post
+        offset += len(post) - len(pre)
     return "\n".join(out) + ("\n" if original.endswith("\n") else ""), rejected
 
 

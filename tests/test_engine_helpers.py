@@ -478,3 +478,187 @@ def test_generate_single_scaffold_file_short_circuits_conftest():
     body = out["content"]
     assert "sys.path.insert" in body
     assert '"src"' in body or "'src'" in body
+
+
+# ---------------------------------------------------------------------
+# clarify_paths structured generation
+# ---------------------------------------------------------------------
+
+
+def _make_sources(n: int) -> List[Dict[str, Any]]:
+    """Build ``n`` distinct (path, chunk_id, symbol) source rows."""
+    out: List[Dict[str, Any]] = []
+    for i in range(n):
+        out.append({
+            "chunk_id": f"/repo/src/mod_{i}.py::func::do_{i}",
+            "path": f"src/mod_{i}.py",
+            "symbol": f"do_{i}",
+            "text": f"def do_{i}():\n    pass\n",
+        })
+    return out
+
+
+def test_clarify_candidates_group_by_file_and_collect_symbols():
+    from cgx.answer.engine import _clarify_candidates_from_sources
+    sources = [
+        {"chunk_id": "/a.py::f::foo", "path": "a.py", "symbol": "foo"},
+        {"chunk_id": "/a.py::f::bar", "path": "a.py", "symbol": "bar"},
+        {"chunk_id": "/b.py::f::baz", "path": "b.py", "symbol": "baz"},
+    ]
+    cands = _clarify_candidates_from_sources(sources)
+    assert [c["path"] for c in cands] == ["a.py", "b.py"]
+    # First chunk_id seen per file wins (preserves retrieval order).
+    assert cands[0]["chunk_id"] == "/a.py::f::foo"
+    assert "foo" in cands[0]["symbols"] and "bar" in cands[0]["symbols"]
+
+
+def test_clarify_candidates_caps_at_max():
+    from cgx.answer.engine import _clarify_candidates_from_sources
+    sources = _make_sources(12)
+    cands = _clarify_candidates_from_sources(sources, max_candidates=5)
+    assert len(cands) == 5
+
+
+def test_validate_clarify_options_filters_unknown_and_dedupes():
+    from cgx.answer.engine import _validate_clarify_options
+    candidates = [{"chunk_id": "A"}, {"chunk_id": "B"}, {"chunk_id": "C"}]
+    raw = [
+        {"title": "t1", "rationale": "r1", "chunk_id": "A"},
+        {"title": "dup", "rationale": "r1b", "chunk_id": "A"},   # dedupe
+        {"title": "t2", "rationale": "r2", "chunk_id": "B"},
+        {"title": "bogus", "rationale": "r", "chunk_id": "ZZZ"},  # not allowed
+        "not a dict",
+        {"title": "t3", "rationale": "r3", "chunk_id": "C"},
+    ]
+    out = _validate_clarify_options(raw, candidates)
+    assert [o["chunk_id"] for o in out] == ["A", "B", "C"]
+
+
+def test_render_clarify_markdown_has_three_sections():
+    from cgx.answer.engine import _render_clarify_markdown
+    md = _render_clarify_markdown(
+        "You want to improve indexing.",
+        [
+            {"title": "Add reranker", "rationale": "More precise.", "chunk_id": "X"},
+            {"title": "Tune chunking", "rationale": "Better recall.", "chunk_id": "Y"},
+            {"title": "Hybrid fusion", "rationale": "Stronger ranking.", "chunk_id": "Z"},
+        ],
+        "Which matters most: accuracy or latency?",
+    )
+    assert "You want to improve indexing." in md
+    assert "**Possible directions:**" in md
+    assert "1. **Add reranker**" in md and "[[X]]" in md
+    assert "2. **Tune chunking**" in md and "[[Y]]" in md
+    assert "3. **Hybrid fusion**" in md and "[[Z]]" in md
+    assert "_Which matters most" in md
+
+
+class _StubClarifyProvider:
+    """Returns the queued JSON payloads in order from ``chat`` calls."""
+
+    def __init__(self, payloads: List[Dict[str, Any]]) -> None:
+        self._payloads = list(payloads)
+        self.calls: List[List[Dict[str, str]]] = []
+
+    def chat(self, messages, temperature=0.2, max_tokens=None,
+             force_json=True, **_kwargs):
+        self.calls.append(list(messages))
+        if not self._payloads:
+            return {"content": "{}"}
+        return {"content": json.dumps(self._payloads.pop(0))}
+
+
+def test_answer_clarify_paths_happy_path_renders_three_options():
+    from cgx.answer.engine import _answer_clarify_paths
+    sources = _make_sources(4)
+    prep = {"sources": sources, "merged_hits": []}
+    provider = _StubClarifyProvider([{
+        "restatement": "You want to improve indexing accuracy.",
+        "options": [
+            {"title": "Better embedder",
+             "rationale": "Use a stronger model.",
+             "chunk_id": sources[0]["chunk_id"]},
+            {"title": "Add reranker",
+             "rationale": "Refine top-N.",
+             "chunk_id": sources[1]["chunk_id"]},
+            {"title": "Adjust chunking",
+             "rationale": "Capture more context.",
+             "chunk_id": sources[2]["chunk_id"]},
+        ],
+        "follow_up_question": "Accuracy or latency first?",
+    }])
+    out = _answer_clarify_paths(prep, "improve indexing accuracy", provider, root=None)
+    assert "**Possible directions:**" in out["answer_md"]
+    assert out["answer_md"].count("\n1. **") == 1
+    assert "Better embedder" in out["answer_md"]
+    assert "Add reranker" in out["answer_md"]
+    assert "Adjust chunking" in out["answer_md"]
+    assert "Accuracy or latency first?" in out["answer_md"]
+    assert len(out["citations"]) == 3
+    assert out["confidence"] >= 0.7
+    assert len(provider.calls) == 1, "happy path must not retry"
+
+
+def test_answer_clarify_paths_retries_when_first_reply_is_thin():
+    from cgx.answer.engine import _answer_clarify_paths
+    sources = _make_sources(5)
+    prep = {"sources": sources, "merged_hits": []}
+    # First reply: only 1 valid option (others reference unknown chunk_ids).
+    # Second reply (retry): 3 valid options.
+    provider = _StubClarifyProvider([
+        {
+            "restatement": "thin reply",
+            "options": [
+                {"title": "ok", "rationale": "r", "chunk_id": sources[0]["chunk_id"]},
+                {"title": "bad", "rationale": "r", "chunk_id": "made-up"},
+            ],
+            "follow_up_question": "q?",
+        },
+        {
+            "restatement": "fuller reply",
+            "options": [
+                {"title": "A", "rationale": "ra", "chunk_id": sources[0]["chunk_id"]},
+                {"title": "B", "rationale": "rb", "chunk_id": sources[1]["chunk_id"]},
+                {"title": "C", "rationale": "rc", "chunk_id": sources[2]["chunk_id"]},
+            ],
+            "follow_up_question": "which one?",
+        },
+    ])
+    out = _answer_clarify_paths(prep, "open-ended goal", provider, root=None)
+    assert len(provider.calls) == 2, "must retry exactly once on thin reply"
+    assert len(out["citations"]) == 3
+    assert "fuller reply" in out["answer_md"]
+
+
+def test_answer_clarify_paths_backfills_from_candidates_when_model_fails_twice():
+    from cgx.answer.engine import _answer_clarify_paths
+    sources = _make_sources(4)
+    prep = {"sources": sources, "merged_hits": []}
+    # Both replies fail to produce any valid options.
+    provider = _StubClarifyProvider([
+        {"restatement": "", "options": [], "follow_up_question": ""},
+        {"restatement": "", "options": "garbage", "follow_up_question": ""},
+    ])
+    out = _answer_clarify_paths(prep, "improve indexing", provider, root=None)
+    assert len(provider.calls) == 2
+    # Backfill must produce at least 3 deterministic options drawn from
+    # the top candidates so the user sees concrete pointers even when
+    # the model fails twice.
+    assert len(out["citations"]) >= 3
+    assert "**Possible directions:**" in out["answer_md"]
+    for s in sources[:3]:
+        assert s["chunk_id"] in out["answer_md"]
+    # The deterministic backfill renders a generic "Review <stem>" title
+    # so the user can distinguish it from a model-authored option.
+    assert "Review" in out["answer_md"]
+
+
+def test_answer_clarify_paths_empty_sources_degrades_gracefully():
+    from cgx.answer.engine import _answer_clarify_paths
+    prep = {"sources": [], "merged_hits": []}
+    provider = _StubClarifyProvider([])  # must NOT be called
+    out = _answer_clarify_paths(prep, "improve indexing", provider, root=None)
+    assert provider.calls == []
+    assert out["citations"] == []
+    assert out["confidence"] <= 0.2
+    assert "Re-index" in out["answer_md"] or "narrow" in out["answer_md"]

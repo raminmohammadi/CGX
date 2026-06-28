@@ -138,6 +138,130 @@ export type EmbedModelsResponse = {
   recommended_default: string;
 };
 
+// --- session-shaped agent types (mirror cgx.session models) ---
+
+export type SessionModeValue = "explore" | "greenfield";
+
+export type TaskKind =
+  | "explore"
+  | "investigate"
+  | "recommend"
+  | "plan_change"
+  | "apply"
+  | "verify"
+  | "ask_user"
+  | "search"
+  | "clarify_requirements"
+  | "decompose"
+  | "scaffold"
+  | "summarize";
+
+export type TaskNodeStatus =
+  | "pending"
+  | "blocked"
+  | "ready"
+  | "in_progress"
+  | "done"
+  | "failed"
+  | "abandoned";
+
+export type ArtifactKind =
+  | "directions_list"
+  | "findings_bundle"
+  | "recommendation_list"
+  | "code_change_plan"
+  | "applied_changes"
+  | "verify_report"
+  | "session_digest"
+  | "requirements_sheet"
+  | "work_plan"
+  | "scaffold_patches";
+
+export type FactKind = "file" | "symbol" | "parameter" | "anchor";
+
+export type DecisionKind =
+  | "choose_path"
+  | "choose_recommendation"
+  | "approve"
+  | "freeform"
+  | "clarify_answers"
+  | "approve_plan";
+
+export type SessionStatusValue =
+  | "active" | "paused" | "completed" | "abandoned";
+
+export interface AgentSessionSummary {
+  session_id: string;
+  title: string;
+  original_objective: string;
+  status: SessionStatusValue;
+  mode: SessionModeValue;
+  current_focus: string | null;
+  root_task_id: string | null;
+  project_root: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface TaskNodeDTO {
+  task_id: string;
+  session_id: string;
+  kind: TaskKind;
+  name: string;
+  description: string;
+  parent_task_id: string | null;
+  status: TaskNodeStatus;
+  inputs: Record<string, any>;
+  outputs: Record<string, any> | null;
+  error: string | null;
+  blockers: string[];
+  children: string[];
+  consumed_decision_ids: string[];
+  produced_artifact_id: string | null;
+  created_at: number;
+  started_at: number | null;
+  completed_at: number | null;
+}
+
+export interface ArtifactDTO {
+  artifact_id: string;
+  session_id: string;
+  produced_by_task_id: string;
+  kind: ArtifactKind;
+  content: Record<string, any>;
+  created_at: number;
+}
+
+export interface FactDTO {
+  fact_id: string;
+  session_id: string;
+  kind: FactKind;
+  content: Record<string, any>;
+  surfaced_in_task_id: string | null;
+  stale: boolean;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface DecisionDTO {
+  decision_id: string;
+  session_id: string;
+  resolved_task_id: string;
+  kind: DecisionKind;
+  question: string;
+  chosen: Record<string, any>;
+  rationale: string | null;
+  made_at: number;
+}
+
+export interface AgentSessionState {
+  session: AgentSessionSummary;
+  tasks: TaskNodeDTO[];
+  artifacts: ArtifactDTO[];
+  facts: FactDTO[];
+  decisions: DecisionDTO[];
+}
+
 async function jsonReq<T>(
   path: string,
   method: "GET" | "POST" | "PUT" | "DELETE" = "GET",
@@ -268,6 +392,64 @@ export const api = {
       "POST",
       body,
     ),
+
+  // --- session-shaped agent (Phase 4) ---
+  agentSessionCreate: (body: {
+    objective: string;
+    project_root?: string | null;
+    title?: string | null;
+    mode?: SessionModeValue | null;
+    index: IndexLocation;
+    provider: ProviderConfig;
+    run_initial_task?: boolean;
+  }) => jsonReq<AgentSessionState>("/api/agent-session", "POST", body),
+  agentSessionList: (projectRoot?: string | null) => {
+    const q = projectRoot
+      ? `?project_root=${encodeURIComponent(projectRoot)}`
+      : "";
+    return jsonReq<AgentSessionSummary[]>(`/api/agent-session${q}`);
+  },
+  agentSessionGet: (sid: string, projectRoot?: string | null) => {
+    const q = projectRoot
+      ? `?project_root=${encodeURIComponent(projectRoot)}`
+      : "";
+    return jsonReq<AgentSessionState>(
+      `/api/agent-session/${encodeURIComponent(sid)}${q}`,
+    );
+  },
+  agentSessionMessage: (sid: string, body: {
+    message: string;
+    index: IndexLocation;
+    provider: ProviderConfig;
+    run_initial_task?: boolean;
+  }) =>
+    jsonReq<AgentSessionState>(
+      `/api/agent-session/${encodeURIComponent(sid)}/message`,
+      "POST",
+      body,
+    ),
+  agentSessionDecision: (sid: string, body: {
+    task_id: string;
+    chosen: Record<string, any>;
+    rationale?: string | null;
+    index: IndexLocation;
+    provider: ProviderConfig;
+    run_initial_task?: boolean;
+  }) =>
+    jsonReq<AgentSessionState>(
+      `/api/agent-session/${encodeURIComponent(sid)}/decision`,
+      "POST",
+      body,
+    ),
+  agentSessionDelete: (sid: string, projectRoot?: string | null) => {
+    const q = projectRoot
+      ? `?project_root=${encodeURIComponent(projectRoot)}`
+      : "";
+    return jsonReq<{ deleted: string }>(
+      `/api/agent-session/${encodeURIComponent(sid)}${q}`,
+      "DELETE",
+    );
+  },
 };
 
 export type RollbackResponse = {

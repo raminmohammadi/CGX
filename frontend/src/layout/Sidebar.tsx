@@ -6,6 +6,7 @@ import {
   ChevronRight,
   CircleCheck,
   Database,
+  History,
   Loader2,
   MessageSquareDot,
   Microchip,
@@ -24,7 +25,8 @@ const tabs = [
   { to: "/index", label: "Incremental Index", icon: Database, pageKey: "index" as const },
   { to: "/ask", label: "Contextual Ask", icon: MessageSquareDot, pageKey: "ask" as const },
   { to: "/plan", label: "Self-Testing Plan", icon: Wand2, pageKey: "plan" as const },
-  { to: "/agent", label: "Agent Loop", icon: Bot, pageKey: "agent" as const },
+  { to: "/agent", label: "Agent Loop", icon: Bot, pageKey: null },
+  { to: "/agent-legacy", label: "Agent (legacy)", icon: History, pageKey: "agent" as const },
   { to: "/hardware", label: "Hardware Pick", icon: Microchip, pageKey: null },
 ];
 

@@ -2,6 +2,388 @@
 
 All notable changes are documented here. Versions follow semver-ish.
 
+## Unreleased -- Session-based Agent (Phases 0-4) + Greenfield loop
+
+A ground-up rewrite of the Agent surface around a **persistent,
+session-shaped task tree** with structured human-in-the-loop
+checkpoints. The new `/agent` route is the default Agent UI; the
+original Planner / Tracker / Judge loop is preserved unchanged at
+`/agent-legacy` and via the `cgx agent` CLI. Backend dependencies,
+the retrieval / codegen stacks, and the legacy `/api/agent` SSE
+route are untouched, so existing scripted callers keep working.
+
+A follow-up greenfield extension lets the same session backbone
+scaffold **new projects from scratch** when no index is available --
+`CLARIFY_REQUIREMENTS -> ASK(clarify_answers) -> DECOMPOSE ->
+ASK(approve_plan) -> SCAFFOLD -> APPLY -> VERIFY` -- selected
+automatically by `Session.mode` (`explore` vs `greenfield`).
+
+### Added
+
+- **Session deletion endpoint** --
+  `DELETE /api/agent-session/{sid}?project_root=...` in
+  `cgx.webui.routes.agent_session` removes a session and its
+  full aggregate (tasks / facts / decisions / artifacts) via
+  SQLite `ON DELETE CASCADE`. Returns `{deleted: sid}` on success
+  or 404 if no runner knows about the id. The Agent UI surfaces a
+  hover-revealed trash icon on each session row (both the active
+  `SessionBar` and the empty-state `PriorSessions` list) with a
+  `window.confirm` guard; deleting the active session clears the
+  selection. Frontend wiring: `agentSessionDelete(sid, projectRoot?)`
+  in `frontend/src/lib/api.ts`, `deleteSession` handler in
+  `AgentPage.tsx`, regression test
+  `test_delete_session_removes_aggregate_and_404s_on_followups`
+  in `tests/test_webui_agent_session.py`.
+- **Resizable + collapsible Agent panels** -- the three-column
+  Agent layout (sessions / task tree / artifacts+facts) now has
+  drag handles between every column and collapse toggles on the
+  left and right rails so the page no longer breaks on narrow
+  viewports. Bounds: session bar 160-360 px, task tree 180-420 px,
+  side panel 220-480 px. Widths and collapsed flags are persisted
+  in the existing `cgx-agent-session` `localStorage` key alongside
+  the active session and selected task id. Implementation:
+  `frontend/src/components/agent/ResizeHandle.tsx` (pointer-event
+  drag with stable baseline), `LiveView.tsx` refactored to inline
+  widths plus a 28 px `CollapsedRail`, and `useAgentSession`
+  expanded with `sessionBarWidth` / `taskTreeWidth` /
+  `sidePanelWidth` plus `sessionBarCollapsed` /
+  `sidePanelCollapsed` (clamped to the per-column bounds).
+- **Greenfield session mode (G0-G9)** -- new
+  `Session.mode: SessionMode` field with values `EXPLORE` (default,
+  modifying an existing repo) and `GREENFIELD` (scaffolding a brand
+  new project). `cgx.session.mode.detect_mode(project_root, index_dir)`
+  auto-selects based on whether the project root is empty / missing
+  and whether a FAISS index exists, and is invoked from
+  `routes/agent_session.create_session` when the request omits an
+  explicit `mode`. The router seeds `CLARIFY_REQUIREMENTS` as the root
+  task in greenfield mode instead of `EXPLORE`.
+- **Greenfield task kinds + artifacts** -- `TaskKind` gains
+  `CLARIFY_REQUIREMENTS`, `DECOMPOSE`, `SCAFFOLD`. `ArtifactKind`
+  gains `REQUIREMENTS_SHEET` (the clarifying questions),
+  `WORK_PLAN` (the layered scaffolding manifest with `plan_md` +
+  `layers[].files[]`), and `SCAFFOLD_PATCHES` (per-file generated
+  diffs compatible with `apply_diffs_to_disk`). `DecisionKind` gains
+  `CLARIFY_ANSWERS` (user answers to the questionnaire) and
+  `APPROVE_PLAN` (approve / reject the work plan).
+- **Greenfield executors** --
+  `cgx.session.tasks.clarify_requirements` issues a `force_json` LLM
+  call to produce 3-6 structured clarification questions (tech stack,
+  must-haves, target environment) with a deterministic fallback bank
+  when the provider is unavailable;
+  `cgx.session.tasks.decompose` wraps
+  `cgx.answer.engine.plan_scaffold_manifest` with the clarify answers
+  folded into the goal text and emits the typed `WORK_PLAN`;
+  `cgx.session.tasks.scaffold` iterates `WORK_PLAN.layers`, calls
+  `generate_single_scaffold_file` per entry, accumulates
+  `existing_files_with_content` context across layers, and emits
+  `SCAFFOLD_PATCHES` ready for the existing `APPLY` / `VERIFY`
+  executors (which now accept either `CODE_CHANGE_PLAN` or
+  `SCAFFOLD_PATCHES` as upstream artifact and skip cleanly when a
+  greenfield project has no tests yet).
+- **Greenfield router branch** --
+  `Router.on_user_message` and `Router.on_decision_recorded` route by
+  `session.mode`: greenfield sessions follow
+  `CLARIFY_REQUIREMENTS -> ASK(clarify_answers) -> DECOMPOSE ->
+  ASK(approve_plan) -> SCAFFOLD -> APPLY -> VERIFY`. EXPLORE failure
+  on a missing index is also downgraded from a crash to a graceful
+  `FAILED` task with a clear error message.
+- **Frontend forms + artifact renderers** --
+  `frontend/src/components/agent/AskUserForm.tsx` adds
+  `ClarifyAnswersForm` (per-question textareas backed by the
+  `REQUIREMENTS_SHEET`) and `ApprovePlanForm` (checklist over the
+  `WORK_PLAN` layers with approve / reject + reason).
+  `ArtifactPreview.tsx` adds `RequirementsBody`, `WorkPlanBody`, and
+  `ScaffoldPatchesBody` renderers. The session mode is surfaced as a
+  badge in the LiveView header.
+- **API mode field** -- `AgentSessionCreateRequest.mode` (optional
+  string) lets callers pin the mode explicitly; when absent the
+  server runs `detect_mode` against the supplied `project_root` and
+  index location and persists the decision on `Session.mode`.
+
+### Changed
+
+- **`ActiveTask.resolveLinkedArtifact`** -- the upstream-artifact
+  lookup is no longer a hardcoded list of explore-mode keys; it
+  scans `task.inputs` for any `*_artifact_id` key so new flows
+  (`requirements_artifact_id`, `work_plan_artifact_id`,
+  `scaffold_patches_artifact_id`, ...) pick up automatically.
+
+### Docs
+
+- `docs/Agent.md`, `docs/architecture.md`, `docs/flowcharts.md`,
+  `docs/usage.md`, and `README.md` document the greenfield loop, the
+  mode auto-detection rules, and the new API field.
+
+### Added
+
+- **`cgx.session` core (Phase 0)** -- new package implementing the
+  session backbone. Pydantic-free dataclasses in
+  `cgx.session.models` (`Session`, `TaskNode`, `Fact`, `Artifact`,
+  `Decision`, `KnowledgeBase`, `DecisionLog`); SQLite persistence in
+  `cgx.session.store.SessionStore` (one DB per project root at
+  `<project_root>/.cgx/sessions.db`, WAL mode, JSON-blob rows with
+  indexed columns); in-process publish/subscribe `EventBus` in
+  `cgx.session.events`. `TaskKind` covers `EXPLORE`, `INVESTIGATE`,
+  `RECOMMEND`, `PLAN_CHANGE`, `APPLY`, `VERIFY`, `ASK_USER`,
+  `SEARCH`, `SUMMARIZE`. `TaskNodeStatus` runs through
+  `PENDING -> BLOCKED -> READY -> IN_PROGRESS -> DONE`/`FAILED`/
+  `ABANDONED`; `ASK_USER` deliberately stays `IN_PROGRESS` until a
+  `Decision` arrives. Covered by `tests/test_session.py`.
+- **Deterministic Router (Phase 1a)** --
+  `cgx.session.router.Router` is pure Python with no LLM calls and
+  no I/O. Three entry points (`on_user_message`,
+  `on_task_completed`, `on_decision_recorded`) cover every
+  transition; each returns a `RouterPlan` of typed actions
+  (`CreateTask`, `UpdateTaskStatus`, `RecordDecision`,
+  `AttachDecisionToTask`) for the caller to apply atomically. A
+  `TASK_SUCCESSOR` table fixes the non-ASK successors
+  (`EXPLORE -> ASK_USER(choose_path)`, `INVESTIGATE -> RECOMMEND`,
+  `RECOMMEND -> ASK_USER(choose_recommendation)`,
+  `PLAN_CHANGE -> ASK_USER(approve)`, `APPLY -> VERIFY`); ASK
+  successors are driven by the shape of the resolving `Decision`.
+- **Executor registry (Phase 1b)** --
+  `cgx.session.tasks.base.register_executor(kind)` registers a pure
+  function `(TaskNode, ExecutorDeps) -> ExecutorResult` against a
+  `TaskKind`. Executors do not write to the store directly; the
+  runner persists their `outputs`, surfaced `facts`, and produced
+  `artifact` after the call. `ExecutorDeps` carries optional
+  `project_root`, `index_dir`, `records_path`, `embed_model`,
+  `provider`, `store`, and an `extra` dict; executors return
+  `ExecutorResult(failure=...)` if a required dep is missing rather
+  than raising.
+- **EXPLORE executor (Phase 1c)** --
+  `cgx.session.tasks.explore` runs retrieval-grounded
+  `clarify_paths` against the project index and produces a
+  `DIRECTIONS_LIST` artifact plus one `ANCHOR` fact per option.
+  Bypasses `answer_with_llm`'s Markdown round-trip by reading
+  structured `debug["options"]` directly so the typed option payload
+  reaches the UI without re-parsing.
+- **ASK_USER + decision validation (Phase 1d)** --
+  `cgx.session.tasks.ask.build_decision(session_id, task, chosen,
+  rationale)` validates incoming `chosen` payloads against the
+  task's `inputs["expected_kind"]` and raises `ValueError`
+  (rendered as HTTP 400) on mismatch:
+  - `choose_path` requires `anchor_chunk_id` (non-empty).
+  - `choose_recommendation` requires `kind in {investigate_more,
+    plan_change, ask_followup, done}`; `kind=investigate_more`
+    additionally requires `anchor_chunk_id`.
+  - `approve` requires `approved: bool`.
+  - `freeform` requires only `text`.
+  Successor spawning is delegated to `Router.on_decision_recorded`
+  so the contract has one source of truth.
+- **SessionRunner (Phase 1e)** --
+  `cgx.session.runner.SessionRunner` is the orchestrator the HTTP
+  routes call. Holds a per-session `threading.Lock` (guarded by an
+  outer lock) so concurrent requests can't interleave half-applied
+  plans; sequences router plans (creates -> decisions -> attaches
+  -> status updates) so a spawned child is visible by the time a
+  parent flips to `DONE`; centralises executor dispatch + failure
+  handling (missing executor or uncaught exception -> task
+  transitions to `FAILED` with a helpful message; surfaced facts
+  still persist). Public API: `start_session`, `post_message`,
+  `post_decision`, `run_next`.
+- **`/api/agent-session/*` HTTP surface (Phase 1f)** --
+  `cgx.webui.routes.agent_session` mounts six JSON endpoints
+  alongside (not replacing) the legacy `/api/agent` SSE route:
+  `POST /api/agent-session` (create + drain READY),
+  `GET /api/agent-session?project_root=...` (list sessions),
+  `GET /api/agent-session/{sid}` (full snapshot),
+  `POST /api/agent-session/{sid}/message` (follow-up; spawns a
+  sibling `EXPLORE` when no `ASK_USER` is open),
+  `POST /api/agent-session/{sid}/decision` (resolve a pending
+  `ASK_USER`), `DELETE /api/agent-session/{sid}` (discard the
+  session and its aggregate via SQLite `ON DELETE CASCADE`;
+  returns `{deleted: sid}`). Every mutating endpoint returns the
+  full `AgentSessionState` snapshot except `DELETE`; mutating
+  endpoints drain the loop
+  in a thread (`_drain_ready`, capped at four steps) until an
+  `ASK_USER` pauses. A per-`project_root` runner cache (`_RUNNERS`)
+  reuses one `SessionStore` (and its SQLite WAL connection) across
+  requests. New Pydantic wire models in `cgx.webui.models`
+  (`AgentSessionCreateRequest`, `AgentSessionMessageRequest`,
+  `AgentSessionDecisionRequest`, `AgentSessionState`, ...).
+- **INVESTIGATE + RECOMMEND executors (Phase 2)** --
+  `cgx.session.tasks.investigate` runs an anchored retrieval keyed
+  on the chosen `anchor_chunk_id`, consults the per-session
+  `KnowledgeBase` to skip redundant work, and produces a
+  `FINDINGS_BUNDLE` artifact plus `SYMBOL` facts.
+  `cgx.session.tasks.recommend` makes a structured (JSON-mode) LLM
+  call and produces a `RECOMMENDATION_LIST` of 2-4 typed
+  recommendations (`kind in {investigate_more, plan_change,
+  ask_followup, done}`). Router successor table extended:
+  `INVESTIGATE -> RECOMMEND`, `RECOMMEND -> ASK_USER(choose_recommendation)`,
+  `CHOOSE_PATH decision -> INVESTIGATE`.
+- **PLAN_CHANGE / APPLY / VERIFY executors (Phase 3)** --
+  `cgx.session.tasks.plan_change` wraps `generate_code_plan` and
+  produces a `CODE_CHANGE_PLAN` artifact (unified diffs + plan_md).
+  `cgx.session.tasks.apply` wraps `apply_diffs_to_disk` and
+  produces an `APPLIED_CHANGES` artifact carrying `applied_files`,
+  `failed_files`, and the per-run `backup_dir` (same mirror under
+  `<project_root>/.cgx-backups/<run_id>/` the legacy loop uses, so
+  `POST /api/rollback` still works on session runs).
+  `cgx.session.tasks.verify` runs the impacted-tests harness and
+  produces a `VERIFY_REPORT`. Router successors:
+  `CHOOSE_RECOMMENDATION(plan_change) -> PLAN_CHANGE`,
+  `PLAN_CHANGE -> ASK_USER(approve)`,
+  `APPROVE(approved=true) -> APPLY`, `APPLY -> VERIFY`.
+  `APPROVE(approved=false)` returns no successor; the user can
+  pivot with a fresh objective.
+- **Session-shaped Agent page (Phase 4)** --
+  `frontend/src/pages/AgentPage.tsx` is now the session-shaped page
+  at `/agent`; the original page moved to
+  `frontend/src/pages/AgentLegacyPage.tsx` and is mounted at
+  `/agent-legacy`. New components under
+  `frontend/src/components/agent/`: `SessionLauncher`, `TaskTree`
+  (hierarchical DAG keyed on `parent_task_id`; depth-based
+  indentation, status icons, orphan re-surfacing),
+  `ActiveTask` + `AskUserForm` (dispatch on `expected_kind` to
+  `ChoosePathForm` / `ChooseRecommendationForm` / `ApproveForm` /
+  `FreeformForm`, posting exactly the shapes `build_decision`
+  expects), `SidePanel` + `ArtifactPreview` (tabbed Knowledge-Base
+  and Artifacts view; per-kind renderers), `LiveView`.
+  `frontend/src/store/agentSession.ts` is a Zustand + `persist`
+  store (key `cgx-agent-session`) that holds the active session id
+  and selected task id in `localStorage` so a tab switch / reload
+  resumes the same view; the snapshot itself is reloaded from
+  `/api/agent-session/{sid}` on mount rather than cached
+  client-side. Sidebar entry updated to surface the session UI as
+  default and `/agent-legacy` as an explicit secondary link.
+- **Frontend component tests** --
+  `frontend/src/components/agent/AskUserForm.test.tsx` (6 cases)
+  pins the wire-shape contract for every `expected_kind` variant
+  (including empty-state handling on `ApproveForm` when the
+  `CODE_CHANGE_PLAN` is missing, `Send` disabled on empty freeform
+  text, and `pending=true` disabling each form).
+  `TaskTree.test.tsx` (6 cases) covers the DAG renderer (root
+  pinning, depth-based indentation, selection ring, orphan
+  re-surfacing, `onSelect` payload).
+- **Backend integration tests** --
+  `tests/test_webui_agent_session.py` drives the full write loop
+  (`EXPLORE -> choose_path -> INVESTIGATE -> RECOMMEND ->
+  choose_recommendation(plan_change) -> PLAN_CHANGE -> approve ->
+  APPLY -> VERIFY`) directly against the FastAPI route handlers
+  through a `_HandlerClient` shim. Pydantic still parses every
+  payload via `AgentSessionCreateRequest` /
+  `AgentSessionDecisionRequest`, so the wire contract is exercised
+  end-to-end without taking an `httpx` test-time dependency. Stub
+  executors are registered for every `TaskKind`; the
+  per-`project_root` `_RUNNERS` cache is cleared and each runner's
+  store is closed between tests. Coverage: full happy-path loop,
+  decline-approval halts the loop, decision validation rejects an
+  empty anchor on `choose_path`, snapshot + list endpoints,
+  follow-up message spawns a sibling `EXPLORE` after a `done`
+  recommendation clears focus.
+
+### Changed
+
+- **`/agent` route now serves the session-based UI by default**;
+  the previous batch Planner / Tracker / Judge view moved to
+  `/agent-legacy`. The sidebar surfaces both. No backend behaviour
+  change for legacy callers -- the `cgx agent` CLI, the
+  `cgx.agents.run_agent` Python API, and the `/api/agent` SSE route
+  all continue to drive the batch loop unchanged.
+- **Documentation refresh** -- `docs/Agent.md`,
+  `docs/architecture.md`, `docs/usage.md`, `docs/flowcharts.md`,
+  and `README.md` updated end-to-end with a new top-level section
+  for the session-shaped agent, explicit cross-references to the
+  legacy view, and a programmatic example driving `SessionRunner`
+  directly. `docs/usage.md` sections 7-15 renumbered to 8-16 to
+  accommodate the new "Session-based Agent (`/agent`)" section.
+
+### Notes
+
+- **No re-index required.** The session backbone reuses the same
+  retrieval, codegen, and provider stacks as the batch loop; only
+  the state model, interaction model, and execution model differ.
+- **No new runtime dependencies.** SQLite is in the stdlib; the
+  session UI is built from the same React / Zustand stack already
+  in use elsewhere in the frontend.
+- **Database location.** One database file per project root at
+  `<project_root>/.cgx/sessions.db` (or `~/.cgx/sessions.db` when
+  no project root is supplied -- typical for interactive scripts
+  and tests with a tmp `HOME`).
+
+## Unreleased -- Ask UI overhaul + Gemini stream resilience + patch context verification
+
+### Added
+
+- **Citation chips in rendered answers** (`frontend/src/components/Markdown.tsx`):
+  a new `preprocessCitations` step rewrites both `[[chunk_id]]` markers
+  (emitted by `cgx.answer.engine`) and single-bracket `[path::kind::name]`
+  variants into compact emerald `CitationChip` pills displaying just the
+  symbol name with the full id surfaced via tooltip. Previously these
+  markers rendered as raw bracketed text, which cluttered every paragraph
+  with long `[[/src/cgx/retrieval/lexical.py::method::LexicalIndex.search]]`
+  strings. No backend changes -- the structured `citations` array on the
+  response is untouched.
+- **Collapsible Sources panel** (`frontend/src/pages/AskPage.tsx`):
+  the retrieval-ranks column is now hidden by default behind a
+  `Sources (N)` toggle in the new `ChatHeader` strip. Clicking reveals
+  the existing `RetrievalPanel` as a right-hand drawer. Frees the main
+  reading area for the answer and matches the cleaner Odysseus-style
+  layout.
+- **Redesigned Ask bar** (`frontend/src/pages/AskPage.tsx`): taller
+  textarea, larger placeholder, emerald focus glow, icon prefix,
+  pill-shaped Ask button, and a `Enter to send · Shift+Enter for newline`
+  hint underneath. Markdown body typography in `Markdown.tsx` was also
+  refreshed (comfier reading size, tighter heading hierarchy, real card
+  around fenced code blocks).
+- **`_format_stream_failure` helper** (`cgx.webui.handlers`): centralised
+  formatter for `thought_warning` SSE payloads. `RuntimeError` messages
+  raised by providers (already pre-scrubbed) render without the redundant
+  class prefix; other exceptions keep `ClassName: msg` so the cause
+  remains visible. Used by both `stream_ask` and `stream_plan`.
+- **Regression tests for patch context verification**
+  (`tests/test_codegen_pipeline.py`): four new tests --
+  `test_apply_hunks_exact_match_applies`,
+  `test_apply_hunks_drifted_line_numbers_fuzzy_locates`,
+  `test_apply_hunks_hallucinated_context_is_rejected`,
+  `test_apply_hunks_ambiguous_match_is_rejected` -- pin the new
+  context-verification contract.
+
+### Changed
+
+- **`GeminiProvider.chat_stream` now retries transient transport errors**
+  (`cgx.answer.providers`). `SSLError`, `ConnectionError`, `Timeout`,
+  and `ChunkedEncodingError` raised *before* any delta has been yielded
+  are retried with exponential backoff up to `max_retries` times (default
+  3) via the existing `cgx.answer.ratelimit.backoff_seconds` helper. A
+  mid-stream break (after deltas have flowed) cannot be safely replayed
+  -- it would duplicate downstream content -- so it instead raises a
+  scrubbed `RuntimeError` the caller can surface as a clean warning.
+  Hard HTTP errors (4xx / 5xx) raise immediately with the status code
+  rather than retry. All error messages run through
+  `GeminiProvider._scrub_secret` so the API key cannot leak into UI
+  banners or logs. Previously a single TLS hiccup yielded
+  `[stream error: SSLError: ...]` into the planner-thinking pane and
+  killed the turn.
+
+### Fixed
+
+- **`cgx.codegen.diff_apply._apply_hunks` silently corrupted files when
+  the model emitted wrong line numbers or hallucinated context lines**.
+  The previous implementation treated `@@` line numbers as authoritative
+  and blindly overwrote `out[anchor:anchor+consumed]` with the post-image
+  without verifying that the pre-image actually matched the buffer.
+  Repro: a diff with `@@ -1,3 +1,3 @@` followed by context line
+  ` def NONEXISTENT_func():` (a function that doesn't exist in the file)
+  was reported as `ok=True` and silently replaced the real `def add()`,
+  producing invalid Python that then failed the downstream
+  `validate_patch_results` syntax check. The rewrite:
+  - Introduces `_build_hunk_images` which splits each hunk body into a
+    **pre-image** (context + deletion lines) and **post-image**
+    (context + addition lines).
+  - Introduces `_locate_pre_image` which locates the pre-image in the
+    working buffer using (1) the `@@` hint, (2) a ±50-line sliding
+    window, and (3) a global unique-match fallback. Ambiguous global
+    matches (more than one location matches) are rejected rather than
+    guessed.
+  - Hunks whose pre-image cannot be located are added to
+    `rejected_hunks` and the file content is **preserved
+    byte-for-byte**, so the downstream syntax validator now sees the
+    real failure ("partial apply" / "rejected hunk") instead of an
+    after-the-fact `SyntaxError` on corrupted output.
+
 ## Unreleased -- Gemma 4 model family + pull-error fix
 
 ### Added

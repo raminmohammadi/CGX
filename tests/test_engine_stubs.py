@@ -25,7 +25,7 @@ pytest.importorskip("faiss")
 
 from cgx.agents import Judge, Planner, run_agent
 from cgx.agents.types import AgentEvent, Plan, Task, TaskKind, TaskStatus
-from cgx.answer.engine import answer_with_llm, generate_code_plan
+from cgx.answer.engine import answer_with_llm, answer_with_llm_stream, generate_code_plan
 from cgx.pipeline.auto import run_index_auto
 
 
@@ -73,6 +73,22 @@ class _StubProvider:
 
     def chat_stream(self, messages, **kw):
         yield ""
+
+
+class _StreamStubProvider:
+    """LLMProvider stub that yields a scripted list of deltas from chat_stream."""
+
+    def __init__(self, deltas: List[str]) -> None:
+        self.deltas = list(deltas)
+        self.stream_calls: List[Dict[str, Any]] = []
+
+    def chat(self, messages, **kw) -> Dict[str, Any]:
+        return {"content": "", "error": None}
+
+    def chat_stream(self, messages, **kw):
+        self.stream_calls.append({"messages": messages, **kw})
+        for d in self.deltas:
+            yield d
 
 
 def _make_mini_project(root: Path) -> None:
@@ -178,6 +194,61 @@ def test_answer_with_llm_debug_field_is_json_safe(mini_index):
         _json.dumps(result, default=str)
     except Exception as exc:
         pytest.fail(f"answer_with_llm result is not JSON-safe: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# answer_with_llm_stream
+# ---------------------------------------------------------------------------
+
+def test_answer_with_llm_stream_emits_deltas_then_final(mini_index):
+    """Streaming must emit ordered answer_delta events then a single answer event."""
+    deltas = ["The `add` ", "function ", "returns ", "the sum."]
+    prov = _StreamStubProvider(deltas)
+    events = list(answer_with_llm_stream(
+        mini_index["index_dir"],
+        mini_index["records_path"],
+        "What does add() do?",
+        prov,
+    ))
+    delta_events = [d for (e, d) in events if e == "answer_delta"]
+    answer_events = [d for (e, d) in events if e == "answer"]
+    assert len(delta_events) == len(deltas), f"expected {len(deltas)} deltas, got {len(delta_events)}"
+    assert [d["delta"] for d in delta_events] == deltas
+    assert len(answer_events) == 1, "must yield exactly one final answer event"
+    final = answer_events[0]
+    assert final["answer_md"].strip() == "".join(deltas).strip()
+    assert isinstance(final.get("citations"), list)
+    assert final.get("debug", {}).get("streamed") is True
+
+
+def test_answer_with_llm_stream_extracts_inline_citations(mini_index):
+    """Citations inside the streamed Markdown must be parsed and filtered to allowed ids."""
+    # First learn a valid chunk_id from the blocking path's debug.sources.
+    prov_sync = _StubProvider([
+        {"content": json.dumps({"answer_md": "x", "citations": []}), "error": None}
+    ])
+    seed = answer_with_llm(
+        mini_index["index_dir"], mini_index["records_path"],
+        "What does add() do?", prov_sync,
+    )
+    sources = (seed.get("debug") or {}).get("sources", [])
+    assert sources, "expected at least one source for citation test"
+    valid_id = sources[0]["chunk_id"]
+
+    deltas = [
+        "`add` returns `a + b` ",
+        f"[[{valid_id}]] ",
+        "and is straightforward [[not-a-real-id]].",
+    ]
+    prov = _StreamStubProvider(deltas)
+    events = list(answer_with_llm_stream(
+        mini_index["index_dir"], mini_index["records_path"],
+        "What does add() do?", prov,
+    ))
+    final = next(d for (e, d) in events if e == "answer")
+    cite_ids = [c["chunk_id"] for c in final["citations"]]
+    assert valid_id in cite_ids
+    assert "not-a-real-id" not in cite_ids
 
 
 # ---------------------------------------------------------------------------

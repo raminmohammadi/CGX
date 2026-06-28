@@ -80,6 +80,15 @@ class AgentRequest(BaseModel):
     stop_on_fail: bool = True
     index: IndexLocation = Field(default_factory=IndexLocation)
     provider: ProviderConfig = Field(default_factory=ProviderConfig)
+    # ``continuation`` signals the user is following up on a previous
+    # exploratory ASK (a ``clarify_paths`` reply) so the Planner should
+    # treat ``goal`` as a narrowed request rather than re-triggering the
+    # exploratory-clarification rewrite. ``prior_goal`` is the original
+    # open-ended request that produced the clarification; the Planner
+    # weaves it into the LLM prompt when ``continuation`` is True so the
+    # narrowed follow-up stays anchored in the broader objective.
+    continuation: bool = False
+    prior_goal: Optional[str] = None
 
 
 class ProfileUpsertRequest(BaseModel):
@@ -102,6 +111,58 @@ class SessionCreateRequest(BaseModel):
 class RollbackRequest(BaseModel):
     project_root: str
     backup_dir: str
+
+
+# --------------------- agent-session (Phase 1) ---------------------
+
+class AgentSessionCreateRequest(BaseModel):
+    """Spin up a new session-backed agent run.
+
+    ``objective`` is the user's long-form goal -- the session keeps it
+    verbatim and the router uses it to seed the root task. Provider and
+    index settings mirror :class:`AgentRequest` so the frontend can
+    reuse the same configuration UI. ``mode`` is optional: when omitted
+    the server auto-detects ``explore`` vs ``greenfield`` from the
+    project root and index location.
+    """
+    objective: str
+    project_root: Optional[str] = None
+    title: Optional[str] = None
+    mode: Optional[str] = None
+    index: IndexLocation = Field(default_factory=IndexLocation)
+    provider: ProviderConfig = Field(default_factory=ProviderConfig)
+    run_initial_task: bool = True
+
+
+class AgentSessionMessageRequest(BaseModel):
+    """Follow-up message to an existing session."""
+    message: str
+    index: IndexLocation = Field(default_factory=IndexLocation)
+    provider: ProviderConfig = Field(default_factory=ProviderConfig)
+    run_initial_task: bool = True
+
+
+class AgentSessionDecisionRequest(BaseModel):
+    """User response to a pending ASK_USER task."""
+    task_id: str
+    chosen: Dict[str, Any]
+    rationale: Optional[str] = None
+    index: IndexLocation = Field(default_factory=IndexLocation)
+    provider: ProviderConfig = Field(default_factory=ProviderConfig)
+    run_initial_task: bool = False
+
+
+class AgentSessionState(BaseModel):
+    """Full read of a session's persistent state.
+
+    Returned by every mutating endpoint so the frontend can render the
+    new tree / artifacts / facts in one round-trip.
+    """
+    session: Dict[str, Any]
+    tasks: List[Dict[str, Any]] = Field(default_factory=list)
+    artifacts: List[Dict[str, Any]] = Field(default_factory=list)
+    facts: List[Dict[str, Any]] = Field(default_factory=list)
+    decisions: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 # --------------------- responses ---------------------

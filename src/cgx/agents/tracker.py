@@ -387,6 +387,45 @@ def _extract_display_output(task: Task) -> Dict[str, Any]:
     elif task.kind == TaskKind.ASK:
         if out.get("answer_md"):
             result["answer_md"] = str(out["answer_md"])
+        cites = out.get("citations") or []
+        if isinstance(cites, list) and cites:
+            result["citations"] = [
+                {"chunk_id": str(c.get("chunk_id") or "")}
+                for c in cites if isinstance(c, dict) and c.get("chunk_id")
+            ]
+        conf = out.get("confidence")
+        if isinstance(conf, (int, float)):
+            result["confidence"] = float(conf)
+        sugg = out.get("suggested_changes") or []
+        if isinstance(sugg, list) and sugg:
+            result["suggested_changes"] = sugg
+        # Slim ``debug`` to just the slots the UI needs to render a
+        # clarify_paths reply box (mode + structured options + the
+        # follow-up question). Drops the heavy ``sources``/``hits``/
+        # ``candidates`` payloads so the SSE event stays small.
+        dbg = out.get("debug")
+        if isinstance(dbg, dict):
+            mode = str(dbg.get("mode") or "")
+            slim: Dict[str, Any] = {}
+            if mode:
+                slim["mode"] = mode
+            if mode == "clarify_paths":
+                opts = dbg.get("options") or []
+                if isinstance(opts, list):
+                    slim["options"] = [
+                        {"title": str(o.get("title") or ""),
+                         "rationale": str(o.get("rationale") or ""),
+                         "chunk_id": str(o.get("chunk_id") or "")}
+                        for o in opts if isinstance(o, dict)
+                    ]
+                fq = dbg.get("follow_up_question")
+                if fq:
+                    slim["follow_up_question"] = str(fq)
+                rs = dbg.get("restatement")
+                if rs:
+                    slim["restatement"] = str(rs)
+            if slim:
+                result["debug"] = slim
     elif task.kind == TaskKind.SEARCH:
         top_files = out.get("top_files") or []
         if top_files:
@@ -679,7 +718,13 @@ class Tracker:
         # file_path, function_name, and optional skeleton.
         if task.kind == TaskKind.FILL_LOGIC:
             return cap(task.description, **inputs)
-        # ASK / PLAN / SEARCH all take the task description as the first arg.
+        if task.kind == TaskKind.ASK:
+            # Forward prior outputs so a preceding SEARCH's hits can be
+            # reused instead of triggering a redundant retrieval. The
+            # wrapper in loop.py extracts ``_prior_outputs`` before
+            # calling the engine.
+            return cap(task.description, _prior_outputs=prior_outputs, **inputs)
+        # PLAN / SEARCH take the task description as the first arg.
         return cap(task.description, **inputs)
 
     # ------------------------------------------------------------------

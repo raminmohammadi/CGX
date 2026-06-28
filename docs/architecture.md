@@ -33,15 +33,23 @@ cgx.codegen.env_manager -- pre-flight dependency scan, pip-install, requirements
 cgx.codegen.symbol_map  -- symbol-table context builder for working-memory injection
 cgx.io.persist          -- JSON/JSONL/FAISS writers shared by the index pipeline
 cgx.pipeline            -- high-level orchestrators (run_index_auto, run_query_auto)
-cgx.agents              -- Planner / Tracker / Judge multi-agent loop
+cgx.agents              -- Planner / Tracker / Judge multi-agent loop (legacy /agent-legacy)
 cgx.agents.viz          -- DAG + status-table renderers for the Agent tab
-cgx.sessions            -- append-only JSONL conversation store
+cgx.session             -- session-shaped agent backbone (default /agent)
+cgx.session.models      -- Session, TaskNode, Fact, Artifact, Decision dataclasses
+cgx.session.router      -- deterministic state machine (TASK_SUCCESSOR table)
+cgx.session.runner      -- SessionRunner: per-session lock, executor dispatch
+cgx.session.store       -- SQLite persistence at <project_root>/.cgx/sessions.db
+cgx.session.mode        -- detect_mode: explore vs greenfield auto-detection
+cgx.session.tasks       -- registered executors (EXPLORE/INVESTIGATE/RECOMMEND/CLARIFY_REQUIREMENTS/DECOMPOSE/SCAFFOLD/...)
+cgx.sessions            -- append-only JSONL conversation store (Ask tab history)
 cgx.telemetry           -- opt-in anonymous startup ping
 cgx.logging_setup       -- shared setup_logging() invoked once from launch.py
 cgx.webui.task_store    -- SQLite task registry + threading.Event cancel tokens
 cgx.webui.routes.tasks  -- REST API for task list / get / event-replay / cancel
 cgx.webui.routes.rollback -- POST /api/rollback restores from an apply backup dir
 cgx.webui.routes.setup  -- discovery endpoints + POST /api/provider/ping
+cgx.webui.routes.agent_session -- /api/agent-session/* JSON routes for the session backbone
 cgx.cli / cgx.webui     -- terminal + FastAPI/React surfaces (uvicorn on :8765)
 ```
 
@@ -347,6 +355,318 @@ the syntax smoke test (e.g. `verify_token` called with the wrong
 signature) to pull the exact function source text from the records file
 and inject it into the re-try prompt.
 
+## Session-shaped agent (`cgx.session`)
+
+The default Agent UI at `/agent` is backed by a **stateful, session-based**
+orchestrator that is independent of the batch `cgx.agents` loop below.
+Where the batch loop commits a full plan up front and streams it to
+completion, the session shape persists a DAG of typed tasks under
+`<project_root>/.cgx/sessions.db` and progresses one task at a time
+with structured human-in-the-loop checkpoints. The two shapes share
+the same retrieval, codegen, and provider stacks; they differ in the
+state model, the interaction model, and the execution model.
+
+### Session modes (`cgx.session.mode`)
+
+A session runs in one of two **modes** -- `explore` (modify an
+existing codebase) or `greenfield` (scaffold a new project from
+scratch). The mode is fixed at session creation and dictates which
+root task the router seeds and which executor branch the runner
+walks. `cgx.session.mode.detect_mode(project_root)` is the
+deterministic auto-detector; callers can override it explicitly via
+the `POST /api/agent-session` body.
+
+* **`explore`** -- the project root exists, is non-empty, and has a
+  usable FAISS index under `<root>/cgx_index/meta.json`. The session
+  seeds `EXPLORE` and walks the retrieval-grounded loop below.
+* **`greenfield`** -- the project root is missing, empty, or has no
+  index. The session seeds `CLARIFY_REQUIREMENTS` and walks the
+  scaffold loop (`clarify → decompose → scaffold → apply → verify`).
+  No retrieval is performed; everything is goal-driven.
+
+The detector prefers `greenfield` whenever the project signals are
+ambiguous, on the principle that mis-seeding `EXPLORE` against a
+missing index crashes immediately, whereas mis-seeding
+`CLARIFY_REQUIREMENTS` against an existing codebase still produces
+useful clarification questions.
+
+### Data model (`cgx.session.models`)
+
+Plain :mod:`dataclasses` (no Pydantic at the core layer -- Pydantic
+stays at the webui wire boundary). JSON-serialise via `to_dict()`,
+matching the convention already used by `cgx.agents.types` and
+`cgx.sessions`.
+
+| Type           | Purpose |
+|----------------|---------|
+| `Session`      | Root aggregate: `original_objective`, `project_root`, `root_task_id`, `status`, timestamps. |
+| `TaskNode`     | One node in the per-session DAG. Carries `kind`, `name`, `description`, `parent_task_id`, `status`, `inputs`, `outputs`, `produced_artifact_id`, `consumed_decision_ids`, `error`, lifecycle timestamps. |
+| `Fact`         | Append-only piece of session knowledge (`FILE` / `SYMBOL` / `PARAMETER` / `ANCHOR`). Updates set `stale=True` rather than mutating `content`. |
+| `Artifact`     | Typed output produced by a finished task. Explore-mode kinds: `DIRECTIONS_LIST`, `FINDINGS_BUNDLE`, `RECOMMENDATION_LIST`, `CODE_CHANGE_PLAN`. Greenfield-mode kinds: `REQUIREMENTS_SHEET`, `WORK_PLAN`, `SCAFFOLD_PATCHES`. Shared write-loop kinds: `APPLIED_CHANGES`, `VERIFY_REPORT`, `SESSION_DIGEST`. |
+| `Decision`     | Structured record of a user choice resolving an `ASK_USER`. Downstream tasks reference decisions by `decision_id`. |
+| `KnowledgeBase` / `DecisionLog` | Per-session views over the facts and decisions tables. |
+
+`TaskKind` values:
+
+* Explore loop: `EXPLORE`, `INVESTIGATE`, `RECOMMEND`, `PLAN_CHANGE`.
+* Greenfield loop: `CLARIFY_REQUIREMENTS`, `DECOMPOSE`, `SCAFFOLD`.
+* Shared: `APPLY`, `VERIFY`, `ASK_USER`, plus utility kinds
+  `SEARCH` / `SUMMARIZE`.
+
+`TaskNodeStatus` runs through
+`PENDING → BLOCKED → READY → IN_PROGRESS → DONE`/`FAILED`/`ABANDONED`;
+`ASK_USER` deliberately stays `IN_PROGRESS` after its executor runs
+until a `Decision` arrives.
+
+### Router (`cgx.session.router`)
+
+`Router` replaces `Planner.plan` from the batch loop. **Pure Python,
+no LLM calls, no I/O**: every method takes the current session state
+plus an event and returns a `RouterPlan` of typed actions
+(`CreateTask`, `UpdateTaskStatus`, `RecordDecision`,
+`AttachDecisionToTask`) that the caller applies to the store.
+
+Three entry points cover every transition:
+
+* `on_user_message(session, message, tasks)` -- no tasks yet → spawn
+  the root task. In explore mode this is `EXPLORE`; in greenfield
+  mode it is `CLARIFY_REQUIREMENTS`. Pending `ASK_USER` open →
+  return empty plan so the caller routes the message to
+  `on_decision_recorded` instead. Otherwise (explore mode) → spawn
+  a sibling `EXPLORE` under the current root (course-correction
+  objective). Greenfield mode does not spawn course-correction
+  siblings: a follow-up message is treated as freeform context.
+* `on_task_completed(session, completed, tasks)` -- dispatch via the
+  `TASK_SUCCESSOR` table:
+
+  ```
+  # Explore loop
+  EXPLORE              -> ASK_USER(choose_path)
+  INVESTIGATE          -> RECOMMEND
+  RECOMMEND            -> ASK_USER(choose_recommendation)
+  PLAN_CHANGE          -> ASK_USER(approve)
+
+  # Greenfield loop
+  CLARIFY_REQUIREMENTS -> ASK_USER(clarify_answers)
+  DECOMPOSE            -> ASK_USER(approve_plan)
+  SCAFFOLD             -> APPLY (mode=greenfield in inputs)
+
+  # Shared write-loop tail
+  APPLY                -> VERIFY
+  VERIFY               -> (terminal)
+  ```
+* `on_decision_recorded(session, decision, tasks)` -- record the
+  decision, attach it to the resolved `ASK_USER`, mark the `ASK_USER`
+  `DONE`, and spawn the typed successor implied by `decision.kind` +
+  `decision.chosen`:
+
+  | `DecisionKind`            | Successor task |
+  |---------------------------|----------------|
+  | `CHOOSE_PATH`             | `INVESTIGATE` anchored on `chosen.anchor_chunk_id` |
+  | `CHOOSE_RECOMMENDATION` `kind=investigate_more` | `INVESTIGATE` on the recommended anchor |
+  | `CHOOSE_RECOMMENDATION` `kind=plan_change` | `PLAN_CHANGE` carrying the full recommendation |
+  | `CHOOSE_RECOMMENDATION` `kind=ask_followup` | Freeform `ASK_USER` |
+  | `CHOOSE_RECOMMENDATION` `kind=done` | No successor (focus closes; a follow-up message spawns a fresh sibling EXPLORE) |
+  | `APPROVE` `approved=true` | `APPLY` against the staged `plan_artifact_id` |
+  | `APPROVE` `approved=false` | No successor (user can pivot via a fresh objective) |
+  | `CLARIFY_ANSWERS`         | `DECOMPOSE` carrying the answers + the prior goal |
+  | `APPROVE_PLAN` `approved=true` | `SCAFFOLD` against the approved `WORK_PLAN` artifact |
+  | `APPROVE_PLAN` `approved=false` | No successor (loop halts; user can restart with a new objective) |
+  | `FREEFORM`                 | None (handled as a new user message by the caller) |
+
+### Runner (`cgx.session.runner`)
+
+`SessionRunner` is the orchestrator the HTTP routes call. It sits
+between the deterministic `Router` (state transitions, no IO) and the
+`SessionStore` (persistence, no business logic). All write paths
+funnel through it so a single sequencer enforces:
+
+* **Router plans applied in order**: creates and decision records
+  happen before status updates so a spawned child is visible to
+  subscribers by the time a parent flips to `DONE`.
+* **Per-session locking** (`Dict[str, threading.Lock]` guarded by an
+  outer lock) so concurrent requests for the same session can't
+  interleave half-applied plans.
+* **Centralised executor dispatch + failure handling**: missing
+  executor → `LookupError` → task transitions to `FAILED` with a
+  helpful message; uncaught executor exception → same path with the
+  exception class + message. Facts surfaced before the error are
+  still persisted.
+
+Public API: `start_session(objective, project_root, title)`,
+`post_message(session_id, message)`, `post_decision(session_id,
+decision)`, `run_next(session_id, deps)`. Routes never touch the
+router or the store directly.
+
+### Executors (`cgx.session.tasks`)
+
+An **executor** is a pure function `(TaskNode, ExecutorDeps) ->
+ExecutorResult` registered via `@register_executor(TaskKind.X)` in
+`cgx.session.tasks.base`. Each kind has at most one executor;
+importing the `cgx.session.tasks` package side-effect-registers them
+all. Executors do **not** write to the store directly -- the runner
+persists their outputs (`task.outputs`), facts (`store.add_fact`),
+and artifacts (`store.save_artifact` + `task.produced_artifact_id`)
+after the call. This keeps executors easy to unit-test without a
+database and gives the runner a single place to enforce ordering.
+
+Concrete executors:
+
+| Module                              | Produces |
+|-------------------------------------|----------|
+| `tasks/explore.py`                  | `DIRECTIONS_LIST` artifact + `ANCHOR` facts (one per option). Bypasses `answer_with_llm`'s Markdown round-trip by reading the structured `debug["options"]` field directly. *(explore mode)* |
+| `tasks/investigate.py`              | `FINDINGS_BUNDLE` artifact anchored on the chosen chunk. *(explore mode)* |
+| `tasks/recommend.py`                | `RECOMMENDATION_LIST` artifact with typed `kind` per recommendation (`investigate_more` / `plan_change` / `ask_followup` / `done`). *(explore mode)* |
+| `tasks/plan_change.py`              | `CODE_CHANGE_PLAN` artifact via `generate_code_plan`. *(explore mode)* |
+| `tasks/clarify_requirements.py`     | `REQUIREMENTS_SHEET` artifact: 3–6 clarification questions (LLM-emitted with a deterministic fallback bank). *(greenfield mode)* |
+| `tasks/decompose.py`                | `WORK_PLAN` artifact (`plan_md` + layered file manifest) via `cgx.answer.engine.plan_scaffold_manifest`, with the user's clarify answers folded into the goal text. *(greenfield mode)* |
+| `tasks/scaffold.py`                 | `SCAFFOLD_PATCHES` artifact: walks the `WORK_PLAN` layers, calls `cgx.answer.engine.generate_single_scaffold_file` per entry while accumulating sibling-file context, captures per-file failures into a `failed` list rather than aborting. *(greenfield mode)* |
+| `tasks/apply.py`                    | `APPLIED_CHANGES` artifact via `apply_diffs_to_disk` (same `backup_dir` mechanic as the batch loop). Accepts either `CODE_CHANGE_PLAN` (explore) or `SCAFFOLD_PATCHES` (greenfield) as the upstream artifact. |
+| `tasks/verify.py`                   | `VERIFY_REPORT` artifact via the impacted-tests runner. In greenfield mode, "no tests discovered yet" reports `ran=False` + `skipped_reason` instead of failing. |
+| `tasks/ask.py`                      | Pseudo-executor: surfaces the question payload; the runner keeps the task at `IN_PROGRESS` until `build_decision` consumes a user reply. |
+
+`ExecutorDeps` carries optional `project_root`, `index_dir`,
+`records_path`, `embed_model`, `provider`, `store`, and an `extra`
+dict. Executors validate the fields they need and return
+`ExecutorResult(failure=...)` if a required dep is missing rather
+than raising.
+
+### Decision contract (`cgx.session.tasks.ask.build_decision`)
+
+The HTTP route layer calls `build_decision(session_id, task, chosen,
+rationale)` on every incoming decision; the function validates
+`chosen` against `task.inputs["expected_kind"]` and raises
+`ValueError` (rendered as `400`) on mismatch. The validated shapes
+are:
+
+| `expected_kind`         | Required slots in `chosen` |
+|-------------------------|----------------------------|
+| `choose_path`           | `anchor_chunk_id` (non-empty) |
+| `choose_recommendation` | `kind ∈ {investigate_more, plan_change, ask_followup, done}`; `kind=investigate_more` additionally requires `anchor_chunk_id` |
+| `approve`               | `approved` (boolean) |
+| `clarify_answers`       | `answers` (non-empty dict keyed by question id) |
+| `approve_plan`          | `approved` (boolean) |
+| `freeform`              | (no required slots) |
+
+The frontend's per-form components in
+`frontend/src/components/agent/AskUserForm.tsx` post exactly these
+shapes, and `tests/test_webui_agent_session.py` pins the contract
+end-to-end against the route handlers.
+
+### Persistence (`cgx.session.store`)
+
+`SessionStore` is a thin SQLite wrapper. One database file per
+project root at `<project_root>/.cgx/sessions.db` (or
+`~/.cgx/sessions.db` when no project root is provided -- typical for
+interactive scripts and tests with a tmp `HOME`). Tables: `sessions`,
+`tasks`, `facts`, `decisions`, `artifacts`. Each row stores the
+dataclass as a JSON blob plus a few indexed columns (session_id,
+status, timestamps) so common queries don't have to parse JSON.
+Connections use WAL mode (`PRAGMA journal_mode=WAL`) for concurrent
+reader tolerance; `PRAGMA foreign_keys=ON` cascades deletes.
+
+Writes funnel through `store.publish` so the in-process `EventBus`
+stays in sync with the on-disk state; the bus is what a future
+streaming surface will subscribe to.
+
+### HTTP surface (`cgx.webui.routes.agent_session`)
+
+JSON-only, mounted at `/api/agent-session` next to the legacy SSE
+route at `/api/agent` -- it does **not** replace it.
+
+| Method | Path                                  | Purpose |
+|--------|---------------------------------------|---------|
+| `POST` | `/api/agent-session`                  | Create a session, seed the root task (`EXPLORE` in explore mode, `CLARIFY_REQUIREMENTS` in greenfield mode), optionally drain READY tasks. Accepts an optional `mode: "explore" | "greenfield"`; falls back to `cgx.session.mode.detect_mode` when absent. Returns the full snapshot. |
+| `GET`  | `/api/agent-session?project_root=...` | List sessions for a project. |
+| `GET`  | `/api/agent-session/{sid}`            | Full state snapshot (`session + tasks + artifacts + facts + decisions`). |
+| `POST` | `/api/agent-session/{sid}/message`    | Post a follow-up message. Spawns a sibling `EXPLORE` when no `ASK_USER` is open. |
+| `POST` | `/api/agent-session/{sid}/decision`   | Resolve a pending `ASK_USER` with a typed `{task_id, chosen, rationale?}` payload. |
+| `DELETE` | `/api/agent-session/{sid}`          | Discard a session and its aggregate (tasks / facts / decisions / artifacts) via SQLite `ON DELETE CASCADE`. Returns `{deleted: sid}` or 404. |
+
+A per-`project_root` runner cache (`_RUNNERS` in the route module)
+reuses one `SessionStore` (and its SQLite WAL connection) across
+requests. Mutating endpoints await `runner.run_next` in a thread
+loop (`_drain_ready`, capped at four steps) so the request returns
+once the synchronous tasks finish or an `ASK_USER` pauses the loop.
+
+Every mutating endpoint returns `AgentSessionState`
+(`cgx.webui.models`) so the React UI can render the updated tree in
+one round-trip. There is no SSE on this surface today -- the UI
+polls while any task is `IN_PROGRESS` other than an `ASK_USER`.
+
+### React UI (`/agent`)
+
+`frontend/src/pages/AgentPage.tsx` is the session-shaped page;
+modular components live under `frontend/src/components/agent/`:
+
+* `SessionLauncher.tsx` -- create a session (objective + project
+  root + mode picker: *auto / explore / greenfield*; *auto* defers
+  to `detect_mode`).
+* `TaskTree.tsx` -- hierarchical DAG renderer keyed on
+  `parent_task_id`; depth-based indentation, status icons, selection
+  highlighting. Orphaned tasks re-surface at the top level so a
+  malformed snapshot still renders. Includes badges for the
+  greenfield kinds (`clarify`, `decompose`, `scaffold`).
+* `ActiveTask.tsx` + `AskUserForm.tsx` -- detail panel for the
+  selected task; dispatches on `expected_kind` to one of
+  `ChoosePathForm`, `ChooseRecommendationForm`, `ApproveForm`,
+  `ClarifyAnswersForm`, `ApprovePlanForm`, `FreeformForm`. Each
+  form posts the typed `chosen` payload `build_decision` expects.
+  `ClarifyAnswersForm` reads the linked `REQUIREMENTS_SHEET` and
+  renders one labeled textarea per question; `ApprovePlanForm`
+  renders the layered file manifest with `[Approve & Scaffold |
+  Reject]`.
+* `SidePanel.tsx` + `ArtifactPreview.tsx` -- tabbed Knowledge-Base
+  and Artifacts view; per-kind artifact renderers, including
+  dedicated bodies for `requirements_sheet`, `work_plan`, and
+  `scaffold_patches`.
+* `LiveView.tsx` -- right-hand active-task pane with polling and a
+  mode badge in the session header (`explore` / `greenfield`).
+
+`frontend/src/store/agentSession.ts` (Zustand + `persist` middleware,
+key `cgx-agent-session`) holds the active session id, the selected
+task id, and the three-column layout state (session-bar / task-tree
+/ side-panel widths plus the collapsed flag for each rail) in
+`localStorage` so a tab switch or reload comes back to the same
+view and the same panel sizing; the snapshot itself is reloaded
+from `/api/agent-session/{sid}` on mount rather than cached
+client-side. Resize handles (`ResizeHandle.tsx`) clamp widths to
+the bounds exported from the store and collapsed rails render in
+place of a panel when its column would otherwise crowd a narrow
+viewport.
+
+The legacy `AgentPage` lives at `frontend/src/pages/AgentLegacyPage.tsx`
+and is mounted at `/agent-legacy`; it still drives the
+`/api/agent` SSE stream against the batch `cgx.agents` loop
+described below.
+
+### Testing
+
+* Core: unit tests over `models.py`, `store.py`, `router.py`,
+  `runner.py`, `mode.py`, and each executor under
+  `tests/test_session*.py`. Greenfield coverage includes
+  mode-detection edge cases, router transitions for the
+  `CLARIFY → DECOMPOSE → SCAFFOLD → APPLY → VERIFY` chain, the
+  reject-plan halt path, and end-to-end runner walks with stub
+  executors.
+* HTTP: `tests/test_webui_agent_session.py` drives both write
+  loops directly against the FastAPI route handlers through a
+  `_HandlerClient` shim. Explore path: `EXPLORE` → choose_path →
+  `INVESTIGATE` → `RECOMMEND` → choose_recommendation(plan_change)
+  → `PLAN_CHANGE` → approve → `APPLY` → `VERIFY`. Greenfield path:
+  explicit `mode="greenfield"` on session creation →
+  `CLARIFY_REQUIREMENTS` → clarify_answers → `DECOMPOSE` →
+  approve_plan → `SCAFFOLD` → `APPLY` → `VERIFY`. Pydantic still
+  parses every payload (so the wire shape is validated) but no
+  ASGI transport is required, keeping the test suite free of an
+  `httpx` dependency. Stub executors are registered for every
+  `TaskKind`.
+* UI: `frontend/src/components/agent/AskUserForm.test.tsx` and
+  `TaskTree.test.tsx` cover the React decision-posting contract and
+  the DAG renderer respectively.
+
+---
+
 ## Multi-agent loop
 
 `cgx.agents` adds an orchestration layer on top of the single-shot
@@ -484,7 +804,10 @@ entry points:
 
 The high-level `cgx.agents.run_agent(goal, …, progress_interval=2.0)`
 wires all three to the default capabilities backed by the existing
-engine, and is exposed via the **🤖 Agent** tab in the React UI. See
+engine, and is exposed at `/agent-legacy` in the React UI (and via
+the `cgx agent` CLI). The default `/agent` route uses the
+session-shaped backbone above; the batch loop is preserved unchanged
+for callers that prefer fire-and-forget semantics. See
 [flowcharts.md](flowcharts.md) for a visual breakdown of the loop and
 the event timeline.
 

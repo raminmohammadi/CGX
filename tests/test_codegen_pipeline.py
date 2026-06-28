@@ -360,3 +360,109 @@ def test_find_missing_packages_respects_declared_pypi_name(tmp_path, monkeypatch
     imports = {"google", "google.generativeai"}
     missing = find_missing_python_packages(imports, str(tmp_path))
     assert "google-generativeai" not in missing
+
+
+
+# -- _apply_hunks context-verification regression tests -----------------
+
+def _two_func_src() -> str:
+    return textwrap.dedent(
+        """
+        def add(a, b):
+            return a + b
+
+        def sub(a, b):
+            return a - b
+        """
+    ).lstrip()
+
+
+def test_apply_hunks_exact_match_applies(tmp_path: Path) -> None:
+    from cgx.codegen.diff_apply import PatchTarget, apply_diffs_in_memory
+
+    (tmp_path / "m.py").write_text(_two_func_src(), encoding="utf-8")
+    diff = textwrap.dedent(
+        """
+        @@ -1,2 +1,2 @@
+         def add(a, b):
+        -    return a + b
+        +    return a + b + 1
+        """
+    ).strip()
+    res = apply_diffs_in_memory(str(tmp_path), [PatchTarget(path="m.py", diff_text=diff)])[0]
+    assert res.ok
+    assert res.rejected_hunks == []
+    assert "return a + b + 1" in (res.new_content or "")
+    # The second function must be untouched.
+    assert "def sub(a, b):" in (res.new_content or "")
+    assert "return a - b" in (res.new_content or "")
+
+
+def test_apply_hunks_drifted_line_numbers_fuzzy_locates(tmp_path: Path) -> None:
+    from cgx.codegen.diff_apply import PatchTarget, apply_diffs_in_memory
+
+    (tmp_path / "m.py").write_text(_two_func_src(), encoding="utf-8")
+    # @@ line numbers are wildly wrong, but the context+deletion uniquely
+    # identifies the sub() function.
+    diff = textwrap.dedent(
+        """
+        @@ -42,2 +42,2 @@
+         def sub(a, b):
+        -    return a - b
+        +    return a - b - 1
+        """
+    ).strip()
+    res = apply_diffs_in_memory(str(tmp_path), [PatchTarget(path="m.py", diff_text=diff)])[0]
+    assert res.ok, f"fuzzy locate should have rescued the drifted hunk: {res.error}"
+    assert "return a - b - 1" in (res.new_content or "")
+    assert "return a + b" in (res.new_content or "")
+
+
+def test_apply_hunks_hallucinated_context_is_rejected(tmp_path: Path) -> None:
+    from cgx.codegen.diff_apply import PatchTarget, apply_diffs_in_memory
+
+    original = _two_func_src()
+    (tmp_path / "m.py").write_text(original, encoding="utf-8")
+    # Context lines that don't exist anywhere in the file: must NOT silently
+    # overwrite real content (this was the pre-fix bug).
+    diff = textwrap.dedent(
+        """
+        @@ -1,3 +1,3 @@
+         def NONEXISTENT_func():
+        -    return None
+        +    return 'red'
+        """
+    ).strip()
+    res = apply_diffs_in_memory(str(tmp_path), [PatchTarget(path="m.py", diff_text=diff)])[0]
+    assert not res.ok
+    assert len(res.rejected_hunks) == 1
+    # Original content must be preserved byte-for-byte.
+    assert res.new_content == original
+
+
+def test_apply_hunks_ambiguous_match_is_rejected(tmp_path: Path) -> None:
+    from cgx.codegen.diff_apply import PatchTarget, apply_diffs_in_memory
+
+    # Two identical blocks; a hunk that matches both with wrong line numbers
+    # is ambiguous -- must reject rather than guess.
+    src = textwrap.dedent(
+        """
+        def a():
+            return 1
+
+        def b():
+            return 1
+        """
+    ).lstrip()
+    (tmp_path / "m.py").write_text(src, encoding="utf-8")
+    diff = textwrap.dedent(
+        """
+        @@ -999,1 +999,1 @@
+        -    return 1
+        +    return 2
+        """
+    ).strip()
+    res = apply_diffs_in_memory(str(tmp_path), [PatchTarget(path="m.py", diff_text=diff)])[0]
+    assert not res.ok
+    assert len(res.rejected_hunks) == 1
+    assert res.new_content == src
