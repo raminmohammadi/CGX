@@ -1,7 +1,8 @@
 import { Cpu } from "lucide-react";
 import { useConnection } from "../store/connection";
 import { useWorkspace } from "../store/workspace";
-import { StatusDot } from "../components/Pill";
+import { useTrace } from "../store/trace";
+import { Pill, StatusDot } from "../components/Pill";
 import type { HardwareInfo, RunningModel } from "../lib/api";
 
 // Top platform header: brand + provider health pulse + mode badge.
@@ -71,6 +72,7 @@ export default function Header() {
   const status = useConnection((s) => s.status);
   const offline = useConnection((s) => s.offline);
   const provider = useWorkspace((s) => s.provider);
+  const traceSettings = useTrace((s) => s.settings);
 
   const isLocal = provider.kind === "ollama";
   const ollamaOK = !offline && !!status?.ollama?.ok;
@@ -192,6 +194,26 @@ export default function Header() {
           <Cpu className="h-3.5 w-3.5 text-slate-600" /> Mode:{" "}
           <span className={modeClass}>{modeLabel}</span>
         </div>
+        {traceSettings?.enabled && (
+          <Pill
+            tone="amber"
+            className={
+              traceSettings.source === "env"
+                ? "cursor-help"
+                : undefined
+            }
+          >
+            <span
+              title={
+                traceSettings.source === "env"
+                  ? "Curated function-call tracing is on (pinned by CGX_TRACE)"
+                  : "Curated function-call tracing is on (toggle in Settings)"
+              }
+            >
+              TRACE
+            </span>
+          </Pill>
+        )}
       </div>
     </header>
   );

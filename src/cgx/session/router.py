@@ -37,6 +37,7 @@ from cgx.session.models import (
     TaskNode,
     TaskNodeStatus,
 )
+from cgx.trace import traced
 
 logger = logging.getLogger(__name__)
 
@@ -633,6 +634,7 @@ class Router:
     run inside a request handler and trivial to unit-test.
     """
 
+    @traced("router")
     def on_user_message(self, *, session: Session, message: str,
                         tasks: List[TaskNode]) -> RouterPlan:
         """Decide how to react to a user message.
@@ -658,6 +660,7 @@ class Router:
         plan.actions.append(CreateTask(_make_root(session, message)))
         return plan
 
+    @traced("router")
     def on_task_completed(self, *, session: Session,
                           completed: TaskNode,
                           tasks: List[TaskNode]) -> RouterPlan:
@@ -689,6 +692,7 @@ class Router:
             plan.actions.append(CreateTask(child))
         return plan
 
+    @traced("router")
     def on_decision_recorded(self, *, session: Session,
                              decision: Decision,
                              tasks: List[TaskNode]) -> RouterPlan:

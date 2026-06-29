@@ -1,6 +1,7 @@
 import type { ArtifactDTO } from "../../lib/api";
 import { Markdown } from "../Markdown";
 import { DiffView } from "../DiffView";
+import { ErrorBoundary } from "../ErrorBoundary";
 
 // Render any session artifact in a kind-aware preview. Falls back to a
 // JSON dump for kinds we don't yet have a dedicated view for so the user
@@ -12,7 +13,9 @@ export function ArtifactPreview({ artifact }: { artifact: ArtifactDTO }) {
         <span>artifact · {artifact.kind}</span>
         <span className="text-slate-600">{artifact.artifact_id.slice(0, 8)}</span>
       </header>
-      <Body artifact={artifact} />
+      <ErrorBoundary label={`artifact ${artifact.kind}`}>
+        <Body artifact={artifact} />
+      </ErrorBoundary>
     </section>
   );
 }
@@ -111,23 +114,36 @@ function PlanBody({ c }: { c: any }) {
 }
 
 function AppliedBody({ c }: { c: any }) {
-  const applied: string[] = c.applied_files || [];
-  const failed: string[] = c.failed_files || [];
+  const applied: string[] = Array.isArray(c.applied_files) ? c.applied_files : [];
+  // ``disk_apply`` emits failed_files as ``[{file, error}, ...]``; legacy
+  // payloads occasionally still carry plain ``string[]``. Normalise both
+  // shapes so rendering can't trip React error #31.
+  const failedRaw: any[] = Array.isArray(c.failed_files) ? c.failed_files : [];
+  const failed: { file: string; error: string }[] = failedRaw.map((f) =>
+    typeof f === "string"
+      ? { file: f, error: "" }
+      : { file: String(f?.file ?? ""), error: String(f?.error ?? "") },
+  );
   return (
     <div className="space-y-2 text-[11px] font-mono">
       <p className="text-slate-300">
         Applied: <span className="text-emerald-400">{applied.length}</span>
         {" · "}Failed: <span className="text-red-400">{failed.length}</span>
-        {c.backup_dir && <span className="text-slate-500"> · backup: {c.backup_dir}</span>}
+        {c.backup_dir && <span className="text-slate-500"> · backup: {String(c.backup_dir)}</span>}
       </p>
       {applied.length > 0 && (
         <ul className="space-y-0.5 pl-3 text-slate-300 list-disc">
-          {applied.map((f) => <li key={f}>{f}</li>)}
+          {applied.map((f) => <li key={f}>{String(f)}</li>)}
         </ul>
       )}
       {failed.length > 0 && (
         <ul className="space-y-0.5 pl-3 text-red-300 list-disc">
-          {failed.map((f) => <li key={f}>{f}</li>)}
+          {failed.map((f, i) => (
+            <li key={i}>
+              {f.file}
+              {f.error && <span className="text-slate-500"> — {f.error}</span>}
+            </li>
+          ))}
         </ul>
       )}
     </div>

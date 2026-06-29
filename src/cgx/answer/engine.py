@@ -17,6 +17,8 @@ from cgx.retrieval.orchestrator import (
 from networkx.readwrite import json_graph
 import networkx as nx  # type: ignore
 
+from cgx.trace import traced
+
 logger = logging.getLogger(__name__)
 
 ALLOWED_CITATION_NOTE = (
@@ -1215,6 +1217,7 @@ def _answer_clarify_paths(
     }
 
 
+@traced("llm")
 def answer_with_llm(
     index_dir: str,
     records_path: str,
@@ -1430,6 +1433,7 @@ def answer_with_llm_stream(
 
 
 
+@traced("llm")
 def generate_code_plan(
     index_dir: str,
     records_path: str,
@@ -2182,6 +2186,7 @@ _MANIFEST_SYSTEM = (
 )
 
 
+@traced("llm")
 def plan_scaffold_manifest(
     idea: str,
     provider: Any,
@@ -2735,6 +2740,7 @@ def _summarize_file_for_context(
     return text
 
 
+@traced("llm")
 def generate_single_scaffold_file(
     path: str,
     description: str,

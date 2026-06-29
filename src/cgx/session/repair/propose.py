@@ -27,8 +27,10 @@ from cgx.session.repair.locate import (
     StyleMixLocation,
 )
 from cgx.session.repair.pypi_client import PyPIClient
+from cgx.trace import traced
 
 
+@traced("repair.propose")
 def propose_unittest_pytest_mix(
     project_root: Path,
     locations: List[StyleMixLocation],
@@ -87,6 +89,7 @@ _CONFTEST_SNIPPET = (
 _FIXTURE_MARKER_PREFIX = "# cgx-repair: missing_fixture"
 
 
+@traced("repair.propose")
 def propose_missing_fixture(
     project_root: Path,
     locations: List[MissingFixtureLocation],
@@ -188,6 +191,7 @@ def _has_pytest_import(source: str) -> bool:
     return False
 
 
+@traced("repair.propose")
 def propose_missing_module_pythonpath(
     project_root: Path,
     locations: List[MissingPythonpathLocation],
@@ -231,6 +235,7 @@ def propose_missing_module_pythonpath(
 _PEER_RELEASE_WINDOW = timedelta(days=60)
 
 
+@traced("repair.propose")
 def propose_third_party_pin(
     project_root: Path,
     content: Dict[str, Any],
@@ -502,6 +507,7 @@ def _build_requirements_diff(
     return [{"file": rel_path, "patch": patch}]
 
 
+@traced("repair.propose")
 def propose_regenerate(
     scaffold_task: TaskNode,
     new_constraints: Dict[str, Any],

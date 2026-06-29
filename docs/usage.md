@@ -369,14 +369,24 @@ CLARIFY_REQUIREMENTS -> ASK_USER(clarify_answers)
                                               APPLY
                                                   |
                                                   v
-                                          BOOTSTRAP_ENV
-                                                  |
+                                          BOOTSTRAP_ENV    (pip freeze ->
+                                                  |         installed_packages,
+                                                  v         Phase 1.1)
+                                          API_CHECK -------+ (failed -> REPAIR;
+                                                  |         Phase 2.2)
                                                   v
-                                              VERIFY <----+
-                                                  |       |
-                                                  v       | (fixable failure,
-                                              REPAIR -----+  attempt < 2,
-                                                              new signature)
+                                            SMOKE  ---------+ (failed -> REPAIR;
+                                                  |          Phase 2.1)
+                                                  v
+                                              VERIFY <-----+
+                                                  |        |
+                                                  v        |
+                                              REPAIR ------+ (fixable failure,
+                                                  |          attempt < 2,
+                                          patch | regenerate new signature)
+                                          (<=5 diffs) | (Phase 6.1)
+                                              v        v
+                                            APPLY    SCAFFOLD (re-enters loop)
 ```
 
 `CLARIFY_REQUIREMENTS` emits 3–6 clarification questions about the

@@ -80,7 +80,7 @@ the webui wire boundary in `cgx.webui.models`).
 |----------------|-------------------------------------------------------------------------|
 | `Session`      | Root aggregate: original objective, project root, root task id, status. |
 | `TaskNode`     | One node in the per-session DAG; carries `kind`, `inputs`, `outputs`, `parent_task_id`, `produced_artifact_id`, `consumed_decision_ids`, lifecycle timestamps. |
-| `Fact`         | An append-only piece of session knowledge (file, symbol, parameter, or anchor). Updates set `stale=True` rather than mutating `content`. |
+| `Fact`         | An append-only piece of session knowledge (`FILE`, `SYMBOL`, `PARAMETER`, `ANCHOR`, or `LLM_CALL`). `LLM_CALL` facts (**Phase 5.1**) carry `{provider, model, sampling_params, prompt, response, latency_ms, tokens_in, tokens_out, source_task_id, role}` recorded by every LLM call site in `cgx.answer.engine`, `clarify_requirements.py`, `decompose.py`, and `scaffold.py`. Updates set `stale=True` rather than mutating `content`. |
 | `Artifact`     | A typed output produced by a finished task (e.g. `DIRECTIONS_LIST`, `FINDINGS_BUNDLE`, `CODE_CHANGE_PLAN`). Survives across turns. |
 | `Decision`     | Structured record of a user choice resolving an `ASK_USER` task; downstream tasks reference decisions by id rather than re-parsing free text. |
 | `KnowledgeBase`| Per-session view over the facts table.                                  |
@@ -98,9 +98,11 @@ Task kinds (`TaskKind`):
 | `SCAFFOLD`              | Walks the `WORK_PLAN` layers, calls `generate_single_scaffold_file` per entry while accumulating sibling-file context, emits `SCAFFOLD_PATCHES`. *(greenfield mode)* |
 | `PLAN_CHANGE`           | Turn an approved recommendation into a unified-diff change plan; produces a `CODE_CHANGE_PLAN`. *(explore mode)* |
 | `APPLY`                 | Write an approved plan's (or scaffold's) diffs to disk; produces `APPLIED_CHANGES` (with `backup_dir`). |
-| `BOOTSTRAP_ENV`         | Provision a project-local `.venv`, install declared requirements, and preflight-install undeclared imports found in the applied files; produces a `BUILD_REPORT` carrying `project_type`, `venv_path`, `python_exe`, `installed_from`, `installed_packages`, `failed_installs`, an `outcome` token (`succeeded` / `failed` / `no_venv` / `skipped` / `partial`), and a `style_issues` list populated by an AST lint over the applied test files (catches `self.assert*` calls in non-`TestCase` classes ahead of `VERIFY`; informational, does not change the outcome). *(greenfield mode)* |
-| `VERIFY`                | Run impacted tests against the working tree; produces a `VERIFY_REPORT` whose `outcome` token classifies pytest's exit code (`passed` / `assertions_failed` / `collection_error` / `no_tests_collected` / `timeout` / `pytest_missing` / `skipped`). Uses `BUILD_REPORT.python_exe` when available so pytest runs inside the project venv, not CGX's interpreter. The report also carries a `failure_signature` (sha1 of outcome + returncode + first error line) used by the autonomous repair loop. |
-| `REPAIR`                | Classify a failed `VERIFY` and emit a typed `REPAIR_PLAN` (diffs + rationale + located classes). v1 ships three deterministic, LLM-free classifications: `unittest_pytest_mix` (rewrite class header to inherit `unittest.TestCase`), `missing_module_pythonpath` (create/extend project-root `conftest.py` so pytest can resolve scaffolded packages), and `missing_fixture` (hoist an `@pytest.fixture` definition into `tests/conftest.py` or project-root `conftest.py` so the test can discover it). Unknown failures yield an empty plan that escalates to `ASK_USER`. Greenfield-only; capped at 2 attempts per session and gated by `failure_signature` to break flapping loops. |
+| `BOOTSTRAP_ENV`         | Provision a project-local `.venv`, install declared requirements, and preflight-install undeclared imports found in the applied files; produces a `BUILD_REPORT` carrying `project_type`, `venv_path`, `python_exe`, `installed_from`, `installed_packages` (parsed `[{name, version}, …]` from `pip freeze --all`, **Phase 1.1**), `freeze_text` (the raw freeze output for diagnostics), `failed_installs`, an `outcome` token (`succeeded` / `failed` / `no_venv` / `skipped` / `partial`), and a `style_issues` list populated by an AST lint over the applied test files (catches `self.assert*` calls in non-`TestCase` classes ahead of `VERIFY`; informational, does not change the outcome). The `installed_packages` snapshot is what the Phase 3.2 PyPI-aware repair proposer reads to compute corrective pins. *(greenfield mode)* |
+| `API_CHECK`             | After `BOOTSTRAP_ENV`, statically walks every applied file and resolves every `from <third_party> import <name>` and aliased `pkg.attr` access under the bootstrapped venv via `importlib` + `inspect.getmembers`. Unresolved references surface as a structured `API_CHECK_REPORT` (`outcome ∈ {passed, failed, skipped}`, `unresolved: [{file, line, module, name}]`, `failure_signature`). A clean run chains to `SMOKE`; `failed` routes to `REPAIR` carrying the `API_CHECK_REPORT` as the source artifact. *(greenfield mode, **Phase 2.2**)* |
+| `SMOKE`                 | Cheap fail-fast gate between `API_CHECK` and `VERIFY`: spawns `<venv>/bin/python -c "import <pkg>"` for every top-level module the applied files declare, with a 30s wall-clock budget. Produces a `SMOKE_REPORT` (`outcome`, `imports: [{module, ok, stderr_tail}]`, `failure_signature`). On `passed` / `skipped` chains to `VERIFY`; on `failed` routes to `REPAIR` (typical trigger: `ImportError: cannot import name 'url_quote' from 'werkzeug.urls'` -- the Flask/Werkzeug peer pin mismatch that motivated the whole plan). *(greenfield mode, **Phase 2.1**)* |
+| `VERIFY`                | Run impacted tests against the working tree; produces a `VERIFY_REPORT` whose `outcome` token classifies pytest's exit code (`passed` / `assertions_failed` / `collection_error` / `no_tests_collected` / `timeout` / `pytest_missing` / `skipped`). Uses `BUILD_REPORT.python_exe` when available so pytest runs inside the project venv, not CGX's interpreter. Pytest is now invoked with `--junitxml=<tmp> -rN --tb=long` and the XML is parsed via stdlib `xml.etree` into a structured `failures: [{nodeid, type, message, traceback}]` list (**Phase 3.1**) so the classifier can consume types rather than re-regexing stdout. Also surfaces `reproduce_cmd` -- a single `shlex.quote`-escaped shell line that re-runs the exact failing pytest invocation under the project venv (**Phase 1.2**) -- and a `failure_signature` (sha1 of outcome + returncode + first error line) used by the autonomous repair loop. |
+| `REPAIR`                | Classify a failed `VERIFY` / `SMOKE` / `API_CHECK` and emit a typed `REPAIR_PLAN` (diffs + rationale + located classes + `strategy` + `extra_constraints`). The classifier is a small registry in `cgx.session.repair.classify`; v1 ships: `unittest_pytest_mix` (rewrite class header to inherit `unittest.TestCase`), `missing_module_pythonpath` (create/extend project-root `conftest.py` so pytest can resolve scaffolded packages), `missing_fixture` (hoist an `@pytest.fixture` definition into `tests/conftest.py` or project-root `conftest.py`), `hallucinated_api` (rename / drop the broken symbol surfaced by `API_CHECK`), and `third_party_import_break` (**Phase 3.2** -- recognises `ImportError: cannot import name '<x>' from '<pkg>'` and `ModuleNotFoundError` for third-party modules, then `propose_third_party_pin` queries the PyPI JSON API via `cgx.session.repair.pypi_client` -- with an on-disk cache under `~/.cgx/pypi-cache/` -- to compute a corrective version pin and emit a `requirements.txt` diff). Unknown failures yield an empty plan that escalates to `ASK_USER(freeform)`. Repair has two branches (**Phase 6.1**): `strategy=patch` writes the proposed diffs through the shared `APPLY` executor (≤5 diffs in a patchable class); `strategy=regenerate` abandons the failed `SCAFFOLD` subtree and re-queues a fresh `SCAFFOLD` with `regenerate_constraints` folded into the goal so the per-file generator avoids the failure mode this time. Greenfield-only; capped at 2 attempts per session and gated by `failure_signature` to break flapping loops; the regenerate branch is additionally capped at one re-scaffold per ancestor chain. |
 | `ASK_USER`              | Structured pause; carries an `expected_kind` indicating which decision contract the UI must satisfy. |
 | `SEARCH` / `SUMMARIZE`  | Utility kinds the router may interleave. |
 
@@ -110,7 +112,8 @@ Task kinds (`TaskKind`):
 Python with no LLM calls and no I/O**: every method takes the current
 session state plus an event and returns a `RouterPlan` of typed
 actions (`CreateTask`, `UpdateTaskStatus`, `RecordDecision`,
-`AttachDecisionToTask`) that the caller applies to the store.
+`AttachDecisionToTask`, `RecordLesson`) that the caller applies to
+the store.
 
 Three entry points cover every transition:
 
@@ -135,16 +138,37 @@ Three entry points cover every transition:
     APPLY inputs),
     `APPLY → BOOTSTRAP_ENV` (greenfield-only edge, threading
     `apply_artifact_id` and `scaffold_artifact_id` through inputs),
-    `BOOTSTRAP_ENV → VERIFY` (threading `build_artifact_id`).
-    Explore mode keeps the direct `APPLY → VERIFY` edge.
+    `BOOTSTRAP_ENV → API_CHECK` (**Phase 2.2**, threading
+    `build_artifact_id`),
+    `API_CHECK (passed | skipped) → SMOKE` (**Phase 2.1**),
+    `API_CHECK (failed) → REPAIR` (subject to the shared retry
+    budget + flap guard, carrying `API_CHECK_REPORT` as the source
+    artifact),
+    `SMOKE (passed | skipped) → VERIFY`,
+    `SMOKE (failed) → REPAIR` (same guards, `SMOKE_REPORT` as
+    source).  Explore mode keeps the direct `APPLY → VERIFY` edge
+    and never spawns `API_CHECK` / `SMOKE`.
   - Repair loop (greenfield only): `VERIFY (assertions_failed |
     collection_error) → REPAIR` (when `repair_attempt < 2` and the
     new `failure_signature` is not in `prior_failure_signatures`);
-    `REPAIR (can_apply) → APPLY` (carrying `build_artifact_id`
-    forward so BOOTSTRAP_ENV is skipped); `REPAIR (empty plan) →
-    ASK_USER(freeform)`. The cycle re-enters `VERIFY` and either
-    terminates (`passed`) or escalates once the budget / signature
-    guard fires.
+    `REPAIR (strategy=patch, can_apply) → APPLY` (carrying
+    `build_artifact_id` forward so BOOTSTRAP_ENV is skipped);
+    `REPAIR (strategy=regenerate) → SCAFFOLD` (**Phase 6.1** -- the
+    router walks up to the nearest `SCAFFOLD` ancestor, marks every
+    live descendant `ABANDONED`, and re-queues a fresh `SCAFFOLD`
+    via `propose_regenerate` with the failure-derived
+    `regenerate_constraints` appended to its `inputs`; capped at
+    one re-scaffold per ancestor chain by `_REGENERATE_BUDGET=1`);
+    `REPAIR (empty plan) → ASK_USER(freeform)`. The cycle re-enters
+    `VERIFY` and either terminates (`passed`) or escalates once the
+    budget / signature guard fires.
+  - Lesson-recording (**Phase 7.1**): whenever a `VERIFY` finishes
+    with `outcome=passed` AND a `REPAIR` is found on its ancestor
+    chain, the router emits a `RecordLesson(verify_task_id,
+    repair_task_id, scaffold_task_id?)` action. The runner resolves
+    it into a `record_lesson(...)` call against
+    `~/.cgx/lessons.jsonl` (override via `$CGX_LESSONS_PATH`) so
+    future `SCAFFOLD` runs in any session can re-use the rule.
 * `on_decision_recorded(session, decision, tasks)` -- user resolved
   an `ASK_USER` via a typed `Decision`. The router records the
   decision, attaches it to the ASK_USER, marks the ASK_USER `DONE`,
@@ -157,23 +181,42 @@ SQLite-backed `SessionStore`. All write paths funnel through it so a
 single sequencer enforces:
 
 * Router plans applied in order: creates, decisions, attaches,
-  status updates.
+  status updates, lesson recording.
 * Per-session locking so concurrent requests for the same session
   can't interleave half-applied plans.
 * Centralised executor dispatch + failure handling.
+* Project-local JSONL agent log: one line per task transition + per
+  executor exception, written to `<project_root>/.cgx/agent.log`
+  via a rotating handler wired in `cgx.logging_setup`
+  (**Phase 1.3**). The handler is best-effort -- log failures are
+  swallowed so they never break the loop.
+* `RecordLesson` resolution: when the router emits one, the runner
+  fetches the `REPAIR_PLAN` artifact and the SCAFFOLD's inputs,
+  derives the `applied_fix` (`{strategy, diff_count, files,
+  extra_constraints}`) and `scope` (`{stack, objective_keywords}`)
+  payloads, and calls `cgx.session.lessons.record_lesson` against
+  `~/.cgx/lessons.jsonl`. Any exception is logged + swallowed.
 
 An **executor** is a pure function `(TaskNode, ExecutorDeps) ->
 ExecutorResult` registered against a `TaskKind` via
 `@register_executor` in `cgx.session.tasks.base`. Each kind has at
 most one executor; importing the `cgx.session.tasks` package
 side-effect-registers them all (`explore.py`, `ask.py`,
-`investigate.py`, `recommend.py`, `plan_change.py`, `apply.py`,
-`verify.py`).
+`investigate.py`, `recommend.py`, `plan_change.py`,
+`clarify_requirements.py`, `decompose.py`, `scaffold.py`,
+`apply.py`, `bootstrap_env.py`, `api_check.py`, `smoke.py`,
+`verify.py`, `repair.py`).
 
 Executors do **not** write to the store directly -- the runner
 persists their outputs, facts, and artifacts after the call. This
 keeps executors easy to unit-test without a database and gives the
-runner a single place to enforce ordering.
+runner a single place to enforce ordering. LLM-issuing executors
+(`clarify_requirements`, `decompose`, `scaffold`, and the
+`cgx.answer.engine` helpers they call) additionally record an
+`LLM_CALL` fact per provider invocation via
+`cgx.session.llm_trace.trace_llm_call` so the UI's task card can
+surface model name, sampling params, latency, and a redacted
+prompt/response preview (**Phase 5.1**).
 
 ### 1A.5 Decision contract
 
@@ -201,7 +244,7 @@ message spawn a fresh sibling EXPLORE -- this is how the user signals
 
 A greenfield session for *"build a Python app with a Flask API and a
 frontend where users enter their information and the server saves it
-as JSON on disk"* walks through six executor calls and two user
+as JSON on disk"* walks through eight executor calls and two user
 checkpoints. Every line below corresponds to one row in the session
 store; the React UI renders each as a node in the task tree.
 
@@ -239,8 +282,22 @@ store; the React UI renders each as a node in the task tree.
    `existing_files_with_content` so cross-file imports resolve
    correctly. Each generation produces a unified diff; failures
    are captured into `failed: [{file, error}]` rather than
-   aborting the loop, so a partial scaffold is recoverable. Output:
-   a `SCAFFOLD_PATCHES` artifact (`diffs`, `generated`, `failed`).
+   aborting the loop, so a partial scaffold is recoverable. Before
+   the executor writes `requirements.txt` it runs the **Phase 4.1**
+   PyPI-aware pin validator (`cgx.session.scaffold_validate`): for
+   every declared pin it queries the package metadata through the
+   shared PyPI client + on-disk cache, inspects `requires_dist`,
+   and auto-tightens upper bounds on a curated peer table
+   (`Flask ↔ Werkzeug`, `Pydantic v1 ↔ v2`, `NumPy ↔ SciPy`,
+   `SQLAlchemy ↔ alembic`) so a hard `Flask==2.1.2` no longer pulls
+   in a Werkzeug 3.x that breaks `url_quote` at import time. The
+   executor also queries `cgx.session.lessons.relevant_lessons`
+   (filtered by the WORK_PLAN's stack + the goal's keyword
+   tokeniser) and folds the top-3 hits into the per-file generator
+   goal under a `Lessons from prior sessions to apply:` header so
+   cross-session knowledge influences this run before the first
+   token is generated (**Phase 7.1**). Output: a `SCAFFOLD_PATCHES`
+   artifact (`diffs`, `generated`, `failed`).
 
 6. `APPLY` consumes the `SCAFFOLD_PATCHES` artifact -- the
    executor accepts either `CODE_CHANGE_PLAN` (explore mode) or
@@ -258,26 +315,61 @@ store; the React UI renders each as a node in the task tree.
    top-level imports in the applied files and install them into the
    same venv; successful adds are appended back to
    `requirements.txt` via `update_requirements` so the manifest
-   stays in sync. The executor emits a `BUILD_REPORT` artifact with
-   the venv path, the manifests installed from, the list of
+   stays in sync. At the end of the run the executor calls
+   `<venv>/bin/pip freeze --all` and stores the parsed
+   `installed_packages: [{name, version}, …]` plus the raw
+   `freeze_text` on the report (**Phase 1.1**) so the repair
+   classifier has the resolved peer-dep graph available without
+   re-shelling pip. The executor emits a `BUILD_REPORT` artifact
+   with the venv path, the manifests installed from, the list of
    preflight-installed and failed packages, and a single `outcome`
-   token the UI surfaces as a coloured badge.  Non-Python projects
+   token the UI surfaces as a coloured badge. Non-Python projects
    short-circuit with `outcome=skipped` so the loop still reaches
    `VERIFY`.
 
-8. `VERIFY` is the same executor as the explore loop, but it now
-   classifies pytest's exit code into an explicit `outcome` token
-   (`passed` / `assertions_failed` / `collection_error` /
-   `no_tests_collected` / `timeout` / `pytest_missing` / `skipped`)
-   and reads `python_exe` from the upstream `BUILD_REPORT` when
-   present, so a `ModuleNotFoundError: flask` shows up as
-   `collection_error` (environment misconfiguration) rather than
-   masquerading as a real test failure. When `mode=greenfield` and
-   no tests have been discovered yet the report carries
-   `ran=False` with a `skipped_reason` so the UI marks the loop
-   terminal-clean.
+8. `API_CHECK` (**Phase 2.2**) statically walks every applied file
+   under the bootstrapped venv and resolves each
+   `from <third_party> import <name>` and aliased `pkg.attr`
+   reference via `importlib` + `inspect.getmembers`. Unresolved
+   references surface in an `API_CHECK_REPORT` (`outcome`,
+   `unresolved: [{file, line, module, name}]`,
+   `failure_signature`). The point is to catch hallucinated symbols
+   -- the LLM imagining a `flask.legacy.url_quote` that does not
+   exist -- before pytest even starts collection. A clean report
+   hands off to `SMOKE`; `failed` routes to `REPAIR` carrying the
+   `API_CHECK_REPORT` as the source artifact.
 
-Three router-level guardrails keep the loop honest:
+9. `SMOKE` (**Phase 2.1**) is the cheapest possible runtime gate:
+   `<venv>/bin/python -c "import <pkg>"` for every top-level
+   module the applied files declare, capped at a 30s wall-clock
+   budget for the whole batch. Result is a `SMOKE_REPORT`
+   (`outcome`, `imports: [{module, ok, stderr_tail}]`,
+   `failure_signature`). On `passed` / `skipped` the router chains
+   to `VERIFY`; on `failed` (e.g. `ImportError: cannot import name
+   'url_quote' from 'werkzeug.urls'`) it routes to `REPAIR` with
+   the `SMOKE_REPORT` as the source artifact, gated by the same
+   retry budget + flap detector as the VERIFY-driven loop.
+
+10. `VERIFY` is the same executor as the explore loop, but it now
+    classifies pytest's exit code into an explicit `outcome` token
+    (`passed` / `assertions_failed` / `collection_error` /
+    `no_tests_collected` / `timeout` / `pytest_missing` /
+    `skipped`) and reads `python_exe` from the upstream
+    `BUILD_REPORT` when present, so a `ModuleNotFoundError: flask`
+    shows up as `collection_error` rather than masquerading as a
+    real test failure. Pytest is invoked with `--junitxml=<tmp>
+    -rN --tb=long` (**Phase 3.1**) and the XML is parsed into a
+    structured `failures: [{nodeid, type, message, traceback}]`
+    list so the classifier consumes typed records rather than
+    re-regexing stdout. The report also carries
+    `reproduce_cmd` -- a single `shlex.quote`-escaped shell line
+    that re-runs the exact failing pytest invocation under the
+    project venv (**Phase 1.2**) -- which the UI renders above the
+    stdout pane. When `mode=greenfield` and no tests have been
+    discovered yet the report carries `ran=False` with a
+    `skipped_reason` so the UI marks the loop terminal-clean.
+
+Four router-level guardrails keep the loop honest:
 
 * The `ASK(approve_plan)` checkpoint is mandatory. Even if the
   manifest looks great, the user has to confirm before any file is
@@ -287,19 +379,25 @@ Three router-level guardrails keep the loop honest:
   surfaces a `SCAFFOLD_PATCHES` artifact -- the `failed` list is
   preserved so the UI can show which file slipped and the user can
   choose whether to apply the partial scaffold or restart.
-* `BOOTSTRAP_ENV` is isolated from `VERIFY`: environment failures
-  surface as `outcome=failed` / `no_venv` on the `BUILD_REPORT`,
-  with a `pip_log_tail` for diagnosis, rather than as opaque
-  test-collection errors downstream.
+* Phases 2.1 / 2.2 keep `BOOTSTRAP_ENV` isolated from `VERIFY`:
+  environment failures surface as `outcome=failed` / `no_venv` on
+  the `BUILD_REPORT` (with a `pip_log_tail` for diagnosis),
+  hallucinated APIs surface on the `API_CHECK_REPORT`, and
+  third-party import breakage surfaces on the `SMOKE_REPORT` --
+  each as a structured signal in <1 s rather than an opaque pytest
+  collection error 30 s later.
 * The autonomous `REPAIR` cycle is greenfield-only and bounded by
-  two orthogonal guards. The retry budget (`repair_attempt` capped
-  at 2) prevents the loop from monopolising the session. The
-  progress detector (a sha1 over the verify outcome, returncode,
-  and first error line, tracked in `prior_failure_signatures` on
-  every downstream task) refuses a second attempt when the
-  signature matches a prior failure, so a fix that "succeeds"
-  but leaves the same crash in place escalates to `ASK_USER`
-  instead of looping forever.
+  three orthogonal guards. The retry budget (`repair_attempt`
+  capped at 2) prevents the loop from monopolising the session.
+  The progress detector (a sha1 over the verify outcome,
+  returncode, and first error line, tracked in
+  `prior_failure_signatures` on every downstream task) refuses a
+  second attempt when the signature matches a prior failure, so a
+  fix that "succeeds" but leaves the same crash in place escalates
+  to `ASK_USER` instead of looping forever. The
+  `_REGENERATE_BUDGET=1` cap on `propose_regenerate` (**Phase
+  6.1**) prevents the patch-vs-regenerate branch from re-
+  scaffolding the same subtree more than once.
 
 ### 1A.7 Persistence
 
@@ -311,6 +409,30 @@ project root is provided). Tables: `sessions`, `tasks`, `facts`,
 blob plus a few indexed columns (session_id, status, timestamps) so
 common queries don't have to parse JSON. Connections use WAL mode for
 concurrent reader tolerance.
+
+Three sibling files live alongside `sessions.db`:
+
+* `<project_root>/.cgx/agent.log` -- rotating JSONL agent log
+  (one line per task transition + per executor exception),
+  written by the project-local handler wired in
+  `cgx.logging_setup` (**Phase 1.3**). Survives the lifetime of
+  the project, not the session, so it's also the place to look
+  when a session row was deleted but the user wants to know what
+  happened.
+* `~/.cgx/lessons.jsonl` -- cross-session lessons store
+  (**Phase 7.1**). Append-only JSONL; each row carries
+  `{lesson_id, created_at, session_id, trigger_signature,
+  classification, applied_fix: {strategy, diff_count, files,
+  extra_constraints}, scope: {stack, objective_keywords}}`. The
+  path is `~/.cgx/lessons.jsonl` by default; override via
+  `$CGX_LESSONS_PATH` (used by tests for isolation). Disk
+  failures, malformed JSON, and missing files are all swallowed
+  silently -- learning is best-effort and must not break the
+  agent loop.
+* `~/.cgx/pypi-cache/` -- on-disk JSON cache for
+  `cgx.session.repair.pypi_client` (**Phases 3.2 + 4.1**), keyed
+  by `{pkg}/{version}.json`. Reused by both the SCAFFOLD pin
+  validator and the third-party-import repair proposer.
 
 ### 1A.8 HTTP surface
 
@@ -389,9 +511,15 @@ same 404 on every mount.
 | Transitions / successor table     | `src/cgx/session/router.py` |
 | The runner sequencer              | `src/cgx/session/runner.py` |
 | Persistence schema                | `src/cgx/session/store.py` |
+| Project-local agent log (Phase 1.3) | `src/cgx/session/agent_log.py`, `src/cgx/logging_setup.py` |
 | Explore-mode executors            | `src/cgx/session/tasks/{explore,investigate,recommend,plan_change}.py` |
-| Greenfield executors              | `src/cgx/session/tasks/{clarify_requirements,decompose,scaffold}.py` |
+| Greenfield executors              | `src/cgx/session/tasks/{clarify_requirements,decompose,scaffold,bootstrap_env,api_check,smoke,repair}.py` |
 | Shared write executors            | `src/cgx/session/tasks/{apply,verify,ask}.py` |
+| Repair classify / locate / propose | `src/cgx/session/repair/{classify,locate,propose}.py` |
+| PyPI client + cache (Phases 3.2 / 4.1) | `src/cgx/session/repair/pypi_client.py` |
+| Scaffold-time pin validator (Phase 4.1) | `src/cgx/session/scaffold_validate.py` |
+| LLM tracing (Phase 5.1)           | `src/cgx/session/llm_trace.py` |
+| Cross-session lessons (Phase 7.1) | `src/cgx/session/lessons.py` |
 | Decision validation               | `src/cgx/session/tasks/ask.py` :: `build_decision` |
 | HTTP surface                      | `src/cgx/webui/routes/agent_session.py` |
 | Wire models                       | `src/cgx/webui/models.py` :: `AgentSession*` |

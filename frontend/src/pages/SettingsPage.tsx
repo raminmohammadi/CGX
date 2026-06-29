@@ -3,9 +3,14 @@ import {
   Check, Download, Loader2, Plus, Save, ShieldCheck, Trash2,
   Wifi, WifiOff, X, BookmarkPlus,
 } from "lucide-react";
-import { api, type PingResult, type ProfileSummary } from "../lib/api";
+import {
+  api,
+  type PingResult,
+  type ProfileSummary,
+} from "../lib/api";
 import { cancelPull, startPull, usePullState } from "../lib/pullManager";
 import { useWorkspace } from "../store/workspace";
+import { useTrace } from "../store/trace";
 import { Card, CardHeader } from "../components/Card";
 import { Field, NumberInput, Select, TextInput } from "../components/Input";
 import { Pill } from "../components/Pill";
@@ -109,6 +114,15 @@ export default function SettingsPage() {
   const [editPull, setEditPull] = useState<PullState | null>(null);
   const editPullRef = useRef<{ abort: () => void } | null>(null);
 
+  // Trace toggle (Phase TR.4). Backed by a shared store so the global
+  // header pill updates in the same tick as the POST resolves. The env-pinned
+  // source surfaces a small notice instead of an interactive control.
+  const traceSettings = useTrace((s) => s.settings);
+  const setTraceInStore = useTrace((s) => s.set);
+  const refreshTraceInStore = useTrace((s) => s.refresh);
+  const [traceBusy, setTraceBusy] = useState(false);
+  const [traceError, setTraceError] = useState<string | null>(null);
+
   const loadProfiles = async () => {
     try {
       setProfiles(await api.listProfiles());
@@ -120,6 +134,23 @@ export default function SettingsPage() {
   useEffect(() => {
     loadProfiles();
   }, []);
+
+  useEffect(() => {
+    void refreshTraceInStore();
+  }, [refreshTraceInStore]);
+
+  const toggleTrace = async (next: boolean) => {
+    setTraceBusy(true);
+    setTraceError(null);
+    try {
+      const updated = await api.setTraceSettings(next);
+      setTraceInStore(updated);
+    } catch (e: any) {
+      setTraceError(e?.message || "failed to update trace setting");
+    } finally {
+      setTraceBusy(false);
+    }
+  };
 
   // Refresh model list when active provider changes
   useEffect(() => {
@@ -709,6 +740,48 @@ export default function SettingsPage() {
               </tbody>
             </table>
           </div>
+        )}
+      </Card>
+
+      {/* ── Observability: trace toggle (Phase TR.4) ── */}
+      <Card padded>
+        <CardHeader
+          eyebrow="Observability"
+          title="Function-call tracing"
+          description="When on, the agent emits enter/exit records for every curated entry point (router, executors, LLM calls, retrieval, codegen, HTTP) into <project>/.cgx/agent.log."
+          right={
+            <div className="flex items-center gap-2">
+              {traceSettings?.enabled && (
+                <Pill tone="amber">TRACE</Pill>
+              )}
+              <button
+                className="av-btn"
+                disabled={
+                  traceBusy ||
+                  traceSettings === null ||
+                  traceSettings.source === "env"
+                }
+                onClick={() =>
+                  traceSettings && toggleTrace(!traceSettings.enabled)
+                }
+              >
+                {traceSettings === null
+                  ? "Loading…"
+                  : traceSettings.enabled
+                  ? "Turn off"
+                  : "Turn on"}
+              </button>
+            </div>
+          }
+        />
+        {traceSettings?.source === "env" && (
+          <p className="text-[11px] text-amber-300 font-mono mt-2">
+            Pinned by <code>CGX_TRACE</code> environment variable; unset it to
+            control from the UI.
+          </p>
+        )}
+        {traceError && (
+          <p className="text-[11px] text-red-300 font-mono mt-2">{traceError}</p>
         )}
       </Card>
 

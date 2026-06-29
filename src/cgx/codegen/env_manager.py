@@ -24,6 +24,8 @@ from typing import Dict, List, Optional, Set, Tuple
 
 import logging
 
+from cgx.trace import traced
+
 logger = logging.getLogger(__name__)
 
 
@@ -346,6 +348,7 @@ def update_requirements(project_root: str, new_packages: List[str]) -> None:
                 len(to_add), to_add)
 
 
+@traced("codegen")
 def preflight_install(
     generated_files: List[str],
     project_root: str,

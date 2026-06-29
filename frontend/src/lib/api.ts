@@ -474,6 +474,16 @@ export const api = {
       "DELETE",
     );
   },
+
+  getTraceSettings: () =>
+    jsonReq<TraceSettings>("/api/settings/trace"),
+  setTraceSettings: (enabled: boolean) =>
+    jsonReq<TraceSettings>("/api/settings/trace", "POST", { enabled }),
+};
+
+export type TraceSettings = {
+  enabled: boolean;
+  source: "env" | "runtime";
 };
 
 export type RollbackResponse = {

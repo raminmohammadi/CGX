@@ -39,6 +39,7 @@ from cgx.retrieval.orchestrator import (
 from cgx.io.persist import save_indices, load_indices, save_jsonl, load_jsonl
 from cgx.retrieval.lexical import get_cached_lexical_index
 from cgx.answer.scope import apply_scope_penalty
+from cgx.trace import traced
 
 # Graph persistence
 from networkx.readwrite import json_graph
@@ -266,6 +267,7 @@ def run_index_auto(
 # Query wrapper (ALL SIGNALS + IMPACT)
 # ---------------------------
 
+@traced("pipeline")
 def run_query_auto(
     index_dir: str,
     records_path: str,

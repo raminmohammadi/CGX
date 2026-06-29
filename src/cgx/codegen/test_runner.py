@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence
 
 from cgx.codegen.diff_apply import PatchResult
+from cgx.trace import traced
 
 logger = logging.getLogger(__name__)
 
@@ -163,6 +164,7 @@ def _project_python_exe(project_root: Path) -> str:
     return sys.executable
 
 
+@traced("codegen")
 def ensure_project_venv(
     project_root: str,
     *,
@@ -416,6 +418,7 @@ def run_pytest_paths(
     )
 
 
+@traced("codegen")
 def run_tests_on_disk(
     project_root: str,
     changed_files: Sequence[str],

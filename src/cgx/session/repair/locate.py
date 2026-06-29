@@ -19,6 +19,7 @@ from cgx.session.repair.classify import (
     missing_fixture_names,
     missing_module_names,
 )
+from cgx.trace import traced
 
 
 @dataclass(frozen=True)
@@ -38,6 +39,7 @@ class StyleMixLocation:
     helpers: frozenset
 
 
+@traced("repair.locate")
 def locate_unittest_pytest_mix(
     project_root: Path,
     candidate_files: Iterable[str],
@@ -104,6 +106,7 @@ class MissingPythonpathLocation:
     resolved_path: str
 
 
+@traced("repair.locate")
 def lint_test_style(
     project_root: Path,
     candidate_files: Iterable[str],
@@ -147,6 +150,7 @@ class MissingFixtureLocation:
     target_rel_path: str
 
 
+@traced("repair.locate")
 def locate_missing_fixture(
     project_root: Path,
     content: Dict[str, Any],
@@ -203,6 +207,7 @@ def locate_missing_fixture(
     return [found[name] for name in wanted if name in found]
 
 
+@traced("repair.locate")
 def locate_missing_module_pythonpath(
     project_root: Path,
     content: Dict[str, Any],

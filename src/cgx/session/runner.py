@@ -45,6 +45,11 @@ from cgx.session.router import (
 from cgx.session.agent_log import log_event
 from cgx.session.store import SessionStore
 from cgx.session.tasks.base import ExecutorDeps, ExecutorResult, dispatch
+from cgx.trace import (
+    reset_trace_context,
+    set_trace_context,
+    traced as _traced,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -86,9 +91,16 @@ class SessionRunner:
                               project_root=project_root, title=title,
                               mode=mode)
         self._store.save_session(session)
-        plan = self._router.on_user_message(
-            session=session, message=objective, tasks=[])
-        self._apply_plan(session, plan)
+        # Trace the seed-router call inside the session's context so the
+        # on_user_message records land in the project agent.log.
+        token = set_trace_context(
+            session_id=session.session_id, project_root=session.project_root)
+        try:
+            plan = self._router.on_user_message(
+                session=session, message=objective, tasks=[])
+            self._apply_plan(session, plan)
+        finally:
+            reset_trace_context(token)
         # Link the root task back to the session for convenient lookup.
         roots = [t for t in self._store.list_tasks(session.session_id)
                  if t.parent_task_id is None]
@@ -99,8 +111,21 @@ class SessionRunner:
 
     def post_message(self, *, session_id: str, message: str) -> RouterPlan:
         session = self._require_session(session_id)
-        with self._lock_for(session_id):
-            tasks = self._store.list_tasks(session_id)
+        # Set the trace context *before* the @_traced wrapper fires so the
+        # runner's own enter/exit records route to <project>/.cgx/agent.log
+        # instead of the global fallback log.
+        token = set_trace_context(
+            session_id=session_id, project_root=session.project_root)
+        try:
+            return self._post_message_traced(session=session, message=message)
+        finally:
+            reset_trace_context(token)
+
+    @_traced("runner")
+    def _post_message_traced(self, *, session: Session,
+                             message: str) -> RouterPlan:
+        with self._lock_for(session.session_id):
+            tasks = self._store.list_tasks(session.session_id)
             plan = self._router.on_user_message(
                 session=session, message=message, tasks=tasks)
             self._apply_plan(session, plan)
@@ -109,8 +134,19 @@ class SessionRunner:
     def post_decision(self, *, session_id: str,
                       decision: Decision) -> RouterPlan:
         session = self._require_session(session_id)
-        with self._lock_for(session_id):
-            tasks = self._store.list_tasks(session_id)
+        token = set_trace_context(
+            session_id=session_id, project_root=session.project_root)
+        try:
+            return self._post_decision_traced(
+                session=session, decision=decision)
+        finally:
+            reset_trace_context(token)
+
+    @_traced("runner")
+    def _post_decision_traced(self, *, session: Session,
+                              decision: Decision) -> RouterPlan:
+        with self._lock_for(session.session_id):
+            tasks = self._store.list_tasks(session.session_id)
             plan = self._router.on_decision_recorded(
                 session=session, decision=decision, tasks=tasks)
             self._apply_plan(session, plan)
@@ -126,8 +162,18 @@ class SessionRunner:
         subsequent calls until a decision arrives.
         """
         session = self._require_session(session_id)
-        with self._lock_for(session_id):
-            task = self._pick_ready(session_id)
+        token = set_trace_context(
+            session_id=session_id, project_root=session.project_root)
+        try:
+            return self._run_next_traced(session=session, deps=deps)
+        finally:
+            reset_trace_context(token)
+
+    @_traced("runner")
+    def _run_next_traced(self, *, session: Session,
+                         deps: ExecutorDeps) -> Optional[TaskNode]:
+        with self._lock_for(session.session_id):
+            task = self._pick_ready(session.session_id)
             if task is None:
                 return None
             return self._execute(session, task, deps)
@@ -168,6 +214,15 @@ class SessionRunner:
             and hasattr(provider, "drain")
         if traced:
             provider.bind(session.session_id, task.task_id)
+        # Phase TR.2: propagate session/task/project_root into the trace
+        # ContextVar so nested @traced calls land in the right agent.log.
+        # Scope spans the entire executor + successor-router call so the
+        # ``on_task_completed`` trace records also land in the project log.
+        trace_token = set_trace_context(
+            session_id=session.session_id,
+            task_id=task.task_id,
+            project_root=session.project_root,
+        )
         try:
             try:
                 result = dispatch(task, deps)
@@ -193,53 +248,54 @@ class SessionRunner:
                         self._store.add_fact(fact)
                 return self._mark_failed(
                     session, task, f"{type(exc).__name__}: {exc}")
+
+            # Persist facts even on failure -- they're append-only context
+            # that may help the user diagnose what went wrong. Tracing
+            # facts are drained from the provider after the executor
+            # returns so both executor-emitted facts and LLM-call facts
+            # land in the same persistence loop.
+            if traced:
+                for fact in provider.drain():
+                    self._store.add_fact(fact)
+            for fact in result.facts:
+                self._store.add_fact(fact)
+
+            if result.failure:
+                return self._mark_failed(session, task, result.failure)
+
+            if result.artifact is not None:
+                self._store.save_artifact(result.artifact)
+                task.produced_artifact_id = result.artifact.artifact_id
+
+            task.outputs = dict(result.outputs or {})
+
+            if task.kind is TaskKind.ASK_USER:
+                # Stays IN_PROGRESS until apply_decision posts a Decision.
+                self._store.save_task(task)
+                log_event(session.project_root, "task_waiting_user",
+                          session_id=session.session_id, task_id=task.task_id,
+                          kind=task.kind.value)
+                return task
+
+            task.status = TaskNodeStatus.DONE
+            task.completed_at = time.time()
+            self._store.save_task(task)
+            log_event(session.project_root, "task_completed",
+                      session_id=session.session_id, task_id=task.task_id,
+                      kind=task.kind.value,
+                      artifact_id=task.produced_artifact_id,
+                      duration_ms=int(((task.completed_at or 0.0)
+                                       - (task.started_at or 0.0)) * 1000))
+
+            tasks_after = self._store.list_tasks(session.session_id)
+            successor_plan = self._router.on_task_completed(
+                session=session, completed=task, tasks=tasks_after)
+            self._apply_plan(session, successor_plan)
+            return task
         finally:
             if traced:
                 provider.unbind()
-
-        # Persist facts even on failure -- they're append-only context
-        # that may help the user diagnose what went wrong. Tracing facts
-        # are drained from the provider after the executor returns so
-        # both executor-emitted facts and LLM-call facts land in the
-        # same persistence loop.
-        if traced:
-            for fact in provider.drain():
-                self._store.add_fact(fact)
-        for fact in result.facts:
-            self._store.add_fact(fact)
-
-        if result.failure:
-            return self._mark_failed(session, task, result.failure)
-
-        if result.artifact is not None:
-            self._store.save_artifact(result.artifact)
-            task.produced_artifact_id = result.artifact.artifact_id
-
-        task.outputs = dict(result.outputs or {})
-
-        if task.kind is TaskKind.ASK_USER:
-            # Stays IN_PROGRESS until apply_decision posts a Decision.
-            self._store.save_task(task)
-            log_event(session.project_root, "task_waiting_user",
-                      session_id=session.session_id, task_id=task.task_id,
-                      kind=task.kind.value)
-            return task
-
-        task.status = TaskNodeStatus.DONE
-        task.completed_at = time.time()
-        self._store.save_task(task)
-        log_event(session.project_root, "task_completed",
-                  session_id=session.session_id, task_id=task.task_id,
-                  kind=task.kind.value,
-                  artifact_id=task.produced_artifact_id,
-                  duration_ms=int(((task.completed_at or 0.0)
-                                   - (task.started_at or 0.0)) * 1000))
-
-        tasks_after = self._store.list_tasks(session.session_id)
-        successor_plan = self._router.on_task_completed(
-            session=session, completed=task, tasks=tasks_after)
-        self._apply_plan(session, successor_plan)
-        return task
+            reset_trace_context(trace_token)
 
     def _mark_failed(self, session: Session, task: TaskNode,
                      message: str) -> TaskNode:

@@ -4,6 +4,7 @@ import type {
   ArtifactDTO, DecisionDTO, FactDTO, TaskNodeDTO,
 } from "../../lib/api";
 import { Pill } from "../Pill";
+import { ErrorBoundary } from "../ErrorBoundary";
 import { AskUserForm } from "./AskUserForm";
 import { ArtifactPreview } from "./ArtifactPreview";
 
@@ -65,7 +66,11 @@ export function ActiveTaskPanel(props: ActiveTaskProps) {
       {linked && (task.kind !== "ask_user" || resolvedDecision !== undefined) && (
         <ArtifactPreview artifact={linked} />
       )}
-      {llmFacts.length > 0 && <LLMTraces facts={llmFacts} />}
+      {llmFacts.length > 0 && (
+        <ErrorBoundary label="llm-traces">
+          <LLMTraces facts={llmFacts} />
+        </ErrorBoundary>
+      )}
     </div>
   );
 }

@@ -24,6 +24,8 @@ import hashlib
 import re
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from cgx.trace import traced
+
 
 REPAIR_CLASSIFICATIONS: Tuple[str, ...] = (
     "third_party_import_break",
@@ -101,6 +103,7 @@ _CLASSIFIER_REGISTRY: Tuple[Tuple[RepairClassification, _ClassifierFn], ...] = (
 )
 
 
+@traced("repair.classify")
 def classify_verify_report(content: Dict[str, Any]) -> RepairClassification:
     """Map a VERIFY_REPORT content dict to a classification token.
 

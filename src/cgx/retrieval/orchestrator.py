@@ -40,6 +40,7 @@ from cgx.retrieval.lexical import LexicalIndex
 from cgx.retrieval.rrf import rrf_fuse
 from cgx.retrieval.tokenize import expand_with_subwords
 from cgx.graph.backend import CodeGraphBackend
+from cgx.trace import traced
 
 
 # ---------------------------
@@ -244,6 +245,7 @@ __all__ = [
 # ---------------------------
 
 
+@traced("retrieval")
 def hybrid_retrieve_two_view(
     query: str,
     *,
@@ -1085,6 +1087,7 @@ def _jaccard(a: Iterable[str], b: Iterable[str]) -> float:
     return float(len(A & B)) / max(1, len(A | B))
 
 
+@traced("retrieval")
 def suggest_insertion_points(
     query: str,
     fused_hits: List[Dict[str, Any]],
@@ -1285,6 +1288,7 @@ def suggest_insertion_points(
 # Change impact analysis (NEW)
 # ---------------------------
 
+@traced("retrieval")
 def analyze_change_impact(
     symbol_query: str,
     fused_hits: List[Dict[str, Any]],

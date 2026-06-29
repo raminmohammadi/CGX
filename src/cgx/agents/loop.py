@@ -36,6 +36,7 @@ from cgx.agents.judge import Judge
 from cgx.agents.planner import Planner
 from cgx.agents.tracker import Tracker
 from cgx.agents.types import AgentEvent, Plan
+from cgx.trace import traced
 
 logger = logging.getLogger(__name__)
 
@@ -1569,6 +1570,7 @@ def _stream_with_retry(
         attempt += 1
 
 
+@traced("agent")
 def run_agent(
     goal: str,
     *,
