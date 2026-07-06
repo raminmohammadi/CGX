@@ -135,6 +135,17 @@ def run_bootstrap_env(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
 
     outcome = _classify_outcome(
         venv_path=venv_path, failed_installs=failed_installs)
+    # Honesty gate: even when nothing failed to *install*, the scaffold's
+    # own third-party imports must actually resolve in the venv. If they
+    # don't (a malformed/unresolvable requirements line that aborted the
+    # batch install, a bad import→PyPI mapping, ...), the app cannot run
+    # and BOOTSTRAP must not report success.
+    missing_runtime: List[str] = []
+    if outcome == "succeeded":
+        missing_runtime = _verify_runtime_imports(
+            root, applied_files, python_exe)
+        if missing_runtime:
+            outcome = "failed"
     artifact = _build_artifact(
         task, project_type=project_type, venv_path=venv_path,
         python_exe=python_exe, installed_from=installed_from,
@@ -144,12 +155,21 @@ def run_bootstrap_env(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         style_issues=style_issues,
         resolved_packages=resolved_packages,
         pip_freeze_text=pip_freeze_text,
+        missing_imports=missing_runtime,
         note=None,
     )
     failure: Optional[str] = None
     if outcome == "failed":
-        failure = (f"bootstrap failed: {len(failed_installs)} package(s) "
-                   f"could not be installed: {sorted(failed_installs)}")
+        reasons: List[str] = []
+        if failed_installs:
+            reasons.append(
+                f"{len(failed_installs)} package(s) could not be "
+                f"installed: {sorted(failed_installs)}")
+        if missing_runtime:
+            reasons.append(
+                f"{len(missing_runtime)} runtime import(s) not importable "
+                f"in venv: {missing_runtime}")
+        failure = "bootstrap failed: " + "; ".join(reasons)
     return ExecutorResult(
         outputs={
             "build_artifact_id": artifact.artifact_id,
@@ -159,6 +179,7 @@ def run_bootstrap_env(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             "python_exe": python_exe,
             "installed_count": len(installed_packages),
             "failed_count": len(failed_installs),
+            "missing_import_count": len(missing_runtime),
             "style_issue_count": len(style_issues),
         },
         artifact=artifact,
@@ -231,6 +252,51 @@ def _detect_venv_path(root: Path, python_exe: str) -> Optional[str]:
     return None
 
 
+def _verify_runtime_imports(
+        root: Path,
+        applied_files: List[str],
+        python_exe: Optional[str]) -> List[str]:
+    """Return third-party import roots the scaffold uses but can't import.
+
+    Scans the applied ``.py`` files for top-level import roots, drops
+    stdlib / first-party / bare-namespace roots, then probes the
+    remaining roots in the provisioned venv. A non-empty result means
+    the app cannot import its own dependencies even though provisioning
+    did not raise -- the caller degrades the outcome to ``failed``.
+    Best-effort: any import/probe error yields ``[]`` so a transient
+    hiccup never fabricates a bootstrap failure.
+    """
+    if not python_exe or not applied_files:
+        return []
+    try:
+        from cgx.codegen.env_manager import (
+            scan_imports, _probe_importable, _is_local_package,
+            _STDLIB_TOP, _NAMESPACE_ROOTS,
+        )
+    except Exception:
+        return []
+    abs_files = [str(root / p) for p in applied_files
+                 if str(p).endswith(".py")]
+    if not abs_files:
+        return []
+    try:
+        roots = {r.split(".")[0] for r in scan_imports(abs_files)}
+        candidates = sorted(
+            r for r in roots
+            if r
+            and r.lower().replace("-", "_") not in _STDLIB_TOP
+            and r not in _NAMESPACE_ROOTS
+            and not _is_local_package(r, str(root)))
+        if not candidates:
+            return []
+        importable = _probe_importable(candidates, python_exe)
+    except Exception as exc:
+        logger.warning(
+            "BOOTSTRAP_ENV: runtime-import verification raised %s", exc)
+        return []
+    return [r for r in candidates if r not in importable]
+
+
 def _classify_outcome(*, venv_path: Optional[str],
                       failed_installs: Dict[str, bool]) -> str:
     """Reduce the bootstrap result to a single token for the UI.
@@ -262,6 +328,7 @@ def _build_artifact(
     resolved_packages: List[Dict[str, str]],
     pip_freeze_text: str,
     note: Optional[str],
+    missing_imports: Optional[List[str]] = None,
 ) -> Artifact:
     """Construct the ``BUILD_REPORT`` artifact for this bootstrap run."""
     content: Dict[str, Any] = {
@@ -273,6 +340,7 @@ def _build_artifact(
         "installed_from": list(installed_from),
         "installed_packages": list(installed_packages),
         "failed_installs": sorted(failed_installs.keys()),
+        "missing_imports": list(missing_imports or []),
         "outcome": outcome,
         "pip_log_tail": pip_log_tail or "",
         "applied_files": list(applied_files),

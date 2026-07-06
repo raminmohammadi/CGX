@@ -90,6 +90,7 @@ def run_verify(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     os.close(junit_fd)
     extra_pytest_args = (
         "-q", "--no-header", "-rN", "--tb=long",
+        "--ignore=.cgx-backups",
         f"--junitxml={junit_path}",
     )
     try:

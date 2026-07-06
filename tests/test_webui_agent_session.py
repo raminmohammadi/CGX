@@ -626,6 +626,104 @@ def test_full_greenfield_loop_via_http(
     assert "directions_list" not in kinds
 
 
+def _install_greenfield_stubs_with_api_repair() -> None:
+    """Greenfield stubs whose API_CHECK fails once then regenerates.
+
+    The first API_CHECK reports a hallucinated ``lance.connect`` symbol
+    so the router spawns REPAIR; the REPAIR stub returns a
+    ``strategy='regenerate'`` verdict, which re-queues a fresh SCAFFOLD
+    and a second SCAFFOLD -> APPLY -> BOOTSTRAP_ENV -> API_CHECK ->
+    SMOKE -> VERIFY cycle. The second API_CHECK is clean so the loop
+    reaches VERIFY. The whole detour is 11 executor steps -- well past
+    the old ``_drain_ready`` budget of 6.
+    """
+    _install_greenfield_stubs()
+    api_calls = {"n": 0}
+
+    @register_executor(TaskKind.API_CHECK)
+    def _api_check_flaky(task, deps):
+        api_calls["n"] += 1
+        first = api_calls["n"] == 1
+        failed_refs = [{"module": "lance", "name": "connect"}] if first else []
+        outcome = "failed" if first else "skipped"
+        sig = "api_check|lance.connect" if first else ""
+        art = Artifact.new(
+            task.session_id, task.task_id, ArtifactKind.API_CHECK_REPORT,
+            {"build_artifact_id": task.inputs.get("build_artifact_id"),
+             "applied_files": ["app.py"], "references": [],
+             "outcome": outcome, "failed_references": failed_refs,
+             "failure_signature": sig, "probe_error": None})
+        return ExecutorResult(
+            outputs={"api_check_artifact_id": art.artifact_id,
+                     "outcome": outcome, "failed_count": len(failed_refs),
+                     "checked_count": 1, "failure_signature": sig},
+            artifact=art)
+
+    @register_executor(TaskKind.REPAIR)
+    def _repair_regenerate(task, deps):
+        priors = task.inputs.get("prior_failure_signatures") \
+            or ["api_check|lance.connect"]
+        art = Artifact.new(
+            task.session_id, task.task_id, ArtifactKind.REPAIR_PLAN,
+            {"diffs": [], "classification": "api_check_failure",
+             "rationale": "hallucinated lance.connect"})
+        return ExecutorResult(
+            outputs={"repair_artifact_id": art.artifact_id,
+                     "classification": "api_check_failure",
+                     "failure_signature": priors[-1],
+                     "repair_attempt": task.inputs.get("repair_attempt", 1),
+                     "diff_count": 0, "can_apply": False,
+                     "strategy": "regenerate",
+                     "extra_constraints": {
+                         "kind": "api_check_failure",
+                         "failed_references": [
+                             {"module": "lance", "name": "connect"}],
+                         "rationale": "regen"}},
+            artifact=art)
+
+
+def test_greenfield_api_check_repair_regenerate_drains_to_verify(
+        client: _HandlerClient, tmp_path: Path) -> None:
+    """A regenerate detour after an API_CHECK failure must reach VERIFY.
+
+    Regression for the stall on session ``ses_e19caed6976d496b``: the
+    drain budget used to be 6, exactly the happy-path pipeline length,
+    so the first repair/regenerate cycle overran it and stranded the
+    regenerated APPLY at READY, leaving the session stuck ``active``.
+    """
+    _install_greenfield_stubs_with_api_repair()
+    state = client.create(
+        objective="flask lancedb app", project_root=str(tmp_path / "p"),
+        mode="greenfield", run_initial_task=True)
+    sid = state["session"]["session_id"]
+
+    ans = _find_task(state, kind="ask_user", expected_kind="clarify_answers")
+    state = client.decision(
+        sid, task_id=ans["task_id"],
+        chosen={"answers": {"q1": "Flask", "q2": "LanceDB", "q3": "None"}},
+        run_initial_task=True)
+    approve = _find_task(state, kind="ask_user",
+                         expected_kind="approve_plan")
+    state = client.decision(sid, task_id=approve["task_id"],
+                            chosen={"approved": True},
+                            run_initial_task=True)
+
+    # The regenerate cycle produced a second SCAFFOLD/APPLY pair, both
+    # of which must have run (not the pre-fix stall where the second
+    # APPLY was created READY and never dispatched).
+    scaffolds = [t for t in state["tasks"] if t["kind"] == "scaffold"]
+    assert len(scaffolds) == 2
+    applies = [t for t in state["tasks"] if t["kind"] == "apply"]
+    assert len(applies) == 2
+    assert all(a["status"] == "done" for a in applies)
+    repair_t = _find_task(state, kind="repair")
+    assert repair_t is not None and repair_t["status"] == "done"
+    verify_t = _find_task(state, kind="verify")
+    assert verify_t is not None and verify_t["status"] == "done"
+    # No task is left stranded at READY -- the stall symptom.
+    assert not any(t["status"] == "ready" for t in state["tasks"])
+
+
 def test_greenfield_decline_plan_halts_loop(
         client: _HandlerClient, tmp_path: Path) -> None:
     _install_greenfield_stubs()

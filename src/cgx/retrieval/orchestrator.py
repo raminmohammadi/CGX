@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import threading
 
 """
 Two-view retrieval orchestrator (ALL SIGNALS REQUIRED + IMPACT ANALYSIS).
@@ -65,6 +66,7 @@ def _records_map(records: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
 _INSERTION_CORPUS_CACHE_MAX = 8
 _INSERTION_CORPUS_CACHE: "Dict[Tuple[int, int, int, int], Tuple[Any, List[str]]]" = {}
 _INSERTION_CORPUS_ORDER: "List[Tuple[int, int, int, int]]" = []
+_CORPUS_CACHE_LOCK = threading.Lock()
 
 
 def _insertion_corpus_key(
@@ -90,9 +92,10 @@ def _build_exemplar_corpus(
 ) -> Tuple[Any, List[str]]:
     """Encode the file/class ``name + docstring`` corpus once, with caching."""
     key = _insertion_corpus_key(records, embedder)
-    cached = _INSERTION_CORPUS_CACHE.get(key)
-    if cached is not None:
-        return cached
+    with _CORPUS_CACHE_LOCK:
+        cached = _INSERTION_CORPUS_CACHE.get(key)
+        if cached is not None:
+            return cached
     texts: List[str] = []
     ids: List[str] = []
     for r in records:
@@ -107,18 +110,24 @@ def _build_exemplar_corpus(
         mat = np.zeros((0, 0), dtype=np.float32)
     else:
         mat = embedder.encode(texts)
-    _INSERTION_CORPUS_CACHE[key] = (mat, ids)
-    _INSERTION_CORPUS_ORDER.append(key)
-    while len(_INSERTION_CORPUS_ORDER) > _INSERTION_CORPUS_CACHE_MAX:
-        evict = _INSERTION_CORPUS_ORDER.pop(0)
-        _INSERTION_CORPUS_CACHE.pop(evict, None)
+    with _CORPUS_CACHE_LOCK:
+        # Re-check key in case another thread encoded it in the meantime
+        cached = _INSERTION_CORPUS_CACHE.get(key)
+        if cached is not None:
+            return cached
+        _INSERTION_CORPUS_CACHE[key] = (mat, ids)
+        _INSERTION_CORPUS_ORDER.append(key)
+        while len(_INSERTION_CORPUS_ORDER) > _INSERTION_CORPUS_CACHE_MAX:
+            evict = _INSERTION_CORPUS_ORDER.pop(0)
+            _INSERTION_CORPUS_CACHE.pop(evict, None)
     return mat, ids
 
 
 def _clear_insertion_corpus_cache() -> None:
     """Test hook: drop all cached exemplar corpora."""
-    _INSERTION_CORPUS_CACHE.clear()
-    _INSERTION_CORPUS_ORDER.clear()
+    with _CORPUS_CACHE_LOCK:
+        _INSERTION_CORPUS_CACHE.clear()
+        _INSERTION_CORPUS_ORDER.clear()
 
 # Shared stopword set for filtering identifier-like tokens out of NL questions.
 # Kept here so both the engine and the orchestrator agree on what counts as a

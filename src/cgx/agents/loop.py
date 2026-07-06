@@ -89,7 +89,9 @@ def _build_default_capabilities(
             kw.setdefault("max_retries", 1)
         # Phase 3: inject symbol map so the SLM knows what's already defined.
         if records_path and not kw.get("symbol_context"):
-            sym_ctx = build_symbol_context_prompt(records_path)
+            t_files = kw.get("target_files") or []
+            t_file = t_files[0] if t_files else None
+            sym_ctx = build_symbol_context_prompt(records_path, target_file=t_file)
             if sym_ctx:
                 kw["symbol_context"] = sym_ctx
         # plan_fix attaches ``target_files`` / ``do_not_change`` to the PLAN
@@ -323,7 +325,7 @@ def _build_default_capabilities(
         if records_path:
             try:
                 from cgx.codegen.symbol_map import build_symbol_context_prompt
-                sym_ctx = build_symbol_context_prompt(records_path)
+                sym_ctx = build_symbol_context_prompt(records_path, target_file=file_path)
             except Exception:
                 pass
 
@@ -706,12 +708,22 @@ def _diagnose_failure(failures: List[Dict[str, Any]]) -> Dict[str, Any]:
 
         # Classify error type -- first match wins by priority.
         if diagnosis["error_type"] == "unknown":
-            if re.search(r"ModuleNotFoundError|ImportError", combined):
-                diagnosis["error_type"] = "import_error"
-            elif re.search(r"SyntaxError", combined):
-                diagnosis["error_type"] = "syntax_error"
-            elif re.search(r"(AssertionError|TypeError|AttributeError|ValueError)", combined):
-                diagnosis["error_type"] = "logic_error"
+            m = re.search(r"^E\s+(\w+Error|AssertionError)\b", combined, re.MULTILINE)
+            if m:
+                exc_name = m.group(1)
+                if exc_name in ("ModuleNotFoundError", "ImportError"):
+                    diagnosis["error_type"] = "import_error"
+                elif exc_name == "SyntaxError":
+                    diagnosis["error_type"] = "syntax_error"
+                elif exc_name in ("AssertionError", "TypeError", "AttributeError", "ValueError"):
+                    diagnosis["error_type"] = "logic_error"
+            if diagnosis["error_type"] == "unknown":
+                if re.search(r"ModuleNotFoundError|ImportError", combined):
+                    diagnosis["error_type"] = "import_error"
+                elif re.search(r"SyntaxError", combined):
+                    diagnosis["error_type"] = "syntax_error"
+                elif re.search(r"(AssertionError|TypeError|AttributeError|ValueError)", combined):
+                    diagnosis["error_type"] = "logic_error"
 
         # Collect bad module names.
         for m in re.finditer(r"No module named '([^']+)'", combined):

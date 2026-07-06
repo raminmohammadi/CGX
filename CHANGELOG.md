@@ -35,6 +35,67 @@ a failure-signature hash, so repeating failures escalate to
 
 ### Added
 
+- **Curated function-call tracing (Phase TR)** -- New single-file
+  instrumentation layer `cgx.trace` gated behind a global toggle that
+  emits `trace_enter` / `trace_exit` (with `elapsed_ms`) or
+  `trace_error` (with `error_type` + truncated message) records for
+  every high-signal entry point on the agent loop. Curated targets --
+  **not** every function in `src/cgx/` -- to keep the log signal high
+  and the production overhead a single `bool` check when off. Wrapped
+  with `@traced(category)`: the router (`Router.on_user_message`,
+  `on_task_completed`, `on_decision_recorded`), the runner
+  (`SessionRunner._post_message_traced`, `_post_decision_traced`,
+  `_run_next_traced`), every executor via `dispatch` in
+  `cgx.session.tasks.base` (wraps the registered function at
+  registration time so every `TaskKind` participates without per-file
+  edits), the three repair helpers (`cgx.session.repair.{classify,
+  locate, propose}`), the four LLM entry points in
+  `cgx.answer.engine` (`answer_with_llm`, `generate_code_plan`,
+  `plan_scaffold_manifest`, `generate_single_scaffold_file`), the
+  three retrieval entry points in `cgx.retrieval.orchestrator` plus
+  `cgx.pipeline.auto.run_query_auto`, the three codegen entry points
+  (`cgx.codegen.disk_apply.apply_diffs_to_disk`,
+  `cgx.codegen.env_manager.preflight_install`, and the two runners in
+  `cgx.codegen.test_runner`), and the legacy batch loop
+  (`cgx.agents.loop.run_agent`). Records are routed via a
+  `contextvars.ContextVar` carrying `session_id` / `task_id` /
+  `project_root`: when a session context is active the records land
+  in `<project_root>/.cgx/agent.log` alongside the existing Phase 1.3
+  task-transition rows so a single tail on the project log shows both
+  business events and per-call timings inline; when no session
+  context is set (HTTP middleware, batch CLI, retrieval / codegen
+  called directly) records fall through to a rotating fallback at
+  `~/.cgx/cgx-trace.log` (2 MiB × 3 backups). The runner sets the
+  context inside `start_session`, `post_message`, `post_decision`,
+  `run_next`, and `_execute` before any decorator fires so the
+  runner's own records route correctly -- the three mutating public
+  methods are thin un-decorated wrappers that prime the ContextVar
+  and delegate to a `@traced("runner")` inner. Toggle precedence:
+  (1) `$CGX_TRACE` env var (`1`/`true`/`yes`/`on` pins ON;
+  `0`/`false`/`no`/`off` pins OFF; `set_trace_enabled` becomes a
+  no-op while pinned; `trace_source()` returns `"env"`),
+  (2) runtime flag flipped via new `POST /api/settings/trace`
+  endpoint with `{"enabled": true|false}` -- returns HTTP `409`
+  when the env var pins the flag so the operator can see the
+  override is coming from the environment, not a stuck UI control,
+  (3) programmatic `cgx.trace.set_trace_enabled(True)` for tests /
+  scripts. Frontend surface: new `frontend/src/store/trace.ts`
+  (shared Zustand store holding `{enabled, source}` with
+  `refresh()` and `set()` actions), a "Function-call tracing"
+  toggle card on `frontend/src/pages/SettingsPage.tsx`, an amber
+  `TRACE` pill next to the Mode badge in
+  `frontend/src/layout/Header.tsx` (tooltip explains env-pinned vs
+  UI-toggled), and `frontend/src/layout/AppShell.tsx` primes the
+  store on mount so the pill reflects server-side state on first
+  paint. Ten new tests: `tests/test_trace.py` covers the sync /
+  async decorator paths, exception path, toggle-off no-op, and
+  nested `ContextVar` propagation across sync + async calls;
+  `tests/test_webui_settings.py` covers GET / POST plus the
+  env-pinned 409 branch (ON and OFF variants);
+  `tests/test_trace_integration.py` drives a real `SessionRunner`
+  against a tmp project and asserts `agent.log` contains `runner`,
+  `router`, and `executor` trace lines when the toggle is ON and
+  zero trace lines when it's OFF.
 - **Cross-session lessons store (Phase 7.1)** -- New module
   `cgx.session.lessons` persists a generalisable rule every time a
   REPAIR cycle is observed to repair its failure -- i.e. a downstream

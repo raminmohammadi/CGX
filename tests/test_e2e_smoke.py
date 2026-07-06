@@ -86,6 +86,11 @@ def test_e2e_react_fastapi_calculator_scaffold(tmp_path):
         {"content": json.dumps({"content": "import React from 'react';\nexport default function App(){return <div>Calc</div>;}"})},
         {"content": json.dumps({"content": "from fastapi import FastAPI\napp = FastAPI()\n@app.post('/compute')\ndef compute():\n    return {'ok': True}\n"})},
         {"content": json.dumps({"content": "fastapi\nuvicorn\n"})},
+        # README.md is injected LAST by ``_inject_readme`` and generated
+        # via the LLM, so it consumes the final scripted reply. The
+        # ``backend/__init__.py`` package-marker is deterministic and
+        # makes no LLM call.
+        {"content": json.dumps({"content": "# Calc\n\nA React UI + FastAPI calculator backend.\n\n## Setup\n\nInstall backend deps from `backend/requirements.txt`.\n"})},
     ]
 
     provider = _ScriptedProvider([planner_reply, manifest_reply, *file_replies])
@@ -108,13 +113,15 @@ def test_e2e_react_fastapi_calculator_scaffold(tmp_path):
     assert "react" in attached and "fastapi" in attached, attached
 
     # The Tracker injected one SCAFFOLD_FILE task per manifest file --
-    # 4 from the LLM manifest plus a deterministic ``backend/__init__.py``
-    # package-marker injected by ``_inject_python_package_inits`` so
-    # pytest can resolve ``from backend.main import …`` on disk.
+    # 4 from the LLM manifest plus two deterministic injections: a
+    # ``backend/__init__.py`` package-marker (``_inject_python_package_inits``)
+    # so pytest can resolve ``from backend.main import …`` on disk, and a
+    # trailing top-level ``README.md`` (``_inject_readme``) generated last.
     file_tasks = [t for t in plan.tasks if t.kind == TaskKind.SCAFFOLD_FILE]
     task_names = [t.name for t in file_tasks]
-    assert len(file_tasks) == 5, task_names
+    assert len(file_tasks) == 6, task_names
     assert "Generate backend/__init__.py" in task_names, task_names
+    assert "Generate README.md" in task_names, task_names
     for t in file_tasks:
         assert t.status == TaskStatus.DONE, f"{t.name} failed: {t.error}"
         assert (t.output or {}).get("syntax_ok", True)

@@ -154,6 +154,23 @@ def detect_intent(question: str) -> Intent:
     if has_sym and any(k in ql for k in ["what does", "explain", "describe", "purpose of", "what is the ", "how does"]):
         return "symbol_explain"
 
+    # Optimization / recommendation requests: the caller wants actionable
+    # advice -- which parameters to pick, what to tune, how to make something
+    # faster or lighter -- not a description of an existing symbol. This must
+    # beat the symbol_explain fallback below: an anchored goal like "best
+    # FAISS parameters for build_faiss_index" carries a symbol token but no
+    # explain-verb, so without this branch it fell through to symbol_explain
+    # and produced a Purpose/Signature write-up instead of recommendations.
+    # ``change_plan`` framing (Goal / Affected files / Step-by-step edits /
+    # Tests / Risks) is the closest fit for a grounded recommendation.
+    if any(k in ql for k in [
+        "optimize", "optimise", "optimization", "optimisation",
+        "optimal", "recommend", "improve", "speed up", "faster",
+        "reduce memory", "tune ", "tuning", "best ",
+        "which parameters", "what parameters",
+    ]):
+        return "change_plan"
+
     # Usage / workflow questions (no concrete symbol target)
     if any(k in ql for k in ["how do i", "how to ", "where to ", "how can i"]):
         return "howto"

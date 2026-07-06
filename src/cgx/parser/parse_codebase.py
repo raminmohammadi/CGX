@@ -4,11 +4,12 @@
 from __future__ import annotations
 
 import ast
-import fnmatch
 import io
 import os
 import tokenize
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+import pathspec
+from pathspec.patterns import GitWildMatchPattern
 from cgx.parser.module_path import compute_module_path
 from cgx.logging_setup import get_logger
 
@@ -43,42 +44,7 @@ DEFAULT_IGNORE_GLOBS = (
 )
 
 
-def _load_gitignore_patterns(project_root: str) -> List[str]:
-    """Read .gitignore at the project root and return a normalized pattern list."""
-    pats: List[str] = []
-    gi = os.path.join(project_root, ".gitignore")
-    if not os.path.isfile(gi):
-        return pats
-    try:
-        with open(gi, "r", encoding="utf-8", errors="ignore") as f:
-            for raw in f:
-                ln = raw.strip()
-                if not ln or ln.startswith("#"):
-                    continue
-                if ln.startswith("!"):
-                    # Negations are not supported; safer to skip than mis-handle.
-                    continue
-                pats.append(ln.lstrip("/"))
-    except Exception:
-        pass
-    return pats
-
-
-def _matches_any(rel_path: str, patterns: Iterable[str]) -> bool:
-    """fnmatch-style match against repo-relative POSIX paths and basenames."""
-    rp = rel_path.replace(os.sep, "/")
-    name = rp.rsplit("/", 1)[-1]
-    for p in patterns:
-        pat = p.rstrip("/").replace(os.sep, "/")
-        if not pat:
-            continue
-        if fnmatch.fnmatch(rp, pat) or fnmatch.fnmatch(name, pat):
-            return True
-        # Match nested entries when pattern is dir-like (no glob chars).
-        if "*" not in pat and "?" not in pat and "[" not in pat:
-            if rp == pat or rp.startswith(pat + "/"):
-                return True
-    return False
+# _load_gitignore_patterns and _matches_any removed in favor of pathspec
 
 
 # ---------- AST helpers ----------
@@ -467,6 +433,7 @@ def _parse_python_module(
             # "inner", preventing duplicate chunk IDs when identically-named
             # helpers are defined inside multiple different test functions.
             self._func_name_stack: List[str] = []
+            self._class_name_stack: List[str] = []
 
         # -------- imports --------
         def visit_Import(self, node: ast.Import):
@@ -506,7 +473,9 @@ def _parse_python_module(
             - Tracks enclosing class context for nested classes.
             - Visits all methods and nested classes recursively.
             """
-            class_id = f"{self.filename}::class::{node.name}"
+            self._class_name_stack.append(node.name)
+            qual_class_name = ".".join(self._class_name_stack)
+            class_id = f"{self.filename}::class::{qual_class_name}"
             # Get source code segment of the source that generated node.
             class_code = _get_source(self.source, node) 
             # unparse an AST node decorator_list into its string representations.
@@ -555,7 +524,7 @@ def _parse_python_module(
             )
 
             prev_class = self.current_class_name
-            self.current_class_name = node.name
+            self.current_class_name = qual_class_name
 
             # methods & nested
             for child in node.body:
@@ -568,6 +537,7 @@ def _parse_python_module(
                     self.visit(child)
 
             self.current_class_name = prev_class
+            self._class_name_stack.pop()
 
         # -------- functions --------
         def visit_FunctionDef(self, node: ast.FunctionDef):
@@ -1110,8 +1080,6 @@ def parse_codebase(
         except Exception:
             max_file_bytes = DEFAULT_MAX_FILE_BYTES
     user_globs = list(ignore_patterns or [])
-    gitignore_globs = _load_gitignore_patterns(project_root)
-    all_globs = list(DEFAULT_IGNORE_GLOBS) + gitignore_globs + user_globs
     abs_root = os.path.abspath(project_root)
 
     def _rel(p: str) -> str:
@@ -1120,6 +1088,25 @@ def parse_codebase(
         except Exception:
             return p
 
+    # Load gitignore
+    gi_lines: List[str] = []
+    gi_path = os.path.join(project_root, ".gitignore")
+    if os.path.isfile(gi_path):
+        try:
+            with open(gi_path, "r", encoding="utf-8", errors="ignore") as f:
+                gi_lines = f.readlines()
+        except Exception:
+            pass
+
+    # Compile pathspec matcher
+    spec_lines = list(DEFAULT_IGNORE_GLOBS) + user_globs
+    for line in gi_lines:
+        ln = line.strip()
+        if ln and not ln.startswith("#"):
+            spec_lines.append(ln)
+
+    spec = pathspec.PathSpec.from_lines(GitWildMatchPattern, spec_lines)
+
     for root, dirs, files in os.walk(project_root, followlinks=follow_symlinks):
         # Prune ignored directories in-place to avoid descending into them.
         pruned: List[str] = []
@@ -1127,7 +1114,7 @@ def parse_codebase(
             if d in DEFAULT_IGNORE_DIRS:
                 continue
             rel_d = _rel(os.path.join(root, d))
-            if _matches_any(rel_d, all_globs):
+            if spec.match_file(rel_d + "/"):
                 continue
             pruned.append(d)
         dirs[:] = pruned
@@ -1139,7 +1126,7 @@ def parse_codebase(
                 continue
             filepath = os.path.join(root, fname)
             rel_fp = _rel(filepath)
-            if _matches_any(rel_fp, all_globs):
+            if spec.match_file(rel_fp):
                 continue
             try:
                 if not follow_symlinks and os.path.islink(filepath):

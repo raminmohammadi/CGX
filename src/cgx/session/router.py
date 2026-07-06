@@ -33,6 +33,7 @@ from cgx.session.models import (
     DecisionKind,
     Session,
     SessionMode,
+    SessionStatus,
     TaskKind,
     TaskNode,
     TaskNodeStatus,
@@ -52,10 +53,31 @@ class CreateTask:
 
 @dataclass
 class UpdateTaskStatus:
-    """Transition ``task_id`` to ``status``; optionally clear blockers."""
+    """Transition ``task_id`` to ``status``; optionally clear blockers.
+
+    ``error`` is recorded on the task when the transition is to
+    ``FAILED`` so the UI can surface why the node went red (e.g. a
+    REPAIR that could not produce a patch).
+    """
     task_id: str
     status: TaskNodeStatus
     clear_blockers: bool = False
+    error: Optional[str] = None
+
+
+@dataclass
+class UpdateSessionStatus:
+    """Transition a session to a terminal (or paused) lifecycle status.
+
+    Emitted by the router when a greenfield write loop reaches a
+    definitive end: ``COMPLETED`` when VERIFY passes, ``FAILED`` when
+    verification fails and no automated recovery (patch / regenerate /
+    install-deps) remains. Asking the user to hand-fix AI-generated
+    code is never a valid recovery, so exhaustion is terminal, not a
+    prompt.
+    """
+    session_id: str
+    status: SessionStatus
 
 
 @dataclass
@@ -84,8 +106,8 @@ class RecordLesson:
     scaffold_task_id: Optional[str] = None
 
 
-RouterAction = Union[CreateTask, UpdateTaskStatus, RecordDecision,
-                     AttachDecisionToTask, RecordLesson]
+RouterAction = Union[CreateTask, UpdateTaskStatus, UpdateSessionStatus,
+                     RecordDecision, AttachDecisionToTask, RecordLesson]
 
 
 @dataclass
@@ -470,13 +492,26 @@ _REPAIR_BUDGET = 2
 _REGENERATE_BUDGET = 1
 
 
-# Outcomes that REPAIR knows how to attempt a fix for. ``passed``,
-# ``skipped``, and ``no_tests_collected`` are terminal -- they're not
-# failures. ``pytest_missing`` is BOOTSTRAP_ENV's job, not REPAIR's.
+# Outcomes that REPAIR knows how to attempt a fix for. ``passed`` and
+# ``skipped`` are terminal -- they're not failures. ``pytest_missing``
+# is BOOTSTRAP_ENV's job, not REPAIR's. ``no_tests_collected`` is
+# repairable only when test files were actually selected but pytest
+# collected zero tests (malformed tests -- see
+# :func:`_verify_to_repair_or_terminal`); a genuinely test-free project
+# still terminates cleanly.
 _REPAIRABLE_VERIFY_OUTCOMES = frozenset({
     "assertions_failed",
     "collection_error",
+    "no_tests_collected",
 })
+
+
+# Terminal VERIFY outcomes that mean the greenfield write loop delivered
+# a working suite. Everything else that reaches a terminal VERIFY (with
+# no REPAIR spawned) is a definitive failure -- never a "success" and
+# never an ASK_USER prompt. ``skipped`` counts as success because it is
+# an explicit opt-out, not a broken suite.
+_VERIFY_SUCCESS_OUTCOMES = frozenset({"passed", "skipped"})
 
 
 def _verify_to_repair_or_terminal(parent: TaskNode) -> List[TaskNode]:
@@ -500,6 +535,14 @@ def _verify_to_repair_or_terminal(parent: TaskNode) -> List[TaskNode]:
     outputs = parent.outputs or {}
     outcome = str(outputs.get("outcome") or "").strip()
     if outcome not in _REPAIRABLE_VERIFY_OUTCOMES:
+        return []
+    # ``no_tests_collected`` (pytest exit 5) is only a failure when
+    # pytest actually selected test files but found zero test functions
+    # in them (malformed tests -- e.g. ``def test_*`` nested inside a
+    # fixture). When nothing was selected the project simply has no
+    # tests yet, which is a clean terminal state, not a repair trigger.
+    if (outcome == "no_tests_collected"
+            and int(outputs.get("tests_selected_count") or 0) <= 0):
         return []
     repair_attempt = int(parent.inputs.get("repair_attempt") or 0)
     if repair_attempt >= _REPAIR_BUDGET:
@@ -536,36 +579,24 @@ def _verify_to_repair_or_terminal(parent: TaskNode) -> List[TaskNode]:
 
 
 def _repair_to_apply_or_ask(parent: TaskNode) -> List[TaskNode]:
-    """Spawn APPLY when REPAIR produced diffs; otherwise ASK_USER.
+    """Spawn APPLY when REPAIR produced an applicable patch.
 
-    The empty-diff path fires when classification returned ``unknown``
-    or the locator could not pin the failure to a concrete span. The
-    user-facing ASK_USER carries the classification + rationale so the
-    operator can decide whether to edit the failing file by hand,
-    abandon the session, or post a fresh objective.
+    The empty-diff path (``can_apply`` False) is handled earlier in
+    :meth:`Router.on_task_completed` by
+    :func:`_repair_terminal_failure_actions`, which marks the session
+    terminally ``FAILED`` rather than asking the user to hand-fix
+    AI-generated code. This function therefore only ever spawns the
+    APPLY successor for an applicable patch; it returns an empty list
+    defensively if it is somehow reached with no patch.
     """
     outputs = parent.outputs or {}
     can_apply = bool(outputs.get("can_apply"))
-    classification = str(outputs.get("classification") or "unknown")
     signature = str(outputs.get("failure_signature") or "")
     attempt = int(outputs.get("repair_attempt")
                   or parent.inputs.get("repair_attempt") or 1)
     prior = list(parent.inputs.get("prior_failure_signatures") or [])
     if not can_apply:
-        return [TaskNode.new(
-            session_id=parent.session_id,
-            kind=TaskKind.ASK_USER,
-            name="Repair could not produce a patch",
-            description=("Automated repair did not yield a diff; review "
-                         "the rationale and decide how to proceed."),
-            parent_task_id=parent.task_id,
-            inputs={
-                "expected_kind": DecisionKind.FREEFORM.value,
-                "repair_artifact_id": parent.produced_artifact_id,
-                "classification": classification,
-                "prior_goal": parent.inputs.get("prior_goal"),
-            },
-        )]
+        return []
     return [TaskNode.new(
         session_id=parent.session_id,
         kind=TaskKind.APPLY,
@@ -583,6 +614,60 @@ def _repair_to_apply_or_ask(parent: TaskNode) -> List[TaskNode]:
                 prior if signature in prior else prior + [signature]),
         },
     )]
+
+
+def _repair_terminal_failure_actions(
+        completed: TaskNode) -> List[RouterAction]:
+    """Fail the session when REPAIR has no automated recovery left.
+
+    Reached from :meth:`Router.on_task_completed` only after the
+    install-deps and regenerate branches have both declined. A REPAIR
+    that produced no applicable patch (``can_apply`` False) means every
+    automated path -- patch, regenerate, dependency install -- is
+    exhausted. Asking the user to hand-edit AI-generated code is never a
+    valid recovery, so the loop terminates: the REPAIR node goes
+    ``FAILED`` (carrying the classification for the UI) and the whole
+    session flips to ``FAILED``. Returns an empty list when the patch is
+    applicable so the caller falls through to the APPLY successor.
+    """
+    outputs = completed.outputs or {}
+    if bool(outputs.get("can_apply")):
+        return []
+    classification = str(outputs.get("classification") or "unknown")
+    error = ("Automated repair could not produce a patch "
+             f"(classification={classification}); no regenerate or "
+             "dependency-install path remained.")
+    return [
+        UpdateTaskStatus(task_id=completed.task_id,
+                         status=TaskNodeStatus.FAILED, error=error),
+        UpdateSessionStatus(session_id=completed.session_id,
+                            status=SessionStatus.FAILED),
+    ]
+
+
+def _verify_terminal_session_actions(
+        completed: TaskNode) -> List[RouterAction]:
+    """Set the session's terminal status for a greenfield VERIFY.
+
+    Called only when a VERIFY finished without spawning a REPAIR
+    successor. In greenfield mode a passing (or skipped) suite means the
+    write loop delivered working code -> ``COMPLETED``; any other
+    terminal outcome (assertions still failing after the repair budget,
+    a flapping signature, a collection error with no fixable cause, or
+    no tests at all) is a definitive ``FAILED`` -- never a silent
+    "success". Explore-mode sessions keep their own lifecycle, so this
+    returns an empty list for them.
+    """
+    mode = str(completed.inputs.get("mode") or "").strip()
+    if mode != SessionMode.GREENFIELD.value:
+        return []
+    outputs = completed.outputs or {}
+    outcome = str(outputs.get("outcome") or "").strip()
+    status = (SessionStatus.COMPLETED
+              if outcome in _VERIFY_SUCCESS_OUTCOMES
+              else SessionStatus.FAILED)
+    return [UpdateSessionStatus(session_id=completed.session_id,
+                                status=status)]
 
 
 def _scaffold_to_apply(parent: TaskNode) -> List[TaskNode]:
@@ -676,20 +761,83 @@ class Router:
         and a SCAFFOLD ancestor exists within budget, the router walks
         the chain, marks the abandoned subtree, and re-queues a fresh
         SCAFFOLD instead of taking the patch path.
+
+        A REPAIR carrying ``outputs.strategy=='install_deps'`` (a
+        missing-dependency verdict from API_CHECK) is spliced the same
+        way: the router re-queues BOOTSTRAP_ENV so preflight installs
+        the absent package(s) and API_CHECK re-probes, rather than
+        regenerating code that references valid APIs.
+
+        A finished greenfield APPLY that dropped any invalid-syntax file
+        (``outputs.failed_count > 0``) is likewise spliced before the
+        table: proceeding with a missing module guarantees a collection
+        error, so the router re-scaffolds within budget (or ends the
+        session terminally ``FAILED`` when it cannot).
         """
         plan = RouterPlan()
         if completed.kind is TaskKind.REPAIR:
+            install_actions = _repair_install_deps_actions(completed)
+            if install_actions:
+                plan.actions.extend(install_actions)
+                return plan
             regen_actions = _repair_regenerate_actions(completed, tasks)
             if regen_actions:
                 plan.actions.extend(regen_actions)
+                return plan
+            fail_actions = _repair_terminal_failure_actions(completed)
+            if fail_actions:
+                plan.actions.extend(fail_actions)
+                return plan
+        if completed.kind is TaskKind.APPLY:
+            dropped_actions = _apply_failed_files_actions(completed, tasks)
+            if dropped_actions:
+                plan.actions.extend(dropped_actions)
                 return plan
         if completed.kind is TaskKind.VERIFY:
             plan.actions.extend(_verify_lesson_actions(completed, tasks))
         spawn = TASK_SUCCESSOR.get(completed.kind)
         if spawn is None:
             return plan
-        for child in spawn(completed):
+        children = spawn(completed)
+        for child in children:
             plan.actions.append(CreateTask(child))
+        if completed.kind is TaskKind.VERIFY and not children:
+            plan.actions.extend(
+                _verify_terminal_session_actions(completed))
+        return plan
+
+    @traced("router")
+    def on_task_failed(self, *, session: Session,
+                       failed: TaskNode,
+                       tasks: List[TaskNode]) -> RouterPlan:
+        """Transition a session to terminal ``FAILED`` on a hard failure.
+
+        A *hard* failure is an executor that returned
+        ``ExecutorResult.failure`` or crashed: it never produced
+        ``outputs``, so the ``outputs``-keyed successor table cannot
+        run and :meth:`on_task_completed` is never reached. Without an
+        explicit terminal transition the greenfield session would hang
+        in ``active`` with a dead FAILED leaf and no successor (e.g. a
+        BOOTSTRAP_ENV whose ``pip install`` failed). Greenfield write
+        loops must always reach a terminal status, so any unrecoverable
+        hard failure ends the session ``FAILED`` -- asking the user to
+        hand-fix AI-generated code is never a valid recovery.
+
+        Explore-mode sessions keep their user-driven lifecycle (the
+        caller may post a follow-up objective), so this returns an empty
+        plan for them, and it is a no-op if the session is already in a
+        terminal status.
+        """
+        plan = RouterPlan()
+        if session.mode is not SessionMode.GREENFIELD:
+            return plan
+        if session.status in (SessionStatus.COMPLETED,
+                              SessionStatus.FAILED,
+                              SessionStatus.ABANDONED):
+            return plan
+        plan.actions.append(UpdateSessionStatus(
+            session_id=session.session_id,
+            status=SessionStatus.FAILED))
         return plan
 
     @traced("router")
@@ -720,6 +868,54 @@ class Router:
 
 
 # --------------------- helpers ---------------------
+
+def _repair_install_deps_actions(
+        completed: TaskNode) -> List[RouterAction]:
+    """Return the router actions that execute an install-deps verdict.
+
+    An ``install_deps`` verdict (set by the REPAIR executor for an
+    API_CHECK ``missing_dependency`` failure) tells the router to
+    re-provision the environment rather than rewrite code: it re-queues
+    a BOOTSTRAP_ENV whose preflight installs the absent third-party
+    imports and syncs requirements.txt. BOOTSTRAP_ENV's own successor
+    (:func:`_bootstrap_to_api_check`) then re-probes the same symbols,
+    so a successful install flows straight back into SMOKE/VERIFY while
+    the shared ``repair_attempt`` + ``prior_failure_signatures`` budget
+    on API_CHECK prevents an install loop. Returns an empty list for
+    any other strategy so the dispatcher falls through to the regenerate
+    / patch / ASK_USER paths.
+    """
+    outputs = completed.outputs or {}
+    strategy = str(outputs.get("strategy") or "").strip()
+    if strategy != "install_deps":
+        return []
+    inputs = completed.inputs or {}
+    repair_attempt = int(outputs.get("repair_attempt")
+                         or inputs.get("repair_attempt") or 1)
+    prior = list(inputs.get("prior_failure_signatures") or [])
+    missing = [str(m) for m in outputs.get("missing_modules") or []]
+    boot = TaskNode.new(
+        session_id=completed.session_id,
+        kind=TaskKind.BOOTSTRAP_ENV,
+        name="Install missing dependencies",
+        description=("Re-provision the project venv to install the "
+                     "third-party package(s) the applied files import "
+                     "but that are absent from the environment, then "
+                     "re-probe via API_CHECK."),
+        parent_task_id=completed.task_id,
+        inputs={
+            "apply_artifact_id": inputs.get("apply_artifact_id"),
+            "plan_artifact_id": inputs.get("plan_artifact_id"),
+            "scaffold_artifact_id": inputs.get("scaffold_artifact_id"),
+            "prior_goal": inputs.get("prior_goal"),
+            "mode": inputs.get("mode") or SessionMode.GREENFIELD.value,
+            "missing_modules": missing,
+            "repair_attempt": repair_attempt,
+            "prior_failure_signatures": prior,
+        },
+    )
+    return [CreateTask(boot)]
+
 
 def _repair_regenerate_actions(completed: TaskNode,
                                tasks: List[TaskNode]) -> List[RouterAction]:
@@ -762,6 +958,97 @@ def _repair_regenerate_actions(completed: TaskNode,
     new_scaffold = propose_regenerate(scaffold, extra_constraints)
     actions.append(CreateTask(new_scaffold))
     return actions
+
+
+def _apply_failed_files_actions(completed: TaskNode,
+                                tasks: List[TaskNode]) -> List[RouterAction]:
+    """Regenerate (or terminally fail) a greenfield APPLY that dropped files.
+
+    The APPLY executor refuses to write a file whose source does not
+    parse as valid Python, recording it under ``failed_files`` and
+    surfacing a non-zero ``failed_count`` while still applying the rest.
+    Continuing to BOOTSTRAP_ENV / VERIFY with a core module silently
+    missing guarantees a downstream collection error, so any greenfield
+    APPLY that dropped a file re-scaffolds within
+    :data:`_REGENERATE_BUDGET` instead of limping forward. When no
+    SCAFFOLD ancestor exists or the regenerate budget is spent the
+    session ends terminally ``FAILED`` -- never proceeds on a
+    known-broken tree, and never asks the user to hand-fix generated
+    code. Returns an empty list for explore mode or a clean apply so the
+    dispatcher takes the normal APPLY -> VERIFY edge.
+    """
+    from cgx.session.repair.propose import propose_regenerate  # dep direction
+
+    outputs = completed.outputs or {}
+    mode = str(completed.inputs.get("mode") or "").strip()
+    if mode != SessionMode.GREENFIELD.value:
+        return []
+    failed_count = int(outputs.get("failed_count") or 0)
+    if failed_count <= 0:
+        return []
+    scaffold = _find_scaffold_ancestor(completed, tasks)
+    if scaffold is not None:
+        prior_regens = int(scaffold.inputs.get("regenerate_attempt") or 0)
+        if prior_regens < _REGENERATE_BUDGET:
+            constraint = _invalid_scaffold_constraint(
+                failed_count,
+                apply_failed=outputs.get("failed_files"),
+                scaffold_failed=(scaffold.outputs or {}).get("failed"))
+            actions: List[RouterAction] = []
+            skip_states = {TaskNodeStatus.DONE, TaskNodeStatus.FAILED,
+                           TaskNodeStatus.ABANDONED}
+            for t in _collect_descendants(scaffold.task_id, tasks):
+                if t.status in skip_states:
+                    continue
+                actions.append(UpdateTaskStatus(
+                    task_id=t.task_id, status=TaskNodeStatus.ABANDONED))
+            actions.append(CreateTask(propose_regenerate(scaffold, constraint)))
+            return actions
+    return [UpdateSessionStatus(
+        session_id=completed.session_id, status=SessionStatus.FAILED)]
+
+
+def _invalid_scaffold_constraint(
+        failed_count: int,
+        *, apply_failed: object,
+        scaffold_failed: object) -> Dict[str, object]:
+    """Build the ``invalid_scaffold_syntax`` regenerate constraint.
+
+    Enumerates each dropped file with its concrete error so the next
+    SCAFFOLD gets actionable feedback rather than a bare count. Draws
+    from two sources, both shaped ``{"file", "error"}``: the SCAFFOLD's
+    own ``failed`` generations (e.g. an empty patch for a missing
+    entrypoint) and APPLY's ``failed_files`` (files whose source did not
+    parse and were skipped before write). De-duplicated by path and
+    capped so the constraint stays prompt-sized.
+    """
+    seen: set = set()
+    details: List[str] = []
+    for entry in (list(scaffold_failed or []) + list(apply_failed or [])):
+        if not isinstance(entry, dict):
+            continue
+        path = str(entry.get("file") or "").strip()
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        err = str(entry.get("error") or "").strip()
+        details.append(f"{path} ({err})" if err else path)
+        if len(details) >= 12:
+            break
+    files_blurb = "; ".join(details) if details else f"{failed_count} file(s)"
+    rationale = (
+        "The previous attempt was abandoned because these generated files "
+        f"were invalid and dropped before write: {files_blurb}. Regenerate "
+        "the whole tree so every file parses as valid Python: keep decorated "
+        "defs indented inside their class/function body, use consistent "
+        "indentation and complete statements, avoid stray or trailing "
+        "commas, define every referenced module and symbol, and import only "
+        "modules that exist in this project or its declared dependencies.")
+    return {
+        "kind": "invalid_scaffold_syntax",
+        "rationale": rationale,
+        "failed_files": details,
+    }
 
 
 def _verify_lesson_actions(completed: TaskNode,

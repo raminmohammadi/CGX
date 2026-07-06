@@ -23,6 +23,7 @@ import math
 import os
 import re
 import logging
+import threading
 
 from cgx.retrieval.tokenize import tokenize_text
 
@@ -158,6 +159,7 @@ class LexicalIndex:
 # previously cached index even if the records.jsonl file path is reused.
 _LEX_CACHE: "Dict[Tuple[str, int, int, int], LexicalIndex]" = {}
 _LEX_CACHE_MAX = 4
+_LEX_LOCK = threading.Lock()
 
 
 def _records_schema_version(records: List[Dict]) -> int:
@@ -189,15 +191,17 @@ def get_cached_lexical_index(records_path: str, records: List[Dict]) -> LexicalI
     sv = _records_schema_version(records)
     key = _cache_key(records_path, sv) if records_path else None
     if key is not None:
-        idx = _LEX_CACHE.get(key)
-        if idx is not None:
-            return idx
+        with _LEX_LOCK:
+            idx = _LEX_CACHE.get(key)
+            if idx is not None:
+                return idx
     idx = LexicalIndex.from_records(records)
     if key is not None:
-        if len(_LEX_CACHE) >= _LEX_CACHE_MAX:
-            try:
-                _LEX_CACHE.pop(next(iter(_LEX_CACHE)))
-            except StopIteration:
-                pass
-        _LEX_CACHE[key] = idx
+        with _LEX_LOCK:
+            if len(_LEX_CACHE) >= _LEX_CACHE_MAX:
+                try:
+                    _LEX_CACHE.pop(next(iter(_LEX_CACHE)))
+                except StopIteration:
+                    pass
+            _LEX_CACHE[key] = idx
     return idx

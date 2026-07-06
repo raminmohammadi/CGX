@@ -25,6 +25,7 @@ from __future__ import annotations
 import ast
 import json
 import logging
+import re
 import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -81,7 +82,20 @@ def run_api_check(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             outcome = "passed" if all(r["ok"] for r in rows) else "failed"
 
     rows = _attach_references(rows, references)
+    for r in rows:
+        if not r.get("ok"):
+            r["category"] = _row_category(r)
     failed = [r for r in rows if not r["ok"]]
+    # A top-level package that is simply absent from the venv is a
+    # bootstrap/install problem, not a hallucinated API. Split those out
+    # so REPAIR can install the package instead of regenerating code that
+    # references a perfectly valid symbol.
+    missing_dep_rows = [r for r in failed
+                        if r.get("category") == "missing_dependency"]
+    hallucinated = [r for r in failed
+                    if r.get("category") != "missing_dependency"]
+    missing_modules = sorted({_missing_module_name(r)
+                              for r in missing_dep_rows})
     signature = _signature(failed) if outcome == "failed" else ""
     content: Dict[str, Any] = {
         "build_artifact_id": task.inputs.get("build_artifact_id"),
@@ -94,6 +108,9 @@ def run_api_check(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         "outcome": outcome,
         "failed_references": [{"module": r["module"], "name": r["name"]}
                               for r in failed],
+        "missing_modules": missing_modules,
+        "hallucinated_references": [{"module": r["module"], "name": r["name"]}
+                                    for r in hallucinated],
         "failure_signature": signature,
         "probe_error": probe_error,
     }
@@ -109,6 +126,8 @@ def run_api_check(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             "outcome": outcome,
             "failed_count": len(failed),
             "checked_count": len(rows),
+            "missing_module_count": len(missing_modules),
+            "hallucinated_count": len(hallucinated),
             "failure_signature": signature,
         },
         artifact=artifact,
@@ -277,6 +296,35 @@ def _attach_references(rows: List[Dict[str, Any]],
         copy["references"] = references.get(key, [])
         out.append(copy)
     return out
+
+
+_NO_MODULE_RE = re.compile(r"No module named '([^']+)'")
+
+
+def _row_category(row: Dict[str, Any]) -> str:
+    """Classify a failed probe row as missing-dependency vs hallucination.
+
+    ``missing_dependency`` when a whole top-level package is absent from
+    the venv -- i.e. a ``ModuleNotFoundError`` for a *dotless* module
+    name (``No module named 'flask'``). That is a bootstrap/install
+    problem: the referenced symbol may be perfectly valid. Everything
+    else -- an ``AttributeError`` on an installed module, or a missing
+    *submodule* of an installed package (``No module named 'flask.foo'``)
+    -- is a genuine ``api_check_failure`` (hallucinated API).
+    """
+    err = str(row.get("error") or "")
+    m = _NO_MODULE_RE.search(err)
+    if m and "." not in m.group(1):
+        return "missing_dependency"
+    return "api_check_failure"
+
+
+def _missing_module_name(row: Dict[str, Any]) -> str:
+    """Return the absent top-level package name for a missing-dep row."""
+    m = _NO_MODULE_RE.search(str(row.get("error") or ""))
+    if m:
+        return m.group(1).split(".")[0]
+    return str(row.get("module") or "").split(".")[0]
 
 
 def _signature(failed: List[Dict[str, Any]]) -> str:

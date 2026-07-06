@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from cgx.session.repair.pypi_client import PyPIClient
 
@@ -149,22 +149,107 @@ def _content_to_new_file_patch(path: str, content: str) -> str:
     return header + (body if body else "+")
 
 
+def _first_party_names(paths: List[str]) -> Set[str]:
+    """Derive first-party module names from generated scaffold paths.
+
+    A top-level directory (``backend/`` -> ``backend``) and every Python
+    module basename (``backend/auth.py`` -> ``auth``) are treated as
+    first-party. The ``tests`` tree is excluded so a bona-fide test
+    dependency is never mistaken for a project module. Names are
+    normalised so they compare directly against ``requirements.txt``
+    pins.
+    """
+    out: Set[str] = set()
+    for p in paths:
+        s = (p or "").strip().replace("\\", "/")
+        parts = [x for x in s.split("/") if x]
+        if not parts:
+            continue
+        top = parts[0]
+        if top and top.lower() not in ("tests", "test"):
+            out.add(_normalise_name(top))
+        if s.endswith(".py"):
+            base = parts[-1][:-3]
+            if base and base != "__init__":
+                out.add(_normalise_name(base))
+    return out
+
+
+def _sanitize_requirements_lines(
+        lines: List[str],
+        first_party: Set[str],
+) -> Tuple[List[str], List[Dict[str, Any]]]:
+    """Drop stdlib/first-party pins and remap import-name aliases.
+
+    A ``requirements.txt`` that pins a stdlib module (``sqlite3``), a
+    first-party project module (``auth``), or an import name whose PyPI
+    distribution differs (``jwt`` -> ``PyJWT``) either aborts
+    ``pip install -r`` outright or silently installs the wrong
+    distribution (so ``import jwt`` succeeds but ``jwt.encode`` is
+    missing). This pass rewrites those lines before APPLY persists the
+    file. Returns ``(new_lines, actions)`` where each action is a
+    ``{action, name, before, after, source}`` record.
+    """
+    # Lazy import: keeps the module-import graph flat and avoids paying
+    # for env_manager at scaffold-validate import time.
+    from cgx.codegen.env_manager import _IMPORT_TO_PYPI, _STDLIB_TOP
+
+    out: List[str] = []
+    actions: List[Dict[str, Any]] = []
+    for raw in lines:
+        parsed = _parse_pin_line(raw)
+        if not parsed:
+            out.append(raw)
+            continue
+        name, _spec, key = parsed
+        ending = "\n" if raw.endswith("\n") else ""
+        if name.lower().replace("-", "_") in _STDLIB_TOP:
+            actions.append({"action": "drop_stdlib", "name": name,
+                            "before": raw.strip(), "after": None,
+                            "source": "sanitizer"})
+            continue
+        if key in first_party:
+            actions.append({"action": "drop_first_party", "name": name,
+                            "before": raw.strip(), "after": None,
+                            "source": "sanitizer"})
+            continue
+        alias = _IMPORT_TO_PYPI.get(name) or _IMPORT_TO_PYPI.get(name.lower())
+        if alias and _normalise_name(alias) != key:
+            # Drop the (wrong-package) version spec: a pin valid for the
+            # shadowing distribution is unlikely to resolve for the real
+            # one, so let pip pick a compatible release.
+            out.append(alias + ending)
+            actions.append({"action": "remap", "name": name,
+                            "before": raw.strip(), "after": alias,
+                            "source": "sanitizer"})
+            continue
+        out.append(raw)
+    return out, actions
+
+
 def validate_requirements_text(
         text: str, *,
         pypi_client: PyPIClient,
+        first_party: Optional[Set[str]] = None,
 ) -> Tuple[str, List[Dict[str, Any]]]:
-    """Tighten fragile peer pins in a ``requirements.txt`` body.
+    """Sanitize a ``requirements.txt`` body and tighten fragile peers.
 
-    Returns ``(new_text, adjustments)`` where ``adjustments`` is a list
-    of ``{consumer, consumer_version, peer, before, after, source}``
-    records describing each rewrite. When no consumer in
-    :data:`FRAGILE_PEERS` is pinned exactly, or PyPI lookups fail, the
-    returned ``new_text`` is identical to ``text`` and ``adjustments``
-    is empty.
+    First strips stdlib/first-party pins and remaps import-name aliases
+    (see :func:`_sanitize_requirements_lines`), then tightens fragile
+    peer pins against PyPI ``requires_dist``. Returns
+    ``(new_text, adjustments)``; ``adjustments`` records every sanitizer
+    action and peer rewrite. When nothing changed (and PyPI lookups
+    fail or find nothing to tighten) the returned ``new_text`` is
+    identical to ``text`` and ``adjustments`` is empty.
     """
     if not text:
         return text, []
     lines: List[str] = text.splitlines(keepends=True)
+
+    adjustments: List[Dict[str, Any]] = []
+    lines, san_actions = _sanitize_requirements_lines(
+        lines, first_party or set())
+    adjustments.extend(san_actions)
 
     def _index() -> Dict[str, Tuple[str, str]]:
         out: Dict[str, Tuple[str, str]] = {}
@@ -176,7 +261,6 @@ def validate_requirements_text(
             out.setdefault(key, (raw.rstrip("\n"), spec))
         return out
 
-    adjustments: List[Dict[str, Any]] = []
     pins = _index()
     for consumer_key, peers in FRAGILE_PEERS.items():
         consumer_pin = pins.get(consumer_key)
@@ -236,6 +320,11 @@ def validate_scaffold_diffs(
     new_diffs = list(diffs)
     new_contents = dict(file_contents)
     all_adjustments: List[Dict[str, Any]] = []
+    # First-party module names are drawn from every generated path so the
+    # sanitizer can strip a project module that leaked into requirements.
+    first_party = _first_party_names(
+        list(new_contents.keys())
+        + [str(e.get("file") or "") for e in new_diffs])
     for idx, entry in enumerate(new_diffs):
         path = str(entry.get("file") or "").strip()
         if not path or not is_requirements_path(path):
@@ -244,7 +333,7 @@ def validate_scaffold_diffs(
         if not isinstance(original, str) or not original:
             continue
         rewritten, adjustments = validate_requirements_text(
-            original, pypi_client=pypi_client)
+            original, pypi_client=pypi_client, first_party=first_party)
         if not adjustments or rewritten == original:
             continue
         new_diffs[idx] = {

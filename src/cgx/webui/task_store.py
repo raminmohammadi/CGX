@@ -29,7 +29,14 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 _DB_PATH = Path.home() / ".cgx" / "tasks.db"
-_lock = threading.Lock()
+# Reentrant: the write helpers (create_task, finish_task, append_event,
+# cancel_task) acquire _lock and then call _get_conn(), which re-acquires
+# _lock to serialise first-time schema init. A plain Lock self-deadlocks
+# whenever a write is the very first DB op in a process (the live server
+# masks it because its first op is a lock-free read); an RLock lets the
+# owning thread recurse while still serialising across threads.
+_lock = threading.RLock()
+_local = threading.local()
 _conn: Optional[sqlite3.Connection] = None
 
 # In-memory cancel events -- not persisted, intentionally reset on server
@@ -44,13 +51,25 @@ _cancel_events: Dict[str, threading.Event] = {}
 def _get_conn() -> sqlite3.Connection:
     global _conn
     if _conn is None:
+        if hasattr(_local, "conn"):
+            try:
+                _local.conn.close()
+            except Exception:
+                pass
+            delattr(_local, "conn")
+
+    conn = getattr(_local, "conn", None)
+    if conn is None:
         _DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _conn = sqlite3.connect(str(_DB_PATH), check_same_thread=False)
-        _conn.execute("PRAGMA journal_mode=WAL")
-        _conn.execute("PRAGMA synchronous=NORMAL")
-        _init_schema(_conn)
-        logger.info("task_store: opened %s", _DB_PATH)
-    return _conn
+        conn = sqlite3.connect(str(_DB_PATH), timeout=30.0)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        with _lock:
+            _init_schema(conn)
+        _local.conn = conn
+        _conn = conn
+        logger.info("task_store: opened thread-local connection %s", _DB_PATH)
+    return conn
 
 
 def _init_schema(conn: sqlite3.Connection) -> None:
@@ -156,13 +175,12 @@ def append_event(task_id: str, event_type: str, payload: Any) -> None:
 
 
 def get_task(task_id: str) -> Optional[Dict[str, Any]]:
-    with _lock:
-        conn = _get_conn()
-        row = conn.execute(
-            "SELECT id, type, status, created_at, started_at, ended_at, error "
-            "FROM tasks WHERE id=?",
-            (task_id,),
-        ).fetchone()
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT id, type, status, created_at, started_at, ended_at, error "
+        "FROM tasks WHERE id=?",
+        (task_id,),
+    ).fetchone()
     if row is None:
         return None
     cols = ("id", "type", "status", "created_at", "started_at", "ended_at", "error")
@@ -171,13 +189,12 @@ def get_task(task_id: str) -> Optional[Dict[str, Any]]:
 
 def get_task_events(task_id: str) -> List[Dict[str, Any]]:
     """Return all recorded events for a task (for frontend replay)."""
-    with _lock:
-        conn = _get_conn()
-        rows = conn.execute(
-            "SELECT event_type, payload_json, at FROM task_events "
-            "WHERE task_id=? ORDER BY rowid",
-            (task_id,),
-        ).fetchall()
+    conn = _get_conn()
+    rows = conn.execute(
+        "SELECT event_type, payload_json, at FROM task_events "
+        "WHERE task_id=? ORDER BY rowid",
+        (task_id,),
+    ).fetchall()
     out = []
     for ev_type, payload_json, at in rows:
         try:
@@ -190,13 +207,12 @@ def get_task_events(task_id: str) -> List[Dict[str, Any]]:
 
 def list_tasks(limit: int = 50) -> List[Dict[str, Any]]:
     """Most-recent tasks first."""
-    with _lock:
-        conn = _get_conn()
-        rows = conn.execute(
-            "SELECT id, type, status, created_at, ended_at, error "
-            "FROM tasks ORDER BY created_at DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
+    conn = _get_conn()
+    rows = conn.execute(
+        "SELECT id, type, status, created_at, ended_at, error "
+        "FROM tasks ORDER BY created_at DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
     cols = ("id", "type", "status", "created_at", "ended_at", "error")
     return [dict(zip(cols, r)) for r in rows]
 

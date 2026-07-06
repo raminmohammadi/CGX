@@ -25,8 +25,8 @@ from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-_MAX_SYMBOLS_PER_FILE = 20
-_MAX_FILES_IN_MAP = 60
+_MAX_SYMBOLS_PER_FILE = 10
+_MAX_FILES_IN_MAP = 25
 
 
 def _normalise_path(raw_path: str) -> str:
@@ -76,10 +76,24 @@ def build_symbol_map(records_path: str) -> Dict[str, List[str]]:
     return file_symbols
 
 
+def _path_proximity(path1: str, path2: str) -> int:
+    """Return the length of the common prefix directory of path1 and path2."""
+    p1 = path1.replace("\\", "/").split("/")
+    p2 = path2.replace("\\", "/").split("/")
+    common = 0
+    for c1, c2 in zip(p1, p2):
+        if c1 == c2:
+            common += 1
+        else:
+            break
+    return common
+
+
 def format_symbol_map(
     symbol_map: Dict[str, List[str]],
     *,
     max_files: int = _MAX_FILES_IN_MAP,
+    target_file: Optional[str] = None,
 ) -> str:
     """Return a compact prompt block listing available symbols.
 
@@ -94,11 +108,18 @@ def format_symbol_map(
     """
     if not symbol_map:
         return ""
+
+    # Sort files by proximity to the target file if provided
+    items = list(symbol_map.items())
+    if target_file:
+        target_norm = _normalise_path(target_file)
+        items.sort(key=lambda kv: _path_proximity(kv[0], target_norm), reverse=True)
+
     lines = ["# AVAILABLE CONTEXT (Do not redefine these):"]
     count = 0
-    for fp, syms in symbol_map.items():
+    for fp, syms in items:
         if count >= max_files:
-            remaining = len(symbol_map) - max_files
+            remaining = len(items) - max_files
             lines.append(f"  … and {remaining} more file(s) not shown")
             break
         visible = syms[:_MAX_SYMBOLS_PER_FILE]
@@ -146,7 +167,7 @@ def fetch_symbol_source(records_path: str, symbol_name: str) -> Optional[str]:
     return None
 
 
-def build_symbol_context_prompt(records_path: Optional[str]) -> str:
+def build_symbol_context_prompt(records_path: Optional[str], target_file: Optional[str] = None) -> str:
     """Convenience wrapper: build the map and return the formatted prompt block.
 
     Returns an empty string when ``records_path`` is ``None`` or the file
@@ -158,4 +179,4 @@ def build_symbol_context_prompt(records_path: Optional[str]) -> str:
     sym_map = build_symbol_map(records_path)
     if not sym_map:
         return ""
-    return format_symbol_map(sym_map)
+    return format_symbol_map(sym_map, target_file=target_file)

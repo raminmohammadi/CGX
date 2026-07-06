@@ -55,6 +55,30 @@ def test_howto_without_symbol():
     assert detect_intent("how do i run tests?") == "howto"
 
 
+# Regression for the FAISS optimization run (57ed9a94): a recommendation /
+# optimization goal anchored on a symbol carried a symbol token but no
+# explain-verb, so it fell through to the symbol_explain fallback and
+# DESCRIBED build_faiss_index instead of RECOMMENDING parameters. Such
+# goals must route to change_plan so the engine emits actionable advice.
+def test_optimization_recommendation_routes_to_change_plan():
+    assert detect_intent(
+        "best FAISS parameters for build_faiss_index") == "change_plan"
+    assert detect_intent(
+        "how to optimize build_faiss_index") == "change_plan"
+    assert detect_intent(
+        "recommend optimal nlist and nprobe for the index") == "change_plan"
+    assert detect_intent("speed up the retriever") == "change_plan"
+    assert detect_intent("which parameters improve recall?") == "change_plan"
+
+
+# The optimization branch must not steal explicit symbol-explain requests:
+# an "explain"/"what does" verb still wins even when the symbol name or
+# question mentions optimization.
+def test_optimization_branch_yields_to_explicit_symbol_explain():
+    assert detect_intent("explain optimize_index") == "symbol_explain"
+    assert detect_intent("what does tune_params do?") == "symbol_explain"
+
+
 def test_symbol_location():
     assert detect_intent("where is parse_codebase defined?") == "symbol_location"
 

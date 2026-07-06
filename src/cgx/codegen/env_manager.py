@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import re
 import subprocess
 import sys
@@ -47,6 +48,7 @@ _IMPORT_TO_PYPI: Dict[str, str] = {
     "sklearn": "scikit-learn",
     "skimage": "scikit-image",
     "bs4": "beautifulsoup4",
+    "jwt": "PyJWT",
     "yaml": "PyYAML",
     "Crypto": "pycryptodome",
     "magic": "python-magic",
@@ -203,14 +205,26 @@ def _read_package_json(project_root: str) -> Set[str]:
     return names
 
 
+# Directories that never hold first-party source; pruned from the
+# nested-module scan so the walk stays bounded (``.venv`` is usually the
+# largest tree by far).
+_LOCAL_SCAN_EXCLUDES = frozenset({
+    ".venv", "venv", "env", ".git", ".cgx", "__pycache__",
+    "node_modules", ".mypy_cache", ".pytest_cache", ".tox",
+    "build", "dist", ".eggs",
+})
+
+
 def _is_local_package(name: str, project_root: str) -> bool:
     """Return True when ``name`` matches a first-party file or directory.
 
-    Covers both flat layouts (``<root>/<name>/`` or ``<root>/<name>.py``)
-    and src-layouts (``<root>/src/<name>/`` or ``<root>/src/<name>.py``),
-    including namespace packages without an ``__init__.py``. Used to
-    avoid mistaking the project's own top-level folder (e.g. ``backend``)
-    for a missing PyPI distribution.
+    Covers flat layouts (``<root>/<name>/`` or ``<root>/<name>.py``),
+    src-layouts (``<root>/src/<name>/`` or ``<root>/src/<name>.py``), and
+    modules nested under an arbitrary package directory (e.g.
+    ``<root>/backend/main.py`` for a bare ``import main``), including
+    namespace packages without an ``__init__.py``. Used to avoid
+    mistaking the project's own modules for a missing PyPI distribution
+    and attempting to ``pip install`` them.
     """
     root = Path(project_root)
     candidates = (
@@ -222,24 +236,94 @@ def _is_local_package(name: str, project_root: str) -> bool:
     for c in candidates:
         if c.is_dir() or c.is_file():
             return True
+    # Nested layouts: walk the source tree for a matching module basename,
+    # pruning virtualenvs / VCS / cache dirs (and any hidden dir) so the
+    # traversal stays cheap.
+    module_file = f"{name}.py"
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames
+                       if d not in _LOCAL_SCAN_EXCLUDES
+                       and not d.startswith(".")]
+        if module_file in filenames or name in dirnames:
+            return True
     return False
+
+
+def _probe_importable(
+    names: List[str],
+    python: Optional[str] = None,
+) -> Set[str]:
+    """Return the subset of top-level import ``names`` that resolve.
+
+    The check runs in the *target* interpreter (the project venv) via a
+    subprocess whenever ``python`` differs from the running one, so a
+    package that only happens to be installed in the CGX server process
+    (e.g. ``uvicorn``) is not mistaken for a satisfied project
+    dependency. Falls back to an in-process ``__import__`` probe when no
+    distinct interpreter is given -- unit tests stub this function
+    directly for determinism.
+    """
+    ordered = list(dict.fromkeys(n for n in names if n))
+    if not ordered:
+        return set()
+    if python and python != sys.executable:
+        script = (
+            "import importlib.util, json, sys\n"
+            "names = json.loads(sys.stdin.read())\n"
+            "ok = []\n"
+            "for n in names:\n"
+            "    try:\n"
+            "        if importlib.util.find_spec(n) is not None:\n"
+            "            ok.append(n)\n"
+            "    except Exception:\n"
+            "        pass\n"
+            "print(json.dumps(ok))\n"
+        )
+        try:
+            proc = subprocess.run(
+                [python, "-c", script], input=json.dumps(ordered),
+                capture_output=True, text=True, timeout=30,
+            )
+            if proc.returncode == 0:
+                return set(json.loads(proc.stdout or "[]"))
+            logger.warning(
+                "env_manager: import probe exited rc=%d: %s",
+                proc.returncode, (proc.stderr or "")[:200])
+        except Exception as exc:
+            logger.warning(
+                "env_manager: import probe subprocess raised %s", exc)
+        # Fall through to the in-process probe on any subprocess failure.
+    out: Set[str] = set()
+    for n in ordered:
+        try:
+            __import__(n)
+            out.add(n)
+        except ImportError:
+            continue
+        except Exception:
+            # Side-effectful import: assume present rather than reinstall.
+            out.add(n)
+    return out
 
 
 def find_missing_python_packages(
     imports: Set[str],
     project_root: str,
+    python: Optional[str] = None,
 ) -> List[str]:
-    """Return Python package names that are imported but not declared.
+    """Return PyPI names imported by the code but absent from the venv.
 
-    Filters out stdlib modules, packages already declared in
-    ``requirements.txt``, first-party project directories, and packages
-    that are already importable in the current environment so we don't
-    re-install them. Import names that differ from their PyPI
+    A package is reported missing when it is imported by the scaffold
+    but not importable under ``python`` (the project venv).
+    Importability -- not mere declaration in ``requirements.txt`` -- is
+    authoritative: a package declared with a version that failed to
+    install (e.g. a malformed or unresolvable pin that aborted
+    ``pip install -r``) is still reported so the caller can install it.
+    Stdlib modules, first-party project packages, and bare namespace
+    roots are filtered out, and import names that differ from their PyPI
     distribution name (``google.generativeai`` → ``google-generativeai``,
-    ``PIL`` → ``Pillow``, …) are translated via :data:`_IMPORT_TO_PYPI`
-    before being reported as missing.
+    ``PIL`` → ``Pillow``, …) are translated via :data:`_IMPORT_TO_PYPI`.
     """
-    declared = _read_requirements(project_root)
     # Drop bare namespace roots when a dotted variant is also present:
     # ``import google.generativeai`` records both ``google`` and
     # ``google.generativeai`` and we only want to install the latter.
@@ -248,8 +332,9 @@ def find_missing_python_packages(
         n for n in imports
         if not (n in _NAMESPACE_ROOTS and n in dotted_roots)
     }
-    missing: List[str] = []
-    seen_pypi: Set[str] = set()
+    # Resolve each surviving import to its PyPI distribution name,
+    # dropping stdlib and first-party packages up front.
+    candidates: List[Tuple[str, str]] = []
     for name in sorted(pruned):
         root = name.split(".")[0]
         # stdlib check operates on the root regardless of dotted form.
@@ -265,22 +350,19 @@ def find_missing_python_packages(
             continue
         else:
             pypi_name = name
-        normalized = pypi_name.lower().replace("-", "_")
-        if normalized in declared:
-            continue
         # Skip first-party project packages -- the project's own top-level
         # folder is not a PyPI distribution and pip cannot install it.
         # Only meaningful for bare root names.
         if "." not in name and _is_local_package(name, project_root):
             continue
-        # Check if already importable (covers editable installs, etc.)
-        try:
-            __import__(name)
-            continue
-        except ImportError:
-            pass
-        except Exception:
-            # Some packages have side effects on import; skip the probe.
+        candidates.append((name, pypi_name))
+    # Probe importability in the target venv in a single batch so a
+    # package present only in the server process isn't skipped.
+    importable = _probe_importable([n for n, _ in candidates], python)
+    missing: List[str] = []
+    seen_pypi: Set[str] = set()
+    for name, pypi_name in candidates:
+        if name in importable:
             continue
         if pypi_name in seen_pypi:
             continue
@@ -360,7 +442,7 @@ def preflight_install(
     whether to update requirements.txt after tests pass.
     """
     imports = scan_imports(generated_files)
-    missing = find_missing_python_packages(imports, project_root)
+    missing = find_missing_python_packages(imports, project_root, python=python)
     if not missing:
         return [], {}
     logger.info(

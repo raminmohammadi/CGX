@@ -102,7 +102,7 @@ Task kinds (`TaskKind`):
 | `API_CHECK`             | After `BOOTSTRAP_ENV`, statically walks every applied file and resolves every `from <third_party> import <name>` and aliased `pkg.attr` access under the bootstrapped venv via `importlib` + `inspect.getmembers`. Unresolved references surface as a structured `API_CHECK_REPORT` (`outcome ∈ {passed, failed, skipped}`, `unresolved: [{file, line, module, name}]`, `failure_signature`). A clean run chains to `SMOKE`; `failed` routes to `REPAIR` carrying the `API_CHECK_REPORT` as the source artifact. *(greenfield mode, **Phase 2.2**)* |
 | `SMOKE`                 | Cheap fail-fast gate between `API_CHECK` and `VERIFY`: spawns `<venv>/bin/python -c "import <pkg>"` for every top-level module the applied files declare, with a 30s wall-clock budget. Produces a `SMOKE_REPORT` (`outcome`, `imports: [{module, ok, stderr_tail}]`, `failure_signature`). On `passed` / `skipped` chains to `VERIFY`; on `failed` routes to `REPAIR` (typical trigger: `ImportError: cannot import name 'url_quote' from 'werkzeug.urls'` -- the Flask/Werkzeug peer pin mismatch that motivated the whole plan). *(greenfield mode, **Phase 2.1**)* |
 | `VERIFY`                | Run impacted tests against the working tree; produces a `VERIFY_REPORT` whose `outcome` token classifies pytest's exit code (`passed` / `assertions_failed` / `collection_error` / `no_tests_collected` / `timeout` / `pytest_missing` / `skipped`). Uses `BUILD_REPORT.python_exe` when available so pytest runs inside the project venv, not CGX's interpreter. Pytest is now invoked with `--junitxml=<tmp> -rN --tb=long` and the XML is parsed via stdlib `xml.etree` into a structured `failures: [{nodeid, type, message, traceback}]` list (**Phase 3.1**) so the classifier can consume types rather than re-regexing stdout. Also surfaces `reproduce_cmd` -- a single `shlex.quote`-escaped shell line that re-runs the exact failing pytest invocation under the project venv (**Phase 1.2**) -- and a `failure_signature` (sha1 of outcome + returncode + first error line) used by the autonomous repair loop. |
-| `REPAIR`                | Classify a failed `VERIFY` / `SMOKE` / `API_CHECK` and emit a typed `REPAIR_PLAN` (diffs + rationale + located classes + `strategy` + `extra_constraints`). The classifier is a small registry in `cgx.session.repair.classify`; v1 ships: `unittest_pytest_mix` (rewrite class header to inherit `unittest.TestCase`), `missing_module_pythonpath` (create/extend project-root `conftest.py` so pytest can resolve scaffolded packages), `missing_fixture` (hoist an `@pytest.fixture` definition into `tests/conftest.py` or project-root `conftest.py`), `hallucinated_api` (rename / drop the broken symbol surfaced by `API_CHECK`), and `third_party_import_break` (**Phase 3.2** -- recognises `ImportError: cannot import name '<x>' from '<pkg>'` and `ModuleNotFoundError` for third-party modules, then `propose_third_party_pin` queries the PyPI JSON API via `cgx.session.repair.pypi_client` -- with an on-disk cache under `~/.cgx/pypi-cache/` -- to compute a corrective version pin and emit a `requirements.txt` diff). Unknown failures yield an empty plan that escalates to `ASK_USER(freeform)`. Repair has two branches (**Phase 6.1**): `strategy=patch` writes the proposed diffs through the shared `APPLY` executor (≤5 diffs in a patchable class); `strategy=regenerate` abandons the failed `SCAFFOLD` subtree and re-queues a fresh `SCAFFOLD` with `regenerate_constraints` folded into the goal so the per-file generator avoids the failure mode this time. Greenfield-only; capped at 2 attempts per session and gated by `failure_signature` to break flapping loops; the regenerate branch is additionally capped at one re-scaffold per ancestor chain. |
+| `REPAIR`                | Classify a failed `VERIFY` / `SMOKE` / `API_CHECK` and emit a typed `REPAIR_PLAN` (diffs + rationale + located classes + `strategy` + `extra_constraints`). The classifier is a small registry in `cgx.session.repair.classify`; v1 ships: `unittest_pytest_mix` (rewrite class header to inherit `unittest.TestCase`), `missing_module_pythonpath` (create/extend project-root `conftest.py` so pytest can resolve scaffolded packages -- but **Fix G2**: `locate_missing_module_pythonpath` only proposes the `conftest.py` fix when the target's *full* dotted path resolves on disk; a missing *leaf* module such as `tests.auth` where `tests/` exists but `tests/auth.py` does not yields no diff and, because `missing_module_pythonpath` is in `_REGENERATE_CLASSES`, routes to `strategy=regenerate` rather than a no-op pythonpath patch), `missing_fixture` (hoist an `@pytest.fixture` definition into `tests/conftest.py` or project-root `conftest.py`), `hallucinated_api` (rename / drop the broken symbol surfaced by `API_CHECK`), and `third_party_import_break` (**Phase 3.2** -- recognises `ImportError: cannot import name '<x>' from '<pkg>'` and `ModuleNotFoundError` for third-party modules, then `propose_third_party_pin` queries the PyPI JSON API via `cgx.session.repair.pypi_client` -- with an on-disk cache under `~/.cgx/pypi-cache/` -- to compute a corrective version pin and emit a `requirements.txt` diff). Unknown failures yield an empty plan that escalates to `ASK_USER(freeform)`. Repair has two branches (**Phase 6.1**): `strategy=patch` writes the proposed diffs through the shared `APPLY` executor (≤5 diffs in a patchable class); `strategy=regenerate` abandons the failed `SCAFFOLD` subtree and re-queues a fresh `SCAFFOLD` with `regenerate_constraints` folded into the goal so the per-file generator avoids the failure mode this time. Greenfield-only; capped at 2 attempts per session and gated by `failure_signature` to break flapping loops; the regenerate branch is additionally capped at one re-scaffold per ancestor chain. |
 | `ASK_USER`              | Structured pause; carries an `expected_kind` indicating which decision contract the UI must satisfy. |
 | `SEARCH` / `SUMMARIZE`  | Utility kinds the router may interleave. |
 
@@ -136,8 +136,15 @@ Three entry points cover every transition:
     `DECOMPOSE → ASK_USER(approve_plan)`,
     `SCAFFOLD → APPLY` (with `mode=greenfield` threaded into the
     APPLY inputs),
-    `APPLY → BOOTSTRAP_ENV` (greenfield-only edge, threading
+    `APPLY (clean) → BOOTSTRAP_ENV` (greenfield-only edge, threading
     `apply_artifact_id` and `scaffold_artifact_id` through inputs),
+    `APPLY (failed_files) → SCAFFOLD` (**Fix G1** -- an APPLY that
+    parses-and-drops an invalid-syntax file leaves a core module
+    missing, so instead of limping into BOOTSTRAP_ENV the router
+    re-scaffolds within `_REGENERATE_BUDGET`, carrying an
+    `invalid_scaffold_syntax` constraint that enumerates each dropped
+    file with its concrete error; no SCAFFOLD ancestor or spent
+    budget → terminal `FAILED`),
     `BOOTSTRAP_ENV → API_CHECK` (**Phase 2.2**, threading
     `build_artifact_id`),
     `API_CHECK (passed | skipped) → SMOKE` (**Phase 2.1**),
@@ -169,6 +176,16 @@ Three entry points cover every transition:
     it into a `record_lesson(...)` call against
     `~/.cgx/lessons.jsonl` (override via `$CGX_LESSONS_PATH`) so
     future `SCAFFOLD` runs in any session can re-use the rule.
+* `on_task_failed(session, failed, tasks)` -- terminal transition
+  for a *hard* failure (**Fix F3**): an executor that returned
+  `ExecutorResult.failure` or crashed produced no `outputs`, so the
+  `outputs`-keyed successor table can never run. Greenfield write
+  loops must always reach a terminal status, so any unrecoverable
+  hard failure (e.g. a BOOTSTRAP_ENV whose `pip install` failed)
+  ends the session `FAILED` rather than hanging in `active` with a
+  dead FAILED leaf and no successor. Explore-mode sessions keep
+  their user-driven lifecycle (empty plan); a no-op once the session
+  is already `COMPLETED` / `FAILED` / `ABANDONED`.
 * `on_decision_recorded(session, decision, tasks)` -- user resolved
   an `ASK_USER` via a typed `Decision`. The router records the
   decision, attaches it to the ASK_USER, marks the ASK_USER `DONE`,
@@ -189,7 +206,13 @@ single sequencer enforces:
   executor exception, written to `<project_root>/.cgx/agent.log`
   via a rotating handler wired in `cgx.logging_setup`
   (**Phase 1.3**). The handler is best-effort -- log failures are
-  swallowed so they never break the loop.
+  swallowed so they never break the loop. When the curated trace
+  toggle (**Phase TR**, see 1A.7 below) is ON, the same `agent.log`
+  also receives `trace_enter` / `trace_exit` / `trace_error` records
+  for every `@traced` entry point along the router → runner →
+  executor → LLM / retrieval / codegen chain, so a single tail on
+  the project log shows both business events and function-call
+  timings inline.
 * `RecordLesson` resolution: when the router emits one, the runner
   fetches the `REPAIR_PLAN` artifact and the SCAFFOLD's inputs,
   derives the `applied_fix` (`{strategy, diff_count, files,
@@ -369,7 +392,7 @@ store; the React UI renders each as a node in the task tree.
     discovered yet the report carries `ran=False` with a
     `skipped_reason` so the UI marks the loop terminal-clean.
 
-Four router-level guardrails keep the loop honest:
+Five router-level guardrails keep the loop honest:
 
 * The `ASK(approve_plan)` checkpoint is mandatory. Even if the
   manifest looks great, the user has to confirm before any file is
@@ -398,6 +421,16 @@ Four router-level guardrails keep the loop honest:
   `_REGENERATE_BUDGET=1` cap on `propose_regenerate` (**Phase
   6.1**) prevents the patch-vs-regenerate branch from re-
   scaffolding the same subtree more than once.
+* Every greenfield failure path is terminal. A hard executor
+  failure that never returns `outputs` ends the session `FAILED`
+  via `on_task_failed` (**Fix F3**) rather than hanging in
+  `active`; and an APPLY that parses-and-drops an invalid-syntax
+  file re-scaffolds within `_REGENERATE_BUDGET` with an
+  `invalid_scaffold_syntax` constraint enumerating the dropped
+  files, then falls to terminal `FAILED` once no SCAFFOLD ancestor
+  remains or the budget is spent (**Fix G1**). The loop never limps
+  forward on a tree with a silently-missing module, and never asks
+  the user to hand-fix AI-generated code.
 
 ### 1A.7 Persistence
 
@@ -410,7 +443,7 @@ blob plus a few indexed columns (session_id, status, timestamps) so
 common queries don't have to parse JSON. Connections use WAL mode for
 concurrent reader tolerance.
 
-Three sibling files live alongside `sessions.db`:
+Four sibling files live alongside `sessions.db`:
 
 * `<project_root>/.cgx/agent.log` -- rotating JSONL agent log
   (one line per task transition + per executor exception),
@@ -418,7 +451,10 @@ Three sibling files live alongside `sessions.db`:
   `cgx.logging_setup` (**Phase 1.3**). Survives the lifetime of
   the project, not the session, so it's also the place to look
   when a session row was deleted but the user wants to know what
-  happened.
+  happened. When the curated function-call trace toggle
+  (**Phase TR**) is ON, `trace_enter` / `trace_exit` /
+  `trace_error` records join the same file so business events
+  and per-call timings live in one JSONL stream.
 * `~/.cgx/lessons.jsonl` -- cross-session lessons store
   (**Phase 7.1**). Append-only JSONL; each row carries
   `{lesson_id, created_at, session_id, trigger_signature,
@@ -433,6 +469,51 @@ Three sibling files live alongside `sessions.db`:
   `cgx.session.repair.pypi_client` (**Phases 3.2 + 4.1**), keyed
   by `{pkg}/{version}.json`. Reused by both the SCAFFOLD pin
   validator and the third-party-import repair proposer.
+* `~/.cgx/cgx-trace.log` (**Phase TR**) -- fallback rotating JSONL
+  trace log written by `cgx.trace` for any `@traced` call whose
+  runtime does not carry a `project_root` in the trace ContextVar
+  (HTTP middleware, batch CLI, retrieval / codegen invoked outside
+  a session). Rotates at 2 MiB with 3 backups; irrelevant when a
+  session is active because those records reach the project
+  `agent.log` instead.
+
+#### Curated function-call tracing (Phase TR)
+
+`cgx.trace` is a single-file, curated instrumentation layer wrapping
+the router (`on_user_message`, `on_task_completed`,
+`on_decision_recorded`), the runner (`_post_message_traced`,
+`_post_decision_traced`, `_run_next_traced`), every executor
+(via `dispatch` in `cgx.session.tasks.base`), the repair helpers
+(`classify`, `locate`, `propose`), and the LLM / retrieval / codegen
+entry points (`cgx.answer.engine`, `cgx.retrieval.orchestrator`,
+`cgx.pipeline.auto`, `cgx.codegen.{disk_apply, env_manager,
+test_runner}`, `cgx.agents.loop`). The `@traced(category)`
+decorator emits a `trace_enter` and either a `trace_exit`
+(with `elapsed_ms`) or a `trace_error` (with `error_type` +
+truncated message) for every call, routed to
+`<project_root>/.cgx/agent.log` when a session context is active
+and to `~/.cgx/cgx-trace.log` otherwise. Off by default -- the
+hot path is a single `bool` check when disabled.
+
+Three ways to flip the toggle, in order of precedence:
+
+1. `$CGX_TRACE=1` / `true` / `on` (or `0` / `false` / `off`) pins
+   the flag from the environment; the settings endpoint reports
+   `source: "env"` and refuses to mutate it (returns HTTP `409`).
+2. `POST /api/settings/trace` with `{"enabled": true|false}`
+   flips the runtime flag; the UI's Settings page and the amber
+   `TRACE` pill in the header both read from the shared Zustand
+   store `frontend/src/store/trace.ts`.
+3. Programmatic: `cgx.trace.set_trace_enabled(True)` for tests /
+   scripts.
+
+Trace context is carried by a `contextvars.ContextVar` so nested
+`@traced` calls (including `async def` ones) inherit the active
+`session_id`, `task_id`, and `project_root` without threading them
+through every argument list. The runner sets the context inside
+`start_session`, `post_message`, `post_decision`, `run_next`, and
+`_execute` before any decorator fires, so router / runner / executor
+records land in the correct project log.
 
 ### 1A.8 HTTP surface
 
@@ -512,6 +593,7 @@ same 404 on every mount.
 | The runner sequencer              | `src/cgx/session/runner.py` |
 | Persistence schema                | `src/cgx/session/store.py` |
 | Project-local agent log (Phase 1.3) | `src/cgx/session/agent_log.py`, `src/cgx/logging_setup.py` |
+| Curated function-call trace (Phase TR) | `src/cgx/trace.py`, `src/cgx/webui/routes/settings.py`, `frontend/src/store/trace.ts` |
 | Explore-mode executors            | `src/cgx/session/tasks/{explore,investigate,recommend,plan_change}.py` |
 | Greenfield executors              | `src/cgx/session/tasks/{clarify_requirements,decompose,scaffold,bootstrap_env,api_check,smoke,repair}.py` |
 | Shared write executors            | `src/cgx/session/tasks/{apply,verify,ask}.py` |

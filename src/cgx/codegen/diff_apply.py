@@ -210,7 +210,27 @@ def _apply_hunks(original: str, hunks: List[List[str]]) -> Tuple[Optional[str], 
             continue
         out[loc:loc + len(pre)] = post
         offset += len(post) - len(pre)
-    return "\n".join(out) + ("\n" if original.endswith("\n") else ""), rejected
+
+    no_newline = False
+    has_newline_marker = False
+    if hunks:
+        last_hunk = hunks[-1]
+        for idx in range(len(last_hunk) - 1, 0, -1):
+            ln = last_hunk[idx]
+            if ln.startswith("\\"):
+                has_newline_marker = True
+                prev_line = last_hunk[idx - 1]
+                if prev_line.startswith("+") or prev_line.startswith(" "):
+                    no_newline = True
+                break
+        if not has_newline_marker and last_hunk[-1].startswith("+"):
+            endswith_newline = True
+        else:
+            endswith_newline = original.endswith("\n") if not no_newline else False
+    else:
+        endswith_newline = original.endswith("\n")
+
+    return "\n".join(out) + ("\n" if endswith_newline else ""), rejected
 
 
 def _split_hunks(diff_text: str) -> List[List[str]]:
@@ -251,7 +271,7 @@ def apply_diffs_in_memory(
     for tgt in targets:
         rel = tgt.path
         original = _read_file(project_root, rel)
-        is_new = original is None
+        is_new = (original is None) or ("--- /dev/null" in tgt.diff_text)
         hunks = _split_hunks(tgt.diff_text)
         if not hunks:
             # New-file diffs from small local models often omit the @@ header.
@@ -269,7 +289,7 @@ def apply_diffs_in_memory(
                 new_content = ("\n".join(synth) + "\n") if synth else ""
                 results.append(PatchResult(
                     path=rel, ok=True, new_content=new_content,
-                    original_content=None, is_new_file=True,
+                    original_content=original, is_new_file=True,
                 ))
                 continue
             results.append(PatchResult(
@@ -292,7 +312,7 @@ def apply_diffs_in_memory(
                         new_lines.append(ln[1:])
             results.append(PatchResult(
                 path=rel, ok=True, new_content="\n".join(new_lines) + "\n",
-                original_content=None, is_new_file=True,
+                original_content=original, is_new_file=True,
             ))
             continue
         try:

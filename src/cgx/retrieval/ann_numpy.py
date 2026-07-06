@@ -43,26 +43,37 @@ class _NumPyIndex:
         if Q.ndim == 1:
             Q = Q[None, :]
 
+        M = Q.shape[0]
+        N = self.X.shape[0]
+        k = min(k, N)
+
         if self.metric in {"cosine", "ip"}:
-            # assume caller normalized Q if they want cosine behavior
-            scores = self.X @ Q.T  # (N, 1)
-            s = scores.ravel()
-            k = min(k, s.shape[0])
-            top = np.argpartition(-s, kth=k-1)[:k]
-            top = top[np.argsort(-s[top], kind="mergesort")]
-            return s[top][None, :].astype("float32"), top[None, :].astype("int64")
+            # Q is (M, D), self.X is (N, D), so scores is (M, N)
+            scores = Q @ self.X.T
+            all_D = []
+            all_I = []
+            for i in range(M):
+                s = scores[i]
+                top = np.argpartition(-s, kth=k-1)[:k]
+                top = top[np.argsort(-s[top], kind="mergesort")]
+                all_D.append(s[top])
+                all_I.append(top)
+            return np.array(all_D, dtype="float32"), np.array(all_I, dtype="int64")
         else:
             # L2 distance
-            # ||a-b||^2 = ||a||^2 + ||b||^2 - 2 a·b
             aa = (self.X ** 2).sum(axis=1)
             bb = (Q ** 2).sum(axis=1)
-            ab = self.X @ Q.T
-            d2 = aa[:, None] + bb[None, :] - 2 * ab
-            d = d2.ravel()
-            k = min(k, d.shape[0])
-            top = np.argpartition(d, kth=k-1)[:k]
-            top = top[np.argsort(d[top], kind="mergesort")]
-            return d[top][None, :].astype("float32"), top[None, :].astype("int64")
+            ab = Q @ self.X.T
+            d2 = bb[:, None] + aa[None, :] - 2 * ab
+            all_D = []
+            all_I = []
+            for i in range(M):
+                d = d2[i]
+                top = np.argpartition(d, kth=k-1)[:k]
+                top = top[np.argsort(d[top], kind="mergesort")]
+                all_D.append(d[top])
+                all_I.append(top)
+            return np.array(all_D, dtype="float32"), np.array(all_I, dtype="int64")
 
 
 def _make_faiss_index(dim: int, metric: str, index: str, **kw):

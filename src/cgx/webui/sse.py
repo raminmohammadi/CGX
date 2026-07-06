@@ -35,6 +35,35 @@ def _safe_json(payload: Any) -> str:
         return json.dumps({"_repr": str(payload)})
 
 
+def _terminal_failure(event_name: str, event_data: Any) -> Optional[str]:
+    """Return a failure message when an event marks the run as degraded.
+
+    Keeps the persisted task status honest: a stream that emits an
+    ``error`` frame, or an agent ``summary`` whose tracker recorded any
+    failed task, must not be stamped ``done``. ``skipped`` alone is not
+    treated as a failure -- soft/optional steps skip on the happy path --
+    but skips that accompany a failure are folded into the message so the
+    run history shows the cascade. Non-agent streams never emit these
+    events, so their behaviour is unchanged.
+    """
+    if event_name == "error":
+        if isinstance(event_data, dict):
+            return str(event_data.get("message") or "stream error")
+        return "stream error"
+    if event_name == "summary" and isinstance(event_data, dict):
+        try:
+            failed = int(event_data.get("failed") or 0)
+            skipped = int(event_data.get("skipped") or 0)
+        except (TypeError, ValueError):
+            return None
+        if failed > 0:
+            msg = f"{failed} task(s) failed"
+            if skipped > 0:
+                msg += f", {skipped} skipped"
+            return msg
+    return None
+
+
 async def bridge_generator(
     gen_factory: Callable[[], Iterator[Any]],
     *,
@@ -108,6 +137,13 @@ async def bridge_generator(
     thread.start()
     logger.debug("sse bridge: thread started task_id=%s", task_id)
 
+    # Terminal-failure message for the persisted task row. The stream can
+    # complete "successfully" (no worker exception) yet still report a
+    # degraded outcome -- an ``error`` event, or an agent ``summary`` whose
+    # judged tasks failed. Without capturing that, ``finish_task`` in the
+    # ``finally`` block would stamp every finished stream ``done`` and hide
+    # the failure from the run history.
+    finish_error: Optional[str] = None
     try:
         while True:
             item = await queue.get()
@@ -115,6 +151,7 @@ async def bridge_generator(
                 break
             if isinstance(item, dict) and "__error__" in item:
                 err_payload = {"message": item["__error__"]}
+                finish_error = str(item["__error__"])
                 if task_id:
                     _ts.append_event(task_id, "error", err_payload)
                 yield {"event": "error", "data": _safe_json(err_payload)}
@@ -122,6 +159,9 @@ async def bridge_generator(
             ev = to_event(item)
             event_name = ev.get("event", "message")
             event_data = ev.get("data")
+            failure = _terminal_failure(event_name, event_data)
+            if failure and finish_error is None:
+                finish_error = failure
             if task_id and event_name not in ("done",):
                 try:
                     _ts.append_event(task_id, event_name, event_data)
@@ -144,6 +184,6 @@ async def bridge_generator(
             try:
                 task = _ts.get_task(task_id)
                 if task and task.get("status") == "running":
-                    _ts.finish_task(task_id)
+                    _ts.finish_task(task_id, error=finish_error)
             except Exception as e:
                 logger.warning("sse bridge: task cleanup failed: %s", e)

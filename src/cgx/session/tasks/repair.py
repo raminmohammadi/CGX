@@ -73,6 +73,9 @@ _REGENERATE_CLASSES = frozenset({
     "third_party_import_break",
     "smoke_import_failure",
     "api_check_failure",
+    "empty_test_suite",
+    "missing_fixture",
+    "missing_module_pythonpath",
     "unknown",
 })
 
@@ -169,6 +172,19 @@ def run_repair(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             {"symbol": s, "package": p} for s, p in pairs
         ]
         extra_plan_fields["pin_decisions"] = decisions
+    elif classification == "empty_test_suite":
+        # pytest exit 5: the selected test file(s) exist but collected
+        # zero tests -- almost always ``def test_*`` nested inside a
+        # fixture / another function, or fixtures misnamed ``test_*``.
+        # There is no mechanical patch; re-scaffold with an explicit
+        # constraint so the regenerated tests are collectable.
+        rationale = (
+            "pytest collected 0 tests from the selected test file(s) "
+            "(exit code 5). Test functions must be defined at module "
+            "top level with names starting with 'test_' -- not nested "
+            "inside a @pytest.fixture or any other function -- and "
+            "fixtures must not be named 'test_*'. Rewrite the test "
+            "module(s) so every test is a top-level 'def test_*'.")
     else:
         rationale = (
             "No deterministic repair available for this failure class; "
@@ -297,12 +313,19 @@ def _run_api_check_repair(task: TaskNode, deps: ExecutorDeps,
                           api_check_artifact_id: str) -> ExecutorResult:
     """Emit a REPAIR_PLAN from an API_CHECK_REPORT.
 
-    Mirrors :func:`_run_smoke_repair`: v1 has no deterministic
-    proposer for hallucinated third-party symbols (Phase 3.2 will add
-    one that distinguishes "wrong version" from "wrong name"). The
-    plan therefore carries ``can_apply=False`` so the router escalates
-    to ASK_USER with a structured rationale enumerating the failing
-    (module, name) pairs.
+    Two failure shapes are handled:
+
+    * ``missing_dependency`` -- the API_CHECK report lists
+      ``missing_modules`` (a whole top-level package is absent from the
+      venv). The symbol is valid; the fix is to (re)install the
+      package, not to rewrite code. The plan carries
+      ``strategy='install_deps'`` so the router re-runs BOOTSTRAP_ENV
+      (whose preflight installs the undeclared imports and syncs
+      requirements.txt) and then re-probes via API_CHECK.
+    * hallucinated symbols -- a valid module is installed but the
+      referenced attribute does not exist. Mirrors
+      :func:`_run_smoke_repair`: v1 has no deterministic proposer, so
+      the plan carries ``strategy='regenerate'`` / ``can_apply=False``.
     """
     artifact = deps.store.get_artifact(api_check_artifact_id)
     if (artifact is None
@@ -311,6 +334,12 @@ def _run_api_check_repair(task: TaskNode, deps: ExecutorDeps,
             failure=f"REPAIR: artifact {api_check_artifact_id!r} missing or "
                     "wrong kind (need API_CHECK_REPORT)")
     content = dict(artifact.content or {})
+    missing_modules = [str(m).strip()
+                       for m in content.get("missing_modules") or []
+                       if str(m).strip()]
+    if missing_modules:
+        return _run_missing_dependency_repair(
+            task, api_check_artifact_id, content, missing_modules)
     failed = [dict(r) for r in content.get("failed_references") or []
               if isinstance(r, dict)]
     signature = str(content.get("failure_signature") or "").strip()
@@ -326,16 +355,18 @@ def _run_api_check_repair(task: TaskNode, deps: ExecutorDeps,
         if len(failed) > 5:
             names += f", ... (+{len(failed) - 5} more)"
         rationale = (
-            f"Third-party symbol(s) {names} could not be resolved under "
-            "the bootstrapped venv. The most likely causes are an "
-            "outdated/incorrect import (renamed or removed upstream) or "
-            "a version mismatch in requirements.txt. Phase 3.2 will "
-            "add a dependency-aware proposer; for now the router "
-            "escalates to ASK_USER.")
+            f"The symbol(s) {names} do NOT exist in the installed "
+            "package version (API_CHECK resolved the module but the "
+            "attribute is absent -- a hallucinated or outdated import). "
+            "When regenerating, REMOVE every reference to those exact "
+            "symbols and use the correct, currently-supported API for the "
+            "installed version instead. In particular, do not import a "
+            "test client from werkzeug -- a Flask test uses "
+            "`app.test_client()` obtained from the app object.")
     else:
         rationale = (
             "API_CHECK reported a failure but no failed references were "
-            "recorded; escalating to ASK_USER.")
+            "recorded.")
     extra_constraints = {
         "kind": "api_check_failure",
         "failed_references": failed,
@@ -369,6 +400,72 @@ def _run_api_check_repair(task: TaskNode, deps: ExecutorDeps,
             "diff_count": 0,
             "can_apply": False,
             "strategy": "regenerate",
+            "extra_constraints": extra_constraints,
+        },
+        artifact=plan,
+    )
+
+
+def _run_missing_dependency_repair(
+        task: TaskNode,
+        api_check_artifact_id: str,
+        content: Dict[str, Any],
+        missing_modules: List[str]) -> ExecutorResult:
+    """Emit a REPAIR_PLAN that reinstalls absent third-party packages.
+
+    A ``missing_dependency`` failure means a whole top-level package the
+    scaffold imports is not installed in the venv -- a bootstrap/install
+    problem, not a hallucinated API. Regenerating the code cannot fix it
+    (the code is correct); the router consumes ``strategy='install_deps'``
+    to re-run BOOTSTRAP_ENV, whose preflight installs the undeclared
+    imports and syncs requirements.txt, then re-probes via API_CHECK.
+    """
+    mods = sorted(dict.fromkeys(missing_modules))
+    signature = str(content.get("failure_signature") or "").strip()
+    if not signature:
+        signature = "api_check|missing:" + ",".join(mods)
+    attempt = int(task.inputs.get("repair_attempt") or 1)
+    classification = "missing_dependency"
+    rationale = (
+        f"Missing third-party dependency(ies): {', '.join(mods)}. The "
+        "referenced symbol(s) are valid but the package(s) are not "
+        "installed in the project venv. The correct fix is to install "
+        "the package(s) (adding them to requirements.txt) and re-probe, "
+        "not to regenerate code that references valid APIs.")
+    extra_constraints = {
+        "kind": "missing_dependency",
+        "missing_modules": mods,
+        "rationale": rationale,
+    }
+    plan = Artifact.new(
+        session_id=task.session_id,
+        produced_by_task_id=task.task_id,
+        kind=ArtifactKind.REPAIR_PLAN,
+        content={
+            "api_check_artifact_id": api_check_artifact_id,
+            "build_artifact_id": content.get("build_artifact_id"),
+            "apply_artifact_id": content.get("apply_artifact_id"),
+            "classification": classification,
+            "failure_signature": signature,
+            "repair_attempt": attempt,
+            "rationale": rationale,
+            "missing_modules": mods,
+            "diffs": [],
+            "strategy": "install_deps",
+            "extra_constraints": extra_constraints,
+            "mode": task.inputs.get("mode"),
+        },
+    )
+    return ExecutorResult(
+        outputs={
+            "repair_artifact_id": plan.artifact_id,
+            "classification": classification,
+            "failure_signature": signature,
+            "repair_attempt": attempt,
+            "diff_count": 0,
+            "can_apply": False,
+            "strategy": "install_deps",
+            "missing_modules": mods,
             "extra_constraints": extra_constraints,
         },
         artifact=plan,
@@ -473,9 +570,12 @@ def _pythonpath_rationale(
 ) -> str:
     """Compose a human-readable rationale for the pythonpath repair."""
     if not locations:
-        return ("Detected ModuleNotFoundError during collection, but none of "
-                "the missing modules map to a project file; the package is "
-                "likely third-party and belongs to BOOTSTRAP_ENV.")
+        return ("A test imported a module that does not exist as a project "
+                "file on disk (ModuleNotFoundError during collection). No "
+                "conftest sys.path entry can create a module that was never "
+                "authored -- regenerate so every imported first-party module "
+                "and symbol actually exists, and imports reference real "
+                "modules only.")
     modules = ", ".join(sorted({loc.module_name for loc in locations}))
     if not has_diff:
         return (f"Project module(s) {modules} resolved on disk, but "

@@ -2,11 +2,13 @@
 
 """APPLY executor: write an approved plan's diffs to the working tree.
 
-Reads the upstream ``CODE_CHANGE_PLAN`` artifact (produced by
-``PLAN_CHANGE`` and gated by an ``APPROVE`` ASK), then hands the diffs
-to :func:`cgx.codegen.disk_apply.apply_diffs_to_disk`. The disk-apply
-helper backs every modified file up under ``.cgx-backups/<run_id>/``
-before overwriting, so this executor stays recoverable.
+Reads the upstream plan artifact -- a ``CODE_CHANGE_PLAN`` (produced by
+``PLAN_CHANGE`` and gated by an ``APPROVE`` ASK), a ``SCAFFOLD_PATCHES``
+(greenfield loop), or a ``REPAIR_PLAN`` (auto-repair loop) -- then hands
+the diffs to :func:`cgx.codegen.disk_apply.apply_diffs_to_disk`. The
+disk-apply helper backs every modified file up under
+``.cgx-backups/<run_id>/`` before overwriting, so this executor stays
+recoverable.
 
 The result lands in an ``APPLIED_CHANGES`` artifact carrying the lists
 of applied/failed files plus the backup path, which the downstream
@@ -41,10 +43,12 @@ def run_apply(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     if deps.store is None:
         return ExecutorResult(
             failure="APPLY requires a session store in deps")
-    # The upstream artifact id can arrive under either name depending on
-    # which loop produced it: ``CODE_CHANGE_PLAN`` (existing-codebase
-    # write loop) or ``SCAFFOLD_PATCHES`` (greenfield loop). Both carry
-    # a ``diffs`` list shaped for ``apply_diffs_to_disk``.
+    # The upstream artifact id can arrive under any of three names
+    # depending on which loop produced it: ``CODE_CHANGE_PLAN``
+    # (existing-codebase write loop), ``SCAFFOLD_PATCHES`` (greenfield
+    # loop), or ``REPAIR_PLAN`` (auto-repair loop, wired in via
+    # ``_repair_to_apply_or_ask``). All three carry a ``diffs`` list
+    # shaped for ``apply_diffs_to_disk``.
     plan_artifact_id = str(
         task.inputs.get("scaffold_artifact_id")
         or task.inputs.get("plan_artifact_id")
@@ -55,10 +59,12 @@ def run_apply(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
 
     plan = deps.store.get_artifact(plan_artifact_id)
     if plan is None or plan.kind not in (
-            ArtifactKind.CODE_CHANGE_PLAN, ArtifactKind.SCAFFOLD_PATCHES):
+            ArtifactKind.CODE_CHANGE_PLAN, ArtifactKind.SCAFFOLD_PATCHES,
+            ArtifactKind.REPAIR_PLAN):
         return ExecutorResult(
             failure=f"APPLY: artifact {plan_artifact_id!r} missing or wrong "
-                    "kind (need CODE_CHANGE_PLAN or SCAFFOLD_PATCHES)")
+                    "kind (need CODE_CHANGE_PLAN, SCAFFOLD_PATCHES, or "
+                    "REPAIR_PLAN)")
 
     diffs = _coerce_diffs((plan.content or {}).get("diffs"))
     if not diffs:
@@ -108,6 +114,7 @@ def run_apply(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             "apply_artifact_id": artifact.artifact_id,
             "applied_count": len(applied_files),
             "failed_count": len(failed_files),
+            "failed_files": failed_files,
             "backup_dir": backup_dir,
         },
         artifact=artifact,

@@ -32,6 +32,7 @@ REPAIR_CLASSIFICATIONS: Tuple[str, ...] = (
     "unittest_pytest_mix",
     "missing_module_pythonpath",
     "missing_fixture",
+    "empty_test_suite",
     "unknown",
 )
 
@@ -108,14 +109,26 @@ def classify_verify_report(content: Dict[str, Any]) -> RepairClassification:
     """Map a VERIFY_REPORT content dict to a classification token.
 
     Only fires on reports where ``ran`` is true and ``outcome`` is one
-    of the genuinely-failed tokens. Skipped / no_tests / pytest_missing
-    reports are not auto-repairable in v1 -- they're environment
-    problems that BOOTSTRAP_ENV (or the user) owns. Walks the
+    of the genuinely-failed tokens. Skipped / pytest_missing reports are
+    not auto-repairable -- they're environment problems that
+    BOOTSTRAP_ENV (or the user) owns. Walks the
     :data:`_CLASSIFIER_REGISTRY` in declared order and returns the first
     matching token; falls back to ``unknown`` so the executor emits an
     empty plan and the router escalates to ASK_USER.
+
+    ``no_tests_collected`` (pytest exit 5) is a special case: pytest
+    found the selected test file(s) but collected zero test functions --
+    the canonical symptom of ``def test_*`` nested inside a fixture or
+    another function rather than defined at module top level. It has no
+    mechanical locator, so it maps to ``empty_test_suite`` which the
+    REPAIR executor routes to a re-scaffold. The router only lets a
+    ``no_tests_collected`` report reach here when test files were
+    actually selected, so this never fires for genuinely test-free
+    projects.
     """
     outcome = str(content.get("outcome") or "").strip()
+    if outcome == "no_tests_collected":
+        return "empty_test_suite"
     if outcome not in ("assertions_failed", "collection_error"):
         return "unknown"
     for token, predicate in _CLASSIFIER_REGISTRY:

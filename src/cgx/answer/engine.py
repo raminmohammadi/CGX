@@ -2288,6 +2288,7 @@ def plan_scaffold_manifest(
         skill_names=skills,
     )
     layers = _inject_python_package_inits(layers)
+    layers = _inject_readme(layers, goal=goal_clean or idea_clean)
     return {
         "plan_md": str(parsed.get("plan_md") or "").strip(),
         "layers": layers,
@@ -2502,6 +2503,46 @@ def _inject_python_package_inits(layers: List[Any]) -> List[Any]:
     return out
 
 
+def _inject_readme(layers: List[Any], *, goal: str = "") -> List[Any]:
+    """Guarantee a project ``README.md`` generated LAST of all files.
+
+    Every finished project should ship a top-level README. The manifest
+    planner frequently omits it, or places it early where it cannot see
+    the files it is meant to describe. We normalise both cases: any
+    existing top-level ``README.md`` entry is dropped and a fresh one is
+    appended to a trailing ``docs`` layer, so the ``SCAFFOLD_FILE`` task
+    for the README runs after every other file and can summarise the
+    real, generated project.
+    """
+    goal_hint = (goal or "").strip()
+    description = (
+        "Top-level project README in Markdown. Summarise what the project "
+        "does, its tech stack, how to install/run it, and how to run the "
+        "tests -- grounded strictly in the files already generated. "
+        "Do NOT invent files, commands, or dependencies that do not exist."
+    )
+    if goal_hint:
+        description = f"{description} Project goal: {goal_hint}"
+
+    out: List[Any] = []
+    for lay in layers or []:
+        if not isinstance(lay, dict):
+            out.append(lay)
+            continue
+        kept = [
+            f for f in (lay.get("files") or [])
+            if not (isinstance(f, dict)
+                    and str(f.get("path") or "").strip().lower() == "readme.md")
+        ]
+        out.append({**lay, "files": kept})
+
+    out.append({
+        "name": "docs",
+        "files": [{"path": "README.md", "description": description}],
+    })
+    return out
+
+
 # Framework-convention path overrides: filename basename → canonical path.
 # These run after the manifest is parsed so the LLM's intent is preserved
 # but config files end up where the toolchain actually expects them.
@@ -2594,6 +2635,13 @@ _SINGLE_FILE_SYSTEM = (
     "(`app.test_client()` for Flask, `TestClient(app)` for FastAPI / "
     "Starlette, `Client()` for Django) -- never bind a real port or use "
     "`requests` / `httpx.Client(base_url='http://localhost:...')` in a test.\n"
+    "- For Flask specifically: obtain the client ONLY from the app object, "
+    "via `client = app.test_client()` (typically wrapped in a "
+    "`@pytest.fixture`). Do NOT import a test client class from werkzeug. "
+    "There is NO `werkzeug.test.TestClient` -- that symbol does not exist "
+    "and raises AttributeError. `TestClient(app)` is a FastAPI/Starlette "
+    "construct imported from `fastapi.testclient` / `starlette.testclient`, "
+    "NOT something you import for a Flask app.\n"
     "- Import the application factory or app instance from the project's "
     "own source files (e.g. `from app import app` or `from main import "
     "create_app`); do not stub or reimplement the framework inline.\n"
@@ -2610,6 +2658,33 @@ _SINGLE_FILE_SYSTEM = (
     "- If you genuinely need the `unittest` API, inherit explicitly from "
     "`unittest.TestCase` and use the `self.assert*` helpers consistently "
     "throughout that class; do not mix the two styles.\n"
+    "Pytest test-discovery discipline (applies to ANY file under tests/):\n"
+    "- Every test MUST be a module-top-level `def test_*` function (or a "
+    "method on a top-level `class Test*`). pytest only collects tests at "
+    "module scope; a `def test_*` nested inside a @pytest.fixture or any "
+    "other function is invisible and yields 'no tests ran' (exit code 5).\n"
+    "- A @pytest.fixture provides setup and MUST return or yield a value "
+    "for tests to consume via an argument; it MUST NOT be named `test_*` "
+    "and MUST NOT define nested test functions inside it.\n"
+    "- Emit at least one real, collectable `def test_*` in every test "
+    "file you generate.\n"
+    "Pytest test-authoring discipline (applies to ANY file under tests/):\n"
+    "- Test the ALREADY-GENERATED code by IMPORTING it. NEVER reimplement, "
+    "copy, or redefine the application's functions, classes, or the app "
+    "object inside the test file -- import them from the project's own "
+    "modules and exercise those.\n"
+    "- Call ONLY functions, methods, attributes, routes, and keyword "
+    "arguments that actually exist in the imported modules. Do NOT invent "
+    "APIs, endpoints, or parameters that were never generated.\n"
+    "- Every test-function parameter MUST be satisfied by a "
+    "@pytest.fixture (in this file or a conftest.py) or by "
+    "@pytest.mark.parametrize. Do NOT declare bare parameters pytest "
+    "cannot resolve -- an unbacked parameter raises `fixture '<name>' not "
+    "found` at collection time (exit code 5) and breaks the whole file.\n"
+    "- Use only pytest's built-in marks (skip, skipif, xfail, parametrize, "
+    "usefixtures). Do NOT apply a custom @pytest.mark.* unless it is "
+    "registered in pytest.ini/pyproject -- unregistered marks fail under "
+    "strict-markers.\n"
 )
 
 _SINGLE_FILE_FREEFORM_SYSTEM = (
@@ -2850,6 +2925,24 @@ def generate_single_scaffold_file(
     if ext_pin:
         system = system + "\n\n" + ext_pin
 
+    # README pin: this file is generated last and must document the REAL
+    # project. Steer the model away from inventing setup steps or files
+    # that were never generated, which is the common failure mode.
+    if base.lower() == "readme.md":
+        system = system + (
+            "\n\nREADME RULES:\n"
+            "- Write GitHub-flavoured Markdown for the top-level project README.\n"
+            "- Include, in order: a title + one-line summary, a short "
+            "description, the tech stack, install/setup steps, how to run "
+            "the project, and how to run the tests.\n"
+            "- Ground EVERY command, path, and dependency in the ALREADY "
+            "GENERATED FILES. If a requirements.txt / package.json exists, "
+            "derive install steps from it; never invent files or commands "
+            "that were not generated.\n"
+            "- Return the Markdown as the JSON \"content\" string. Do not "
+            "wrap it in an extra code fence."
+        )
+
     parts: List[str] = []
     if goal:
         parts.append(f"PROJECT GOAL:\n{goal}")
@@ -2948,19 +3041,55 @@ def generate_single_scaffold_file(
             syntax_ok = False
             syntax_error = "content is a unified-diff header, not a file body"
     if syntax_ok and ext == "py" and content:
+        import ast as _ast
         try:
-            import ast as _ast
             _ast.parse(content)
         except SyntaxError as e:
-            syntax_ok = False
-            syntax_error = str(e)
+            # One hardened retry with the exact SyntaxError surfaced.
+            # Broken Python that slips through here is silently dropped by
+            # APPLY's own syntax gate, which can leave the project without
+            # its entry point or its only test file (VERIFY then reports
+            # "no tests located" and the loop declares a false success).
+            retry = _regenerate_scaffold_file(
+                provider, system, context, budget,
+                _SYNTAX_RETRY_INSTR.format(lang="Python", error=e))
+            retry_ok = False
+            if retry:
+                try:
+                    _ast.parse(retry)
+                    retry_ok = True
+                except SyntaxError:
+                    retry_ok = False
+            if retry_ok:
+                content = retry
+            else:
+                syntax_ok = False
+                syntax_error = str(e)
     elif syntax_ok and ext == "json" and content:
+        import json as _json
         try:
-            import json as _json
             _json.loads(content)
         except Exception as e:
-            syntax_ok = False
-            syntax_error = str(e)
+            # One hardened retry with the exact parse error surfaced --
+            # symmetric with the .py path above. A malformed data file
+            # (e.g. users.json the app reads at startup) is otherwise
+            # silently dropped by APPLY's syntax gate, so the app boots
+            # against a missing file and SMOKE/VERIFY fail downstream.
+            retry = _regenerate_scaffold_file(
+                provider, system, context, budget,
+                _SYNTAX_RETRY_INSTR.format(lang="JSON", error=e))
+            retry_ok = False
+            if retry:
+                try:
+                    _json.loads(retry)
+                    retry_ok = True
+                except Exception:
+                    retry_ok = False
+            if retry_ok:
+                content = retry
+            else:
+                syntax_ok = False
+                syntax_error = str(e)
     elif syntax_ok and ext == "toml" and content:
         try:
             import tomllib as _tomllib
@@ -2995,6 +3124,60 @@ def generate_single_scaffold_file(
                     content = ""
                     break
 
+    # First-party symbol-consistency gate: a regenerated file (typically
+    # a test) frequently imports a symbol from an already-generated
+    # project module that the module never actually defines (e.g.
+    # `from auth import generate_jwt` when auth.py has no `generate_jwt`).
+    # API_CHECK would flag it as a hallucinated attribute, but the
+    # regenerate loop can't fix it without knowing what the module really
+    # exports. Retry once with the real symbol inventory; otherwise fail
+    # the file so APPLY drops it rather than persisting a broken import.
+    if content and syntax_ok and ext == "py" and existing_files_with_content:
+        sym_index = _module_symbol_index(existing_files_with_content)
+        violations = _first_party_symbol_violations(content, sym_index)
+        if violations:
+            retry = _regenerate_scaffold_file(
+                provider, system, context, budget,
+                _symbol_retry_instruction(violations))
+            retry_ok = False
+            if retry:
+                import ast as _ast
+                try:
+                    _ast.parse(retry)
+                    retry_ok = not _first_party_symbol_violations(
+                        retry, sym_index)
+                except SyntaxError:
+                    retry_ok = False
+            if retry_ok:
+                content = retry
+            else:
+                first = violations[0]
+                syntax_ok = False
+                syntax_error = (
+                    "imports undefined first-party symbol(s) "
+                    f"{first['missing']} from module '{first['module']}'")
+                content = ""
+
+    # Test-collectability gate: a pytest module that parses cleanly but
+    # defines no module-top-level `def test_*` collects zero tests (pytest
+    # exit 5) and stalls the verify->repair->regenerate loop -- the single
+    # most common greenfield failure, where the model reimplements the app
+    # under the test path instead of testing it. Retry once with a
+    # hardened, path-specific instruction so the empty suite never reaches
+    # the (budget-limited) repair loop.
+    if (content and syntax_ok and ext == "py"
+            and _is_pytest_test_path(path)
+            and not _has_collectable_pytest_test(content)):
+        retry = _regenerate_scaffold_file(
+            provider, system, context, budget, _TEST_RETRY_INSTR)
+        if retry and _has_collectable_pytest_test(retry):
+            content = retry
+        else:
+            syntax_ok = False
+            syntax_error = (
+                "no collectable pytest test: define at least one "
+                "top-level `def test_*` function (pytest exit 5)")
+
     patch = _content_to_new_file_patch(path, content) if content else ""
     result: Dict[str, Any] = {
         "file": path,
@@ -3007,6 +3190,219 @@ def generate_single_scaffold_file(
     if syntax_error:
         result["syntax_error"] = syntax_error
     return result
+
+
+def _is_pytest_test_path(path: str) -> bool:
+    """True when ``path`` is a Python file pytest would collect as a test.
+
+    Matches pytest's default naming convention: a ``.py`` file whose
+    basename is ``test_*.py`` or ``*_test.py``. Files under ``tests/``
+    that do not follow the convention (helpers, fixtures modules) are not
+    collected by pytest, so they are excluded here too.
+    """
+    p = path.strip().lower()
+    if not p.endswith(".py"):
+        return False
+    base = p.rsplit("/", 1)[-1]
+    return base.startswith("test_") or base.endswith("_test.py")
+
+
+def _has_collectable_pytest_test(content: str) -> bool:
+    """True when ``content`` defines at least one pytest-collectable test.
+
+    A test is collectable when it is a module-top-level function named
+    ``test`` / ``test_*`` (sync or async) or a ``test_*`` method on a
+    top-level ``class Test*``. Returns ``False`` on any syntax error --
+    an unparseable module collects nothing either.
+    """
+    import ast as _ast
+
+    def _is_test_name(name: str) -> bool:
+        return name == "test" or name.startswith("test_")
+
+    try:
+        tree = _ast.parse(content)
+    except SyntaxError:
+        return False
+    for node in tree.body:
+        if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+            if _is_test_name(node.name):
+                return True
+        elif isinstance(node, _ast.ClassDef) and node.name.startswith("Test"):
+            for item in node.body:
+                if (isinstance(item, (_ast.FunctionDef, _ast.AsyncFunctionDef))
+                        and _is_test_name(item.name)):
+                    return True
+    return False
+
+
+_TEST_RETRY_INSTR = (
+    "\n\nCRITICAL RETRY -- YOUR PREVIOUS ATTEMPT WAS REJECTED:\n"
+    "The file you produced contained NO pytest-collectable tests, so "
+    "pytest collected 0 items (exit code 5). Do NOT reimplement or copy "
+    "the application code into this file. Instead:\n"
+    "- IMPORT the code under test from the already-generated modules.\n"
+    "- Write at least THREE module-top-level `def test_*` functions, "
+    "each with real `assert` statements exercising a distinct behaviour.\n"
+    "- Do NOT add an `if __name__ == '__main__'` block or any "
+    "application logic."
+)
+
+
+def _module_symbol_index(
+        existing_files_with_content: List[Dict[str, str]],
+) -> Dict[str, Optional[set]]:
+    """Map each already-generated Python module to its exported symbols.
+
+    Keys are the import names another file could plausibly use -- the
+    module basename (``auth``), the full dotted path (``backend.auth``),
+    and the root-stripped path (``auth`` for ``src/auth.py``). The value
+    is the set of top-level names the module defines (functions,
+    classes, assignments, and imported aliases, which are all reachable
+    as module attributes), or ``None`` when the module does a
+    ``from x import *`` and its surface can't be determined statically.
+    """
+    import ast as _ast
+    index: Dict[str, Optional[set]] = {}
+    for ef in existing_files_with_content or []:
+        ep = (ef.get("path") or "").strip()
+        ec = ef.get("content") or ""
+        if not ep or not ec or not ep.endswith(".py"):
+            continue
+        try:
+            tree = _ast.parse(ec)
+        except SyntaxError:
+            continue
+        symbols: set = set()
+        star = False
+        for node in tree.body:
+            if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef,
+                                 _ast.ClassDef)):
+                symbols.add(node.name)
+            elif isinstance(node, _ast.Assign):
+                for t in node.targets:
+                    if isinstance(t, _ast.Name):
+                        symbols.add(t.id)
+            elif isinstance(node, _ast.AnnAssign):
+                if isinstance(node.target, _ast.Name):
+                    symbols.add(node.target.id)
+            elif isinstance(node, (_ast.Import, _ast.ImportFrom)):
+                for a in node.names:
+                    if a.name == "*":
+                        star = True
+                        continue
+                    symbols.add(a.asname or a.name.split(".")[0])
+        segs = [s for s in ep[:-3].split("/") if s and s != "__init__"]
+        names = set()
+        if segs:
+            names.add(segs[-1])
+            names.add(".".join(segs))
+            if len(segs) > 1:
+                names.add(".".join(segs[1:]))
+        for nm in names:
+            if star:
+                index[nm] = None
+            elif index.get(nm) is not None or nm not in index:
+                index[nm] = (index.get(nm) or set()) | symbols
+    return index
+
+
+def _first_party_symbol_violations(
+        content: str, index: Dict[str, Optional[set]],
+) -> List[Dict[str, Any]]:
+    """Return ``from <module> import <name>`` uses that don't resolve.
+
+    Only ``from`` imports of a first-party module present in ``index``
+    (with a known symbol surface) are checked; absolute third-party
+    imports, relative imports, and star-exporting modules are skipped.
+    """
+    import ast as _ast
+    try:
+        tree = _ast.parse(content)
+    except SyntaxError:
+        return []
+    out: List[Dict[str, Any]] = []
+    for node in tree.body:
+        if not isinstance(node, _ast.ImportFrom):
+            continue
+        if node.level:
+            continue
+        mod = node.module or ""
+        if mod not in index:
+            continue
+        avail = index[mod]
+        if avail is None:
+            continue
+        missing = [a.name for a in node.names
+                   if a.name != "*" and a.name not in avail]
+        if missing:
+            out.append({"module": mod, "missing": missing,
+                        "available": sorted(avail)})
+    return out
+
+
+def _symbol_retry_instruction(violations: List[Dict[str, Any]]) -> str:
+    """Build the hardened retry prompt listing each module's real API."""
+    parts = []
+    for v in violations:
+        avail = ", ".join(v["available"]) or "(nothing importable)"
+        parts.append(
+            f"- module '{v['module']}' does NOT define "
+            f"{', '.join(v['missing'])}; it only defines: {avail}")
+    return (
+        "\n\nCRITICAL RETRY -- YOUR PREVIOUS ATTEMPT WAS REJECTED:\n"
+        "You imported first-party symbols that the already-generated "
+        "modules do not define:\n" + "\n".join(parts) + "\n"
+        "Return the COMPLETE, corrected file. Import ONLY symbols that "
+        "actually exist in those modules (listed above) and call their "
+        "real API. Do NOT invent names or add markdown fences.")
+
+
+_SYNTAX_RETRY_INSTR = (
+    "\n\nCRITICAL RETRY -- YOUR PREVIOUS ATTEMPT WAS REJECTED:\n"
+    "The file you produced is not valid {lang} and failed to parse with:\n"
+    "  {error}\n"
+    "Return the COMPLETE, corrected file. It MUST parse cleanly: balance "
+    "all quotes/brackets/parentheses, close every triple-quoted string, "
+    "and terminate every block header (def/if/for/class) with a colon. "
+    "Do NOT include markdown fences, comments about the fix, or ellipsis."
+)
+
+
+def _regenerate_scaffold_file(
+        provider: Any, base_system: str, context: str,
+        budget: Dict[str, Any], instruction: str) -> str:
+    """Re-request a single scaffold file with a hardened instruction.
+
+    Reuses the original context (goal + already-generated files) with an
+    appended, failure-specific ``instruction`` so a second attempt can
+    correct the problem the first attempt shipped (a syntax error, or a
+    test file with no collectable tests). Returns the fence-stripped
+    ``content`` string, or ``""`` on any provider/parse failure.
+    """
+    hardened = base_system + instruction
+    try:
+        raw = provider.chat(
+            messages=[
+                {"role": "system", "content": hardened},
+                {"role": "user", "content": context},
+            ],
+            temperature=0.1,
+            max_tokens=budget["output_tokens"],
+            force_json=True,
+        ).get("content", "")
+    except Exception:  # pragma: no cover - defensive: provider hiccup
+        return ""
+    parsed = _extract_json_object(raw)
+    out = str(parsed.get("content") or "") if parsed else ""
+    if out:
+        stripped = out.strip()
+        if stripped.startswith("```"):
+            m = re.match(r"^```[a-zA-Z0-9_+\-]*\s*\n(.*?)\n```\s*$",
+                         stripped, re.DOTALL)
+            if m:
+                out = m.group(1)
+    return out
 
 
 def _render_plan_for_validation(parsed: Dict[str, Any]) -> str:

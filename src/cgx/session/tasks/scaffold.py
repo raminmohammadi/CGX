@@ -179,6 +179,7 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             "scaffold_artifact_id": artifact.artifact_id,
             "generated_count": len(generated),
             "failed_count": len(failed),
+            "failed": failed,
             "pin_adjustments_count": len(pin_adjustments),
         },
         artifact=artifact,

@@ -32,6 +32,7 @@ class SessionStatus(str, enum.Enum):
     ACTIVE = "active"
     PAUSED = "paused"
     COMPLETED = "completed"
+    FAILED = "failed"
     ABANDONED = "abandoned"
 
 

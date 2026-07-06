@@ -40,6 +40,7 @@ from cgx.session.router import (
     RecordLesson,
     Router,
     RouterPlan,
+    UpdateSessionStatus,
     UpdateTaskStatus,
 )
 from cgx.session.agent_log import log_event
@@ -52,6 +53,21 @@ from cgx.trace import (
 )
 
 logger = logging.getLogger(__name__)
+
+_LLM_TASK_KINDS = {
+    TaskKind.EXPLORE,
+    TaskKind.INVESTIGATE,
+    TaskKind.RECOMMEND,
+    TaskKind.PLAN_CHANGE,
+    TaskKind.REPAIR,
+    TaskKind.CLARIFY_REQUIREMENTS,
+    TaskKind.DECOMPOSE,
+    TaskKind.SCAFFOLD,
+}
+
+# GPU inference throttle: serialise heavy LLM generation tasks to protect
+# local GPU VRAM.
+_GPU_INFERENCE_SEMAPHORE = threading.Semaphore(1)
 
 
 class SessionRunner:
@@ -225,7 +241,11 @@ class SessionRunner:
         )
         try:
             try:
-                result = dispatch(task, deps)
+                if task.kind in _LLM_TASK_KINDS and provider is not None:
+                    with _GPU_INFERENCE_SEMAPHORE:
+                        result = dispatch(task, deps)
+                else:
+                    result = dispatch(task, deps)
             except LookupError as exc:
                 logger.warning("runner: %s", exc)
                 log_event(session.project_root, "executor_missing",
@@ -235,7 +255,7 @@ class SessionRunner:
                 if traced:
                     for fact in provider.drain():
                         self._store.add_fact(fact)
-                return self._mark_failed(session, task, str(exc))
+                return self._fail_and_route(session, task, str(exc))
             except Exception as exc:  # pragma: no cover - defensive
                 logger.exception("runner: executor crashed")
                 log_event(session.project_root, "executor_crashed",
@@ -246,7 +266,7 @@ class SessionRunner:
                 if traced:
                     for fact in provider.drain():
                         self._store.add_fact(fact)
-                return self._mark_failed(
+                return self._fail_and_route(
                     session, task, f"{type(exc).__name__}: {exc}")
 
             # Persist facts even on failure -- they're append-only context
@@ -261,7 +281,7 @@ class SessionRunner:
                 self._store.add_fact(fact)
 
             if result.failure:
-                return self._mark_failed(session, task, result.failure)
+                return self._fail_and_route(session, task, result.failure)
 
             if result.artifact is not None:
                 self._store.save_artifact(result.artifact)
@@ -308,6 +328,25 @@ class SessionRunner:
                   kind=task.kind.value, error=message)
         return task
 
+    def _fail_and_route(self, session: Session, task: TaskNode,
+                        message: str) -> TaskNode:
+        """Mark ``task`` FAILED and route the hard failure through the router.
+
+        A hard failure (executor ``result.failure`` or a crash) produces
+        no ``outputs``, so the ``on_task_completed`` successor table never
+        runs. Feeding it to :meth:`Router.on_task_failed` lets a
+        greenfield session reach its terminal ``FAILED`` status instead of
+        hanging in ``active`` with a dead FAILED leaf. Explore-mode
+        sessions get an empty plan, preserving their user-driven
+        lifecycle.
+        """
+        self._mark_failed(session, task, message)
+        tasks_after = self._store.list_tasks(session.session_id)
+        plan = self._router.on_task_failed(
+            session=session, failed=task, tasks=tasks_after)
+        self._apply_plan(session, plan)
+        return task
+
     def _apply_plan(self, session: Session, plan: RouterPlan) -> None:
         """Apply the router's actions to the store, in order.
 
@@ -340,13 +379,47 @@ class SessionRunner:
                 t.status = action.status
                 if action.clear_blockers:
                     t.blockers = []
-                if action.status is TaskNodeStatus.DONE:
+                if action.error is not None:
+                    t.error = action.error
+                if action.status in (TaskNodeStatus.DONE,
+                                     TaskNodeStatus.FAILED):
                     t.completed_at = time.time()
                 self._store.save_task(t)
+            elif isinstance(action, UpdateSessionStatus):
+                self._apply_session_status(session, action)
             elif isinstance(action, RecordLesson):
                 self._record_lesson(session, action)
             else:  # pragma: no cover - exhaustive at the type level
                 logger.warning("runner: unknown action %r", action)
+
+    def _apply_session_status(self, session: Session,
+                              action: UpdateSessionStatus) -> None:
+        """Persist a router-driven session lifecycle transition.
+
+        The router emits :class:`UpdateSessionStatus` when a greenfield
+        write loop reaches a definitive end (VERIFY passed -> COMPLETED;
+        verification failed with no automated recovery -> FAILED). The
+        target is normally the in-flight ``session``; fall back to a
+        store lookup so a mismatched id still lands.
+        """
+        target = session
+        if session.session_id != action.session_id:
+            fetched = self._store.get_session(action.session_id)
+            if fetched is None:
+                logger.warning(
+                    "runner: UpdateSessionStatus targets missing %s",
+                    action.session_id)
+                return
+            target = fetched
+        target.status = action.status
+        self._store.save_session(target)
+        log_event(target.project_root, "session_status_changed",
+                  session_id=target.session_id, status=action.status.value)
+
+    def delete_session_lock(self, session_id: str) -> None:
+        """Evict the lock for a session to prevent memory leaks."""
+        with self._locks_guard:
+            self._locks.pop(session_id, None)
 
     def _record_lesson(self, session: Session,
                        action: RecordLesson) -> None:

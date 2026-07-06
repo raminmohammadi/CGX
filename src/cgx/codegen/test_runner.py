@@ -69,7 +69,8 @@ def _module_candidates(rel_path: str) -> List[str]:
 
 
 _SKIP_DIRS = {".venv", "venv", ".git", "__pycache__", "node_modules",
-              "dist", "build", ".tox", ".mypy_cache", ".ruff_cache"}
+              "dist", "build", ".tox", ".mypy_cache", ".ruff_cache",
+              ".cgx-backups"}
 
 
 def discover_all_tests(
@@ -273,6 +274,45 @@ def _ensure_sandbox_venv(sandbox: Path, setup_timeout: float = 120.0) -> str:
     venv_dir = sandbox / ".venv"
     python_exe = str(venv_dir / "bin" / "python")
 
+    # Check if uv is available
+    has_uv = False
+    try:
+        subprocess.run(["uv", "--version"], capture_output=True, check=True)
+        has_uv = True
+    except Exception:
+        pass
+
+    if has_uv:
+        try:
+            # Create venv using uv
+            subprocess.run(
+                ["uv", "venv", "--quiet", str(venv_dir)],
+                cwd=str(sandbox), capture_output=True, timeout=setup_timeout, check=True
+            )
+            # Install pytest using uv
+            subprocess.run(
+                ["uv", "pip", "install", "--quiet", "--python", python_exe, "pytest"],
+                cwd=str(sandbox), capture_output=True, timeout=setup_timeout, check=True
+            )
+            # Install requirements using uv
+            for req in ("requirements.txt", "requirements-dev.txt", "requirements-test.txt"):
+                req_path = sandbox / req
+                if req_path.is_file():
+                    subprocess.run(
+                        ["uv", "pip", "install", "--quiet", "--python", python_exe, "-r", str(req)],
+                        cwd=str(sandbox), capture_output=True, timeout=setup_timeout, check=True
+                    )
+            # Editable install if package
+            if (sandbox / "pyproject.toml").is_file() or (sandbox / "setup.py").is_file():
+                subprocess.run(
+                    ["uv", "pip", "install", "--quiet", "--python", python_exe, "-e", "."],
+                    cwd=str(sandbox), capture_output=True, timeout=setup_timeout, check=True
+                )
+            return python_exe
+        except Exception as e:
+            logger.warning("codegen.test_runner: uv-based sandbox setup failed (%s); falling back to pip", e)
+
+    # Standard fallback
     result = subprocess.run(
         [sys.executable, "-m", "venv", str(venv_dir)],
         cwd=str(sandbox), capture_output=True, timeout=setup_timeout,
@@ -319,7 +359,7 @@ def run_impacted_tests(
     results: Sequence[PatchResult],
     *,
     timeout_seconds: float = 120.0,
-    extra_pytest_args: Iterable[str] = ("-q", "--no-header"),
+    extra_pytest_args: Iterable[str] = ("-q", "--no-header", "--ignore=.cgx-backups"),
     copy_filter: Optional[Iterable[str]] = None,
 ) -> TestRunOutcome:
     """Copy the project, apply patches, and run impacted tests under pytest."""
@@ -335,6 +375,7 @@ def run_impacted_tests(
         ignore = shutil.ignore_patterns(
             ".git", ".venv", "venv", "__pycache__", "node_modules",
             "*.pyc", ".mypy_cache", ".ruff_cache", "cgx_index", "dist", "build",
+            ".cgx-backups",
         )
         shutil.copytree(src, tmp / src.name, ignore=ignore, symlinks=False)
         sandbox = tmp / src.name
@@ -381,7 +422,7 @@ def run_pytest_paths(
     test_paths: Sequence[str],
     *,
     timeout_seconds: float = 180.0,
-    extra_pytest_args: Iterable[str] = ("-q", "--no-header"),
+    extra_pytest_args: Iterable[str] = ("-q", "--no-header", "--ignore=.cgx-backups"),
     python_exe: Optional[str] = None,
 ) -> TestRunOutcome:
     """Run pytest on an explicit list of test files against ``project_root``.
@@ -424,7 +465,7 @@ def run_tests_on_disk(
     changed_files: Sequence[str],
     *,
     timeout_seconds: float = 180.0,
-    extra_pytest_args: Iterable[str] = ("-q", "--no-header"),
+    extra_pytest_args: Iterable[str] = ("-q", "--no-header", "--ignore=.cgx-backups"),
     python_exe: Optional[str] = None,
 ) -> TestRunOutcome:
     """Run impacted tests directly against ``project_root`` (no sandbox copy).

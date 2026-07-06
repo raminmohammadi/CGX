@@ -412,7 +412,13 @@ back to `requirements.txt`); the resulting `BUILD_REPORT` artifact
 carries the venv path, the manifests installed from, the list of
 installed/failed packages, and an `outcome` token
 (`succeeded` / `failed` / `no_venv` / `skipped` / `partial`).
-`VERIFY` then runs pytest inside that venv and classifies the exit
+`APPLY` drops any file whose source does not parse and records it in
+`failed_files`; in greenfield mode a non-empty `failed_files` means a
+core module is silently missing, so rather than limping into
+`BOOTSTRAP_ENV` the router re-scaffolds within its regenerate budget
+with an `invalid_scaffold_syntax` constraint that enumerates each
+dropped file and its concrete error (Fix G1). `VERIFY` then runs
+pytest inside that venv and classifies the exit
 code into an `outcome` token (`passed` / `assertions_failed` /
 `collection_error` / `no_tests_collected` / `timeout` /
 `pytest_missing` / `skipped`) so a missing dependency reads as
@@ -446,7 +452,12 @@ v1 recognises three classifications:
   can resolve the scaffolded package on the next pass; a marker
   check makes the proposer idempotent (re-running it after a
   successful fix yields zero diffs, which escalates the loop to
-  `ASK_USER` instead of repeating).
+  `ASK_USER` instead of repeating). Fix G2: the locator only proposes
+  this `conftest.py` fix when the missing module's *full* dotted path
+  resolves on disk. A missing *leaf* (e.g. `tests.auth` where
+  `tests/` exists but `tests/auth.py` was never authored) yields no
+  diff -- no `sys.path` entry can conjure a module nobody wrote -- so
+  the classification routes to a regenerate instead of a no-op patch.
 * `missing_fixture` -- pytest reports `fixture '<name>' not found`
   during collection. The locator scans every `.py` file under the
   project root (skipping `.venv`, `__pycache__`, dotfile directories,
@@ -472,6 +483,15 @@ capped at two attempts and refuses to retry when the new
 `failure_signature` matches one already seen on the chain, so a
 fix that "succeeds" without actually resolving the failure
 escalates to a freeform `ASK_USER` instead of looping.
+
+Every greenfield failure path is terminal. A *hard* executor
+failure -- one that returns no `outputs`, such as a `BOOTSTRAP_ENV`
+whose `pip install` fails -- ends the session `FAILED` via the
+router's `on_task_failed` entry point (Fix F3) instead of leaving it
+hung in `active`; and a regenerate whose budget is spent (no SCAFFOLD
+ancestor left to retry) also ends `FAILED`. The loop never asks the
+user to hand-fix AI-generated code, and it never proceeds on a
+known-broken tree.
 
 `BOOTSTRAP_ENV` runs a complementary preflight test-style lint
 (`cgx.session.repair.locate.lint_test_style`) after
@@ -1067,6 +1087,30 @@ for recoverable issues (e.g. LLM fallback, missing cancel token). To
 increase verbosity set the `CGX_LOG_LEVEL` environment variable, or
 call `setup_logging` with the desired level before importing other cgx
 modules.
+
+### Function-call tracing (troubleshooting)
+
+When a session fails in a non-obvious place -- a REPAIR loop looping,
+an LLM call returning nothing, a codegen apply that silently no-ops --
+flip the **Function-call tracing** toggle on the `/settings` page (or
+export `CGX_TRACE=1` before launching `cgx web`) and rerun the failing
+step. While the toggle is on, an amber `TRACE` pill appears in the
+header and every curated entry point on the agent loop -- router,
+runner, executor, repair (`classify` / `locate` / `propose`), LLM
+(`cgx.answer.engine`), retrieval (`cgx.retrieval.orchestrator`,
+`cgx.pipeline.auto`), and codegen (`disk_apply`, `env_manager`,
+`test_runner`) -- appends `trace_enter` / `trace_exit`
+(with `elapsed_ms`) or `trace_error` (with `error_type` +
+truncated message) records to `<project_root>/.cgx/agent.log`.
+Calls made outside a session (retrieval / codegen driven from the CLI,
+HTTP middleware) fall through to a rotating fallback at
+`~/.cgx/cgx-trace.log` (2 MiB × 3 backups). `$CGX_TRACE` pins the
+flag when set -- the UI reports `source: "env"` and refuses to
+mutate it (HTTP `409`) so you can tell env-pinned from UI-pinned at
+a glance. Toggle it off once you have the failing trace: the
+decorator is a single `bool` check when disabled, but each `@traced`
+call still writes a JSONL row while it's on, so long-running sessions
+can produce thousands of lines.
 
 ## 15. Task REST API
 

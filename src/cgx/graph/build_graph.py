@@ -91,7 +91,7 @@ def parse_method_triplet_from_id(cid: str):
 
     try:
         pre, qual = cid.split("::method::", 1)
-        cls, meth = qual.split(".", 1)
+        cls, meth = qual.rsplit(".", 1)
         return pre, cls, meth
     except Exception:
         return None, None, None
