@@ -497,6 +497,54 @@ def test_inject_readme_is_idempotent():
 
 
 # ---------------------------------------------------------------------------
+# _inject_required_test_file: every greenfield manifest must ship at least
+# one test so the verify step has a runnable self-correction signal.
+# ---------------------------------------------------------------------------
+def test_inject_required_test_file_adds_pytest_smoke_for_python():
+    from cgx.answer.engine import _inject_required_test_file
+    layers = [
+        {"name": "backend", "files": [
+            {"path": "backend/main.py", "description": "FastAPI entry"},
+        ]},
+    ]
+    out = _inject_required_test_file(
+        layers, goal="build a python fastapi backend", skill_names=["python", "fastapi"],
+    )
+    paths = [f["path"] for lay in out for f in (lay.get("files") or [])]
+    assert "tests/test_smoke.py" in paths
+
+
+def test_inject_required_test_file_adds_js_test_for_react():
+    from cgx.answer.engine import _inject_required_test_file
+    layers = [
+        {"name": "ui", "files": [
+            {"path": "package.json", "description": "npm manifest"},
+            {"path": "src/App.jsx", "description": "React App"},
+        ]},
+    ]
+    out = _inject_required_test_file(
+        layers, goal="build a react calculator ui", skill_names=["react"],
+    )
+    paths = [f["path"] for lay in out for f in (lay.get("files") or [])]
+    # Extension mirrors the project's own source files (.jsx here).
+    assert "tests/app.test.jsx" in paths
+
+
+def test_inject_required_test_file_is_noop_when_test_present():
+    from cgx.answer.engine import _inject_required_test_file
+    layers = [
+        {"name": "core", "files": [{"path": "src/app.py", "description": "entry"}]},
+        {"name": "tests", "files": [
+            {"path": "tests/test_app.py", "description": "existing test"},
+        ]},
+    ]
+    out = _inject_required_test_file(layers, goal="python app", skill_names=["python"])
+    paths = [f["path"] for lay in out for f in (lay.get("files") or [])]
+    assert paths.count("tests/test_app.py") == 1
+    assert "tests/test_smoke.py" not in paths
+
+
+# ---------------------------------------------------------------------------
 # _is_pytest_test_path / _has_collectable_pytest_test: the deterministic
 # gate that stops an empty test suite (pytest exit 5) from stalling the
 # verify->repair loop.

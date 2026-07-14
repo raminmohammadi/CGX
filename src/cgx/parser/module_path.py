@@ -58,15 +58,26 @@ def compute_module_path(project_root: str, file_path: str) -> str:
             drive, tail = os.path.splitdrive(file_path)
             rel_path = tail.lstrip(os.sep).replace("\\", "/")
 
-        # Strip extension
-        if rel_path.endswith(".py"):
-            rel_path = rel_path[:-3]
+        # Strip the real file extension. For Python (".py") this is
+        # byte-identical to the historical ".py"-only strip; for other
+        # languages (".js", ".ts", ...) it drops their extension too so
+        # multi-language parsers get a clean dotted path.
+        _root, _ext = os.path.splitext(rel_path)
+        _ext = _ext.lower()
+        rel_path = _root
 
         # Replace separators with dots
         mod_path = rel_path.replace("/", ".")
 
-        # Drop trailing .__init__
+        # Drop trailing package-marker segments so a package's entry file
+        # collapses to the package path. ".__init__" is the Python marker
+        # (byte-identical to the historical behavior); ".index" is the
+        # JS/TS package entry and is only collapsed for those extensions so
+        # a Python file literally named ``index.py`` is unaffected.
         if mod_path.endswith(".__init__"):
+            mod_path = mod_path.rsplit(".", 1)[0]
+        elif _ext in (".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx",
+                      ".mts", ".cts") and mod_path.endswith(".index"):
             mod_path = mod_path.rsplit(".", 1)[0]
 
         # Guarantee non-empty

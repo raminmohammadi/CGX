@@ -45,6 +45,7 @@ class TaskKind(str, enum.Enum):
     SUMMARIZE = "summarize"             # short, LLM-driven summarisation of prior outputs
     APPLY = "apply"                     # write a prior PLAN/SCAFFOLD's files to disk (+ smoke test)
     VERIFY = "verify"                   # run impacted pytest tests against the modified tree
+    REINDEX = "reindex"                 # refresh the on-disk index after APPLY (incremental) so later tasks see new code
     FILL_LOGIC = "fill_logic"           # fill empty function bodies in a skeleton file (skeleton-and-fill phase 2)
 
 

@@ -144,13 +144,20 @@ AST-walk path for older indices. The companion anchor fields
 emitted by `cgx.retrieval.orchestrator.suggest_insertion_points`
 so an insertion target can be located without re-parsing the file.
 
-The parser side is fronted by a small registry
-(`cgx.parser.python_parser.PythonASTParser` registering for `.py`
-via the `BaseParser` ABC in `cgx.parser.base`). The project walker
-in `parse_codebase` dispatches on file extension; non-`.py` files
-are silently skipped today. Adding a language later means writing a
-new `BaseParser` subclass and registering its extensions -- no
-changes to the orchestrator or codegen layers.
+The parser side is fronted by a small registry keyed on file
+extension, all sharing the `BaseParser` ABC in `cgx.parser.base`.
+`PythonASTParser` (stdlib `ast`) registers for `.py` and is always
+available; `cgx.parser.js_ts_parser` registers tree-sitter parsers
+for `.js`, `.jsx`, `.ts`, and `.tsx` when the optional `parsers`
+extra is installed. The project walker in `parse_codebase`
+dispatches on extension and gracefully skips files with no
+registered parser, so a core install still indexes Python cleanly.
+Re-indexing is incremental at the parse layer via
+`cgx.parser.incremental`: a `parse_cache.json` manifest keyed on
+each file's mtime/sha lets unchanged files reuse their cached
+chunks. Adding a language later means writing a new `BaseParser`
+subclass and registering its extensions -- no changes to the
+orchestrator or codegen layers.
 
 ---
 

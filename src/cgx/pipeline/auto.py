@@ -96,7 +96,19 @@ def run_index_auto(
                 project_root, out_dir, metric, index_type, model_name)
 
     # ---------------- Parse & Graph ----------------
-    chunks, calls = _ensure_tuple_parse(parse_codebase(project_root))
+    # When incremental, reuse an on-disk parse cache so unchanged files are not
+    # re-parsed; the graph is then rebuilt from the merged (mostly cached)
+    # chunk set. A full parse is byte-for-byte equivalent to the incremental
+    # result for the same tree, so disabling the flag stays a pure fallback.
+    parse_stats: Dict[str, int] = {}
+    if incremental:
+        from cgx.parser.incremental import incremental_parse_codebase
+        cache_path = os.path.join(out_dir, "parse_cache.json")
+        chunks, calls, parse_stats = incremental_parse_codebase(
+            project_root, cache_path=cache_path,
+        )
+    else:
+        chunks, calls = _ensure_tuple_parse(parse_codebase(project_root))
     logger.info("Parsed codebase: %d chunks, %d calls", len(chunks), len(calls or []))
 
     G = build_knowledge_graph(chunks, calls)
@@ -248,6 +260,18 @@ def run_index_auto(
         logger.warning("Graph serialization failed, continuing: %s", e, exc_info=True)
         graph_path = None
 
+    # Hierarchical repo map: cheap whole-repo context for the Planner, derived
+    # from the intent-side record summaries and cached (fingerprint-keyed) so a
+    # later load skips the rebuild when records are unchanged.
+    repo_map_path = os.path.join(out_dir, "repo_map.json")
+    try:
+        from cgx.answer.repo_map import build_or_load_repo_map
+        rmap = build_or_load_repo_map(records, cache_path=repo_map_path)
+        logger.info("Saved repo_map.json (%s)", rmap.get("stats"))
+    except Exception as e:
+        logger.warning("Repo map build failed, continuing: %s", e, exc_info=True)
+        repo_map_path = None
+
     result = {
         "counts": {k: len(v) for k, v in per_view.items()},
         "out": {
@@ -255,9 +279,11 @@ def run_index_auto(
             "records": os.path.join(out_dir, "records.jsonl"),
             "chunks": os.path.join(out_dir, "chunks.jsonl"),
             "graph": graph_path,
+            "repo_map": repo_map_path,
         },
         "incremental": bool(incremental),
         "embedding_cache": cache_stats_per_view,
+        "parse": parse_stats,
     }
     logger.info("=== run_index_auto completed === %s", result["counts"])
     return result

@@ -27,6 +27,55 @@ from `nvidia-smi` -- e.g. `pip install --index-url
 https://download.pytorch.org/whl/cu128 torch` for a CUDA 12.8 driver.
 See `requirements-ml.txt` for the full recipe.
 
+## The terminal dashboard
+
+For a terminal-first workflow, run `cgx` with no arguments (or `cgx
+dash`) to open the interactive dashboard -- a full-screen REPL that
+unifies indexing, questions, and the agent loop in one place:
+
+```bash
+cgx                                  # bare invocation -> dashboard
+cgx dash --project-root /path/to/repo
+```
+
+The screen has four zones: an ASCII banner, a **status bar** (current
+directory, index state, active model and remaining context window), a
+**tips** panel, and a bordered input box. Type a plain message to route
+it through the Planner -> Tracker -> Judge agent loop -- it can answer a
+question, plan an edit, or scaffold new code. Lines starting with `/`
+are commands:
+
+| Command            | Action                                            |
+| ------------------ | ------------------------------------------------- |
+| `/help`            | Show the command reference.                       |
+| `/ask <question>`  | Fast, read-only grounded answer (streams live).   |
+| `/index [path]`    | Build/refresh the code graph for the project.     |
+| `/project <path>`  | Switch the active project directory.              |
+| `/model <name>`    | Set the model for the current provider.           |
+| `/provider <name>` | Use a saved profile, or `ollama`/`openai`/`gemini`. |
+| `/status`          | Show provider, index, and hardware status.        |
+| `/serve`           | Launch the web UI (FastAPI + React).              |
+| `/clear`           | Clear the screen and scrollback.                  |
+| `/quit`, `/exit`   | Leave the dashboard.                              |
+
+The dashboard shares the **exact streaming engine** the web UI uses:
+`/ask`, plain-text agent goals, and `/index` all run through
+`cgx.webui.handlers` (`stream_ask` / `stream_agent` / `stream_index`).
+Heavy work runs on a background thread while a Braille spinner shows
+elapsed time, so the prompt never looks frozen and answer tokens stream
+into the terminal as they arrive. Press **Ctrl-C** to cancel the
+running task and return to the prompt -- it flips the same `cancel_event`
+the web UI's Stop button uses, so the backend halts between tokens
+rather than the process dying. Ctrl-C at an empty prompt just clears the
+line; only `/quit` or EOF (Ctrl-D) leave the dashboard.
+
+The dashboard is stdlib-only: it uses ANSI escape sequences directly
+with no `rich`/`textual` dependency, so it works cleanly over SSH.
+Colour is auto-disabled when stdout is not a TTY or when `NO_COLOR` /
+`CGX_NO_COLOR` is set (`CGX_FORCE_COLOR` forces it back on). All the
+explicit subcommands below (`cgx index`, `cgx ask`, `cgx serve`, ...)
+remain available for scripted, non-interactive use.
+
 ## 1. Pick a provider
 
 CGX supports four provider kinds, all configurable from the **⚙️ Setup**
@@ -107,9 +156,29 @@ indices/                   # FAISS files + per-view metadata (.npy + .json)
 records.jsonl              # canonical records (one per chunk)
 chunks.jsonl               # raw parser chunks
 graph.json                 # NetworkX node-link graph
+repo_map.json              # cached hierarchical repo map (Planner context)
+parse_cache.json           # per-file parse cache (incremental re-parse)
 emb_cache_intent.npz       # content-addressed embedding cache (intent view)
 emb_cache_impl.npz         # content-addressed embedding cache (impl view)
 ```
+
+### Multi-language parsing
+
+`parse_codebase` dispatches each file to a parser by extension through an
+internal registry. Python (`.py`) is always parsed with the stdlib `ast`
+and needs no extra dependencies. JavaScript / TypeScript / TSX
+(`.js`, `.jsx`, `.ts`, `.tsx`) are parsed via tree-sitter when the
+optional `parsers` extra is installed:
+
+```bash
+pip install "cgx[parsers]"
+```
+
+Without that extra, JS/TS files are simply skipped and Python-only
+indexing continues to work -- the pipeline degrades gracefully rather
+than failing. Every parser emits the same chunk/call-relation shape, so
+retrieval, the graph, and the agent loop are language-agnostic
+downstream.
 
 ### Parallel two-view build and GPU detection
 
@@ -124,7 +193,13 @@ is in progress; clicking it terminates the SSE stream cleanly.
 
 ### Incremental re-indexing
 
-The two `emb_cache_*.npz` files make re-indexing cheap. Each file
+Re-indexing is cheap at **two** layers. First, at the *parse* layer
+(`cgx.parser.incremental`): a `parse_cache.json` manifest keyed on each
+file's mtime + sha lets unchanged files reuse their cached chunks, so
+only edited files are actually re-parsed. Second, at the *embedding*
+layer, described below.
+
+The two `emb_cache_*.npz` files make re-embedding cheap. Each file
 stores `{sha256(corpus_text): np.ndarray}` pairs; on the next
 `run_index_auto` call, unchanged chunks reuse their cached vectors and
 only modified chunks reach the embedder.
@@ -706,7 +781,7 @@ A picture-first overview lives in [flowcharts.md](flowcharts.md) -- the
 | `search` | Retrieve relevant code chunks | Yes |
 | `summarize` | Condense prior outputs | No |
 | `apply` | Write diffs from `plan` / `scaffold_file` outputs to `project_root` on disk (with backup mirror) | No |
-| `verify` | Run impacted pytest tests (with pre-flight dep install) | No |
+| `verify` | Detect the project's stack(s) and run each matching test runner via a pluggable registry (`cgx.codegen.test_runners`) -- pytest (with pre-flight dep install) for Python, `npm test`/`npm run build` for JS/TS -- merging their outcomes into one pass/fail signal | No |
 | `fill_logic` | Fill a single empty function body in an existing skeleton file | No |
 
 ### Generating a new project from scratch
@@ -723,7 +798,13 @@ call that returns just the layered file list, no contents) and the
 Tracker injects one `scaffold_file` task per planned file into the
 plan immediately after, ordered layer-by-layer so dependency-heavy
 files (core types, utilities) are generated before the files that
-import them. Each `scaffold_file` task calls
+import them. Before that, the manifest builder deterministically
+guarantees a well-formed layout: it injects required packaging files,
+a stack-appropriate test file when the manifest carried none
+(`_inject_required_test_file`, so `verify` always has a runnable
+pass/fail signal), Python package `__init__.py` markers, and a
+trailing `README.md`. The Judge's manifest check enforces the same
+required-test rule as a backstop. Each `scaffold_file` task calls
 `generate_single_scaffold_file` with the target path, its layer, and
 the full content of files already generated by earlier
 `scaffold_file` tasks. The `apply` task writes every generated file

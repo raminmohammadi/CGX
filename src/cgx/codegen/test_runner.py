@@ -38,6 +38,9 @@ logger = logging.getLogger(__name__)
 @dataclass
 class TestRunOutcome:
     """Result of running impacted tests against a patched sandbox."""
+    # The ``Test`` prefix is a naming coincidence; keep pytest from trying
+    # to collect this dataclass as a test case.
+    __test__ = False
     ran: bool
     returncode: int = 0
     stdout: str = ""

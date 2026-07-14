@@ -12,7 +12,8 @@ Wires :class:`~cgx.agents.planner.Planner`,
 * ``search``   → :func:`cgx.pipeline.auto.run_query_auto`
 * ``summarize``→ inline LLM condensation of prior outputs
 * ``apply``    → :func:`cgx.codegen.disk_apply.apply_diffs_to_disk`
-* ``verify``   → :func:`cgx.codegen.test_runner.run_tests_on_disk`
+* ``verify``   → :func:`cgx.codegen.test_runners.run_project_tests`
+* ``reindex``  → :func:`cgx.pipeline.auto.run_index_auto` (incremental refresh)
 
 ``scaffold`` is the only capability that does **not** require an index --
 it generates a brand-new project from a plain-language idea and stores
@@ -111,6 +112,14 @@ def _build_default_capabilities(
                 "Do NOT modify or re-emit these files (already verified):\n"
                 + "\n".join(f"- {p}" for p in do_not_change)
             )
+        # The Planner stamps a read-only "understand" brief onto change
+        # tasks. Fold it into the task text so the generator plans the
+        # edit grounded in the real files/symbols/tests (it's not a
+        # ``generate_code_plan`` parameter, so it would otherwise be
+        # stripped by ``safe_kw`` below).
+        brief_text = _render_understand_guidance(kw.pop("understand_brief", None))
+        if brief_text:
+            guidance.append(brief_text)
         if guidance:
             task_text = (task_text or "").rstrip() + "\n\n" + "\n\n".join(guidance)
         accepted = set(inspect.signature(generate_code_plan).parameters)
@@ -179,10 +188,8 @@ def _build_default_capabilities(
     def verify(prior: List[Dict[str, Any]], **kw: Any) -> Dict[str, Any]:
         if not project_root:
             raise ValueError("verify requires project_root to be set")
-        from cgx.codegen.test_runner import (
-            discover_all_tests, ensure_project_venv,
-            run_pytest_paths, run_tests_on_disk,
-        )
+        from cgx.codegen.test_runner import ensure_project_venv
+        from cgx.codegen.test_runners import run_project_tests
         changed = _changed_files_from_prior(prior)
 
         # Phase 1: ensure the project has its own .venv with declared
@@ -224,26 +231,17 @@ def _build_default_capabilities(
             except Exception as _e:
                 logger.debug("verify: preflight_install skipped: %s", _e)
 
-        # Standalone verify (no prior APPLY) -- sweep all discovered tests.
-        mode = "impacted"
-        if not changed:
-            discovered = discover_all_tests(project_root)
-            if discovered:
-                outcome = run_pytest_paths(
-                    project_root, discovered,
-                    timeout_seconds=float(kw.get("timeout", 180.0)),
-                )
-                mode = "all"
-            else:
-                outcome = run_tests_on_disk(
-                    project_root, changed,
-                    timeout_seconds=float(kw.get("timeout", 180.0)),
-                )
-        else:
-            outcome = run_tests_on_disk(
-                project_root, changed,
-                timeout_seconds=float(kw.get("timeout", 180.0)),
-            )
+        # Phase 3: detect the project's stack(s) and run each matching test
+        # runner (pytest, npm, ...) via the registry, merging their outcomes
+        # into one pass/fail signal. ``mode`` reflects whether the run was
+        # scoped to files changed upstream or a full sweep. ``python_exe``
+        # targets the project venv so pytest sees the bootstrapped deps.
+        mode = "impacted" if changed else "all"
+        outcome = run_project_tests(
+            project_root, changed,
+            timeout_seconds=float(kw.get("timeout", 180.0)),
+            python_exe=project_python,
+        )
         return {
             "ran": outcome.ran,
             "tests_passed": outcome.ran and outcome.returncode == 0,
@@ -253,6 +251,35 @@ def _build_default_capabilities(
             "stderr": outcome.stderr,
             "skipped_reason": outcome.skipped_reason,
             "mode": mode,
+        }
+
+    def reindex(prior: List[Dict[str, Any]], **kw: Any) -> Dict[str, Any]:
+        # Incrementally refresh the on-disk index so later SEARCH/ASK/PLAN
+        # tasks in this run see freshly applied code. Because retrieval
+        # capabilities reload records/indices from disk on every call (and
+        # the lexical cache is keyed on the records file's mtime/size), a
+        # rewrite is all that's needed to make the new code visible.
+        # Degrades gracefully to a no-op when the project isn't indexed.
+        if not project_root:
+            return {"reindexed": False, "skipped_reason": "no project_root"}
+        out_dir = None
+        if records_path:
+            out_dir = os.path.dirname(os.path.abspath(records_path))
+        elif index_dir:
+            out_dir = os.path.dirname(os.path.abspath(index_dir.rstrip("/\\")))
+        if not out_dir or not os.path.isdir(out_dir):
+            return {"reindexed": False,
+                    "skipped_reason": "index directory not found"}
+        from cgx.pipeline.auto import run_index_auto
+        rk: Dict[str, Any] = {"incremental": True}
+        if embed_model:
+            rk["model_name"] = embed_model
+        result = run_index_auto(project_root, out_dir, **rk)
+        return {
+            "reindexed": True,
+            "counts": result.get("counts") or {},
+            "parse": result.get("parse") or {},
+            "out": result.get("out") or {},
         }
 
     def scaffold_manifest(task_text: str, **kw: Any) -> Dict[str, Any]:
@@ -403,8 +430,51 @@ def _build_default_capabilities(
 
     return {"ask": ask, "plan": plan, "scaffold": scaffold, "search": search,
             "summarize": summarize, "apply": apply, "verify": verify,
+            "reindex": reindex,
             "scaffold_manifest": scaffold_manifest, "scaffold_file": scaffold_file,
             "fill_logic": fill_logic}
+
+
+def _render_understand_guidance(brief: Any) -> Optional[str]:
+    """Render the Planner's understand brief as generator guidance text.
+
+    Folds the structured brief (relevant files, symbols already defined,
+    existing tests to extend) into a compact block appended to the plan
+    task text so the code generator edits existing code rather than
+    recreating it. Returns ``None`` when the brief is missing or empty.
+    """
+    if not isinstance(brief, dict):
+        return None
+    parts: List[str] = []
+    rel = brief.get("relevant_files") or []
+    if rel:
+        parts.append(
+            "Relevant existing files (reuse/extend rather than recreate):\n"
+            + "\n".join(f"- {p}" for p in rel)
+        )
+    rendered_syms: List[str] = []
+    for s in (brief.get("symbols") or []):
+        if not isinstance(s, dict):
+            continue
+        kind = str(s.get("kind") or "").strip()
+        label = str(s.get("symbol") or "")
+        if kind:
+            label += f" ({kind})"
+        rendered_syms.append(f"- {label} in {s.get('file')}")
+    if rendered_syms:
+        parts.append(
+            "Symbols already defined (call them; do not redefine):\n"
+            + "\n".join(rendered_syms)
+        )
+    tests = brief.get("existing_tests") or []
+    if tests:
+        parts.append(
+            "Existing tests to extend (add cases here rather than starting "
+            "new suites):\n" + "\n".join(f"- {p}" for p in tests)
+        )
+    if not parts:
+        return None
+    return "Understand brief (orientation for this change):\n" + "\n\n".join(parts)
 
 
 def _extract_prior_search_hits(
@@ -592,6 +662,37 @@ def _build_default_retriever(
         return run_query_auto(**kwargs)
 
     return _retrieve
+
+
+def _build_default_repo_map(
+    index_dir: Optional[str], records_path: Optional[str],
+) -> Optional[Callable[[], Optional[Dict[str, Any]]]]:
+    """Return a zero-arg provider yielding the project's hierarchical repo map.
+
+    Returns ``None`` when no index is configured so the Planner simply
+    omits whole-repo context. The provider is lazy (only reads records
+    and builds/loads the map when the Planner calls it) and reuses a
+    fingerprint-keyed cache next to the index (``repo_map.json``).
+    """
+    if not index_dir or not records_path:
+        return None
+    if not os.path.isdir(index_dir):
+        return None
+
+    def _repo_map() -> Optional[Dict[str, Any]]:
+        from cgx.io.persist import load_jsonl
+        from cgx.answer.repo_map import build_or_load_repo_map
+        try:
+            records = load_jsonl(records_path)
+        except Exception as e:
+            logger.warning("repo map: failed to load records: %s", e)
+            return None
+        if not records:
+            return None
+        cache_path = os.path.join(index_dir, "repo_map.json")
+        return build_or_load_repo_map(records, cache_path=cache_path)
+
+    return _repo_map
 
 
 def _extract_verify_failures(plan: Any) -> List[Dict[str, Any]]:
@@ -1631,7 +1732,9 @@ def run_agent(
         retriever = _build_default_retriever(
             index_dir, records_path, embed_model=embed_model,
         )
-        planner = Planner(provider=provider, retriever=retriever)
+        repo_map = _build_default_repo_map(index_dir, records_path)
+        planner = Planner(provider=provider, retriever=retriever,
+                          repo_map=repo_map)
     # Only forward the optional kwargs when set, so callers that inject a
     # planner stub with a narrower ``plan(goal)`` signature (e.g. unit
     # tests) keep working in the default non-continuation path.

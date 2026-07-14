@@ -2287,6 +2287,11 @@ def plan_scaffold_manifest(
         goal=goal_clean or idea_clean,
         skill_names=skills,
     )
+    layers = _inject_required_test_file(
+        layers,
+        goal=goal_clean or idea_clean,
+        skill_names=skills,
+    )
     layers = _inject_python_package_inits(layers)
     layers = _inject_readme(layers, goal=goal_clean or idea_clean)
     return {
@@ -2393,6 +2398,101 @@ def _inject_required_manifest_files(
             "name": "config",
             "files": [{"path": p, "description": d} for p, d in to_inject.items()],
         })
+    return out
+
+
+# Test-file path conventions across the stacks CGX scaffolds. A manifest
+# already carries tests when any planned path matches one of these: the
+# pytest ``test_*.py`` / ``*_test.py`` names or the JS/TS ``*.test.*`` /
+# ``*.spec.*`` names.
+_TEST_FILE_RE = re.compile(
+    r"(?:^|/)test_[^/]+\.py$"
+    r"|(?:^|/)[^/]+_test\.py$"
+    r"|\.(?:test|spec)\.(?:js|jsx|ts|tsx|mjs|cjs)$",
+    re.IGNORECASE,
+)
+
+
+def _inject_required_test_file(
+    layers: List[Any],
+    *,
+    goal: str = "",
+    skill_names: Optional[List[str]] = None,
+) -> List[Any]:
+    """Guarantee every greenfield manifest carries at least one test file.
+
+    A scaffold with no tests leaves the ``verify`` step nothing to run, so
+    the self-correction loop has no pass/fail signal. Small models often
+    skip tests despite the prompt; rather than burn a retry on the Judge's
+    required-test check, we inject a stack-appropriate test entry whose
+    content the per-file generator fills in later.
+    """
+    paths: List[str] = []
+    for lay in layers or []:
+        if not isinstance(lay, dict):
+            continue
+        for f in (lay.get("files") or []):
+            if isinstance(f, dict):
+                p = str(f.get("path") or "").strip()
+                if p:
+                    paths.append(p)
+    if any(_TEST_FILE_RE.search(p) for p in paths):
+        return layers
+
+    goal_low = (goal or "").lower()
+    names_low = {s.lower() for s in (skill_names or [])}
+    exts = {"." + p.rsplit(".", 1)[-1].lower() for p in paths if "." in p}
+
+    _JS = re.compile(
+        r"\b(react|vue|svelte|next\.?js|express|angular|typescript|javascript|node(?:\.?js)?)\b",
+        re.IGNORECASE,
+    )
+    _PY = re.compile(r"\b(python|fastapi|flask|django)\b", re.IGNORECASE)
+    py_stack = (
+        bool(_PY.search(goal_low))
+        or bool(names_low & {"python", "fastapi", "flask", "django", "python_cli"})
+        or ".py" in exts
+    )
+    js_stack = (
+        bool(_JS.search(goal_low))
+        or bool(names_low & {"react", "vue", "svelte", "nextjs", "express",
+                             "angular", "typescript", "javascript", "node", "nodejs"})
+        or bool(exts & {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"})
+    )
+
+    if py_stack or not js_stack:
+        # Default to Python: pytest is always available, so the injected
+        # test is runnable by ``verify`` even with no toolchain installed.
+        entry = {
+            "path": "tests/test_smoke.py",
+            "description": (
+                "pytest smoke test: import the project's primary module(s) "
+                "and assert their core behaviour so `verify` has a runnable "
+                "pass/fail signal"
+            ),
+        }
+    else:
+        ext = ("tsx" if ".tsx" in exts else "ts" if ".ts" in exts
+               else "jsx" if ".jsx" in exts else "js")
+        entry = {
+            "path": f"tests/app.test.{ext}",
+            "description": (
+                "Vitest/Jest unit test covering the core component/logic so "
+                "the build+test step has a real pass/fail signal"
+            ),
+        }
+
+    out = list(layers)
+    tests_layer = next(
+        (lay for lay in out
+         if isinstance(lay, dict)
+         and str(lay.get("name") or "").lower() in ("tests", "test", "testing")),
+        None,
+    )
+    if tests_layer is not None:
+        tests_layer["files"] = list(tests_layer.get("files") or []) + [entry]
+    else:
+        out.append({"name": "tests", "files": [entry]})
     return out
 
 

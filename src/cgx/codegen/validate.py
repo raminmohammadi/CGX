@@ -6,11 +6,17 @@ Currently this module implements:
 
 - Python: ``ast.parse`` over the post-patch source, surfacing line/column
   information for the first ``SyntaxError`` if any.
+- JavaScript / TypeScript / TSX: a tree-sitter parse that fails on the first
+  ERROR / MISSING node (best-effort: skipped when the optional tree-sitter
+  grammar is unavailable, mirroring the YAML validator).
 - JSON: ``json.loads`` for ``*.json`` files.
 - YAML: ``yaml.safe_load`` when PyYAML is importable (best-effort).
 
 Each validator is intentionally cheap and side-effect-free so we can run them
-on every iteration of an LLM generation loop.
+on every iteration of an LLM generation loop. Grounding correctness in a real
+parser rather than the model's self-report keeps generation quality flat
+across providers -- a weak local model that emits broken JS is caught by the
+same deterministic gate as a strong cloud one.
 """
 
 from __future__ import annotations
@@ -20,7 +26,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass
-from typing import List, Optional, Sequence
+from typing import Any, List, Optional, Sequence
 
 from cgx.codegen.diff_apply import PatchResult
 
@@ -38,14 +44,30 @@ class SyntaxDiagnostic:
     column: Optional[int] = None
 
 
+# Extension -> tree-sitter grammar name for the JS/TS family. Mirrors the
+# parser registrations in ``cgx.parser.js_ts_parser`` so the syntax gate
+# covers exactly the files those parsers index. The grammar name doubles as
+# the diagnostic ``language`` label.
+_JS_TS_LANGS = {
+    ".js": "javascript", ".jsx": "javascript",
+    ".mjs": "javascript", ".cjs": "javascript",
+    ".ts": "typescript", ".mts": "typescript", ".cts": "typescript",
+    ".tsx": "tsx",
+}
+
+
 def _detect_language(path: str) -> str:
     p = path.lower()
-    if p.endswith(".py"):
+    dot = p.rfind(".")
+    ext = p[dot:] if dot >= 0 else ""
+    if ext == ".py":
         return "python"
-    if p.endswith(".json"):
+    if ext == ".json":
         return "json"
-    if p.endswith((".yaml", ".yml")):
+    if ext in (".yaml", ".yml"):
         return "yaml"
+    if ext in _JS_TS_LANGS:
+        return _JS_TS_LANGS[ext]
     return "unknown"
 
 
@@ -95,6 +117,67 @@ def _validate_yaml(path: str, source: str) -> SyntaxDiagnostic:
         return SyntaxDiagnostic(path=path, ok=True, language="yaml")
     except Exception as e:
         return SyntaxDiagnostic(path=path, ok=False, language="yaml", error=f"{type(e).__name__}: {e}")
+
+
+def _first_error_node(root: Any) -> Optional[Any]:
+    """Return the first ERROR / MISSING node in a tree-sitter tree, or ``None``.
+
+    Iterative pre-order walk so a deeply-nested syntax error does not blow the
+    Python recursion limit on a large generated file.
+    """
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if node.is_missing or node.type == "ERROR":
+            return node
+        # Only descend where the parser flagged a problem; a clean subtree
+        # cannot contain an ERROR/MISSING node.
+        if node.has_error:
+            stack.extend(reversed(node.children))
+    return None
+
+
+def validate_js_ts_source(
+    path: str, source: str, language: str,
+) -> SyntaxDiagnostic:
+    """Parse ``source`` with the tree-sitter ``language`` grammar.
+
+    ``language`` is a grammar name (``javascript`` / ``typescript`` / ``tsx``).
+    Degrades gracefully -- when the optional ``tree_sitter_language_pack``
+    dependency (or the specific grammar) is unavailable we return ``ok=True``
+    with a skip note, mirroring the YAML validator, so an install without the
+    ``parsers`` extra behaves exactly as before this gate existed.
+    """
+    from cgx.parser.treesitter_base import _get_ts_parser
+
+    parser = _get_ts_parser(language)
+    if parser is None:
+        return SyntaxDiagnostic(
+            path=path, ok=True, language=language,
+            error="tree-sitter grammar unavailable; skipped",
+        )
+    try:
+        tree = parser.parse(source.encode("utf-8", errors="ignore"))
+    except Exception as e:  # pragma: no cover - defensive
+        return SyntaxDiagnostic(
+            path=path, ok=False, language=language,
+            error=f"{type(e).__name__}: {e}",
+        )
+    if not tree.root_node.has_error:
+        return SyntaxDiagnostic(path=path, ok=True, language=language)
+    bad = _first_error_node(tree.root_node)
+    if bad is None:
+        # ``has_error`` was set but no ERROR/MISSING node surfaced; treat as OK
+        # rather than emit an error with no location to feed back.
+        return SyntaxDiagnostic(path=path, ok=True, language=language)
+    line = bad.start_point[0] + 1
+    column = bad.start_point[1] + 1
+    kind = "missing token" if bad.is_missing else "syntax error"
+    return SyntaxDiagnostic(
+        path=path, ok=False, language=language,
+        error=f"{kind} near line {line}, column {column}",
+        line=line, column=column,
+    )
 
 
 _JS_EXTS = {".jsx", ".js", ".tsx", ".ts", ".mjs", ".cjs"}
@@ -182,6 +265,8 @@ def validate_patch_results(results: Sequence[PatchResult]) -> List[SyntaxDiagnos
             continue
         if lang == "python":
             diagnostics.append(validate_python_source(r.path, r.new_content))
+        elif lang in ("javascript", "typescript", "tsx"):
+            diagnostics.append(validate_js_ts_source(r.path, r.new_content, lang))
         elif lang == "json":
             diagnostics.append(_validate_json(r.path, r.new_content))
         elif lang == "yaml":

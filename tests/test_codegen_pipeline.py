@@ -504,3 +504,86 @@ def test_apply_hunks_ambiguous_match_is_rejected(tmp_path: Path) -> None:
     assert not res.ok
     assert len(res.rejected_hunks) == 1
     assert res.new_content == src
+
+
+# ---------------------------------------------------------------------------
+# JS/TS/TSX syntax gate: tree-sitter-backed deterministic validation. Grammars
+# ship with the ``parsers`` extra; skip the real-parse cases when absent so the
+# suite still runs on a minimal install (the degradation case is exercised via
+# monkeypatch below and needs no grammar).
+# ---------------------------------------------------------------------------
+def _require_grammar(language: str) -> None:
+    from cgx.parser.treesitter_base import treesitter_available
+
+    if not treesitter_available(language):
+        pytest.skip(f"tree-sitter grammar for {language!r} unavailable")
+
+
+def test_validate_js_source_accepts_valid() -> None:
+    _require_grammar("javascript")
+    from cgx.codegen.validate import validate_js_ts_source
+
+    src = "export function add(a, b) {\n  return a + b;\n}\n"
+    diag = validate_js_ts_source("src/add.js", src, "javascript")
+    assert diag.ok
+    assert diag.language == "javascript"
+
+
+def test_validate_js_source_flags_syntax_error() -> None:
+    _require_grammar("javascript")
+    from cgx.codegen.validate import validate_js_ts_source
+
+    # Unclosed function body.
+    src = "export function add(a, b) {\n  return a + b;\n"
+    diag = validate_js_ts_source("src/add.js", src, "javascript")
+    assert not diag.ok
+    assert diag.line is not None
+
+
+def test_validate_tsx_accepts_jsx() -> None:
+    _require_grammar("tsx")
+    from cgx.codegen.validate import validate_js_ts_source
+
+    src = (
+        "export const App = (): JSX.Element => {\n"
+        "  return <div className=\"x\">hi</div>;\n"
+        "};\n"
+    )
+    diag = validate_js_ts_source("src/App.tsx", src, "tsx")
+    assert diag.ok
+
+
+def test_validate_ts_flags_syntax_error() -> None:
+    _require_grammar("typescript")
+    from cgx.codegen.validate import validate_js_ts_source
+
+    src = "const x: number = ;\n"
+    diag = validate_js_ts_source("src/x.ts", src, "typescript")
+    assert not diag.ok
+
+
+def test_validate_js_ts_source_degrades_when_grammar_unavailable(monkeypatch) -> None:
+    # No ``parsers`` extra installed -> skip the gate rather than hard-fail,
+    # mirroring the YAML validator when PyYAML is absent.
+    import cgx.parser.treesitter_base as ts_base
+    from cgx.codegen.validate import validate_js_ts_source
+
+    monkeypatch.setattr(ts_base, "_get_ts_parser", lambda language: None)
+    diag = validate_js_ts_source("src/add.js", "this is not js {{{", "javascript")
+    assert diag.ok
+    assert "unavailable" in (diag.error or "")
+
+
+def test_validate_patch_results_routes_js_through_gate() -> None:
+    _require_grammar("javascript")
+    from cgx.codegen.diff_apply import PatchResult
+    from cgx.codegen.validate import validate_patch_results
+
+    good = PatchResult(path="src/ok.js", ok=True,
+                       new_content="export const x = 1;\n")
+    bad = PatchResult(path="src/bad.jsx", ok=True,
+                      new_content="export function f() {\n  return (\n")
+    diags = {d.path: d for d in validate_patch_results([good, bad])}
+    assert diags["src/ok.js"].ok
+    assert not diags["src/bad.jsx"].ok
+    assert diags["src/bad.jsx"].language == "javascript"

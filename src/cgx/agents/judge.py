@@ -133,6 +133,17 @@ _LANGUAGE_REQUIRED_FILES: Dict[str, tuple] = {
 }
 
 
+# Test-file naming conventions across the stacks CGX scaffolds: pytest
+# ``test_*.py`` / ``*_test.py`` and the JS/TS ``*.test.*`` / ``*.spec.*``
+# names. Kept in sync with the engine's manifest test injector.
+_TEST_FILE_RE = re.compile(
+    r"(?:^|/)test_[^/]+\.py$"
+    r"|(?:^|/)[^/]+_test\.py$"
+    r"|\.(?:test|spec)\.(?:js|jsx|ts|tsx|mjs|cjs)$",
+    re.IGNORECASE,
+)
+
+
 def _goal_language_backend_exts(goal_low: str) -> tuple:
     """Pick the most specific backend extensions implied by the goal text."""
     for lang, exts in _LANGUAGE_BACKEND_EXTS.items():
@@ -215,6 +226,14 @@ def _manifest_required_missing(
         if not (basenames & set(entry_names)):
             issues.append("Goal asks for a Python backend but manifest has "
                           f"no entry module ({', '.join(entry_names)}).")
+
+    # Every scaffold must ship at least one test so the verify step has a
+    # self-correction signal. Backstops the deterministic test injection in
+    # the manifest builder (engine._inject_required_test_file).
+    if not any(_TEST_FILE_RE.search(p) for p in paths):
+        issues.append("Manifest has no test file; a scaffold must include at "
+                      "least one test (e.g. tests/test_*.py or *.test.ts) so "
+                      "the verify step has a runnable pass/fail signal.")
 
     if not issues:
         return None
@@ -320,7 +339,8 @@ class Judge:
         if (struct is not None and struct.passed
                 and (task.kind in (TaskKind.SEARCH, TaskKind.APPLY,
                                    TaskKind.VERIFY, TaskKind.SCAFFOLD,
-                                   TaskKind.SCAFFOLD_MANIFEST, TaskKind.SCAFFOLD_FILE)
+                                   TaskKind.SCAFFOLD_MANIFEST, TaskKind.SCAFFOLD_FILE,
+                                   TaskKind.REINDEX)
                      or _is_clarify_ask(task))):
             logger.info("Judge: structural PASS short-circuit id=%s kind=%s "
                         "(skipping LLM grader)", task.id, kind_val)
@@ -561,6 +581,19 @@ class Judge:
             return Verdict(verdict="fail", confidence=0.95,
                            rationale=f"Impacted tests failed (rc={rc}).",
                            checked_criteria=ncrit)
+        if task.kind == TaskKind.REINDEX:
+            # Mechanical, ground-truth step: a no-op (project not indexed on
+            # disk) is a soft pass, and a completed refresh is a hard pass.
+            if not bool(out.get("reindexed")):
+                reason = str(out.get("skipped_reason") or "index not refreshed")
+                return Verdict(verdict="pass", confidence=0.6,
+                               rationale=f"Reindex skipped: {reason}",
+                               checked_criteria=ncrit)
+            counts = out.get("counts") or {}
+            n = sum(int(v) for v in counts.values() if isinstance(v, int))
+            return Verdict(verdict="pass", confidence=0.95,
+                           rationale=f"Index refreshed ({n} record(s)).",
+                           checked_criteria=ncrit)
         if task.kind == TaskKind.SCAFFOLD_MANIFEST:
             layers = out.get("layers")
             if not isinstance(layers, list) or not layers:
@@ -627,6 +660,10 @@ class Judge:
         logger.info("Judge: invoking LLM grader id=%s kind=%s artifact_len=%d",
                     task.id, kind_val, len(artifact))
         try:
+            # Schema-constrained decoding pins the verdict object's shape on
+            # providers that support it; others fall back to plain JSON mode
+            # and the balanced-brace extractor below still applies.
+            from cgx.answer.schemas import JUDGE_SCHEMA
             resp = self.provider.chat(
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
@@ -635,6 +672,7 @@ class Judge:
                 temperature=0.0,
                 max_tokens=1000,
                 force_json=True,
+                json_schema=JUDGE_SCHEMA,
             )
         except Exception as e:
             logger.warning("Judge: LLM grader raised %s: %s",

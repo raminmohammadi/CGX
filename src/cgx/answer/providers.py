@@ -11,6 +11,7 @@ from typing import Any, Dict, Iterator, List, Optional
 import requests  # intentionally re-exported; UI imports this to ensure dependency
 
 from cgx.answer.ratelimit import RateLimiter, backoff_seconds, request_with_retry
+from cgx.answer.schemas import to_gemini_schema, to_openai_response_format
 
 DEFAULT_TIMEOUT = float(os.environ.get("CGX_HTTP_TIMEOUT", "120"))
 
@@ -49,6 +50,12 @@ class LLMProvider:
     All providers accept `force_json` (default True). When False, providers
     must NOT request constrained JSON output, so callers can emit free-form
     text (e.g. unified diffs) without backslash/quote escaping artefacts.
+
+    Providers also accept an optional `json_schema` (a JSON-Schema dict). When
+    supplied together with `force_json`, the provider requests schema-
+    constrained decoding in its native form; on any backend that rejects the
+    schema the call degrades gracefully to plain JSON mode, so callers keep
+    their existing balanced-brace extraction as the final safety net.
     """
     def chat(
         self,
@@ -56,6 +63,7 @@ class LLMProvider:
         temperature: float = 0.2,
         max_tokens: Optional[int] = None,
         force_json: bool = True,
+        json_schema: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         raise NotImplementedError
@@ -114,6 +122,7 @@ class OllamaProvider(LLMProvider):
         temperature: float = 0.2,
         max_tokens: Optional[int] = None,
         force_json: bool = True,
+        json_schema: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         url = f"{self.base_url}/api/chat"
@@ -127,17 +136,27 @@ class OllamaProvider(LLMProvider):
             "options": options,
         }
         if force_json:
-            # Constrains the sampler to emit a single JSON object.
-            payload["format"] = "json"
+            # Ollama's `format` accepts either the literal string "json" or a
+            # JSON schema object (structured outputs). Prefer the schema when
+            # given; fall back below if the server rejects it.
+            payload["format"] = json_schema if json_schema else "json"
         if max_tokens is not None:
             # Ollama supports `num_predict` as a cap on tokens to generate
             options["num_predict"] = int(max_tokens)
 
-        resp = request_with_retry(
-            lambda: requests.post(url, json=payload, timeout=self.timeout),
-            limiter=self._limiter,
-            max_retries=self._max_retries,
-        )
+        def _post():
+            return request_with_retry(
+                lambda: requests.post(url, json=payload, timeout=self.timeout),
+                limiter=self._limiter,
+                max_retries=self._max_retries,
+            )
+
+        resp = _post()
+        # Graceful degradation: an older Ollama (or a model without grammar
+        # support) rejects a schema `format`. Retry once in plain JSON mode.
+        if force_json and json_schema and getattr(resp, "status_code", 200) >= 400:
+            payload["format"] = "json"
+            resp = _post()
         try:
             resp.raise_for_status()
         except Exception as e:
@@ -255,6 +274,7 @@ class GeminiProvider(LLMProvider):
         temperature: float = 0.2,
         max_tokens: Optional[int] = None,
         force_json: bool = True,
+        json_schema: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         if not self.api_key:
@@ -273,14 +293,27 @@ class GeminiProvider(LLMProvider):
         if max_tokens:
             body["generationConfig"]["maxOutputTokens"] = int(max_tokens)
         if force_json:
-            # Gemini supports constrained JSON output via responseMimeType.
+            # Gemini supports constrained JSON output via responseMimeType,
+            # and structured output via responseSchema (an OpenAPI subset).
             body["generationConfig"]["responseMimeType"] = "application/json"
+            if json_schema:
+                body["generationConfig"]["responseSchema"] = to_gemini_schema(
+                    json_schema
+                )
 
-        resp = request_with_retry(
-            lambda: requests.post(self._url(), json=body, timeout=self.timeout),
-            limiter=self._limiter,
-            max_retries=self._max_retries,
-        )
+        def _post():
+            return request_with_retry(
+                lambda: requests.post(self._url(), json=body, timeout=self.timeout),
+                limiter=self._limiter,
+                max_retries=self._max_retries,
+            )
+
+        resp = _post()
+        # Graceful degradation: a rejected schema (400) drops back to plain
+        # JSON mode, which every current Gemini model honours.
+        if force_json and json_schema and getattr(resp, "status_code", 200) >= 400:
+            body["generationConfig"].pop("responseSchema", None)
+            resp = _post()
         try:
             resp.raise_for_status()
         except Exception as e:
@@ -480,6 +513,7 @@ class OpenAICompatProvider(LLMProvider):
         temperature: float = 0.2,
         max_tokens: Optional[int] = None,
         force_json: bool = True,
+        json_schema: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         path = self.endpoint_path if self.endpoint_path.startswith("/") else "/" + self.endpoint_path
@@ -505,14 +539,32 @@ class OpenAICompatProvider(LLMProvider):
             )
 
         if force_json:
-            # Prefer strict JSON responses if supported; fall back on 4xx.
-            try:
-                body["response_format"] = {"type": "json_object"}
-                resp = _do_post(body)
-                if resp.status_code >= 400:
-                    raise RuntimeError(f"HTTP {resp.status_code}")
-            except Exception:
-                body.pop("response_format", None)
+            # Try the most constrained response_format first and walk down a
+            # compatibility ladder, accepting the first attempt that does not
+            # 4xx: json_schema (structured) -> json_object -> plain text. This
+            # keeps strong servers on the tightest contract while degrading
+            # gracefully on ones that reject the newer field.
+            ladder: List[Optional[Dict[str, Any]]] = []
+            if json_schema:
+                ladder.append(to_openai_response_format(json_schema))
+            ladder.append({"type": "json_object"})
+            ladder.append(None)  # plain: no response_format
+            resp = None
+            for rf in ladder:
+                if rf is None:
+                    body.pop("response_format", None)
+                else:
+                    body["response_format"] = rf
+                try:
+                    resp = _do_post(body)
+                except Exception:
+                    resp = None
+                    continue
+                if getattr(resp, "status_code", 500) < 400:
+                    break
+            if resp is None:
+                # Every attempt raised a transport error; issue the plain
+                # request once more so the exception propagates as before.
                 resp = _do_post(body)
         else:
             resp = _do_post(body)

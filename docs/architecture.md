@@ -8,7 +8,10 @@ CGX is structured as a small set of cooperating layers under `cgx.*`.
 cgx.parser              -- language-aware tree walker → chunk records
 cgx.parser.schema       -- TypedDicts pinning the chunk + call-relation shapes
 cgx.parser.base         -- BaseParser ABC; the per-language seam
-cgx.parser.python_parser -- PythonASTParser; the only registered parser today
+cgx.parser.python_parser -- PythonASTParser (stdlib ast); always registered
+cgx.parser.treesitter_base -- shared tree-sitter loader for non-Python grammars
+cgx.parser.js_ts_parser -- JavaScript / TypeScript / TSX parsers ([parsers] extra)
+cgx.parser.incremental  -- file-hash/mtime-keyed re-parse + parse_cache.json
 cgx.parser.module_path  -- repo-root-aware dotted-name resolver for imports
 cgx.graph               -- NetworkX call/containment graph over chunks
 cgx.graph.aggregation   -- node/edge projections consumed by retrieval + viz
@@ -20,7 +23,9 @@ cgx.retrieval           -- hybrid retriever (semantic + BM25 + graph) + RRF
 cgx.retrieval.tokenize  -- symmetric sub-word tokenizer (camelCase / snake_case)
 cgx.answer              -- LLM providers, intent detection, prompt registry
 cgx.answer.context_map  -- tiered ("Code Map") SOURCES builder for the prompt
-cgx.answer.model_caps   -- model-window-aware budgets consumed by context_map
+cgx.answer.model_caps   -- model-window-aware budgets + capability tiers
+cgx.answer.repo_map     -- hierarchical repo map (cached) fed to the Planner
+cgx.answer.schemas      -- JSON schemas for provider-native constrained decoding
 cgx.answer.providers    -- OllamaProvider, OpenAICompatProvider, GeminiProvider
 cgx.answer.ratelimit    -- token-bucket limiter + 429/5xx retry
 cgx.answer.profiles     -- provider config + keyring-backed secret store
@@ -58,6 +63,17 @@ cgx.cli / cgx.webui     -- terminal + FastAPI/React surfaces (uvicorn on :8765)
 
 1. `parse_codebase` walks the repo (respecting `.gitignore`, ignore globs
    and a 1 MB file-size cap) and emits one chunk per file/class/function.
+   Files are dispatched by extension through `_PARSER_REGISTRY`: Python is
+   parsed with the stdlib `ast`, while JavaScript / TypeScript / TSX are
+   parsed via tree-sitter (`cgx.parser.js_ts_parser`) when the optional
+   `parsers` extra is installed -- absent it, those files are simply
+   skipped and Python-only indexing still works. Re-indexing runs
+   incrementally by default (`cgx.parser.incremental`): a
+   `parse_cache.json` manifest keyed on each file's mtime/sha lets
+   unchanged files reuse their cached chunks so only edited files are
+   re-parsed. A hierarchical repo map (`cgx.answer.repo_map`) is also
+   emitted and cached (`repo_map.json`) for cheap whole-repo Planner
+   context.
 2. `build_knowledge_graph` derives a NetworkX graph with `calls`, `module`,
    `attr` and `defined_in` edges.
 3. `make_index_records` materialises chunk records, then
@@ -141,10 +157,16 @@ not the focal body.
 **Budget** (`cgx.answer.model_caps.get_context_map_budget`)
 
 `get_context_map_budget(provider)` returns a five-key dict scaled by
-the provider's model context window. The same window-resolution logic
-already used by `get_summary_budget` (small / mid / large / huge tiers
-at 16K / 64K / 200K boundaries) drives a separate, more generous set
-of numbers tuned for SOURCES rather than summary prose:
+the provider's model context window. Every budget / prompt-strategy
+accessor now keys off a single classification,
+`get_capability_tier(provider_or_model)` -> `small | medium | large |
+xlarge` (context-window bands at 16K / 64K / 200K), so a new model only
+needs a window entry and never a per-model branch at a call site. The
+tier indexes flat tables (`_SUMMARY_BUDGETS`, `_CONTEXT_MAP_BUDGETS`,
+`_PROMPT_STRATEGIES`); `get_summary_budget`, `get_context_map_budget`,
+and `get_prompt_strategy` are thin lookups returning copies. The
+context-map budget uses a separate, more generous set of numbers tuned
+for SOURCES rather than summary prose:
 
 | Window           | `primary_chars` | `neighbor_chars` | `primary_max` | `neighbor_max` | `total_chars` |
 |------------------|-----------------|------------------|---------------|----------------|---------------|
@@ -223,7 +245,12 @@ total-chars ceiling, ordering), and the engine-level branch
 
 1. `parse_fenced_diffs` extracts ` ```diff path=... ``` blocks.
 2. `apply_diffs_in_memory` projects each patch onto the current file.
-3. `validate_patch_results` runs `ast.parse` over Python targets.
+3. `validate_patch_results` runs a per-language syntax gate: `ast.parse`
+   over Python targets and a tree-sitter parse over JavaScript /
+   TypeScript / TSX targets (the latter skipped gracefully when the
+   optional `parsers` extra is absent). Grounding the check in a real
+   parser rather than the model's self-report keeps quality flat across
+   providers.
 4. `run_impacted_tests` (when enabled) copies the project into a
    temporary directory, materialises the diffs, and runs
    `pytest <impacted_files>` with a timeout.
@@ -279,6 +306,23 @@ orchestration layer never knows which backend it is talking to.
 | `OllamaProvider` | `"ollama"` | Local Ollama via `/api/chat`; JSON mode via `format: "json"`. |
 | `OpenAICompatProvider` | `"openai-compat"` or `"custom"` | Any `/v1/chat/completions`-compatible endpoint. Accepts `endpoint_path` to override the path suffix and `allow_no_auth=True` to skip Bearer auth (private subnets). |
 | `GeminiProvider` | `"gemini"` | Google Gemini via `generativelanguage.googleapis.com`. Maps CGX's `messages` to Gemini's `contents` + `systemInstruction`; merges consecutive same-role turns; uses `responseMimeType: "application/json"` for JSON mode; streams via `streamGenerateContent`. |
+
+**Schema-constrained decoding** (`cgx.answer.schemas`): every `chat()`
+also accepts an optional `json_schema` dict. When passed together with
+`force_json`, each provider requests structured output in its native
+form -- Ollama sets `format` to the schema object, `OpenAICompatProvider`
+sends `response_format={"type":"json_schema", ...}`, and `GeminiProvider`
+sets `generationConfig.responseSchema` (converted to Gemini's OpenAPI
+subset via `to_gemini_schema`). Any backend that rejects the schema
+(HTTP 4xx) degrades gracefully: Ollama and Gemini retry once in plain
+JSON mode, and `OpenAICompatProvider` walks a
+`json_schema -> json_object -> plain` ladder, accepting the first
+attempt that does not 4xx. Callers keep their `force_json` + balanced-
+brace extractor (`_extract_json` / `_extract_json_object`) as the final
+safety net, so weaker models fall back cleanly instead of failing. The
+canonical schemas live in `cgx.answer.schemas` (`PLAN_SCHEMA` for the
+Planner decomposition, `JUDGE_SCHEMA` for the Judge verdict) and are
+wired into `Planner._llm_plan` and `Judge._llm_judge`.
 
 **Profile persistence**: `cgx.answer.profiles.Profile` stores `kind`,
 `model`, `base_url`, `temperature`, `num_predict`, `has_api_key`,

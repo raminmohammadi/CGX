@@ -1032,47 +1032,21 @@ def _parse_python_module(
     return code_chunks, call_relations
 
 
-def parse_codebase(
+def _iter_source_files(
     project_root: str,
     *,
     ignore_patterns: Optional[List[str]] = None,
     max_file_bytes: Optional[int] = None,
     follow_symlinks: bool = False,
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Parse and analyze an entire codebase into structured entities and call relations.
+) -> "Iterable[Tuple[Any, str, str]]":
+    """Yield ``(parser, filepath, source_code)`` for each parseable file.
 
-    Recursively traverses ``project_root``, dispatching each file to the
-    parser registered for its extension in :data:`_PARSER_REGISTRY` (today
-    only ``.py`` via :class:`PythonASTParser`). Per-file results are
-    concatenated and the cross-file post-processing -- call-relation
-    deduplication and reverse-edge aggregation onto chunk metadata --
-    runs at the end.
-
-    Parameters
-    ----------
-    project_root:
-        Repository root to walk.
-    ignore_patterns:
-        Extra gitignore-style globs (applied alongside the project's own
-        ``.gitignore`` and ``DEFAULT_IGNORE_GLOBS``).
-    max_file_bytes:
-        Soft cap on file size; files above the cap are skipped with a
-        warning. Defaults to the ``CGX_PARSER_MAX_FILE_BYTES`` env var
-        (or ``DEFAULT_MAX_FILE_BYTES`` if unset).
-    follow_symlinks:
-        Whether ``os.walk`` should descend into symlinked directories
-        and whether symlinked files should be parsed.
-
-    Returns
-    -------
-    tuple[list[dict], list[dict]]
-        ``(code_chunks, deduped_call_relations)`` with the per-chunk
-        shape pinned by :mod:`cgx.parser.schema` and the schema version
-        tracked by ``cgx.embeddings.records.SCHEMA_VERSION``.
+    Shared walk used by :func:`parse_codebase` and the incremental parser
+    (:mod:`cgx.parser.incremental`). Honors ``.gitignore``, the default
+    ignore dirs/globs, the per-file size cap and the symlink policy, and only
+    yields files whose extension has a parser registered in
+    :data:`_PARSER_REGISTRY`.
     """
-    code_chunks: List[Dict[str, Any]] = []
-    call_relations: List[Dict[str, Any]] = []
-
     # Resolve safety knobs (args > env > defaults).
     if max_file_bytes is None:
         try:
@@ -1143,15 +1117,21 @@ def parse_codebase(
             except Exception as e:
                 logger.warning("Skipping unreadable file %s: %s", filepath, e)
                 continue
+            yield parser, filepath, source_code
 
-            try:
-                file_chunks, file_calls = parser.parse_file(filepath, source_code, project_root)
-            except Exception as e:
-                logger.error("Parser failed for %s: %s", filepath, e)
-                continue
-            code_chunks.extend(file_chunks)
-            call_relations.extend(file_calls)
 
+def _finalize_calls(
+    code_chunks: List[Dict[str, Any]],
+    call_relations: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Deduplicate call relations and attach reverse-edge metadata.
+
+    Runs the global cross-file post-processing that must see every call in
+    the merged corpus: it removes duplicate call sites and stamps
+    ``calls_out_top`` / ``called_by_count`` onto each function/lambda chunk.
+    Kept separate so the incremental parser can re-run it over a merged mix
+    of freshly parsed and cached per-file results.
+    """
     # Deduplicate call relations
     seen = set()
     deduped: List[Dict[str, Any]] = []
@@ -1186,6 +1166,64 @@ def parse_codebase(
     return code_chunks, deduped
 
 
+def parse_codebase(
+    project_root: str,
+    *,
+    ignore_patterns: Optional[List[str]] = None,
+    max_file_bytes: Optional[int] = None,
+    follow_symlinks: bool = False,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Parse and analyze an entire codebase into structured entities and call relations.
+
+    Recursively traverses ``project_root``, dispatching each file to the
+    parser registered for its extension in :data:`_PARSER_REGISTRY` (today
+    only ``.py`` via :class:`PythonASTParser`). Per-file results are
+    concatenated and the cross-file post-processing -- call-relation
+    deduplication and reverse-edge aggregation onto chunk metadata --
+    runs at the end.
+
+    Parameters
+    ----------
+    project_root:
+        Repository root to walk.
+    ignore_patterns:
+        Extra gitignore-style globs (applied alongside the project's own
+        ``.gitignore`` and ``DEFAULT_IGNORE_GLOBS``).
+    max_file_bytes:
+        Soft cap on file size; files above the cap are skipped with a
+        warning. Defaults to the ``CGX_PARSER_MAX_FILE_BYTES`` env var
+        (or ``DEFAULT_MAX_FILE_BYTES`` if unset).
+    follow_symlinks:
+        Whether ``os.walk`` should descend into symlinked directories
+        and whether symlinked files should be parsed.
+
+    Returns
+    -------
+    tuple[list[dict], list[dict]]
+        ``(code_chunks, deduped_call_relations)`` with the per-chunk
+        shape pinned by :mod:`cgx.parser.schema` and the schema version
+        tracked by ``cgx.embeddings.records.SCHEMA_VERSION``.
+    """
+    code_chunks: List[Dict[str, Any]] = []
+    call_relations: List[Dict[str, Any]] = []
+
+    for parser, filepath, source_code in _iter_source_files(
+        project_root,
+        ignore_patterns=ignore_patterns,
+        max_file_bytes=max_file_bytes,
+        follow_symlinks=follow_symlinks,
+    ):
+        try:
+            file_chunks, file_calls = parser.parse_file(filepath, source_code, project_root)
+        except Exception as e:
+            logger.error("Parser failed for %s: %s", filepath, e)
+            continue
+        code_chunks.extend(file_chunks)
+        call_relations.extend(file_calls)
+
+    return _finalize_calls(code_chunks, call_relations)
+
+
 # Register concrete parsers. Imported here (rather than at module top)
 # so the registry is populated lazily and cannot create an import cycle
 # with cgx.parser.python_parser, which imports back from this module.
@@ -1195,6 +1233,29 @@ def _register_default_parsers() -> None:
     inst = PythonASTParser()
     for ext in inst.extensions:
         _PARSER_REGISTRY[ext] = inst
+
+    # Multi-language parsers are gated on the optional tree-sitter dependency.
+    # Each is registered only when its grammar can actually be loaded so that,
+    # with the ``parsers`` extra uninstalled, the walker keeps skipping those
+    # files exactly as it did before multi-language support existed.
+    try:
+        from cgx.parser.treesitter_base import treesitter_available
+        from cgx.parser.js_ts_parser import (
+            JavaScriptParser, TSXParser, TypeScriptParser,
+        )
+    except Exception as exc:  # pragma: no cover - defensive import guard
+        logger.debug("tree-sitter parsers unavailable: %s", exc)
+        return
+
+    for parser_cls in (JavaScriptParser, TypeScriptParser, TSXParser):
+        try:
+            if not treesitter_available(parser_cls.language):
+                continue
+            parser = parser_cls()
+            for ext in parser.extensions:
+                _PARSER_REGISTRY[ext] = parser
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("skipping %s: %s", parser_cls.__name__, exc)
 
 
 _register_default_parsers()

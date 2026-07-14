@@ -240,6 +240,24 @@ ollama pull qwen2.5-coder:3b
 
 ## Quick start
 
+### Terminal dashboard
+
+Run `cgx` with no arguments (or `cgx dash`) to open the interactive
+terminal dashboard -- a full-screen REPL with a banner, a status bar
+(directory, index state, model, context window), and a bordered input
+box. Type a plain message to route it through the agent loop, or use
+slash commands (`/index`, `/model`, `/provider`, `/status`, `/serve`,
+`/help`, `/quit`):
+
+```bash
+cgx                                  # bare invocation -> dashboard
+cgx dash --project-root /path/to/repo
+```
+
+It is stdlib-only (ANSI, no `rich`/`textual`), works over SSH, and
+auto-disables colour when stdout is not a TTY or `NO_COLOR` is set.
+See [docs/usage.md § The terminal dashboard](docs/usage.md#the-terminal-dashboard).
+
 ### UI (recommended)
 
 ```bash
@@ -333,6 +351,9 @@ Tabs (left → right):
    `max_retries` apply automatically to every call made by that profile.
 
 ### CLI
+
+Bare `cgx` opens the [terminal dashboard](#terminal-dashboard); the
+explicit subcommands below are for scripted, non-interactive use.
 
 ```bash
 cgx index --project-root /path/to/repo --out-dir /tmp/cgx_index
