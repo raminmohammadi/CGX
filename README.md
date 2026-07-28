@@ -1,4 +1,9 @@
-![alt text](docs/images/logo.png)
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/logo.png">
+    <img src="docs/images/logo.png" width="220" alt="CGX -- Code Graph eXecution">
+  </picture>
+</p>
 
 <p align="center">
   <a href="https://github.com/raminmohammadi/CGX/actions/workflows/ci.yml?branch=main"><img src="https://github.com/raminmohammadi/CGX/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI status"></a>
