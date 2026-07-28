@@ -703,6 +703,43 @@ The session database lives at `<project_root>/.cgx/sessions.db` (or
 `sessions`, `tasks`, `facts`, `decisions`, `artifacts`; one row per
 aggregate stored as a JSON blob plus indexed columns.
 
+#### Session budgets (autonomous-loop safety valve)
+
+A greenfield session runs an autonomous Plan → Scaffold → Apply →
+Bootstrap → Verify → Repair loop. The per-loop regenerate/repair caps
+bound individual retries, but a **session budget** bounds the whole
+run so a pathological loop can never spin forever. Configure it on
+`start_session` (all default to unlimited/off, so existing callers are
+unaffected):
+
+```python
+session = runner.start_session(
+    objective="build a FastAPI todo API with tests",
+    project_root="/path/to/proj",
+    mode=SessionMode.GREENFIELD,   # from cgx.session.models
+    max_task_runs=40,              # cap on compute-bearing task runs
+    max_wall_seconds=1800,         # 30-minute wall-clock cap
+    headless=True,                 # no user to ask -> fail terminally
+)
+```
+
+* `max_task_runs` -- ceiling on how many compute-bearing tasks the
+  session may run (an `ASK_USER` pause is free and never counts).
+* `max_wall_seconds` -- wall-clock ceiling measured from the first
+  work task (`first_task_started_at`).
+* `headless` -- picks the exhaustion behaviour. Either cap tripping
+  triggers escalation *before* the next task is dispatched:
+  * **interactive** (`headless=False`, the default): the loop pauses
+    on a fresh `ASK_USER(freeform)` that surfaces the exhaustion, and
+    the session goes `PAUSED`. Resume it by posting a `Decision`
+    (e.g. raise the budget and continue, or stop).
+  * **headless** (`headless=True`): there is no user to ask, so the
+    READY work is abandoned and the session ends terminally `FAILED`.
+
+The HTTP `POST /api/agent-session` route uses the unlimited defaults;
+drive budgeted / headless runs through the programmatic `SessionRunner`
+API above (or a thin wrapper of your own).
+
 ### When to use the legacy view (`/agent-legacy`)
 
 The batch Planner → Tracker → Judge loop described in §7 is still

@@ -186,16 +186,18 @@ Three entry points cover every transition:
   dead FAILED leaf and no successor. Explore-mode sessions keep
   their user-driven lifecycle (empty plan); a no-op once the session
   is already `COMPLETED` / `FAILED` / `ABANDONED`.
-* `on_budget_exhausted(session, tasks)` -- session-level circuit
-  breaker (**Phase E**) for autonomous loops that slip past the
-  per-loop regenerate/repair caps. The `Session` carries a budget
-  (`max_task_runs`, `max_wall_seconds`, `headless`; all default to
-  unlimited/off) plus live counters (`task_runs`,
+* `on_budget_exhausted(session, over_task, tasks, reason)` --
+  session-level circuit breaker (**Phase E**) for autonomous loops
+  that slip past the per-loop regenerate/repair caps. The `Session`
+  carries a budget (`max_task_runs`, `max_wall_seconds`, `headless`;
+  all default to unlimited/off) plus live counters (`task_runs`,
   `first_task_started_at`) that only compute-bearing tasks charge --
   an `ASK_USER` wait-state is free, so escalation itself can always
-  surface. When a budget is exceeded the transition diverges by mode:
-  an **interactive** session blocks every still-READY work task,
-  spawns one `ASK_USER(freeform)` describing the exhaustion, and goes
+  surface. The runner checks the budget in `run_next` before
+  dispatching a non-`ASK_USER` task and, when it is exceeded, calls
+  this transition instead of executing. It diverges by mode: an
+  **interactive** session blocks every still-READY work task, spawns
+  one `ASK_USER(freeform)` describing the exhaustion, and goes
   `PAUSED` for the user to redirect or stop it; a **headless** session
   abandons the READY work and ends terminally `FAILED` (there is no
   user to ask). `_make_budget_ask` builds the escalation prompt.
