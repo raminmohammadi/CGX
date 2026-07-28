@@ -133,6 +133,17 @@ _LANGUAGE_REQUIRED_FILES: Dict[str, tuple] = {
 }
 
 
+# Test-file naming conventions across the stacks CGX scaffolds: pytest
+# ``test_*.py`` / ``*_test.py`` and the JS/TS ``*.test.*`` / ``*.spec.*``
+# names. Kept in sync with the engine's manifest test injector.
+_TEST_FILE_RE = re.compile(
+    r"(?:^|/)test_[^/]+\.py$"
+    r"|(?:^|/)[^/]+_test\.py$"
+    r"|\.(?:test|spec)\.(?:js|jsx|ts|tsx|mjs|cjs)$",
+    re.IGNORECASE,
+)
+
+
 def _goal_language_backend_exts(goal_low: str) -> tuple:
     """Pick the most specific backend extensions implied by the goal text."""
     for lang, exts in _LANGUAGE_BACKEND_EXTS.items():
@@ -216,6 +227,14 @@ def _manifest_required_missing(
             issues.append("Goal asks for a Python backend but manifest has "
                           f"no entry module ({', '.join(entry_names)}).")
 
+    # Every scaffold must ship at least one test so the verify step has a
+    # self-correction signal. Backstops the deterministic test injection in
+    # the manifest builder (engine._inject_required_test_file).
+    if not any(_TEST_FILE_RE.search(p) for p in paths):
+        issues.append("Manifest has no test file; a scaffold must include at "
+                      "least one test (e.g. tests/test_*.py or *.test.ts) so "
+                      "the verify step has a runnable pass/fail signal.")
+
     if not issues:
         return None
     if len(issues) == 1:
@@ -240,6 +259,25 @@ _ENUM_LINE_RE = re.compile(
     r"^\s*(?:[0-9]{1,2}[.)]|[-*•]|#{1,6})\s+\S",
     re.MULTILINE,
 )
+
+# Match a Markdown list item -- ordered (``1.``, ``2)``) or unordered
+# bullet (``- ``, ``* ``, ``• ``) -- but NOT ``#`` headings. Used by the
+# SUMMARIZE verbosity gate so a heading isn't miscounted as a bullet.
+_LIST_ITEM_RE = re.compile(
+    r"^\s*(?:[0-9]{1,2}[.)]|[-*•])\s+\S",
+    re.MULTILINE,
+)
+
+# Verbosity / answer-quality budgets for the free-text answer kinds
+# (ASK, SUMMARIZE). These act as a deterministic pre-gate in front of the
+# strict LLM judge: an obviously over-long answer hard-fails here (and
+# saves an LLM call), while an answer within budget defers its
+# substantive verdict to the LLM grader (ASK) or passes structurally
+# (SUMMARIZE). The SUMMARIZE bullet cap mirrors the "<=8 bullets"
+# contract in the ``summarize`` capability prompt (cgx.agents.loop).
+_ASK_MAX_WORDS = 1000
+_SUMMARIZE_MAX_BULLETS = 8
+_SUMMARIZE_MAX_WORDS = 400
 
 
 def _is_clarify_ask(task: Task) -> bool:
@@ -320,7 +358,8 @@ class Judge:
         if (struct is not None and struct.passed
                 and (task.kind in (TaskKind.SEARCH, TaskKind.APPLY,
                                    TaskKind.VERIFY, TaskKind.SCAFFOLD,
-                                   TaskKind.SCAFFOLD_MANIFEST, TaskKind.SCAFFOLD_FILE)
+                                   TaskKind.SCAFFOLD_MANIFEST, TaskKind.SCAFFOLD_FILE,
+                                   TaskKind.REINDEX)
                      or _is_clarify_ask(task))):
             logger.info("Judge: structural PASS short-circuit id=%s kind=%s "
                         "(skipping LLM grader)", task.id, kind_val)
@@ -495,7 +534,53 @@ class Judge:
                                "options nor asks a follow-up question."),
                     checked_criteria=ncrit,
                 )
+            # Verbosity gate for a grounded (non-clarify) ASK: a
+            # pathologically long answer hard-fails here rather than
+            # burning an LLM-grader call on runaway output. Answers within
+            # budget return None so the strict LLM judge still decides the
+            # substantive verdict (grounding, citations, correctness).
+            words = len(answer.split())
+            if words > _ASK_MAX_WORDS:
+                return Verdict(
+                    verdict="fail", confidence=0.8,
+                    rationale=(f"Answer is too verbose ({words} words; "
+                               f"budget {_ASK_MAX_WORDS})."),
+                    checked_criteria=ncrit,
+                )
             return None
+        if task.kind == TaskKind.SUMMARIZE:
+            # SUMMARIZE has no ground truth to check, only an answer-quality
+            # contract: the ``summarize`` capability asks for "<=8 bullets".
+            # Enforce that budget (plus a word cap) deterministically so an
+            # over-long or empty condensation is rejected before -- and
+            # independently of -- the strict LLM grader.
+            answer = str(out.get("answer_md") or out.get("answer") or "")
+            if not answer.strip():
+                return Verdict(verdict="fail", confidence=0.9,
+                               rationale="Summary is empty.",
+                               checked_criteria=ncrit)
+            bullets = len(_LIST_ITEM_RE.findall(answer))
+            if bullets > _SUMMARIZE_MAX_BULLETS:
+                return Verdict(
+                    verdict="fail", confidence=0.85,
+                    rationale=(f"Summary has {bullets} list items; exceeds "
+                               f"the {_SUMMARIZE_MAX_BULLETS}-bullet budget."),
+                    checked_criteria=ncrit,
+                )
+            words = len(answer.split())
+            if words > _SUMMARIZE_MAX_WORDS:
+                return Verdict(
+                    verdict="fail", confidence=0.8,
+                    rationale=(f"Summary is too verbose ({words} words; "
+                               f"budget {_SUMMARIZE_MAX_WORDS})."),
+                    checked_criteria=ncrit,
+                )
+            return Verdict(
+                verdict="pass", confidence=0.75,
+                rationale=(f"Summary within budget ({bullets} bullet(s), "
+                           f"{words} word(s))."),
+                checked_criteria=ncrit,
+            )
         if task.kind == TaskKind.SEARCH:
             hits = out.get("hits") or []
             if not hits:
@@ -560,6 +645,19 @@ class Judge:
             rc = out.get("returncode")
             return Verdict(verdict="fail", confidence=0.95,
                            rationale=f"Impacted tests failed (rc={rc}).",
+                           checked_criteria=ncrit)
+        if task.kind == TaskKind.REINDEX:
+            # Mechanical, ground-truth step: a no-op (project not indexed on
+            # disk) is a soft pass, and a completed refresh is a hard pass.
+            if not bool(out.get("reindexed")):
+                reason = str(out.get("skipped_reason") or "index not refreshed")
+                return Verdict(verdict="pass", confidence=0.6,
+                               rationale=f"Reindex skipped: {reason}",
+                               checked_criteria=ncrit)
+            counts = out.get("counts") or {}
+            n = sum(int(v) for v in counts.values() if isinstance(v, int))
+            return Verdict(verdict="pass", confidence=0.95,
+                           rationale=f"Index refreshed ({n} record(s)).",
                            checked_criteria=ncrit)
         if task.kind == TaskKind.SCAFFOLD_MANIFEST:
             layers = out.get("layers")
@@ -627,6 +725,10 @@ class Judge:
         logger.info("Judge: invoking LLM grader id=%s kind=%s artifact_len=%d",
                     task.id, kind_val, len(artifact))
         try:
+            # Schema-constrained decoding pins the verdict object's shape on
+            # providers that support it; others fall back to plain JSON mode
+            # and the balanced-brace extractor below still applies.
+            from cgx.answer.schemas import JUDGE_SCHEMA
             resp = self.provider.chat(
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
@@ -635,6 +737,7 @@ class Judge:
                 temperature=0.0,
                 max_tokens=1000,
                 force_json=True,
+                json_schema=JUDGE_SCHEMA,
             )
         except Exception as e:
             logger.warning("Judge: LLM grader raised %s: %s",
@@ -730,7 +833,7 @@ class Judge:
             fp = str(out.get("file") or "")
             content = str(out.get("content") or out.get("patch") or "")
             return f"File: {fp}\n\n```\n{content[:3000]}\n```"
-        if task.kind == TaskKind.ASK:
+        if task.kind in (TaskKind.ASK, TaskKind.SUMMARIZE):
             return str(out.get("answer_md") or out.get("answer") or "")
         if task.kind == TaskKind.SEARCH:
             hits = out.get("hits") or []

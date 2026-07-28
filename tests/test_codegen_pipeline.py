@@ -289,32 +289,19 @@ def test_extract_imports_python_captures_from_namespace_form():
 
 
 def _force_import_miss(monkeypatch):
-    """Make ``find_missing_python_packages``'s import-probe always miss.
+    """Force the import probe to report every candidate as missing.
 
-    The function does a live ``__import__(name)`` to skip packages that
-    happen to be installed in the current interpreter. Tests need a
-    deterministic answer independent of which extras the contributor
-    has locally, so we stub the probe to raise ``ImportError`` for
-    every name.
+    ``find_missing_python_packages`` probes the target interpreter (the
+    project venv) to skip packages that are already importable. Tests
+    need a deterministic answer independent of which extras the
+    contributor has installed locally, so we stub the probe to return an
+    empty importable-set -- i.e. everything is missing.
     """
-    import builtins
-    real = builtins.__import__
+    from cgx.codegen import env_manager
 
-    def _fake(name, *a, **kw):
-        # Allow the cgx.codegen.env_manager module's own ``import ast``
-        # / ``import json`` etc. to keep working -- only fail on the
-        # third-party names the function probes for.
-        if name in {
-            "PIL", "cv2", "sklearn", "bs4", "yaml", "skimage",
-            "Crypto", "magic", "dateutil", "dotenv", "jose", "git",
-            "OpenSSL", "serial", "usb",
-            "google", "google.generativeai", "google.cloud",
-            "google.oauth2", "google.auth", "google.api_core",
-        }:
-            raise ImportError(name)
-        return real(name, *a, **kw)
-
-    monkeypatch.setattr(builtins, "__import__", _fake)
+    monkeypatch.setattr(
+        env_manager, "_probe_importable",
+        lambda names, python=None: set())
 
 
 def test_find_missing_packages_maps_google_generativeai(tmp_path, monkeypatch):
@@ -348,18 +335,69 @@ def test_find_missing_packages_maps_well_known_aliases(tmp_path, monkeypatch):
     assert "cv2" not in missing
 
 
-def test_find_missing_packages_respects_declared_pypi_name(tmp_path, monkeypatch):
-    from cgx.codegen.env_manager import find_missing_python_packages
+def test_find_missing_packages_skips_importable(tmp_path, monkeypatch):
+    from cgx.codegen import env_manager
 
-    _force_import_miss(monkeypatch)
-    # When the user already declared ``google-generativeai``, the agent
-    # must NOT re-install it on a subsequent run.
+    # An already-importable package must NOT be reported (idempotency),
+    # regardless of whether it is declared in requirements.txt.
+    monkeypatch.setattr(
+        env_manager, "_probe_importable",
+        lambda names, python=None: {"google.generativeai"})
     (tmp_path / "requirements.txt").write_text(
         "google-generativeai>=0.3.0\n", encoding="utf-8",
     )
     imports = {"google", "google.generativeai"}
-    missing = find_missing_python_packages(imports, str(tmp_path))
+    missing = env_manager.find_missing_python_packages(imports, str(tmp_path))
     assert "google-generativeai" not in missing
+
+
+def test_find_missing_packages_skips_nested_first_party(tmp_path, monkeypatch):
+    from cgx.codegen.env_manager import find_missing_python_packages
+
+    _force_import_miss(monkeypatch)
+    (tmp_path / "requirements.txt").write_text("", encoding="utf-8")
+    # ``main`` lives at backend/main.py -- a first-party module nested
+    # under a package dir, not a flat or src-layout module.
+    backend = tmp_path / "backend"
+    backend.mkdir()
+    (backend / "main.py").write_text("app = 1\n", encoding="utf-8")
+    missing = find_missing_python_packages({"main"}, str(tmp_path))
+    # It is not a PyPI distribution, so it must never be reported for
+    # installation despite the empty requirements.txt.
+    assert "main" not in missing
+
+
+def test_find_missing_packages_ignores_venv_when_detecting_local(
+        tmp_path, monkeypatch):
+    from cgx.codegen.env_manager import find_missing_python_packages
+
+    _force_import_miss(monkeypatch)
+    (tmp_path / "requirements.txt").write_text("", encoding="utf-8")
+    # A same-named module buried inside a pruned dir (.venv) must NOT be
+    # treated as first-party -- ``flask`` here is a real dependency.
+    vend = tmp_path / ".venv" / "lib" / "flask"
+    vend.mkdir(parents=True)
+    (vend / "flask.py").write_text("", encoding="utf-8")
+    missing = find_missing_python_packages({"flask"}, str(tmp_path))
+    assert "flask" in missing
+
+
+def test_find_missing_packages_reports_declared_but_uninstalled(
+        tmp_path, monkeypatch):
+    from cgx.codegen import env_manager
+
+    # requirements.txt declares flask, but it isn't importable in the
+    # target venv -- e.g. a malformed/unresolvable line aborted the batch
+    # ``pip install -r``. Importability is authoritative, so flask must
+    # still be reported missing rather than silently trusted.
+    monkeypatch.setattr(
+        env_manager, "_probe_importable",
+        lambda names, python=None: set())
+    (tmp_path / "requirements.txt").write_text(
+        "flask==2.3.2\n", encoding="utf-8")
+    missing = env_manager.find_missing_python_packages(
+        {"flask"}, str(tmp_path))
+    assert "flask" in missing
 
 
 
@@ -466,3 +504,86 @@ def test_apply_hunks_ambiguous_match_is_rejected(tmp_path: Path) -> None:
     assert not res.ok
     assert len(res.rejected_hunks) == 1
     assert res.new_content == src
+
+
+# ---------------------------------------------------------------------------
+# JS/TS/TSX syntax gate: tree-sitter-backed deterministic validation. Grammars
+# ship with the ``parsers`` extra; skip the real-parse cases when absent so the
+# suite still runs on a minimal install (the degradation case is exercised via
+# monkeypatch below and needs no grammar).
+# ---------------------------------------------------------------------------
+def _require_grammar(language: str) -> None:
+    from cgx.parser.treesitter_base import treesitter_available
+
+    if not treesitter_available(language):
+        pytest.skip(f"tree-sitter grammar for {language!r} unavailable")
+
+
+def test_validate_js_source_accepts_valid() -> None:
+    _require_grammar("javascript")
+    from cgx.codegen.validate import validate_js_ts_source
+
+    src = "export function add(a, b) {\n  return a + b;\n}\n"
+    diag = validate_js_ts_source("src/add.js", src, "javascript")
+    assert diag.ok
+    assert diag.language == "javascript"
+
+
+def test_validate_js_source_flags_syntax_error() -> None:
+    _require_grammar("javascript")
+    from cgx.codegen.validate import validate_js_ts_source
+
+    # Unclosed function body.
+    src = "export function add(a, b) {\n  return a + b;\n"
+    diag = validate_js_ts_source("src/add.js", src, "javascript")
+    assert not diag.ok
+    assert diag.line is not None
+
+
+def test_validate_tsx_accepts_jsx() -> None:
+    _require_grammar("tsx")
+    from cgx.codegen.validate import validate_js_ts_source
+
+    src = (
+        "export const App = (): JSX.Element => {\n"
+        "  return <div className=\"x\">hi</div>;\n"
+        "};\n"
+    )
+    diag = validate_js_ts_source("src/App.tsx", src, "tsx")
+    assert diag.ok
+
+
+def test_validate_ts_flags_syntax_error() -> None:
+    _require_grammar("typescript")
+    from cgx.codegen.validate import validate_js_ts_source
+
+    src = "const x: number = ;\n"
+    diag = validate_js_ts_source("src/x.ts", src, "typescript")
+    assert not diag.ok
+
+
+def test_validate_js_ts_source_degrades_when_grammar_unavailable(monkeypatch) -> None:
+    # No ``parsers`` extra installed -> skip the gate rather than hard-fail,
+    # mirroring the YAML validator when PyYAML is absent.
+    import cgx.parser.treesitter_base as ts_base
+    from cgx.codegen.validate import validate_js_ts_source
+
+    monkeypatch.setattr(ts_base, "_get_ts_parser", lambda language: None)
+    diag = validate_js_ts_source("src/add.js", "this is not js {{{", "javascript")
+    assert diag.ok
+    assert "unavailable" in (diag.error or "")
+
+
+def test_validate_patch_results_routes_js_through_gate() -> None:
+    _require_grammar("javascript")
+    from cgx.codegen.diff_apply import PatchResult
+    from cgx.codegen.validate import validate_patch_results
+
+    good = PatchResult(path="src/ok.js", ok=True,
+                       new_content="export const x = 1;\n")
+    bad = PatchResult(path="src/bad.jsx", ok=True,
+                      new_content="export function f() {\n  return (\n")
+    diags = {d.path: d for d in validate_patch_results([good, bad])}
+    assert diags["src/ok.js"].ok
+    assert not diags["src/bad.jsx"].ok
+    assert diags["src/bad.jsx"].language == "javascript"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import threading
 
 """
 Two-view retrieval orchestrator (ALL SIGNALS REQUIRED + IMPACT ANALYSIS).
@@ -40,6 +41,7 @@ from cgx.retrieval.lexical import LexicalIndex
 from cgx.retrieval.rrf import rrf_fuse
 from cgx.retrieval.tokenize import expand_with_subwords
 from cgx.graph.backend import CodeGraphBackend
+from cgx.trace import traced
 
 
 # ---------------------------
@@ -64,6 +66,7 @@ def _records_map(records: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
 _INSERTION_CORPUS_CACHE_MAX = 8
 _INSERTION_CORPUS_CACHE: "Dict[Tuple[int, int, int, int], Tuple[Any, List[str]]]" = {}
 _INSERTION_CORPUS_ORDER: "List[Tuple[int, int, int, int]]" = []
+_CORPUS_CACHE_LOCK = threading.Lock()
 
 
 def _insertion_corpus_key(
@@ -89,9 +92,10 @@ def _build_exemplar_corpus(
 ) -> Tuple[Any, List[str]]:
     """Encode the file/class ``name + docstring`` corpus once, with caching."""
     key = _insertion_corpus_key(records, embedder)
-    cached = _INSERTION_CORPUS_CACHE.get(key)
-    if cached is not None:
-        return cached
+    with _CORPUS_CACHE_LOCK:
+        cached = _INSERTION_CORPUS_CACHE.get(key)
+        if cached is not None:
+            return cached
     texts: List[str] = []
     ids: List[str] = []
     for r in records:
@@ -106,18 +110,24 @@ def _build_exemplar_corpus(
         mat = np.zeros((0, 0), dtype=np.float32)
     else:
         mat = embedder.encode(texts)
-    _INSERTION_CORPUS_CACHE[key] = (mat, ids)
-    _INSERTION_CORPUS_ORDER.append(key)
-    while len(_INSERTION_CORPUS_ORDER) > _INSERTION_CORPUS_CACHE_MAX:
-        evict = _INSERTION_CORPUS_ORDER.pop(0)
-        _INSERTION_CORPUS_CACHE.pop(evict, None)
+    with _CORPUS_CACHE_LOCK:
+        # Re-check key in case another thread encoded it in the meantime
+        cached = _INSERTION_CORPUS_CACHE.get(key)
+        if cached is not None:
+            return cached
+        _INSERTION_CORPUS_CACHE[key] = (mat, ids)
+        _INSERTION_CORPUS_ORDER.append(key)
+        while len(_INSERTION_CORPUS_ORDER) > _INSERTION_CORPUS_CACHE_MAX:
+            evict = _INSERTION_CORPUS_ORDER.pop(0)
+            _INSERTION_CORPUS_CACHE.pop(evict, None)
     return mat, ids
 
 
 def _clear_insertion_corpus_cache() -> None:
     """Test hook: drop all cached exemplar corpora."""
-    _INSERTION_CORPUS_CACHE.clear()
-    _INSERTION_CORPUS_ORDER.clear()
+    with _CORPUS_CACHE_LOCK:
+        _INSERTION_CORPUS_CACHE.clear()
+        _INSERTION_CORPUS_ORDER.clear()
 
 # Shared stopword set for filtering identifier-like tokens out of NL questions.
 # Kept here so both the engine and the orchestrator agree on what counts as a
@@ -244,6 +254,7 @@ __all__ = [
 # ---------------------------
 
 
+@traced("retrieval")
 def hybrid_retrieve_two_view(
     query: str,
     *,
@@ -1085,6 +1096,7 @@ def _jaccard(a: Iterable[str], b: Iterable[str]) -> float:
     return float(len(A & B)) / max(1, len(A | B))
 
 
+@traced("retrieval")
 def suggest_insertion_points(
     query: str,
     fused_hits: List[Dict[str, Any]],
@@ -1285,6 +1297,7 @@ def suggest_insertion_points(
 # Change impact analysis (NEW)
 # ---------------------------
 
+@traced("retrieval")
 def analyze_change_impact(
     symbol_query: str,
     fused_hits: List[Dict[str, Any]],

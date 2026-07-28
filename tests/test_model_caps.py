@@ -5,7 +5,11 @@ from typing import Any, Dict, List
 
 from cgx.answer.model_caps import (
     DEFAULT_CONTEXT_TOKENS,
+    TIERS,
+    get_capability_tier,
+    get_context_map_budget,
     get_model_context_window,
+    get_prompt_strategy,
     get_summary_budget,
     provider_model_name,
 )
@@ -153,3 +157,56 @@ def test_generate_single_scaffold_file_uses_provider_budget():
     user_msg2 = prov2.calls[0]["messages"][1]["content"]
     assert user_msg2.count("### f") == 50
     assert prov2.calls[0]["max_tokens"] == 8_000
+
+
+# ---------------------------------------------------------------------------
+# get_capability_tier
+# ---------------------------------------------------------------------------
+def test_capability_tier_bands_from_context_window():
+    # One representative model per band; tiers derive solely from the
+    # context window (8K -> small, 32K -> medium, 128K -> large, 200K+ ->
+    # xlarge).
+    assert get_capability_tier(_Prov("llama3")) == "small"
+    assert get_capability_tier(_Prov("qwen2.5-coder")) == "medium"
+    assert get_capability_tier(_Prov("gpt-4o")) == "large"
+    assert get_capability_tier(_Prov("gemini-2.5-flash")) == "xlarge"
+    assert get_capability_tier(_Prov("claude-3-5-sonnet")) == "xlarge"
+
+
+def test_capability_tier_accepts_provider_or_raw_string():
+    # A raw model-id string and a provider carrying the same id agree.
+    assert get_capability_tier("gpt-4o") == get_capability_tier(_Prov("gpt-4o"))
+    # Unknown / missing model falls back to the smallest tier.
+    assert get_capability_tier(_Prov("nope")) == "small"
+    assert get_capability_tier(None) == "small"
+    assert all(t in TIERS for t in {"small", "medium", "large", "xlarge"})
+
+
+# ---------------------------------------------------------------------------
+# Budgets derive from the tier and return safe copies
+# ---------------------------------------------------------------------------
+def test_budgets_are_tier_indexed_and_return_copies():
+    # Same tier -> identical budget for two different models in that band.
+    assert get_summary_budget(_Prov("gpt-4o")) == \
+        get_summary_budget(_Prov("o1-mini"))
+    assert get_context_map_budget(_Prov("gpt-4o")) == \
+        get_context_map_budget(_Prov("o1-mini"))
+    # Mutating the returned dict must not corrupt the shared table.
+    b = get_summary_budget(_Prov("llama3"))
+    b["max_files"] = 9999
+    assert get_summary_budget(_Prov("llama3"))["max_files"] == 12
+
+
+# ---------------------------------------------------------------------------
+# get_prompt_strategy tiers
+# ---------------------------------------------------------------------------
+def test_prompt_strategy_hardens_weak_models_and_frees_strong_ones():
+    small = get_prompt_strategy(_Prov("llama3"))
+    assert small["tier"] == "small"
+    assert small["reinforce_json"] is True
+    assert small["plan_max_tokens"] == 1_000
+
+    large = get_prompt_strategy(_Prov("gemini-2.5-flash"))
+    assert large["tier"] == "xlarge"
+    assert large["reinforce_json"] is False
+    assert large["plan_max_tokens"] == 2_000

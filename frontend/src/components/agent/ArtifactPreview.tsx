@@ -1,6 +1,7 @@
 import type { ArtifactDTO } from "../../lib/api";
 import { Markdown } from "../Markdown";
 import { DiffView } from "../DiffView";
+import { ErrorBoundary } from "../ErrorBoundary";
 
 // Render any session artifact in a kind-aware preview. Falls back to a
 // JSON dump for kinds we don't yet have a dedicated view for so the user
@@ -12,7 +13,9 @@ export function ArtifactPreview({ artifact }: { artifact: ArtifactDTO }) {
         <span>artifact · {artifact.kind}</span>
         <span className="text-slate-600">{artifact.artifact_id.slice(0, 8)}</span>
       </header>
-      <Body artifact={artifact} />
+      <ErrorBoundary label={`artifact ${artifact.kind}`}>
+        <Body artifact={artifact} />
+      </ErrorBoundary>
     </section>
   );
 }
@@ -29,6 +32,8 @@ function Body({ artifact }: { artifact: ArtifactDTO }) {
   if (artifact.kind === "work_plan") return <WorkPlanBody c={c} />;
   if (artifact.kind === "scaffold_patches") return <ScaffoldPatchesBody c={c} />;
   if (artifact.kind === "build_report") return <BuildReportBody c={c} />;
+  if (artifact.kind === "smoke_report") return <SmokeReportBody c={c} />;
+  if (artifact.kind === "api_check_report") return <ApiCheckReportBody c={c} />;
   if (artifact.kind === "repair_plan") return <RepairPlanBody c={c} />;
   return <pre className="text-[11px] font-mono text-slate-300 whitespace-pre-wrap break-words">{JSON.stringify(c, null, 2)}</pre>;
 }
@@ -109,23 +114,36 @@ function PlanBody({ c }: { c: any }) {
 }
 
 function AppliedBody({ c }: { c: any }) {
-  const applied: string[] = c.applied_files || [];
-  const failed: string[] = c.failed_files || [];
+  const applied: string[] = Array.isArray(c.applied_files) ? c.applied_files : [];
+  // ``disk_apply`` emits failed_files as ``[{file, error}, ...]``; legacy
+  // payloads occasionally still carry plain ``string[]``. Normalise both
+  // shapes so rendering can't trip React error #31.
+  const failedRaw: any[] = Array.isArray(c.failed_files) ? c.failed_files : [];
+  const failed: { file: string; error: string }[] = failedRaw.map((f) =>
+    typeof f === "string"
+      ? { file: f, error: "" }
+      : { file: String(f?.file ?? ""), error: String(f?.error ?? "") },
+  );
   return (
     <div className="space-y-2 text-[11px] font-mono">
       <p className="text-slate-300">
         Applied: <span className="text-emerald-400">{applied.length}</span>
         {" · "}Failed: <span className="text-red-400">{failed.length}</span>
-        {c.backup_dir && <span className="text-slate-500"> · backup: {c.backup_dir}</span>}
+        {c.backup_dir && <span className="text-slate-500"> · backup: {String(c.backup_dir)}</span>}
       </p>
       {applied.length > 0 && (
         <ul className="space-y-0.5 pl-3 text-slate-300 list-disc">
-          {applied.map((f) => <li key={f}>{f}</li>)}
+          {applied.map((f) => <li key={f}>{String(f)}</li>)}
         </ul>
       )}
       {failed.length > 0 && (
         <ul className="space-y-0.5 pl-3 text-red-300 list-disc">
-          {failed.map((f) => <li key={f}>{f}</li>)}
+          {failed.map((f, i) => (
+            <li key={i}>
+              {f.file}
+              {f.error && <span className="text-slate-500"> — {f.error}</span>}
+            </li>
+          ))}
         </ul>
       )}
     </div>
@@ -157,6 +175,37 @@ function VerifyBody({ c }: { c: any }) {
         {Array.isArray(c.tests_selected) && c.tests_selected.length > 0 &&
           <span className="text-slate-500"> · {c.tests_selected.length} selected</span>}
       </p>
+      {c.reproduce_cmd && (
+        <div>
+          <p className="text-slate-500">reproduce:</p>
+          <pre className="bg-slate-950 border border-white/5 rounded p-2 text-emerald-300 overflow-x-auto whitespace-pre">
+            {String(c.reproduce_cmd)}
+          </pre>
+        </div>
+      )}
+      {Array.isArray(c.failures) && c.failures.length > 0 && (
+        <div className="space-y-1">
+          <p className="text-slate-500">{c.failures.length} failure{c.failures.length === 1 ? "" : "s"}:</p>
+          {c.failures.slice(0, 8).map((f: any, i: number) => (
+            <details key={i} className="bg-slate-950 border border-red-900/40 rounded p-2">
+              <summary className="cursor-pointer text-red-300">
+                <span className="text-slate-500">{String(f.kind || "failure")}</span>
+                {" · "}
+                <span>{String(f.nodeid || "")}</span>
+                {f.type && <span className="text-slate-500"> · {String(f.type)}</span>}
+              </summary>
+              {f.message && (
+                <p className="text-slate-300 mt-1 whitespace-pre-wrap break-words">{String(f.message).slice(0, 600)}</p>
+              )}
+              {f.traceback && (
+                <pre className="mt-1 text-slate-400 whitespace-pre-wrap break-words max-h-48 overflow-y-auto">
+                  {String(f.traceback).slice(-2000)}
+                </pre>
+              )}
+            </details>
+          ))}
+        </div>
+      )}
       {c.stdout && (
         <pre className="bg-slate-950 border border-white/5 rounded p-2 text-slate-300 max-h-60 overflow-y-auto whitespace-pre-wrap">
           {String(c.stdout).slice(-4000)}
@@ -180,6 +229,7 @@ function BuildReportBody({ c }: { c: any }) {
   const installed: string[] = c.installed_packages || [];
   const failed: string[] = c.failed_installs || [];
   const manifests: string[] = c.installed_from || [];
+  const resolved: { name: string; version: string }[] = c.resolved_packages || [];
   return (
     <div className="space-y-2 text-[11px] font-mono">
       <p className="text-slate-300">
@@ -189,6 +239,21 @@ function BuildReportBody({ c }: { c: any }) {
       </p>
       {manifests.length > 0 && (
         <p className="text-slate-500">manifests: {manifests.join(", ")}</p>
+      )}
+      {resolved.length > 0 && (
+        <details className="text-slate-400">
+          <summary className="cursor-pointer text-slate-400">
+            resolved: {resolved.length} package{resolved.length === 1 ? "" : "s"}
+          </summary>
+          <ul className="pl-3 list-disc text-slate-300 max-h-40 overflow-y-auto">
+            {resolved.map((p) => (
+              <li key={p.name}>
+                <span>{p.name}</span>
+                <span className="text-slate-500">=={p.version}</span>
+              </li>
+            ))}
+          </ul>
+        </details>
       )}
       {installed.length > 0 && (
         <div>
@@ -228,6 +293,122 @@ function BuildReportBody({ c }: { c: any }) {
         <pre className="bg-slate-950 border border-white/5 rounded p-2 text-slate-300 max-h-40 overflow-y-auto whitespace-pre-wrap">
           {String(c.pip_log_tail).slice(-2000)}
         </pre>
+      )}
+    </div>
+  );
+}
+
+
+function SmokeReportBody({ c }: { c: any }) {
+  const outcome = String(c.outcome || "skipped");
+  const modules: any[] = Array.isArray(c.modules) ? c.modules : [];
+  const failed = modules.filter((m) => !m?.ok);
+  const passed = modules.filter((m) => !!m?.ok);
+  const outcomeColor =
+    outcome === "passed" ? "text-emerald-300"
+      : outcome === "failed" ? "text-red-300"
+      : "text-slate-400";
+  return (
+    <div className="text-[11px] font-mono space-y-1.5">
+      <p className={outcomeColor}>
+        outcome: {outcome} · tested {modules.length} module{modules.length === 1 ? "" : "s"}
+      </p>
+      {failed.length > 0 && (
+        <div>
+          <p className="text-red-300">failed imports ({failed.length}):</p>
+          <ul className="pl-3 list-disc text-red-200/90 space-y-1">
+            {failed.map((m: any, i: number) => (
+              <li key={i}>
+                <span className="text-slate-100">{String(m.name)}</span>
+                {m.stderr_tail && (
+                  <pre className="bg-slate-950 border border-white/5 rounded p-1.5 mt-1 text-slate-300 max-h-32 overflow-y-auto whitespace-pre-wrap">
+                    {String(m.stderr_tail).slice(-1200)}
+                  </pre>
+                )}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {passed.length > 0 && (
+        <details className="text-slate-400">
+          <summary className="cursor-pointer">
+            passed imports ({passed.length})
+          </summary>
+          <ul className="pl-3 list-disc text-emerald-300">
+            {passed.map((m: any, i: number) => (<li key={i}>{String(m.name)}</li>))}
+          </ul>
+        </details>
+      )}
+      {outcome === "skipped" && (
+        <p className="text-slate-500 italic">
+          No third-party imports detected in the applied files (or no
+          python interpreter available); SMOKE was a no-op.
+        </p>
+      )}
+    </div>
+  );
+}
+
+
+function ApiCheckReportBody({ c }: { c: any }) {
+  const outcome = String(c.outcome || "skipped");
+  const refs: any[] = Array.isArray(c.references) ? c.references : [];
+  const failed = refs.filter((r) => !r?.ok);
+  const passed = refs.filter((r) => !!r?.ok);
+  const probeError = c.probe_error ? String(c.probe_error) : "";
+  const outcomeColor =
+    outcome === "passed" ? "text-emerald-300"
+      : outcome === "failed" ? "text-red-300"
+      : "text-slate-400";
+  return (
+    <div className="text-[11px] font-mono space-y-1.5">
+      <p className={outcomeColor}>
+        outcome: {outcome} · checked {refs.length} reference{refs.length === 1 ? "" : "s"}
+      </p>
+      {probeError && (
+        <p className="text-amber-300">probe_error: {probeError}</p>
+      )}
+      {failed.length > 0 && (
+        <div>
+          <p className="text-red-300">unresolved references ({failed.length}):</p>
+          <ul className="pl-3 list-disc text-red-200/90 space-y-1">
+            {failed.map((r: any, i: number) => (
+              <li key={i}>
+                <span className="text-slate-100">
+                  {String(r.module)}.{String(r.name)}
+                </span>
+                {r.error && (
+                  <p className="text-slate-400 mt-0.5">{String(r.error)}</p>
+                )}
+                {Array.isArray(r.references) && r.references.length > 0 && (
+                  <p className="text-slate-500 text-[10px] mt-0.5">
+                    referenced from {r.references.map((ref: any) =>
+                      `${ref.file}:${ref.lineno}`).join(", ")}
+                  </p>
+                )}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {passed.length > 0 && (
+        <details className="text-slate-400">
+          <summary className="cursor-pointer">
+            resolved references ({passed.length})
+          </summary>
+          <ul className="pl-3 list-disc text-emerald-300">
+            {passed.map((r: any, i: number) => (
+              <li key={i}>{String(r.module)}.{String(r.name)}</li>
+            ))}
+          </ul>
+        </details>
+      )}
+      {outcome === "skipped" && !probeError && (
+        <p className="text-slate-500 italic">
+          No third-party API references detected in the applied files (or
+          no python interpreter available); API_CHECK was a no-op.
+        </p>
       )}
     </div>
   );
@@ -302,11 +483,15 @@ function ScaffoldPatchesBody({ c }: { c: any }) {
   const generated: any[] = c.generated || [];
   const failed: any[] = c.failed || [];
   const diffs: { file: string; patch: string }[] = c.diffs || [];
+  const pinAdjustments: any[] = c.pin_adjustments || [];
   return (
     <div className="space-y-2 text-[11px] font-mono">
       <p className="text-slate-300">
         Generated: <span className="text-emerald-400">{generated.length}</span>
         {" · "}Failed: <span className="text-red-400">{failed.length}</span>
+        {pinAdjustments.length > 0 && (
+          <>{" · "}Pin adjustments: <span className="text-amber-400">{pinAdjustments.length}</span></>
+        )}
       </p>
       {generated.length > 0 && (
         <ul className="space-y-0.5 pl-3 text-slate-300 list-disc">
@@ -325,6 +510,30 @@ function ScaffoldPatchesBody({ c }: { c: any }) {
             <li key={i}>{String(f.file)} — {String(f.error)}</li>
           ))}
         </ul>
+      )}
+      {pinAdjustments.length > 0 && (
+        <details className="text-slate-300">
+          <summary className="cursor-pointer text-amber-300">
+            Tightened {pinAdjustments.length} fragile peer pin{pinAdjustments.length === 1 ? "" : "s"}
+          </summary>
+          <ul className="space-y-0.5 pl-3 list-disc">
+            {pinAdjustments.map((a, i) => (
+              <li key={i}>
+                <span className="text-slate-400">{String(a.file || "requirements.txt")}</span>
+                {" · "}
+                <span className="text-amber-200">{String(a.peer)}</span>
+                {a.before && (
+                  <>
+                    {" "}<span className="text-slate-500 line-through">{String(a.before)}</span>
+                  </>
+                )}
+                {" -> "}
+                <span className="text-emerald-300">{String(a.after)}</span>
+                <span className="text-slate-500"> (from {String(a.consumer)}=={String(a.consumer_version)})</span>
+              </li>
+            ))}
+          </ul>
+        </details>
       )}
       {diffs.length > 0 && (
         <DiffView diff={diffs.map((d) => d.patch).join("\n")} />

@@ -17,10 +17,14 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from fastapi import FastAPI
+import time
+
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+
+from cgx.trace import emit_trace as _trace_emit, is_trace_enabled
 
 from cgx.webui.routes import (
     agent,
@@ -33,6 +37,7 @@ from cgx.webui.routes import (
     profiles,
     rollback,
     sessions,
+    settings as settings_route,
     setup,
     status,
     tasks,
@@ -67,6 +72,29 @@ def create_app() -> FastAPI:
         allow_credentials=False,
     )
 
+    # Per-request trace bracket (Phase TR.3). One ``enter``/``exit`` record
+    # per HTTP request when the global trace flag is on. The toggle-off
+    # branch is a single bool check so production overhead stays near zero.
+    @app.middleware("http")
+    async def _trace_requests(request: Request, call_next):
+        if not is_trace_enabled():
+            return await call_next(request)
+        t0 = time.perf_counter()
+        path = request.url.path
+        method = request.method
+        _trace_emit("trace_enter", category="http", fn=f"{method} {path}")
+        try:
+            response = await call_next(request)
+        except BaseException as exc:
+            _trace_emit("trace_error", category="http", fn=f"{method} {path}",
+                        elapsed_ms=int((time.perf_counter() - t0) * 1000),
+                        error_type=type(exc).__name__, error=str(exc)[:300])
+            raise
+        _trace_emit("trace_exit", category="http", fn=f"{method} {path}",
+                    elapsed_ms=int((time.perf_counter() - t0) * 1000),
+                    status_code=getattr(response, "status_code", None))
+        return response
+
     # --- REST + SSE routes ---
     app.include_router(status.router, prefix="/api")
     app.include_router(setup.router, prefix="/api")
@@ -81,6 +109,7 @@ def create_app() -> FastAPI:
     app.include_router(agent_session.router, prefix="/api")
     app.include_router(tasks.router, prefix="/api")
     app.include_router(rollback.router, prefix="/api")
+    app.include_router(settings_route.router, prefix="/api")
 
     # --- Static SPA (built React app) ---
     _mount_spa(app)

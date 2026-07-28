@@ -136,6 +136,10 @@ export interface AskState {
   busy: boolean;
   messages: ChatMsg[];
   error: string | null;
+  // Which session the messages currently belong to. Lets the AskPage loader
+  // skip a re-fetch (which would clobber streamed/in-flight messages) when it
+  // remounts on the same session after a tab switch.
+  sessionId?: string | null;
 }
 
 // ─── plan page ───────────────────────────────────────────────────────────────
@@ -200,7 +204,7 @@ const defaultAgent: AgentState = {
   tasks: [], planTitle: null, rationale: "",
   events: [], summary: null, error: null,
 };
-const defaultAsk: AskState = { busy: false, messages: [], error: null };
+const defaultAsk: AskState = { busy: false, messages: [], error: null, sessionId: null };
 const defaultPlan: PlanState = {
   busy: false, thought: "", warning: null,
   planMd: null, diff: null, report: null, error: null,
@@ -318,6 +322,7 @@ export const useTasks = create<TasksStore>()(
           busy: s.ask.busy,
           messages: s.ask.messages,
           error: s.ask.error,
+          sessionId: s.ask.sessionId,
         },
         plan: {
           busy: s.plan.busy,

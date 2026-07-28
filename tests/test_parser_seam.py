@@ -18,9 +18,11 @@ import textwrap
 import pytest
 
 from cgx.parser.base import BaseParser
+from cgx.parser.markdown_parser import MarkdownParser
 from cgx.parser.parse_codebase import _PARSER_REGISTRY, _parse_python_module, parse_codebase
 from cgx.parser.python_parser import PythonASTParser
 from cgx.parser.schema import CallRelation, CodeChunk  # noqa: F401  (import smoke)
+from cgx.embeddings.records import make_index_records
 
 
 # ---------- BaseParser contract -----------------------------------------
@@ -145,3 +147,92 @@ def test_parse_codebase_aggregates_across_files(tmp_path):
     # Cross-file post-processing runs: foo gets calls_out_top attached.
     foo = next(c for c in chunks if c["type"] == "function" and c["name"] == "foo")
     assert "calls_out_top" in foo["meta"]
+
+
+# ---------- Markdown / RST documentation parser -------------------------
+
+
+_README = textwrap.dedent(
+    """
+    # Project Title
+
+    Intro paragraph describing the project.
+
+    ## Installation
+
+    Run ``pip install foo`` to install.
+
+    ## Usage
+
+    Import it and call ``foo.run()``.
+    """
+).lstrip()
+
+
+def test_registry_contains_markdown_parser():
+    for ext in (".md", ".markdown", ".mdx", ".rst"):
+        assert isinstance(_PARSER_REGISTRY.get(ext), MarkdownParser)
+
+
+def test_markdown_parser_chunks_by_heading(tmp_path):
+    fp = tmp_path / "README.md"
+    fp.write_text(_README)
+    chunks, calls = MarkdownParser().parse_file(str(fp), _README, str(tmp_path))
+    # No call graph for prose.
+    assert calls == []
+    # One file chunk plus one doc chunk per heading section.
+    types = sorted({c["type"] for c in chunks})
+    assert types == ["doc", "file"]
+    doc_titles = {c["name"] for c in chunks if c["type"] == "doc"}
+    assert {"Installation", "Usage"}.issubset(doc_titles)
+    # Every emitted chunk is stamped with doc provenance.
+    for c in chunks:
+        assert c["meta"].get("source_kind") == "doc"
+        for key in ("id", "type", "name", "file", "code",
+                    "start_line", "end_line", "col_offset", "meta"):
+            assert key in c, f"missing {key} on {c.get('id')}"
+    # File chunk anchors at line 1 and lists the section titles.
+    file_chunk = next(c for c in chunks if c["type"] == "file")
+    assert file_chunk["start_line"] == 1
+    assert "Installation" in file_chunk["code"]
+
+
+def test_markdown_parser_handles_setext_headings(tmp_path):
+    src = "Title\n=====\n\nbody line\n\nSub\n---\n\nmore\n"
+    chunks, _calls = MarkdownParser().parse_file(str(tmp_path / "d.md"), src, str(tmp_path))
+    titles = {c["name"] for c in chunks if c["type"] == "doc"}
+    assert {"Title", "Sub"}.issubset(titles)
+
+
+def test_markdown_parser_ignores_empty_source(tmp_path):
+    chunks, calls = MarkdownParser().parse_file(str(tmp_path / "e.md"), "   \n\n", str(tmp_path))
+    assert chunks == [] and calls == []
+
+
+def test_parse_codebase_indexes_readme_and_prunes_vendored_docs(tmp_path):
+    (tmp_path / "a.py").write_text("def foo():\n    return 1\n")
+    (tmp_path / "README.md").write_text(_README)
+    # Vendored generated-site output must be pruned by DEFAULT_IGNORE_DIRS.
+    site = tmp_path / "_site"
+    site.mkdir()
+    (site / "vendored.md").write_text("# Vendored\n\nnoise\n")
+    chunks, _calls = parse_codebase(str(tmp_path))
+    doc_files = {os.path.basename(c["file"]) for c in chunks
+                 if c.get("meta", {}).get("source_kind") == "doc"}
+    assert "README.md" in doc_files
+    assert "vendored.md" not in doc_files
+
+
+def test_source_kind_provenance_on_records(tmp_path):
+    (tmp_path / "a.py").write_text('"""mod."""\n\ndef foo():\n    return 1\n')
+    (tmp_path / "README.md").write_text(_README)
+    chunks, _calls = parse_codebase(str(tmp_path))
+    recs = make_index_records(chunks, G=None)
+    by_kind = {}
+    for r in recs:
+        by_kind.setdefault(r.get("source_kind"), set()).add(os.path.basename(r.get("file") or ""))
+    # Code records carry "code"; doc records carry "doc".
+    assert "README.md" in by_kind.get("doc", set())
+    assert "a.py" in by_kind.get("code", set())
+    # Every record has an explicit provenance (no None leaking through).
+    assert all(r.get("source_kind") in ("code", "doc") for r in recs)

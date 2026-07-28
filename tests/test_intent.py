@@ -55,6 +55,30 @@ def test_howto_without_symbol():
     assert detect_intent("how do i run tests?") == "howto"
 
 
+# Regression for the FAISS optimization run (57ed9a94): a recommendation /
+# optimization goal anchored on a symbol carried a symbol token but no
+# explain-verb, so it fell through to the symbol_explain fallback and
+# DESCRIBED build_faiss_index instead of RECOMMENDING parameters. Such
+# goals must route to change_plan so the engine emits actionable advice.
+def test_optimization_recommendation_routes_to_change_plan():
+    assert detect_intent(
+        "best FAISS parameters for build_faiss_index") == "change_plan"
+    assert detect_intent(
+        "how to optimize build_faiss_index") == "change_plan"
+    assert detect_intent(
+        "recommend optimal nlist and nprobe for the index") == "change_plan"
+    assert detect_intent("speed up the retriever") == "change_plan"
+    assert detect_intent("which parameters improve recall?") == "change_plan"
+
+
+# The optimization branch must not steal explicit symbol-explain requests:
+# an "explain"/"what does" verb still wins even when the symbol name or
+# question mentions optimization.
+def test_optimization_branch_yields_to_explicit_symbol_explain():
+    assert detect_intent("explain optimize_index") == "symbol_explain"
+    assert detect_intent("what does tune_params do?") == "symbol_explain"
+
+
 def test_symbol_location():
     assert detect_intent("where is parse_codebase defined?") == "symbol_location"
 
@@ -188,3 +212,22 @@ def test_apply_scope_penalty_handles_root_test_filename_without_tests_dir():
     out = apply_scope_penalty(hits, "src", penalty=0.3)
     assert out[0]["chunk_id"].split("::")[0].endswith("foo.py")
     assert out[1].get("scope_demoted") is True
+
+
+# ---------- endpoint enumeration intent ----------------------------------
+
+
+def test_enumerate_intent_fires_for_counting_endpoint_queries():
+    assert detect_intent("how many api endpoints does scanai have?") == "enumerate"
+    assert detect_intent("list all endpoints") == "enumerate"
+    assert detect_intent("list the routes in the auth module") == "enumerate"
+    assert detect_intent("count of apis") == "enumerate"
+    assert detect_intent("which endpoints exist?") == "enumerate"
+
+
+def test_enumerate_intent_requires_both_cue_and_keyword():
+    # Enumeration cue but no api/endpoint/route keyword -> not enumerate.
+    assert detect_intent("how many functions are there?") != "enumerate"
+    # api keyword but no enumeration cue -> not enumerate.
+    assert detect_intent("how does the api work?") != "enumerate"
+    assert detect_intent("what is scanai?") != "enumerate"

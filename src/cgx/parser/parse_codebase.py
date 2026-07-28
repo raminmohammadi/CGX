@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import ast
-import fnmatch
 import io
 import os
+import re
 import tokenize
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+import pathspec
+from pathspec.patterns import GitWildMatchPattern
 from cgx.parser.module_path import compute_module_path
 from cgx.logging_setup import get_logger
 
@@ -33,6 +35,8 @@ DEFAULT_IGNORE_DIRS = (
     "node_modules",
     "build", "dist", ".eggs", "site-packages",
     ".idea", ".vscode",
+    # Generated static-site / docs output (near-universally vendored artefacts).
+    "_site", ".docusaurus",
 )
 
 # Glob patterns (gitignore-style) applied to repo-relative paths.
@@ -43,42 +47,7 @@ DEFAULT_IGNORE_GLOBS = (
 )
 
 
-def _load_gitignore_patterns(project_root: str) -> List[str]:
-    """Read .gitignore at the project root and return a normalized pattern list."""
-    pats: List[str] = []
-    gi = os.path.join(project_root, ".gitignore")
-    if not os.path.isfile(gi):
-        return pats
-    try:
-        with open(gi, "r", encoding="utf-8", errors="ignore") as f:
-            for raw in f:
-                ln = raw.strip()
-                if not ln or ln.startswith("#"):
-                    continue
-                if ln.startswith("!"):
-                    # Negations are not supported; safer to skip than mis-handle.
-                    continue
-                pats.append(ln.lstrip("/"))
-    except Exception:
-        pass
-    return pats
-
-
-def _matches_any(rel_path: str, patterns: Iterable[str]) -> bool:
-    """fnmatch-style match against repo-relative POSIX paths and basenames."""
-    rp = rel_path.replace(os.sep, "/")
-    name = rp.rsplit("/", 1)[-1]
-    for p in patterns:
-        pat = p.rstrip("/").replace(os.sep, "/")
-        if not pat:
-            continue
-        if fnmatch.fnmatch(rp, pat) or fnmatch.fnmatch(name, pat):
-            return True
-        # Match nested entries when pattern is dir-like (no glob chars).
-        if "*" not in pat and "?" not in pat and "[" not in pat:
-            if rp == pat or rp.startswith(pat + "/"):
-                return True
-    return False
+# _load_gitignore_patterns and _matches_any removed in favor of pathspec
 
 
 # ---------- AST helpers ----------
@@ -392,6 +361,52 @@ def _build_file_code_stub(module_doc: Optional[str], members: Dict[str, List[Dic
     return "\n".join(parts)
 
 
+# Web-route decorator recognition (FastAPI / Flask / Starlette style).
+# ``decorators`` are already unparsed strings such as ``app.get('/x')`` or
+# ``router.route('/y', methods=['GET', 'POST'])``. We only need the HTTP
+# verb(s) and the path literal; the receiver name (app/router/bp/…) is
+# irrelevant so any dotted attribute call is accepted.
+_ROUTE_VERB_RE = re.compile(
+    r"\.(get|post|put|delete|patch|head|options|websocket|route|api_route)\s*\(",
+    re.IGNORECASE,
+)
+_ROUTE_STR_ARG_RE = re.compile(r"""\(\s*(?:r|f|rf|fr)?['"]([^'"]*)['"]""")
+_ROUTE_METHODS_KW_RE = re.compile(r"methods\s*=\s*[\[\(]([^\]\)]*)[\]\)]", re.IGNORECASE)
+_ROUTE_METHOD_TOKEN_RE = re.compile(r"""['"]([A-Za-z]+)['"]""")
+
+
+def _detect_route(decorators: List[str]) -> Optional[Dict[str, Any]]:
+    """Return ``{"methods": [...], "path": str|None}`` for the first decorator
+    that looks like a web-route registration, else ``None``.
+
+    Recognizes verb decorators (``@app.get('/x')`` → ``["GET"]``),
+    ``@app.websocket('/ws')`` → ``["WEBSOCKET"]`` and Flask-style
+    ``@app.route('/y', methods=['GET','POST'])`` (defaults to ``["GET"]``
+    when ``methods=`` is absent). Deterministic and side-effect free.
+    """
+    for dec in decorators or []:
+        if not isinstance(dec, str):
+            continue
+        m = _ROUTE_VERB_RE.search(dec)
+        if not m:
+            continue
+        verb = m.group(1).lower()
+        path_m = _ROUTE_STR_ARG_RE.search(dec)
+        path = path_m.group(1) if path_m else None
+        if verb in ("route", "api_route"):
+            kw = _ROUTE_METHODS_KW_RE.search(dec)
+            methods = (
+                [t.upper() for t in _ROUTE_METHOD_TOKEN_RE.findall(kw.group(1))]
+                if kw else ["GET"]
+            )
+        elif verb == "websocket":
+            methods = ["WEBSOCKET"]
+        else:
+            methods = [verb.upper()]
+        return {"methods": methods or ["GET"], "path": path}
+    return None
+
+
 def _parse_python_module(
     filepath: str,
     source_code: str,
@@ -467,6 +482,7 @@ def _parse_python_module(
             # "inner", preventing duplicate chunk IDs when identically-named
             # helpers are defined inside multiple different test functions.
             self._func_name_stack: List[str] = []
+            self._class_name_stack: List[str] = []
 
         # -------- imports --------
         def visit_Import(self, node: ast.Import):
@@ -506,7 +522,9 @@ def _parse_python_module(
             - Tracks enclosing class context for nested classes.
             - Visits all methods and nested classes recursively.
             """
-            class_id = f"{self.filename}::class::{node.name}"
+            self._class_name_stack.append(node.name)
+            qual_class_name = ".".join(self._class_name_stack)
+            class_id = f"{self.filename}::class::{qual_class_name}"
             # Get source code segment of the source that generated node.
             class_code = _get_source(self.source, node) 
             # unparse an AST node decorator_list into its string representations.
@@ -555,7 +573,7 @@ def _parse_python_module(
             )
 
             prev_class = self.current_class_name
-            self.current_class_name = node.name
+            self.current_class_name = qual_class_name
 
             # methods & nested
             for child in node.body:
@@ -568,6 +586,7 @@ def _parse_python_module(
                     self.visit(child)
 
             self.current_class_name = prev_class
+            self._class_name_stack.pop()
 
         # -------- functions --------
         def visit_FunctionDef(self, node: ast.FunctionDef):
@@ -631,6 +650,7 @@ def _parse_python_module(
 
             meta: Dict[str, Any] = {
                 "decorators": decorators,
+                "route": _detect_route(decorators),
                 "method_kind": method_kind,
                 "is_async": bool(is_async or isinstance(node, ast.AsyncFunctionDef)),
                 "is_method": bool(effective_is_method),
@@ -1062,6 +1082,140 @@ def _parse_python_module(
     return code_chunks, call_relations
 
 
+def _iter_source_files(
+    project_root: str,
+    *,
+    ignore_patterns: Optional[List[str]] = None,
+    max_file_bytes: Optional[int] = None,
+    follow_symlinks: bool = False,
+) -> "Iterable[Tuple[Any, str, str]]":
+    """Yield ``(parser, filepath, source_code)`` for each parseable file.
+
+    Shared walk used by :func:`parse_codebase` and the incremental parser
+    (:mod:`cgx.parser.incremental`). Honors ``.gitignore``, the default
+    ignore dirs/globs, the per-file size cap and the symlink policy, and only
+    yields files whose extension has a parser registered in
+    :data:`_PARSER_REGISTRY`.
+    """
+    # Resolve safety knobs (args > env > defaults).
+    if max_file_bytes is None:
+        try:
+            max_file_bytes = int(os.environ.get("CGX_PARSER_MAX_FILE_BYTES", "") or DEFAULT_MAX_FILE_BYTES)
+        except Exception:
+            max_file_bytes = DEFAULT_MAX_FILE_BYTES
+    user_globs = list(ignore_patterns or [])
+    abs_root = os.path.abspath(project_root)
+
+    def _rel(p: str) -> str:
+        try:
+            return os.path.relpath(p, abs_root)
+        except Exception:
+            return p
+
+    # Load gitignore
+    gi_lines: List[str] = []
+    gi_path = os.path.join(project_root, ".gitignore")
+    if os.path.isfile(gi_path):
+        try:
+            with open(gi_path, "r", encoding="utf-8", errors="ignore") as f:
+                gi_lines = f.readlines()
+        except Exception:
+            pass
+
+    # Compile pathspec matcher
+    spec_lines = list(DEFAULT_IGNORE_GLOBS) + user_globs
+    for line in gi_lines:
+        ln = line.strip()
+        if ln and not ln.startswith("#"):
+            spec_lines.append(ln)
+
+    spec = pathspec.PathSpec.from_lines(GitWildMatchPattern, spec_lines)
+
+    for root, dirs, files in os.walk(project_root, followlinks=follow_symlinks):
+        # Prune ignored directories in-place to avoid descending into them.
+        pruned: List[str] = []
+        for d in list(dirs):
+            if d in DEFAULT_IGNORE_DIRS:
+                continue
+            rel_d = _rel(os.path.join(root, d))
+            if spec.match_file(rel_d + "/"):
+                continue
+            pruned.append(d)
+        dirs[:] = pruned
+
+        for fname in files:
+            ext = os.path.splitext(fname)[1].lower()
+            parser = _PARSER_REGISTRY.get(ext)
+            if parser is None:
+                continue
+            filepath = os.path.join(root, fname)
+            rel_fp = _rel(filepath)
+            if spec.match_file(rel_fp):
+                continue
+            try:
+                if not follow_symlinks and os.path.islink(filepath):
+                    continue
+                st = os.stat(filepath)
+                if max_file_bytes and st.st_size > max_file_bytes:
+                    logger.warning(
+                        "Skipping %s: size %d bytes exceeds max_file_bytes=%d",
+                        rel_fp, st.st_size, max_file_bytes,
+                    )
+                    continue
+                with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+                    source_code = f.read()
+            except Exception as e:
+                logger.warning("Skipping unreadable file %s: %s", filepath, e)
+                continue
+            yield parser, filepath, source_code
+
+
+def _finalize_calls(
+    code_chunks: List[Dict[str, Any]],
+    call_relations: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Deduplicate call relations and attach reverse-edge metadata.
+
+    Runs the global cross-file post-processing that must see every call in
+    the merged corpus: it removes duplicate call sites and stamps
+    ``calls_out_top`` / ``called_by_count`` onto each function/lambda chunk.
+    Kept separate so the incremental parser can re-run it over a merged mix
+    of freshly parsed and cached per-file results.
+    """
+    # Deduplicate call relations
+    seen = set()
+    deduped: List[Dict[str, Any]] = []
+    for cr in call_relations:
+        key = (cr.get("caller_id"), cr.get("callee_name"), cr.get("callee_fullname"), cr.get("lineno"))
+        if key not in seen:
+            seen.add(key)
+            deduped.append(cr)
+
+    # ---- compute reverse edges & topK calls_out ----
+    calls_out_map: Dict[str, List[str]] = {}
+    calls_in_count: Dict[str, int] = {}
+
+    for cr in deduped:
+        caller = cr["caller_id"]
+        callee = cr.get("callee_fullname") or cr.get("callee_name")
+        if not callee:
+            continue
+        calls_out_map.setdefault(caller, []).append(callee)
+        calls_in_count[callee] = calls_in_count.get(callee, 0) + 1
+
+    # attach to function/method chunks
+    for ch in code_chunks:
+        if ch["type"] in ("function", "lambda"):
+            cid = ch["id"]
+            meta = ch.get("meta", {})
+            calls_out = sorted(calls_out_map.get(cid, []))
+            meta["calls_out_top"] = calls_out[:10]
+            meta["called_by_count"] = calls_in_count.get(cid, 0)
+            ch["meta"] = meta
+
+    return code_chunks, deduped
+
+
 def parse_codebase(
     project_root: str,
     *,
@@ -1103,100 +1257,21 @@ def parse_codebase(
     code_chunks: List[Dict[str, Any]] = []
     call_relations: List[Dict[str, Any]] = []
 
-    # Resolve safety knobs (args > env > defaults).
-    if max_file_bytes is None:
+    for parser, filepath, source_code in _iter_source_files(
+        project_root,
+        ignore_patterns=ignore_patterns,
+        max_file_bytes=max_file_bytes,
+        follow_symlinks=follow_symlinks,
+    ):
         try:
-            max_file_bytes = int(os.environ.get("CGX_PARSER_MAX_FILE_BYTES", "") or DEFAULT_MAX_FILE_BYTES)
-        except Exception:
-            max_file_bytes = DEFAULT_MAX_FILE_BYTES
-    user_globs = list(ignore_patterns or [])
-    gitignore_globs = _load_gitignore_patterns(project_root)
-    all_globs = list(DEFAULT_IGNORE_GLOBS) + gitignore_globs + user_globs
-    abs_root = os.path.abspath(project_root)
-
-    def _rel(p: str) -> str:
-        try:
-            return os.path.relpath(p, abs_root)
-        except Exception:
-            return p
-
-    for root, dirs, files in os.walk(project_root, followlinks=follow_symlinks):
-        # Prune ignored directories in-place to avoid descending into them.
-        pruned: List[str] = []
-        for d in list(dirs):
-            if d in DEFAULT_IGNORE_DIRS:
-                continue
-            rel_d = _rel(os.path.join(root, d))
-            if _matches_any(rel_d, all_globs):
-                continue
-            pruned.append(d)
-        dirs[:] = pruned
-
-        for fname in files:
-            ext = os.path.splitext(fname)[1].lower()
-            parser = _PARSER_REGISTRY.get(ext)
-            if parser is None:
-                continue
-            filepath = os.path.join(root, fname)
-            rel_fp = _rel(filepath)
-            if _matches_any(rel_fp, all_globs):
-                continue
-            try:
-                if not follow_symlinks and os.path.islink(filepath):
-                    continue
-                st = os.stat(filepath)
-                if max_file_bytes and st.st_size > max_file_bytes:
-                    logger.warning(
-                        "Skipping %s: size %d bytes exceeds max_file_bytes=%d",
-                        rel_fp, st.st_size, max_file_bytes,
-                    )
-                    continue
-                with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
-                    source_code = f.read()
-            except Exception as e:
-                logger.warning("Skipping unreadable file %s: %s", filepath, e)
-                continue
-
-            try:
-                file_chunks, file_calls = parser.parse_file(filepath, source_code, project_root)
-            except Exception as e:
-                logger.error("Parser failed for %s: %s", filepath, e)
-                continue
-            code_chunks.extend(file_chunks)
-            call_relations.extend(file_calls)
-
-    # Deduplicate call relations
-    seen = set()
-    deduped: List[Dict[str, Any]] = []
-    for cr in call_relations:
-        key = (cr.get("caller_id"), cr.get("callee_name"), cr.get("callee_fullname"), cr.get("lineno"))
-        if key not in seen:
-            seen.add(key)
-            deduped.append(cr)
-
-    # ---- compute reverse edges & topK calls_out ----
-    calls_out_map: Dict[str, List[str]] = {}
-    calls_in_count: Dict[str, int] = {}
-
-    for cr in deduped:
-        caller = cr["caller_id"]
-        callee = cr.get("callee_fullname") or cr.get("callee_name")
-        if not callee:
+            file_chunks, file_calls = parser.parse_file(filepath, source_code, project_root)
+        except Exception as e:
+            logger.error("Parser failed for %s: %s", filepath, e)
             continue
-        calls_out_map.setdefault(caller, []).append(callee)
-        calls_in_count[callee] = calls_in_count.get(callee, 0) + 1
+        code_chunks.extend(file_chunks)
+        call_relations.extend(file_calls)
 
-    # attach to function/method chunks
-    for ch in code_chunks:
-        if ch["type"] in ("function", "lambda"):
-            cid = ch["id"]
-            meta = ch.get("meta", {})
-            calls_out = sorted(calls_out_map.get(cid, []))
-            meta["calls_out_top"] = calls_out[:10]
-            meta["called_by_count"] = calls_in_count.get(cid, 0)
-            ch["meta"] = meta
-
-    return code_chunks, deduped
+    return _finalize_calls(code_chunks, call_relations)
 
 
 # Register concrete parsers. Imported here (rather than at module top)
@@ -1208,6 +1283,39 @@ def _register_default_parsers() -> None:
     inst = PythonASTParser()
     for ext in inst.extensions:
         _PARSER_REGISTRY[ext] = inst
+
+    # Markdown / RST docs. Pure-python (no optional dep), so always registered:
+    # standalone documentation carries intent/rationale that code omits. Vendored
+    # doc trees are still pruned by .gitignore, DEFAULT_IGNORE_DIRS and the size
+    # cap, exactly as for source files.
+    from cgx.parser.markdown_parser import MarkdownParser
+
+    md = MarkdownParser()
+    for ext in md.extensions:
+        _PARSER_REGISTRY[ext] = md
+
+    # Multi-language parsers are gated on the optional tree-sitter dependency.
+    # Each is registered only when its grammar can actually be loaded so that,
+    # with the ``parsers`` extra uninstalled, the walker keeps skipping those
+    # files exactly as it did before multi-language support existed.
+    try:
+        from cgx.parser.treesitter_base import treesitter_available
+        from cgx.parser.js_ts_parser import (
+            JavaScriptParser, TSXParser, TypeScriptParser,
+        )
+    except Exception as exc:  # pragma: no cover - defensive import guard
+        logger.debug("tree-sitter parsers unavailable: %s", exc)
+        return
+
+    for parser_cls in (JavaScriptParser, TypeScriptParser, TSXParser):
+        try:
+            if not treesitter_available(parser_cls.language):
+                continue
+            parser = parser_cls()
+            for ext in parser.extensions:
+                _PARSER_REGISTRY[ext] = parser
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("skipping %s: %s", parser_cls.__name__, exc)
 
 
 _register_default_parsers()

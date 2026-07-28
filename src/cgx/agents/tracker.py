@@ -16,6 +16,7 @@ Capabilities dispatched by task ``kind``:
 * ``summarize``⇒ ``capabilities["summarize"](prior_outputs: list, **task.inputs) -> dict``
 * ``apply``    ⇒ ``capabilities["apply"](prior_outputs: list, **task.inputs) -> dict``
 * ``verify``   ⇒ ``capabilities["verify"](prior_outputs: list, **task.inputs) -> dict``
+* ``reindex``  ⇒ ``capabilities["reindex"](prior_outputs: list, **task.inputs) -> dict``
 
 ``ask``, ``plan``, ``scaffold``, and ``search`` receive the task description
 as their first positional argument.  ``summarize``, ``apply``, and ``verify``
@@ -152,10 +153,12 @@ def _summarize_task_output(task: Task) -> str:
                         names.append(fp.rsplit("/", 1)[-1])
             if names:
                 bits.append("top: " + ", ".join(names))
-            impact = out.get("impact") or {}
-            impacted = impact.get("impacted_files") if isinstance(impact, dict) else None
-            if isinstance(impacted, list) and impacted:
-                bits.append(f"{len(impacted)} impacted file(s)")
+            # ``run_query_auto`` stores change-impact under ``impact`` as a
+            # ranked list of ``{file, score, reasons}`` (see
+            # ``analyze_change_impact``).
+            impact = out.get("impact") or []
+            if isinstance(impact, list) and impact:
+                bits.append(f"{len(impact)} impacted file(s)")
         elif task.kind == TaskKind.SUMMARIZE:
             ans = str(out.get("answer_md") or "").strip()
             if ans:
@@ -175,6 +178,17 @@ def _summarize_task_output(task: Task) -> str:
             backup = out.get("backup_dir")
             if backup:
                 bits.append(f"backups → {backup}")
+        elif task.kind == TaskKind.REINDEX:
+            counts = out.get("counts") or {}
+            n = sum(int(v) for v in counts.values() if isinstance(v, int))
+            if n:
+                bits.append(f"re-indexed {n} record(s)")
+            parse = out.get("parse") or {}
+            reparsed = parse.get("reparsed") or parse.get("changed")
+            if reparsed:
+                bits.append(f"{reparsed} file(s) re-parsed")
+            if out.get("skipped_reason"):
+                bits.append(str(out["skipped_reason"]))
         elif task.kind == TaskKind.FILL_LOGIC:
             fn = str(out.get("function_name") or "").strip()
             fp = str(out.get("file_path") or "").strip()
@@ -478,6 +492,16 @@ def _extract_display_output(task: Task) -> Dict[str, Any]:
             result["stdout_tail"] = str(out.get("stdout"))[-3000:]
         if out.get("stderr"):
             result["stderr_tail"] = str(out.get("stderr"))[-1500:]
+    elif task.kind == TaskKind.REINDEX:
+        result["reindexed"] = bool(out.get("reindexed"))
+        if out.get("counts"):
+            result["counts"] = {str(k): int(v)
+                                for k, v in (out.get("counts") or {}).items()
+                                if isinstance(v, int)}
+        if out.get("parse"):
+            result["parse"] = out.get("parse")
+        if out.get("skipped_reason"):
+            result["skipped_reason"] = str(out.get("skipped_reason"))
     return result
 
 
@@ -649,12 +673,36 @@ class Tracker:
             # retry loop knows which files are on disk and which still need fixing.
             if task.kind == TaskKind.APPLY:
                 out = task.output or {}
-                for fp in (out.get("applied_files") or []):
-                    plan.owned_files[str(fp)] = "applied"
+                applied_now = [str(fp) for fp in (out.get("applied_files") or [])]
+                for fp in applied_now:
+                    plan.owned_files[fp] = "applied"
                 for entry in (out.get("failed_files") or []):
                     fp = entry.get("file") if isinstance(entry, dict) else str(entry)
                     if fp:
                         plan.owned_files[str(fp)] = "failed"
+                # Refresh the on-disk index (incrementally) so any later
+                # SEARCH/ASK/PLAN tasks in this run see the freshly written
+                # code. Only when a reindex capability is registered, files
+                # were actually applied, and the next task isn't already a
+                # REINDEX -- keeps this graceful for partial deployments and
+                # idempotent across the retry loop.
+                next_is_reindex = (
+                    i < len(plan.tasks)
+                    and plan.tasks[i].kind == TaskKind.REINDEX
+                )
+                if (applied_now and "reindex" in self.capabilities
+                        and not next_is_reindex):
+                    reindex_task = Task(
+                        description="Refresh the code index after applying changes",
+                        kind=TaskKind.REINDEX,
+                        name="Re-index changed files",
+                    )
+                    logger.info(
+                        "Tracker: injecting REINDEX task id=%s after APPLY id=%s",
+                        reindex_task.id, task.id)
+                    plan.tasks.insert(i, reindex_task)
+                    yield AgentEvent(type="plan",
+                                     payload={"plan": plan.to_dict()})
 
             # Dynamic task injection: if a capability (e.g. scaffold_manifest)
             # returned an "inject_tasks" list, insert those tasks immediately
@@ -705,9 +753,11 @@ class Tracker:
     def _dispatch(cap: Capability, task: Task,
                   prior_outputs: List[Dict[str, Any]]) -> Dict[str, Any]:
         inputs = dict(task.inputs)
-        if task.kind in (TaskKind.SUMMARIZE, TaskKind.APPLY, TaskKind.VERIFY):
+        if task.kind in (TaskKind.SUMMARIZE, TaskKind.APPLY, TaskKind.VERIFY,
+                         TaskKind.REINDEX):
             # These kinds consume previous task outputs (the prior PLAN's
-            # diffs in particular) rather than a free-text query.
+            # diffs in particular, or the APPLY manifest for REINDEX) rather
+            # than a free-text query.
             return cap(prior_outputs, **inputs)
         if task.kind in (TaskKind.SCAFFOLD, TaskKind.SCAFFOLD_MANIFEST, TaskKind.SCAFFOLD_FILE):
             # Forward prior outputs so sibling scaffold tasks share one

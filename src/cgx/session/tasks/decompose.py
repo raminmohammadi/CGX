@@ -68,6 +68,15 @@ def run_decompose(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         return ExecutorResult(
             failure="DECOMPOSE: planner returned an empty manifest")
 
+    # Deterministic coherence gate: fail early (with an actionable message
+    # the router folds into a retry constraint) when the manifest is
+    # logically broken, then topologically order files by dependency hints
+    # so SCAFFOLD generates dependencies before their consumers.
+    coherence_error = _validate_manifest_coherence(layers)
+    if coherence_error:
+        return ExecutorResult(failure=coherence_error)
+    layers = _order_manifest_layers(layers)
+
     artifact = Artifact.new(
         session_id=task.session_id,
         produced_by_task_id=task.task_id,
@@ -145,7 +154,7 @@ def _coerce_layers(raw: Any) -> List[Dict[str, Any]]:
         if not isinstance(layer, dict):
             continue
         name = str(layer.get("name") or "project").strip()
-        files: List[Dict[str, str]] = []
+        files: List[Dict[str, Any]] = []
         for f in (layer.get("files") or []):
             if not isinstance(f, dict):
                 continue
@@ -153,10 +162,194 @@ def _coerce_layers(raw: Any) -> List[Dict[str, Any]]:
             desc = str(f.get("description") or path).strip()
             if not path:
                 continue
-            files.append({"path": path, "description": desc})
+            entry: Dict[str, Any] = {"path": path, "description": desc}
+            deps = _coerce_depends_on(f.get("depends_on"))
+            if deps:
+                entry["depends_on"] = deps
+            files.append(entry)
         out.append({"name": name, "files": files})
+    return out
+
+
+def _coerce_depends_on(raw: Any) -> List[str]:
+    """Normalize a per-file ``depends_on`` hint to a de-duplicated str list."""
+    if not isinstance(raw, list):
+        return []
+    out: List[str] = []
+    seen: set = set()
+    for d in raw:
+        s = str(d or "").strip()
+        if s and s not in seen:
+            seen.add(s)
+            out.append(s)
     return out
 
 
 def _layer_file_count(layers: List[Dict[str, Any]]) -> int:
     return sum(len(layer.get("files") or []) for layer in layers)
+
+
+# File extensions that count as runnable/source (an "entry point" or a
+# module a test can target). Docs, lockfiles, and pure config are absent
+# on purpose so a manifest that is all README/config/tests fails early.
+_SOURCE_EXTS = {
+    ".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".vue",
+    ".go", ".rs", ".java", ".rb", ".php", ".c", ".cc", ".cpp",
+    ".h", ".hpp", ".cs", ".swift", ".kt", ".scala", ".sh",
+    ".html", ".css", ".scss", ".sql",
+}
+
+
+def _file_ext(path: str) -> str:
+    base = path.rsplit("/", 1)[-1]
+    dot = base.rfind(".")
+    return base[dot:].lower() if dot > 0 else ""
+
+
+def _is_source_file(path: str) -> bool:
+    return _file_ext(path) in _SOURCE_EXTS
+
+
+def _is_test_file(path: str) -> bool:
+    low = path.lower()
+    base = low.rsplit("/", 1)[-1]
+    if (low.startswith("tests/") or low.startswith("test/")
+            or "/tests/" in low or "/test/" in low):
+        return True
+    if base.startswith("test_") or base.endswith("_test.py"):
+        return True
+    return ".test." in base or ".spec." in base
+
+
+def _manifest_files(layers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [f for lay in layers if isinstance(lay, dict)
+            for f in (lay.get("files") or [])
+            if isinstance(f, dict) and f.get("path")]
+
+
+def _find_dependency_cycle(
+        files: List[Dict[str, Any]]) -> Optional[List[str]]:
+    """Return a cyclic path (``a -> b -> a``) among intra-manifest deps."""
+    path_set = {f["path"] for f in files}
+    adj: Dict[str, List[str]] = {}
+    for f in files:
+        adj.setdefault(f["path"], [])
+        for dep in f.get("depends_on") or []:
+            if dep in path_set and dep != f["path"]:
+                adj[f["path"]].append(dep)
+    white, gray, black = 0, 1, 2
+    color = {p: white for p in adj}
+    stack: List[str] = []
+
+    def dfs(node: str) -> Optional[List[str]]:
+        color[node] = gray
+        stack.append(node)
+        for nxt in adj.get(node, []):
+            if color.get(nxt) == gray:
+                return stack[stack.index(nxt):] + [nxt]
+            if color.get(nxt) == white:
+                found = dfs(nxt)
+                if found:
+                    return found
+        stack.pop()
+        color[node] = black
+        return None
+
+    for p in adj:
+        if color[p] == white:
+            found = dfs(p)
+            if found:
+                return found
+    return None
+
+
+def _validate_manifest_coherence(
+        layers: List[Dict[str, Any]]) -> Optional[str]:
+    """Deterministic manifest sanity check.
+
+    Fails DECOMPOSE early (with an actionable message the router folds
+    into a retry constraint) when the plan is logically broken:
+    ``depends_on`` naming a file absent from the manifest, a dependency
+    cycle, or a manifest carrying no runnable source file (only
+    docs/config/tests -- nothing to build or to test against).
+    """
+    files = _manifest_files(layers)
+    path_set = {f["path"] for f in files}
+
+    dangling: List[str] = []
+    for f in files:
+        for dep in f.get("depends_on") or []:
+            if dep not in path_set:
+                dangling.append(f"{dep!r} (needed by {f['path']!r})")
+    if dangling:
+        return ("DECOMPOSE: manifest has dangling dependency reference(s): "
+                + ", ".join(dangling[:6])
+                + ". Every depends_on must name a file in the manifest.")
+
+    cycle = _find_dependency_cycle(files)
+    if cycle:
+        return ("DECOMPOSE: manifest has a circular dependency: "
+                + " -> ".join(cycle)
+                + ". Break the cycle so files generate dependency-first.")
+
+    non_test_source = [f["path"] for f in files
+                       if _is_source_file(f["path"])
+                       and not _is_test_file(f["path"])]
+    if not non_test_source:
+        return ("DECOMPOSE: manifest has no runnable source file (only "
+                "docs/config/tests). Add at least one entry-point module.")
+    return None
+
+
+def _order_manifest_layers(
+        layers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Topologically sort files *within* each layer by intra-layer
+    ``depends_on`` hints so a file is generated after the siblings it
+    imports. Declared order is preserved for independent files (stable);
+    layer order is left untouched -- cross-layer dependencies are assumed
+    satisfied by the planner's layering.
+    """
+    out: List[Dict[str, Any]] = []
+    for lay in layers:
+        if not isinstance(lay, dict):
+            out.append(lay)
+            continue
+        files = [f for f in (lay.get("files") or [])
+                 if isinstance(f, dict) and f.get("path")]
+        out.append({**lay, "files": _toposort_files(files)})
+    return out
+
+
+def _toposort_files(
+        files: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if len(files) < 2:
+        return list(files)
+    paths = [f["path"] for f in files]
+    order_index = {p: i for i, p in enumerate(paths)}
+    path_set = set(paths)
+    by_path = {f["path"]: f for f in files}
+    indeg = {p: 0 for p in paths}
+    adj: Dict[str, List[str]] = {p: [] for p in paths}
+    for f in files:
+        for dep in f.get("depends_on") or []:
+            if dep in path_set and dep != f["path"]:
+                adj[dep].append(f["path"])
+                indeg[f["path"]] += 1
+    ready = sorted((p for p in paths if indeg[p] == 0),
+                   key=order_index.get)
+    ordered: List[str] = []
+    while ready:
+        p = ready.pop(0)
+        ordered.append(p)
+        newly: List[str] = []
+        for nxt in adj[p]:
+            indeg[nxt] -= 1
+            if indeg[nxt] == 0:
+                newly.append(nxt)
+        if newly:
+            ready.extend(newly)
+            ready.sort(key=order_index.get)
+    if len(ordered) != len(paths):
+        # A cycle slipped past validation -- keep declared order.
+        return list(files)
+    return [by_path[p] for p in ordered]

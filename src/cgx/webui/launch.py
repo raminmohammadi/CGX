@@ -38,32 +38,14 @@ def _open_browser_later(url: str, delay: float = 0.8) -> None:
 def _maybe_enable_hf_offline() -> None:
     """Flip HuggingFace into offline mode when the embedding model is cached.
 
-    Skips remote update checks (which can hang behind SSL timeouts on
-    locked-down networks) at SentenceTransformer load time. Only opts in
-    when the user hasn't explicitly set the flag and the default embed
-    model has a snapshot in the local HF cache.
+    Thin wrapper over :func:`cgx.embeddings.build.maybe_enable_hf_offline`
+    (the shared guard used by every entry point) so the web UI enables
+    offline mode as early as possible -- before any HuggingFace import.
     """
-    if os.environ.get("HF_HUB_OFFLINE") or os.environ.get("TRANSFORMERS_OFFLINE"):
-        return
     try:
-        from cgx.config import EmbeddingConfig
-        model_name = EmbeddingConfig().model_name
+        from cgx.embeddings.build import maybe_enable_hf_offline
+        maybe_enable_hf_offline()
     except Exception:
-        return
-    cache_root = (
-        os.environ.get("HF_HOME")
-        or os.environ.get("HUGGINGFACE_HUB_CACHE")
-        or os.path.expanduser("~/.cache/huggingface/hub")
-    )
-    if os.environ.get("HF_HOME"):
-        cache_root = os.path.join(cache_root, "hub")
-    safe = "models--" + model_name.replace("/", "--")
-    snapshots = os.path.join(cache_root, safe, "snapshots")
-    try:
-        if os.path.isdir(snapshots) and any(os.scandir(snapshots)):
-            os.environ["HF_HUB_OFFLINE"] = "1"
-            os.environ["TRANSFORMERS_OFFLINE"] = "1"
-    except OSError:
         pass
 
 

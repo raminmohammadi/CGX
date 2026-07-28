@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 from cgx.session.models import Artifact, Fact, TaskKind, TaskNode
+from cgx.trace import traced
 
 
 @dataclass
@@ -70,11 +71,15 @@ def register_executor(kind: TaskKind) -> Callable[[Executor], Executor]:
     """Decorator that wires ``fn`` as the executor for ``kind``.
 
     Re-registering replaces the prior executor; tests rely on that to
-    swap in stubs without monkey-patching internal dicts.
+    swap in stubs without monkey-patching internal dicts. The registered
+    function is wrapped in :func:`cgx.trace.traced` so every executor
+    invocation surfaces an ``enter``/``exit`` record in the project
+    agent log when the global trace toggle is on.
     """
     def _wrap(fn: Executor) -> Executor:
-        _REGISTRY[kind] = fn
-        return fn
+        wrapped = traced("executor")(fn)
+        _REGISTRY[kind] = wrapped
+        return wrapped
     return _wrap
 
 

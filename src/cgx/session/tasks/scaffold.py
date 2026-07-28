@@ -17,7 +17,9 @@ disk-apply path without special casing greenfield.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Dict, List, Optional, Tuple
 
 from cgx.session.models import (
     Artifact,
@@ -25,6 +27,8 @@ from cgx.session.models import (
     TaskKind,
     TaskNode,
 )
+from cgx.session.repair.pypi_client import PyPIClient
+from cgx.session.scaffold_validate import validate_scaffold_diffs
 from cgx.session.tasks.base import (
     ExecutorDeps,
     ExecutorResult,
@@ -60,68 +64,74 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         return ExecutorResult(
             failure="SCAFFOLD: work plan carries no layers")
 
-    # Lazy import: drags the scaffold prompt templates.
-    from cgx.answer.engine import generate_single_scaffold_file
+    # Phase 6.1: when REPAIR routed a regenerate verdict here, fold the
+    # accumulated constraint payloads into the goal so the per-file
+    # generator sees the prior-failure context. Each entry is a small
+    # ``{kind, rationale, ...}`` dict shaped by the classifier; the
+    # join keeps the prompt human-readable without leaking JSON syntax.
+    regenerate_constraints = task.inputs.get("regenerate_constraints")
+    if isinstance(regenerate_constraints, list) and regenerate_constraints:
+        goal = _augment_goal_with_constraints(goal, regenerate_constraints)
+
+    # Phase 7.1: pull matching cross-session lessons (recorded after
+    # prior REPAIR -> VERIFY-pass cycles) and inject them as additional
+    # constraints. Scored by stack overlap + objective-keyword overlap;
+    # noop when the store is empty so the happy path stays unchanged.
+    lesson_constraints = _lessons_as_constraints(goal, content)
+    if lesson_constraints:
+        goal = _augment_goal_with_constraints(goal, lesson_constraints,
+                                              header="Lessons from prior "
+                                              "sessions to apply:")
 
     diffs: List[Dict[str, str]] = []
     existing_with_content: List[Dict[str, str]] = []
     generated: List[Dict[str, Any]] = []
     failed: List[Dict[str, str]] = []
+    concurrency = _scaffold_concurrency()
 
-    for layer in layers:
-        if not isinstance(layer, dict):
-            continue
-        layer_name = str(layer.get("name") or "project").strip()
-        for entry in (layer.get("files") or []):
-            if not isinstance(entry, dict):
-                continue
-            path = str(entry.get("path") or "").strip()
-            description = str(entry.get("description") or path).strip()
-            if not path:
-                continue
-            try:
-                result = generate_single_scaffold_file(
-                    path, description, deps.provider,
-                    layer=layer_name,
-                    existing_files_with_content=list(existing_with_content),
-                    goal=goal,
-                )
-            except Exception as exc:
-                logger.exception(
-                    "SCAFFOLD: generate_single_scaffold_file crashed for %s",
-                    path)
-                failed.append({
-                    "file": path,
-                    "error": f"{type(exc).__name__}: {exc}",
-                })
-                continue
-
-            file_path = str(result.get("file") or path).strip()
-            patch = str(result.get("patch") or "")
-            file_content = str(result.get("content") or "")
-            if not file_path or not patch:
-                failed.append({
-                    "file": path,
-                    "error": "generator returned empty patch",
-                })
-                continue
-
-            diffs.append({"file": file_path, "patch": patch})
-            existing_with_content.append({
-                "path": file_path, "content": file_content,
-            })
+    # Targeted regeneration (router failed-files splices): when a prior
+    # SCAFFOLD/APPLY dropped specific files, only those paths are
+    # re-generated while every prior-good diff is reused verbatim. This
+    # keeps the retry proportional to the failure instead of re-running the
+    # whole manifest and risking re-breaking files that were fine. Falls
+    # back to a whole-tree regenerate when the marker or prior artifact is
+    # absent, so the happy path is unchanged.
+    regen_set = _resolve_regenerate_set(task, deps)
+    if regen_set is not None:
+        for reused in _reused_good_files(task, deps, regen_set):
+            diffs.append({"file": reused["path"], "patch": reused["patch"]})
+            existing_with_content.append(
+                {"path": reused["path"], "content": reused["content"]})
             generated.append({
-                "file": file_path,
-                "layer": layer_name,
-                "syntax_ok": bool(result.get("syntax_ok")),
-                "confidence": result.get("confidence"),
-                "bytes": len(file_content),
+                "file": reused["path"], "layer": "reused",
+                "syntax_ok": True, "confidence": None,
+                "bytes": len(reused["content"]), "reused": True,
             })
 
-    if not diffs:
-        return ExecutorResult(
-            failure="SCAFFOLD: every file generation failed")
+    # Resumable progress (B4): when a prior SCAFFOLD for this same work
+    # plan crashed or was killed mid-run, the runner threads the id of its
+    # last on-disk checkpoint here. Seed every already-generated file so
+    # this attempt regenerates only the remainder instead of discarding
+    # completed work. Skipped when a targeted regenerate is active (that
+    # path already reuses prior-good diffs) or the pointer is unresolvable.
+    resume_done: set = set()
+    if regen_set is None:
+        for done in _resume_generated_files(task, deps, work_plan_id):
+            diffs.append({"file": done["path"], "patch": done["patch"]})
+            existing_with_content.append(
+                {"path": done["path"], "content": done["content"]})
+            generated.append({
+                "file": done["path"], "layer": "resumed",
+                "syntax_ok": True, "confidence": None,
+                "bytes": len(done["content"]), "resumed": True,
+            })
+            resume_done.add(done["path"])
 
+    # Build the SCAFFOLD_PATCHES artifact up front with a stable id and
+    # ``complete=False`` so it can be checkpointed to the store after every
+    # layer. ``content`` holds live references to the diffs/generated/failed
+    # lists, so each checkpoint save reflects the latest progress; the final
+    # save (with pin adjustments + ``complete=True``) upserts the same row.
     artifact = Artifact.new(
         session_id=task.session_id,
         produced_by_task_id=task.task_id,
@@ -133,13 +143,418 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             "diffs": diffs,
             "generated": generated,
             "failed": failed,
+            "pin_adjustments": [],
+            "complete": False,
         },
     )
+
+    for layer in layers:
+        if not isinstance(layer, dict):
+            continue
+        layer_name = str(layer.get("name") or "project").strip()
+        # Collect this layer's files (manifest order) after the targeted-
+        # regenerate skip, so the parallel and serial paths share one plan.
+        pending: List[Tuple[str, str]] = []
+        for entry in (layer.get("files") or []):
+            if not isinstance(entry, dict):
+                continue
+            path = str(entry.get("path") or "").strip()
+            description = str(entry.get("description") or path).strip()
+            if not path:
+                continue
+            # Targeted regenerate: skip every file not slated for
+            # regeneration -- it was reused above (or was never at fault).
+            if regen_set is not None and path not in regen_set:
+                continue
+            # Resume: skip files already generated by the crashed attempt.
+            if path in resume_done:
+                continue
+            pending.append((path, description))
+        if not pending:
+            continue
+
+        parallel = concurrency > 1 and len(pending) > 1
+        if parallel:
+            # Bounded fan-out within the layer: every file sees the same
+            # frozen cross-layer context (prior layers only), so sibling
+            # generations are independent and safe to run concurrently.
+            # Results are gathered by manifest index so diff/failure order
+            # is deterministic regardless of completion order. The worker
+            # count honours the GPU throttle -- it defaults to 1 (serial)
+            # so a single local GPU is never over-subscribed.
+            context_snapshot = list(existing_with_content)
+            layer_results: List[Any] = [None] * len(pending)
+            max_workers = min(concurrency, len(pending))
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                fut_to_idx = {
+                    pool.submit(
+                        _generate_one, p, d, layer_name,
+                        list(context_snapshot), deps.provider, goal): i
+                    for i, (p, d) in enumerate(pending)
+                }
+                for fut in as_completed(fut_to_idx):
+                    layer_results[fut_to_idx[fut]] = fut.result()
+        else:
+            # Serial: each file additionally sees its already-generated
+            # siblings, maximising intra-layer import resolution (the legacy
+            # behaviour, preserved as the default).
+            layer_results = []
+            for (p, d) in pending:
+                ok, fail = _generate_one(
+                    p, d, layer_name, list(existing_with_content),
+                    deps.provider, goal)
+                layer_results.append((ok, fail))
+                if ok is not None:
+                    existing_with_content.append(
+                        {"path": ok["file"], "content": ok["content"]})
+
+        # Fold the layer's outcomes into the running state in manifest
+        # order. In the parallel path the context snapshot was frozen, so
+        # append successes now to feed the next layer.
+        for ok, fail in layer_results:
+            if fail is not None:
+                failed.append(fail)
+                continue
+            diffs.append({"file": ok["file"], "patch": ok["patch"]})
+            generated.append({
+                "file": ok["file"],
+                "layer": ok["layer"],
+                "syntax_ok": ok["syntax_ok"],
+                "confidence": ok["confidence"],
+                "bytes": len(ok["content"]),
+            })
+            if parallel:
+                existing_with_content.append(
+                    {"path": ok["file"], "content": ok["content"]})
+
+        # Checkpoint after each layer so a crash mid-run is resumable.
+        _checkpoint_progress(deps, artifact)
+
+    if not diffs:
+        return ExecutorResult(
+            failure="SCAFFOLD: every file generation failed")
+
+    # Phase 4.1: tighten upper bounds on known-fragile peers using the
+    # consumer's PyPI ``requires_dist`` *before* APPLY writes the file.
+    # Network / fetch failures degrade to no-op (returns the original
+    # diffs and empty adjustments) so SCAFFOLD never blocks on PyPI.
+    pin_adjustments: List[Dict[str, Any]] = []
+    try:
+        pypi_client = _resolve_pypi_client(deps)
+        file_contents = {e["path"]: e["content"]
+                         for e in existing_with_content
+                         if e.get("path") and isinstance(e.get("content"), str)}
+        diffs, _, pin_adjustments = validate_scaffold_diffs(
+            diffs, file_contents, pypi_client=pypi_client)
+    except Exception:  # pragma: no cover - defensive: validator is best-effort
+        logger.exception(
+            "SCAFFOLD: pin validator raised; emitting unmodified diffs")
+        pin_adjustments = []
+
+    # Finalise the checkpoint artifact in place: pin validation reassigns
+    # ``diffs`` to a new list, so re-point the content at it, attach the
+    # adjustment log, and flip ``complete``. Same artifact_id, so the
+    # runner's post-return save_artifact upserts the checkpoint row.
+    artifact.content["diffs"] = diffs
+    artifact.content["generated"] = generated
+    artifact.content["failed"] = failed
+    artifact.content["pin_adjustments"] = pin_adjustments
+    artifact.content["complete"] = True
     return ExecutorResult(
         outputs={
             "scaffold_artifact_id": artifact.artifact_id,
             "generated_count": len(generated),
             "failed_count": len(failed),
+            "failed": failed,
+            "pin_adjustments_count": len(pin_adjustments),
         },
         artifact=artifact,
     )
+
+
+def _generate_one(
+        path: str, description: str, layer_name: str,
+        context: List[Dict[str, str]], provider: Any, goal: str,
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, str]]]:
+    """Generate one scaffold file. Returns ``(ok_entry, fail_entry)``.
+
+    Exactly one element is non-``None``. ``ok_entry`` carries both the diff
+    and the metadata/content the caller folds into the artifact; ``fail_entry``
+    is the ``{file, error}`` shape the router turns into a targeted regenerate
+    constraint. It reads no shared state, so it is safe to run inside the
+    bounded per-layer worker pool. The generator import is resolved on each
+    call so monkeypatched stubs (and any hot-swapped prompt templates) take
+    effect.
+    """
+    from cgx.answer.engine import generate_single_scaffold_file
+    try:
+        result = generate_single_scaffold_file(
+            path, description, provider,
+            layer=layer_name,
+            existing_files_with_content=context,
+            goal=goal,
+        )
+    except Exception as exc:
+        logger.exception(
+            "SCAFFOLD: generate_single_scaffold_file crashed for %s", path)
+        return None, {"file": path, "error": f"{type(exc).__name__}: {exc}"}
+
+    file_path = str(result.get("file") or path).strip()
+    patch = str(result.get("patch") or "")
+    file_content = str(result.get("content") or "")
+    if not file_path or not patch:
+        return None, {"file": path, "error": "generator returned empty patch"}
+    return {
+        "file": file_path,
+        "patch": patch,
+        "content": file_content,
+        "layer": layer_name,
+        "syntax_ok": bool(result.get("syntax_ok")),
+        "confidence": result.get("confidence"),
+    }, None
+
+
+def _scaffold_concurrency() -> int:
+    """Return the bounded per-layer generation worker count (>= 1).
+
+    Defaults to 1 (serial) so a single local GPU is never over-subscribed:
+    the runner's ``_GPU_INFERENCE_SEMAPHORE`` already serialises whole LLM
+    tasks, and intra-layer fan-out only pays off when the provider can
+    service concurrent requests (cloud endpoints, or a host with GPU
+    headroom). Opt in via ``CGX_SCAFFOLD_CONCURRENCY``; malformed or sub-1
+    values clamp to 1.
+    """
+    raw = os.environ.get("CGX_SCAFFOLD_CONCURRENCY")
+    if not raw:
+        return 1
+    try:
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _resolve_pypi_client(deps: ExecutorDeps) -> PyPIClient:
+    """Return the injected PyPI client, or build a default."""
+    injected = (deps.extra or {}).get("pypi_client")
+    if isinstance(injected, PyPIClient):
+        return injected
+    return PyPIClient()
+
+
+def _resolve_regenerate_set(
+        task: TaskNode, deps: ExecutorDeps) -> Optional[set]:
+    """Return the set of paths to regenerate, or ``None`` for whole-tree.
+
+    Targeted regeneration is active only when the router threaded both a
+    non-empty ``regenerate_files`` list and a ``prior_scaffold_artifact_id``
+    that resolves to a real SCAFFOLD_PATCHES artifact. Any missing piece
+    degrades to a whole-tree regenerate (``None``) so a stale or dangling
+    marker can never cause files to be silently skipped.
+    """
+    files = task.inputs.get("regenerate_files")
+    prior_id = str(task.inputs.get("prior_scaffold_artifact_id") or "").strip()
+    if not isinstance(files, list) or not files or not prior_id:
+        return None
+    if deps.store is None:
+        return None
+    prior = deps.store.get_artifact(prior_id)
+    if prior is None or prior.kind is not ArtifactKind.SCAFFOLD_PATCHES:
+        return None
+    regen = {str(p).strip() for p in files if str(p).strip()}
+    return regen or None
+
+
+def _reused_good_files(
+        task: TaskNode, deps: ExecutorDeps,
+        regen_set: set) -> List[Dict[str, str]]:
+    """Return prior-good ``{path, patch, content}`` entries to reuse verbatim.
+
+    Reads the prior SCAFFOLD_PATCHES diffs and returns every file *not* in
+    ``regen_set``. ``content`` is reconstructed from the new-file patch so
+    the regenerated files still receive the good files as cross-file
+    context (imports, symbol inventory). The caller has already verified
+    the artifact resolves via :func:`_resolve_regenerate_set`.
+    """
+    prior_id = str(task.inputs.get("prior_scaffold_artifact_id") or "").strip()
+    prior = deps.store.get_artifact(prior_id)
+    out: List[Dict[str, str]] = []
+    seen: set = set()
+    for d in ((prior.content or {}).get("diffs") or []):
+        if not isinstance(d, dict):
+            continue
+        fpath = str(d.get("file") or "").strip()
+        patch = str(d.get("patch") or "")
+        if not fpath or not patch or fpath in regen_set or fpath in seen:
+            continue
+        seen.add(fpath)
+        out.append({
+            "path": fpath, "patch": patch,
+            "content": _content_from_new_file_patch(patch),
+        })
+    return out
+
+
+def _content_from_new_file_patch(patch: str) -> str:
+    """Reconstruct file content from a ``/dev/null`` new-file unified diff.
+
+    Inverse of ``engine._content_to_new_file_patch``: strips the leading
+    ``+`` from every body line after the ``@@`` hunk header. Best-effort --
+    used only to seed cross-file context, never to write to disk (the
+    reused patch itself is what APPLY re-applies).
+    """
+    body: List[str] = []
+    started = False
+    for line in patch.splitlines():
+        if not started:
+            if line.startswith("@@"):
+                started = True
+            continue
+        if line.startswith("+"):
+            body.append(line[1:])
+    return "\n".join(body)
+
+
+def _checkpoint_progress(deps: ExecutorDeps, artifact: Artifact) -> None:
+    """Persist the in-progress SCAFFOLD_PATCHES artifact after a layer.
+
+    Best-effort: ``save_artifact`` uses ``INSERT OR REPLACE`` keyed by
+    ``artifact_id``, so calling it after every layer upserts the same row
+    with the latest ``diffs``/``generated``/``failed`` -- a crash or
+    timeout mid-run then leaves the completed files on disk for
+    :func:`_resume_generated_files` to seed. A checkpoint save must never
+    fail the generation task itself, so any store error is swallowed
+    (the next layer's checkpoint, or the runner's post-return save, will
+    persist the same state).
+    """
+    store = deps.store
+    if store is None:
+        return
+    try:
+        store.save_artifact(artifact)
+    except Exception:  # pragma: no cover - defensive: checkpoint is best-effort
+        logger.exception("SCAFFOLD: checkpoint save_artifact failed")
+
+
+def _resume_generated_files(
+        task: TaskNode, deps: ExecutorDeps,
+        work_plan_id: str) -> List[Dict[str, str]]:
+    """Return already-generated ``{path, patch, content}`` from a checkpoint.
+
+    Resume is active only when the router threaded a
+    ``resume_scaffold_artifact_id`` that resolves to a real
+    SCAFFOLD_PATCHES artifact produced for the *same* work plan -- a
+    checkpoint from a different plan (or a dangling id) degrades to an
+    empty list so a stale marker can never seed the wrong files. Content
+    is reconstructed from each new-file patch (as in
+    :func:`_reused_good_files`) so resumed files still serve as cross-file
+    context for the remaining generations.
+    """
+    resume_id = str(task.inputs.get("resume_scaffold_artifact_id") or "").strip()
+    if not resume_id or deps.store is None:
+        return []
+    prior = deps.store.get_artifact(resume_id)
+    if prior is None or prior.kind is not ArtifactKind.SCAFFOLD_PATCHES:
+        return []
+    prior_content = prior.content or {}
+    if str(prior_content.get("work_plan_artifact_id") or "").strip() \
+            != work_plan_id:
+        return []
+    out: List[Dict[str, str]] = []
+    seen: set = set()
+    for d in (prior_content.get("diffs") or []):
+        if not isinstance(d, dict):
+            continue
+        fpath = str(d.get("file") or "").strip()
+        patch = str(d.get("patch") or "")
+        if not fpath or not patch or fpath in seen:
+            continue
+        seen.add(fpath)
+        out.append({
+            "path": fpath, "patch": patch,
+            "content": _content_from_new_file_patch(patch),
+        })
+    return out
+
+
+def _augment_goal_with_constraints(
+        goal: str, constraints: List[Dict[str, Any]],
+        *, header: str = "Prior-attempt failures to avoid this time:") -> str:
+    """Append ``constraints`` to ``goal`` under ``header`` as a bulleted tail.
+
+    Each entry is rendered as ``- <kind>: <rationale>`` so the LLM
+    sees the failure as a structured caveat rather than free-form
+    context. The original goal is preserved verbatim; the tail is
+    delimited by a blank line + header so prompt-builders that split on
+    line ranges keep working. The header is configurable so Phase 7.1
+    lessons can re-use the same shape with a clearer call-out.
+    """
+    lines = ["", header]
+    for entry in constraints:
+        if not isinstance(entry, dict):
+            continue
+        kind = str(entry.get("kind") or "constraint").strip()
+        rationale = str(entry.get("rationale") or "").strip()
+        if rationale:
+            lines.append(f"- {kind}: {rationale}")
+        else:
+            lines.append(f"- {kind}")
+    if len(lines) == 2:
+        return goal
+    return f"{goal}\n" + "\n".join(lines) if goal else "\n".join(lines[1:])
+
+
+def _lessons_as_constraints(
+        goal: str, work_plan: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Translate matching :mod:`cgx.session.lessons` records into constraint dicts.
+
+    Best-effort: any failure in the lesson store (missing file, OS
+    error, malformed JSON) is swallowed by the underlying
+    :func:`relevant_lessons` and surfaces here as an empty list.
+    """
+    from cgx.session.lessons import relevant_lessons
+
+    stack = _extract_stack_packages(work_plan)
+    try:
+        lessons = relevant_lessons(objective=goal, stack=stack, limit=3)
+    except Exception as exc:  # pragma: no cover - best effort
+        logger.warning("scaffold: relevant_lessons failed: %s", exc)
+        return []
+    out: List[Dict[str, Any]] = []
+    for lesson in lessons:
+        cls = str(lesson.get("classification") or "lesson").strip()
+        sig = str(lesson.get("trigger_signature") or "").strip()
+        fix = lesson.get("applied_fix") or {}
+        files = fix.get("files") or []
+        files_part = (f" (touched {', '.join(files[:3])}"
+                      f"{'...' if len(files) > 3 else ''})") if files else ""
+        rationale = (
+            f"A previous session hit {sig!r} and fixed it via "
+            f"{fix.get('strategy') or 'patch'}{files_part}; avoid the "
+            "same trigger here.")
+        out.append({"kind": f"lesson:{cls}", "rationale": rationale})
+    return out
+
+
+def _extract_stack_packages(work_plan: Dict[str, Any]) -> List[str]:
+    """Return the package list a SCAFFOLD goal is targeting.
+
+    Reads from ``requirements_pins`` first (the curated list a DECOMPOSE
+    leaves on the WORK_PLAN) and falls back to the layer-derived
+    ``pins`` field; either way the result is a list of bare package
+    names with no version specifier.
+    """
+    out: List[str] = []
+    for key in ("requirements_pins", "pins", "stack"):
+        pins = work_plan.get(key)
+        if isinstance(pins, list):
+            for entry in pins:
+                if isinstance(entry, str):
+                    name = entry.split("==")[0].split(">=")[0]
+                    name = name.split("<")[0].split(";")[0].strip()
+                    if name:
+                        out.append(name)
+                elif isinstance(entry, dict):
+                    name = str(entry.get("name") or "").strip()
+                    if name:
+                        out.append(name)
+    return out

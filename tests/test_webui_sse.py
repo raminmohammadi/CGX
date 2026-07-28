@@ -165,3 +165,85 @@ def test_bridge_with_task_id_records_error_payload():
     asyncio.run(go())
     types = [e["type"] for e in ts.get_task_events(task_id)]
     assert "error" in types
+    # A worker exception must leave the task FAILED, not DONE.
+    task = ts.get_task(task_id)
+    assert task["status"] == "failed"
+    assert "kapow" in (task["error"] or "")
+
+
+# ---------------------------------------------------------------------------
+# terminal-failure propagation to the persisted task status
+# ---------------------------------------------------------------------------
+def test_bridge_marks_failed_when_summary_reports_failed_tasks():
+    """Regression for the FAISS run persisted ``done`` despite a judge fail.
+
+    The agent tracker ends every run with a ``summary`` event carrying
+    completed/failed/skipped counts. When ``failed`` is non-zero the run
+    is degraded and the persisted status must be ``failed`` -- not ``done``.
+    """
+    task_id = ts.create_task("agent")
+
+    def gen():
+        yield ("task_failed", {"task_id": "t1", "error": "judge: nope"})
+        yield ("task_skipped", {"task_id": "t2"})
+        yield ("summary", {"completed": 1, "failed": 1, "skipped": 1})
+
+    def to_event(item):
+        ev, payload = item
+        return {"event": ev, "data": payload}
+
+    async def go():
+        return await _collect(sse.bridge_generator(
+            gen, to_event=to_event, task_id=task_id, cancel_event=None,
+        ))
+
+    events = asyncio.run(go())
+    assert events[-1] == {"event": "done", "data": "{}"}
+    task = ts.get_task(task_id)
+    assert task["status"] == "failed"
+    assert "1 task(s) failed" in (task["error"] or "")
+    assert "1 skipped" in (task["error"] or "")
+
+
+def test_bridge_marks_failed_on_error_event_without_worker_exception():
+    task_id = ts.create_task("agent")
+
+    def gen():
+        yield ("status", {"phase": "executing"})
+        yield ("error", {"message": "run_agent init failed: boom"})
+
+    def to_event(item):
+        ev, payload = item
+        return {"event": ev, "data": payload}
+
+    async def go():
+        return await _collect(sse.bridge_generator(
+            gen, to_event=to_event, task_id=task_id, cancel_event=None,
+        ))
+
+    asyncio.run(go())
+    task = ts.get_task(task_id)
+    assert task["status"] == "failed"
+    assert "boom" in (task["error"] or "")
+
+
+def test_bridge_summary_all_passed_stays_done():
+    task_id = ts.create_task("agent")
+
+    def gen():
+        yield ("summary", {"completed": 3, "failed": 0, "skipped": 1})
+
+    def to_event(item):
+        ev, payload = item
+        return {"event": ev, "data": payload}
+
+    async def go():
+        return await _collect(sse.bridge_generator(
+            gen, to_event=to_event, task_id=task_id, cancel_event=None,
+        ))
+
+    asyncio.run(go())
+    task = ts.get_task(task_id)
+    # A clean run (no failures) stays DONE even if optional steps skipped.
+    assert task["status"] == "done"
+    assert task["error"] is None

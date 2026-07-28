@@ -26,6 +26,7 @@ from cgx.codegen.diff_apply import (
 from cgx.codegen.validate import (
     SyntaxDiagnostic,
     validate_python_source,
+    validate_js_ts_source,
     validate_patch_results,
 )
 from cgx.codegen.test_runner import (
@@ -49,6 +50,7 @@ __all__ = [
     "apply_diffs_in_memory",
     "SyntaxDiagnostic",
     "validate_python_source",
+    "validate_js_ts_source",
     "validate_patch_results",
     "TestRunOutcome",
     "discover_all_tests",

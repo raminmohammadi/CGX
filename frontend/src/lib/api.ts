@@ -17,6 +17,10 @@ export type ProviderConfig = {
   num_ctx?: number | null;
   endpoint_path?: string;
   allow_no_auth?: boolean;
+  // Opt-in reasoning/"thinking" phase for ASK. The backend only honors it
+  // when the selected model is reasoning-capable; otherwise it answers
+  // directly. Undefined is treated as false.
+  think?: boolean;
 };
 
 export type IndexLocation = {
@@ -179,9 +183,12 @@ export type ArtifactKind =
   | "work_plan"
   | "scaffold_patches"
   | "build_report"
-  | "repair_plan";
+  | "repair_plan"
+  | "smoke_report"
+  | "api_check_report";
 
-export type FactKind = "file" | "symbol" | "parameter" | "anchor";
+export type FactKind =
+  | "file" | "symbol" | "parameter" | "anchor" | "llm_call";
 
 export type DecisionKind =
   | "choose_path"
@@ -471,6 +478,16 @@ export const api = {
       "DELETE",
     );
   },
+
+  getTraceSettings: () =>
+    jsonReq<TraceSettings>("/api/settings/trace"),
+  setTraceSettings: (enabled: boolean) =>
+    jsonReq<TraceSettings>("/api/settings/trace", "POST", { enabled }),
+};
+
+export type TraceSettings = {
+  enabled: boolean;
+  source: "env" | "runtime";
 };
 
 export type RollbackResponse = {

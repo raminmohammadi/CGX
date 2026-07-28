@@ -8,7 +8,7 @@ runs without touching any real model, index, or network.
 The scenarios mirror the documented happy paths in ``docs/usage.md``:
 
 * multi-skill scaffold (React UI + FastAPI backend) with disk APPLY +
-  VERIFY skipping because no tests are generated;
+  VERIFY running the always-injected test file;
 * single-skill scaffold (Django) that produces a manage.py;
 * unsupported-tech scaffold goal (Tkinter) that still routes to SCAFFOLD
   via the ``_TECH_RE`` fallback even though no skill claims it;
@@ -86,6 +86,15 @@ def test_e2e_react_fastapi_calculator_scaffold(tmp_path):
         {"content": json.dumps({"content": "import React from 'react';\nexport default function App(){return <div>Calc</div>;}"})},
         {"content": json.dumps({"content": "from fastapi import FastAPI\napp = FastAPI()\n@app.post('/compute')\ndef compute():\n    return {'ok': True}\n"})},
         {"content": json.dumps({"content": "fastapi\nuvicorn\n"})},
+        # ``tests/test_smoke.py`` is injected by ``_inject_required_test_file``
+        # (no manifest carried a test), so scaffolds always ship a runnable
+        # self-correction signal; it is generated after the backend layer.
+        {"content": json.dumps({"content": "def test_smoke():\n    assert True\n"})},
+        # README.md is injected LAST by ``_inject_readme`` and generated
+        # via the LLM, so it consumes the final scripted reply. The
+        # ``backend/__init__.py`` package-marker is deterministic and
+        # makes no LLM call.
+        {"content": json.dumps({"content": "# Calc\n\nA React UI + FastAPI calculator backend.\n\n## Setup\n\nInstall backend deps from `backend/requirements.txt`.\n"})},
     ]
 
     provider = _ScriptedProvider([planner_reply, manifest_reply, *file_replies])
@@ -99,7 +108,10 @@ def test_e2e_react_fastapi_calculator_scaffold(tmp_path):
 
     kinds = [t.kind for t in plan.tasks]
     assert kinds[0] == TaskKind.SCAFFOLD_MANIFEST
-    assert kinds[-2:] == [TaskKind.APPLY, TaskKind.VERIFY]
+    # After APPLY writes the scaffold to disk the Tracker injects a REINDEX
+    # (the ``reindex`` capability is registered by default), so later tasks
+    # would see the fresh code; VERIFY then runs the project's tests.
+    assert kinds[-3:] == [TaskKind.APPLY, TaskKind.REINDEX, TaskKind.VERIFY]
 
     # Manifest must carry the goal-level skill set so the per-file generator
     # gets the React + FastAPI prompts.
@@ -108,13 +120,18 @@ def test_e2e_react_fastapi_calculator_scaffold(tmp_path):
     assert "react" in attached and "fastapi" in attached, attached
 
     # The Tracker injected one SCAFFOLD_FILE task per manifest file --
-    # 4 from the LLM manifest plus a deterministic ``backend/__init__.py``
-    # package-marker injected by ``_inject_python_package_inits`` so
-    # pytest can resolve ``from backend.main import …`` on disk.
+    # 4 from the LLM manifest plus three deterministic injections: a
+    # ``tests/test_smoke.py`` (``_inject_required_test_file``) so every
+    # scaffold ships a runnable test, a ``backend/__init__.py`` package
+    # marker (``_inject_python_package_inits``) so pytest can resolve
+    # ``from backend.main import …`` on disk, and a trailing top-level
+    # ``README.md`` (``_inject_readme``) generated last.
     file_tasks = [t for t in plan.tasks if t.kind == TaskKind.SCAFFOLD_FILE]
     task_names = [t.name for t in file_tasks]
-    assert len(file_tasks) == 5, task_names
+    assert len(file_tasks) == 7, task_names
+    assert "Generate tests/test_smoke.py" in task_names, task_names
     assert "Generate backend/__init__.py" in task_names, task_names
+    assert "Generate README.md" in task_names, task_names
     for t in file_tasks:
         assert t.status == TaskStatus.DONE, f"{t.name} failed: {t.error}"
         assert (t.output or {}).get("syntax_ok", True)
@@ -125,7 +142,8 @@ def test_e2e_react_fastapi_calculator_scaffold(tmp_path):
     written_str = " ".join(written)
     assert "App.jsx" in written_str and "main.py" in written_str
     for rel in ("package.json", "src/App.jsx", "backend/main.py",
-                "backend/requirements.txt", "backend/__init__.py"):
+                "backend/requirements.txt", "backend/__init__.py",
+                "tests/test_smoke.py"):
         assert (tmp_path / rel).exists(), f"missing written file: {rel}"
     assert "import React" in (tmp_path / "src/App.jsx").read_text()
     assert "FastAPI" in (tmp_path / "backend/main.py").read_text()

@@ -10,6 +10,7 @@ import { ActiveTaskPanel } from "./ActiveTask";
 import { SidePanel } from "./SidePanel";
 import { ResizeHandle } from "./ResizeHandle";
 import { TextArea } from "../Input";
+import { ErrorBoundary } from "../ErrorBoundary";
 import { cn, formatRelative } from "../../lib/utils";
 import { useAgentSession } from "../../store/agentSession";
 
@@ -125,13 +126,16 @@ export function LiveView({
                 {error}
               </div>
             )}
-            <ActiveTaskPanel
-              task={focused ?? null}
-              artifacts={state.artifacts}
-              decisions={state.decisions}
-              onDecide={onDecide}
-              pending={pending}
-            />
+            <ErrorBoundary label="active-task">
+              <ActiveTaskPanel
+                task={focused ?? null}
+                artifacts={state.artifacts}
+                decisions={state.decisions}
+                facts={state.facts}
+                onDecide={onDecide}
+                pending={pending}
+              />
+            </ErrorBoundary>
           </div>
         </div>
         <FollowUpBar
@@ -153,14 +157,16 @@ export function LiveView({
             getCurrent={() => sidePanelWidth}
             onResize={setSidePanelWidth}
           />
-          <SidePanel
-            facts={state.facts}
-            artifacts={state.artifacts}
-            decisions={state.decisions}
-            width={sidePanelWidth}
-            onCollapse={() => setSidePanelCollapsed(true)}
-            onSelectArtifact={(taskId) => setSelectedTaskId(taskId)}
-          />
+          <ErrorBoundary label="side-panel">
+            <SidePanel
+              facts={state.facts}
+              artifacts={state.artifacts}
+              decisions={state.decisions}
+              width={sidePanelWidth}
+              onCollapse={() => setSidePanelCollapsed(true)}
+              onSelectArtifact={(taskId) => setSelectedTaskId(taskId)}
+            />
+          </ErrorBoundary>
         </>
       )}
     </div>

@@ -24,8 +24,12 @@ except ImportError:  # pragma: no cover - py<3.8 fallback, unused in practice
     from typing_extensions import TypedDict  # type: ignore[assignment]
 
 
-ChunkType = Literal["file", "class", "function", "method", "lambda"]
-"""Discriminator for the ``type`` field of a code chunk."""
+ChunkType = Literal["file", "class", "function", "method", "lambda", "doc"]
+"""Discriminator for the ``type`` field of a chunk.
+
+``doc`` is emitted by :class:`cgx.parser.markdown_parser.MarkdownParser` for a
+heading-delimited documentation section; such chunks also carry
+``meta['source_kind'] == 'doc'`` (code chunks default to ``'code'``)."""
 
 
 class CodeChunk(TypedDict, total=False):

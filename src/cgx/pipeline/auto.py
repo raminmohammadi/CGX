@@ -19,6 +19,7 @@ actually use lexical and graph expansion at query time.
 """
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import os
@@ -39,9 +40,15 @@ from cgx.retrieval.orchestrator import (
 from cgx.io.persist import save_indices, load_indices, save_jsonl, load_jsonl
 from cgx.retrieval.lexical import get_cached_lexical_index
 from cgx.answer.scope import apply_scope_penalty
+from cgx.trace import traced
 
 # Graph persistence
 from networkx.readwrite import json_graph
+
+
+def _now_iso() -> str:
+    """Local, timezone-aware completion timestamp for the index manifest."""
+    return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
 def _ensure_tuple_parse(res):
@@ -68,6 +75,16 @@ def _encode_with_embedder(embedder: Any, rows: List[Dict[str, Any]], *, normaliz
     return embs
 
 
+class IndexBuildCancelled(Exception):
+    """Raised inside :func:`run_index_auto` when a caller flips ``cancel_event``.
+
+    The build polls the event at stage boundaries (parse / graph / embed /
+    persist) so a Ctrl-C in the dashboard stops promptly and -- crucially --
+    *before* any index files are written, so a cancelled build never leaves a
+    half-written ``.cgx/index`` that later looks "ready".
+    """
+
+
 def run_index_auto(
     project_root: str,
     out_dir: str,
@@ -78,6 +95,7 @@ def run_index_auto(
     batch_size: int = 64,
     embedder: Optional[Any] = None,
     incremental: bool = True,
+    cancel_event: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     Build two-view FAISS indices and persist alongside records and graph/chunks.
@@ -88,22 +106,45 @@ def run_index_auto(
         Optional object exposing ``.encode(list[str]) -> np.ndarray``. When
         provided it takes precedence over ``model_name`` and bypasses
         ``build_embeddings`` (useful for BYO encoders / tests / mocks).
+    cancel_event
+        Optional ``threading.Event``; when set, the build raises
+        :class:`IndexBuildCancelled` at the next stage boundary.
     """
     os.makedirs(out_dir, exist_ok=True)
+
+    def _ck() -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise IndexBuildCancelled("index build cancelled")
+
     logger.info("=== run_index_auto starting ===")
     logger.info("project_root=%s out_dir=%s metric=%s index_type=%s model=%s",
                 project_root, out_dir, metric, index_type, model_name)
 
     # ---------------- Parse & Graph ----------------
-    chunks, calls = _ensure_tuple_parse(parse_codebase(project_root))
+    # When incremental, reuse an on-disk parse cache so unchanged files are not
+    # re-parsed; the graph is then rebuilt from the merged (mostly cached)
+    # chunk set. A full parse is byte-for-byte equivalent to the incremental
+    # result for the same tree, so disabling the flag stays a pure fallback.
+    parse_stats: Dict[str, int] = {}
+    if incremental:
+        from cgx.parser.incremental import incremental_parse_codebase
+        cache_path = os.path.join(out_dir, "parse_cache.json")
+        chunks, calls, parse_stats = incremental_parse_codebase(
+            project_root, cache_path=cache_path,
+        )
+    else:
+        chunks, calls = _ensure_tuple_parse(parse_codebase(project_root))
     logger.info("Parsed codebase: %d chunks, %d calls", len(chunks), len(calls or []))
+    _ck()
 
     G = build_knowledge_graph(chunks, calls)
     logger.info("Knowledge graph built: %d nodes, %d edges", G.number_of_nodes(), G.number_of_edges())
+    _ck()
 
     # ---------------- Records + Corpus ----------------
     records = make_index_records(chunks, G)
     logger.info("make_index_records produced %d records", len(records))
+    _ck()
 
     try:
         corpus = prepare_embedding_corpus(records, which=which)
@@ -131,9 +172,29 @@ def run_index_auto(
     cache_stats_per_view: Dict[str, Dict[str, int]] = {}
     normalize = (metric in {"cosine", "ip"})
 
+    def _make_progress_cb(view_name: str):
+        """A throttled (done, total) callback that logs embedding progress.
+
+        Emits a line every ~5% (and always at 100%) so a long-running embed
+        of a large repo shows steady progress instead of going silent.
+        """
+        state = {"last_pct": -1}
+
+        def _cb(done: int, total: int) -> None:
+            if total <= 0:
+                return
+            pct = int(done * 100 / total)
+            if done >= total or pct >= state["last_pct"] + 5:
+                state["last_pct"] = pct
+                logger.info("Embedding view=%s progress %d/%d (%d%%)",
+                            view_name, done, total, pct)
+
+        return _cb
+
     def _build_view(view_name: str, rows: List[Dict[str, Any]]):
         """Embed + index one corpus view; returns (view_name, index_dict, cache_stats)."""
         logger.info("Building index for view=%s (rows=%d)", view_name, len(rows))
+        _ck()
         if not rows:
             logger.warning("No rows for view=%s, skipping", view_name)
             return view_name, {
@@ -145,6 +206,8 @@ def run_index_auto(
             if incremental:
                 cache_path = os.path.join(out_dir, f"emb_cache_{view_name}.npz")
                 texts = [str(r.get("text") or r.get("code") or "") for r in rows]
+
+                progress_cb = _make_progress_cb(view_name)
 
                 def _encode(missing_texts: List[str]) -> np.ndarray:
                     if embedder is not None and hasattr(embedder, "encode"):
@@ -161,6 +224,7 @@ def run_index_auto(
                         batch_size=batch_size,
                         field_strategy="auto",
                         max_length=256,
+                        progress_cb=progress_cb,
                     )
 
                 embs, stats = embed_with_cache(
@@ -178,6 +242,7 @@ def run_index_auto(
                         rows, model_name=model_name, backend="auto",
                         normalize=normalize, batch_size=batch_size,
                         field_strategy="auto", max_length=256,
+                        progress_cb=_make_progress_cb(view_name),
                     )
             logger.info("Embedding done for view=%s shape=%s", view_name, np.asarray(embs).shape)
         except Exception as e:
@@ -212,9 +277,29 @@ def run_index_auto(
                 indices["views"][vn] = view_dict
                 if vstats:
                     cache_stats_per_view[vn] = vstats
+            except IndexBuildCancelled:
+                # Cancellation is expected control flow, not a build failure:
+                # propagate quietly so the caller can stop without a scary trace.
+                raise
             except Exception as e:
                 logger.error("View %s failed: %s", view_name, e, exc_info=True)
                 raise
+
+    # A Ctrl-C between the last view finishing and the writes below must still
+    # abort before any index file is persisted, so a cancelled build never
+    # leaves a half-written index dir that later looks "ready".
+    _ck()
+
+    # Stamp provenance onto the index dict so save_indices records which model
+    # built it (and when / for which project). A later query reads this back to
+    # pick the matching embedder and to catch a dim mismatch up front.
+    indexed_at = _now_iso()
+    embed_model = getattr(embedder, "model_name", None) or model_name
+    indices["embed_model"] = embed_model
+    indices["index_type"] = index_type
+    indices["project_root"] = os.path.abspath(project_root)
+    indices["indexed_at"] = indexed_at
+    indices["counts"] = {k: len(v) for k, v in per_view.items()}
 
     # ---------------- Persist ----------------
     try:
@@ -247,16 +332,32 @@ def run_index_auto(
         logger.warning("Graph serialization failed, continuing: %s", e, exc_info=True)
         graph_path = None
 
+    # Hierarchical repo map: cheap whole-repo context for the Planner, derived
+    # from the intent-side record summaries and cached (fingerprint-keyed) so a
+    # later load skips the rebuild when records are unchanged.
+    repo_map_path = os.path.join(out_dir, "repo_map.json")
+    try:
+        from cgx.answer.repo_map import build_or_load_repo_map
+        rmap = build_or_load_repo_map(records, cache_path=repo_map_path)
+        logger.info("Saved repo_map.json (%s)", rmap.get("stats"))
+    except Exception as e:
+        logger.warning("Repo map build failed, continuing: %s", e, exc_info=True)
+        repo_map_path = None
+
     result = {
         "counts": {k: len(v) for k, v in per_view.items()},
+        "embed_model": embed_model,
+        "indexed_at": indexed_at,
         "out": {
             "indices": os.path.join(out_dir, "indices"),
             "records": os.path.join(out_dir, "records.jsonl"),
             "chunks": os.path.join(out_dir, "chunks.jsonl"),
             "graph": graph_path,
+            "repo_map": repo_map_path,
         },
         "incremental": bool(incremental),
         "embedding_cache": cache_stats_per_view,
+        "parse": parse_stats,
     }
     logger.info("=== run_index_auto completed === %s", result["counts"])
     return result
@@ -266,6 +367,7 @@ def run_index_auto(
 # Query wrapper (ALL SIGNALS + IMPACT)
 # ---------------------------
 
+@traced("pipeline")
 def run_query_auto(
     index_dir: str,
     records_path: str,
@@ -326,6 +428,17 @@ def run_query_auto(
             G = None
 
     if embedder is None or not hasattr(embedder, "encode"):
+        # The index manifest records which model built it. When no explicit
+        # embedder is supplied, trust that model over the caller's default so a
+        # query never embeds with the wrong dim (the 768-vs-1024 crash). A BYO
+        # embedder is respected as-is; the caller owns that choice.
+        stored_model = indices.get("embed_model")
+        if stored_model and stored_model != model_name:
+            logger.info(
+                "run_query_auto: overriding embed model %r -> %r (from index meta)",
+                model_name, stored_model,
+            )
+            model_name = stored_model
         embedder = BuildEmbedder(model_name=model_name, batch_size=64, normalize=True)
 
     # Reuse a path-keyed LexicalIndex across queries to avoid rebuilding BM25

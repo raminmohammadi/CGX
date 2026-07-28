@@ -27,6 +27,55 @@ from `nvidia-smi` -- e.g. `pip install --index-url
 https://download.pytorch.org/whl/cu128 torch` for a CUDA 12.8 driver.
 See `requirements-ml.txt` for the full recipe.
 
+## The terminal dashboard
+
+For a terminal-first workflow, run `cgx` with no arguments (or `cgx
+dash`) to open the interactive dashboard -- a full-screen REPL that
+unifies indexing, questions, and the agent loop in one place:
+
+```bash
+cgx                                  # bare invocation -> dashboard
+cgx dash --project-root /path/to/repo
+```
+
+The screen has four zones: an ASCII banner, a **status bar** (current
+directory, index state, active model and remaining context window), a
+**tips** panel, and a bordered input box. Type a plain message to route
+it through the Planner -> Tracker -> Judge agent loop -- it can answer a
+question, plan an edit, or scaffold new code. Lines starting with `/`
+are commands:
+
+| Command            | Action                                            |
+| ------------------ | ------------------------------------------------- |
+| `/help`            | Show the command reference.                       |
+| `/ask <question>`  | Fast, read-only grounded answer (streams live).   |
+| `/index [path]`    | Build/refresh the code graph for the project.     |
+| `/project <path>`  | Switch the active project directory.              |
+| `/model <name>`    | Set the model for the current provider.           |
+| `/provider <name>` | Use a saved profile, or `ollama`/`openai`/`gemini`. |
+| `/status`          | Show provider, index, and hardware status.        |
+| `/serve`           | Launch the web UI (FastAPI + React).              |
+| `/clear`           | Clear the screen and scrollback.                  |
+| `/quit`, `/exit`   | Leave the dashboard.                              |
+
+The dashboard shares the **exact streaming engine** the web UI uses:
+`/ask`, plain-text agent goals, and `/index` all run through
+`cgx.webui.handlers` (`stream_ask` / `stream_agent` / `stream_index`).
+Heavy work runs on a background thread while a Braille spinner shows
+elapsed time, so the prompt never looks frozen and answer tokens stream
+into the terminal as they arrive. Press **Ctrl-C** to cancel the
+running task and return to the prompt -- it flips the same `cancel_event`
+the web UI's Stop button uses, so the backend halts between tokens
+rather than the process dying. Ctrl-C at an empty prompt just clears the
+line; only `/quit` or EOF (Ctrl-D) leave the dashboard.
+
+The dashboard is stdlib-only: it uses ANSI escape sequences directly
+with no `rich`/`textual` dependency, so it works cleanly over SSH.
+Colour is auto-disabled when stdout is not a TTY or when `NO_COLOR` /
+`CGX_NO_COLOR` is set (`CGX_FORCE_COLOR` forces it back on). All the
+explicit subcommands below (`cgx index`, `cgx ask`, `cgx serve`, ...)
+remain available for scripted, non-interactive use.
+
 ## 1. Pick a provider
 
 CGX supports four provider kinds, all configurable from the **⚙️ Setup**
@@ -107,9 +156,29 @@ indices/                   # FAISS files + per-view metadata (.npy + .json)
 records.jsonl              # canonical records (one per chunk)
 chunks.jsonl               # raw parser chunks
 graph.json                 # NetworkX node-link graph
+repo_map.json              # cached hierarchical repo map (Planner context)
+parse_cache.json           # per-file parse cache (incremental re-parse)
 emb_cache_intent.npz       # content-addressed embedding cache (intent view)
 emb_cache_impl.npz         # content-addressed embedding cache (impl view)
 ```
+
+### Multi-language parsing
+
+`parse_codebase` dispatches each file to a parser by extension through an
+internal registry. Python (`.py`) is always parsed with the stdlib `ast`
+and needs no extra dependencies. JavaScript / TypeScript / TSX
+(`.js`, `.jsx`, `.ts`, `.tsx`) are parsed via tree-sitter when the
+optional `parsers` extra is installed:
+
+```bash
+pip install "cgx[parsers]"
+```
+
+Without that extra, JS/TS files are simply skipped and Python-only
+indexing continues to work -- the pipeline degrades gracefully rather
+than failing. Every parser emits the same chunk/call-relation shape, so
+retrieval, the graph, and the agent loop are language-agnostic
+downstream.
 
 ### Parallel two-view build and GPU detection
 
@@ -124,7 +193,13 @@ is in progress; clicking it terminates the SSE stream cleanly.
 
 ### Incremental re-indexing
 
-The two `emb_cache_*.npz` files make re-indexing cheap. Each file
+Re-indexing is cheap at **two** layers. First, at the *parse* layer
+(`cgx.parser.incremental`): a `parse_cache.json` manifest keyed on each
+file's mtime + sha lets unchanged files reuse their cached chunks, so
+only edited files are actually re-parsed. Second, at the *embedding*
+layer, described below.
+
+The two `emb_cache_*.npz` files make re-embedding cheap. Each file
 stores `{sha256(corpus_text): np.ndarray}` pairs; on the next
 `run_index_auto` call, unchanged chunks reuse their cached vectors and
 only modified chunks reach the embedder.
@@ -369,14 +444,24 @@ CLARIFY_REQUIREMENTS -> ASK_USER(clarify_answers)
                                               APPLY
                                                   |
                                                   v
-                                          BOOTSTRAP_ENV
-                                                  |
+                                          BOOTSTRAP_ENV    (pip freeze ->
+                                                  |         installed_packages,
+                                                  v         Phase 1.1)
+                                          API_CHECK -------+ (failed -> REPAIR;
+                                                  |         Phase 2.2)
                                                   v
-                                              VERIFY <----+
-                                                  |       |
-                                                  v       | (fixable failure,
-                                              REPAIR -----+  attempt < 2,
-                                                              new signature)
+                                            SMOKE  ---------+ (failed -> REPAIR;
+                                                  |          Phase 2.1)
+                                                  v
+                                              VERIFY <-----+
+                                                  |        |
+                                                  v        |
+                                              REPAIR ------+ (fixable failure,
+                                                  |          attempt < 2,
+                                          patch | regenerate new signature)
+                                          (<=5 diffs) | (Phase 6.1)
+                                              v        v
+                                            APPLY    SCAFFOLD (re-enters loop)
 ```
 
 `CLARIFY_REQUIREMENTS` emits 3–6 clarification questions about the
@@ -402,7 +487,13 @@ back to `requirements.txt`); the resulting `BUILD_REPORT` artifact
 carries the venv path, the manifests installed from, the list of
 installed/failed packages, and an `outcome` token
 (`succeeded` / `failed` / `no_venv` / `skipped` / `partial`).
-`VERIFY` then runs pytest inside that venv and classifies the exit
+`APPLY` drops any file whose source does not parse and records it in
+`failed_files`; in greenfield mode a non-empty `failed_files` means a
+core module is silently missing, so rather than limping into
+`BOOTSTRAP_ENV` the router re-scaffolds within its regenerate budget
+with an `invalid_scaffold_syntax` constraint that enumerates each
+dropped file and its concrete error (Fix G1). `VERIFY` then runs
+pytest inside that venv and classifies the exit
 code into an `outcome` token (`passed` / `assertions_failed` /
 `collection_error` / `no_tests_collected` / `timeout` /
 `pytest_missing` / `skipped`) so a missing dependency reads as
@@ -436,7 +527,12 @@ v1 recognises three classifications:
   can resolve the scaffolded package on the next pass; a marker
   check makes the proposer idempotent (re-running it after a
   successful fix yields zero diffs, which escalates the loop to
-  `ASK_USER` instead of repeating).
+  `ASK_USER` instead of repeating). Fix G2: the locator only proposes
+  this `conftest.py` fix when the missing module's *full* dotted path
+  resolves on disk. A missing *leaf* (e.g. `tests.auth` where
+  `tests/` exists but `tests/auth.py` was never authored) yields no
+  diff -- no `sys.path` entry can conjure a module nobody wrote -- so
+  the classification routes to a regenerate instead of a no-op patch.
 * `missing_fixture` -- pytest reports `fixture '<name>' not found`
   during collection. The locator scans every `.py` file under the
   project root (skipping `.venv`, `__pycache__`, dotfile directories,
@@ -462,6 +558,15 @@ capped at two attempts and refuses to retry when the new
 `failure_signature` matches one already seen on the chain, so a
 fix that "succeeds" without actually resolving the failure
 escalates to a freeform `ASK_USER` instead of looping.
+
+Every greenfield failure path is terminal. A *hard* executor
+failure -- one that returns no `outputs`, such as a `BOOTSTRAP_ENV`
+whose `pip install` fails -- ends the session `FAILED` via the
+router's `on_task_failed` entry point (Fix F3) instead of leaving it
+hung in `active`; and a regenerate whose budget is spent (no SCAFFOLD
+ancestor left to retry) also ends `FAILED`. The loop never asks the
+user to hand-fix AI-generated code, and it never proceeds on a
+known-broken tree.
 
 `BOOTSTRAP_ENV` runs a complementary preflight test-style lint
 (`cgx.session.repair.locate.lint_test_style`) after
@@ -598,6 +703,43 @@ The session database lives at `<project_root>/.cgx/sessions.db` (or
 `sessions`, `tasks`, `facts`, `decisions`, `artifacts`; one row per
 aggregate stored as a JSON blob plus indexed columns.
 
+#### Session budgets (autonomous-loop safety valve)
+
+A greenfield session runs an autonomous Plan → Scaffold → Apply →
+Bootstrap → Verify → Repair loop. The per-loop regenerate/repair caps
+bound individual retries, but a **session budget** bounds the whole
+run so a pathological loop can never spin forever. Configure it on
+`start_session` (all default to unlimited/off, so existing callers are
+unaffected):
+
+```python
+session = runner.start_session(
+    objective="build a FastAPI todo API with tests",
+    project_root="/path/to/proj",
+    mode=SessionMode.GREENFIELD,   # from cgx.session.models
+    max_task_runs=40,              # cap on compute-bearing task runs
+    max_wall_seconds=1800,         # 30-minute wall-clock cap
+    headless=True,                 # no user to ask -> fail terminally
+)
+```
+
+* `max_task_runs` -- ceiling on how many compute-bearing tasks the
+  session may run (an `ASK_USER` pause is free and never counts).
+* `max_wall_seconds` -- wall-clock ceiling measured from the first
+  work task (`first_task_started_at`).
+* `headless` -- picks the exhaustion behaviour. Either cap tripping
+  triggers escalation *before* the next task is dispatched:
+  * **interactive** (`headless=False`, the default): the loop pauses
+    on a fresh `ASK_USER(freeform)` that surfaces the exhaustion, and
+    the session goes `PAUSED`. Resume it by posting a `Decision`
+    (e.g. raise the budget and continue, or stop).
+  * **headless** (`headless=True`): there is no user to ask, so the
+    READY work is abandoned and the session ends terminally `FAILED`.
+
+The HTTP `POST /api/agent-session` route uses the unlimited defaults;
+drive budgeted / headless runs through the programmatic `SessionRunner`
+API above (or a thin wrapper of your own).
+
 ### When to use the legacy view (`/agent-legacy`)
 
 The batch Planner → Tracker → Judge loop described in §7 is still
@@ -676,7 +818,7 @@ A picture-first overview lives in [flowcharts.md](flowcharts.md) -- the
 | `search` | Retrieve relevant code chunks | Yes |
 | `summarize` | Condense prior outputs | No |
 | `apply` | Write diffs from `plan` / `scaffold_file` outputs to `project_root` on disk (with backup mirror) | No |
-| `verify` | Run impacted pytest tests (with pre-flight dep install) | No |
+| `verify` | Detect the project's stack(s) and run each matching test runner via a pluggable registry (`cgx.codegen.test_runners`) -- pytest (with pre-flight dep install) for Python, `npm test`/`npm run build` for JS/TS -- merging their outcomes into one pass/fail signal | No |
 | `fill_logic` | Fill a single empty function body in an existing skeleton file | No |
 
 ### Generating a new project from scratch
@@ -693,7 +835,13 @@ call that returns just the layered file list, no contents) and the
 Tracker injects one `scaffold_file` task per planned file into the
 plan immediately after, ordered layer-by-layer so dependency-heavy
 files (core types, utilities) are generated before the files that
-import them. Each `scaffold_file` task calls
+import them. Before that, the manifest builder deterministically
+guarantees a well-formed layout: it injects required packaging files,
+a stack-appropriate test file when the manifest carried none
+(`_inject_required_test_file`, so `verify` always has a runnable
+pass/fail signal), Python package `__init__.py` markers, and a
+trailing `README.md`. The Judge's manifest check enforces the same
+required-test rule as a backstop. Each `scaffold_file` task calls
 `generate_single_scaffold_file` with the target path, its layer, and
 the full content of files already generated by earlier
 `scaffold_file` tasks. The `apply` task writes every generated file
@@ -1057,6 +1205,30 @@ for recoverable issues (e.g. LLM fallback, missing cancel token). To
 increase verbosity set the `CGX_LOG_LEVEL` environment variable, or
 call `setup_logging` with the desired level before importing other cgx
 modules.
+
+### Function-call tracing (troubleshooting)
+
+When a session fails in a non-obvious place -- a REPAIR loop looping,
+an LLM call returning nothing, a codegen apply that silently no-ops --
+flip the **Function-call tracing** toggle on the `/settings` page (or
+export `CGX_TRACE=1` before launching `cgx web`) and rerun the failing
+step. While the toggle is on, an amber `TRACE` pill appears in the
+header and every curated entry point on the agent loop -- router,
+runner, executor, repair (`classify` / `locate` / `propose`), LLM
+(`cgx.answer.engine`), retrieval (`cgx.retrieval.orchestrator`,
+`cgx.pipeline.auto`), and codegen (`disk_apply`, `env_manager`,
+`test_runner`) -- appends `trace_enter` / `trace_exit`
+(with `elapsed_ms`) or `trace_error` (with `error_type` +
+truncated message) records to `<project_root>/.cgx/agent.log`.
+Calls made outside a session (retrieval / codegen driven from the CLI,
+HTTP middleware) fall through to a rotating fallback at
+`~/.cgx/cgx-trace.log` (2 MiB × 3 backups). `$CGX_TRACE` pins the
+flag when set -- the UI reports `source: "env"` and refuses to
+mutate it (HTTP `409`) so you can tell env-pinned from UI-pinned at
+a glance. Toggle it off once you have the failing trace: the
+decorator is a single `bool` check when disabled, but each `@traced`
+call still writes a JSONL row while it's on, so long-running sessions
+can produce thousands of lines.
 
 ## 15. Task REST API
 

@@ -22,13 +22,17 @@ from __future__ import annotations
 
 import hashlib
 import re
-from typing import Any, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+from cgx.trace import traced
 
 
 REPAIR_CLASSIFICATIONS: Tuple[str, ...] = (
+    "third_party_import_break",
     "unittest_pytest_mix",
     "missing_module_pythonpath",
     "missing_fixture",
+    "empty_test_suite",
     "unknown",
 )
 
@@ -67,28 +71,90 @@ _FIXTURE_NOT_FOUND_RE = re.compile(
     r"fixture\s+'([A-Za-z_][A-Za-z0-9_]*)'\s+not found"
 )
 
+# Third-party API break: ``ImportError: cannot import name '<sym>' from
+# '<pkg>'`` is emitted when the named module exists (the install
+# succeeded) but the requested attribute is missing -- the canonical
+# shape of a version mismatch between a consumer and one of its peers.
+# We pull both the symbol and the package out so the dependency-aware
+# proposer can recompute the correct pin via PyPI metadata.
+_CANNOT_IMPORT_NAME_RE = re.compile(
+    r"ImportError:\s+cannot import name\s+'([A-Za-z_][A-Za-z0-9_]*)'\s+"
+    r"from\s+'([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)'"
+)
 
+
+# --------------------- registry ---------------------
+
+# Each entry is ``(token, predicate)`` where ``predicate(content)``
+# returns ``True`` if the failure text matches the classifier. Order
+# matters: the first matching entry wins, so the more-specific patterns
+# (e.g. "cannot import name") must come before the broader ones
+# (e.g. "ModuleNotFoundError").
+_ClassifierFn = Callable[[Dict[str, Any]], bool]
+
+_CLASSIFIER_REGISTRY: Tuple[Tuple[RepairClassification, _ClassifierFn], ...] = (
+    ("third_party_import_break",
+     lambda c: bool(_CANNOT_IMPORT_NAME_RE.search(_failure_text(c)))),
+    ("unittest_pytest_mix",
+     lambda c: bool(_UNITTEST_HELPER_RE.search(_failure_text(c)))),
+    ("missing_module_pythonpath",
+     lambda c: bool(_MODULE_NOT_FOUND_RE.search(_failure_text(c)))),
+    ("missing_fixture",
+     lambda c: bool(_FIXTURE_NOT_FOUND_RE.search(_failure_text(c)))),
+)
+
+
+@traced("repair.classify")
 def classify_verify_report(content: Dict[str, Any]) -> RepairClassification:
     """Map a VERIFY_REPORT content dict to a classification token.
 
     Only fires on reports where ``ran`` is true and ``outcome`` is one
-    of the genuinely-failed tokens. Skipped / no_tests / pytest_missing
-    reports are not auto-repairable in v1 -- they're environment
-    problems that BOOTSTRAP_ENV (or the user) owns.
+    of the genuinely-failed tokens. Skipped / pytest_missing reports are
+    not auto-repairable -- they're environment problems that
+    BOOTSTRAP_ENV (or the user) owns. Walks the
+    :data:`_CLASSIFIER_REGISTRY` in declared order and returns the first
+    matching token; falls back to ``unknown`` so the executor emits an
+    empty plan and the router escalates to ASK_USER.
+
+    ``no_tests_collected`` (pytest exit 5) is a special case: pytest
+    found the selected test file(s) but collected zero test functions --
+    the canonical symptom of ``def test_*`` nested inside a fixture or
+    another function rather than defined at module top level. It has no
+    mechanical locator, so it maps to ``empty_test_suite`` which the
+    REPAIR executor routes to a re-scaffold. The router only lets a
+    ``no_tests_collected`` report reach here when test files were
+    actually selected, so this never fires for genuinely test-free
+    projects.
     """
     outcome = str(content.get("outcome") or "").strip()
+    if outcome == "no_tests_collected":
+        return "empty_test_suite"
     if outcome not in ("assertions_failed", "collection_error"):
         return "unknown"
-    blob = _failure_text(content)
-    if not blob:
-        return "unknown"
-    if _UNITTEST_HELPER_RE.search(blob):
-        return "unittest_pytest_mix"
-    if _MODULE_NOT_FOUND_RE.search(blob):
-        return "missing_module_pythonpath"
-    if _FIXTURE_NOT_FOUND_RE.search(blob):
-        return "missing_fixture"
+    for token, predicate in _CLASSIFIER_REGISTRY:
+        if predicate(content):
+            return token
     return "unknown"
+
+
+def third_party_import_breaks(
+        content: Dict[str, Any]) -> Tuple[Tuple[str, str], ...]:
+    """Return ``((symbol, package), ...)`` pairs from "cannot import name".
+
+    Used by the dependency-aware proposer to drive the PyPI lookup.
+    The package name is the **top-level** distribution (e.g. ``werkzeug``
+    for ``werkzeug.urls``) so it can be matched against installed
+    packages in the BUILD_REPORT. Order-preserving and de-duplicated.
+    """
+    blob = _failure_text(content)
+    out: List[Tuple[str, str]] = []
+    for m in _CANNOT_IMPORT_NAME_RE.finditer(blob):
+        symbol = m.group(1)
+        pkg = m.group(2).split(".", 1)[0]
+        pair = (symbol, pkg)
+        if pair not in out:
+            out.append(pair)
+    return tuple(out)
 
 
 def missing_module_names(content: Dict[str, Any]) -> Tuple[str, ...]:
@@ -139,17 +205,48 @@ def failure_signature(content: Dict[str, Any]) -> str:
     return hashlib.sha1(raw).hexdigest()[:16]
 
 
+def failure_text(content: Dict[str, Any]) -> str:
+    """Public accessor for the concatenated VERIFY failure text.
+
+    A thin wrapper over :func:`_failure_text` so callers outside this
+    module (e.g. the bounded LLM-repair path in the REPAIR executor) can
+    feed the exact same failure blob to a provider without importing a
+    private name or re-deriving the concatenation order.
+    """
+    return _failure_text(content)
+
+
 # --------------------- helpers ---------------------
 
 def _failure_text(content: Dict[str, Any]) -> str:
-    """Concatenate stdout + stderr from a VERIFY_REPORT for scanning.
+    """Concatenate every textual failure source in a VERIFY_REPORT.
 
+    Walks the structured ``failures`` list first (populated from
+    ``--junitxml`` by VERIFY) so the classifier sees the
+    captured traceback / exception type even when pytest's short stdout
+    elided it; then falls back to ``stdout`` + ``stderr`` for runs that
+    pre-date the junit pipeline or whose junit file failed to parse.
     Order matters: pytest writes the captured traceback to stdout under
-    its default mode, with stderr carrying setup warnings. The combined
-    blob is what a human reads to triage a failure, so the classifier
-    sees the same input.
+    its default mode, with stderr carrying setup warnings.
     """
-    parts = []
+    parts: List[str] = []
+    failures = content.get("failures")
+    if isinstance(failures, list):
+        for fail in failures:
+            if not isinstance(fail, dict):
+                continue
+            # Synthesize a canonical ``<Type>: <message>`` line so the
+            # existing regexes (which were built against pytest's stdout
+            # rendering) match against junit attributes too.
+            etype = fail.get("type") or ""
+            msg = fail.get("message") or ""
+            if isinstance(etype, str) and isinstance(msg, str) and etype:
+                parts.append(f"{etype}: {msg}".rstrip())
+            elif isinstance(msg, str) and msg:
+                parts.append(msg)
+            tb = fail.get("traceback")
+            if isinstance(tb, str) and tb:
+                parts.append(tb)
     for key in ("stdout", "stderr"):
         v = content.get(key)
         if isinstance(v, str) and v:

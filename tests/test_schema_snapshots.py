@@ -219,6 +219,33 @@ def test_meta_json_carries_schema_version(tmp_path: Path) -> None:
     assert meta_path.exists(), "save_indices must write meta.json"
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
     assert meta.get("schema_version") == SCHEMA_VERSION
+    # Provenance stamped by run_index_auto so a later query can pick the right
+    # embedder and detect a dim mismatch up front.
+    assert meta.get("embed_model")
+    assert meta.get("indexed_at")
+    assert meta.get("embed_dim") == 16
+    assert meta.get("counts") and set(meta["counts"]) == {"intent", "impl"}
+    assert os.path.abspath(str(proj)) == meta.get("project_root")
+
+
+def test_index_build_cancellation_writes_no_index(tmp_path: Path) -> None:
+    # A pre-set cancel_event must abort at the first stage boundary and leave
+    # no index dir behind, so a cancelled build never looks "ready" later.
+    import threading
+
+    from cgx.pipeline.auto import IndexBuildCancelled, run_index_auto
+
+    proj = tmp_path / "proj"
+    out_dir = tmp_path / "out"
+    _make_synth_repo(proj)
+    ev = threading.Event()
+    ev.set()
+    with pytest.raises(IndexBuildCancelled):
+        run_index_auto(
+            str(proj), str(out_dir), metric="cosine", index_type="flat",
+            embedder=HashEmbedder(dim=16), cancel_event=ev,
+        )
+    assert not (Path(out_dir) / "indices" / "meta.json").exists()
 
 
 def test_camel_case_subword_query_hits_identifier(tmp_path: Path) -> None:

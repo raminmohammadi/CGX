@@ -31,6 +31,23 @@ except Exception:  # pragma: no cover - fall back to no skills
 
 logger = logging.getLogger(__name__)
 
+# File-extension -> language label, used to summarise the conventions of
+# the code a change goal will touch in the read-only "understand" brief.
+# Ordered so more specific extensions (``.tsx``/``.jsx``) are recognised;
+# ``str.endswith`` keeps ``.ts``/``.js`` from matching them.
+_EXT_LANG = {
+    ".py": "Python",
+    ".tsx": "TypeScript (React)",
+    ".ts": "TypeScript",
+    ".jsx": "JavaScript (React)",
+    ".js": "JavaScript",
+    ".vue": "Vue",
+    ".go": "Go",
+    ".rs": "Rust",
+    ".java": "Java",
+    ".rb": "Ruby",
+}
+
 
 def _detected_skill_names(goal: str) -> List[str]:
     """Return the names of skills that fire on *goal* (highest score first).
@@ -302,15 +319,26 @@ def _goal_is_change(goal: str) -> bool:
     Combines :func:`cgx.answer.intent.detect_intent` (authoritative when it
     returns ``"change_plan"``) with a verb-based heuristic so we still
     recognise change requests when the classifier is uncertain.
+
+    An explicit change verb (``add``/``refactor``/``fix``/...) is decisive.
+    Absent one, a forward-looking *exploratory* ask ("improve X", "suggest
+    ways to ...", "recommend optimizations") is treated as read-only even
+    when the fuzzy classifier labels it ``change_plan`` -- those are ideation
+    goals routed through the exploratory clarify path, and misrouting them as
+    a code change strips their softened criteria and clarify prompt.
     """
     if not goal:
+        return False
+    if _CHANGE_VERB_RE.search(goal) is not None:
+        return True
+    if _EXPLORATORY_RE.search(goal) is not None and not _goal_is_scaffold(goal):
         return False
     try:
         if detect_intent(goal) == "change_plan":
             return True
     except Exception:
         pass
-    return _CHANGE_VERB_RE.search(goal) is not None
+    return False
 
 
 def _goal_is_verify_only(goal: str) -> bool:
@@ -338,9 +366,11 @@ def _goal_is_exploratory(goal: str) -> bool:
     """
     if not goal:
         return False
-    if _goal_is_change(goal) or _goal_is_verify_only(goal):
+    if _EXPLORATORY_RE.search(goal) is None:
         return False
-    return _EXPLORATORY_RE.search(goal) is not None
+    if _goal_is_change(goal) or _goal_is_verify_only(goal) or _goal_is_scaffold(goal):
+        return False
+    return True
 
 
 # Engine mode name used for exploratory ASK tasks. Defined here so the
@@ -512,6 +542,7 @@ class Planner:
         max_tasks: int = 8,
         *,
         retriever: Optional[Any] = None,
+        repo_map: Optional[Any] = None,
     ) -> None:
         self.provider = provider
         self.max_tasks = max(1, int(max_tasks))
@@ -519,6 +550,12 @@ class Planner:
         # When supplied, the planner uses ``top_files`` to ground the LLM
         # prompt with real candidate paths from the index.
         self.retriever = retriever
+        # ``repo_map() -> dict | None`` (matches ``build_repo_map``'s shape).
+        # A zero-arg, lazy provider so the whole-repo structure is only
+        # materialised when an LLM plan actually needs it; when supplied,
+        # the planner renders a budgeted tree as top-level context so
+        # decomposition is grounded in the project's real layout.
+        self.repo_map = repo_map
 
     def plan(self, goal: str, *, continuation: bool = False,
              prior_goal: Optional[str] = None) -> Plan:
@@ -535,12 +572,28 @@ class Planner:
                     goal[:80], type(self.provider).__name__ if self.provider else "None",
                     "yes" if self.retriever else "no", bool(continuation),
                     carried_prior[:60])
-        candidates = self._retrieve_candidates(goal)
+        # Fetch the retriever result once and derive both candidate files
+        # and change-impact (blast radius) from it, so a code-change plan
+        # is grounded in the same retrieval the answer pipeline uses.
+        retr_result = self._run_retriever(goal)
+        candidates = self._candidates_from_result(goal, retr_result)
+        impacted = self._impacted_from_result(goal, retr_result)
+        # Read-only "understand" pre-step: for edit/add-to-existing goals,
+        # derive a bounded structured brief (relevant files, key symbols,
+        # existing tests, conventions) from the SAME retrieval + repo map
+        # so the LLM plans the change grounded in real code -- no extra
+        # queries. ``None`` for scaffolds and read-only questions.
+        understand = self._build_understand_brief(
+            goal, retr_result, candidates, impacted)
         tasks: List[Task]
         rationale_box: List[str] = []
         if self.provider is not None:
             logger.info("Planner: calling LLM for plan decomposition")
             tasks = self._llm_plan(goal, candidates=candidates,
+                                   impacted=impacted,
+                                   repo_map_text=self._render_repo_map(),
+                                   understand_text=self._render_understand_brief(
+                                       understand),
                                    rationale_box=rationale_box,
                                    prior_goal=carried_prior or None)
             logger.info("Planner: LLM returned %d tasks", len(tasks))
@@ -552,6 +605,12 @@ class Planner:
         tasks = self._enforce_kind_policy(goal, tasks, continuation=continuation)
         if not continuation:
             tasks = self._enforce_exploratory_clarification(goal, tasks)
+        # Stamp the blast radius onto PLAN tasks so the UI/Judge can see
+        # which call sites the change may ripple into.
+        self._attach_impacted_files(tasks, impacted)
+        # Stamp the understand brief onto PLAN tasks so the code generator
+        # (``generate_code_plan``) and the UI share the same orientation.
+        self._attach_understand_brief(tasks, understand)
         rationale = (rationale_box[0] if rationale_box
                      else _fallback_rationale(goal, tasks))
         plan = Plan(goal=goal.strip(),
@@ -642,19 +701,17 @@ class Planner:
         )
         return plan
 
-    def _retrieve_candidates(self, goal: str) -> List[str]:
-        """Call the optional retriever and return up to 8 candidate file paths.
+    def _run_retriever(self, goal: str) -> Optional[Dict[str, Any]]:
+        """Call the optional retriever once and return its raw result dict.
 
-        When the goal's scope resolves to ``"src"`` (production code), test
-        paths are dropped from ``top_files`` even though they may rank high
-        in the hybrid retriever's output. ``run_query_auto`` only soft-
-        penalises ``hits``; ``top_files`` aggregates per-file ranks before
-        the penalty is applied, so test files can still surface here and
-        mislead the LLM into building VERIFY tasks around unrelated test
-        modules.
+        Returns ``None`` when no retriever is configured or the call
+        fails, so callers can degrade to LLM-only / deterministic
+        planning. Fetching the result once lets :meth:`plan` derive both
+        candidate files and change-impact (blast radius) from a single
+        retrieval instead of hitting the pipeline twice.
         """
         if self.retriever is None:
-            return []
+            return None
         try:
             result = self.retriever(goal)
         except Exception as e:
@@ -664,7 +721,24 @@ class Planner:
             logger.warning(
                 "Planner: retriever failed: %s: %r", type(e).__name__, e,
             )
-            return []
+            return None
+        if not isinstance(result, dict):
+            return None
+        return result
+
+    def _candidates_from_result(
+        self, goal: str, result: Optional[Dict[str, Any]],
+    ) -> List[str]:
+        """Extract up to 8 candidate file paths from a retriever result.
+
+        When the goal's scope resolves to ``"src"`` (production code), test
+        paths are dropped from ``top_files`` even though they may rank high
+        in the hybrid retriever's output. ``run_query_auto`` only soft-
+        penalises ``hits``; ``top_files`` aggregates per-file ranks before
+        the penalty is applied, so test files can still surface here and
+        mislead the LLM into building VERIFY tasks around unrelated test
+        modules.
+        """
         if not isinstance(result, dict):
             return []
         top_files = result.get("top_files") or []
@@ -693,6 +767,298 @@ class Planner:
                 dropped_tests,
             )
         return out
+
+    def _impacted_from_result(
+        self, goal: str, result: Optional[Dict[str, Any]], *, limit: int = 8,
+    ) -> List[str]:
+        """Extract the ranked blast-radius files for a code-change goal.
+
+        ``run_query_auto`` runs :func:`analyze_change_impact` and stores
+        the result under ``impact`` as a ranked list of
+        ``{"file", "score", "reasons"}``. These are the files that call
+        into (or are depended on by) the symbol the goal targets, so the
+        LLM should review them for follow-on edits and test coverage.
+        Only surfaced for change goals; test paths are dropped under
+        ``src`` scope to match :meth:`_candidates_from_result`.
+        """
+        if not isinstance(result, dict):
+            return []
+        if not _goal_is_change(goal):
+            return []
+        impact = result.get("impact") or []
+        if not isinstance(impact, list):
+            return []
+        from cgx.answer.scope import detect_scope, _is_test_path
+        scope = detect_scope(goal)
+        out: List[str] = []
+        for item in impact:
+            if isinstance(item, dict):
+                fp = str(item.get("file") or "").strip()
+            elif isinstance(item, str):
+                fp = item.strip()
+            else:
+                continue
+            if not fp or fp in out:
+                continue
+            if scope == "src" and _is_test_path(fp):
+                continue
+            out.append(fp)
+            if len(out) >= limit:
+                break
+        if out:
+            logger.info(
+                "Planner: %d change-impact file(s) surfaced for goal", len(out),
+            )
+        return out
+
+    def _retrieve_candidates(self, goal: str) -> List[str]:
+        """Backward-compatible wrapper: fetch and extract candidates.
+
+        Retained for callers/tests that only need candidate paths; new
+        code paths in :meth:`plan` fetch the retriever result once and
+        derive candidates and change-impact together.
+        """
+        return self._candidates_from_result(goal, self._run_retriever(goal))
+
+    @staticmethod
+    def _attach_impacted_files(tasks: List[Task], impacted: List[str]) -> None:
+        """Stamp the blast-radius file list onto every PLAN task.
+
+        The ``plan`` capability strips unknown kwargs before calling
+        ``generate_code_plan`` (see ``loop.py``), so this metadata is
+        safe to attach: it travels with the plan for the UI / Judge and
+        does not break downstream engine calls.
+        """
+        if not impacted:
+            return
+        for t in tasks:
+            if t.kind == TaskKind.PLAN:
+                t.inputs.setdefault("impacted_files", list(impacted))
+
+    def _build_understand_brief(
+        self, goal: str, result: Optional[Dict[str, Any]],
+        candidates: List[str], impacted: List[str],
+    ) -> Optional[Dict[str, Any]]:
+        """Produce a bounded, read-only orientation brief for change goals.
+
+        The "understand" pre-step: before the LLM decomposes an edit /
+        add-to-existing goal, hand it a compact structured view of the
+        code it will touch -- the relevant files, the key symbols defined
+        there, the existing tests it should extend, and the language
+        conventions in play. Derived from the SAME single retrieval + the
+        already-computed candidate/impact lists, so it costs no extra
+        queries.
+
+        Returns ``None`` for non-change goals (fresh scaffolds and
+        read-only questions don't need grounding in existing code) or
+        when nothing useful could be derived.
+        """
+        if not _goal_is_change(goal):
+            return None
+        symbols = self._symbols_from_result(goal, result)
+        tests = self._existing_tests_from_result(result)
+        files_for_conv = list(candidates) + [s["file"] for s in symbols]
+        conventions = self._conventions_from_files(files_for_conv)
+        if not (candidates or symbols or tests or impacted):
+            return None
+        brief: Dict[str, Any] = {}
+        if candidates:
+            brief["relevant_files"] = list(candidates)
+        if symbols:
+            brief["symbols"] = symbols
+        if tests:
+            brief["existing_tests"] = tests
+        if impacted:
+            brief["impacted_files"] = list(impacted)
+        if conventions:
+            brief["conventions"] = conventions
+        logger.info(
+            "Planner: understand brief built (files=%d symbols=%d tests=%d "
+            "conventions=%d)",
+            len(brief.get("relevant_files", [])), len(symbols), len(tests),
+            len(conventions))
+        return brief or None
+
+    def _symbols_from_result(
+        self, goal: str, result: Optional[Dict[str, Any]], *, limit: int = 12,
+    ) -> List[Dict[str, str]]:
+        """Extract key ``{symbol, kind, file}`` triples from the hits.
+
+        Hybrid retriever hits carry ``chunk_id`` in the form
+        ``<path>::<kind>::<symbol>``. Dedupe on ``(file, symbol)``,
+        preserving fused rank, and drop test-path symbols under ``src``
+        scope to match :meth:`_candidates_from_result`.
+        """
+        if not isinstance(result, dict):
+            return []
+        hits = result.get("hits") or []
+        if not isinstance(hits, list):
+            return []
+        from cgx.answer.scope import detect_scope, _is_test_path
+        scope = detect_scope(goal)
+        out: List[Dict[str, str]] = []
+        seen: set = set()
+        for h in hits:
+            if not isinstance(h, dict):
+                continue
+            cid = str(h.get("chunk_id") or "")
+            parts = cid.split("::")
+            if len(parts) < 3:
+                continue
+            fp, kind, symbol = parts[0].strip(), parts[1].strip(), parts[2].strip()
+            if not fp or not symbol:
+                continue
+            if scope == "src" and _is_test_path(fp):
+                continue
+            key = (fp, symbol)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({"symbol": symbol, "kind": kind, "file": fp})
+            if len(out) >= limit:
+                break
+        return out
+
+    @staticmethod
+    def _existing_tests_from_result(
+        result: Optional[Dict[str, Any]], *, limit: int = 6,
+    ) -> List[str]:
+        """Collect existing test files surfaced by the retrieval.
+
+        Test paths are always relevant for a change goal (the plan should
+        extend them), so -- unlike candidates -- they are never dropped by
+        scope. Aggregated file-level ``top_files`` are preferred, then
+        per-chunk hit paths.
+        """
+        if not isinstance(result, dict):
+            return []
+        from cgx.answer.scope import _is_test_path
+        out: List[str] = []
+        seen: set = set()
+
+        def _add(fp: str) -> bool:
+            fp = fp.strip()
+            if fp and _is_test_path(fp) and fp not in seen:
+                seen.add(fp)
+                out.append(fp)
+            return len(out) >= limit
+
+        for f in (result.get("top_files") or []):
+            if isinstance(f, dict):
+                fp = str(f.get("file") or f.get("path") or "")
+            elif isinstance(f, str):
+                fp = f
+            else:
+                continue
+            if _add(fp):
+                return out
+        for h in (result.get("hits") or []):
+            if not isinstance(h, dict):
+                continue
+            cid = str(h.get("chunk_id") or "")
+            fp = cid.split("::", 1)[0] if "::" in cid else str(h.get("path") or "")
+            if _add(fp):
+                break
+        return out
+
+    @staticmethod
+    def _conventions_from_files(files: List[str]) -> List[str]:
+        """Summarise the languages present across *files* (dedup, ordered)."""
+        langs: List[str] = []
+        for fp in files:
+            if not fp:
+                continue
+            for ext, lang in _EXT_LANG.items():
+                if fp.endswith(ext) and lang not in langs:
+                    langs.append(lang)
+                    break
+        return langs
+
+    @staticmethod
+    def _render_understand_brief(
+        brief: Optional[Dict[str, Any]],
+    ) -> Optional[str]:
+        """Render the brief as a compact prompt block for :meth:`_llm_plan`.
+
+        Only the parts that aren't already shown in their own prompt
+        sections (candidate files, blast radius) are rendered here --
+        key symbols, existing tests, and conventions -- so the prompt
+        stays lean and non-duplicative. The full structured brief still
+        travels to the generator via :meth:`_attach_understand_brief`.
+        """
+        if not brief:
+            return None
+        lines: List[str] = []
+        symbols = brief.get("symbols") or []
+        if symbols:
+            rendered = []
+            for s in symbols:
+                kind = str(s.get("kind") or "").strip()
+                label = str(s.get("symbol") or "")
+                if kind:
+                    label += f" ({kind})"
+                rendered.append(f"{label} in {s.get('file')}")
+            lines.append("- Key symbols already defined: " + "; ".join(rendered))
+        tests = brief.get("existing_tests") or []
+        if tests:
+            lines.append("- Existing tests to extend: " + ", ".join(tests))
+        conventions = brief.get("conventions") or []
+        if conventions:
+            lines.append("- Languages/conventions: " + ", ".join(conventions))
+        if not lines:
+            return None
+        return (
+            "Understand brief (read-only orientation for this change -- "
+            "reuse the symbols already defined, extend the listed tests, "
+            "and match the project's conventions):\n" + "\n".join(lines)
+        )
+
+    @staticmethod
+    def _attach_understand_brief(
+        tasks: List[Task], brief: Optional[Dict[str, Any]],
+    ) -> None:
+        """Stamp the full structured understand brief onto every PLAN task.
+
+        Like :meth:`_attach_impacted_files`, the ``plan`` capability
+        strips unknown kwargs before calling ``generate_code_plan`` (see
+        ``loop.py``), so this metadata is safe to attach: it travels with
+        the plan for the generator / UI and does not break downstream
+        engine calls.
+        """
+        if not brief:
+            return
+        for t in tasks:
+            if t.kind == TaskKind.PLAN:
+                t.inputs.setdefault("understand_brief", dict(brief))
+
+    def _render_repo_map(self) -> Optional[str]:
+        """Render the whole-repo map as budgeted prompt text, if available.
+
+        Calls the optional ``repo_map`` provider lazily and renders a
+        bounded package -> file -> symbol tree. Returns ``None`` when no
+        provider is wired, it yields nothing, or rendering fails -- the
+        Planner then simply omits the whole-repo context.
+        """
+        if self.repo_map is None:
+            return None
+        try:
+            rm = self.repo_map() if callable(self.repo_map) else self.repo_map
+        except Exception as e:
+            logger.warning(
+                "Planner: repo_map provider failed: %s: %r", type(e).__name__, e,
+            )
+            return None
+        if not isinstance(rm, dict) or not rm.get("files"):
+            return None
+        try:
+            from cgx.answer.repo_map import render_repo_map
+            text = render_repo_map(rm).strip()
+        except Exception as e:
+            logger.warning(
+                "Planner: render_repo_map failed: %s: %r", type(e).__name__, e,
+            )
+            return None
+        return text or None
 
     def _enforce_kind_policy(
         self, goal: str, tasks: List[Task],
@@ -933,6 +1299,9 @@ class Planner:
 
     def _llm_plan(self, goal: str, *,
                   candidates: Optional[List[str]] = None,
+                  impacted: Optional[List[str]] = None,
+                  repo_map_text: Optional[str] = None,
+                  understand_text: Optional[str] = None,
                   rationale_box: Optional[List[str]] = None,
                   prior_goal: Optional[str] = None) -> List[Task]:
         """Call the LLM and return the parsed tasks.
@@ -961,20 +1330,55 @@ class Planner:
             )
         else:
             user_parts.append(f"Goal:\n{goal.strip()}")
+        if repo_map_text:
+            user_parts.append(
+                "Repo map (whole-repo structure: packages, files and their "
+                "top-level symbols). Use it to ground the plan in the real "
+                "layout — reuse existing modules and place new code where it "
+                f"fits:\n{repo_map_text}"
+            )
         if candidates:
             user_parts.append(
                 "Candidate files surfaced by the index (prefer these when "
                 "the goal targets specific code):\n- " + "\n- ".join(candidates)
             )
+        if impacted:
+            user_parts.append(
+                "Change impact (blast radius) — files that call into or "
+                "depend on the code you plan to modify. Review each for "
+                "required follow-on edits (e.g. updating call sites) and "
+                "make sure the VERIFY step covers them:\n- "
+                + "\n- ".join(impacted)
+            )
+        if understand_text:
+            user_parts.append(understand_text)
+        # Select the planning prompt strategy from the provider's
+        # capability tier rather than special-casing model ids: weak
+        # local models get an explicit strict-JSON reminder and a tight
+        # token ceiling; strong models take the lean path with more room.
+        from cgx.answer.model_caps import get_prompt_strategy
+        from cgx.answer.schemas import PLAN_SCHEMA
+        strategy = get_prompt_strategy(self.provider)
+        if strategy.get("reinforce_json"):
+            user_parts.append(
+                "Return ONLY a single valid JSON object matching the schema "
+                "above -- no prose, no markdown, no code fences."
+            )
         try:
+            # Pass the plan JSON schema so providers that support schema-
+            # constrained decoding (Ollama structured outputs, OpenAI
+            # json_schema, Gemini responseSchema) can only emit a conforming
+            # object; providers that don't fall back to plain JSON mode and
+            # the balanced-brace extractor below still applies.
             resp = self.provider.chat(
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": "\n\n".join(user_parts) + "\n"},
                 ],
                 temperature=0.1,
-                max_tokens=1000,
+                max_tokens=int(strategy.get("plan_max_tokens") or 1000),
                 force_json=True,
+                json_schema=PLAN_SCHEMA,
             )
         except Exception as e:
             logger.warning("Planner: LLM chat raised %s: %s", type(e).__name__, e)

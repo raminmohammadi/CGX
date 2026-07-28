@@ -31,6 +31,7 @@ from fastapi import APIRouter, HTTPException, Query
 # Importing the tasks package side-effect-registers Phase 1 executors.
 from cgx.session import tasks as _tasks  # noqa: F401
 from cgx.session import SessionRunner, SessionStore
+from cgx.session.llm_trace import TracingProvider
 from cgx.session.mode import detect_mode
 from cgx.session.models import SessionMode
 from cgx.session.tasks.ask import build_decision
@@ -54,6 +55,7 @@ router = APIRouter(tags=["agent-session"], prefix="/agent-session")
 # ``None`` falls back to the user-global path used by Phase 0 tests.
 _RUNNERS: Dict[str, SessionRunner] = {}
 _RUNNERS_LOCK = threading.Lock()
+_SESSION_TO_RUNNER: Dict[str, SessionRunner] = {}
 
 
 def _get_runner(project_root: Optional[str]) -> SessionRunner:
@@ -81,6 +83,12 @@ def _build_deps(req_provider, req_index, project_root: Optional[str],
                               "/v1/chat/completions"),
         allow_no_auth=bool(getattr(req_provider, "allow_no_auth", False)),
     )
+    # Wrap with TracingProvider so every chat / chat_stream invocation
+    # the executor makes lands as an LLM_CALL fact attributed to the
+    # producing task (Phase 5.1). Untraced providers (already wrapped
+    # in nested calls) are passed through unchanged.
+    if provider is not None and not isinstance(provider, TracingProvider):
+        provider = TracingProvider(provider)
     return ExecutorDeps(
         project_root=project_root,
         index_dir=req_index.index_dir,
@@ -109,18 +117,34 @@ def _snapshot(runner: SessionRunner, session_id: str) -> AgentSessionState:
 
 
 async def _drain_ready(runner: SessionRunner, session_id: str,
-                       deps: ExecutorDeps, *, max_steps: int = 4) -> None:
+                       deps: ExecutorDeps, *, max_steps: int = 64) -> None:
     """Synchronously execute READY tasks until none remain or budget exhausts.
 
-    Capped at ``max_steps`` so a runaway router doesn't peg the request
-    thread. ASK_USER tasks intentionally stop the loop -- they go to
-    IN_PROGRESS rather than DONE.
+    The loop stops naturally when ``run_next`` returns ``None`` -- either
+    nothing is READY or the pipeline paused on an ASK_USER (which goes to
+    IN_PROGRESS, not DONE, so it leaves no READY task behind). ``max_steps``
+    is only a safety valve against a router bug that spawns READY tasks
+    without end; it must not double as a functional limit, or a task
+    created READY past the cap is stranded with no request to re-drive it.
+
+    The greenfield write pipeline is SCAFFOLD -> APPLY -> BOOTSTRAP_ENV ->
+    API_CHECK -> SMOKE -> VERIFY (6 tasks on the happy path). An
+    API_CHECK / SMOKE / VERIFY failure can splice in a bounded REPAIR
+    detour -- either a regenerate (fresh SCAFFOLD -> APPLY -> ...) or a
+    patch (APPLY -> VERIFY). Those detours are capped inside the router
+    (``_REPAIR_BUDGET`` / ``_REGENERATE_BUDGET`` plus no-progress
+    signature guards), so the total per drive is bounded well under the
+    cap; the previous default of 6 cut the very first repair cycle off
+    mid-pipeline and left the regenerated APPLY stuck at READY.
     """
     for _ in range(max_steps):
         task = await asyncio.to_thread(
             runner.run_next, session_id=session_id, deps=deps)
         if task is None:
             return
+    logger.warning(
+        "drain: hit max_steps=%d for session %s without quiescing; "
+        "a READY task may remain undispatched", max_steps, session_id)
 
 
 # --------------------- routes ---------------------
@@ -132,6 +156,8 @@ async def create_session(req: AgentSessionCreateRequest) -> AgentSessionState:
     session = await asyncio.to_thread(
         runner.start_session, objective=req.objective,
         project_root=req.project_root, title=req.title, mode=mode)
+    with _RUNNERS_LOCK:
+        _SESSION_TO_RUNNER[session.session_id] = runner
     if req.run_initial_task:
         deps = _build_deps(req.provider, req.index, req.project_root,
                            store=runner.store)
@@ -234,6 +260,9 @@ async def delete_session(sid: str,
     if not removed:
         raise HTTPException(status_code=404,
                             detail=f"session {sid!r} not found")
+    runner.delete_session_lock(sid)
+    with _RUNNERS_LOCK:
+        _SESSION_TO_RUNNER.pop(sid, None)
     return {"deleted": sid}
 
 
@@ -246,8 +275,16 @@ def _resolve_runner_for(sid: str) -> SessionRunner:
     matches -- typical for sessions created without a project_root.
     """
     with _RUNNERS_LOCK:
+        runner = _SESSION_TO_RUNNER.get(sid)
+        if runner is not None:
+            return runner
         runners = list(_RUNNERS.values())
     for r in runners:
         if r.store.get_session(sid) is not None:
+            with _RUNNERS_LOCK:
+                _SESSION_TO_RUNNER[sid] = r
             return r
-    return _get_runner(None)
+    default_runner = _get_runner(None)
+    with _RUNNERS_LOCK:
+        _SESSION_TO_RUNNER[sid] = default_runner
+    return default_runner

@@ -35,6 +35,11 @@ class ProviderConfig(BaseModel):
     num_ctx: Optional[int] = None
     endpoint_path: str = "/v1/chat/completions"
     allow_no_auth: bool = False
+    # Opt-in reasoning/"thinking" phase for the ASK stream. When True *and*
+    # the selected model is reasoning-capable, ``stream_ask`` emits a thought
+    # sketch before the grounded answer; otherwise it answers directly. Kept
+    # False by default so ASK stays fast unless the user asks for thinking.
+    think: bool = False
 
 
 class IndexLocation(BaseModel):

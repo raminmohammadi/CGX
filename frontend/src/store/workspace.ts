@@ -33,6 +33,7 @@ const defaultProvider: ProviderConfig = {
   num_ctx: null,
   endpoint_path: "/v1/chat/completions",
   allow_no_auth: false,
+  think: false,
 };
 
 const defaultIndex: IndexLocation = {

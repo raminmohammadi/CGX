@@ -28,6 +28,7 @@ from cgx.codegen.diff_apply import (
     parse_fenced_diffs,
 )
 from cgx.codegen.validate import check_cross_file_coherence, validate_patch_results
+from cgx.trace import traced
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +117,7 @@ def _build_file_tree(rel_paths: List[str]) -> str:
     return "\n".join(lines)
 
 
+@traced("codegen")
 def apply_diffs_to_disk(
     project_root: str,
     diffs: Sequence[Dict[str, str]],

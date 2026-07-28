@@ -19,6 +19,7 @@ from cgx.session.repair.classify import (
     missing_fixture_names,
     missing_module_names,
 )
+from cgx.trace import traced
 
 
 @dataclass(frozen=True)
@@ -38,6 +39,7 @@ class StyleMixLocation:
     helpers: frozenset
 
 
+@traced("repair.locate")
 def locate_unittest_pytest_mix(
     project_root: Path,
     candidate_files: Iterable[str],
@@ -104,6 +106,7 @@ class MissingPythonpathLocation:
     resolved_path: str
 
 
+@traced("repair.locate")
 def lint_test_style(
     project_root: Path,
     candidate_files: Iterable[str],
@@ -147,6 +150,7 @@ class MissingFixtureLocation:
     target_rel_path: str
 
 
+@traced("repair.locate")
 def locate_missing_fixture(
     project_root: Path,
     content: Dict[str, Any],
@@ -203,6 +207,7 @@ def locate_missing_fixture(
     return [found[name] for name in wanted if name in found]
 
 
+@traced("repair.locate")
 def locate_missing_module_pythonpath(
     project_root: Path,
     content: Dict[str, Any],
@@ -211,10 +216,15 @@ def locate_missing_module_pythonpath(
 
     Walks the names from
     :func:`cgx.session.repair.classify.missing_module_names` and keeps
-    only those whose top-level component resolves to a sibling file or
-    directory inside ``project_root``. Skips ``.venv`` / dotfile dirs
-    so a vendored ``.venv/foo`` doesn't masquerade as the project
-    module.
+    only those whose *full* dotted path resolves to a file or package
+    inside ``project_root``. Skips ``.venv`` / dotfile dirs so a
+    vendored ``.venv/foo`` doesn't masquerade as the project module.
+
+    A missing *leaf* (e.g. ``tests.auth`` where ``tests/`` exists but
+    ``tests/auth.py`` does not) is deliberately not resolved here: no
+    ``conftest`` sys.path entry can create a module that was never
+    authored, so that case is left for the REPAIR regenerate path
+    rather than being papered over with a pythonpath patch.
     """
     root = Path(project_root).resolve()
     out: List[MissingPythonpathLocation] = []
@@ -222,6 +232,8 @@ def locate_missing_module_pythonpath(
     for dotted in missing_module_names(content):
         top = dotted.split(".", 1)[0]
         if not top or top in seen_top:
+            continue
+        if not _dotted_path_resolves(root, dotted):
             continue
         seen_top.add(top)
         candidates = [root / f"{top}.py", root / top]
@@ -243,6 +255,32 @@ def locate_missing_module_pythonpath(
 
 
 # --------------------- helpers ---------------------
+
+def _dotted_path_resolves(root: Path, dotted: str) -> bool:
+    """True when every component of ``dotted`` resolves under ``root``.
+
+    Non-leaf components must be package directories; the leaf may be
+    either a ``<name>.py`` module or a package directory. This tells a
+    genuine sys.path gap (the whole dotted path exists on disk but isn't
+    importable from pytest) apart from a missing leaf module -- an
+    authoring error the regenerate path owns, not a pythonpath fix.
+    """
+    parts = [p for p in dotted.split(".") if p]
+    if not parts:
+        return False
+    cur = root
+    for i, part in enumerate(parts):
+        is_leaf = i == len(parts) - 1
+        as_dir = cur / part
+        if is_leaf:
+            if (cur / f"{part}.py").is_file():
+                return True
+            return as_dir.is_dir() and _is_python_dir(as_dir)
+        if not as_dir.is_dir():
+            return False
+        cur = as_dir
+    return False
+
 
 def _is_python_dir(path: Path) -> bool:
     """True when ``path`` is a non-hidden directory containing ``.py`` files.

@@ -128,10 +128,14 @@ function FactsTab({ facts }: { facts: FactDTO[] }) {
         >
           <p className="text-[10px] font-mono text-slate-400 uppercase tracking-wider">
             {f.kind}{f.stale && " · stale"}
+            {f.kind === "llm_call" && typeof f.content?.latency_ms === "number"
+              && ` · ${Math.round(f.content.latency_ms)}ms`}
           </p>
           <p className="text-[11px] text-slate-200 truncate">
-            {String(f.content?.title || f.content?.path || f.content?.symbol
-              || f.content?.chunk_id || f.fact_id)}
+            {f.kind === "llm_call"
+              ? String(f.content?.model || "model?")
+              : String(f.content?.title || f.content?.path || f.content?.symbol
+                || f.content?.chunk_id || f.fact_id)}
           </p>
         </li>
       ))}

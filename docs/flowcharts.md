@@ -144,13 +144,20 @@ AST-walk path for older indices. The companion anchor fields
 emitted by `cgx.retrieval.orchestrator.suggest_insertion_points`
 so an insertion target can be located without re-parsing the file.
 
-The parser side is fronted by a small registry
-(`cgx.parser.python_parser.PythonASTParser` registering for `.py`
-via the `BaseParser` ABC in `cgx.parser.base`). The project walker
-in `parse_codebase` dispatches on file extension; non-`.py` files
-are silently skipped today. Adding a language later means writing a
-new `BaseParser` subclass and registering its extensions -- no
-changes to the orchestrator or codegen layers.
+The parser side is fronted by a small registry keyed on file
+extension, all sharing the `BaseParser` ABC in `cgx.parser.base`.
+`PythonASTParser` (stdlib `ast`) registers for `.py` and is always
+available; `cgx.parser.js_ts_parser` registers tree-sitter parsers
+for `.js`, `.jsx`, `.ts`, and `.tsx` when the optional `parsers`
+extra is installed. The project walker in `parse_codebase`
+dispatches on extension and gracefully skips files with no
+registered parser, so a core install still indexes Python cleanly.
+Re-indexing is incremental at the parse layer via
+`cgx.parser.incremental`: a `parse_cache.json` manifest keyed on
+each file's mtime/sha lets unchanged files reuse their cached
+chunks. Adding a language later means writing a new `BaseParser`
+subclass and registering its extensions -- no changes to the
+orchestrator or codegen layers.
 
 ---
 
@@ -173,9 +180,13 @@ overridden via the launcher) determines which root task is seeded:
   disk.
 
 Both loops converge on a shared write-loop tail. Explore mode goes
-directly `APPLY → VERIFY`; greenfield mode inserts a
-`BOOTSTRAP_ENV` step in between so the project's runtime is
-provisioned before pytest runs. Every `ASK_USER` in either path is a
+directly `APPLY → VERIFY`; greenfield mode inserts
+`BOOTSTRAP_ENV → API_CHECK → SMOKE` between `APPLY` and `VERIFY` so
+the project's runtime is provisioned, third-party imports are
+statically resolved, and a runtime `python -c "import …"` smoke
+batch catches third-party import breaks (e.g. a stale
+`Flask 2.1.x` pulling Werkzeug 3.x that removes `url_quote`) before
+pytest collection runs. Every `ASK_USER` in either path is a
 structured checkpoint, not a freeform prompt.
 
 ### Explore loop
@@ -276,12 +287,41 @@ structured checkpoint, not a freeform prompt.
                   +-----------------+
                   | BOOTSTRAP_ENV   |  create/refresh .venv, install
                   +-----------------+  requirements.txt, preflight
-                            |          undeclared imports
-                            |          -> BUILD_REPORT artifact
-                            v          (outcome=succeeded|failed|
-                       +--------+        no_venv|skipped|partial)
+                            |          undeclared imports;
+                            |          `pip freeze --all` parsed into
+                            |          `installed_packages` (Phase 1.1)
+                            v          -> BUILD_REPORT artifact
+                  +-----------------+   (outcome=succeeded|failed|
+                  |   API_CHECK     |     no_venv|skipped|partial)
+                  +-----------------+
+                            |          static walk over applied files;
+                            |          resolves `from <pkg> import <x>`
+                            |          via importlib + getmembers in the
+                            |          bootstrapped venv
+                            |          -> API_CHECK_REPORT artifact
+                            |          (Phase 2.2; outcome=passed|
+                            |           failed|skipped; on `failed`
+                            |           routes to REPAIR with this
+                            |           report as the source artifact)
+                            v
+                  +-----------------+
+                  |     SMOKE       |  runs `python -c "import <pkg>"`
+                  +-----------------+  per top-level applied module
+                            |          inside the bootstrapped venv
+                            |          (30s batch budget, captures
+                            |          stderr_tail per import)
+                            |          -> SMOKE_REPORT artifact
+                            |          (Phase 2.1; outcome=passed|
+                            |           failed|skipped; on `failed`
+                            |           routes to REPAIR)
+                            v
+                       +--------+
                        | VERIFY |  pytest inside the project venv
                        +--------+   (uses BUILD_REPORT.python_exe);
+                                    runs with `--junitxml` and parses
+                                    structured failures (Phase 3.1);
+                                    persists a single-shot
+                                    `reproduce_cmd` (Phase 1.2);
                                     classifies rc into outcome; in
                                     greenfield with no tests yet
                                     -> ran=False + skipped_reason
@@ -289,60 +329,75 @@ structured checkpoint, not a freeform prompt.
 
 ### Autonomous repair loop (greenfield only)
 
-When a greenfield `VERIFY` ends with `outcome=assertions_failed` or
-`collection_error`, the router fires a deterministic repair cycle
-before declaring the session stuck. The cycle is capped at 2
-attempts and gated by a failure-signature hash so flapping fixes
-escalate to `ASK_USER` instead of looping:
+The router fires a deterministic repair cycle from three upstream
+sources: an `API_CHECK` that ends `failed` (**Phase 2.2**), a
+`SMOKE` that ends `failed` (**Phase 2.1**), or a `VERIFY` that ends
+`assertions_failed` / `collection_error`. The cycle is capped by
+`repair_attempt < 2` AND a `failure_signature`-hash flap detector,
+plus a per-ancestor-chain `_REGENERATE_BUDGET=1` for the regenerate
+branch added in **Phase 6.1**:
 
 ```
-                       +--------+
-                       | VERIFY |  outcome in {assertions_failed,
-                       +--------+               collection_error}
-                            |     failure_signature recorded on the report
+   +-----------+   +-------+   +--------+
+   | API_CHECK |   | SMOKE |   | VERIFY |   any of these can route
+   +-----------+   +-------+   +--------+   to REPAIR
+        | failed       | failed     | assertions_failed|collection_error
+        +--------------+------------+
+                            |  (source artifact threaded into REPAIR.inputs:
+                            |   API_CHECK_REPORT | SMOKE_REPORT |
+                            |   VERIFY_REPORT, each carrying its own
+                            |   failure_signature)
                             v
                        +--------+
-                       | REPAIR |  classify_verify_report (regex over
-                       +--------+   pytest traceback) ->
-                            |       classification token (v1:
-                            |       unittest_pytest_mix |
-                            |       missing_module_pythonpath |
-                            |       missing_fixture |
-                            |       unknown)
-                            |     unittest_pytest_mix:
-                            |       locate_unittest_pytest_mix (AST walk
-                            |       of changed/selected test files) ->
-                            |       propose_unittest_pytest_mix (rewrite
-                            |       class header to inherit
-                            |       unittest.TestCase + insert import)
-                            |     missing_module_pythonpath:
-                            |       locate_missing_module_pythonpath
-                            |       (match ModuleNotFoundError targets
-                            |       to project-root files/dirs) ->
-                            |       propose_missing_module_pythonpath
-                            |       (create/prepend project-root
-                            |       conftest.py with sys.path entry)
-                            |     missing_fixture:
-                            |       locate_missing_fixture (project-wide
-                            |       AST scan for @pytest.fixture defs
-                            v       matching the missing names) ->
-                       can_apply?    propose_missing_fixture (hoist the
-                       /       \     def into tests/conftest.py or root
-                  yes /         \    conftest.py with idempotent marker)
-                     |           \ no -> empty diffs
-                     v           v
-                +-------+    +-------------------------+
-                | APPLY |    | ASK_USER(freeform)      |  escalation:
-                +-------+    +-------------------------+   carries the
-                    |   carries build_artifact_id              classification
-                    |   forward, so BOOTSTRAP_ENV is           + rationale
-                    v   skipped on this pass
-                +--------+
-                | VERIFY |  re-runs pytest in the project venv.
-                +--------+  Same loop guards:
-                              - repair_attempt >= 2 -> terminal
-                              - new failure_signature in
-                                prior_failure_signatures -> terminal
+                       | REPAIR |  classify via cgx.session.repair.classify
+                       +--------+  (Phase 3.2 registry):
+                            |        - unittest_pytest_mix
+                            |        - missing_module_pythonpath
+                            |        - missing_fixture
+                            |        - hallucinated_api
+                            |        - third_party_import_break
+                            |             (Phase 3.2; propose_third_party_pin
+                            |              reads BUILD_REPORT.installed_packages,
+                            |              queries pypi.org/pypi/<pkg>/<ver>/json
+                            |              via pypi_client (~/.cgx/pypi-cache/),
+                            |              emits a requirements.txt diff against
+                            |              the peer-dependency table)
+                            |        - unknown
+                            |
+                            v
+                _select_repair_strategy()  (Phase 6.1)
+                /                       \
+               /  patch                   \  regenerate
+              v   (<=5 diffs in a          v  (no diffs in a regenerate-
+        +----------+ patchable class)   +----------+ eligible class, or
+        |  APPLY   |                    | SCAFFOLD | >5 diffs; always for
+        +----------+                    +----------+ SMOKE / API_CHECK
+              |   carries build_artifact_id    |     breaks)
+              |   forward, BOOTSTRAP_ENV       |   propose_regenerate:
+              |   is skipped on this pass      |     - walks up to nearest
+              v                                |       SCAFFOLD ancestor
+        +----------+                           |     - marks live descendants
+        |  VERIFY  |                           |       ABANDONED
+        +----------+                           |     - re-queues fresh
+              | passed                         |       SCAFFOLD with bumped
+              v                                |       regenerate_attempt +
+   +------------------+                        |       regenerate_constraints
+   | RecordLesson     |  Phase 7.1: emitted    |       in inputs
+   | -> lessons.jsonl |  iff a REPAIR is on    |     - capped at
+   +------------------+  the ancestor chain    |       _REGENERATE_BUDGET=1
+                                               v
+                                          (re-enters greenfield loop:
+                                           SCAFFOLD -> APPLY ->
+                                           BOOTSTRAP_ENV -> API_CHECK ->
+                                           SMOKE -> VERIFY)
+
+   empty diffs (classification=unknown OR proposer marker already
+   present) -> ASK_USER(freeform) carrying classification + rationale
+
+   loop guards (terminal if any fires):
+     - repair_attempt >= 2
+     - new failure_signature already in prior_failure_signatures
+     - regenerate_attempt would exceed _REGENERATE_BUDGET on the chain
 ```
 
 Three pieces of code own every transition:
@@ -351,10 +406,10 @@ Three pieces of code own every transition:
   and no I/O. Every transition is one of three entry points
   (`on_user_message`, `on_task_completed`, `on_decision_recorded`)
   that returns a `RouterPlan` of typed actions (`CreateTask`,
-  `UpdateTaskStatus`, `RecordDecision`, `AttachDecisionToTask`). The
-  successor for any non-ASK kind comes from the `TASK_SUCCESSOR`
-  dispatch table; the successor for an `ASK_USER` is driven by the
-  shape of the resolving `Decision`.
+  `UpdateTaskStatus`, `RecordDecision`, `AttachDecisionToTask`,
+  `RecordLesson`). The successor for any non-ASK kind comes from the
+  `TASK_SUCCESSOR` dispatch table; the successor for an `ASK_USER`
+  is driven by the shape of the resolving `Decision`.
 * **`cgx.session.runner.SessionRunner`** is the orchestrator the
   HTTP routes call. It sequences router plans through the store,
   acquires a per-session lock so concurrent requests can't interleave
@@ -398,8 +453,14 @@ Where to look in the repo:
 | Transitions              | `src/cgx/session/router.py` |
 | Orchestrator             | `src/cgx/session/runner.py` |
 | Persistence              | `src/cgx/session/store.py` |
+| Project-local agent log  | `src/cgx/session/agent_log.py` (Phase 1.3) |
+| Cross-session lessons    | `src/cgx/session/lessons.py` (Phase 7.1) |
+| LLM tracing              | `src/cgx/session/llm_trace.py` (Phase 5.1) |
+| SCAFFOLD pin validator   | `src/cgx/session/scaffold_validate.py` (Phase 4.1) |
+| Repair classify / locate / propose | `src/cgx/session/repair/{classify,locate,propose}.py` |
+| PyPI metadata client     | `src/cgx/session/repair/pypi_client.py` (Phase 3.2) |
 | Explore executors        | `src/cgx/session/tasks/{explore,investigate,recommend,plan_change}.py` |
-| Greenfield executors     | `src/cgx/session/tasks/{clarify_requirements,decompose,scaffold}.py` |
+| Greenfield executors     | `src/cgx/session/tasks/{clarify_requirements,decompose,scaffold,bootstrap_env,api_check,smoke,repair}.py` |
 | Shared write executors   | `src/cgx/session/tasks/{apply,verify,ask}.py` |
 | Decision validation      | `src/cgx/session/tasks/ask.py :: build_decision` |
 | HTTP routes              | `src/cgx/webui/routes/agent_session.py` |
@@ -416,7 +477,10 @@ Where to look in the repo:
 Source code, embeddings, FAISS indices, chat sessions, the SQLite
 task registry (`~/.cgx/tasks.db`), the session-based agent's
 persistent state (`<project_root>/.cgx/sessions.db`, or
-`~/.cgx/sessions.db` when no project root is configured), and the
+`~/.cgx/sessions.db` when no project root is configured), the
+project-local agent log (`<project_root>/.cgx/agent.log`, Phase 1.3),
+the cross-session lesson store (`~/.cgx/lessons.jsonl`, Phase 7.1),
+the PyPI metadata cache (`~/.cgx/pypi-cache/`, Phase 3.2), and the
 embedding cache all live on the local machine under `~/.cgx/` and
 `indices/`. The legacy batch agent streams SSE over localhost and
 persists every event into the task registry so the UI can replay a

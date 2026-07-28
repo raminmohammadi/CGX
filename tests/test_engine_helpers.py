@@ -459,6 +459,289 @@ def test_inject_required_files_conftest_idempotent_when_already_present():
 
 
 # ---------------------------------------------------------------------------
+# _inject_readme: every project gets a top-level README.md, generated LAST
+# so it can summarise the real, already-generated files.
+# ---------------------------------------------------------------------------
+def test_inject_readme_appends_when_absent():
+    from cgx.answer.engine import _inject_readme
+    layers = [
+        {"name": "core", "files": [{"path": "src/app.py", "description": "entry"}]},
+    ]
+    out = _inject_readme(layers, goal="Build a thing")
+    paths = [f["path"] for lay in out for f in (lay.get("files") or [])]
+    assert paths[-1] == "README.md"
+    assert out[-1]["name"] == "docs"
+
+
+def test_inject_readme_moves_existing_readme_to_end():
+    from cgx.answer.engine import _inject_readme
+    layers = [
+        {"name": "docs", "files": [{"path": "README.md", "description": "old"}]},
+        {"name": "core", "files": [{"path": "src/app.py", "description": "entry"}]},
+    ]
+    out = _inject_readme(layers)
+    paths = [f["path"] for lay in out for f in (lay.get("files") or [])]
+    # Exactly one README, and it is the final file generated.
+    assert paths.count("README.md") == 1
+    assert paths[-1] == "README.md"
+
+
+def test_inject_readme_is_idempotent():
+    from cgx.answer.engine import _inject_readme
+    layers = [{"name": "core", "files": [{"path": "src/app.py", "description": "e"}]}]
+    once = _inject_readme(layers)
+    twice = _inject_readme(once)
+    paths = [f["path"] for lay in twice for f in (lay.get("files") or [])]
+    assert paths.count("README.md") == 1
+    assert paths[-1] == "README.md"
+
+
+# ---------------------------------------------------------------------------
+# _inject_required_test_file: every greenfield manifest must ship at least
+# one test so the verify step has a runnable self-correction signal.
+# ---------------------------------------------------------------------------
+def test_inject_required_test_file_adds_pytest_smoke_for_python():
+    from cgx.answer.engine import _inject_required_test_file
+    layers = [
+        {"name": "backend", "files": [
+            {"path": "backend/main.py", "description": "FastAPI entry"},
+        ]},
+    ]
+    out = _inject_required_test_file(
+        layers, goal="build a python fastapi backend", skill_names=["python", "fastapi"],
+    )
+    paths = [f["path"] for lay in out for f in (lay.get("files") or [])]
+    assert "tests/test_smoke.py" in paths
+
+
+def test_inject_required_test_file_adds_js_test_for_react():
+    from cgx.answer.engine import _inject_required_test_file
+    layers = [
+        {"name": "ui", "files": [
+            {"path": "package.json", "description": "npm manifest"},
+            {"path": "src/App.jsx", "description": "React App"},
+        ]},
+    ]
+    out = _inject_required_test_file(
+        layers, goal="build a react calculator ui", skill_names=["react"],
+    )
+    paths = [f["path"] for lay in out for f in (lay.get("files") or [])]
+    # Extension mirrors the project's own source files (.jsx here).
+    assert "tests/app.test.jsx" in paths
+
+
+def test_inject_required_test_file_is_noop_when_test_present():
+    from cgx.answer.engine import _inject_required_test_file
+    layers = [
+        {"name": "core", "files": [{"path": "src/app.py", "description": "entry"}]},
+        {"name": "tests", "files": [
+            {"path": "tests/test_app.py", "description": "existing test"},
+        ]},
+    ]
+    out = _inject_required_test_file(layers, goal="python app", skill_names=["python"])
+    paths = [f["path"] for lay in out for f in (lay.get("files") or [])]
+    assert paths.count("tests/test_app.py") == 1
+    assert "tests/test_smoke.py" not in paths
+
+
+# ---------------------------------------------------------------------------
+# _is_pytest_test_path / _has_collectable_pytest_test: the deterministic
+# gate that stops an empty test suite (pytest exit 5) from stalling the
+# verify->repair loop.
+# ---------------------------------------------------------------------------
+def test_is_pytest_test_path_matches_conventions():
+    from cgx.answer.engine import _is_pytest_test_path
+    assert _is_pytest_test_path("tests/test_app.py")
+    assert _is_pytest_test_path("test_foo.py")
+    assert _is_pytest_test_path("pkg/foo_test.py")
+    # Non-tests: conftest, helpers, source, and non-Python files.
+    assert not _is_pytest_test_path("tests/conftest.py")
+    assert not _is_pytest_test_path("tests/helper.py")
+    assert not _is_pytest_test_path("src/app.py")
+    assert not _is_pytest_test_path("tests/test_app.txt")
+
+
+def test_has_collectable_pytest_test_detects_top_level_function():
+    from cgx.answer.engine import _has_collectable_pytest_test
+    assert _has_collectable_pytest_test("def test_x():\n    assert True\n")
+    assert _has_collectable_pytest_test("async def test_y():\n    assert 1\n")
+
+
+def test_has_collectable_pytest_test_detects_test_class_method():
+    from cgx.answer.engine import _has_collectable_pytest_test
+    src = "class TestThing:\n    def test_a(self):\n        assert True\n"
+    assert _has_collectable_pytest_test(src)
+
+
+def test_has_collectable_pytest_test_rejects_app_logic_and_nested():
+    from cgx.answer.engine import _has_collectable_pytest_test
+    # App logic reimplemented under a test path -- the observed failure.
+    app = ("def init_db():\n    return True\n\n"
+           "def register(u, p):\n    return u\n")
+    assert not _has_collectable_pytest_test(app)
+    # test_* nested inside a fixture is invisible to pytest.
+    nested = ("import pytest\n\n@pytest.fixture\ndef client():\n"
+              "    def test_inner():\n        assert True\n    return 1\n")
+    assert not _has_collectable_pytest_test(nested)
+    # Unparseable module collects nothing.
+    assert not _has_collectable_pytest_test("def (:\n")
+
+
+class _QueueProvider:
+    """Fake provider returning queued ``{"content": ...}`` JSON payloads."""
+
+    model = "gpt-4o"  # cloud-tier so get_summary_budget stays generous
+
+    def __init__(self, payloads: List[str]):
+        self._payloads = list(payloads)
+        self._payloads_last = payloads[-1] if payloads else ""
+        self.calls = 0
+
+    def chat(self, *args: Any, **kwargs: Any) -> Dict[str, str]:
+        self.calls += 1
+        body = self._payloads.pop(0) if self._payloads else self._payloads_last
+        return {"content": json.dumps({"content": body})}
+
+
+_APP_LOGIC = ("import sqlite3\n\n"
+              "def init_db():\n    return True\n\n"
+              "def register(u, p):\n    return u\n")
+_REAL_TESTS = ("from app import init_db\n\n"
+               "def test_init_db():\n    assert init_db() is True\n\n"
+               "def test_register():\n    assert True\n\n"
+               "def test_more():\n    assert 2 + 2 == 4\n")
+
+
+def test_scaffold_test_file_retries_when_no_collectable_test():
+    from cgx.answer.engine import generate_single_scaffold_file
+    provider = _QueueProvider([_APP_LOGIC, _REAL_TESTS])
+    out = generate_single_scaffold_file(
+        "tests/test_app.py", "tests for the app", provider,
+        layer="tests", goal="build an app",
+    )
+    assert provider.calls == 2, "gate must trigger exactly one retry"
+    assert out["syntax_ok"] is True
+    assert "def test_init_db" in out["content"]
+    assert out["patch"]
+
+
+def test_scaffold_test_file_flags_when_retry_still_empty():
+    from cgx.answer.engine import generate_single_scaffold_file
+    provider = _QueueProvider([_APP_LOGIC, _APP_LOGIC])
+    out = generate_single_scaffold_file(
+        "tests/test_app.py", "tests for the app", provider,
+        layer="tests", goal="build an app",
+    )
+    assert provider.calls == 2
+    assert out["syntax_ok"] is False
+    assert "collectable" in out.get("syntax_error", "")
+
+
+_BROKEN_PY = "def compute(a, b:\n    return a + b\n"  # missing ')'
+_VALID_PY = "def compute(a, b):\n    return a + b\n"
+
+
+def test_scaffold_py_syntax_error_retries_and_recovers():
+    from cgx.answer.engine import generate_single_scaffold_file
+    provider = _QueueProvider([_BROKEN_PY, _VALID_PY])
+    out = generate_single_scaffold_file(
+        "src/calculator.py", "calculator core", provider,
+        layer="core", goal="build a calculator",
+    )
+    assert provider.calls == 2, "syntax gate must trigger one retry"
+    assert out["syntax_ok"] is True
+    assert out["content"] == _VALID_PY
+    assert out["patch"]
+
+
+def test_scaffold_py_syntax_error_flags_when_retry_still_broken():
+    from cgx.answer.engine import generate_single_scaffold_file
+    provider = _QueueProvider([_BROKEN_PY, _BROKEN_PY])
+    out = generate_single_scaffold_file(
+        "src/calculator.py", "calculator core", provider,
+        layer="core", goal="build a calculator",
+    )
+    assert provider.calls == 2
+    assert out["syntax_ok"] is False
+    assert out.get("syntax_error")
+
+
+# Unbalanced JSX: the return expression is never closed. Parsed with the
+# tree-sitter ``javascript`` grammar this reports has_error, which the
+# inline gate turns into one hardened retry.
+_BROKEN_JSX = (
+    "import React from 'react'\n"
+    "export default function App() {\n"
+    "  return (\n"
+    "    <div><h1>Calc</h1>\n"
+    "}\n"
+)
+_VALID_JSX = (
+    "import React from 'react'\n"
+    "export default function App() {\n"
+    "  return (\n"
+    "    <div><h1>Calc</h1></div>\n"
+    "  );\n"
+    "}\n"
+)
+
+
+def test_scaffold_jsx_syntax_error_retries_and_recovers():
+    from cgx.answer.engine import generate_single_scaffold_file
+    provider = _QueueProvider([_BROKEN_JSX, _VALID_JSX])
+    out = generate_single_scaffold_file(
+        "src/App.jsx", "root component", provider,
+        layer="ui", goal="build a react calculator",
+    )
+    assert provider.calls == 2, "JS syntax gate must trigger one retry"
+    assert out["syntax_ok"] is True
+    assert out["content"] == _VALID_JSX
+    assert out["patch"]
+
+
+def test_scaffold_jsx_syntax_error_flags_when_retry_still_broken():
+    from cgx.answer.engine import generate_single_scaffold_file
+    provider = _QueueProvider([_BROKEN_JSX, _BROKEN_JSX])
+    out = generate_single_scaffold_file(
+        "src/App.jsx", "root component", provider,
+        layer="ui", goal="build a react calculator",
+    )
+    assert provider.calls == 2
+    assert out["syntax_ok"] is False
+    assert out.get("syntax_error")
+
+
+_BAD_SYMBOL_TESTS = ("from app import generate_token\n\n"
+                     "def test_x():\n    assert generate_token()\n")
+
+
+def test_scaffold_retries_on_undefined_first_party_symbol():
+    from cgx.answer.engine import generate_single_scaffold_file
+    provider = _QueueProvider([_BAD_SYMBOL_TESTS, _REAL_TESTS])
+    out = generate_single_scaffold_file(
+        "tests/test_app.py", "tests for the app", provider,
+        layer="tests", goal="build an app",
+        existing_files_with_content=[{"path": "app.py", "content": _APP_LOGIC}],
+    )
+    assert provider.calls == 2, "symbol gate must trigger exactly one retry"
+    assert out["syntax_ok"] is True
+    assert "generate_token" not in out["content"]
+
+
+def test_scaffold_flags_when_first_party_symbol_still_undefined():
+    from cgx.answer.engine import generate_single_scaffold_file
+    provider = _QueueProvider([_BAD_SYMBOL_TESTS, _BAD_SYMBOL_TESTS])
+    out = generate_single_scaffold_file(
+        "tests/test_app.py", "tests for the app", provider,
+        layer="tests", goal="build an app",
+        existing_files_with_content=[{"path": "app.py", "content": _APP_LOGIC}],
+    )
+    assert provider.calls == 2
+    assert out["syntax_ok"] is False
+    assert "generate_token" in out.get("syntax_error", "")
+
+
+# ---------------------------------------------------------------------------
 # generate_single_scaffold_file: conftest.py short-circuits the LLM and
 # emits a deterministic sys.path-bootstrap body.
 # ---------------------------------------------------------------------------

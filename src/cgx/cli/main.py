@@ -102,9 +102,17 @@ def _cmd_serve(args: argparse.Namespace) -> None:
     _launch(host=args.host, port=args.port, no_browser=args.no_browser)
 
 
+def _cmd_dash(args: argparse.Namespace) -> None:
+    """Launch the interactive terminal dashboard."""
+    from cgx.cli.tui import run_dashboard
+    run_dashboard(project_root=getattr(args, "project_root", None))
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="cgx", description="Codebase RAG CLI")
-    sub = parser.add_subparsers(dest="cmd", required=True)
+    # No subcommand -> launch the interactive dashboard (the friendly
+    # default surface). Explicit subcommands remain for scripted use.
+    sub = parser.add_subparsers(dest="cmd", required=False)
 
     # index
     p_i = sub.add_parser("index", help="Parse -> records -> two-view embeddings -> FAISS -> persist")
@@ -158,7 +166,18 @@ def main(argv: list[str] | None = None) -> None:
                      help="Do not open a browser tab on startup.")
     p_s.set_defaults(func=_cmd_serve)
 
+    # dash -- the interactive terminal dashboard (also the bare-`cgx` default)
+    p_d = sub.add_parser(
+        "dash", help="Launch the interactive terminal dashboard (default).")
+    p_d.add_argument("--project-root", default=None,
+                     help="Project directory to open (default: current dir).")
+    p_d.set_defaults(func=_cmd_dash)
+
     args = parser.parse_args(argv)
+    # Bare `cgx` (no subcommand) opens the dashboard.
+    if getattr(args, "func", None) is None:
+        _cmd_dash(args)
+        return
     # Opt-in anonymous telemetry; off unless ``CGX_TELEMETRY=1`` is set.
     try:
         from cgx import telemetry

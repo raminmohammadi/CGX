@@ -1,9 +1,10 @@
-import { useMemo } from "react";
-import { Check, Loader2 } from "lucide-react";
+import { useMemo, useState } from "react";
+import { Check, ChevronDown, ChevronRight, Loader2 } from "lucide-react";
 import type {
-  ArtifactDTO, DecisionDTO, TaskNodeDTO,
+  ArtifactDTO, DecisionDTO, FactDTO, TaskNodeDTO,
 } from "../../lib/api";
 import { Pill } from "../Pill";
+import { ErrorBoundary } from "../ErrorBoundary";
 import { AskUserForm } from "./AskUserForm";
 import { ArtifactPreview } from "./ArtifactPreview";
 
@@ -13,12 +14,21 @@ export interface ActiveTaskProps {
   task: TaskNodeDTO | null;
   artifacts: ArtifactDTO[];
   decisions: DecisionDTO[];
+  facts?: FactDTO[];
   onDecide: (payload: { chosen: Record<string, any>; rationale?: string }) => Promise<void> | void;
   pending: boolean;
 }
 
 export function ActiveTaskPanel(props: ActiveTaskProps) {
-  const { task, artifacts, decisions, onDecide, pending } = props;
+  const { task, artifacts, decisions, facts, onDecide, pending } = props;
+  const llmFacts = useMemo(
+    () => (task && facts
+      ? facts.filter(
+          (f) => f.kind === "llm_call" && f.surfaced_in_task_id === task.task_id,
+        )
+      : []),
+    [task, facts],
+  );
   // Resolve the linked artifact once: every ASK_USER input carries the
   // upstream artifact id under a kind-specific key. Hook runs every
   // render so it must stay above any early return.
@@ -56,7 +66,95 @@ export function ActiveTaskPanel(props: ActiveTaskProps) {
       {linked && (task.kind !== "ask_user" || resolvedDecision !== undefined) && (
         <ArtifactPreview artifact={linked} />
       )}
+      {llmFacts.length > 0 && (
+        <ErrorBoundary label="llm-traces">
+          <LLMTraces facts={llmFacts} />
+        </ErrorBoundary>
+      )}
     </div>
+  );
+}
+
+function LLMTraces({ facts }: { facts: FactDTO[] }) {
+  const sorted = useMemo(
+    () => [...facts].sort((a, b) => a.created_at - b.created_at),
+    [facts],
+  );
+  return (
+    <details className="rounded-lg border border-white/5 bg-slate-950/40">
+      <summary className="cursor-pointer select-none px-3 py-2 text-[10px] font-mono uppercase tracking-wider text-slate-400 hover:text-slate-200">
+        LLM calls <span className="ml-1 text-slate-500">({sorted.length})</span>
+      </summary>
+      <ul className="px-3 pb-3 pt-1 space-y-1.5">
+        {sorted.map((f, i) => (
+          <LLMTraceRow key={f.fact_id} fact={f} index={i + 1} />
+        ))}
+      </ul>
+    </details>
+  );
+}
+
+function LLMTraceRow({ fact, index }: { fact: FactDTO; index: number }) {
+  const [open, setOpen] = useState(false);
+  const c = fact.content || {};
+  const latency = typeof c.latency_ms === "number" ? `${c.latency_ms.toFixed(0)}ms` : null;
+  const model = typeof c.model === "string" ? c.model : "model?";
+  const samp = c.sampling || {};
+  return (
+    <li className="rounded border border-white/5 bg-slate-950/60">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="w-full flex items-center gap-2 px-2 py-1.5 text-left hover:bg-white/5"
+      >
+        {open ? <ChevronDown className="h-3 w-3 text-slate-500" />
+              : <ChevronRight className="h-3 w-3 text-slate-500" />}
+        <span className="text-[10px] font-mono text-slate-500">#{index}</span>
+        <span className="text-[11px] font-mono text-slate-200 truncate">{model}</span>
+        {latency && (
+          <span className="text-[10px] font-mono text-emerald-400 ml-auto">{latency}</span>
+        )}
+        {c.streamed && (
+          <span className="text-[9px] font-mono uppercase tracking-wider text-sky-400">stream</span>
+        )}
+        {c.error && (
+          <span className="text-[9px] font-mono uppercase tracking-wider text-red-400">error</span>
+        )}
+      </button>
+      {open && (
+        <div className="border-t border-white/5 px-2 py-2 space-y-2 text-[11px] font-mono">
+          <div className="text-slate-500 text-[10px] uppercase tracking-wider">
+            sampling · temp={samp.temperature ?? "?"} · max_tokens={samp.max_tokens ?? "?"}
+            {samp.force_json !== undefined && ` · force_json=${samp.force_json}`}
+          </div>
+          <div>
+            <div className="text-[10px] uppercase tracking-wider text-slate-500 mb-1">
+              prompt <span className="text-slate-600">({c.prompt_chars ?? 0} chars)</span>
+            </div>
+            <pre className="bg-slate-950/80 rounded p-2 text-slate-300 whitespace-pre-wrap break-words max-h-64 overflow-auto">
+              {String(c.prompt || "")}
+            </pre>
+          </div>
+          {c.error ? (
+            <div>
+              <div className="text-[10px] uppercase tracking-wider text-red-400 mb-1">error</div>
+              <pre className="bg-red-950/30 rounded p-2 text-red-300 whitespace-pre-wrap break-words">
+                {String(c.error)}
+              </pre>
+            </div>
+          ) : (
+            <div>
+              <div className="text-[10px] uppercase tracking-wider text-slate-500 mb-1">
+                response <span className="text-slate-600">({c.response_chars ?? 0} chars)</span>
+              </div>
+              <pre className="bg-slate-950/80 rounded p-2 text-emerald-200 whitespace-pre-wrap break-words max-h-64 overflow-auto">
+                {String(c.response || "")}
+              </pre>
+            </div>
+          )}
+        </div>
+      )}
+    </li>
   );
 }
 

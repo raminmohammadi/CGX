@@ -13,8 +13,23 @@ import { Pill } from "../components/Pill";
 
 const PAGE_KEY = "ask";
 
+// Model families that expose a native reasoning / "thinking" phase. Mirrors
+// the backend registry in cgx.answer.model_caps.model_supports_thinking so
+// the toggle is only offered when the server would actually honor it.
+const THINKING_MODEL_KEYS = [
+  "deepseek-r1", "qwq", "qwen3", "gpt-oss", "magistral", "cogito",
+  "smallthinker", "phi4-reasoning", "phi-4-reasoning", "granite3.2",
+  "granite3.3", "o1", "o3", "o4-mini", "gemini-2.5",
+];
+
+function modelSupportsThinking(model: string | undefined): boolean {
+  if (!model) return false;
+  const m = model.trim().toLowerCase();
+  return THINKING_MODEL_KEYS.some((k) => m.includes(k));
+}
+
 export default function AskPage() {
-  const { provider, index, selectedSessionId, setSelectedSession } = useWorkspace();
+  const { provider, index, selectedSessionId, setSelectedSession, setProvider } = useWorkspace();
   const { ask, setAsk, appendAskMessage, resetAsk } = useTasks();
   const { busy, messages, error } = ask;
 
@@ -36,11 +51,18 @@ export default function AskPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Load session messages when sidebar picks a session.
+  // Load session messages when the selected session changes to one we haven't
+  // loaded yet. The ask store is a module-level singleton that keeps streaming
+  // across tab switches, so on remount we must NOT re-fetch and clobber the
+  // messages already in the store for this session -- mid-stream the server
+  // has nothing persisted yet, so a re-fetch would blank the in-flight answer.
+  // Keying on the store's own sessionId also covers the brand-new session that
+  // send() creates, so no separate skip-flag is needed.
   useEffect(() => {
     let alive = true;
     (async () => {
       if (!selectedSessionId) { resetAsk(); return; }
+      if (useTasks.getState().ask.sessionId === selectedSessionId) return;
       try {
         const items = await api.sessionMessages(selectedSessionId);
         if (!alive) return;
@@ -52,7 +74,7 @@ export default function AskPage() {
             sources: (m.meta as any)?.sources,
             intent: (m.meta as any)?.intent,
           }));
-        setAsk({ messages: conv });
+        setAsk({ messages: conv, sessionId: selectedSessionId });
       } catch {
         if (alive) resetAsk();
       }
@@ -102,6 +124,9 @@ export default function AskPage() {
 
     let sid = selectedSessionId;
     if (!sid) sid = await startSession();
+    // Tag the store with the session these messages belong to so the loader
+    // effect won't re-fetch and wipe them when we navigate back to this tab.
+    if (sid) setAsk({ sessionId: sid });
 
     appendAskMessage({ role: "user", content: text });
     appendAskMessage({ role: "assistant", content: "", streaming: true, thought: "" });
@@ -183,6 +208,12 @@ export default function AskPage() {
   const intent = lastAssistant?.intent;
   const sourceCount = sources.length;
 
+  // Thinking toggle: only meaningful for reasoning-capable models. When the
+  // active model doesn't support it, the control is disabled and treated as
+  // off regardless of the persisted flag.
+  const thinkSupported = modelSupportsThinking(provider.model);
+  const thinkOn = !!provider.think && thinkSupported;
+
   // Default-collapsed retrieval panel: most reads are answer-first, so keep
   // the rank list one click away rather than always-on screen real estate.
   const [showSources, setShowSources] = useState(false);
@@ -211,6 +242,10 @@ export default function AskPage() {
           onCancel={cancel}
           onKeyDown={handleKey}
           error={error}
+          think={thinkOn}
+          thinkSupported={thinkSupported}
+          onToggleThink={() => setProvider({ think: !thinkOn })}
+          model={provider.model}
         />
       </div>
 
@@ -268,6 +303,7 @@ function ChatHeader({
 
 function AskBar({
   draftRef, busy, onSend, onCancel, onKeyDown, error,
+  think, thinkSupported, onToggleThink, model,
 }: {
   draftRef: React.RefObject<HTMLTextAreaElement | null>;
   busy: boolean;
@@ -275,6 +311,10 @@ function AskBar({
   onCancel: () => void;
   onKeyDown: (e: React.KeyboardEvent<HTMLTextAreaElement>) => void;
   error: string | null;
+  think: boolean;
+  thinkSupported: boolean;
+  onToggleThink: () => void;
+  model: string;
 }) {
   return (
     <div className="px-5 pt-3 pb-4 border-t border-muted bg-slate-950/60">
@@ -291,6 +331,39 @@ function AskBar({
           className="flex-1 bg-transparent outline-none text-sm text-white py-1
                      resize-none placeholder-slate-500 max-h-48 leading-relaxed"
         />
+        <button
+          type="button"
+          onClick={onToggleThink}
+          aria-pressed={think}
+          title={
+            think
+              ? (thinkSupported
+                  ? "Thinking on — model reasons before answering. Click to turn off."
+                  : `Thinking on, but ${model || "this model"} has no reasoning phase, so it won't take effect. Click to turn off.`)
+              : "Thinking off — answers directly (faster). Click to turn on."
+          }
+          className={
+            "shrink-0 self-stretch inline-flex items-center gap-1.5 px-3 rounded-xl text-xs font-mono border transition " +
+            (think
+              ? (thinkSupported
+                  ? "bg-purple-500/15 text-purple-300 border-purple-500/40 shadow-[0_0_16px_-6px_rgba(168,85,247,0.7)]"
+                  : "bg-amber-500/15 text-amber-300 border-amber-500/40")
+              : "bg-slate-900 text-slate-300 border-white/10 hover:text-purple-300 hover:border-purple-500/40")
+          }
+        >
+          <Brain className="h-3.5 w-3.5" />
+          <span>Thinking</span>
+          <span
+            className={
+              "px-1.5 py-px rounded-sm text-[10px] font-semibold " +
+              (think
+                ? (thinkSupported ? "bg-purple-500/25 text-purple-200" : "bg-amber-500/25 text-amber-200")
+                : "bg-slate-800 text-slate-400")
+            }
+          >
+            {think ? (thinkSupported ? "on" : "on*") : "off"}
+          </span>
+        </button>
         {busy ? (
           <button
             onClick={onCancel}
@@ -312,14 +385,21 @@ function AskBar({
         )}
       </div>
       <div className="flex items-center justify-between mt-1.5 px-1">
-        <p className="text-[10px] text-slate-500 font-mono">
-          <kbd className="px-1 py-px rounded bg-slate-900 border border-white/5 text-slate-400">Enter</kbd>
-          {" "}to send ·{" "}
-          <kbd className="px-1 py-px rounded bg-slate-900 border border-white/5 text-slate-400">Shift</kbd>
-          {" + "}
-          <kbd className="px-1 py-px rounded bg-slate-900 border border-white/5 text-slate-400">Enter</kbd>
-          {" "}for newline
-        </p>
+        <div className="flex items-center gap-3 min-w-0">
+          {think && !thinkSupported && (
+            <span className="text-[10px] text-amber-400/80 font-mono">
+              on* — {model || "this model"} has no reasoning phase; Thinking won't take effect
+            </span>
+          )}
+          <p className="text-[10px] text-slate-500 font-mono">
+            <kbd className="px-1 py-px rounded bg-slate-900 border border-white/5 text-slate-400">Enter</kbd>
+            {" "}to send ·{" "}
+            <kbd className="px-1 py-px rounded bg-slate-900 border border-white/5 text-slate-400">Shift</kbd>
+            {" + "}
+            <kbd className="px-1 py-px rounded bg-slate-900 border border-white/5 text-slate-400">Enter</kbd>
+            {" "}for newline
+          </p>
+        </div>
         {error && <p className="text-[10px] text-red-400 font-mono">{error}</p>}
       </div>
     </div>

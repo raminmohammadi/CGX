@@ -217,6 +217,251 @@ def test_planner_drops_llm_scaffold_tasks_for_existing_codebase_goal():
     assert kinds[-3:] == [TaskKind.PLAN, TaskKind.APPLY, TaskKind.VERIFY]
 
 
+def test_planner_surfaces_change_impact_to_llm_and_plan_task():
+    # A code-change goal whose retriever returns change-impact (blast
+    # radius) files must (a) surface them in the LLM planning prompt and
+    # (b) stamp them onto the terminal PLAN task's inputs.
+    provider = _StubProvider([{
+        "content": json.dumps({"tasks": [
+            {"name": "Edit exporter", "description": "Add CSV export",
+             "kind": "plan", "criteria": ["diff present"]},
+        ]}),
+    }])
+
+    def fake_retriever(goal: str) -> Dict[str, Any]:
+        return {
+            "top_files": [{"file": "src/reports/exporter.py"}],
+            "impact": [
+                {"file": "src/reports/exporter.py", "score": 1.0, "reasons": {}},
+                {"file": "src/reports/api.py", "score": 0.6, "reasons": {}},
+                {"file": "tests/test_reports.py", "score": 0.5, "reasons": {}},
+            ],
+        }
+
+    plan = Planner(provider=provider, retriever=fake_retriever).plan(
+        "Add CSV export to reports")
+
+    # The blast radius is passed to the LLM prompt as a distinct section.
+    user_msg = provider.calls[0]["messages"][-1]["content"]
+    assert "Change impact" in user_msg
+    assert "src/reports/api.py" in user_msg
+    # scope=src drops the test path from the impact list.
+    assert "tests/test_reports.py" not in user_msg
+
+    # The PLAN task carries the impacted files for the UI / Judge.
+    plan_task = next(t for t in plan.tasks if t.kind == TaskKind.PLAN)
+    assert plan_task.inputs.get("impacted_files") == [
+        "src/reports/exporter.py", "src/reports/api.py",
+    ]
+
+
+def test_planner_omits_change_impact_for_readonly_goal():
+    # Read-only goals must not surface change-impact: the blast radius is
+    # only meaningful when the plan will actually modify code.
+    provider = _StubProvider([{
+        "content": json.dumps({"tasks": [
+            {"name": "Answer", "description": "Explain reports", "kind": "ask"},
+        ]}),
+    }])
+
+    def fake_retriever(goal: str) -> Dict[str, Any]:
+        return {
+            "top_files": [{"file": "src/reports/exporter.py"}],
+            "impact": [
+                {"file": "src/reports/exporter.py", "score": 1.0, "reasons": {}},
+            ],
+        }
+
+    plan = Planner(provider=provider, retriever=fake_retriever).plan(
+        "What does the reports exporter do?")
+    user_msg = provider.calls[0]["messages"][-1]["content"]
+    assert "Change impact" not in user_msg
+    for t in plan.tasks:
+        assert "impacted_files" not in (t.inputs or {})
+
+
+def _fake_repo_map() -> Dict[str, Any]:
+    return {
+        "stats": {"n_files": 1, "n_symbols": 1, "n_packages": 1},
+        "packages": [{"path": "src/reports",
+                      "files": ["src/reports/exporter.py"]}],
+        "files": [{
+            "path": "src/reports/exporter.py",
+            "summary": "CSV/JSON exporters.",
+            "symbols": [{"kind": "function", "name": "export_csv",
+                         "signature": "(rows)"}],
+        }],
+    }
+
+
+def test_planner_feeds_repo_map_into_llm_prompt():
+    # A wired repo_map provider must surface the whole-repo structure as a
+    # distinct prompt section so decomposition is grounded in real layout.
+    provider = _StubProvider([{
+        "content": json.dumps({"tasks": [
+            {"name": "Answer", "description": "Explain exporters", "kind": "ask"},
+        ]}),
+    }])
+    Planner(provider=provider, repo_map=_fake_repo_map).plan(
+        "How does exporting work?")
+    user_msg = provider.calls[0]["messages"][-1]["content"]
+    assert "Repo map" in user_msg
+    assert "export_csv" in user_msg
+
+
+def test_planner_omits_repo_map_when_provider_yields_nothing():
+    # An empty / missing repo map must not add a section or raise.
+    provider = _StubProvider([{
+        "content": json.dumps({"tasks": [
+            {"name": "Answer", "description": "Explain exporters", "kind": "ask"},
+        ]}),
+    }])
+    Planner(provider=provider, repo_map=lambda: None).plan(
+        "How does exporting work?")
+    user_msg = provider.calls[0]["messages"][-1]["content"]
+    assert "Repo map" not in user_msg
+
+
+def test_planner_surfaces_understand_brief_for_change_goal():
+    # A code-change goal must get a read-only "understand" brief derived
+    # from the same retrieval: key symbols + existing tests surfaced in the
+    # LLM prompt, and the full structured brief stamped on the PLAN task.
+    provider = _StubProvider([{
+        "content": json.dumps({"tasks": [
+            {"name": "Edit exporter", "description": "Add CSV export",
+             "kind": "plan", "criteria": ["diff present"]},
+        ]}),
+    }])
+
+    def fake_retriever(goal: str) -> Dict[str, Any]:
+        return {
+            "top_files": [
+                {"file": "src/reports/exporter.py"},
+                {"file": "tests/test_reports.py"},
+            ],
+            "hits": [
+                {"chunk_id": "src/reports/exporter.py::function::export_report"},
+                {"chunk_id": "src/reports/exporter.py::class::Exporter"},
+                {"chunk_id": "tests/test_reports.py::function::test_export"},
+            ],
+            "impact": [
+                {"file": "src/reports/exporter.py", "score": 1.0, "reasons": {}},
+            ],
+        }
+
+    plan = Planner(provider=provider, retriever=fake_retriever).plan(
+        "Add CSV export to reports")
+
+    # The brief is rendered as its own prompt section (symbols + tests +
+    # conventions), complementing the candidate/impact sections.
+    user_msg = provider.calls[0]["messages"][-1]["content"]
+    assert "Understand brief" in user_msg
+    assert "export_report (function)" in user_msg
+    assert "Exporter (class)" in user_msg
+    assert "tests/test_reports.py" in user_msg
+    assert "Python" in user_msg
+
+    # The full structured brief travels with the PLAN task for the
+    # generator / UI. scope=src drops the test-path symbol but keeps the
+    # test file under "existing tests to extend".
+    plan_task = next(t for t in plan.tasks if t.kind == TaskKind.PLAN)
+    brief = plan_task.inputs.get("understand_brief")
+    assert isinstance(brief, dict)
+    assert brief["relevant_files"] == ["src/reports/exporter.py"]
+    assert {"symbol": "export_report", "kind": "function",
+            "file": "src/reports/exporter.py"} in brief["symbols"]
+    assert all(s["file"] != "tests/test_reports.py" for s in brief["symbols"])
+    assert brief["existing_tests"] == ["tests/test_reports.py"]
+    assert brief["conventions"] == ["Python"]
+
+
+def test_planner_omits_understand_brief_for_readonly_goal():
+    # Read-only questions don't touch existing code, so no brief is built
+    # or stamped -- the LLM prompt stays free of the orientation block.
+    provider = _StubProvider([{
+        "content": json.dumps({"tasks": [
+            {"name": "Answer", "description": "Explain exporters", "kind": "ask"},
+        ]}),
+    }])
+
+    def fake_retriever(goal: str) -> Dict[str, Any]:
+        return {
+            "top_files": [{"file": "src/reports/exporter.py"}],
+            "hits": [
+                {"chunk_id": "src/reports/exporter.py::function::export_report"},
+            ],
+        }
+
+    plan = Planner(provider=provider, retriever=fake_retriever).plan(
+        "How does exporting work?")
+    user_msg = provider.calls[0]["messages"][-1]["content"]
+    assert "Understand brief" not in user_msg
+    for t in plan.tasks:
+        assert "understand_brief" not in (t.inputs or {})
+
+
+def test_render_understand_guidance_folds_brief_into_task_text():
+    # The plan capability folds the stamped brief into the generator's
+    # task text so it edits existing code instead of recreating it.
+    from cgx.agents.loop import _render_understand_guidance
+    brief = {
+        "relevant_files": ["src/reports/exporter.py"],
+        "symbols": [{"symbol": "export_report", "kind": "function",
+                     "file": "src/reports/exporter.py"}],
+        "existing_tests": ["tests/test_reports.py"],
+        "conventions": ["Python"],
+    }
+    text = _render_understand_guidance(brief)
+    assert text is not None
+    assert "src/reports/exporter.py" in text
+    assert "export_report (function)" in text
+    assert "tests/test_reports.py" in text
+    # An empty / non-dict brief yields nothing to fold.
+    assert _render_understand_guidance(None) is None
+    assert _render_understand_guidance({}) is None
+
+
+def test_planner_applies_tier_prompt_strategy_to_llm_call():
+    # A weak (small-tier) provider gets an explicit strict-JSON reminder
+    # and the tier's planning token ceiling; a strong (xlarge) provider
+    # takes the lean path with more room and no reminder.
+    weak = _StubProvider([{
+        "content": json.dumps({"tasks": [
+            {"name": "Answer", "description": "Explain", "kind": "ask"},
+        ]}),
+    }])
+    weak.model = "llama3"  # 8K window -> small tier
+    Planner(provider=weak).plan("How does exporting work?")
+    call = weak.calls[0]
+    assert call["max_tokens"] == 1_000
+    assert "ONLY a single valid JSON object" in call["messages"][-1]["content"]
+
+    strong = _StubProvider([{
+        "content": json.dumps({"tasks": [
+            {"name": "Answer", "description": "Explain", "kind": "ask"},
+        ]}),
+    }])
+    strong.model = "gemini-2.5-flash"  # 1M window -> xlarge tier
+    Planner(provider=strong).plan("How does exporting work?")
+    call2 = strong.calls[0]
+    assert call2["max_tokens"] == 2_000
+    assert "ONLY a single valid JSON object" not in call2["messages"][-1]["content"]
+
+
+def test_planner_passes_plan_schema_for_constrained_decoding():
+    # The planning call forwards the canonical PLAN_SCHEMA so schema-aware
+    # providers can constrain decoding; the tier does not affect this.
+    from cgx.answer.schemas import PLAN_SCHEMA
+
+    prov = _StubProvider([{
+        "content": json.dumps({"tasks": [
+            {"name": "Answer", "description": "Explain", "kind": "ask"},
+        ]}),
+    }])
+    Planner(provider=prov).plan("How does exporting work?")
+    assert prov.calls[0]["json_schema"] is PLAN_SCHEMA
+
+
 # ---------------------------------------------------------------------------
 # Tracker
 # ---------------------------------------------------------------------------
@@ -697,6 +942,87 @@ def test_judge_clarify_paths_accepts_suggested_changes_as_options():
     assert "4" in v.rationale or "option" in v.rationale.lower()
 
 
+# ---------------------------------------------------------------------------
+# Judge: ASK / SUMMARIZE answer-quality (verbosity) gate
+# ---------------------------------------------------------------------------
+def test_judge_summarize_passes_within_bullet_budget():
+    # A tight, on-contract summary (<=8 bullets, well under the word cap)
+    # passes the structural gate without needing an LLM grader.
+    task = Task(description="summarize", kind=TaskKind.SUMMARIZE,
+                criteria=["condenses prior work"],
+                output={"answer_md": (
+                    "- Indexed the repository.\n"
+                    "- Ran the query pipeline.\n"
+                    "- Reranked the top hits.\n"
+                )})
+    v = Judge(provider=None).judge(task)
+    assert v.verdict == "pass"
+    assert "budget" in v.rationale.lower()
+
+
+def test_judge_summarize_fails_when_too_many_bullets():
+    # The summarize capability's contract is "<=8 bullets"; nine list
+    # items must hard-fail the structural gate with no LLM grader.
+    bullets = "\n".join(f"- point {i}" for i in range(9))
+    task = Task(description="summarize", kind=TaskKind.SUMMARIZE,
+                criteria=["at most 8 bullets"], output={"answer_md": bullets})
+    v = Judge(provider=None).judge(task)
+    assert v.verdict == "fail"
+    assert "bullet" in v.rationale.lower()
+
+
+def test_judge_summarize_fails_when_too_verbose():
+    # Within the bullet budget but far over the word cap: a condensation
+    # of prior work products must stay tight.
+    body = "\n".join(f"- {'word ' * 200}".rstrip() for _ in range(3))
+    task = Task(description="summarize", kind=TaskKind.SUMMARIZE,
+                criteria=["concise"], output={"answer_md": body})
+    v = Judge(provider=None).judge(task)
+    assert v.verdict == "fail"
+    assert "verbose" in v.rationale.lower()
+
+
+def test_judge_summarize_fails_on_empty():
+    task = Task(description="summarize", kind=TaskKind.SUMMARIZE,
+                criteria=["non-empty"], output={"answer_md": "   "})
+    v = Judge(provider=None).judge(task)
+    assert v.verdict == "fail"
+    assert "empty" in v.rationale.lower()
+
+
+def test_judge_ask_fails_when_answer_too_verbose():
+    # A pathologically long ASK answer hard-fails the verbosity gate
+    # before any LLM-grader call is made.
+    from cgx.agents.judge import _ASK_MAX_WORDS
+    answer = "word " * (_ASK_MAX_WORDS + 5)
+    task = Task(description="explain", kind=TaskKind.ASK,
+                criteria=["answers the question"],
+                output={"answer_md": answer})
+    v = Judge(provider=None).judge(task)
+    assert v.verdict == "fail"
+    assert "verbose" in v.rationale.lower()
+
+
+def test_judge_ask_within_budget_defers_to_llm_grader():
+    # A within-budget, non-clarify ASK must NOT be short-circuited by the
+    # verbosity gate: the strict LLM grader still decides the substantive
+    # verdict. Assert the provider was actually consulted.
+    called = {"n": 0}
+
+    class _StubProvider:
+        def chat(self, **kw):
+            called["n"] += 1
+            return {"content": '{"verdict":"pass","confidence":0.9,'
+                               '"rationale":"grounded"}'}
+
+    task = Task(description="explain", kind=TaskKind.ASK,
+                criteria=["answers the question"],
+                output={"answer_md": "A concise, grounded answer [[a.py::f]]."})
+    v = Judge(provider=_StubProvider()).judge(task)
+    assert v.verdict == "pass"
+    assert called["n"] == 1, "within-budget ASK must reach the LLM grader"
+
+
 def test_engine_answer_accepts_mode_override_and_extra_kwargs():
     # The engine's answer entrypoints must accept ``mode_override`` and
     # tolerate agent-only inputs (e.g. ``goal``) without raising. We hit
@@ -1067,6 +1393,37 @@ def test_judge_still_fails_scaffold_with_tech_mismatch_via_structural():
     v = Judge(provider=None).judge(task)
     assert v.verdict == "fail"
     assert "React" in v.rationale or "Python" in v.rationale
+
+
+def test_manifest_required_missing_flags_absent_test_file():
+    # A scaffold manifest with source + packaging but no test file must be
+    # flagged so verify always has a runnable self-correction signal.
+    from cgx.agents.judge import _manifest_required_missing
+    layers = [
+        {"name": "backend", "files": [
+            {"path": "backend/main.py", "description": "entry"},
+            {"path": "requirements.txt", "description": "deps"},
+        ]},
+    ]
+    rationale = _manifest_required_missing(layers, ["python", "fastapi"],
+                                           "build a python fastapi backend")
+    assert rationale is not None
+    assert "test" in rationale.lower()
+
+
+def test_manifest_required_missing_passes_when_test_present():
+    from cgx.agents.judge import _manifest_required_missing
+    layers = [
+        {"name": "core", "files": [
+            {"path": "app.py", "description": "entry"},
+            {"path": "pyproject.toml", "description": "metadata"},
+        ]},
+        {"name": "tests", "files": [
+            {"path": "tests/test_app.py", "description": "test"},
+        ]},
+    ]
+    assert _manifest_required_missing(layers, ["python"],
+                                      "build a python library") is None
 
 
 def test_scaffold_existing_files_collects_paths_in_order_no_duplicates():
@@ -1543,10 +1900,11 @@ def test_plan_capability_strips_target_files_and_folds_into_task_text(monkeypatc
     monkeypatch.setattr(
         "cgx.answer.engine.generate_code_plan", fake_generate_code_plan,
     )
-    # Avoid touching the on-disk symbol map.
+    # Avoid touching the on-disk symbol map. The real helper accepts a
+    # ``target_file`` kwarg (proximity sorting); the stub must mirror that.
     monkeypatch.setattr(
         "cgx.codegen.symbol_map.build_symbol_context_prompt",
-        lambda _p: "",
+        lambda _p, target_file=None: "",
     )
 
     caps = _build_default_capabilities(
@@ -2002,4 +2360,138 @@ def test_search_view_dim_mismatch_raises_clear_error():
     msg = str(ei.value)
     assert "768" in msg and "1024" in msg
     assert "intent" in msg
+
+
+# ---------------------------------------------------------------------------
+# In-loop REINDEX capability (Task 1.3)
+# ---------------------------------------------------------------------------
+def _apply_plan(applied=("src/app.py",), failed=()):
+    """A two-task PLAN→APPLY plan whose APPLY reports the given files."""
+    return Plan(goal="g", tasks=[
+        Task(description="gen", kind=TaskKind.PLAN),
+        Task(description="write", kind=TaskKind.APPLY),
+    ]), applied, failed
+
+
+def _make_caps(reindex_calls):
+    def plan_cap(_text, **_):
+        return {"plan_md": "...", "diffs": [{"file": "src/app.py", "patch": "p"}]}
+
+    def apply_cap(prior, **_):
+        return {"applied_files": ["src/app.py"], "failed_files": []}
+
+    def reindex_cap(prior, **_):
+        reindex_calls.append(prior)
+        return {"reindexed": True, "counts": {"intent": 3, "impl": 3}}
+
+    return {"plan": plan_cap, "apply": apply_cap, "reindex": reindex_cap}
+
+
+def test_tracker_injects_reindex_after_successful_apply():
+    plan, _, _ = _apply_plan()
+    calls: List[Any] = []
+    events = _run_with(plan, _make_caps(calls), stop_on_fail=False)
+    kinds = [t.kind for t in plan.tasks]
+    assert TaskKind.REINDEX in kinds, "REINDEX task was not injected after APPLY"
+    # The injected task ran and received the prior APPLY output.
+    assert len(calls) == 1
+    assert any(p.get("applied_files") == ["src/app.py"] for p in calls[0])
+    done = [e for e in events if e.type == "task_done"]
+    assert any(e.payload.get("kind") == "reindex" for e in done)
+    reindex_done = next(e for e in done if e.payload.get("kind") == "reindex")
+    assert reindex_done.payload["output"]["reindexed"] is True
+
+
+def test_tracker_skips_reindex_when_capability_absent():
+    plan, _, _ = _apply_plan()
+
+    def plan_cap(_text, **_):
+        return {"diffs": [{"file": "src/app.py", "patch": "p"}]}
+
+    def apply_cap(prior, **_):
+        return {"applied_files": ["src/app.py"], "failed_files": []}
+
+    _run_with(plan, {"plan": plan_cap, "apply": apply_cap}, stop_on_fail=False)
+    assert TaskKind.REINDEX not in [t.kind for t in plan.tasks]
+
+
+def test_tracker_skips_reindex_when_nothing_applied():
+    plan, _, _ = _apply_plan()
+    calls: List[Any] = []
+    caps = _make_caps(calls)
+    caps["apply"] = lambda prior, **_: {"applied_files": [], "failed_files": [
+        {"file": "src/app.py", "error": "patch failed"}]}
+    _run_with(plan, caps, stop_on_fail=False)
+    assert TaskKind.REINDEX not in [t.kind for t in plan.tasks]
+    assert calls == []
+
+
+def test_tracker_does_not_double_inject_reindex():
+    # A plan that already schedules REINDEX right after APPLY must not get a
+    # second, auto-injected one.
+    plan = Plan(goal="g", tasks=[
+        Task(description="gen", kind=TaskKind.PLAN),
+        Task(description="write", kind=TaskKind.APPLY),
+        Task(description="refresh", kind=TaskKind.REINDEX),
+    ])
+    calls: List[Any] = []
+    _run_with(plan, _make_caps(calls), stop_on_fail=False)
+    assert [t.kind for t in plan.tasks].count(TaskKind.REINDEX) == 1
+    assert len(calls) == 1
+
+
+def test_judge_passes_reindex_task_when_refreshed():
+    task = Task(description="reindex", kind=TaskKind.REINDEX,
+                criteria=["index refreshed"],
+                output={"reindexed": True, "counts": {"intent": 2, "impl": 2}})
+    v = Judge(provider=None).judge(task)
+    assert v.verdict == "pass"
+    assert "refreshed" in v.rationale.lower()
+
+
+def test_judge_soft_passes_reindex_noop():
+    task = Task(description="reindex", kind=TaskKind.REINDEX,
+                criteria=["index refreshed"],
+                output={"reindexed": False, "skipped_reason": "no project_root"})
+    v = Judge(provider=None).judge(task)
+    assert v.verdict == "pass"
+    assert "skipped" in v.rationale.lower()
+
+
+def test_default_reindex_capability_is_registered_and_noop_without_root():
+    from cgx.agents.loop import _build_default_capabilities
+    caps = _build_default_capabilities(
+        provider=None, index_dir=None, records_path=None, project_root=None,
+    )
+    assert "reindex" in caps
+    out = caps["reindex"]([])
+    assert out["reindexed"] is False
+
+
+def test_default_reindex_capability_calls_run_index_auto(tmp_path, monkeypatch):
+    from cgx.agents.loop import _build_default_capabilities
+    records = tmp_path / "records.jsonl"
+    records.write_text("", encoding="utf-8")
+    captured: Dict[str, Any] = {}
+
+    def fake_run_index_auto(project_root, out_dir, **kw):
+        captured["project_root"] = project_root
+        captured["out_dir"] = out_dir
+        captured["kw"] = kw
+        return {"counts": {"intent": 4, "impl": 4}, "parse": {"reparsed": 1},
+                "out": {"records": str(records)}}
+
+    monkeypatch.setattr("cgx.pipeline.auto.run_index_auto", fake_run_index_auto)
+    caps = _build_default_capabilities(
+        provider=None, index_dir=str(tmp_path / "indices"),
+        records_path=str(records), project_root=str(tmp_path),
+        embed_model="BAAI/bge-m3",
+    )
+    out = caps["reindex"]([])
+    assert out["reindexed"] is True
+    assert out["counts"] == {"intent": 4, "impl": 4}
+    assert captured["project_root"] == str(tmp_path)
+    assert captured["out_dir"] == str(tmp_path)  # derived from records dir
+    assert captured["kw"]["incremental"] is True
+    assert captured["kw"]["model_name"] == "BAAI/bge-m3"
 
