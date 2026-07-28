@@ -2237,7 +2237,8 @@ _MANIFEST_SYSTEM = (
     '    {\n'
     '      "name": "core|ui|config|tests",\n'
     '      "files": [\n'
-    '        {"path": "src/foo.py", "description": "one-line purpose"}\n'
+    '        {"path": "src/foo.py", "description": "one-line purpose",\n'
+    '         "depends_on": ["src/bar.py"]}\n'
     "      ]\n"
     "    }\n"
     "  ]\n"
@@ -2247,6 +2248,9 @@ _MANIFEST_SYSTEM = (
     "(wrong: calculator/src/App.jsx, right: src/App.jsx).\n"
     "- Group files by layer: core logic, UI, config/packaging, tests.\n"
     "- Test files REQUIRED under tests/.\n"
+    "- Optional per file: \"depends_on\" lists sibling manifest paths this "
+    "file imports/needs so files generate dependency-first. Reference only "
+    "paths present in this manifest; never form a cycle.\n"
     "- 3 to 15 files total. Prefer completeness over brevity.\n"
     "- Canonical top-level dirs: src/, backend/, tests/, public/, docs/.\n"
 )
@@ -2751,6 +2755,20 @@ def _normalize_manifest_paths(layers: List[Any]) -> List[Any]:
             if canon and p != canon:
                 f = {**f, "path": canon}
                 p = canon
+            # Canonicalize any dependency hints the same way so a
+            # depends_on pointing at a rewritten config file (e.g.
+            # src/package.json -> package.json) does not read as dangling
+            # to the DECOMPOSE coherence check.
+            deps = f.get("depends_on")
+            if isinstance(deps, list) and deps:
+                canon_deps: List[Any] = []
+                for d in deps:
+                    ds = str(d or "").strip()
+                    if not ds:
+                        continue
+                    db = ds.rsplit("/", 1)[-1].lower()
+                    canon_deps.append(_CANONICAL_CONFIG_PATHS.get(db, ds))
+                f = {**f, "depends_on": canon_deps}
             if p in seen:
                 continue
             seen.add(p)

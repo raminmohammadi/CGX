@@ -2645,6 +2645,92 @@ def test_decompose_executor_empty_manifest_is_failure(store, monkeypatch):
     assert "empty manifest" in result.failure
 
 
+def _run_decompose_with_manifest(store, monkeypatch, manifest):
+    from cgx.session.tasks.decompose import run_decompose
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    monkeypatch.setattr("cgx.answer.engine.plan_scaffold_manifest",
+                        lambda *a, **kw: manifest)
+    t = TaskNode.new(session.session_id, TaskKind.DECOMPOSE, "d",
+                     inputs={"prior_goal": "g", "answers": {}})
+    return run_decompose(
+        t, ExecutorDeps(provider=_StubProvider(""), store=store))
+
+
+def test_decompose_orders_files_by_dependency(store, monkeypatch):
+    # src/app.py imports src/util.py but is declared first; the topo sort
+    # must reorder so the dependency is generated before its consumer.
+    result = _run_decompose_with_manifest(store, monkeypatch, {
+        "plan_md": "p",
+        "layers": [{"name": "core", "files": [
+            {"path": "src/app.py", "description": "entry",
+             "depends_on": ["src/util.py"]},
+            {"path": "src/util.py", "description": "helpers"}]}],
+    })
+    assert result.failure is None
+    paths = [f["path"] for f in result.artifact.content["layers"][0]["files"]]
+    assert paths.index("src/util.py") < paths.index("src/app.py")
+
+
+def test_decompose_preserves_order_without_dependency_hints(store, monkeypatch):
+    # No depends_on anywhere -> declared order is preserved (stable sort).
+    result = _run_decompose_with_manifest(store, monkeypatch, {
+        "plan_md": "p",
+        "layers": [{"name": "core", "files": [
+            {"path": "src/a.py", "description": "a"},
+            {"path": "src/b.py", "description": "b"},
+            {"path": "src/c.py", "description": "c"}]}],
+    })
+    assert result.failure is None
+    paths = [f["path"] for f in result.artifact.content["layers"][0]["files"]]
+    assert paths == ["src/a.py", "src/b.py", "src/c.py"]
+
+
+def test_decompose_fails_on_dangling_dependency(store, monkeypatch):
+    result = _run_decompose_with_manifest(store, monkeypatch, {
+        "plan_md": "p",
+        "layers": [{"name": "core", "files": [
+            {"path": "src/app.py", "description": "entry",
+             "depends_on": ["src/missing.py"]}]}],
+    })
+    assert result.failure
+    assert "dangling dependency" in result.failure
+    assert "src/missing.py" in result.failure
+
+
+def test_decompose_fails_on_dependency_cycle(store, monkeypatch):
+    result = _run_decompose_with_manifest(store, monkeypatch, {
+        "plan_md": "p",
+        "layers": [{"name": "core", "files": [
+            {"path": "a.py", "description": "a", "depends_on": ["b.py"]},
+            {"path": "b.py", "description": "b", "depends_on": ["a.py"]}]}],
+    })
+    assert result.failure
+    assert "circular dependency" in result.failure
+
+
+def test_decompose_fails_when_no_source_entry_point(store, monkeypatch):
+    result = _run_decompose_with_manifest(store, monkeypatch, {
+        "plan_md": "p",
+        "layers": [{"name": "meta", "files": [
+            {"path": "README.md", "description": "docs"},
+            {"path": "package.json", "description": "config"}]}],
+    })
+    assert result.failure
+    assert "no runnable source" in result.failure
+
+
+def test_decompose_fails_when_only_test_files(store, monkeypatch):
+    result = _run_decompose_with_manifest(store, monkeypatch, {
+        "plan_md": "p",
+        "layers": [{"name": "tests", "files": [
+            {"path": "tests/test_app.py", "description": "tests"},
+            {"path": "README.md", "description": "docs"}]}],
+    })
+    assert result.failure
+    assert "no runnable source" in result.failure
+
+
 def test_scaffold_executor_missing_work_plan_fails(store):
     from cgx.session.tasks.scaffold import run_scaffold
     session = Session.new("g", mode=SessionMode.GREENFIELD)
