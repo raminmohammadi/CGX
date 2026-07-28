@@ -1,3 +1,5 @@
+![alt text](docs/images/logo.png)
+
 <p align="center">
   <a href="https://github.com/raminmohammadi/CGX/actions/workflows/ci.yml?branch=main"><img src="https://github.com/raminmohammadi/CGX/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI status"></a>
   <a href="https://github.com/raminmohammadi/CGX/releases"><img src="https://img.shields.io/github/v/release/raminmohammadi/CGX?label=RELEASE" alt="GitHub release"></a>
