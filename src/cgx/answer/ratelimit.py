@@ -118,12 +118,19 @@ def request_with_retry(
     limiter: Optional[RateLimiter] = None,
     max_retries: int = 3,
     sleep: Callable[[float], None] = time.sleep,
+    retryable: Optional[Callable[[BaseException], bool]] = None,
 ) -> Any:
     """Invoke ``func()`` with rate-limiting and 429/5xx retry.
 
     ``func`` must return an object with a ``status_code`` attribute and a
     ``headers`` mapping (i.e. a ``requests.Response``). Network exceptions
     propagate after the final attempt.
+
+    ``retryable`` is an optional predicate over a raised exception. When it
+    returns ``False`` the exception is re-raised immediately without consuming
+    the retry budget -- used to avoid re-running an already-slow request (e.g. a
+    read timeout on a local model) where a further attempt only stacks another
+    full timeout instead of recovering.
     """
     last_exc: Optional[BaseException] = None
     for attempt in range(1, max_retries + 2):  # +1 so max_retries=0 → 1 try
@@ -133,6 +140,10 @@ def request_with_retry(
             resp = func()
         except Exception as e:
             last_exc = e
+            if retryable is not None and not retryable(e):
+                logger.warning("ratelimit: non-retryable exception %s: %s",
+                               type(e).__name__, e)
+                raise
             if attempt > max_retries:
                 logger.warning("ratelimit: giving up after %d attempt(s); last exception %s: %s",
                                attempt, type(e).__name__, e)

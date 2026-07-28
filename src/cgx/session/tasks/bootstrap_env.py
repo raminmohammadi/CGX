@@ -29,6 +29,7 @@ stderr for the UI to surface.
 from __future__ import annotations
 
 import logging
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -66,6 +67,9 @@ def run_bootstrap_env(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     project_type = _detect_project_type(root)
     applied_files = _resolve_applied_files(task, deps)
     timeout = float(task.inputs.get("timeout_seconds") or 300.0)
+
+    if project_type == "node":
+        return _bootstrap_node(task, root, applied_files, timeout)
 
     if project_type != "python":
         artifact = _build_artifact(
@@ -190,18 +194,97 @@ def run_bootstrap_env(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
 # --------------------- helpers ---------------------
 
 def _detect_project_type(root: Path) -> str:
-    """Return ``python`` when a Python manifest is present, else ``unknown``.
+    """Return ``python`` / ``node`` for a known stack, else ``unknown``.
 
-    Looks for ``requirements.txt`` / ``pyproject.toml`` / ``setup.py`` /
-    ``setup.cfg`` at the project root. Greenfield scaffolds always emit
-    one of these for Python projects via ``_inject_required_manifest_files``,
-    so the check is reliable for our supported templates.
+    Python markers (``requirements.txt`` / ``pyproject.toml`` /
+    ``setup.py`` / ``setup.cfg``) take priority over ``package.json``:
+    a polyglot repo still gets its richer venv provisioning + preflight
+    path, and VERIFY's ``NpmRunner`` best-effort installs ``node_modules``
+    on its own. A ``package.json``-only project resolves to ``node`` so
+    BOOTSTRAP_ENV can provision ``node_modules`` before VERIFY runs the
+    build/test smoke -- otherwise the JS signal would be a false success.
     """
     for name in ("requirements.txt", "pyproject.toml",
                  "setup.py", "setup.cfg"):
         if (root / name).is_file():
             return "python"
+    if (root / "package.json").is_file():
+        return "node"
     return "unknown"
+
+
+def _bootstrap_node(task: TaskNode, root: Path,
+                    applied_files: List[str],
+                    timeout: float) -> ExecutorResult:
+    """Provision ``node_modules`` for a JS/TS project (best-effort).
+
+    Runs a bounded ``npm install`` so VERIFY's ``NpmRunner`` build/test
+    smoke has its dependencies. Provisioning is deliberately non-fatal:
+    an offline box (no ``npm``, or an install that cannot reach the
+    registry) degrades to ``skipped`` rather than failing the session --
+    the real build/test signal is produced downstream by VERIFY, and
+    hard-failing here would deny the loop that signal entirely. Emits a
+    ``BUILD_REPORT`` with ``project_type=node`` and no ``python_exe`` so
+    the Python-only API_CHECK / SMOKE gates skip cleanly.
+    """
+    node_modules = root / "node_modules"
+    pip_log_tail = ""
+    note: Optional[str]
+    if shutil.which("npm") is None:
+        outcome = "skipped"
+        note = "npm not installed"
+    elif node_modules.is_dir():
+        outcome = "succeeded"
+        note = "node_modules already present"
+    else:
+        rc, pip_log_tail = _run_npm_install(root, timeout)
+        if node_modules.is_dir():
+            outcome = "succeeded"
+            note = None
+        else:
+            outcome = "skipped"
+            note = f"npm install did not provision node_modules (rc={rc})"
+    artifact = _build_artifact(
+        task, project_type="node", venv_path=None, python_exe=None,
+        installed_from=[], installed_packages=[], failed_installs={},
+        outcome=outcome, pip_log_tail=pip_log_tail,
+        applied_files=applied_files, style_issues=[],
+        resolved_packages=[], pip_freeze_text="", note=note,
+    )
+    return ExecutorResult(
+        outputs={
+            "build_artifact_id": artifact.artifact_id,
+            "outcome": outcome,
+            "project_type": "node",
+            "venv_path": None,
+            "python_exe": None,
+            "installed_count": 0,
+            "failed_count": 0,
+            "missing_import_count": 0,
+            "style_issue_count": 0,
+        },
+        artifact=artifact,
+    )
+
+
+def _run_npm_install(root: Path, timeout: float) -> Tuple[int, str]:
+    """Run a bounded ``npm install``; return ``(returncode, stderr_tail)``.
+
+    Best-effort by design -- any timeout or spawn error collapses to a
+    non-zero code and a short diagnostic tail so the caller degrades to
+    ``skipped`` instead of raising.
+    """
+    try:
+        proc = subprocess.run(
+            ["npm", "install", "--no-audit", "--no-fund"],
+            cwd=str(root), capture_output=True, text=True,
+            timeout=min(timeout, 300.0),
+        )
+    except subprocess.TimeoutExpired as exc:
+        return 124, ((exc.stderr or "") + "\n[timeout]")[-800:]
+    except Exception as exc:
+        return -1, f"{type(exc).__name__}: {exc}"
+    return proc.returncode, (proc.stderr or proc.stdout or "")[-800:]
 
 
 def _resolve_applied_files(task: TaskNode,

@@ -1294,6 +1294,18 @@ def test_router_greenfield_verify_failure_spawns_repair():
     assert "abc123" in rep.inputs["prior_failure_signatures"]
 
 
+def test_router_greenfield_verify_failed_outcome_spawns_repair():
+    """A non-pytest ``failed`` VERIFY (e.g. npm build) -> REPAIR too."""
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    ver = _greenfield_failed_verify(
+        signature="npmbuild1", outcome="failed", session=session)
+    plan = Router().on_task_completed(
+        session=session, completed=ver, tasks=[ver])
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    assert len(creates) == 1
+    assert creates[0].task.kind is TaskKind.REPAIR
+
+
 def test_router_explore_verify_failure_does_not_spawn_repair():
     """REPAIR is greenfield-only; explore-mode VERIFY failures are terminal."""
     session = Session.new("g")
@@ -1811,6 +1823,118 @@ def test_verify_failures_empty_when_junitxml_missing(
         t, ExecutorDeps(project_root=str(tmp_path), store=store))
     assert result.failure is None
     assert result.artifact.content["failures"] == []
+
+
+def test_verify_npm_only_build_failure_is_failed(
+        tmp_path, store, monkeypatch):
+    """A package.json-only project runs NpmRunner; a build break -> failed."""
+    from cgx.codegen.test_runner import TestRunOutcome
+    from cgx.codegen import test_runners
+    from cgx.session.tasks.verify import run_verify
+
+    # No python markers and no ``test_*.py`` -> pytest does not detect;
+    # only NpmRunner applies, so a non-zero build is a real failure signal
+    # rather than a silent "no tests -> skipped -> success".
+    (tmp_path / "package.json").write_text(
+        '{"name": "app", "scripts": {"build": "vite build"}}',
+        encoding="utf-8")
+
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+
+    def _fake_run(self, root, files, **kw):
+        return TestRunOutcome(
+            ran=True, returncode=1,
+            stdout="build failed", stderr="TS2345",
+            tests_selected=["npm run build"])
+
+    monkeypatch.setattr(test_runners.NpmRunner, "run", _fake_run)
+
+    t = TaskNode.new(session.session_id, TaskKind.VERIFY, "verify",
+                     inputs={"changed_files": ["src/App.jsx"],
+                             "mode": SessionMode.GREENFIELD.value})
+    store.save_task(t)
+    result = run_verify(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    assert result.failure is None
+    assert result.outputs["outcome"] == "failed"
+    assert result.outputs["tests_passed"] is False
+    assert result.outputs["ran"] is True
+    content = result.artifact.content
+    assert content["outcome"] == "failed"
+    assert "build failed" in content["stdout"]
+    # No pytest selection -> no paste-ready pytest reproduce line.
+    assert content["reproduce_cmd"] is None
+
+
+def test_verify_npm_only_build_pass_is_passed(
+        tmp_path, store, monkeypatch):
+    """A package.json-only project whose build/test succeeds -> passed."""
+    from cgx.codegen.test_runner import TestRunOutcome
+    from cgx.codegen import test_runners
+    from cgx.session.tasks.verify import run_verify
+
+    (tmp_path / "package.json").write_text(
+        '{"name": "app", "scripts": {"build": "vite build"}}',
+        encoding="utf-8")
+
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+
+    monkeypatch.setattr(
+        test_runners.NpmRunner, "run",
+        lambda self, root, files, **kw: TestRunOutcome(
+            ran=True, returncode=0, stdout="built ok", stderr="",
+            tests_selected=["npm run build"]))
+
+    t = TaskNode.new(session.session_id, TaskKind.VERIFY, "verify",
+                     inputs={"changed_files": ["src/App.jsx"],
+                             "mode": SessionMode.GREENFIELD.value})
+    store.save_task(t)
+    result = run_verify(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    assert result.failure is None
+    assert result.outputs["outcome"] == "passed"
+    assert result.outputs["tests_passed"] is True
+
+
+def test_verify_polyglot_npm_failure_surfaces_over_pytest_pass(
+        tmp_path, store, monkeypatch):
+    """In a polyglot repo, a failing npm build is not masked by green pytest."""
+    from cgx.codegen.test_runner import TestRunOutcome
+    from cgx.codegen import test_runners
+    from cgx.session.tasks.verify import run_verify
+
+    (tmp_path / "package.json").write_text(
+        '{"name": "app", "scripts": {"build": "vite build"}}',
+        encoding="utf-8")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_x.py").write_text(
+        "def test_x(): assert 1\n", encoding="utf-8")
+
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+
+    monkeypatch.setattr(
+        "cgx.codegen.test_runner.run_tests_on_disk",
+        lambda root, files, **_kw: TestRunOutcome(
+            ran=True, returncode=0, stdout="1 passed", stderr="",
+            tests_selected=[str(tmp_path / "tests" / "test_x.py")]))
+    monkeypatch.setattr(
+        test_runners.NpmRunner, "run",
+        lambda self, root, files, **kw: TestRunOutcome(
+            ran=True, returncode=1, stdout="build failed", stderr="",
+            tests_selected=["npm run build"]))
+
+    t = TaskNode.new(session.session_id, TaskKind.VERIFY, "verify",
+                     inputs={"changed_files": ["src/App.jsx"],
+                             "mode": SessionMode.GREENFIELD.value})
+    store.save_task(t)
+    result = run_verify(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    assert result.failure is None
+    assert result.outputs["outcome"] == "failed"
+    assert result.outputs["tests_passed"] is False
 
 
 def test_plan_change_executor_needs_provider():
@@ -2616,6 +2740,377 @@ def test_scaffold_executor_records_partial_failure(store, monkeypatch):
     assert result.outputs["failed"] == failed
 
 
+def test_scaffold_targeted_regenerate_reuses_good_diffs(store, monkeypatch):
+    """regenerate_files -> only the failed path is generated; good diffs reused."""
+    from cgx.answer.engine import _content_to_new_file_patch
+    from cgx.session.tasks.scaffold import run_scaffold
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    plan = Artifact.new(
+        session.session_id, "task_x", ArtifactKind.WORK_PLAN, {
+            "prior_goal": "g", "composed_goal": "build a react calculator",
+            "answers": {}, "plan_md": "",
+            "layers": [{"name": "ui", "files": [
+                {"path": "src/index.js", "description": "entry"},
+                {"path": "src/App.jsx", "description": "root component"},
+                {"path": "README.md", "description": "docs"}]}],
+        })
+    store.save_artifact(plan)
+    prior = Artifact.new(
+        session.session_id, "task_sc0", ArtifactKind.SCAFFOLD_PATCHES, {
+            "diffs": [
+                {"file": "src/index.js",
+                 "patch": _content_to_new_file_patch(
+                     "src/index.js", "import App from './App'\n")},
+                {"file": "README.md",
+                 "patch": _content_to_new_file_patch("README.md", "# Calc\n")},
+                # A stale App.jsx diff that must NOT be reused -- it's the
+                # file being regenerated.
+                {"file": "src/App.jsx",
+                 "patch": _content_to_new_file_patch("src/App.jsx", "BROKEN")},
+            ],
+        })
+    store.save_artifact(prior)
+
+    seen: list = []
+
+    def fake_generate(path, description, provider, *,
+                      layer=None, existing_files_with_content=None,
+                      goal=None):
+        seen.append({"path": path,
+                     "context": [c["path"]
+                                 for c in (existing_files_with_content or [])]})
+        body = "export default function App(){return null}\n"
+        return {"file": path, "patch": _content_to_new_file_patch(path, body),
+                "content": body, "syntax_ok": True, "confidence": 0.9}
+
+    monkeypatch.setattr("cgx.answer.engine.generate_single_scaffold_file",
+                        fake_generate)
+    t = TaskNode.new(
+        session.session_id, TaskKind.SCAFFOLD, "s",
+        inputs={"work_plan_artifact_id": plan.artifact_id,
+                "regenerate_files": ["src/App.jsx"],
+                "prior_scaffold_artifact_id": prior.artifact_id})
+    result = run_scaffold(
+        t, ExecutorDeps(provider=_StubProvider(""), store=store))
+    assert result.failure is None
+    # Only the failed file was generated; the good files were reused.
+    assert [s["path"] for s in seen] == ["src/App.jsx"]
+    # The regenerated file saw both reused good files as cross-file context
+    # (so imports resolve), reconstructed from their patches -- never the
+    # stale App.jsx.
+    assert set(seen[0]["context"]) == {"src/index.js", "README.md"}
+    # The emitted diff set carries all three files: two reused verbatim plus
+    # the freshly regenerated one.
+    files = {d["file"] for d in result.artifact.content["diffs"]}
+    assert files == {"src/index.js", "src/App.jsx", "README.md"}
+    reused = next(d for d in result.artifact.content["diffs"]
+                  if d["file"] == "src/index.js")
+    assert "import App from './App'" in reused["patch"]
+    gen = {g["file"]: g for g in result.artifact.content["generated"]}
+    assert gen["src/index.js"].get("reused") is True
+    assert gen["src/App.jsx"].get("reused") is not True
+
+
+def test_scaffold_targeted_regenerate_falls_back_without_prior(store, monkeypatch):
+    """A regenerate_files marker with no resolvable prior -> whole-tree regen."""
+    from cgx.session.tasks.scaffold import run_scaffold
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    plan = Artifact.new(
+        session.session_id, "task_x", ArtifactKind.WORK_PLAN, {
+            "prior_goal": "g", "composed_goal": "g", "answers": {},
+            "plan_md": "",
+            "layers": [{"name": "app", "files": [
+                {"path": "a.py", "description": ""},
+                {"path": "b.py", "description": ""}]}],
+        })
+    store.save_artifact(plan)
+
+    seen: list = []
+
+    def fake_generate(path, *a, **kw):
+        seen.append(path)
+        return {"file": path, "patch": f"+++ {path}\nx",
+                "content": "x", "syntax_ok": True}
+
+    monkeypatch.setattr("cgx.answer.engine.generate_single_scaffold_file",
+                        fake_generate)
+    t = TaskNode.new(
+        session.session_id, TaskKind.SCAFFOLD, "s",
+        inputs={"work_plan_artifact_id": plan.artifact_id,
+                "regenerate_files": ["a.py"],
+                "prior_scaffold_artifact_id": "art_missing"})
+    result = run_scaffold(
+        t, ExecutorDeps(provider=_StubProvider(""), store=store))
+    assert result.failure is None
+    # Prior artifact unresolvable -> every manifest file is regenerated.
+    assert seen == ["a.py", "b.py"]
+
+
+def test_scaffold_checkpoints_progress_after_each_layer(store, monkeypatch):
+    """B4: the SCAFFOLD_PATCHES artifact is upserted after every layer.
+
+    Each checkpoint carries the files generated so far with ``complete``
+    False; only the returned artifact is finalised (``complete`` True),
+    so a crash mid-run leaves resumable partial progress on disk.
+    """
+    import copy
+    from cgx.session.tasks.scaffold import run_scaffold
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    plan = Artifact.new(
+        session.session_id, "task_x", ArtifactKind.WORK_PLAN, {
+            "composed_goal": "g", "prior_goal": "g",
+            "layers": [
+                {"name": "l1", "files": [{"path": "a.py", "description": ""}]},
+                {"name": "l2", "files": [{"path": "b.py", "description": ""}]}],
+        })
+    store.save_artifact(plan)
+
+    def fake_generate(path, *a, **kw):
+        body = f"# {path}\n"
+        return {"file": path, "patch": f"+++ {path}\n{body}",
+                "content": body, "syntax_ok": True}
+
+    monkeypatch.setattr("cgx.answer.engine.generate_single_scaffold_file",
+                        fake_generate)
+
+    checkpoints: list = []
+    real_save = store.save_artifact
+
+    def spy_save(artifact):
+        if artifact.kind is ArtifactKind.SCAFFOLD_PATCHES:
+            snap = copy.deepcopy(artifact.content)
+            checkpoints.append(
+                ([d["file"] for d in snap["diffs"]], snap.get("complete")))
+        return real_save(artifact)
+
+    monkeypatch.setattr(store, "save_artifact", spy_save)
+    t = TaskNode.new(session.session_id, TaskKind.SCAFFOLD, "s",
+                     inputs={"work_plan_artifact_id": plan.artifact_id})
+    result = run_scaffold(
+        t, ExecutorDeps(provider=_StubProvider(""), store=store))
+    assert result.failure is None
+    # One checkpoint per layer, each incomplete and cumulative.
+    assert checkpoints == [(["a.py"], False), (["a.py", "b.py"], False)]
+    # The returned artifact is the same row, finalised for the runner to save.
+    assert result.artifact.content["complete"] is True
+    assert result.outputs["generated_count"] == 2
+
+
+def test_scaffold_resumes_from_checkpoint_skipping_done_files(
+        store, monkeypatch):
+    """B4: a resume pointer seeds checkpointed files and regenerates the rest."""
+    from cgx.answer.engine import _content_to_new_file_patch
+    from cgx.session.tasks.scaffold import run_scaffold
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    plan = Artifact.new(
+        session.session_id, "task_x", ArtifactKind.WORK_PLAN, {
+            "composed_goal": "g", "prior_goal": "g",
+            "layers": [
+                {"name": "l1", "files": [{"path": "a.py", "description": ""}]},
+                {"name": "l2", "files": [{"path": "b.py", "description": ""}]}],
+        })
+    store.save_artifact(plan)
+    # A crashed prior attempt that checkpointed only a.py.
+    ckpt = Artifact.new(
+        session.session_id, "crashed_task", ArtifactKind.SCAFFOLD_PATCHES, {
+            "work_plan_artifact_id": plan.artifact_id,
+            "diffs": [{"file": "a.py",
+                       "patch": _content_to_new_file_patch("a.py", "# a\n")}],
+            "generated": [{"file": "a.py"}], "failed": [], "complete": False,
+        })
+    store.save_artifact(ckpt)
+
+    seen: list = []
+
+    def fake_generate(path, *a, **kw):
+        seen.append(path)
+        body = f"# {path}\n"
+        return {"file": path, "patch": f"+++ {path}\n{body}",
+                "content": body, "syntax_ok": True}
+
+    monkeypatch.setattr("cgx.answer.engine.generate_single_scaffold_file",
+                        fake_generate)
+    t = TaskNode.new(
+        session.session_id, TaskKind.SCAFFOLD, "s",
+        inputs={"work_plan_artifact_id": plan.artifact_id,
+                "resume_scaffold_artifact_id": ckpt.artifact_id})
+    result = run_scaffold(
+        t, ExecutorDeps(provider=_StubProvider(""), store=store))
+    assert result.failure is None
+    # a.py resumed from the checkpoint; only b.py was regenerated.
+    assert seen == ["b.py"]
+    diffs = result.artifact.content["diffs"]
+    assert [d["file"] for d in diffs] == ["a.py", "b.py"]
+    gen = {g["file"]: g for g in result.artifact.content["generated"]}
+    assert gen["a.py"].get("resumed") is True
+    assert gen["b.py"].get("resumed") is not True
+    assert result.outputs["generated_count"] == 2
+
+
+def test_scaffold_resume_ignores_checkpoint_for_different_work_plan(
+        store, monkeypatch):
+    """B4: a checkpoint produced for a different work plan is not used to seed."""
+    from cgx.answer.engine import _content_to_new_file_patch
+    from cgx.session.tasks.scaffold import run_scaffold
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    plan = Artifact.new(
+        session.session_id, "task_x", ArtifactKind.WORK_PLAN, {
+            "composed_goal": "g", "prior_goal": "g",
+            "layers": [{"name": "l1", "files": [
+                {"path": "a.py", "description": ""},
+                {"path": "b.py", "description": ""}]}],
+        })
+    store.save_artifact(plan)
+    ckpt = Artifact.new(
+        session.session_id, "crashed_task", ArtifactKind.SCAFFOLD_PATCHES, {
+            "work_plan_artifact_id": "a_different_plan",
+            "diffs": [{"file": "a.py",
+                       "patch": _content_to_new_file_patch("a.py", "# a\n")}],
+            "generated": [{"file": "a.py"}], "failed": [], "complete": False,
+        })
+    store.save_artifact(ckpt)
+
+    seen: list = []
+
+    def fake_generate(path, *a, **kw):
+        seen.append(path)
+        body = f"# {path}\n"
+        return {"file": path, "patch": f"+++ {path}\n{body}",
+                "content": body, "syntax_ok": True}
+
+    monkeypatch.setattr("cgx.answer.engine.generate_single_scaffold_file",
+                        fake_generate)
+    t = TaskNode.new(
+        session.session_id, TaskKind.SCAFFOLD, "s",
+        inputs={"work_plan_artifact_id": plan.artifact_id,
+                "resume_scaffold_artifact_id": ckpt.artifact_id})
+    result = run_scaffold(
+        t, ExecutorDeps(provider=_StubProvider(""), store=store))
+    assert result.failure is None
+    # Checkpoint's work plan mismatched -> nothing seeded, full manifest run.
+    assert seen == ["a.py", "b.py"]
+
+
+def test_scaffold_parallel_generation_preserves_order_and_cross_layer_context(
+        store, monkeypatch):
+    """B3: CGX_SCAFFOLD_CONCURRENCY fans out within a layer.
+
+    Diffs stay in manifest order regardless of completion order, and every
+    file in a later layer still sees the earlier layer's content -- but
+    intra-layer siblings are NOT in each other's context (frozen snapshot),
+    which is exactly what makes concurrent generation safe.
+    """
+    import threading
+    monkeypatch.setenv("CGX_SCAFFOLD_CONCURRENCY", "4")
+    from cgx.session.tasks.scaffold import run_scaffold
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    plan = Artifact.new(
+        session.session_id, "task_x", ArtifactKind.WORK_PLAN, {
+            "prior_goal": "g", "composed_goal": "build a react app",
+            "answers": {}, "plan_md": "",
+            "layers": [
+                {"name": "base", "files": [
+                    {"path": "src/config.js", "description": "config"}]},
+                {"name": "ui", "files": [
+                    {"path": "src/A.jsx", "description": "A"},
+                    {"path": "src/B.jsx", "description": "B"},
+                    {"path": "src/C.jsx", "description": "C"}]},
+            ],
+        })
+    store.save_artifact(plan)
+
+    lock = threading.Lock()
+    seen: dict = {}
+    completion_order: list = []
+    # Force a non-manifest completion order (C, then B, then A) by chaining
+    # per-file "done" events -- this proves the gather step re-sorts back
+    # into manifest order rather than emitting in completion order.
+    done = {p: threading.Event()
+            for p in ("src/A.jsx", "src/B.jsx", "src/C.jsx")}
+
+    def fake_generate(path, description, provider, *,
+                      layer=None, existing_files_with_content=None, goal=None):
+        with lock:
+            seen[path] = [c["path"] for c in (existing_files_with_content or [])]
+        if path == "src/B.jsx":
+            done["src/C.jsx"].wait(2)
+        elif path == "src/A.jsx":
+            done["src/B.jsx"].wait(2)
+        if path in done:
+            with lock:
+                completion_order.append(path)
+            done[path].set()
+        body = f"// {path}\n"
+        return {"file": path, "patch": f"+++ {path}\n{body}",
+                "content": body, "syntax_ok": True, "confidence": 0.9}
+
+    monkeypatch.setattr("cgx.answer.engine.generate_single_scaffold_file",
+                        fake_generate)
+    t = TaskNode.new(session.session_id, TaskKind.SCAFFOLD, "s",
+                     inputs={"work_plan_artifact_id": plan.artifact_id})
+    result = run_scaffold(
+        t, ExecutorDeps(provider=_StubProvider(""), store=store))
+    assert result.failure is None
+    assert result.outputs["generated_count"] == 4
+    assert result.outputs["failed_count"] == 0
+    # Emitted diffs follow manifest order even though C completed first.
+    assert [d["file"] for d in result.artifact.content["diffs"]] == [
+        "src/config.js", "src/A.jsx", "src/B.jsx", "src/C.jsx"]
+    # Cross-layer context preserved: every ui file saw base/config.js.
+    for p in ("src/A.jsx", "src/B.jsx", "src/C.jsx"):
+        assert seen[p] == ["src/config.js"], p
+    # Sanity: the events really did invert completion vs manifest order.
+    assert completion_order == ["src/C.jsx", "src/B.jsx", "src/A.jsx"]
+
+
+def test_scaffold_parallel_generation_aggregates_failures_in_order(
+        store, monkeypatch):
+    """B3: a mid-layer crash under parallelism is captured, order-stable."""
+    monkeypatch.setenv("CGX_SCAFFOLD_CONCURRENCY", "3")
+    from cgx.session.tasks.scaffold import run_scaffold
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    plan = Artifact.new(
+        session.session_id, "task_x", ArtifactKind.WORK_PLAN, {
+            "prior_goal": "g", "composed_goal": "g", "answers": {},
+            "plan_md": "",
+            "layers": [{"name": "app", "files": [
+                {"path": "a.py", "description": ""},
+                {"path": "b.py", "description": ""},
+                {"path": "c.py", "description": ""}]}],
+        })
+    store.save_artifact(plan)
+
+    def fake_generate(path, *a, **kw):
+        if path == "b.py":
+            raise RuntimeError("model timed out")
+        return {"file": path, "patch": f"+++ {path}\nx",
+                "content": "x", "syntax_ok": True}
+
+    monkeypatch.setattr("cgx.answer.engine.generate_single_scaffold_file",
+                        fake_generate)
+    t = TaskNode.new(session.session_id, TaskKind.SCAFFOLD, "s",
+                     inputs={"work_plan_artifact_id": plan.artifact_id})
+    result = run_scaffold(
+        t, ExecutorDeps(provider=_StubProvider(""), store=store))
+    assert result.failure is None
+    assert result.outputs["generated_count"] == 2
+    assert result.outputs["failed_count"] == 1
+    # Successes keep manifest order; the failed peer is dropped from diffs.
+    assert [d["file"] for d in result.artifact.content["diffs"]] == [
+        "a.py", "c.py"]
+    failed = result.artifact.content["failed"]
+    assert [f["file"] for f in failed] == ["b.py"]
+    assert "RuntimeError" in failed[0]["error"]
+    assert result.outputs["failed"] == failed
+
+
 # --------------------- BOOTSTRAP_ENV executor unit tests ---------------------
 
 def test_bootstrap_env_requires_project_root():
@@ -2644,6 +3139,105 @@ def test_bootstrap_env_skips_non_python_project(tmp_path, store):
     assert result.artifact.content["resolved_packages"] == []
     assert result.artifact.content["pip_freeze_text"] == ""
     assert "non-python" in (result.artifact.content.get("note") or "")
+
+
+def test_bootstrap_env_python_takes_priority_over_package_json(tmp_path):
+    """A polyglot repo bootstraps Python; package.json-only -> node."""
+    from cgx.session.tasks.bootstrap_env import _detect_project_type
+    (tmp_path / "package.json").write_text("{}", encoding="utf-8")
+    assert _detect_project_type(tmp_path) == "node"
+    (tmp_path / "requirements.txt").write_text("flask\n", encoding="utf-8")
+    assert _detect_project_type(tmp_path) == "python"
+
+
+def test_bootstrap_env_node_runs_npm_install(tmp_path, store, monkeypatch):
+    """package.json-only -> project_type=node, bounded npm install runs."""
+    from cgx.session.tasks import bootstrap_env as bs
+    (tmp_path / "package.json").write_text(
+        '{"name": "app", "scripts": {"build": "vite build"}}',
+        encoding="utf-8")
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+
+    calls: dict = {}
+
+    def _fake_run(cmd, **kw):
+        calls["cmd"] = list(cmd)
+        (tmp_path / "node_modules").mkdir()
+
+        class _P:
+            returncode = 0
+            stdout = "added 1 package"
+            stderr = ""
+
+        return _P()
+
+    monkeypatch.setattr(bs.shutil, "which", lambda name: "/usr/bin/npm")
+    monkeypatch.setattr(bs.subprocess, "run", _fake_run)
+
+    t = TaskNode.new(session.session_id, TaskKind.BOOTSTRAP_ENV, "boot",
+                     inputs={"applied_files": ["src/App.jsx"],
+                             "mode": SessionMode.GREENFIELD.value})
+    result = bs.run_bootstrap_env(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    assert result.failure is None
+    assert result.outputs["project_type"] == "node"
+    assert result.outputs["outcome"] == "succeeded"
+    assert calls["cmd"][:2] == ["npm", "install"]
+    content = result.artifact.content
+    assert content["project_type"] == "node"
+    # No venv/python for a node stack -> Python-only gates skip cleanly.
+    assert content["python_exe"] is None
+    assert content["venv_path"] is None
+
+
+def test_bootstrap_env_node_npm_missing_is_skipped(tmp_path, store, monkeypatch):
+    """No npm binary -> skipped, non-fatal (VERIFY still gives the signal)."""
+    from cgx.session.tasks import bootstrap_env as bs
+    (tmp_path / "package.json").write_text('{"name": "app"}', encoding="utf-8")
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+
+    def _no_run(*a, **k):
+        raise AssertionError("npm install must not run without npm present")
+
+    monkeypatch.setattr(bs.shutil, "which", lambda name: None)
+    monkeypatch.setattr(bs.subprocess, "run", _no_run)
+
+    t = TaskNode.new(session.session_id, TaskKind.BOOTSTRAP_ENV, "boot",
+                     inputs={"mode": SessionMode.GREENFIELD.value})
+    result = bs.run_bootstrap_env(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    assert result.failure is None
+    assert result.outputs["project_type"] == "node"
+    assert result.outputs["outcome"] == "skipped"
+    assert result.artifact.content["note"] == "npm not installed"
+
+
+def test_bootstrap_env_node_install_failure_is_nonfatal(
+        tmp_path, store, monkeypatch):
+    """An offline npm install (rc!=0, no node_modules) -> skipped, non-fatal."""
+    from cgx.session.tasks import bootstrap_env as bs
+    (tmp_path / "package.json").write_text('{"name": "app"}', encoding="utf-8")
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+
+    class _P:
+        returncode = 1
+        stdout = ""
+        stderr = "npm ERR! ENOTFOUND registry.npmjs.org"
+
+    monkeypatch.setattr(bs.shutil, "which", lambda name: "/usr/bin/npm")
+    monkeypatch.setattr(bs.subprocess, "run", lambda *a, **k: _P())
+
+    t = TaskNode.new(session.session_id, TaskKind.BOOTSTRAP_ENV, "boot",
+                     inputs={"mode": SessionMode.GREENFIELD.value})
+    result = bs.run_bootstrap_env(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    assert result.failure is None
+    assert result.outputs["outcome"] == "skipped"
+    assert "rc=1" in result.artifact.content["note"]
+    assert "ENOTFOUND" in result.artifact.content["pip_log_tail"]
 
 
 def test_bootstrap_env_provisions_venv_and_records_preflight(
@@ -3139,6 +3733,80 @@ def test_smoke_runs_probes_and_records_failure(tmp_path, store, monkeypatch):
     assert werkzeug_row["ok"] is False
     assert "url_quote" in werkzeug_row["stderr_tail"]
     assert set(seen) == {"flask", "werkzeug"}
+
+
+def _node_smoke_task(store, tmp_path, *, build_script=True,
+                     node_modules=True):
+    """Build a package.json-only SMOKE task fixture for the JS build-smoke."""
+    scripts = '{"build": "vite build"}' if build_script else "{}"
+    (tmp_path / "package.json").write_text(
+        '{"name": "app", "scripts": ' + scripts + "}", encoding="utf-8")
+    if node_modules:
+        (tmp_path / "node_modules").mkdir()
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    return TaskNode.new(session.session_id, TaskKind.SMOKE, "smoke",
+                        inputs={"applied_files": ["src/App.jsx"],
+                                "mode": SessionMode.GREENFIELD.value})
+
+
+def test_smoke_node_build_failure_is_failed(tmp_path, store, monkeypatch):
+    """A non-building JS app fails the SMOKE build-smoke honestly."""
+    from cgx.session.tasks import smoke as smoke_mod
+    t = _node_smoke_task(store, tmp_path)
+
+    class _P:
+        returncode = 1
+        stdout = ""
+        stderr = "src/App.jsx: TS2345 build error"
+
+    monkeypatch.setattr(smoke_mod.shutil, "which", lambda name: "/usr/bin/npm")
+    monkeypatch.setattr(smoke_mod.subprocess, "run", lambda *a, **k: _P())
+
+    result = smoke_mod.run_smoke(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    assert result.failure is None
+    assert result.outputs["outcome"] == "failed"
+    bs = result.artifact.content["build_smoke"]
+    assert bs["ok"] is False
+    assert "TS2345" in bs["stderr_tail"]
+    assert "npm run build" in result.outputs["failure_signature"]
+
+
+def test_smoke_node_build_pass_is_passed(tmp_path, store, monkeypatch):
+    """A clean JS build -> outcome=passed (chains on to VERIFY)."""
+    from cgx.session.tasks import smoke as smoke_mod
+    t = _node_smoke_task(store, tmp_path)
+
+    class _P:
+        returncode = 0
+        stdout = "built"
+        stderr = ""
+
+    monkeypatch.setattr(smoke_mod.shutil, "which", lambda name: "/usr/bin/npm")
+    monkeypatch.setattr(smoke_mod.subprocess, "run", lambda *a, **k: _P())
+
+    result = smoke_mod.run_smoke(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    assert result.outputs["outcome"] == "passed"
+    assert result.artifact.content["build_smoke"]["ok"] is True
+
+
+def test_smoke_node_skips_without_node_modules(tmp_path, store, monkeypatch):
+    """No provisioned node_modules -> build-smoke skips (no false failure)."""
+    from cgx.session.tasks import smoke as smoke_mod
+    t = _node_smoke_task(store, tmp_path, node_modules=False)
+
+    def _no_run(*a, **k):
+        raise AssertionError("build-smoke must not run without node_modules")
+
+    monkeypatch.setattr(smoke_mod.shutil, "which", lambda name: "/usr/bin/npm")
+    monkeypatch.setattr(smoke_mod.subprocess, "run", _no_run)
+
+    result = smoke_mod.run_smoke(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    assert result.outputs["outcome"] == "skipped"
+    assert result.artifact.content["build_smoke"] is None
 
 
 def test_smoke_resolves_applied_files_from_apply_artifact(tmp_path, store):
@@ -4083,6 +4751,43 @@ def test_repair_executor_emits_smoke_repair_plan(store, tmp_path: Path):
     assert result.outputs["diff_count"] == 0
     assert result.artifact.content["failed_modules"] == ["werkzeug"]
     assert "werkzeug" in result.artifact.content["rationale"]
+
+
+def test_repair_executor_emits_regenerate_for_build_smoke_failure(
+        store, tmp_path: Path):
+    """A JS build-smoke break -> strategy=regenerate with the build error."""
+    from cgx.session.tasks import repair as _repair_module  # noqa: F401
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    smoke_task = TaskNode.new(
+        session.session_id, TaskKind.SMOKE, "smoke", inputs={})
+    smoke_artifact = Artifact.new(
+        session_id=session.session_id,
+        produced_by_task_id=smoke_task.task_id,
+        kind=ArtifactKind.SMOKE_REPORT,
+        content={"outcome": "failed",
+                 "failed_modules": [],
+                 "failure_signature": "smoke_import|npm run build --silent",
+                 "modules": [],
+                 "build_smoke": {"label": "npm run build --silent",
+                                 "ok": False,
+                                 "stderr_tail": "src/App.jsx: TS2345"}})
+    store.save_task(smoke_task)
+    store.save_artifact(smoke_artifact)
+    repair_task = TaskNode.new(
+        session.session_id, TaskKind.REPAIR, "repair",
+        inputs={"smoke_artifact_id": smoke_artifact.artifact_id,
+                "mode": SessionMode.GREENFIELD.value,
+                "repair_attempt": 1})
+    deps = ExecutorDeps(project_root=str(tmp_path), store=store)
+    from cgx.session.tasks.base import _REGISTRY
+    result = _REGISTRY[TaskKind.REPAIR](repair_task, deps)
+    assert result.failure is None
+    assert result.outputs["strategy"] == "regenerate"
+    constraints = result.outputs["extra_constraints"]
+    assert constraints["kind"] == "invalid_build_smoke"
+    assert "TS2345" in constraints["build_error"]
+    assert "build" in result.artifact.content["rationale"].lower()
 
 
 def test_classify_missing_module_pythonpath_from_collection_error():
@@ -5615,6 +6320,12 @@ def test_router_apply_failed_files_regenerates_within_budget():
     # The session must not be failed while a regenerate is still possible.
     assert not [a for a in plan.actions
                 if isinstance(a, UpdateSessionStatus)]
+    # B2: the regenerate is targeted -- it names exactly the dropped files
+    # (SCAFFOLD's empty patch + APPLY's two syntax failures) and points at
+    # the prior SCAFFOLD_PATCHES artifact so its good diffs are reused.
+    assert set(new_scaffold.inputs["regenerate_files"]) == {
+        "backend/main.py", "backend/models.py", "tests/test_auth.py"}
+    assert new_scaffold.inputs["prior_scaffold_artifact_id"] == "art_scaffold"
 
 
 def test_router_apply_failed_files_budget_exhausted_fails_session():
@@ -5652,6 +6363,242 @@ def test_router_apply_failed_files_explore_mode_proceeds_normally():
     creates = [a for a in plan.actions if isinstance(a, CreateTask)]
     assert len(creates) == 1
     assert creates[0].task.kind is TaskKind.VERIFY
+
+
+def _build_scaffold_failed_chain(*, prior_regens: int = 0,
+                                 failed_count: int = 2,
+                                 with_pending_child: bool = True):
+    """Build a SCAFFOLD that dropped files, with an optional live APPLY child.
+
+    Mirrors :func:`_build_apply_failed_chain` but the failure surfaces on
+    the SCAFFOLD itself (LLM timeout / empty patch) while its surviving
+    diffs would otherwise apply cleanly.
+    """
+    from cgx.session.models import SessionMode
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    parent = TaskNode.new(
+        session.session_id, TaskKind.ASK_USER, "approve",
+        inputs={"work_plan_artifact_id": "art_plan"})
+    parent.status = TaskNodeStatus.DONE
+    scaffold = TaskNode.new(
+        session.session_id, TaskKind.SCAFFOLD, "scaffold",
+        parent_task_id=parent.task_id,
+        inputs={"work_plan_artifact_id": "art_plan",
+                "regenerate_attempt": prior_regens})
+    scaffold.produced_artifact_id = "art_scaffold"
+    failed = [
+        {"file": "src/components/Calculator.jsx",
+         "error": "ReadTimeout: read timed out (read timeout=300.0)"},
+        {"file": "backend/main.py",
+         "error": "generator returned empty patch"}][:failed_count]
+    scaffold.outputs = {"scaffold_artifact_id": "art_scaffold",
+                        "generated_count": 8,
+                        "failed_count": failed_count, "failed": failed}
+    scaffold.status = TaskNodeStatus.DONE
+    tasks = [parent, scaffold]
+    if with_pending_child:
+        apply_t = TaskNode.new(
+            session.session_id, TaskKind.APPLY, "apply",
+            parent_task_id=scaffold.task_id,
+            inputs={"mode": "greenfield",
+                    "scaffold_artifact_id": "art_scaffold"})
+        apply_t.status = TaskNodeStatus.READY
+        tasks.append(apply_t)
+    return session, parent, scaffold, tasks
+
+
+def test_router_scaffold_failed_files_regenerates_within_budget():
+    """SCAFFOLD that dropped files -> abandon live subtree + re-scaffold."""
+    session, parent, scaffold, tasks = _build_scaffold_failed_chain()
+    plan = Router().on_task_completed(
+        session=session, completed=scaffold, tasks=tasks)
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    assert len(creates) == 1
+    new_scaffold = creates[0].task
+    assert new_scaffold.kind is TaskKind.SCAFFOLD
+    assert new_scaffold.parent_task_id == parent.task_id
+    assert new_scaffold.inputs["regenerate_attempt"] == 1
+    assert new_scaffold.inputs["regenerated_from_task_id"] == scaffold.task_id
+    payloads = new_scaffold.inputs["regenerate_constraints"]
+    assert payloads and payloads[0]["kind"] == "invalid_scaffold_syntax"
+    # The constraint enumerates the concrete per-file SCAFFOLD failures
+    # (timeout + empty patch) so the retry has actionable feedback.
+    rationale = payloads[0]["rationale"]
+    assert "src/components/Calculator.jsx" in rationale
+    assert "read timed out" in rationale
+    assert "backend/main.py" in rationale
+    listed = payloads[0]["failed_files"]
+    assert len(listed) == 2
+    # The live APPLY child is abandoned so the stale subtree cannot run.
+    abandoned = {a.task_id for a in plan.actions
+                 if isinstance(a, UpdateTaskStatus)}
+    pending = [t for t in tasks if t.status is TaskNodeStatus.READY]
+    assert {p.task_id for p in pending} <= abandoned
+    # No terminal failure while a regenerate is still possible.
+    assert not [a for a in plan.actions
+                if isinstance(a, UpdateSessionStatus)]
+    # B2: the regenerate is targeted -- exactly the two dropped SCAFFOLD
+    # files, pointed at the prior SCAFFOLD_PATCHES artifact for reuse.
+    assert set(new_scaffold.inputs["regenerate_files"]) == {
+        "src/components/Calculator.jsx", "backend/main.py"}
+    assert new_scaffold.inputs["prior_scaffold_artifact_id"] == "art_scaffold"
+
+
+def test_router_scaffold_failed_files_budget_exhausted_fails_session():
+    """No regenerate budget left -> greenfield session fails terminally."""
+    from cgx.session.router import _REGENERATE_BUDGET
+    session, _parent, scaffold, tasks = _build_scaffold_failed_chain(
+        prior_regens=_REGENERATE_BUDGET)
+    plan = Router().on_task_completed(
+        session=session, completed=scaffold, tasks=tasks)
+    assert [a for a in plan.actions if isinstance(a, CreateTask)] == []
+    status = [a for a in plan.actions if isinstance(a, UpdateSessionStatus)]
+    assert len(status) == 1
+    assert status[0].status is SessionStatus.FAILED
+
+
+def test_router_scaffold_clean_still_spawns_apply():
+    """A SCAFFOLD with no dropped files keeps its SCAFFOLD -> APPLY edge."""
+    session, _parent, scaffold, tasks = _build_scaffold_failed_chain(
+        failed_count=0, with_pending_child=False)
+    scaffold.outputs = {"scaffold_artifact_id": "art_scaffold",
+                        "generated_count": 8, "failed_count": 0,
+                        "failed": []}
+    plan = Router().on_task_completed(
+        session=session, completed=scaffold, tasks=tasks)
+    assert not [a for a in plan.actions if isinstance(a, UpdateSessionStatus)]
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    assert len(creates) == 1
+    assert creates[0].task.kind is TaskKind.APPLY
+
+
+def _build_crashed_scaffold(*, prior_regens: int = 0,
+                            with_pending_child: bool = True):
+    """Build a SCAFFOLD that crashed mid-run (hard failure, no outputs).
+
+    Mirrors :func:`_build_scaffold_failed_chain` but the SCAFFOLD is
+    ``FAILED`` with no ``outputs`` (an LLM timeout / process kill), which
+    is the state :meth:`Router.on_task_failed` sees for a crash.
+    """
+    from cgx.session.models import SessionMode
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    parent = TaskNode.new(
+        session.session_id, TaskKind.ASK_USER, "approve",
+        inputs={"work_plan_artifact_id": "art_plan"})
+    parent.status = TaskNodeStatus.DONE
+    scaffold = TaskNode.new(
+        session.session_id, TaskKind.SCAFFOLD, "scaffold",
+        parent_task_id=parent.task_id,
+        inputs={"work_plan_artifact_id": "art_plan",
+                "regenerate_attempt": prior_regens})
+    scaffold.status = TaskNodeStatus.FAILED
+    tasks = [parent, scaffold]
+    if with_pending_child:
+        child = TaskNode.new(
+            session.session_id, TaskKind.APPLY, "apply",
+            parent_task_id=scaffold.task_id,
+            inputs={"mode": "greenfield"})
+        child.status = TaskNodeStatus.READY
+        tasks.append(child)
+    return session, parent, scaffold, tasks
+
+
+def test_router_on_task_failed_scaffold_resumes_from_checkpoint():
+    """B4: a crashed SCAFFOLD with a checkpoint re-queues a resuming SCAFFOLD."""
+    session, parent, scaffold, tasks = _build_crashed_scaffold()
+    plan = Router().on_task_failed(
+        session=session, failed=scaffold, tasks=tasks,
+        resume_scaffold_artifact_id="art_ckpt")
+    # No terminal failure while a resume is still possible.
+    assert not [a for a in plan.actions if isinstance(a, UpdateSessionStatus)]
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    assert len(creates) == 1
+    new_scaffold = creates[0].task
+    assert new_scaffold.kind is TaskKind.SCAFFOLD
+    assert new_scaffold.parent_task_id == parent.task_id
+    assert new_scaffold.inputs["resume_scaffold_artifact_id"] == "art_ckpt"
+    assert new_scaffold.inputs["regenerate_attempt"] == 1
+    assert new_scaffold.inputs["regenerated_from_task_id"] == scaffold.task_id
+    # The live APPLY child is abandoned so the stale subtree cannot run.
+    abandoned = {a.task_id for a in plan.actions
+                 if isinstance(a, UpdateTaskStatus)}
+    pending = [t for t in tasks if t.status is TaskNodeStatus.READY]
+    assert {p.task_id for p in pending} <= abandoned
+
+
+def test_router_on_task_failed_scaffold_resume_budget_exhausted_fails():
+    """B4: a re-crashed SCAFFOLD with no budget left fails the session."""
+    from cgx.session.router import _REGENERATE_BUDGET
+    session, _parent, scaffold, tasks = _build_crashed_scaffold(
+        prior_regens=_REGENERATE_BUDGET, with_pending_child=False)
+    plan = Router().on_task_failed(
+        session=session, failed=scaffold, tasks=tasks,
+        resume_scaffold_artifact_id="art_ckpt")
+    assert [a for a in plan.actions if isinstance(a, CreateTask)] == []
+    status = [a for a in plan.actions if isinstance(a, UpdateSessionStatus)]
+    assert len(status) == 1
+    assert status[0].status is SessionStatus.FAILED
+
+
+def test_router_on_task_failed_scaffold_without_checkpoint_fails():
+    """B4: a crash with nothing checkpointed keeps the terminal-FAILED path."""
+    session, _parent, scaffold, tasks = _build_crashed_scaffold(
+        with_pending_child=False)
+    plan = Router().on_task_failed(
+        session=session, failed=scaffold, tasks=tasks,
+        resume_scaffold_artifact_id=None)
+    assert [a for a in plan.actions if isinstance(a, CreateTask)] == []
+    status = [a for a in plan.actions if isinstance(a, UpdateSessionStatus)]
+    assert len(status) == 1
+    assert status[0].status is SessionStatus.FAILED
+
+
+def test_runner_scaffold_crash_resumes_from_checkpoint(tmp_path, store):
+    """B4 end-to-end: the runner resolves a crashed SCAFFOLD's checkpoint.
+
+    A SCAFFOLD that checkpoints one file then crashes must not fail the
+    session terminally: the runner resolves the incomplete checkpoint and
+    the router re-queues a resuming SCAFFOLD pointed at it.
+    """
+    from cgx.session.models import SessionMode
+
+    @register_executor(TaskKind.SCAFFOLD)
+    def _checkpoint_then_crash(task, deps):
+        art = Artifact.new(
+            task.session_id, task.task_id, ArtifactKind.SCAFFOLD_PATCHES, {
+                "work_plan_artifact_id": "art_plan",
+                "diffs": [{"file": "a.py", "patch": "+++ a.py\n# a\n"}],
+                "generated": [{"file": "a.py"}], "failed": [],
+                "complete": False,
+            })
+        deps.store.save_artifact(art)
+        raise RuntimeError("model timed out mid-scaffold")
+
+    session = Session.new("g", project_root=str(tmp_path),
+                          mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    scaffold = TaskNode.new(
+        session.session_id, TaskKind.SCAFFOLD, "scaffold",
+        inputs={"mode": SessionMode.GREENFIELD.value,
+                "work_plan_artifact_id": "art_plan"})
+    scaffold.status = TaskNodeStatus.READY
+    store.save_task(scaffold)
+
+    out = SessionRunner(store).run_next(
+        session_id=session.session_id, deps=ExecutorDeps(store=store))
+    assert out.status is TaskNodeStatus.FAILED
+    # Session stays active -- a resuming SCAFFOLD was queued, not a terminal fail.
+    assert store.get_session(session.session_id).status \
+        is SessionStatus.ACTIVE
+    resumed = [t for t in store.list_tasks(session.session_id)
+               if t.kind is TaskKind.SCAFFOLD
+               and t.task_id != scaffold.task_id]
+    assert len(resumed) == 1
+    ckpt_id = resumed[0].inputs["resume_scaffold_artifact_id"]
+    ckpt = store.get_artifact(ckpt_id)
+    # The pointer resolves to the crashed task's incomplete checkpoint.
+    assert ckpt.produced_by_task_id == scaffold.task_id
+    assert ckpt.content["complete"] is False
 
 
 def test_scaffold_augments_goal_with_regenerate_constraints(

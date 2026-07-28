@@ -10,8 +10,13 @@ usable on machines without a local embedder installed.
 """
 
 from typing import Any, List, Dict, Optional, Callable, Tuple
+import logging
+import os
+import sys
 import threading
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 # Module-level caches so the encoder model is loaded once per process and
@@ -27,6 +32,65 @@ _HF_MODEL_CACHE: Dict[Tuple[str, str], Tuple[Any, Any]] = {}
 # parallel, and the concurrent CUDA allocations trigger the meta-tensor error.
 _ST_MODEL_LOCK = threading.Lock()
 _HF_MODEL_LOCK = threading.Lock()
+
+
+def _sync_hub_offline_constant(value: bool) -> None:
+    """Mirror ``HF_HUB_OFFLINE`` onto the already-imported hub constant.
+
+    ``huggingface_hub`` snapshots the env var into
+    ``huggingface_hub.constants.HF_HUB_OFFLINE`` at import time, so setting
+    the environment variable *after* the hub has been imported has no
+    effect. When the module is already loaded we patch the constant too;
+    otherwise the env var alone is enough for the upcoming import.
+    """
+    try:
+        if "huggingface_hub.constants" in sys.modules:
+            import huggingface_hub.constants as _hc
+            _hc.HF_HUB_OFFLINE = bool(value)
+    except Exception:
+        pass
+
+
+def maybe_enable_hf_offline(model_name: Optional[str] = None) -> bool:
+    """Flip HuggingFace into offline mode when the model is cached locally.
+
+    Skips remote update checks -- which can hang for minutes behind SSL
+    timeouts on locked-down/offline networks -- at model load time. Only
+    opts in when the user hasn't explicitly set the flag and the target
+    model already has a snapshot in the local HF cache, so a first-time
+    download still works online. This is the single guard shared by every
+    entry point (web UI, CLI/TUI, and the programmatic agent loop).
+
+    Returns ``True`` when offline mode is (now or already) enabled.
+    """
+    if os.environ.get("HF_HUB_OFFLINE") or os.environ.get("TRANSFORMERS_OFFLINE"):
+        _sync_hub_offline_constant(True)
+        return True
+    if not model_name:
+        try:
+            from cgx.config import EmbeddingConfig
+            model_name = EmbeddingConfig().model_name
+        except Exception:
+            return False
+    cache_root = (
+        os.environ.get("HF_HOME")
+        or os.environ.get("HUGGINGFACE_HUB_CACHE")
+        or os.path.expanduser("~/.cache/huggingface/hub")
+    )
+    if os.environ.get("HF_HOME"):
+        cache_root = os.path.join(cache_root, "hub")
+    safe = "models--" + model_name.replace("/", "--")
+    snapshots = os.path.join(cache_root, safe, "snapshots")
+    try:
+        if os.path.isdir(snapshots) and any(os.scandir(snapshots)):
+            os.environ["HF_HUB_OFFLINE"] = "1"
+            os.environ["TRANSFORMERS_OFFLINE"] = "1"
+            _sync_hub_offline_constant(True)
+            logger.info("HF_HUB_OFFLINE=1 (%s cached locally)", model_name)
+            return True
+    except OSError:
+        pass
+    return False
 
 
 def _get_st_model(model_name: str, device: str, max_length: int) -> Any:
@@ -47,6 +111,9 @@ def _get_st_model(model_name: str, device: str, max_length: int) -> Any:
         with _ST_MODEL_LOCK:
             st_model = _ST_MODEL_CACHE.get(key)  # re-check after acquiring
             if st_model is None:
+                # Avoid a multi-minute stall on remote update checks when the
+                # model is already cached and the network is locked down.
+                maybe_enable_hf_offline(model_name)
                 from sentence_transformers import SentenceTransformer
                 # low_cpu_mem_usage=False prevents transformers>=4.35 from placing
                 # weights on the "meta" device during from_pretrained, which would
@@ -82,6 +149,7 @@ def _get_hf_model(model_name: str, device: str) -> Tuple[Any, Any]:
         cached = _HF_MODEL_CACHE.get(key)
         if cached is not None:
             return cached
+        maybe_enable_hf_offline(model_name)
         from transformers import AutoTokenizer, AutoModel
         tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True, trust_remote_code=True)
         # low_cpu_mem_usage=False: transformers>=4.35 defaults to lazy meta-tensor

@@ -666,6 +666,51 @@ def test_scaffold_py_syntax_error_flags_when_retry_still_broken():
     assert out.get("syntax_error")
 
 
+# Unbalanced JSX: the return expression is never closed. Parsed with the
+# tree-sitter ``javascript`` grammar this reports has_error, which the
+# inline gate turns into one hardened retry.
+_BROKEN_JSX = (
+    "import React from 'react'\n"
+    "export default function App() {\n"
+    "  return (\n"
+    "    <div><h1>Calc</h1>\n"
+    "}\n"
+)
+_VALID_JSX = (
+    "import React from 'react'\n"
+    "export default function App() {\n"
+    "  return (\n"
+    "    <div><h1>Calc</h1></div>\n"
+    "  );\n"
+    "}\n"
+)
+
+
+def test_scaffold_jsx_syntax_error_retries_and_recovers():
+    from cgx.answer.engine import generate_single_scaffold_file
+    provider = _QueueProvider([_BROKEN_JSX, _VALID_JSX])
+    out = generate_single_scaffold_file(
+        "src/App.jsx", "root component", provider,
+        layer="ui", goal="build a react calculator",
+    )
+    assert provider.calls == 2, "JS syntax gate must trigger one retry"
+    assert out["syntax_ok"] is True
+    assert out["content"] == _VALID_JSX
+    assert out["patch"]
+
+
+def test_scaffold_jsx_syntax_error_flags_when_retry_still_broken():
+    from cgx.answer.engine import generate_single_scaffold_file
+    provider = _QueueProvider([_BROKEN_JSX, _BROKEN_JSX])
+    out = generate_single_scaffold_file(
+        "src/App.jsx", "root component", provider,
+        layer="ui", goal="build a react calculator",
+    )
+    assert provider.calls == 2
+    assert out["syntax_ok"] is False
+    assert out.get("syntax_error")
+
+
 _BAD_SYMBOL_TESTS = ("from app import generate_token\n\n"
                      "def test_x():\n    assert generate_token()\n")
 

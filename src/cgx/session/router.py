@@ -498,11 +498,15 @@ _REGENERATE_BUDGET = 1
 # repairable only when test files were actually selected but pytest
 # collected zero tests (malformed tests -- see
 # :func:`_verify_to_repair_or_terminal`); a genuinely test-free project
-# still terminates cleanly.
+# still terminates cleanly. ``failed`` is a non-pytest runner (e.g. an
+# ``npm`` build/test) that exited non-zero: it classifies as ``unknown``
+# in the repair classifier, which routes to a re-scaffold (regenerate)
+# so a JS/TS build break is not a silent false success.
 _REPAIRABLE_VERIFY_OUTCOMES = frozenset({
     "assertions_failed",
     "collection_error",
     "no_tests_collected",
+    "failed",
 })
 
 
@@ -773,6 +777,10 @@ class Router:
         table: proceeding with a missing module guarantees a collection
         error, so the router re-scaffolds within budget (or ends the
         session terminally ``FAILED`` when it cannot).
+
+        A finished SCAFFOLD that dropped any file (``outputs.failed_count
+        > 0`` from an LLM timeout or empty patch) is spliced the same way
+        so the tree is never applied with a required file simply absent.
         """
         plan = RouterPlan()
         if completed.kind is TaskKind.REPAIR:
@@ -787,6 +795,11 @@ class Router:
             fail_actions = _repair_terminal_failure_actions(completed)
             if fail_actions:
                 plan.actions.extend(fail_actions)
+                return plan
+        if completed.kind is TaskKind.SCAFFOLD:
+            dropped_actions = _scaffold_failed_files_actions(completed, tasks)
+            if dropped_actions:
+                plan.actions.extend(dropped_actions)
                 return plan
         if completed.kind is TaskKind.APPLY:
             dropped_actions = _apply_failed_files_actions(completed, tasks)
@@ -809,7 +822,9 @@ class Router:
     @traced("router")
     def on_task_failed(self, *, session: Session,
                        failed: TaskNode,
-                       tasks: List[TaskNode]) -> RouterPlan:
+                       tasks: List[TaskNode],
+                       resume_scaffold_artifact_id: Optional[str] = None
+                       ) -> RouterPlan:
         """Transition a session to terminal ``FAILED`` on a hard failure.
 
         A *hard* failure is an executor that returned
@@ -823,6 +838,15 @@ class Router:
         hard failure ends the session ``FAILED`` -- asking the user to
         hand-fix AI-generated code is never a valid recovery.
 
+        One recoverable case (B4): a SCAFFOLD that crashed or timed out
+        *mid-run* after checkpointing some files. When the runner resolves
+        the crashed task's incomplete SCAFFOLD_PATCHES checkpoint and
+        threads its id via ``resume_scaffold_artifact_id``, and the shared
+        regenerate budget is not spent, re-queue a fresh SCAFFOLD that
+        resumes from that checkpoint (regenerating only the remainder)
+        instead of discarding every completed file. Budget-exhausted or
+        checkpoint-less crashes fall through to the terminal ``FAILED``.
+
         Explore-mode sessions keep their user-driven lifecycle (the
         caller may post a follow-up objective), so this returns an empty
         plan for them, and it is a no-op if the session is already in a
@@ -834,6 +858,11 @@ class Router:
         if session.status in (SessionStatus.COMPLETED,
                               SessionStatus.FAILED,
                               SessionStatus.ABANDONED):
+            return plan
+        resume_actions = _scaffold_resume_actions(
+            failed, tasks, resume_scaffold_artifact_id)
+        if resume_actions:
+            plan.actions.extend(resume_actions)
             return plan
         plan.actions.append(UpdateSessionStatus(
             session_id=session.session_id,
@@ -990,10 +1019,15 @@ def _apply_failed_files_actions(completed: TaskNode,
     if scaffold is not None:
         prior_regens = int(scaffold.inputs.get("regenerate_attempt") or 0)
         if prior_regens < _REGENERATE_BUDGET:
+            scaffold_outputs = scaffold.outputs or {}
             constraint = _invalid_scaffold_constraint(
                 failed_count,
                 apply_failed=outputs.get("failed_files"),
-                scaffold_failed=(scaffold.outputs or {}).get("failed"))
+                scaffold_failed=scaffold_outputs.get("failed"))
+            regen_files = _failed_scaffold_paths(
+                scaffold_outputs.get("failed"), outputs.get("failed_files"))
+            prior_id = str(
+                scaffold_outputs.get("scaffold_artifact_id") or "").strip()
             actions: List[RouterAction] = []
             skip_states = {TaskNodeStatus.DONE, TaskNodeStatus.FAILED,
                            TaskNodeStatus.ABANDONED}
@@ -1002,10 +1036,103 @@ def _apply_failed_files_actions(completed: TaskNode,
                     continue
                 actions.append(UpdateTaskStatus(
                     task_id=t.task_id, status=TaskNodeStatus.ABANDONED))
-            actions.append(CreateTask(propose_regenerate(scaffold, constraint)))
+            actions.append(CreateTask(propose_regenerate(
+                scaffold, constraint,
+                regenerate_files=regen_files,
+                prior_scaffold_artifact_id=prior_id)))
             return actions
     return [UpdateSessionStatus(
         session_id=completed.session_id, status=SessionStatus.FAILED)]
+
+
+def _scaffold_failed_files_actions(completed: TaskNode,
+                                   tasks: List[TaskNode]) -> List[RouterAction]:
+    """Regenerate (or terminally fail) a SCAFFOLD that dropped files.
+
+    The SCAFFOLD executor records every file whose generation crashed
+    (e.g. an LLM read timeout) or returned an empty patch under
+    ``outputs.failed`` while still emitting the survivors -- so a partial
+    generation returns *success* with ``failed_count > 0``. Proceeding to
+    APPLY / VERIFY with a required module never written guarantees a
+    downstream collection error the test-repair loop cannot fix: there is
+    nothing to patch because the file is simply absent. Mirroring
+    :func:`_apply_failed_files_actions`, any SCAFFOLD that dropped a file
+    re-scaffolds within :data:`_REGENERATE_BUDGET`, folding the concrete
+    per-file errors into the regenerate constraint so the retry has
+    actionable feedback. When the budget is spent the session ends
+    terminally ``FAILED`` rather than limping forward on a known-incomplete
+    tree. Returns an empty list for a clean scaffold so the dispatcher
+    takes the normal SCAFFOLD -> APPLY edge.
+    """
+    from cgx.session.repair.propose import propose_regenerate  # dep direction
+
+    outputs = completed.outputs or {}
+    failed_count = int(outputs.get("failed_count") or 0)
+    if failed_count <= 0:
+        return []
+    prior_regens = int(completed.inputs.get("regenerate_attempt") or 0)
+    if prior_regens >= _REGENERATE_BUDGET:
+        return [UpdateSessionStatus(
+            session_id=completed.session_id, status=SessionStatus.FAILED)]
+    constraint = _invalid_scaffold_constraint(
+        failed_count, apply_failed=None,
+        scaffold_failed=outputs.get("failed"))
+    regen_files = _failed_scaffold_paths(outputs.get("failed"), None)
+    prior_id = str(outputs.get("scaffold_artifact_id") or "").strip()
+    actions: List[RouterAction] = []
+    skip_states = {TaskNodeStatus.DONE, TaskNodeStatus.FAILED,
+                   TaskNodeStatus.ABANDONED}
+    for t in _collect_descendants(completed.task_id, tasks):
+        if t.status in skip_states:
+            continue
+        actions.append(UpdateTaskStatus(
+            task_id=t.task_id, status=TaskNodeStatus.ABANDONED))
+    actions.append(CreateTask(propose_regenerate(
+        completed, constraint,
+        regenerate_files=regen_files,
+        prior_scaffold_artifact_id=prior_id)))
+    return actions
+
+
+def _scaffold_resume_actions(
+        failed: TaskNode, tasks: List[TaskNode],
+        resume_scaffold_artifact_id: Optional[str]) -> List[RouterAction]:
+    """Re-queue a SCAFFOLD that crashed mid-run to resume from a checkpoint.
+
+    A SCAFFOLD executor checkpoints its SCAFFOLD_PATCHES artifact after
+    every layer, so a crash or timeout leaves the completed files under
+    an incomplete checkpoint. When the runner resolves that checkpoint
+    and threads its id here, and the shared regenerate budget is not
+    spent, abandon any live descendants and re-queue a fresh SCAFFOLD
+    carrying ``resume_scaffold_artifact_id`` -- the new attempt seeds
+    every checkpointed file and regenerates only the remainder, so the
+    completed work is not discarded. The incremented ``regenerate_attempt``
+    doubles as the crash-loop guard: a second crash exhausts the budget
+    and falls through to terminal ``FAILED``. Returns an empty list (the
+    caller then ends the session ``FAILED``) for a non-SCAFFOLD failure,
+    an absent checkpoint, or a spent budget.
+    """
+    from cgx.session.repair.propose import propose_regenerate  # dep direction
+
+    if failed.kind is not TaskKind.SCAFFOLD:
+        return []
+    resume_id = str(resume_scaffold_artifact_id or "").strip()
+    if not resume_id:
+        return []
+    prior_regens = int(failed.inputs.get("regenerate_attempt") or 0)
+    if prior_regens >= _REGENERATE_BUDGET:
+        return []
+    actions: List[RouterAction] = []
+    skip_states = {TaskNodeStatus.DONE, TaskNodeStatus.FAILED,
+                   TaskNodeStatus.ABANDONED}
+    for t in _collect_descendants(failed.task_id, tasks):
+        if t.status in skip_states:
+            continue
+        actions.append(UpdateTaskStatus(
+            task_id=t.task_id, status=TaskNodeStatus.ABANDONED))
+    actions.append(CreateTask(propose_regenerate(
+        failed, {}, resume_scaffold_artifact_id=resume_id)))
+    return actions
 
 
 def _invalid_scaffold_constraint(
@@ -1039,7 +1166,7 @@ def _invalid_scaffold_constraint(
     rationale = (
         "The previous attempt was abandoned because these generated files "
         f"were invalid and dropped before write: {files_blurb}. Regenerate "
-        "the whole tree so every file parses as valid Python: keep decorated "
+        "each dropped file so it parses as valid Python: keep decorated "
         "defs indented inside their class/function body, use consistent "
         "indentation and complete statements, avoid stray or trailing "
         "commas, define every referenced module and symbol, and import only "
@@ -1049,6 +1176,29 @@ def _invalid_scaffold_constraint(
         "rationale": rationale,
         "failed_files": details,
     }
+
+
+def _failed_scaffold_paths(scaffold_failed: object,
+                           apply_failed: object) -> List[str]:
+    """Return the de-duplicated file paths dropped by SCAFFOLD/APPLY.
+
+    Draws from the same two ``{"file", "error"}`` sources as
+    :func:`_invalid_scaffold_constraint` -- the SCAFFOLD's own ``failed``
+    generations and APPLY's ``failed_files`` -- but returns just the
+    paths so the router can hand SCAFFOLD a targeted regenerate set
+    (regenerate only these; reuse every prior-good diff).
+    """
+    out: List[str] = []
+    seen: set = set()
+    for entry in (list(scaffold_failed or []) + list(apply_failed or [])):
+        if not isinstance(entry, dict):
+            continue
+        path = str(entry.get("file") or "").strip()
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        out.append(path)
+    return out
 
 
 def _verify_lesson_actions(completed: TaskNode,

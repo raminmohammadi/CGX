@@ -22,7 +22,9 @@ content to plan a remediation.
 from __future__ import annotations
 
 import ast
+import json
 import logging
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -43,6 +45,7 @@ from cgx.session.tasks.base import (
 logger = logging.getLogger(__name__)
 
 _DEFAULT_TIMEOUT_PER_MODULE = 5.0
+_DEFAULT_BUILD_SMOKE_TIMEOUT = 180.0
 _STDERR_TAIL_CHARS = 800
 
 
@@ -61,17 +64,38 @@ def run_smoke(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     candidates = _collect_third_party_imports(root, applied_files)
     modules: List[Dict[str, Any]] = []
     if not python_exe or not candidates:
-        outcome = "skipped"
+        py_outcome = "skipped"
     else:
         timeout = float(task.inputs.get("timeout_per_module")
                         or _DEFAULT_TIMEOUT_PER_MODULE)
         for pkg in candidates:
             ok, tail = _probe_import(python_exe, pkg, timeout)
             modules.append({"name": pkg, "ok": ok, "stderr_tail": tail})
-        outcome = "passed" if all(m["ok"] for m in modules) else "failed"
+        py_outcome = "passed" if all(m["ok"] for m in modules) else "failed"
+
+    # JS/TS build-smoke: a non-building frontend must fail honestly here
+    # rather than skip through to a false-green VERIFY. Runs ``npm run
+    # build`` (buildability only); VERIFY's ``NpmRunner`` then runs the
+    # ``test`` script. Gated on a provisioned ``node_modules`` (see
+    # BOOTSTRAP_ENV) so an offline box that never installed deps skips
+    # rather than fabricating a build failure.
+    build_smoke = _npm_build_smoke(root, task)
 
     failed = [m["name"] for m in modules if not m["ok"]]
-    signature = _signature(failed) if outcome == "failed" else ""
+    part_outcomes = [py_outcome]
+    if build_smoke is not None:
+        part_outcomes.append("passed" if build_smoke["ok"] else "failed")
+    if "failed" in part_outcomes:
+        outcome = "failed"
+    elif "passed" in part_outcomes:
+        outcome = "passed"
+    else:
+        outcome = "skipped"
+
+    sig_parts = list(failed)
+    if build_smoke is not None and not build_smoke["ok"]:
+        sig_parts.append(build_smoke["label"])
+    signature = _signature(sig_parts) if outcome == "failed" else ""
     content: Dict[str, Any] = {
         "build_artifact_id": task.inputs.get("build_artifact_id"),
         "apply_artifact_id": task.inputs.get("apply_artifact_id"),
@@ -80,6 +104,7 @@ def run_smoke(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         "python_exe": python_exe,
         "applied_files": list(applied_files),
         "modules": modules,
+        "build_smoke": build_smoke,
         "outcome": outcome,
         "failed_modules": failed,
         "failure_signature": signature,
@@ -233,4 +258,62 @@ def _probe_import(python_exe: str, pkg: str,
 def _signature(failed_modules: List[str]) -> str:
     """A stable string keyed on the failing modules for loop detection."""
     return "smoke_import|" + ",".join(sorted(failed_modules))
+
+
+def _npm_build_command(root: Path) -> Optional[List[str]]:
+    """Return the ``npm run build`` invocation, or ``None`` when absent.
+
+    The smoke deliberately probes buildability only (the ``build``
+    script); the ``test`` script is VERIFY's job via ``NpmRunner``, so
+    we never run it twice.
+    """
+    try:
+        data = json.loads(
+            (root / "package.json").read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    scripts = data.get("scripts") if isinstance(data.get("scripts"), dict) else {}
+    if str(scripts.get("build") or ""):
+        return ["npm", "run", "build", "--silent"]
+    return None
+
+
+def _npm_build_smoke(root: Path, task: TaskNode) -> Optional[Dict[str, Any]]:
+    """Run ``npm run build`` as a fast buildability gate for JS/TS projects.
+
+    Returns ``None`` (skip) when there is no ``package.json``, no ``npm``
+    binary, no ``build`` script, or no provisioned ``node_modules`` --
+    the last guard keeps an offline box (deps never installed) from
+    fabricating a build failure. Otherwise returns
+    ``{"label", "ok", "stderr_tail"}`` so a broken build surfaces as a
+    real ``failed`` outcome that routes into REPAIR/REGENERATE.
+    """
+    if not (root / "package.json").is_file():
+        return None
+    if shutil.which("npm") is None:
+        return None
+    if not (root / "node_modules").is_dir():
+        return None
+    cmd = _npm_build_command(root)
+    if cmd is None:
+        return None
+    timeout = float(task.inputs.get("build_smoke_timeout")
+                    or _DEFAULT_BUILD_SMOKE_TIMEOUT)
+    label = " ".join(cmd)
+    try:
+        proc = subprocess.run(
+            cmd, cwd=str(root), capture_output=True, text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        tail = ((exc.stderr or "") + "\n[timeout]")[-_STDERR_TAIL_CHARS:]
+        return {"label": label, "ok": False, "stderr_tail": tail}
+    except Exception as exc:
+        return {"label": label, "ok": False,
+                "stderr_tail": f"{type(exc).__name__}: {exc}"}
+    ok = proc.returncode == 0
+    tail = "" if ok else (proc.stderr or proc.stdout or "")[-_STDERR_TAIL_CHARS:]
+    return {"label": label, "ok": ok, "stderr_tail": tail}
 

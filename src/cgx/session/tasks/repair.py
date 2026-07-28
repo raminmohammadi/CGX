@@ -253,11 +253,14 @@ def _run_smoke_repair(task: TaskNode, deps: ExecutorDeps,
                     "wrong kind (need SMOKE_REPORT)")
     content = dict(smoke_artifact.content or {})
     failed = [str(m) for m in content.get("failed_modules") or []]
+    build_smoke = content.get("build_smoke")
+    build_broke = isinstance(build_smoke, dict) and not build_smoke.get("ok")
     signature = str(content.get("failure_signature") or "").strip()
     if not signature:
         signature = "smoke_import|" + ",".join(sorted(failed))
     attempt = int(task.inputs.get("repair_attempt") or 1)
     classification = "smoke_import_failure"
+    build_stderr = ""
     if failed:
         rationale = (
             f"Third-party import(s) {', '.join(failed)} failed under the "
@@ -266,15 +269,28 @@ def _run_smoke_repair(task: TaskNode, deps: ExecutorDeps,
             "requirements.txt or a transitive version conflict. Phase "
             "3.2 will add a dependency-aware proposer; for now the "
             "router escalates to ASK_USER.")
+    elif build_broke:
+        # JS/TS build-smoke break: the frontend does not build. There is
+        # no dependency to pin; re-authoring the offending files is the
+        # only fix, so fold the build error into the regenerate feedback.
+        build_stderr = str(build_smoke.get("stderr_tail") or "")
+        label = str(build_smoke.get("label") or "npm run build")
+        rationale = (
+            f"The JS/TS build-smoke (`{label}`) failed: the applied "
+            "frontend does not build. Re-author the failing file(s) to "
+            "fix the reported build error.")
     else:
         rationale = (
             "SMOKE reported a failure but no failed modules were "
             "recorded; escalating to ASK_USER.")
-    extra_constraints = {
+    extra_constraints: Dict[str, Any] = {
         "kind": "smoke_import_failure",
         "failed_modules": failed,
         "rationale": rationale,
     }
+    if build_broke:
+        extra_constraints["kind"] = "invalid_build_smoke"
+        extra_constraints["build_error"] = build_stderr
     artifact = Artifact.new(
         session_id=task.session_id,
         produced_by_task_id=task.task_id,

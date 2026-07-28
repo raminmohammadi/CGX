@@ -319,15 +319,26 @@ def _goal_is_change(goal: str) -> bool:
     Combines :func:`cgx.answer.intent.detect_intent` (authoritative when it
     returns ``"change_plan"``) with a verb-based heuristic so we still
     recognise change requests when the classifier is uncertain.
+
+    An explicit change verb (``add``/``refactor``/``fix``/...) is decisive.
+    Absent one, a forward-looking *exploratory* ask ("improve X", "suggest
+    ways to ...", "recommend optimizations") is treated as read-only even
+    when the fuzzy classifier labels it ``change_plan`` -- those are ideation
+    goals routed through the exploratory clarify path, and misrouting them as
+    a code change strips their softened criteria and clarify prompt.
     """
     if not goal:
+        return False
+    if _CHANGE_VERB_RE.search(goal) is not None:
+        return True
+    if _EXPLORATORY_RE.search(goal) is not None and not _goal_is_scaffold(goal):
         return False
     try:
         if detect_intent(goal) == "change_plan":
             return True
     except Exception:
         pass
-    return _CHANGE_VERB_RE.search(goal) is not None
+    return False
 
 
 def _goal_is_verify_only(goal: str) -> bool:
@@ -355,9 +366,11 @@ def _goal_is_exploratory(goal: str) -> bool:
     """
     if not goal:
         return False
-    if _goal_is_change(goal) or _goal_is_verify_only(goal):
+    if _EXPLORATORY_RE.search(goal) is None:
         return False
-    return _EXPLORATORY_RE.search(goal) is not None
+    if _goal_is_change(goal) or _goal_is_verify_only(goal) or _goal_is_scaffold(goal):
+        return False
+    return True
 
 
 # Engine mode name used for exploratory ASK tasks. Defined here so the

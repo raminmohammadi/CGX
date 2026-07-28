@@ -1819,10 +1819,11 @@ def test_plan_capability_strips_target_files_and_folds_into_task_text(monkeypatc
     monkeypatch.setattr(
         "cgx.answer.engine.generate_code_plan", fake_generate_code_plan,
     )
-    # Avoid touching the on-disk symbol map.
+    # Avoid touching the on-disk symbol map. The real helper accepts a
+    # ``target_file`` kwarg (proximity sorting); the stub must mirror that.
     monkeypatch.setattr(
         "cgx.codegen.symbol_map.build_symbol_context_prompt",
-        lambda _p: "",
+        lambda _p, target_file=None: "",
     )
 
     caps = _build_default_capabilities(

@@ -26,6 +26,7 @@ import time
 from typing import Any, Dict, Optional
 
 from cgx.session.models import (
+    ArtifactKind,
     Decision,
     Session,
     SessionMode,
@@ -342,10 +343,41 @@ class SessionRunner:
         """
         self._mark_failed(session, task, message)
         tasks_after = self._store.list_tasks(session.session_id)
+        resume_id = self._resume_checkpoint_id(session, task)
         plan = self._router.on_task_failed(
-            session=session, failed=task, tasks=tasks_after)
+            session=session, failed=task, tasks=tasks_after,
+            resume_scaffold_artifact_id=resume_id)
         self._apply_plan(session, plan)
         return task
+
+    def _resume_checkpoint_id(self, session: Session,
+                              task: TaskNode) -> Optional[str]:
+        """Return the id of ``task``'s incomplete SCAFFOLD checkpoint, if any.
+
+        A SCAFFOLD executor upserts its SCAFFOLD_PATCHES artifact after
+        every layer (B4), so a crash mid-run leaves an incomplete
+        checkpoint (``content.complete`` falsy) whose ``produced_by_task_id``
+        is the crashed task. Resolving it here lets the IO-free router
+        decide whether to resume from it rather than discard the completed
+        files. Returns ``None`` for a non-SCAFFOLD task or when no
+        incomplete checkpoint exists (a clean crash with nothing written).
+        """
+        if task.kind is not TaskKind.SCAFFOLD:
+            return None
+        try:
+            artifacts = self._store.list_artifacts(session.session_id)
+        except Exception:  # pragma: no cover - defensive: store best-effort
+            logger.exception("runner: list_artifacts failed resolving resume")
+            return None
+        for art in artifacts:
+            if art.produced_by_task_id != task.task_id:
+                continue
+            if art.kind is not ArtifactKind.SCAFFOLD_PATCHES:
+                continue
+            if (art.content or {}).get("complete"):
+                continue
+            return art.artifact_id
+        return None
 
     def _apply_plan(self, session: Session, plan: RouterPlan) -> None:
         """Apply the router's actions to the store, in order.

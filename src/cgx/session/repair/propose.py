@@ -511,6 +511,10 @@ def _build_requirements_diff(
 def propose_regenerate(
     scaffold_task: TaskNode,
     new_constraints: Dict[str, Any],
+    *,
+    regenerate_files: Optional[Sequence[str]] = None,
+    prior_scaffold_artifact_id: Optional[str] = None,
+    resume_scaffold_artifact_id: Optional[str] = None,
 ) -> TaskNode:
     """Return a sibling SCAFFOLD task with ``new_constraints`` folded in.
 
@@ -532,6 +536,29 @@ def propose_regenerate(
       was abandoned, useful for the UI and for cross-session learning
       (Phase 7).
 
+    When ``regenerate_files`` and ``prior_scaffold_artifact_id`` are both
+    supplied (the failed-files router splices), two more keys direct
+    SCAFFOLD to a *targeted* regeneration: only the named paths are
+    re-generated while every prior-good diff from
+    ``prior_scaffold_artifact_id`` is reused verbatim. This keeps the
+    blast radius proportional to the failure instead of re-running the
+    whole manifest (which also risks re-breaking files that were fine):
+
+    * ``regenerate_files`` -- the concrete paths to re-generate.
+    * ``prior_scaffold_artifact_id`` -- the SCAFFOLD_PATCHES artifact
+      whose good diffs are reused for every other file.
+
+    Absent those (a whole-tree regenerate, e.g. a REPAIR-classified
+    logic failure), any stale targeted markers copied from the prior
+    inputs are cleared so the next attempt regenerates the full tree.
+
+    When ``resume_scaffold_artifact_id`` is supplied (the crash-resume
+    router path for a SCAFFOLD that died mid-run), it is stamped into
+    ``inputs`` so the fresh SCAFFOLD seeds every file the crashed attempt
+    already checkpointed and regenerates only the remainder. It is
+    orthogonal to the targeted-regenerate markers and cleared when absent
+    so a stale pointer cannot resurrect a wrong checkpoint.
+
     The function is intentionally pure: it does no I/O and returns a
     fresh :class:`TaskNode` the router can wrap in a ``CreateTask``
     alongside the matching ``UpdateTaskStatus(ABANDONED)`` actions for
@@ -545,6 +572,20 @@ def propose_regenerate(
     inputs["regenerate_attempt"] = (
         int(inputs.get("regenerate_attempt") or 0) + 1)
     inputs["regenerated_from_task_id"] = scaffold_task.task_id
+    targeted = [str(p).strip() for p in (regenerate_files or [])
+                if str(p).strip()]
+    if targeted and prior_scaffold_artifact_id:
+        inputs["regenerate_files"] = targeted
+        inputs["prior_scaffold_artifact_id"] = str(prior_scaffold_artifact_id)
+    else:
+        # Whole-tree regenerate: drop any targeted markers copied from the
+        # prior inputs so a later attempt cannot silently skip files.
+        inputs.pop("regenerate_files", None)
+        inputs.pop("prior_scaffold_artifact_id", None)
+    if resume_scaffold_artifact_id:
+        inputs["resume_scaffold_artifact_id"] = str(resume_scaffold_artifact_id)
+    else:
+        inputs.pop("resume_scaffold_artifact_id", None)
     return TaskNode.new(
         session_id=scaffold_task.session_id,
         kind=TaskKind.SCAFFOLD,

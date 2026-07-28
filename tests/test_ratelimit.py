@@ -124,6 +124,44 @@ def test_request_with_retry_raises_after_persistent_exception():
     assert len(calls) == 3
 
 
+def test_request_with_retry_skips_non_retryable_exception():
+    """A predicate returning False short-circuits the retry budget."""
+    calls = []
+
+    def f():
+        calls.append(1)
+        raise RuntimeError("do not retry me")
+
+    with pytest.raises(RuntimeError):
+        request_with_retry(
+            f,
+            max_retries=5,
+            sleep=lambda _s: None,
+            retryable=lambda e: not isinstance(e, RuntimeError),
+        )
+    # Non-retryable → exactly one attempt, no backoff sleeps consumed.
+    assert len(calls) == 1
+
+
+def test_request_with_retry_predicate_still_retries_matching_exception():
+    """A predicate returning True keeps the normal retry behaviour."""
+    calls = []
+
+    def f():
+        calls.append(1)
+        raise ValueError("transient")
+
+    with pytest.raises(ValueError):
+        request_with_retry(
+            f,
+            max_retries=2,
+            sleep=lambda _s: None,
+            retryable=lambda e: isinstance(e, ValueError),
+        )
+    # 1 initial + 2 retries = 3 attempts.
+    assert len(calls) == 3
+
+
 def test_provider_kwargs_passthrough_does_not_break_old_callers():
     """Verify the new rate_limit / max_retries kwargs are accepted but optional."""
     from cgx.answer.providers import OllamaProvider, OpenAICompatProvider
@@ -131,8 +169,10 @@ def test_provider_kwargs_passthrough_does_not_break_old_callers():
     b = OllamaProvider(rate_limit=5.0, max_retries=2)
     c = OpenAICompatProvider(model="x", base_url="http://x")
     d = OpenAICompatProvider(model="x", base_url="http://x", rate_limit=1, max_retries=0)
-    # Internal handles exist and are correctly typed.
-    assert a._limiter is None and a._max_retries == 0
+    # Internal handles exist and are correctly typed. Ollama keeps no limiter
+    # by default but carries a small retry budget so a cold-load read timeout
+    # or transient reset recovers instead of failing on the first hiccup.
+    assert a._limiter is None and a._max_retries == 2
     assert b._limiter is not None and b._max_retries == 2
     # OpenAI compat default keeps 3 retries.
     assert c._max_retries == 3 and c._limiter is None

@@ -3263,6 +3263,26 @@ def generate_single_scaffold_file(
         except Exception as e:
             syntax_ok = False
             syntax_error = f"TOML parse error: {e}"
+    elif syntax_ok and ext in _JS_TS_GRAMMAR_BY_EXT and content:
+        # Symmetric with the .py/.json gates above, for the JS/TS/JSX/Vue
+        # family. A frontend file that fails to parse (unbalanced JSX, a
+        # dangling brace) is otherwise silently dropped by APPLY's syntax
+        # gate, leaving the app without its entry component -- the
+        # build-smoke then fails downstream with no way to self-correct in
+        # SCAFFOLD. Degrades to a no-op when the tree-sitter grammar is
+        # unavailable (validate_js_ts_source returns ok=True with a skip).
+        from cgx.codegen.validate import validate_js_ts_source
+        _grammar = _JS_TS_GRAMMAR_BY_EXT[ext]
+        diag = validate_js_ts_source(path, content, _grammar)
+        if not diag.ok:
+            retry = _regenerate_scaffold_file(
+                provider, system, context, budget,
+                _SYNTAX_RETRY_INSTR.format(lang=_grammar, error=diag.error))
+            if retry and validate_js_ts_source(path, retry, _grammar).ok:
+                content = retry
+            else:
+                syntax_ok = False
+                syntax_error = diag.error
 
     # Extension/content mismatch check: a 3B model frequently emits Vue
     # SFC content under a .jsx path, or vice versa. These heuristics catch
@@ -3522,6 +3542,19 @@ def _symbol_retry_instruction(violations: List[Dict[str, Any]]) -> str:
         "Return the COMPLETE, corrected file. Import ONLY symbols that "
         "actually exist in those modules (listed above) and call their "
         "real API. Do NOT invent names or add markdown fences.")
+
+
+# Extension -> tree-sitter grammar name for the JS/TS/Vue family. Mirrors
+# ``cgx.codegen.validate._JS_TS_LANGS`` (plus ``vue``) so the inline scaffold
+# syntax gate covers exactly the frontend files APPLY's own gate would
+# otherwise silently drop. The grammar name doubles as the retry-instruction
+# language label.
+_JS_TS_GRAMMAR_BY_EXT = {
+    "js": "javascript", "jsx": "javascript",
+    "mjs": "javascript", "cjs": "javascript",
+    "ts": "typescript", "mts": "typescript", "cts": "typescript",
+    "tsx": "tsx", "vue": "vue",
+}
 
 
 _SYNTAX_RETRY_INSTR = (

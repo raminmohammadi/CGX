@@ -15,6 +15,13 @@ from cgx.answer.schemas import to_gemini_schema, to_openai_response_format
 
 DEFAULT_TIMEOUT = float(os.environ.get("CGX_HTTP_TIMEOUT", "120"))
 
+# Local Ollama generation of a whole file with a mid-size model routinely
+# exceeds the 120s remote default -- especially on the first request after a
+# cold model load, where the read blocks while weights page into VRAM. Give
+# the local server a more generous read budget so a single generation attempt
+# does not trip the timeout mid-answer.
+DEFAULT_OLLAMA_TIMEOUT = float(os.environ.get("CGX_OLLAMA_TIMEOUT", "300"))
+
 # Transport-layer requests exceptions that are typically transient: a TLS
 # handshake hiccup, a proxy reset, or a momentary timeout. Re-attempting the
 # request with backoff is usually enough to recover. Server-side errors
@@ -101,18 +108,19 @@ class OllamaProvider(LLMProvider):
         self,
         model: str = "qwen2.5-coder:3b",
         base_url: str = "http://localhost:11434",
-        timeout: float = DEFAULT_TIMEOUT,
+        timeout: float = DEFAULT_OLLAMA_TIMEOUT,
         extra_options: Optional[Dict[str, Any]] = None,
         rate_limit: Optional[float] = None,
-        max_retries: int = 0,
+        max_retries: int = 2,
     ) -> None:
         self.model = model
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.extra_options = extra_options or {}
-        # Rate limiting + retry are opt-in. Ollama is local by default so the
-        # defaults here are no-ops; remote OpenAI-compatible setups typically
-        # want a small ``rate_limit`` and ``max_retries=3``.
+        # Rate limiting stays opt-in (no limiter unless ``rate_limit`` is set).
+        # A small retry budget is on by default so a cold-load read timeout or
+        # a momentary connection reset recovers instead of failing the task on
+        # the first transport hiccup.
         self._limiter = _build_limiter(rate_limit)
         self._max_retries = max(0, int(max_retries))
 
@@ -149,6 +157,11 @@ class OllamaProvider(LLMProvider):
                 lambda: requests.post(url, json=payload, timeout=self.timeout),
                 limiter=self._limiter,
                 max_retries=self._max_retries,
+                # A read timeout means the local server is already generating and
+                # simply slower than ``self.timeout`` -- re-issuing the POST only
+                # queues another full-length generation. Fail fast on that case
+                # while still recovering from transient connect/SSL/reset errors.
+                retryable=lambda e: not isinstance(e, requests.exceptions.ReadTimeout),
             )
 
         resp = _post()
