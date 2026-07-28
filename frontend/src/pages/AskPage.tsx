@@ -35,12 +35,6 @@ export default function AskPage() {
 
   const threadRef = useRef<HTMLDivElement | null>(null);
   const draftRef = useRef<HTMLTextAreaElement | null>(null);
-  // send() creates a brand-new session on the first question, which flips
-  // selectedSessionId and would otherwise trigger the loader effect below --
-  // clobbering the just-appended (optimistic) user + assistant messages with
-  // the still-empty server history (messages persist only at stream end). This
-  // ref suppresses exactly that one self-inflicted reload.
-  const skipNextSessionLoad = useRef(false);
 
   // On mount: if busy but no live connection, stream finished while we were away.
   useEffect(() => {
@@ -57,15 +51,18 @@ export default function AskPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Load session messages when sidebar picks a session.
+  // Load session messages when the selected session changes to one we haven't
+  // loaded yet. The ask store is a module-level singleton that keeps streaming
+  // across tab switches, so on remount we must NOT re-fetch and clobber the
+  // messages already in the store for this session -- mid-stream the server
+  // has nothing persisted yet, so a re-fetch would blank the in-flight answer.
+  // Keying on the store's own sessionId also covers the brand-new session that
+  // send() creates, so no separate skip-flag is needed.
   useEffect(() => {
-    if (skipNextSessionLoad.current) {
-      skipNextSessionLoad.current = false;
-      return;
-    }
     let alive = true;
     (async () => {
       if (!selectedSessionId) { resetAsk(); return; }
+      if (useTasks.getState().ask.sessionId === selectedSessionId) return;
       try {
         const items = await api.sessionMessages(selectedSessionId);
         if (!alive) return;
@@ -77,7 +74,7 @@ export default function AskPage() {
             sources: (m.meta as any)?.sources,
             intent: (m.meta as any)?.intent,
           }));
-        setAsk({ messages: conv });
+        setAsk({ messages: conv, sessionId: selectedSessionId });
       } catch {
         if (alive) resetAsk();
       }
@@ -99,10 +96,6 @@ export default function AskPage() {
   const startSession = useCallback(async () => {
     try {
       const s = await api.createSession();
-      // Skip the loader effect that this session switch is about to fire:
-      // the new session has no persisted messages yet, and send() is about to
-      // append the optimistic ones we must not overwrite.
-      skipNextSessionLoad.current = true;
       setSelectedSession(s.id);
       return s.id;
     } catch {
@@ -131,6 +124,9 @@ export default function AskPage() {
 
     let sid = selectedSessionId;
     if (!sid) sid = await startSession();
+    // Tag the store with the session these messages belong to so the loader
+    // effect won't re-fetch and wipe them when we navigate back to this tab.
+    if (sid) setAsk({ sessionId: sid });
 
     appendAskMessage({ role: "user", content: text });
     appendAskMessage({ role: "assistant", content: "", streaming: true, thought: "" });
@@ -335,6 +331,39 @@ function AskBar({
           className="flex-1 bg-transparent outline-none text-sm text-white py-1
                      resize-none placeholder-slate-500 max-h-48 leading-relaxed"
         />
+        <button
+          type="button"
+          onClick={onToggleThink}
+          aria-pressed={think}
+          title={
+            think
+              ? (thinkSupported
+                  ? "Thinking on — model reasons before answering. Click to turn off."
+                  : `Thinking on, but ${model || "this model"} has no reasoning phase, so it won't take effect. Click to turn off.`)
+              : "Thinking off — answers directly (faster). Click to turn on."
+          }
+          className={
+            "shrink-0 self-stretch inline-flex items-center gap-1.5 px-3 rounded-xl text-xs font-mono border transition " +
+            (think
+              ? (thinkSupported
+                  ? "bg-purple-500/15 text-purple-300 border-purple-500/40 shadow-[0_0_16px_-6px_rgba(168,85,247,0.7)]"
+                  : "bg-amber-500/15 text-amber-300 border-amber-500/40")
+              : "bg-slate-900 text-slate-300 border-white/10 hover:text-purple-300 hover:border-purple-500/40")
+          }
+        >
+          <Brain className="h-3.5 w-3.5" />
+          <span>Thinking</span>
+          <span
+            className={
+              "px-1.5 py-px rounded-sm text-[10px] font-semibold " +
+              (think
+                ? (thinkSupported ? "bg-purple-500/25 text-purple-200" : "bg-amber-500/25 text-amber-200")
+                : "bg-slate-800 text-slate-400")
+            }
+          >
+            {think ? (thinkSupported ? "on" : "on*") : "off"}
+          </span>
+        </button>
         {busy ? (
           <button
             onClick={onCancel}
@@ -357,30 +386,11 @@ function AskBar({
       </div>
       <div className="flex items-center justify-between mt-1.5 px-1">
         <div className="flex items-center gap-3 min-w-0">
-          <button
-            type="button"
-            onClick={thinkSupported ? onToggleThink : undefined}
-            disabled={!thinkSupported}
-            title={
-              thinkSupported
-                ? (think ? "Thinking on — model sketches its approach first" : "Thinking off — answers directly (faster)")
-                : `${model || "This model"} has no reasoning phase`
-            }
-            className={
-              "inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-mono border transition " +
-              (!thinkSupported
-                ? "opacity-40 cursor-not-allowed border-white/5 text-slate-600"
-                : think
-                  ? "bg-purple-500/15 text-purple-300 border-purple-500/30"
-                  : "bg-slate-900 text-slate-400 border-white/5 hover:text-purple-300 hover:border-purple-500/30")
-            }
-          >
-            <Brain className="h-3 w-3" />
-            <span>Thinking</span>
-            <span className={think && thinkSupported ? "text-purple-300" : "text-slate-600"}>
-              {think && thinkSupported ? "on" : "off"}
+          {think && !thinkSupported && (
+            <span className="text-[10px] text-amber-400/80 font-mono">
+              on* — {model || "this model"} has no reasoning phase; Thinking won't take effect
             </span>
-          </button>
+          )}
           <p className="text-[10px] text-slate-500 font-mono">
             <kbd className="px-1 py-px rounded bg-slate-900 border border-white/5 text-slate-400">Enter</kbd>
             {" "}to send ·{" "}
