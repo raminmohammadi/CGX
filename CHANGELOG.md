@@ -2,6 +2,51 @@
 
 All notable changes are documented here. Versions follow semver-ish.
 
+## Unreleased -- Deterministic endpoint enumeration (schema v5)
+
+Counting/listing questions about the HTTP surface ("how many API
+endpoints does X have?", "list all routes") are now answered
+deterministically instead of through semantic ranking. The truth is an
+aggregate scattered across many route-decorator chunks, so ranking
+surfaced a handful and produced wrong counts.
+
+At parse time, `parse_codebase._detect_route` recognizes FastAPI / Flask /
+Starlette-style route decorators (`@app.get('/x')`, `@router.post(...)`,
+`@app.websocket('/ws')`, `@app.route('/y', methods=[...])`) on
+functions/methods and stamps `chunk.meta['route'] = {"methods": [...],
+"path": str|None}`. Each record mirrors this into a `route` field.
+
+`detect_intent` gains an `enumerate` mode (an enumeration cue *and* an
+api/endpoint/route keyword). The new `cgx.answer.enumeration` module
+filters route-bearing records (optionally scoped to a subject term drawn
+from the question), dedupes, and renders an exact count + list.
+`_prepare_answer_request` short-circuits to this result for both the
+blocking and streaming answer paths when endpoints are found, and falls
+through to normal grounded answering otherwise.
+
+**Re-index advisory:** `SCHEMA_VERSION` is bumped `4 -> 5`. v4 indices
+lack `route` and cannot be enumerated; rebuild to gain endpoint counting.
+
+## Unreleased -- Documentation ingestion + record provenance (schema v4)
+
+Standalone documentation (`README.md`, `docs/*.md`, design notes, `.rst`)
+is now first-class in the index. A pure-python `MarkdownParser`
+(`.md` / `.markdown` / `.mdx` / `.rst`) splits each doc file on its
+headings (ATX `#` and setext underlines) and emits one `doc` chunk per
+section plus a `file` chunk for the repo map; it needs no optional
+dependency, so it is always registered. Vendored doc trees are pruned by
+the same `.gitignore` / `DEFAULT_IGNORE_DIRS` / size-cap path as source
+files, with `_site` and `.docusaurus` added to the default ignore list.
+
+Every record now carries a `source_kind` (`"code"` | `"doc"`) mirrored
+from `chunk.meta['source_kind']`, so retrieval / answer layers can
+attribute and weight prose against code; `source_kind` is echoed into
+the BM25 corpus rows as well.
+
+**Re-index advisory:** `SCHEMA_VERSION` is bumped `3 -> 4`. v3 indices
+lack `source_kind` and contain no documentation content; readers should
+rebuild to pick up the new field and index their docs.
+
 ## Unreleased -- Session-based Agent (Phases 0-4) + Greenfield loop
 
 A ground-up rewrite of the Agent surface around a **persistent,

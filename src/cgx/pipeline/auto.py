@@ -19,6 +19,7 @@ actually use lexical and graph expansion at query time.
 """
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import os
@@ -45,6 +46,11 @@ from cgx.trace import traced
 from networkx.readwrite import json_graph
 
 
+def _now_iso() -> str:
+    """Local, timezone-aware completion timestamp for the index manifest."""
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
 def _ensure_tuple_parse(res):
     """Support both parse_codebase(project_root)->chunks and ->(chunks, calls)."""
     if isinstance(res, tuple) and len(res) >= 1:
@@ -69,6 +75,16 @@ def _encode_with_embedder(embedder: Any, rows: List[Dict[str, Any]], *, normaliz
     return embs
 
 
+class IndexBuildCancelled(Exception):
+    """Raised inside :func:`run_index_auto` when a caller flips ``cancel_event``.
+
+    The build polls the event at stage boundaries (parse / graph / embed /
+    persist) so a Ctrl-C in the dashboard stops promptly and -- crucially --
+    *before* any index files are written, so a cancelled build never leaves a
+    half-written ``.cgx/index`` that later looks "ready".
+    """
+
+
 def run_index_auto(
     project_root: str,
     out_dir: str,
@@ -79,6 +95,7 @@ def run_index_auto(
     batch_size: int = 64,
     embedder: Optional[Any] = None,
     incremental: bool = True,
+    cancel_event: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     Build two-view FAISS indices and persist alongside records and graph/chunks.
@@ -89,8 +106,16 @@ def run_index_auto(
         Optional object exposing ``.encode(list[str]) -> np.ndarray``. When
         provided it takes precedence over ``model_name`` and bypasses
         ``build_embeddings`` (useful for BYO encoders / tests / mocks).
+    cancel_event
+        Optional ``threading.Event``; when set, the build raises
+        :class:`IndexBuildCancelled` at the next stage boundary.
     """
     os.makedirs(out_dir, exist_ok=True)
+
+    def _ck() -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise IndexBuildCancelled("index build cancelled")
+
     logger.info("=== run_index_auto starting ===")
     logger.info("project_root=%s out_dir=%s metric=%s index_type=%s model=%s",
                 project_root, out_dir, metric, index_type, model_name)
@@ -110,13 +135,16 @@ def run_index_auto(
     else:
         chunks, calls = _ensure_tuple_parse(parse_codebase(project_root))
     logger.info("Parsed codebase: %d chunks, %d calls", len(chunks), len(calls or []))
+    _ck()
 
     G = build_knowledge_graph(chunks, calls)
     logger.info("Knowledge graph built: %d nodes, %d edges", G.number_of_nodes(), G.number_of_edges())
+    _ck()
 
     # ---------------- Records + Corpus ----------------
     records = make_index_records(chunks, G)
     logger.info("make_index_records produced %d records", len(records))
+    _ck()
 
     try:
         corpus = prepare_embedding_corpus(records, which=which)
@@ -147,6 +175,7 @@ def run_index_auto(
     def _build_view(view_name: str, rows: List[Dict[str, Any]]):
         """Embed + index one corpus view; returns (view_name, index_dict, cache_stats)."""
         logger.info("Building index for view=%s (rows=%d)", view_name, len(rows))
+        _ck()
         if not rows:
             logger.warning("No rows for view=%s, skipping", view_name)
             return view_name, {
@@ -225,9 +254,29 @@ def run_index_auto(
                 indices["views"][vn] = view_dict
                 if vstats:
                     cache_stats_per_view[vn] = vstats
+            except IndexBuildCancelled:
+                # Cancellation is expected control flow, not a build failure:
+                # propagate quietly so the caller can stop without a scary trace.
+                raise
             except Exception as e:
                 logger.error("View %s failed: %s", view_name, e, exc_info=True)
                 raise
+
+    # A Ctrl-C between the last view finishing and the writes below must still
+    # abort before any index file is persisted, so a cancelled build never
+    # leaves a half-written index dir that later looks "ready".
+    _ck()
+
+    # Stamp provenance onto the index dict so save_indices records which model
+    # built it (and when / for which project). A later query reads this back to
+    # pick the matching embedder and to catch a dim mismatch up front.
+    indexed_at = _now_iso()
+    embed_model = getattr(embedder, "model_name", None) or model_name
+    indices["embed_model"] = embed_model
+    indices["index_type"] = index_type
+    indices["project_root"] = os.path.abspath(project_root)
+    indices["indexed_at"] = indexed_at
+    indices["counts"] = {k: len(v) for k, v in per_view.items()}
 
     # ---------------- Persist ----------------
     try:
@@ -274,6 +323,8 @@ def run_index_auto(
 
     result = {
         "counts": {k: len(v) for k, v in per_view.items()},
+        "embed_model": embed_model,
+        "indexed_at": indexed_at,
         "out": {
             "indices": os.path.join(out_dir, "indices"),
             "records": os.path.join(out_dir, "records.jsonl"),
@@ -354,6 +405,17 @@ def run_query_auto(
             G = None
 
     if embedder is None or not hasattr(embedder, "encode"):
+        # The index manifest records which model built it. When no explicit
+        # embedder is supplied, trust that model over the caller's default so a
+        # query never embeds with the wrong dim (the 768-vs-1024 crash). A BYO
+        # embedder is respected as-is; the caller owns that choice.
+        stored_model = indices.get("embed_model")
+        if stored_model and stored_model != model_name:
+            logger.info(
+                "run_query_auto: overriding embed model %r -> %r (from index meta)",
+                model_name, stored_model,
+            )
+            model_name = stored_model
         embedder = BuildEmbedder(model_name=model_name, batch_size=64, normalize=True)
 
     # Reuse a path-keyed LexicalIndex across queries to avoid rebuilding BM25

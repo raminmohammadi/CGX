@@ -6,6 +6,7 @@ from __future__ import annotations
 import ast
 import io
 import os
+import re
 import tokenize
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 import pathspec
@@ -34,6 +35,8 @@ DEFAULT_IGNORE_DIRS = (
     "node_modules",
     "build", "dist", ".eggs", "site-packages",
     ".idea", ".vscode",
+    # Generated static-site / docs output (near-universally vendored artefacts).
+    "_site", ".docusaurus",
 )
 
 # Glob patterns (gitignore-style) applied to repo-relative paths.
@@ -358,6 +361,52 @@ def _build_file_code_stub(module_doc: Optional[str], members: Dict[str, List[Dic
     return "\n".join(parts)
 
 
+# Web-route decorator recognition (FastAPI / Flask / Starlette style).
+# ``decorators`` are already unparsed strings such as ``app.get('/x')`` or
+# ``router.route('/y', methods=['GET', 'POST'])``. We only need the HTTP
+# verb(s) and the path literal; the receiver name (app/router/bp/…) is
+# irrelevant so any dotted attribute call is accepted.
+_ROUTE_VERB_RE = re.compile(
+    r"\.(get|post|put|delete|patch|head|options|websocket|route|api_route)\s*\(",
+    re.IGNORECASE,
+)
+_ROUTE_STR_ARG_RE = re.compile(r"""\(\s*(?:r|f|rf|fr)?['"]([^'"]*)['"]""")
+_ROUTE_METHODS_KW_RE = re.compile(r"methods\s*=\s*[\[\(]([^\]\)]*)[\]\)]", re.IGNORECASE)
+_ROUTE_METHOD_TOKEN_RE = re.compile(r"""['"]([A-Za-z]+)['"]""")
+
+
+def _detect_route(decorators: List[str]) -> Optional[Dict[str, Any]]:
+    """Return ``{"methods": [...], "path": str|None}`` for the first decorator
+    that looks like a web-route registration, else ``None``.
+
+    Recognizes verb decorators (``@app.get('/x')`` → ``["GET"]``),
+    ``@app.websocket('/ws')`` → ``["WEBSOCKET"]`` and Flask-style
+    ``@app.route('/y', methods=['GET','POST'])`` (defaults to ``["GET"]``
+    when ``methods=`` is absent). Deterministic and side-effect free.
+    """
+    for dec in decorators or []:
+        if not isinstance(dec, str):
+            continue
+        m = _ROUTE_VERB_RE.search(dec)
+        if not m:
+            continue
+        verb = m.group(1).lower()
+        path_m = _ROUTE_STR_ARG_RE.search(dec)
+        path = path_m.group(1) if path_m else None
+        if verb in ("route", "api_route"):
+            kw = _ROUTE_METHODS_KW_RE.search(dec)
+            methods = (
+                [t.upper() for t in _ROUTE_METHOD_TOKEN_RE.findall(kw.group(1))]
+                if kw else ["GET"]
+            )
+        elif verb == "websocket":
+            methods = ["WEBSOCKET"]
+        else:
+            methods = [verb.upper()]
+        return {"methods": methods or ["GET"], "path": path}
+    return None
+
+
 def _parse_python_module(
     filepath: str,
     source_code: str,
@@ -601,6 +650,7 @@ def _parse_python_module(
 
             meta: Dict[str, Any] = {
                 "decorators": decorators,
+                "route": _detect_route(decorators),
                 "method_kind": method_kind,
                 "is_async": bool(is_async or isinstance(node, ast.AsyncFunctionDef)),
                 "is_method": bool(effective_is_method),
@@ -1233,6 +1283,16 @@ def _register_default_parsers() -> None:
     inst = PythonASTParser()
     for ext in inst.extensions:
         _PARSER_REGISTRY[ext] = inst
+
+    # Markdown / RST docs. Pure-python (no optional dep), so always registered:
+    # standalone documentation carries intent/rationale that code omits. Vendored
+    # doc trees are still pruned by .gitignore, DEFAULT_IGNORE_DIRS and the size
+    # cap, exactly as for source files.
+    from cgx.parser.markdown_parser import MarkdownParser
+
+    md = MarkdownParser()
+    for ext in md.extensions:
+        _PARSER_REGISTRY[ext] = md
 
     # Multi-language parsers are gated on the optional tree-sitter dependency.
     # Each is registered only when its grammar can actually be loaded so that,

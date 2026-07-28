@@ -189,6 +189,16 @@ def test_map_event_index_result_shows_counts():
     assert instr.op == "line" and "index ready" in instr.text
 
 
+def test_map_event_index_result_shows_model_and_timestamp():
+    # The success line surfaces which model built the index and when, so the
+    # user can confirm the build actually completed (not just started).
+    payload = {"embed_model": "test/model", "indexed_at": "2026-07-14T18:00:00",
+               "summary": {"counts": {"intent": 5}}}
+    instr = ops.map_event("result", payload, enabled=False)
+    assert instr.op == "line"
+    assert "test/model" in instr.text and "2026-07-14T18:00:00" in instr.text
+
+
 def test_map_event_summary_extracts_answer_md():
     payload = {"plan": {"tasks": [
         {"kind": "search", "output": {}},
@@ -262,3 +272,47 @@ def test_printer_line_writes_through_injected_writer():
     printer, lines = _collect_printer()
     printer.line("hello world")
     assert "hello world\n" in lines
+
+
+# --- index discovery: completion marker + manifest -------------------
+
+def _write_completed_index(project_root: str, **meta) -> str:
+    """Create a minimal *completed* index layout under ``.cgx/index``."""
+    out_dir = ops.default_out_dir(project_root)
+    index_dir, records = ops.index_paths(out_dir)
+    os.makedirs(index_dir, exist_ok=True)
+    import json
+    with open(os.path.join(index_dir, "meta.json"), "w", encoding="utf-8") as f:
+        json.dump(meta or {"schema_version": 3}, f)
+    with open(records, "w", encoding="utf-8") as f:
+        f.write("{}\n")
+    return index_dir
+
+
+def test_find_existing_index_requires_meta_marker(tmp_path):
+    proj = str(tmp_path)
+    # Only records.jsonl (a cancelled build) -> not ready.
+    index_dir, records = ops.index_paths(ops.default_out_dir(proj))
+    os.makedirs(index_dir, exist_ok=True)
+    with open(records, "w", encoding="utf-8") as f:
+        f.write("{}\n")
+    assert ops.find_existing_index(proj) is None
+    # Adding meta.json (written last by save_indices) makes it ready.
+    _write_completed_index(proj)
+    assert ops.find_existing_index(proj) is not None
+
+
+def test_index_info_reads_manifest(tmp_path):
+    proj = str(tmp_path)
+    _write_completed_index(proj, embed_model="m", indexed_at="t", counts={"intent": 3})
+    info = ops.index_info(proj)
+    assert info["embed_model"] == "m" and info["indexed_at"] == "t"
+    assert info["counts"] == {"intent": 3}
+
+
+def test_probe_status_shows_build_time_and_model(tmp_path):
+    proj = str(tmp_path)
+    _write_completed_index(proj, embed_model="jina", indexed_at="2026-07-14T18:00:00")
+    state = DashboardState(project_root=proj, model="test-model")
+    out = ops.probe_status(state)
+    assert "ready" in out and "2026-07-14T18:00:00" in out and "jina" in out

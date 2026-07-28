@@ -19,10 +19,12 @@ from cgx.parser.parse_codebase import (
     _collect_top_level_members,
     _comments_by_line,
     _comments_in_span,
+    _detect_route,
     _dotted_attr,
     _infer_type,
     _param_list,
     _parse_docstring,
+    _parse_python_module,
     _signature_str,
     _unparse,
     _value_preview,
@@ -176,3 +178,51 @@ def test_collect_top_level_members_and_stub():
     # signature_str does not include the return annotation; only param list.
     assert "def hello(name: str): ..." in stub
     assert "class Foo(Base): ..." in stub
+
+
+# ---------- web-route decorator detection --------------------------------
+
+
+def test_detect_route_verb_decorators():
+    assert _detect_route(["app.get('/items')"]) == {"methods": ["GET"], "path": "/items"}
+    assert _detect_route(["router.post('/users/{id}')"]) == {
+        "methods": ["POST"], "path": "/users/{id}",
+    }
+    assert _detect_route(["app.websocket('/ws')"]) == {
+        "methods": ["WEBSOCKET"], "path": "/ws",
+    }
+
+
+def test_detect_route_flask_style_methods_list():
+    assert _detect_route(["app.route('/legacy', methods=['GET', 'POST'])"]) == {
+        "methods": ["GET", "POST"], "path": "/legacy",
+    }
+    # route without an explicit methods= defaults to GET.
+    assert _detect_route(["bp.route('/x')"]) == {"methods": ["GET"], "path": "/x"}
+
+
+def test_detect_route_ignores_non_route_decorators():
+    assert _detect_route(["staticmethod"]) is None
+    assert _detect_route(["property"]) is None
+    assert _detect_route([]) is None
+    assert _detect_route(["functools.lru_cache(maxsize=1)"]) is None
+
+
+def test_detect_route_wired_into_function_meta():
+    src = (
+        "from fastapi import FastAPI\n"
+        "app = FastAPI()\n"
+        "@app.get('/health')\n"
+        "def health():\n    return 1\n"
+        "@app.route('/legacy', methods=['GET', 'POST'])\n"
+        "def legacy():\n    return 2\n"
+        "def plain():\n    return 3\n"
+    )
+    chunks, _ = _parse_python_module("/proj/api.py", src, "/proj")
+    routes = {
+        c["name"]: c["meta"].get("route")
+        for c in chunks if c["type"] == "function"
+    }
+    assert routes["health"] == {"methods": ["GET"], "path": "/health"}
+    assert routes["legacy"] == {"methods": ["GET", "POST"], "path": "/legacy"}
+    assert routes["plain"] is None

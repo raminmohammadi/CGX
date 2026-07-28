@@ -9,6 +9,7 @@ embeddings, agent loop) only load when an operation actually runs.
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
 from typing import Any, Dict, Iterator, Optional, Tuple
@@ -32,11 +33,29 @@ def index_paths(out_dir: str) -> Tuple[str, str]:
 
 
 def find_existing_index(project_root: str) -> Optional[Tuple[str, str]]:
-    """Locate a previously built index under ``<project>/.cgx/index``."""
+    """Locate a *completed* index under ``<project>/.cgx/index``.
+
+    ``meta.json`` is written last by ``save_indices``, so its presence (next to
+    ``records.jsonl``) is the completion marker: a build that was Ctrl-C'd mid
+    way leaves only ``parse_cache.json`` and is correctly reported as absent.
+    """
     index_dir, records = index_paths(default_out_dir(project_root))
-    if os.path.isdir(index_dir) and os.path.exists(records):
+    meta = os.path.join(index_dir, "meta.json")
+    if os.path.isdir(index_dir) and os.path.exists(meta) and os.path.exists(records):
         return index_dir, records
     return None
+
+
+def index_info(project_root: str) -> Optional[Dict[str, Any]]:
+    """Return the manifest (``meta.json``) of the project's index, if built."""
+    idx = find_existing_index(project_root)
+    if not idx:
+        return None
+    try:
+        with open(os.path.join(idx[0], "meta.json"), "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
 
 
 def probe_status(state: Any) -> str:
@@ -61,8 +80,19 @@ def probe_status(state: Any) -> str:
         lines.append(f"Hardware : RAM {ram} GB / VRAM {vram} GB")
     except Exception:
         pass
-    idx = find_existing_index(state.project_root)
-    lines.append(f"Index    : {'ready' if idx else 'not built (run /index)'}")
+    info = index_info(state.project_root)
+    if info:
+        when = info.get("indexed_at") or "?"
+        lines.append(f"Index    : ready (built {when})")
+        lines.append(f"  model  : {info.get('embed_model') or '?'}")
+        counts = info.get("counts") or {}
+        if counts:
+            lines.append(f"  counts : {counts}")
+        stored_root = info.get("project_root")
+        if stored_root and os.path.abspath(stored_root) != os.path.abspath(state.project_root):
+            lines.append(f"  ⚠ built for a different project: {stored_root}")
+    else:
+        lines.append("Index    : not built (run /index)")
     return "\n".join(lines)
 
 
@@ -189,8 +219,13 @@ def map_event(etype: str, payload: Optional[Dict[str, Any]], *,
         return Render("status", str(payload.get("message")
                                     or payload.get("stage") or "working…"))
     if etype == "result":
-        counts = (payload.get("summary") or {}).get("counts") or {}
-        return Render("line", c("✔ ", "green") + f"index ready: {counts}")
+        summary = payload.get("summary") or {}
+        counts = summary.get("counts") or {}
+        model = payload.get("embed_model") or summary.get("embed_model")
+        when = payload.get("indexed_at") or summary.get("indexed_at")
+        bits = [b for b in (str(model) if model else "", str(when) if when else "") if b]
+        tail = ansi.dim("  " + " · ".join(bits), enabled=enabled) if bits else ""
+        return Render("line", c("✔ ", "green") + f"index ready: {counts}" + tail)
 
     # --- agent --------------------------------------------------------
     if etype == "status":

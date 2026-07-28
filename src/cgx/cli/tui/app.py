@@ -238,6 +238,38 @@ class Dashboard:
             self._emit(self._status_bar())
 
 
+def _quiet_engine_logging(project_root: str) -> None:
+    """Route engine logs to a file so they never shred the rendered TUI.
+
+    The parser / embeddings / agent pipeline emits INFO+WARNING lines to
+    the root logger; on the web server those stream to stdout, but in the
+    terminal dashboard they would overwrite the banner, status bar, and
+    streaming answer. We drop any console handler and append everything to
+    ``<project>/.cgx/dashboard.log`` instead (tail it to watch a build).
+    """
+    import logging
+
+    root = logging.getLogger()
+    for h in list(root.handlers):
+        if isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler):
+            root.removeHandler(h)
+    log_path = os.path.join(os.path.abspath(project_root), ".cgx", "dashboard.log")
+    try:
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        if not any(isinstance(h, logging.FileHandler) for h in root.handlers):
+            fh = logging.FileHandler(log_path, encoding="utf-8")
+            fh.setFormatter(logging.Formatter(
+                "[%(levelname)s] %(asctime)s %(name)s: %(message)s", "%H:%M:%S"))
+            root.addHandler(fh)
+        root.setLevel(logging.INFO)
+        root.propagate = False
+    except Exception:
+        # Worst case: silence the console rather than pollute the TUI.
+        root.setLevel(logging.ERROR)
+
+
 def run_dashboard(project_root: Optional[str] = None) -> None:
     """Entry point used by the ``cgx`` console script (bare invocation)."""
-    Dashboard(project_root=project_root).run()
+    root = os.path.abspath(project_root or os.getcwd())
+    _quiet_engine_logging(root)
+    Dashboard(project_root=root).run()

@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 from cgx.answer.engine import answer_with_llm_stream, generate_code_plan
 from cgx.answer.intent import detect_intent
 from cgx.answer.scope import resolve_scope_for_intent
-from cgx.pipeline.auto import run_index_auto, run_query_auto
+from cgx.pipeline.auto import IndexBuildCancelled, run_index_auto, run_query_auto
 from cgx.webui.helpers import (
     build_provider,
     diffs_payload,
@@ -97,14 +97,22 @@ def stream_index(
         summary = run_index_auto(
             project_root=project_root, out_dir=out_dir,
             metric=metric, index_type=index_type, model_name=embed_model,
+            cancel_event=cancel_event,
         )
         logger.info("stream_index: completed summary=%s", summary.get("counts", {}))
         yield "result", {
             "status": "ok",
             "project_root": project_root,
             "out_dir": out_dir,
+            "embed_model": summary.get("embed_model"),
+            "indexed_at": summary.get("indexed_at"),
             "summary": json_safe(summary),
         }
+    except IndexBuildCancelled:
+        # Cooperative cancel: the build stopped at a stage boundary before any
+        # index files were written, so there is nothing to clean up.
+        logger.info("stream_index: build cancelled by user")
+        yield "cancelled", {"message": "Index build cancelled"}
     except Exception as e:
         logger.exception("stream_index: failed with %s", e)
         yield "error", {"message": f"{type(e).__name__}: {e}"}

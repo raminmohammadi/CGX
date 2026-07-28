@@ -70,7 +70,17 @@ logger = get_logger(__name__)
 #     so downstream consumers (suggest_insertion_points, ast_insert) can
 #     splice code without re-walking the AST. v2 indices lack these
 #     fields; readers should rebuild.
-SCHEMA_VERSION = 3
+# v4: Provenance + documentation ingestion. Markdown/RST files are now parsed
+#     into 'doc' chunks, and every record carries a ``source_kind``
+#     ("code" | "doc") mirrored from ``chunk.meta['source_kind']`` so
+#     retrieval/answer layers can attribute and weight prose vs code. v3
+#     indices lack ``source_kind`` and any doc content; readers should rebuild.
+# v5: Web-route provenance. Function/method records now carry a ``route``
+#     field ({"methods": [...], "path": str|None}) mirrored from
+#     ``chunk.meta['route']`` when a FastAPI/Flask-style route decorator is
+#     present, else ``None``. Enables deterministic endpoint enumeration
+#     ("how many API endpoints…"). v4 indices lack ``route``; rebuild to gain it.
+SCHEMA_VERSION = 5
 
 
 # ---------------------------
@@ -209,6 +219,7 @@ def make_index_records(
                 # identity & context
                 "id": cid,
                 "type": ctype,
+                "source_kind": meta.get("source_kind") or "code",
                 "name": ch.get("name"),
                 "file": ch.get("file"),
                 "class_name": meta.get("class_name"),
@@ -240,6 +251,7 @@ def make_index_records(
                 "instance_attributes_written": inst_attr_written,
                 "raises": raises_list,
                 "decorators": meta.get("decorators"),
+                "route": meta.get("route"),
                 "method_kind": meta.get("method_kind"),
                 "is_async": bool(meta.get("is_async", False)),
                 "is_generator": bool(meta.get("is_generator", False)),
@@ -337,6 +349,7 @@ def prepare_embedding_corpus(
                         "text": rec.get(f"view_{w}", "") or "",
                         "tokens_estimate": int(tok),
                         "type": rec.get("type"),
+                        "source_kind": rec.get("source_kind") or "code",
                         "name": rec.get("name"),
                         "file": rec.get("file"),
                     }

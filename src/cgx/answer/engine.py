@@ -675,6 +675,44 @@ def _get_stream_system_prompt(mode: str) -> str:
     return SYSTEM_PROMPTS_STREAM.get(mode, SYSTEM_STREAM)
 
 
+def _auto_retrieve_hits(
+    index_dir: str,
+    records_path: str,
+    question: str,
+    top_k: int,
+) -> List[Dict[str, Any]]:
+    """Run hybrid retrieval for callers that didn't pre-compute ``hits``.
+
+    Routes through :func:`cgx.pipeline.auto.run_query_auto` -- the same
+    semantic+lexical+graph pipeline the web UI's ask path uses -- so the
+    SOURCES reflect the question. ``run_query_auto`` auto-selects the embed
+    model recorded in the index manifest, so this stays correct for local
+    models built with a non-default embedder. Any failure (missing index,
+    embedder error) degrades to an empty list so the caller can fall back to
+    leading rows rather than crash.
+    """
+    try:
+        from cgx.pipeline.auto import run_query_auto  # lazy: avoid import cycle
+        out_dir = Path(index_dir).parent
+        cp = out_dir / "chunks.jsonl"
+        gp = out_dir / "graph.json"
+        retrieval = run_query_auto(
+            index_dir=index_dir,
+            records_path=records_path,
+            query=question or "",
+            chunks_path=str(cp) if cp.exists() else None,
+            graph_path=str(gp) if gp.exists() else None,
+            top_k_per_view=max(int(top_k), 20),
+            neighbor_depth=1,
+            use_lexical=True,
+        )
+        return retrieval.get("hits", []) or []
+    except Exception as e:
+        logger.warning("_auto_retrieve_hits: retrieval failed (%s); "
+                       "falling back to leading rows", e)
+        return []
+
+
 def _prepare_answer_request(
     index_dir: str,
     records_path: str,
@@ -708,6 +746,25 @@ def _prepare_answer_request(
     cmap = _chunk_map(indices)
 
     mode = mode_override if mode_override else detect_intent(question)
+
+    # --- Deterministic endpoint enumeration short-circuit ---
+    # "how many / list all API endpoints" is an aggregate over scattered
+    # route-decorator chunks, which semantic ranking answers unreliably.
+    # Answer it exactly from ``route`` metadata (see parse_codebase.
+    # _detect_route). Only short-circuit when endpoints are actually found;
+    # otherwise fall through to normal answering so stale/route-less indices
+    # still get a reply instead of a confidently-wrong "0 endpoints".
+    if mode == "enumerate":
+        try:
+            from cgx.answer.enumeration import answer_endpoint_enumeration
+            recs = load_jsonl(records_path) if records_path else []
+            result = answer_endpoint_enumeration(recs, question)
+            if int(result.get("debug", {}).get("endpoint_count", 0)) > 0:
+                return "done", result
+        except Exception as e:
+            logger.error("enumerate short-circuit failed: %s", e)
+        # Fall through: treat as a normal grounded question.
+        mode = "qa"
 
     # --- Improved Target symbol detection ---
     symbols = _symbol_tokens(question)
@@ -801,8 +858,17 @@ def _prepare_answer_request(
     base_hits: List[Dict[str, Any]] = []
     if hits:
         base_hits = hits
-    else:
-        if not forced_hits:
+    elif not forced_hits:
+        # No caller-supplied hits and no symbol match. Run real hybrid
+        # retrieval (semantic + lexical + graph) so SOURCES reflect the
+        # question. The previous fallback grabbed the first ``top_k`` rows
+        # of each view -- arbitrary chunks unrelated to the query -- which
+        # is the main reason programmatic asks (e.g. the agent's
+        # INVESTIGATE step, which passes no ``hits``) returned ungrounded
+        # answers. Leading-row selection remains only as a last resort when
+        # retrieval yields nothing (missing/empty index).
+        base_hits = _auto_retrieve_hits(index_dir, records_path, question, top_k)
+        if not base_hits:
             for name in ["intent", "impl"]:
                 vw = (indices.get("views") or {}).get(name) or {}
                 for r in (vw.get("rows") or [])[:top_k]:

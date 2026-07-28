@@ -212,3 +212,22 @@ def test_apply_scope_penalty_handles_root_test_filename_without_tests_dir():
     out = apply_scope_penalty(hits, "src", penalty=0.3)
     assert out[0]["chunk_id"].split("::")[0].endswith("foo.py")
     assert out[1].get("scope_demoted") is True
+
+
+# ---------- endpoint enumeration intent ----------------------------------
+
+
+def test_enumerate_intent_fires_for_counting_endpoint_queries():
+    assert detect_intent("how many api endpoints does scanai have?") == "enumerate"
+    assert detect_intent("list all endpoints") == "enumerate"
+    assert detect_intent("list the routes in the auth module") == "enumerate"
+    assert detect_intent("count of apis") == "enumerate"
+    assert detect_intent("which endpoints exist?") == "enumerate"
+
+
+def test_enumerate_intent_requires_both_cue_and_keyword():
+    # Enumeration cue but no api/endpoint/route keyword -> not enumerate.
+    assert detect_intent("how many functions are there?") != "enumerate"
+    # api keyword but no enumeration cue -> not enumerate.
+    assert detect_intent("how does the api work?") != "enumerate"
+    assert detect_intent("what is scanai?") != "enumerate"
