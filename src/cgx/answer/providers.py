@@ -22,6 +22,12 @@ DEFAULT_TIMEOUT = float(os.environ.get("CGX_HTTP_TIMEOUT", "120"))
 # does not trip the timeout mid-answer.
 DEFAULT_OLLAMA_TIMEOUT = float(os.environ.get("CGX_OLLAMA_TIMEOUT", "300"))
 
+# Keep the model resident in VRAM between requests so back-to-back queries
+# don't pay a cold reload (Ollama unloads after ~5m by default, which shows up
+# as a multi-second stall on the first token of the next question). Accepts an
+# Ollama duration string ("30m"), a number of seconds, or "-1" to never unload.
+DEFAULT_OLLAMA_KEEP_ALIVE = os.environ.get("CGX_OLLAMA_KEEP_ALIVE", "30m")
+
 # Transport-layer requests exceptions that are typically transient: a TLS
 # handshake hiccup, a proxy reset, or a momentary timeout. Re-attempting the
 # request with backoff is usually enough to recover. Server-side errors
@@ -112,11 +118,15 @@ class OllamaProvider(LLMProvider):
         extra_options: Optional[Dict[str, Any]] = None,
         rate_limit: Optional[float] = None,
         max_retries: int = 2,
+        keep_alive: Optional[str] = DEFAULT_OLLAMA_KEEP_ALIVE,
     ) -> None:
         self.model = model
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.extra_options = extra_options or {}
+        # How long Ollama keeps this model loaded after a request. ``None``
+        # leaves it to the server default; any other value is sent verbatim.
+        self.keep_alive = keep_alive
         # Rate limiting stays opt-in (no limiter unless ``rate_limit`` is set).
         # A small retry budget is on by default so a cold-load read timeout or
         # a momentary connection reset recovers instead of failing the task on
@@ -143,6 +153,8 @@ class OllamaProvider(LLMProvider):
             "stream": False,
             "options": options,
         }
+        if self.keep_alive is not None:
+            payload["keep_alive"] = self.keep_alive
         if force_json:
             # Ollama's `format` accepts either the literal string "json" or a
             # JSON schema object (structured outputs). Prefer the schema when
@@ -208,6 +220,8 @@ class OllamaProvider(LLMProvider):
             "stream": True,
             "options": options,
         }
+        if self.keep_alive is not None:
+            payload["keep_alive"] = self.keep_alive
         try:
             with requests.post(url, json=payload, timeout=self.timeout, stream=True) as resp:
                 resp.raise_for_status()

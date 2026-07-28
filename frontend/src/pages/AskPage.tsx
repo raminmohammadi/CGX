@@ -61,6 +61,13 @@ export default function AskPage() {
   useEffect(() => {
     let alive = true;
     (async () => {
+      // Never clobber an in-flight/streaming conversation. send() creates a
+      // brand-new session on the first question, which flips selectedSessionId
+      // and re-fires this effect *while* the SSE handlers are writing into
+      // ask.messages -- and the server has nothing persisted until the stream
+      // ends, so a re-fetch here would blank the just-typed question and the
+      // streaming answer. Bail while busy; the stream owns the store.
+      if (useTasks.getState().ask.busy) return;
       if (!selectedSessionId) { resetAsk(); return; }
       if (useTasks.getState().ask.sessionId === selectedSessionId) return;
       try {

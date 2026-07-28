@@ -162,7 +162,11 @@ def stream_ask(
             model_name=embed_model,
             chunks_path=chunks_path if os.path.exists(chunks_path) else None,
             graph_path=graph_path if os.path.exists(graph_path) else None,
-            top_k_per_view=20, neighbor_depth=1, use_lexical=True,
+            # 10 per view (was 20): fewer fused hits -> a smaller grounding
+            # prompt -> faster prefill / time-to-first-token on local models,
+            # with no measurable quality loss for typical Ask questions. Mirrors
+            # the agent loop's retrieval budget.
+            top_k_per_view=10, neighbor_depth=1, use_lexical=True,
             scope=scope,
         )
     except Exception as e:

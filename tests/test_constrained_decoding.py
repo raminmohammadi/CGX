@@ -114,6 +114,35 @@ def test_ollama_sends_schema_format_and_falls_back(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Ollama: keep_alive keeps the model resident between requests
+# ---------------------------------------------------------------------------
+def test_ollama_sends_keep_alive_by_default(monkeypatch):
+    rec = _Recorder([200], _OLLAMA_OK)
+    monkeypatch.setattr(providers.requests, "post", rec)
+    providers.OllamaProvider(model="llama3").chat(
+        [{"role": "user", "content": "hi"}], force_json=False,
+    )
+    assert rec.bodies[0]["keep_alive"] == providers.DEFAULT_OLLAMA_KEEP_ALIVE
+
+
+def test_ollama_keep_alive_omitted_when_none(monkeypatch):
+    rec = _Recorder([200], _OLLAMA_OK)
+    monkeypatch.setattr(providers.requests, "post", rec)
+    providers.OllamaProvider(model="llama3", keep_alive=None).chat(
+        [{"role": "user", "content": "hi"}], force_json=False,
+    )
+    assert "keep_alive" not in rec.bodies[0]
+
+
+def test_build_provider_flows_keep_alive_to_ollama():
+    from cgx.webui.helpers import build_provider
+    prov = build_provider(kind="ollama", model="llama3",
+                          base_url="http://localhost:11434")
+    assert isinstance(prov, providers.OllamaProvider)
+    assert prov.keep_alive == providers.DEFAULT_OLLAMA_KEEP_ALIVE
+
+
+# ---------------------------------------------------------------------------
 # Gemini: responseSchema present, dropped on 400
 # ---------------------------------------------------------------------------
 def test_gemini_sends_response_schema_and_falls_back(monkeypatch):
