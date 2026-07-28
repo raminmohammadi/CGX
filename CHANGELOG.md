@@ -2,6 +2,113 @@
 
 All notable changes are documented here. Versions follow semver-ish.
 
+## Unreleased -- Greenfield agentic-loop hardening (Phases A-E)
+
+A reliability pass over the greenfield loop (Plan -> Scaffold -> Apply ->
+Bootstrap -> Verify -> Repair) so it converges on small local models
+(3B-7B) instead of stalling, looping, or writing unparseable code.
+Every change is greenfield-only unless noted; explore-mode sessions and
+the legacy `/agent` batch loop are unaffected.
+
+### Phase A -- Multi-language verify + build-smoke
+
+* `VERIFY` now dispatches to the correct test runner by project type:
+  Python via pytest and JS/TS via `cgx.codegen.test_runner.NpmRunner`
+  (`npm test` / configured script), so a Node scaffold is actually
+  exercised rather than reported as "no tests collected".
+* `BOOTSTRAP_ENV` provisions JS toolchains (detects `package.json`,
+  runs the install step) alongside the existing Python venv path.
+* A **build-smoke** gate runs the project's build/compile step before
+  `VERIFY` so a scaffold that does not build fails fast with a concrete
+  error instead of burning a full test run.
+
+### Phase B -- Executor robustness (SCAFFOLD / per-file generation)
+
+* **Syntax-retry**: `generate_single_scaffold_file` validates every
+  generated file (Python via `ast`, JSON via `json`, TOML via
+  `tomllib`, and the JS/TS/JSX/Vue family via tree-sitter through
+  `cgx.codegen.validate.validate_js_ts_source`) and, on a parse
+  failure, issues exactly one hardened regeneration with the concrete
+  error surfaced (`_SYNTAX_RETRY_INSTR`). A file that still does not
+  parse is dropped with a `syntax_error` rather than persisted.
+* Additional single-file gates, each with one targeted retry:
+  extension/content mismatch (e.g. Vue SFC under a `.jsx` path),
+  duplicate-content (byte-identical to a sibling after whitespace
+  normalisation), first-party symbol imports that the generated
+  modules do not actually define (`_symbol_retry_instruction`), and a
+  pytest test-collectability gate (`_TEST_RETRY_INSTR`) that rejects a
+  test file with no top-level `def test_*` (pytest exit 5).
+* **Targeted per-file regeneration**: when a `SCAFFOLD`/`APPLY` drops
+  specific files, only those paths are regenerated while every
+  prior-good diff is reused verbatim, so a retry is proportional to the
+  failure instead of re-running the whole manifest.
+* **Intra-layer parallelism**: `_generate_one` reads no shared state
+  and can run inside a bounded per-layer worker pool. Concurrency is
+  opt-in via `CGX_SCAFFOLD_CONCURRENCY` (defaults to 1/serial so a
+  single local GPU is never over-subscribed; malformed or sub-1 values
+  clamp to 1).
+* **Incremental checkpointing**: the `SCAFFOLD_PATCHES` artifact is
+  saved after every layer (`_checkpoint_progress`, best-effort upsert
+  keyed by `artifact_id`). A crash or timeout mid-run leaves completed
+  files on disk, and `_resume_generated_files` seeds them on the next
+  attempt so only the remainder is regenerated.
+
+### Phase C -- Planner (manifest ordering + re-planning)
+
+* Manifest dependency ordering so files are generated in an order that
+  respects intra-project imports.
+* Re-planning escalation: an unrecoverable failure class walks up to
+  the nearest `SCAFFOLD` ancestor and re-queues a fresh scaffold with
+  `regenerate_constraints` folded into the goal (capped at
+  `_REGENERATE_BUDGET=1` per ancestor chain).
+
+### Phase D -- Bounded LLM repair
+
+* `REPAIR` previously escalated any failure without a deterministic
+  fix straight to `ASK_USER`. It now attempts a **bounded LLM repair**
+  first (`_propose_llm_logic_repair` ->
+  `cgx.answer.engine.generate_repair_files`): the model is handed the
+  goal, the failing test tail, and the complete contents of the most
+  relevant source/test files (capped at `_PATCH_DIFF_LIMIT=5` files),
+  and returns complete corrected file bodies. Each proposed file is
+  re-validated (`_validate_repair_source`, same per-language gate as
+  scaffold) before it reaches `APPLY`. Only when the model declines or
+  every candidate fails validation does the flow fall through to
+  regenerate / `ASK_USER`.
+
+### Phase E -- Session budget + escalation
+
+* The `Session` aggregate carries a per-session budget: config fields
+  `max_task_runs`, `max_wall_seconds`, and `headless` (all default to
+  unlimited/off), plus live counters `task_runs` and
+  `first_task_started_at`. Only compute-bearing tasks charge the
+  budget; an `ASK_USER` wait-state stays free so escalation itself can
+  always surface. The store round-trips the new fields with
+  backward-compatible defaults, so pre-existing sessions load
+  unchanged.
+* On exhaustion, `Router.on_budget_exhausted` diverges by mode: an
+  **interactive** session blocks every still-READY work task, spawns a
+  single `ASK_USER(freeform)` surfacing the exhaustion, and goes
+  `PAUSED`; a **headless** session abandons the READY work and ends
+  terminally `FAILED`. This catches runaway autonomous loops that
+  bypass per-task retry caps.
+
+### Judge -- ASK / SUMMARIZE answer-quality gates
+
+* Cheap deterministic structural pre-gates fail obviously-bad output
+  before an LLM-grader call, deferring qualitative judgement to the
+  strict local-model judge. New constants: `_ASK_MAX_WORDS = 1000`,
+  `_SUMMARIZE_MAX_BULLETS = 8` (mirrors the "<=8 bullets" contract in
+  the `summarize` capability), `_SUMMARIZE_MAX_WORDS = 400`.
+* `SUMMARIZE` gained a structural branch (previously it soft-passed):
+  it now hard-fails empty, over-bullet, and over-verbose summaries.
+  `_LIST_ITEM_RE` counts bullets/ordered items without miscounting a
+  Markdown `#` heading. The non-clarify `ASK` path hard-fails a
+  pathologically long answer; within-budget answers still defer to the
+  LLM judge for substance (grounding/citations). `_render_artifact`
+  maps `SUMMARIZE` to its `answer_md` so the strict judge sees rendered
+  markdown.
+
 ## Unreleased -- Deterministic endpoint enumeration (schema v5)
 
 Counting/listing questions about the HTTP surface ("how many API

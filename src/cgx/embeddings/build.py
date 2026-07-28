@@ -175,6 +175,7 @@ def build_embeddings(
     max_length: Optional[int] = None,      # None -> sensible default per model family
     field_strategy: str = "auto",          # "auto" | "code_only" | "code_signature_doc" | "custom"
     text_builder: Optional[Callable[[Dict], str]] = None,  # used when field_strategy="custom"
+    progress_cb: Optional[Callable[[int, int], None]] = None,  # called (done, total) per batch
 ) -> np.ndarray:
     """
     Build dense vector embeddings for code chunks or corpus rows using either a 
@@ -236,6 +237,10 @@ def build_embeddings(
 
     text_builder : Callable or None
         Required if field_strategy="custom". Receives a chunk/corpus row, returns a string.
+
+    progress_cb : Callable or None
+        Optional callback invoked as ``progress_cb(done, total)`` after each
+        encoded batch, so callers can surface embedding progress on large corpora.
 
     Returns
     -------
@@ -332,13 +337,31 @@ def build_embeddings(
     if backend in ("auto", "sentence-transformers"):
         try:
             st_model = _get_st_model(model_name, device, max_length)
-            embs = st_model.encode(
-                texts,
-                batch_size=batch_size,
-                show_progress_bar=False,
-                convert_to_numpy=True,
-                normalize_embeddings=False,
-            )
+            if progress_cb is not None:
+                # Encode in explicit batches so we can report progress after
+                # each one; ST would otherwise swallow the whole corpus in a
+                # single opaque call.
+                total = len(texts)
+                parts: List[np.ndarray] = []
+                for i in range(0, total, batch_size):
+                    part = st_model.encode(
+                        texts[i:i + batch_size],
+                        batch_size=batch_size,
+                        show_progress_bar=False,
+                        convert_to_numpy=True,
+                        normalize_embeddings=False,
+                    )
+                    parts.append(np.asarray(part))
+                    progress_cb(min(i + batch_size, total), total)
+                embs = np.vstack(parts) if parts else np.zeros((0, 0), dtype=np.float32)
+            else:
+                embs = st_model.encode(
+                    texts,
+                    batch_size=batch_size,
+                    show_progress_bar=False,
+                    convert_to_numpy=True,
+                    normalize_embeddings=False,
+                )
             return _norm(embs)
         except Exception:
             if backend == "sentence-transformers":
@@ -357,8 +380,9 @@ def build_embeddings(
         return summed / counts
 
     pooled: List[np.ndarray] = []
+    total = len(texts)
     with torch.no_grad():
-        for i in range(0, len(texts), batch_size):
+        for i in range(0, total, batch_size):
             batch = texts[i:i + batch_size]
             toks = tokenizer(
                 batch,
@@ -373,6 +397,8 @@ def build_embeddings(
             else:
                 vec = _mean_pool(out.last_hidden_state, toks["attention_mask"])
             pooled.append(vec.detach().cpu().numpy())
+            if progress_cb is not None:
+                progress_cb(min(i + batch_size, total), total)
 
     embs = np.vstack(pooled)
     return _norm(embs)

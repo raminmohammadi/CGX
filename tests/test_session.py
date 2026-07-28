@@ -575,6 +575,133 @@ def test_runner_greenfield_hard_failure_marks_session_failed(tmp_path, store):
         is SessionStatus.FAILED
 
 
+# --------------------- E1: per-session budget ---------------------
+
+def _seed_two_summarize(store, session):
+    """Seed two independent READY work tasks with deterministic order.
+
+    SUMMARIZE has no successor in the router table, so each completes
+    without spawning children -- leaving the peer READY so the budget
+    check bites on the second ``run_next``.
+    """
+    a = TaskNode.new(session.session_id, TaskKind.SUMMARIZE, "a")
+    a.status = TaskNodeStatus.READY
+    a.created_at = 1.0
+    store.save_task(a)
+    b = TaskNode.new(session.session_id, TaskKind.SUMMARIZE, "b")
+    b.status = TaskNodeStatus.READY
+    b.created_at = 2.0
+    store.save_task(b)
+    return a, b
+
+
+def test_runner_task_budget_escalates_to_ask_user(store):
+    @register_executor(TaskKind.SUMMARIZE)
+    def _ok(task, deps):
+        return ExecutorResult(outputs={"ok": True})
+
+    session = Session.new("g", max_task_runs=1)
+    store.save_session(session)
+    a, b = _seed_two_summarize(store, session)
+    runner = SessionRunner(store)
+
+    # First work task runs and consumes the one-run budget.
+    first = runner.run_next(session_id=session.session_id,
+                            deps=ExecutorDeps())
+    assert first.task_id == a.task_id
+    assert first.status is TaskNodeStatus.DONE
+    assert store.get_session(session.session_id).task_runs == 1
+
+    # Second run trips the budget *before* dispatching -> escalation.
+    out = runner.run_next(session_id=session.session_id, deps=ExecutorDeps())
+    assert out.task_id == b.task_id
+    assert out.status is TaskNodeStatus.BLOCKED
+    sess = store.get_session(session.session_id)
+    assert sess.status is SessionStatus.PAUSED
+    asks = [t for t in store.list_tasks(session.session_id)
+            if t.kind is TaskKind.ASK_USER]
+    assert len(asks) == 1
+    assert "task budget" in asks[0].inputs["reason"]
+
+    # The loop quiesces: the only READY task left is the exempt ASK_USER,
+    # which surfaces (IN_PROGRESS); nothing runs after it.
+    surfaced = runner.run_next(session_id=session.session_id,
+                               deps=ExecutorDeps())
+    assert surfaced.kind is TaskKind.ASK_USER
+    assert surfaced.status is TaskNodeStatus.IN_PROGRESS
+    assert runner.run_next(session_id=session.session_id,
+                           deps=ExecutorDeps()) is None
+    # The exempt ASK_USER did not consume the budget.
+    assert store.get_session(session.session_id).task_runs == 1
+
+
+def test_runner_task_budget_headless_fails_terminally(store):
+    @register_executor(TaskKind.SUMMARIZE)
+    def _ok(task, deps):
+        return ExecutorResult(outputs={"ok": True})
+
+    session = Session.new("g", max_task_runs=1, headless=True)
+    store.save_session(session)
+    a, b = _seed_two_summarize(store, session)
+    runner = SessionRunner(store)
+    runner.run_next(session_id=session.session_id, deps=ExecutorDeps())
+    out = runner.run_next(session_id=session.session_id, deps=ExecutorDeps())
+    assert out.task_id == b.task_id
+    assert out.status is TaskNodeStatus.ABANDONED
+    assert store.get_session(session.session_id).status \
+        is SessionStatus.FAILED
+    # Headless mode never prompts a user.
+    assert not [t for t in store.list_tasks(session.session_id)
+                if t.kind is TaskKind.ASK_USER]
+    assert runner.run_next(session_id=session.session_id,
+                           deps=ExecutorDeps()) is None
+
+
+def test_runner_wall_clock_budget_escalates(store):
+    @register_executor(TaskKind.SUMMARIZE)
+    def _ok(task, deps):
+        return ExecutorResult(outputs={"ok": True})
+
+    # A zero-second wall budget: the anchor is set on the first work
+    # task, so the second run is always past the cap.
+    session = Session.new("g", max_wall_seconds=0.0)
+    store.save_session(session)
+    a, b = _seed_two_summarize(store, session)
+    runner = SessionRunner(store)
+    first = runner.run_next(session_id=session.session_id,
+                            deps=ExecutorDeps())
+    assert first.status is TaskNodeStatus.DONE
+    assert store.get_session(
+        session.session_id).first_task_started_at is not None
+    out = runner.run_next(session_id=session.session_id, deps=ExecutorDeps())
+    assert out.status is TaskNodeStatus.BLOCKED
+    sess = store.get_session(session.session_id)
+    assert sess.status is SessionStatus.PAUSED
+    asks = [t for t in store.list_tasks(session.session_id)
+            if t.kind is TaskKind.ASK_USER]
+    assert "time budget" in asks[0].inputs["reason"]
+
+
+def test_runner_no_budget_configured_runs_all_tasks(store):
+    @register_executor(TaskKind.SUMMARIZE)
+    def _ok(task, deps):
+        return ExecutorResult(outputs={"ok": True})
+
+    session = Session.new("g")  # no caps configured
+    store.save_session(session)
+    a, b = _seed_two_summarize(store, session)
+    runner = SessionRunner(store)
+    runner.run_next(session_id=session.session_id, deps=ExecutorDeps())
+    runner.run_next(session_id=session.session_id, deps=ExecutorDeps())
+    tasks = {t.task_id: t for t in store.list_tasks(session.session_id)}
+    assert tasks[a.task_id].status is TaskNodeStatus.DONE
+    assert tasks[b.task_id].status is TaskNodeStatus.DONE
+    assert store.get_session(session.session_id).status \
+        is SessionStatus.ACTIVE
+    assert not [t for t in store.list_tasks(session.session_id)
+                if t.kind is TaskKind.ASK_USER]
+
+
 def test_build_decision_rejects_choose_path_without_anchor():
     session = Session.new("g")
     ask = TaskNode.new(session.session_id, TaskKind.ASK_USER, "pick",

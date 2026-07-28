@@ -133,6 +133,48 @@ def provider_model_name(provider: Any) -> Optional[str]:
     return str(name) if name else None
 
 
+# Model families that expose a native reasoning / "thinking" phase. Matching
+# is substring-based against the lowercased model id so Ollama tags
+# (``deepseek-r1:8b``) and vendor variants (``o4-mini``) all resolve without
+# an exact-name entry. Ordinary instruct models (gemma, plain llama, phi3,
+# mistral) are absent on purpose -- for those the ASK sketch phase is pure
+# latency with no reasoning payoff, so it is skipped.
+_THINKING_MODEL_KEYS = (
+    # Local / Ollama reasoning models
+    "deepseek-r1",
+    "qwq",
+    "qwen3",
+    "gpt-oss",
+    "magistral",
+    "cogito",
+    "smallthinker",
+    "phi4-reasoning",
+    "phi-4-reasoning",
+    "granite3.2",
+    "granite3.3",
+    # Cloud reasoning models
+    "o1",
+    "o3",
+    "o4-mini",
+    "gemini-2.5",
+)
+
+
+def model_supports_thinking(model: Optional[str]) -> bool:
+    """Return True when ``model`` exposes a native reasoning/"thinking" phase.
+
+    The ASK stream uses this to decide whether the (slow) thought sketch is
+    worth running: only reasoning-capable models produce a meaningful
+    thinking pass, so non-reasoning models (e.g. gemma, plain llama) skip it
+    and answer directly. Matching mirrors :func:`get_model_context_window`:
+    case-insensitive and tolerant of Ollama ``model:tag`` suffixes.
+    """
+    if not model:
+        return False
+    m = model.strip().lower()
+    return any(key in m for key in _THINKING_MODEL_KEYS)
+
+
 # Capability tiers, ordered small -> xlarge. A single ladder keyed on the
 # context window so every downstream budget / prompt-strategy decision
 # derives from one classification instead of re-deriving ad-hoc

@@ -416,6 +416,15 @@ def _session_from_json(blob: str) -> Session:
         project_root=d.get("project_root"),
         created_at=float(d.get("created_at") or 0.0),
         updated_at=float(d.get("updated_at") or 0.0),
+        max_task_runs=(int(d["max_task_runs"])
+                       if d.get("max_task_runs") is not None else None),
+        max_wall_seconds=(float(d["max_wall_seconds"])
+                          if d.get("max_wall_seconds") is not None else None),
+        headless=bool(d.get("headless", False)),
+        task_runs=int(d.get("task_runs") or 0),
+        first_task_started_at=(float(d["first_task_started_at"])
+                               if d.get("first_task_started_at") is not None
+                               else None),
     )
 
 

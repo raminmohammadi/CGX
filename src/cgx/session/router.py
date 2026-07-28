@@ -905,8 +905,65 @@ class Router:
             plan.actions.append(CreateTask(successor))
         return plan
 
+    @traced("router")
+    def on_budget_exhausted(self, *, session: Session,
+                            over_task: TaskNode,
+                            tasks: List[TaskNode],
+                            reason: str = "") -> RouterPlan:
+        """Halt an autonomous loop that hit its per-session budget.
+
+        The runner detects budget exhaustion (task-run count or
+        wall-clock) *before* dispatching the next work task and asks the
+        router how to stop. An interactive session pauses: every
+        still-READY work task is set ``BLOCKED`` so the drain loop cannot
+        re-pick it, a fresh ``ASK_USER`` surfaces the exhaustion, and the
+        session goes ``PAUSED``. A ``headless`` session has no user to
+        prompt, so the loop ends terminally ``FAILED`` with the READY
+        work abandoned -- never silently looping past its budget.
+        """
+        plan = RouterPlan()
+        ready_work = [t for t in tasks
+                      if t.status is TaskNodeStatus.READY
+                      and t.kind is not TaskKind.ASK_USER]
+        if session.headless:
+            for t in ready_work:
+                plan.actions.append(UpdateTaskStatus(
+                    task_id=t.task_id, status=TaskNodeStatus.ABANDONED,
+                    error=f"session budget exhausted: {reason}"))
+            plan.actions.append(UpdateSessionStatus(
+                session_id=session.session_id, status=SessionStatus.FAILED))
+            return plan
+        for t in ready_work:
+            plan.actions.append(UpdateTaskStatus(
+                task_id=t.task_id, status=TaskNodeStatus.BLOCKED))
+        plan.actions.append(CreateTask(_make_budget_ask(over_task, reason)))
+        plan.actions.append(UpdateSessionStatus(
+            session_id=session.session_id, status=SessionStatus.PAUSED))
+        return plan
+
 
 # --------------------- helpers ---------------------
+
+
+def _make_budget_ask(over_task: TaskNode, reason: str) -> TaskNode:
+    """Build the ASK_USER that surfaces a paused-on-budget session."""
+    prior_goal = (over_task.inputs.get("prior_goal")
+                  or over_task.inputs.get("goal"))
+    return TaskNode.new(
+        session_id=over_task.session_id,
+        kind=TaskKind.ASK_USER,
+        name="Session budget exhausted",
+        description=(f"The session hit its {reason} before finishing. "
+                     "Autonomous work is paused -- review the progress so "
+                     "far and decide whether to continue or stop."),
+        parent_task_id=over_task.parent_task_id,
+        inputs={
+            "expected_kind": DecisionKind.FREEFORM.value,
+            "reason": reason,
+            "prior_goal": prior_goal,
+            "over_task_id": over_task.task_id,
+        },
+    )
 
 def _repair_install_deps_actions(
         completed: TaskNode) -> List[RouterAction]:

@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 
 from cgx.answer.engine import answer_with_llm_stream, generate_code_plan
 from cgx.answer.intent import detect_intent
+from cgx.answer.model_caps import model_supports_thinking
 from cgx.answer.scope import resolve_scope_for_intent
 from cgx.pipeline.auto import IndexBuildCancelled, run_index_auto, run_query_auto
 from cgx.webui.helpers import (
@@ -124,6 +125,7 @@ def stream_ask(
     base_url: str, api_key: Optional[str], temperature: float, num_predict: int,
     num_ctx: Optional[int] = None,
     endpoint_path: str = "/v1/chat/completions", allow_no_auth: bool = False,
+    think: bool = False,
     cancel_event=None,
 ) -> Iterator[Event]:
     """Stream thoughts then the grounded answer with sources + meta."""
@@ -196,22 +198,33 @@ def stream_ask(
         {"role": "user", "content": sketch_user},
     ]
 
-    logger.info("stream_ask: streaming thought tokens")
+    # The thought sketch is a full extra generation pass, so it only runs
+    # when the user opted in *and* the model is reasoning-capable. For every
+    # other case (toggle off, or a non-reasoning model like gemma) we skip
+    # straight to the grounded answer -- halving latency on local models.
+    do_think = bool(think) and model_supports_thinking(model)
     thought_tokens = 0
-    try:
-        for delta in prov.chat_stream(messages, temperature=float(temperature),
-                                      max_tokens=min(int(num_predict), 512)):
-            if cancel_event and cancel_event.is_set():
-                yield "cancelled", {"message": "Cancelled during thought"}
-                return
-            if delta:
-                thought_tokens += 1
-                yield "thought", {"delta": delta}
-    except Exception as e:
-        logger.warning("stream_ask: thought stream unavailable: %s", e)
-        yield "thought_warning", {"message": _format_stream_failure(e)}
+    if not do_think:
+        logger.info(
+            "stream_ask: skipping thought phase (think=%s model=%s supported=%s)",
+            think, model, model_supports_thinking(model),
+        )
+    else:
+        logger.info("stream_ask: streaming thought tokens")
+        try:
+            for delta in prov.chat_stream(messages, temperature=float(temperature),
+                                          max_tokens=min(int(num_predict), 512)):
+                if cancel_event and cancel_event.is_set():
+                    yield "cancelled", {"message": "Cancelled during thought"}
+                    return
+                if delta:
+                    thought_tokens += 1
+                    yield "thought", {"delta": delta}
+        except Exception as e:
+            logger.warning("stream_ask: thought stream unavailable: %s", e)
+            yield "thought_warning", {"message": _format_stream_failure(e)}
 
-    logger.info("stream_ask: thought complete (%d tokens), streaming answer", thought_tokens)
+        logger.info("stream_ask: thought complete (%d tokens), streaming answer", thought_tokens)
     answer_delta_tokens = 0
     result: Optional[Dict[str, Any]] = None
     try:

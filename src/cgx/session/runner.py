@@ -98,15 +98,23 @@ class SessionRunner:
     def start_session(self, *, objective: str,
                       project_root: Optional[str] = None,
                       title: Optional[str] = None,
-                      mode: SessionMode = SessionMode.EXPLORE) -> Session:
+                      mode: SessionMode = SessionMode.EXPLORE,
+                      max_task_runs: Optional[int] = None,
+                      max_wall_seconds: Optional[float] = None,
+                      headless: bool = False) -> Session:
         """Create a session + its root task and persist both.
 
         ``mode`` decides whether the router seeds an EXPLORE root (default,
         existing codebase) or a CLARIFY_REQUIREMENTS root (greenfield).
+        ``max_task_runs`` / ``max_wall_seconds`` cap the session's
+        autonomous work (``None`` = unlimited); ``headless`` makes budget
+        exhaustion terminal ``FAILED`` instead of pausing on an ASK_USER.
         """
         session = Session.new(original_objective=objective,
                               project_root=project_root, title=title,
-                              mode=mode)
+                              mode=mode, max_task_runs=max_task_runs,
+                              max_wall_seconds=max_wall_seconds,
+                              headless=headless)
         self._store.save_session(session)
         # Trace the seed-router call inside the session's context so the
         # on_user_message records land in the project agent.log.
@@ -193,6 +201,13 @@ class SessionRunner:
             task = self._pick_ready(session.session_id)
             if task is None:
                 return None
+            # The ASK_USER pause primitive is exempt from the budget so an
+            # escalation prompt (and any pending user gate) can still be
+            # surfaced once the cap is reached.
+            if task.kind is not TaskKind.ASK_USER:
+                reason = self._budget_reason(session)
+                if reason is not None:
+                    return self._escalate_budget(session, task, reason)
             return self._execute(session, task, deps)
 
     # ----------------------- internals -----------------------
@@ -216,12 +231,56 @@ class SessionRunner:
             session_id, TaskNodeStatus.READY)
         return ready[0] if ready else None
 
+    def _budget_reason(self, session: Session) -> Optional[str]:
+        """Return a human-readable cause when ``session`` is over budget.
+
+        ``None`` means the session still has headroom on both axes (or
+        neither cap is configured). The task-run cap is checked first so
+        its message wins when both trip on the same call.
+        """
+        max_runs = session.max_task_runs
+        if max_runs is not None and session.task_runs >= max_runs:
+            unit = "task run" if max_runs == 1 else "task runs"
+            return f"task budget ({max_runs} {unit})"
+        max_secs = session.max_wall_seconds
+        started = session.first_task_started_at
+        if (max_secs is not None and started is not None
+                and (time.time() - started) >= max_secs):
+            return f"time budget ({max_secs:g}s)"
+        return None
+
+    def _escalate_budget(self, session: Session, task: TaskNode,
+                         reason: str) -> TaskNode:
+        """Stop an over-budget loop and route the escalation via the router.
+
+        Returns the over-budget task in its post-escalation state (BLOCKED
+        for an interactive pause, ABANDONED for a headless terminal fail)
+        so the drain loop sees no lingering READY work and quiesces.
+        """
+        log_event(session.project_root, "session_budget_exhausted",
+                  session_id=session.session_id, task_id=task.task_id,
+                  reason=reason, task_runs=session.task_runs,
+                  headless=session.headless)
+        tasks_after = self._store.list_tasks(session.session_id)
+        plan = self._router.on_budget_exhausted(
+            session=session, over_task=task, tasks=tasks_after, reason=reason)
+        self._apply_plan(session, plan)
+        return self._store.get_task(task.task_id) or task
+
     def _execute(self, session: Session, task: TaskNode,
                  deps: ExecutorDeps) -> TaskNode:
         """Run a task through its executor and persist the outcome."""
         task.status = TaskNodeStatus.IN_PROGRESS
         task.started_at = time.time()
         self._store.save_task(task)
+        # Charge the per-session budget for real work only; the ASK_USER
+        # pause primitive is free so escalation/user gates don't consume
+        # the cap. The wall-clock anchor starts on the first work task.
+        if task.kind is not TaskKind.ASK_USER:
+            session.task_runs += 1
+            if session.first_task_started_at is None:
+                session.first_task_started_at = task.started_at
+            self._store.save_session(session)
         log_event(session.project_root, "task_started",
                   session_id=session.session_id, task_id=task.task_id,
                   kind=task.kind.value, name=task.name)

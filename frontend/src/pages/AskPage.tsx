@@ -13,13 +13,34 @@ import { Pill } from "../components/Pill";
 
 const PAGE_KEY = "ask";
 
+// Model families that expose a native reasoning / "thinking" phase. Mirrors
+// the backend registry in cgx.answer.model_caps.model_supports_thinking so
+// the toggle is only offered when the server would actually honor it.
+const THINKING_MODEL_KEYS = [
+  "deepseek-r1", "qwq", "qwen3", "gpt-oss", "magistral", "cogito",
+  "smallthinker", "phi4-reasoning", "phi-4-reasoning", "granite3.2",
+  "granite3.3", "o1", "o3", "o4-mini", "gemini-2.5",
+];
+
+function modelSupportsThinking(model: string | undefined): boolean {
+  if (!model) return false;
+  const m = model.trim().toLowerCase();
+  return THINKING_MODEL_KEYS.some((k) => m.includes(k));
+}
+
 export default function AskPage() {
-  const { provider, index, selectedSessionId, setSelectedSession } = useWorkspace();
+  const { provider, index, selectedSessionId, setSelectedSession, setProvider } = useWorkspace();
   const { ask, setAsk, appendAskMessage, resetAsk } = useTasks();
   const { busy, messages, error } = ask;
 
   const threadRef = useRef<HTMLDivElement | null>(null);
   const draftRef = useRef<HTMLTextAreaElement | null>(null);
+  // send() creates a brand-new session on the first question, which flips
+  // selectedSessionId and would otherwise trigger the loader effect below --
+  // clobbering the just-appended (optimistic) user + assistant messages with
+  // the still-empty server history (messages persist only at stream end). This
+  // ref suppresses exactly that one self-inflicted reload.
+  const skipNextSessionLoad = useRef(false);
 
   // On mount: if busy but no live connection, stream finished while we were away.
   useEffect(() => {
@@ -38,6 +59,10 @@ export default function AskPage() {
 
   // Load session messages when sidebar picks a session.
   useEffect(() => {
+    if (skipNextSessionLoad.current) {
+      skipNextSessionLoad.current = false;
+      return;
+    }
     let alive = true;
     (async () => {
       if (!selectedSessionId) { resetAsk(); return; }
@@ -74,6 +99,10 @@ export default function AskPage() {
   const startSession = useCallback(async () => {
     try {
       const s = await api.createSession();
+      // Skip the loader effect that this session switch is about to fire:
+      // the new session has no persisted messages yet, and send() is about to
+      // append the optimistic ones we must not overwrite.
+      skipNextSessionLoad.current = true;
       setSelectedSession(s.id);
       return s.id;
     } catch {
@@ -183,6 +212,12 @@ export default function AskPage() {
   const intent = lastAssistant?.intent;
   const sourceCount = sources.length;
 
+  // Thinking toggle: only meaningful for reasoning-capable models. When the
+  // active model doesn't support it, the control is disabled and treated as
+  // off regardless of the persisted flag.
+  const thinkSupported = modelSupportsThinking(provider.model);
+  const thinkOn = !!provider.think && thinkSupported;
+
   // Default-collapsed retrieval panel: most reads are answer-first, so keep
   // the rank list one click away rather than always-on screen real estate.
   const [showSources, setShowSources] = useState(false);
@@ -211,6 +246,10 @@ export default function AskPage() {
           onCancel={cancel}
           onKeyDown={handleKey}
           error={error}
+          think={thinkOn}
+          thinkSupported={thinkSupported}
+          onToggleThink={() => setProvider({ think: !thinkOn })}
+          model={provider.model}
         />
       </div>
 
@@ -268,6 +307,7 @@ function ChatHeader({
 
 function AskBar({
   draftRef, busy, onSend, onCancel, onKeyDown, error,
+  think, thinkSupported, onToggleThink, model,
 }: {
   draftRef: React.RefObject<HTMLTextAreaElement | null>;
   busy: boolean;
@@ -275,6 +315,10 @@ function AskBar({
   onCancel: () => void;
   onKeyDown: (e: React.KeyboardEvent<HTMLTextAreaElement>) => void;
   error: string | null;
+  think: boolean;
+  thinkSupported: boolean;
+  onToggleThink: () => void;
+  model: string;
 }) {
   return (
     <div className="px-5 pt-3 pb-4 border-t border-muted bg-slate-950/60">
@@ -312,14 +356,40 @@ function AskBar({
         )}
       </div>
       <div className="flex items-center justify-between mt-1.5 px-1">
-        <p className="text-[10px] text-slate-500 font-mono">
-          <kbd className="px-1 py-px rounded bg-slate-900 border border-white/5 text-slate-400">Enter</kbd>
-          {" "}to send ·{" "}
-          <kbd className="px-1 py-px rounded bg-slate-900 border border-white/5 text-slate-400">Shift</kbd>
-          {" + "}
-          <kbd className="px-1 py-px rounded bg-slate-900 border border-white/5 text-slate-400">Enter</kbd>
-          {" "}for newline
-        </p>
+        <div className="flex items-center gap-3 min-w-0">
+          <button
+            type="button"
+            onClick={thinkSupported ? onToggleThink : undefined}
+            disabled={!thinkSupported}
+            title={
+              thinkSupported
+                ? (think ? "Thinking on — model sketches its approach first" : "Thinking off — answers directly (faster)")
+                : `${model || "This model"} has no reasoning phase`
+            }
+            className={
+              "inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-mono border transition " +
+              (!thinkSupported
+                ? "opacity-40 cursor-not-allowed border-white/5 text-slate-600"
+                : think
+                  ? "bg-purple-500/15 text-purple-300 border-purple-500/30"
+                  : "bg-slate-900 text-slate-400 border-white/5 hover:text-purple-300 hover:border-purple-500/30")
+            }
+          >
+            <Brain className="h-3 w-3" />
+            <span>Thinking</span>
+            <span className={think && thinkSupported ? "text-purple-300" : "text-slate-600"}>
+              {think && thinkSupported ? "on" : "off"}
+            </span>
+          </button>
+          <p className="text-[10px] text-slate-500 font-mono">
+            <kbd className="px-1 py-px rounded bg-slate-900 border border-white/5 text-slate-400">Enter</kbd>
+            {" "}to send ·{" "}
+            <kbd className="px-1 py-px rounded bg-slate-900 border border-white/5 text-slate-400">Shift</kbd>
+            {" + "}
+            <kbd className="px-1 py-px rounded bg-slate-900 border border-white/5 text-slate-400">Enter</kbd>
+            {" "}for newline
+          </p>
+        </div>
         {error && <p className="text-[10px] text-red-400 font-mono">{error}</p>}
       </div>
     </div>

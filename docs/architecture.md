@@ -444,7 +444,7 @@ matching the convention already used by `cgx.agents.types` and
 
 | Type           | Purpose |
 |----------------|---------|
-| `Session`      | Root aggregate: `original_objective`, `project_root`, `root_task_id`, `status`, timestamps. |
+| `Session`      | Root aggregate: `original_objective`, `project_root`, `root_task_id`, `status`, timestamps. Carries the **Phase E** session budget: config `max_task_runs`, `max_wall_seconds`, `headless` (all default to unlimited/off) plus live counters `task_runs` and `first_task_started_at`. The store round-trips the new fields with backward-compatible `.get()` defaults, so pre-existing sessions load unchanged. |
 | `TaskNode`     | One node in the per-session DAG. Carries `kind`, `name`, `description`, `parent_task_id`, `status`, `inputs`, `outputs`, `produced_artifact_id`, `consumed_decision_ids`, `error`, lifecycle timestamps. |
 | `Fact`         | Append-only piece of session knowledge (`FILE` / `SYMBOL` / `PARAMETER` / `ANCHOR` / `LLM_CALL`). `LLM_CALL` facts (**Phase 5.1**) carry `{provider, model, sampling_params, prompt, response, latency_ms, tokens_in, tokens_out, source_task_id, role}` recorded by every LLM call site in `cgx.answer.engine`, `clarify_requirements.py`, `decompose.py`, and `scaffold.py` via `cgx.session.llm_trace.trace_llm_call`. Updates set `stale=True` rather than mutating `content`. |
 | `Artifact`     | Typed output produced by a finished task. Explore-mode kinds: `DIRECTIONS_LIST`, `FINDINGS_BUNDLE`, `RECOMMENDATION_LIST`, `CODE_CHANGE_PLAN`. Greenfield-mode kinds: `REQUIREMENTS_SHEET`, `WORK_PLAN`, `SCAFFOLD_PATCHES`, `BUILD_REPORT`, `API_CHECK_REPORT`, `SMOKE_REPORT`, `REPAIR_PLAN`. Shared write-loop kinds: `APPLIED_CHANGES`, `VERIFY_REPORT`, `SESSION_DIGEST`. |
@@ -561,6 +561,18 @@ Four entry points cover every transition:
   never a valid recovery. Explore-mode sessions keep their
   user-driven lifecycle (return an empty plan); a no-op once the
   session is already `COMPLETED` / `FAILED` / `ABANDONED`.
+* `on_budget_exhausted(session, over_task, tasks, reason)` --
+  session-level circuit breaker (**Phase E**). When the runner detects
+  a session over its `max_task_runs` or `max_wall_seconds` budget, an
+  *interactive* session sets every still-READY work task `BLOCKED`,
+  spawns one `ASK_USER` (`DecisionKind.FREEFORM`, built by
+  `_make_budget_ask`, carrying the human-readable `reason`) surfacing
+  the exhaustion, and goes `PAUSED`; a *headless* session abandons the
+  READY work and ends terminally `FAILED`. Only compute-bearing tasks
+  charge the budget -- the `ASK_USER` wait-state stays free so the
+  escalation itself can always surface. This catches runaway
+  autonomous loops that slip past the per-loop regenerate / repair
+  caps.
 * `on_decision_recorded(session, decision, tasks)` -- record the
   decision, attach it to the resolved `ASK_USER`, mark the `ASK_USER`
   `DONE`, and spawn the typed successor implied by `decision.kind` +
@@ -598,6 +610,16 @@ funnel through it so a single sequencer enforces:
   helpful message; uncaught executor exception → same path with the
   exception class + message. Facts surfaced before the error are
   still persisted.
+* **Session-budget accounting** (**Phase E**): `run_next` checks the
+  budget (`_budget_reason`) for any non-`ASK_USER` task *before*
+  dispatch; when `max_task_runs` or `max_wall_seconds` is exceeded it
+  routes through `_escalate_budget` → `Router.on_budget_exhausted`
+  instead of executing -- pausing an interactive session on an
+  `ASK_USER` or ending a headless one `FAILED`. Compute-bearing tasks
+  charge the budget in `_execute` (increments `task_runs`; stamps
+  `first_task_started_at` on the first work task); the `ASK_USER`
+  wait-state is exempt on both the check and the charge, so escalation
+  never starves itself.
 
 Public API: `start_session(objective, project_root, title)`,
 `post_message(session_id, message)`, `post_decision(session_id,

@@ -172,6 +172,25 @@ def run_index_auto(
     cache_stats_per_view: Dict[str, Dict[str, int]] = {}
     normalize = (metric in {"cosine", "ip"})
 
+    def _make_progress_cb(view_name: str):
+        """A throttled (done, total) callback that logs embedding progress.
+
+        Emits a line every ~5% (and always at 100%) so a long-running embed
+        of a large repo shows steady progress instead of going silent.
+        """
+        state = {"last_pct": -1}
+
+        def _cb(done: int, total: int) -> None:
+            if total <= 0:
+                return
+            pct = int(done * 100 / total)
+            if done >= total or pct >= state["last_pct"] + 5:
+                state["last_pct"] = pct
+                logger.info("Embedding view=%s progress %d/%d (%d%%)",
+                            view_name, done, total, pct)
+
+        return _cb
+
     def _build_view(view_name: str, rows: List[Dict[str, Any]]):
         """Embed + index one corpus view; returns (view_name, index_dict, cache_stats)."""
         logger.info("Building index for view=%s (rows=%d)", view_name, len(rows))
@@ -188,6 +207,8 @@ def run_index_auto(
                 cache_path = os.path.join(out_dir, f"emb_cache_{view_name}.npz")
                 texts = [str(r.get("text") or r.get("code") or "") for r in rows]
 
+                progress_cb = _make_progress_cb(view_name)
+
                 def _encode(missing_texts: List[str]) -> np.ndarray:
                     if embedder is not None and hasattr(embedder, "encode"):
                         arr = np.asarray(embedder.encode(missing_texts), dtype=np.float32)
@@ -203,6 +224,7 @@ def run_index_auto(
                         batch_size=batch_size,
                         field_strategy="auto",
                         max_length=256,
+                        progress_cb=progress_cb,
                     )
 
                 embs, stats = embed_with_cache(
@@ -220,6 +242,7 @@ def run_index_auto(
                         rows, model_name=model_name, backend="auto",
                         normalize=normalize, batch_size=batch_size,
                         field_strategy="auto", max_length=256,
+                        progress_cb=_make_progress_cb(view_name),
                     )
             logger.info("Embedding done for view=%s shape=%s", view_name, np.asarray(embs).shape)
         except Exception as e:

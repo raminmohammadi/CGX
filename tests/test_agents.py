@@ -942,6 +942,87 @@ def test_judge_clarify_paths_accepts_suggested_changes_as_options():
     assert "4" in v.rationale or "option" in v.rationale.lower()
 
 
+# ---------------------------------------------------------------------------
+# Judge: ASK / SUMMARIZE answer-quality (verbosity) gate
+# ---------------------------------------------------------------------------
+def test_judge_summarize_passes_within_bullet_budget():
+    # A tight, on-contract summary (<=8 bullets, well under the word cap)
+    # passes the structural gate without needing an LLM grader.
+    task = Task(description="summarize", kind=TaskKind.SUMMARIZE,
+                criteria=["condenses prior work"],
+                output={"answer_md": (
+                    "- Indexed the repository.\n"
+                    "- Ran the query pipeline.\n"
+                    "- Reranked the top hits.\n"
+                )})
+    v = Judge(provider=None).judge(task)
+    assert v.verdict == "pass"
+    assert "budget" in v.rationale.lower()
+
+
+def test_judge_summarize_fails_when_too_many_bullets():
+    # The summarize capability's contract is "<=8 bullets"; nine list
+    # items must hard-fail the structural gate with no LLM grader.
+    bullets = "\n".join(f"- point {i}" for i in range(9))
+    task = Task(description="summarize", kind=TaskKind.SUMMARIZE,
+                criteria=["at most 8 bullets"], output={"answer_md": bullets})
+    v = Judge(provider=None).judge(task)
+    assert v.verdict == "fail"
+    assert "bullet" in v.rationale.lower()
+
+
+def test_judge_summarize_fails_when_too_verbose():
+    # Within the bullet budget but far over the word cap: a condensation
+    # of prior work products must stay tight.
+    body = "\n".join(f"- {'word ' * 200}".rstrip() for _ in range(3))
+    task = Task(description="summarize", kind=TaskKind.SUMMARIZE,
+                criteria=["concise"], output={"answer_md": body})
+    v = Judge(provider=None).judge(task)
+    assert v.verdict == "fail"
+    assert "verbose" in v.rationale.lower()
+
+
+def test_judge_summarize_fails_on_empty():
+    task = Task(description="summarize", kind=TaskKind.SUMMARIZE,
+                criteria=["non-empty"], output={"answer_md": "   "})
+    v = Judge(provider=None).judge(task)
+    assert v.verdict == "fail"
+    assert "empty" in v.rationale.lower()
+
+
+def test_judge_ask_fails_when_answer_too_verbose():
+    # A pathologically long ASK answer hard-fails the verbosity gate
+    # before any LLM-grader call is made.
+    from cgx.agents.judge import _ASK_MAX_WORDS
+    answer = "word " * (_ASK_MAX_WORDS + 5)
+    task = Task(description="explain", kind=TaskKind.ASK,
+                criteria=["answers the question"],
+                output={"answer_md": answer})
+    v = Judge(provider=None).judge(task)
+    assert v.verdict == "fail"
+    assert "verbose" in v.rationale.lower()
+
+
+def test_judge_ask_within_budget_defers_to_llm_grader():
+    # A within-budget, non-clarify ASK must NOT be short-circuited by the
+    # verbosity gate: the strict LLM grader still decides the substantive
+    # verdict. Assert the provider was actually consulted.
+    called = {"n": 0}
+
+    class _StubProvider:
+        def chat(self, **kw):
+            called["n"] += 1
+            return {"content": '{"verdict":"pass","confidence":0.9,'
+                               '"rationale":"grounded"}'}
+
+    task = Task(description="explain", kind=TaskKind.ASK,
+                criteria=["answers the question"],
+                output={"answer_md": "A concise, grounded answer [[a.py::f]]."})
+    v = Judge(provider=_StubProvider()).judge(task)
+    assert v.verdict == "pass"
+    assert called["n"] == 1, "within-budget ASK must reach the LLM grader"
+
+
 def test_engine_answer_accepts_mode_override_and_extra_kwargs():
     # The engine's answer entrypoints must accept ``mode_override`` and
     # tolerate agent-only inputs (e.g. ``goal``) without raising. We hit

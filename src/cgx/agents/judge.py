@@ -260,6 +260,25 @@ _ENUM_LINE_RE = re.compile(
     re.MULTILINE,
 )
 
+# Match a Markdown list item -- ordered (``1.``, ``2)``) or unordered
+# bullet (``- ``, ``* ``, ``• ``) -- but NOT ``#`` headings. Used by the
+# SUMMARIZE verbosity gate so a heading isn't miscounted as a bullet.
+_LIST_ITEM_RE = re.compile(
+    r"^\s*(?:[0-9]{1,2}[.)]|[-*•])\s+\S",
+    re.MULTILINE,
+)
+
+# Verbosity / answer-quality budgets for the free-text answer kinds
+# (ASK, SUMMARIZE). These act as a deterministic pre-gate in front of the
+# strict LLM judge: an obviously over-long answer hard-fails here (and
+# saves an LLM call), while an answer within budget defers its
+# substantive verdict to the LLM grader (ASK) or passes structurally
+# (SUMMARIZE). The SUMMARIZE bullet cap mirrors the "<=8 bullets"
+# contract in the ``summarize`` capability prompt (cgx.agents.loop).
+_ASK_MAX_WORDS = 1000
+_SUMMARIZE_MAX_BULLETS = 8
+_SUMMARIZE_MAX_WORDS = 400
+
 
 def _is_clarify_ask(task: Task) -> bool:
     """True when ``task`` is an ASK routed through the clarify_paths mode.
@@ -515,7 +534,53 @@ class Judge:
                                "options nor asks a follow-up question."),
                     checked_criteria=ncrit,
                 )
+            # Verbosity gate for a grounded (non-clarify) ASK: a
+            # pathologically long answer hard-fails here rather than
+            # burning an LLM-grader call on runaway output. Answers within
+            # budget return None so the strict LLM judge still decides the
+            # substantive verdict (grounding, citations, correctness).
+            words = len(answer.split())
+            if words > _ASK_MAX_WORDS:
+                return Verdict(
+                    verdict="fail", confidence=0.8,
+                    rationale=(f"Answer is too verbose ({words} words; "
+                               f"budget {_ASK_MAX_WORDS})."),
+                    checked_criteria=ncrit,
+                )
             return None
+        if task.kind == TaskKind.SUMMARIZE:
+            # SUMMARIZE has no ground truth to check, only an answer-quality
+            # contract: the ``summarize`` capability asks for "<=8 bullets".
+            # Enforce that budget (plus a word cap) deterministically so an
+            # over-long or empty condensation is rejected before -- and
+            # independently of -- the strict LLM grader.
+            answer = str(out.get("answer_md") or out.get("answer") or "")
+            if not answer.strip():
+                return Verdict(verdict="fail", confidence=0.9,
+                               rationale="Summary is empty.",
+                               checked_criteria=ncrit)
+            bullets = len(_LIST_ITEM_RE.findall(answer))
+            if bullets > _SUMMARIZE_MAX_BULLETS:
+                return Verdict(
+                    verdict="fail", confidence=0.85,
+                    rationale=(f"Summary has {bullets} list items; exceeds "
+                               f"the {_SUMMARIZE_MAX_BULLETS}-bullet budget."),
+                    checked_criteria=ncrit,
+                )
+            words = len(answer.split())
+            if words > _SUMMARIZE_MAX_WORDS:
+                return Verdict(
+                    verdict="fail", confidence=0.8,
+                    rationale=(f"Summary is too verbose ({words} words; "
+                               f"budget {_SUMMARIZE_MAX_WORDS})."),
+                    checked_criteria=ncrit,
+                )
+            return Verdict(
+                verdict="pass", confidence=0.75,
+                rationale=(f"Summary within budget ({bullets} bullet(s), "
+                           f"{words} word(s))."),
+                checked_criteria=ncrit,
+            )
         if task.kind == TaskKind.SEARCH:
             hits = out.get("hits") or []
             if not hits:
@@ -768,7 +833,7 @@ class Judge:
             fp = str(out.get("file") or "")
             content = str(out.get("content") or out.get("patch") or "")
             return f"File: {fp}\n\n```\n{content[:3000]}\n```"
-        if task.kind == TaskKind.ASK:
+        if task.kind in (TaskKind.ASK, TaskKind.SUMMARIZE):
             return str(out.get("answer_md") or out.get("answer") or "")
         if task.kind == TaskKind.SEARCH:
             hits = out.get("hits") or []

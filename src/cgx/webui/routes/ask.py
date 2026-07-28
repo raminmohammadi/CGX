@@ -44,6 +44,7 @@ async def ask(req: AskRequest) -> EventSourceResponse:
             num_ctx=getattr(pcfg, "num_ctx", None),
             endpoint_path=getattr(pcfg, "endpoint_path", "/v1/chat/completions"),
             allow_no_auth=bool(getattr(pcfg, "allow_no_auth", False)),
+            think=bool(getattr(pcfg, "think", False)),
             cancel_event=cancel_event,
         ):
             if ev == "intent":

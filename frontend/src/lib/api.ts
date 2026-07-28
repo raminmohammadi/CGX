@@ -17,6 +17,10 @@ export type ProviderConfig = {
   num_ctx?: number | null;
   endpoint_path?: string;
   allow_no_auth?: boolean;
+  // Opt-in reasoning/"thinking" phase for ASK. The backend only honors it
+  // when the selected model is reasoning-capable; otherwise it answers
+  // directly. Undefined is treated as false.
+  think?: boolean;
 };
 
 export type IndexLocation = {

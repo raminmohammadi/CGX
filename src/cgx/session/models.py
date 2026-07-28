@@ -311,11 +311,26 @@ class Session:
     project_root: Optional[str] = None
     created_at: float = field(default_factory=_now)
     updated_at: float = field(default_factory=_now)
+    # Optional per-session resource budget (E1). ``None`` means unlimited
+    # for that axis. The runner escalates when either cap is reached --
+    # an interactive session pauses on a fresh ASK_USER, a ``headless``
+    # session ends terminally FAILED -- rather than looping until the
+    # drain's coarse ``max_steps`` safety valve trips.
+    max_task_runs: Optional[int] = None
+    max_wall_seconds: Optional[float] = None
+    headless: bool = False
+    # Live counters the runner maintains as it dispatches work tasks
+    # (everything except the ASK_USER pause primitive).
+    task_runs: int = 0
+    first_task_started_at: Optional[float] = None
 
     @classmethod
     def new(cls, original_objective: str, *, title: Optional[str] = None,
             project_root: Optional[str] = None,
-            mode: SessionMode = SessionMode.EXPLORE) -> "Session":
+            mode: SessionMode = SessionMode.EXPLORE,
+            max_task_runs: Optional[int] = None,
+            max_wall_seconds: Optional[float] = None,
+            headless: bool = False) -> "Session":
         t = (title or original_objective).strip()
         if len(t) > 80:
             t = t[:77] + "..."
@@ -325,6 +340,9 @@ class Session:
             original_objective=original_objective,
             project_root=project_root,
             mode=mode,
+            max_task_runs=max_task_runs,
+            max_wall_seconds=max_wall_seconds,
+            headless=headless,
         )
 
     def to_dict(self) -> Dict[str, Any]:
