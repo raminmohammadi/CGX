@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/images/logo.png">
-    <img src="docs/images/logo.png" width="280" alt="CGX -- Code Graph eXecution">
+    <img src="docs/images/logo.png" width="380" alt="CGX -- Code Graph eXecution">
   </picture>
 </p>
 
