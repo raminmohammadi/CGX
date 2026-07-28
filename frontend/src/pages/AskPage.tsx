@@ -61,8 +61,22 @@ export default function AskPage() {
   useEffect(() => {
     let alive = true;
     (async () => {
-      if (!selectedSessionId) { resetAsk(); return; }
+      if (!selectedSessionId) {
+        abortConnection(PAGE_KEY);
+        resetAsk();
+        return;
+      }
+      // Same session the store already holds -- possibly mid-stream after a tab
+      // switch, or the brand-new session send() just tagged before the server
+      // has persisted anything. Keep local state; the stream owns the store and
+      // a re-fetch here would blank the in-flight question + answer. This single
+      // check covers both the first-question self-switch and tab remounts.
       if (useTasks.getState().ask.sessionId === selectedSessionId) return;
+      // Genuine switch to a *different* session (sidebar click / new session).
+      // Stop any stream still running for the previous session so its deltas
+      // can't bleed into the one we're about to load, then fetch its history.
+      abortConnection(PAGE_KEY);
+      setAsk({ busy: false });
       try {
         const items = await api.sessionMessages(selectedSessionId);
         if (!alive) return;
@@ -74,7 +88,7 @@ export default function AskPage() {
             sources: (m.meta as any)?.sources,
             intent: (m.meta as any)?.intent,
           }));
-        setAsk({ messages: conv, sessionId: selectedSessionId });
+        setAsk({ messages: conv, sessionId: selectedSessionId, busy: false });
       } catch {
         if (alive) resetAsk();
       }

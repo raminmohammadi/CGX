@@ -31,7 +31,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install -e ".[dev,codegen]"
+          pip install -e ".[dev,codegen,parsers]"
 
       - name: Assert ML stack is *not* installed
         run: |
@@ -77,7 +77,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install --extra-index-url https://download.pytorch.org/whl/cpu -r requirements-ml.txt
-          pip install -e ".[dev,codegen]"
+          pip install -e ".[dev,codegen,parsers]"
 
       - name: Run tests
         env:
