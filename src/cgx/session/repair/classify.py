@@ -205,6 +205,17 @@ def failure_signature(content: Dict[str, Any]) -> str:
     return hashlib.sha1(raw).hexdigest()[:16]
 
 
+def failure_text(content: Dict[str, Any]) -> str:
+    """Public accessor for the concatenated VERIFY failure text.
+
+    A thin wrapper over :func:`_failure_text` so callers outside this
+    module (e.g. the bounded LLM-repair path in the REPAIR executor) can
+    feed the exact same failure blob to a provider without importing a
+    private name or re-deriving the concatenation order.
+    """
+    return _failure_text(content)
+
+
 # --------------------- helpers ---------------------
 
 def _failure_text(content: Dict[str, Any]) -> str:

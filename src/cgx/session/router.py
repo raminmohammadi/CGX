@@ -478,6 +478,7 @@ def _decompose_to_ask(parent: TaskNode) -> List[TaskNode]:
             "prior_goal": parent.inputs.get("prior_goal"),
             "requirements_artifact_id":
                 parent.inputs.get("requirements_artifact_id"),
+            "replan_attempt": parent.inputs.get("replan_attempt"),
         },
     )]
 
@@ -490,6 +491,15 @@ _REPAIR_BUDGET = 2
 # the budget is exhausted the regenerate branch falls back to the
 # patch branch's ASK_USER escalation.
 _REGENERATE_BUDGET = 1
+
+# Maximum number of *re-plan* escalations per session. When a SCAFFOLD or
+# APPLY spends its per-manifest regenerate budget the manifest itself is
+# the suspect (not the generation of any single file), so before failing
+# terminally the router escalates once to a fresh DECOMPOSE that revises
+# the plan with the accumulated failure folded into its goal. A single
+# revision is enough; a second exhaustion on the revised manifest is a
+# genuine dead end and terminates the session.
+_REPLAN_BUDGET = 1
 
 
 # Outcomes that REPAIR knows how to attempt a fix for. ``passed`` and
@@ -999,12 +1009,14 @@ def _apply_failed_files_actions(completed: TaskNode,
     Continuing to BOOTSTRAP_ENV / VERIFY with a core module silently
     missing guarantees a downstream collection error, so any greenfield
     APPLY that dropped a file re-scaffolds within
-    :data:`_REGENERATE_BUDGET` instead of limping forward. When no
-    SCAFFOLD ancestor exists or the regenerate budget is spent the
-    session ends terminally ``FAILED`` -- never proceeds on a
-    known-broken tree, and never asks the user to hand-fix generated
-    code. Returns an empty list for explore mode or a clean apply so the
-    dispatcher takes the normal APPLY -> VERIFY edge.
+    :data:`_REGENERATE_BUDGET` instead of limping forward. When the
+    regenerate budget is spent the router escalates once to a revised
+    manifest via :func:`_replan_or_fail` (a fresh DECOMPOSE) before ending
+    the session terminally ``FAILED``. When no SCAFFOLD ancestor exists the
+    session fails terminally -- it never proceeds on a known-broken tree,
+    and never asks the user to hand-fix generated code. Returns an empty
+    list for explore mode or a clean apply so the dispatcher takes the
+    normal APPLY -> VERIFY edge.
     """
     from cgx.session.repair.propose import propose_regenerate  # dep direction
 
@@ -1016,33 +1028,114 @@ def _apply_failed_files_actions(completed: TaskNode,
     if failed_count <= 0:
         return []
     scaffold = _find_scaffold_ancestor(completed, tasks)
-    if scaffold is not None:
-        prior_regens = int(scaffold.inputs.get("regenerate_attempt") or 0)
-        if prior_regens < _REGENERATE_BUDGET:
-            scaffold_outputs = scaffold.outputs or {}
-            constraint = _invalid_scaffold_constraint(
-                failed_count,
-                apply_failed=outputs.get("failed_files"),
-                scaffold_failed=scaffold_outputs.get("failed"))
-            regen_files = _failed_scaffold_paths(
-                scaffold_outputs.get("failed"), outputs.get("failed_files"))
-            prior_id = str(
-                scaffold_outputs.get("scaffold_artifact_id") or "").strip()
-            actions: List[RouterAction] = []
-            skip_states = {TaskNodeStatus.DONE, TaskNodeStatus.FAILED,
-                           TaskNodeStatus.ABANDONED}
-            for t in _collect_descendants(scaffold.task_id, tasks):
-                if t.status in skip_states:
-                    continue
-                actions.append(UpdateTaskStatus(
-                    task_id=t.task_id, status=TaskNodeStatus.ABANDONED))
-            actions.append(CreateTask(propose_regenerate(
-                scaffold, constraint,
-                regenerate_files=regen_files,
-                prior_scaffold_artifact_id=prior_id)))
-            return actions
-    return [UpdateSessionStatus(
+    if scaffold is None:
+        return [UpdateSessionStatus(
+            session_id=completed.session_id, status=SessionStatus.FAILED)]
+    scaffold_outputs = scaffold.outputs or {}
+    constraint = _invalid_scaffold_constraint(
+        failed_count,
+        apply_failed=outputs.get("failed_files"),
+        scaffold_failed=scaffold_outputs.get("failed"))
+    prior_regens = int(scaffold.inputs.get("regenerate_attempt") or 0)
+    if prior_regens >= _REGENERATE_BUDGET:
+        return _replan_or_fail(
+            completed, tasks, scaffold=scaffold,
+            failure_note=str(constraint.get("rationale") or ""))
+    regen_files = _failed_scaffold_paths(
+        scaffold_outputs.get("failed"), outputs.get("failed_files"))
+    prior_id = str(
+        scaffold_outputs.get("scaffold_artifact_id") or "").strip()
+    actions: List[RouterAction] = []
+    skip_states = {TaskNodeStatus.DONE, TaskNodeStatus.FAILED,
+                   TaskNodeStatus.ABANDONED}
+    for t in _collect_descendants(scaffold.task_id, tasks):
+        if t.status in skip_states:
+            continue
+        actions.append(UpdateTaskStatus(
+            task_id=t.task_id, status=TaskNodeStatus.ABANDONED))
+    actions.append(CreateTask(propose_regenerate(
+        scaffold, constraint,
+        regenerate_files=regen_files,
+        prior_scaffold_artifact_id=prior_id)))
+    return actions
+
+
+def _fold_failure_into_goal(prior_goal: str, failure_note: str) -> str:
+    """Append a re-plan failure note to a goal so DECOMPOSE can react.
+
+    The revised goal keeps the original objective verbatim and adds a
+    short, explicit note describing why the prior manifest could not be
+    scaffolded so the planner restructures the plan (drop the offending
+    file, split a layer, pick a simpler stack) instead of re-emitting the
+    same broken manifest.
+    """
+    goal = (prior_goal or "").strip()
+    note = (failure_note or "").strip()
+    if not note:
+        return goal
+    banner = ("The previous plan could not be scaffolded. Revise the file "
+              "manifest to avoid this failure: " + note)
+    return f"{goal}\n\n{banner}" if goal else banner
+
+
+def _replan_or_fail(completed: TaskNode, tasks: List[TaskNode], *,
+                    scaffold: Optional[TaskNode],
+                    failure_note: str) -> List[RouterAction]:
+    """Escalate an exhausted regenerate budget to a fresh DECOMPOSE.
+
+    When a SCAFFOLD/APPLY has spent its per-manifest
+    :data:`_REGENERATE_BUDGET` the manifest itself is the suspect, not
+    the generation of any single file. Before failing the session
+    terminally the router escalates *once* (capped by
+    :data:`_REPLAN_BUDGET`) to a revised plan: it abandons the live
+    subtree under the failing SCAFFOLD and spawns a fresh DECOMPOSE whose
+    goal folds in ``failure_note`` so the planner can restructure the
+    manifest. The ``replan_attempt`` counter threads DECOMPOSE ->
+    ASK_USER(APPROVE_PLAN) -> SCAFFOLD (and copies verbatim across
+    :func:`propose_regenerate` retries), so a second exhaustion on the
+    revised manifest falls through to terminal ``FAILED``. Returns the
+    terminal-fail action when no SCAFFOLD lineage exists or the re-plan
+    budget is already spent.
+    """
+    fail = [UpdateSessionStatus(
         session_id=completed.session_id, status=SessionStatus.FAILED)]
+    if scaffold is None:
+        return fail
+    prior_replans = int(scaffold.inputs.get("replan_attempt") or 0)
+    if prior_replans >= _REPLAN_BUDGET:
+        return fail
+    prior_goal = str(scaffold.inputs.get("prior_goal") or "").strip()
+    decompose = _find_ancestor_by_kind(scaffold, tasks, TaskKind.DECOMPOSE)
+    answers: Dict[str, object] = {}
+    if decompose is not None:
+        prior_answers = decompose.inputs.get("answers")
+        if isinstance(prior_answers, dict):
+            answers = dict(prior_answers)
+    new_decompose = TaskNode.new(
+        session_id=completed.session_id,
+        kind=TaskKind.DECOMPOSE,
+        name="Revise the work plan",
+        description=("Re-plan the file manifest after the prior plan's "
+                     "scaffold could not be generated cleanly."),
+        parent_task_id=scaffold.task_id,
+        inputs={
+            "prior_goal": _fold_failure_into_goal(prior_goal, failure_note),
+            "requirements_artifact_id":
+                scaffold.inputs.get("requirements_artifact_id"),
+            "answers": answers,
+            "replan_attempt": prior_replans + 1,
+        },
+    )
+    actions: List[RouterAction] = []
+    skip_states = {TaskNodeStatus.DONE, TaskNodeStatus.FAILED,
+                   TaskNodeStatus.ABANDONED}
+    for t in _collect_descendants(scaffold.task_id, tasks):
+        if t.status in skip_states:
+            continue
+        actions.append(UpdateTaskStatus(
+            task_id=t.task_id, status=TaskNodeStatus.ABANDONED))
+    actions.append(CreateTask(new_decompose))
+    return actions
 
 
 def _scaffold_failed_files_actions(completed: TaskNode,
@@ -1059,10 +1152,12 @@ def _scaffold_failed_files_actions(completed: TaskNode,
     :func:`_apply_failed_files_actions`, any SCAFFOLD that dropped a file
     re-scaffolds within :data:`_REGENERATE_BUDGET`, folding the concrete
     per-file errors into the regenerate constraint so the retry has
-    actionable feedback. When the budget is spent the session ends
-    terminally ``FAILED`` rather than limping forward on a known-incomplete
-    tree. Returns an empty list for a clean scaffold so the dispatcher
-    takes the normal SCAFFOLD -> APPLY edge.
+    actionable feedback. When that budget is spent the router escalates
+    once to a revised manifest via :func:`_replan_or_fail` (a fresh
+    DECOMPOSE) before ending the session terminally ``FAILED`` -- it never
+    limps forward on a known-incomplete tree. Returns an empty list for a
+    clean scaffold so the dispatcher takes the normal SCAFFOLD -> APPLY
+    edge.
     """
     from cgx.session.repair.propose import propose_regenerate  # dep direction
 
@@ -1070,13 +1165,14 @@ def _scaffold_failed_files_actions(completed: TaskNode,
     failed_count = int(outputs.get("failed_count") or 0)
     if failed_count <= 0:
         return []
-    prior_regens = int(completed.inputs.get("regenerate_attempt") or 0)
-    if prior_regens >= _REGENERATE_BUDGET:
-        return [UpdateSessionStatus(
-            session_id=completed.session_id, status=SessionStatus.FAILED)]
     constraint = _invalid_scaffold_constraint(
         failed_count, apply_failed=None,
         scaffold_failed=outputs.get("failed"))
+    prior_regens = int(completed.inputs.get("regenerate_attempt") or 0)
+    if prior_regens >= _REGENERATE_BUDGET:
+        return _replan_or_fail(
+            completed, tasks, scaffold=completed,
+            failure_note=str(constraint.get("rationale") or ""))
     regen_files = _failed_scaffold_paths(outputs.get("failed"), None)
     prior_id = str(outputs.get("scaffold_artifact_id") or "").strip()
     actions: List[RouterAction] = []
@@ -1242,9 +1338,9 @@ def _verify_lesson_actions(completed: TaskNode,
     )]
 
 
-def _find_scaffold_ancestor(start: TaskNode,
-                            tasks: List[TaskNode]) -> Optional[TaskNode]:
-    """Walk up ``parent_task_id`` chain to the nearest SCAFFOLD task."""
+def _find_ancestor_by_kind(start: TaskNode, tasks: List[TaskNode],
+                           kind: TaskKind) -> Optional[TaskNode]:
+    """Walk up ``parent_task_id`` chain to the nearest task of ``kind``."""
     by_id = {t.task_id: t for t in tasks}
     visited: set = set()
     cur_id = start.parent_task_id
@@ -1253,10 +1349,16 @@ def _find_scaffold_ancestor(start: TaskNode,
         cur = by_id.get(cur_id)
         if cur is None:
             return None
-        if cur.kind is TaskKind.SCAFFOLD:
+        if cur.kind is kind:
             return cur
         cur_id = cur.parent_task_id
     return None
+
+
+def _find_scaffold_ancestor(start: TaskNode,
+                            tasks: List[TaskNode]) -> Optional[TaskNode]:
+    """Walk up ``parent_task_id`` chain to the nearest SCAFFOLD task."""
+    return _find_ancestor_by_kind(start, tasks, TaskKind.SCAFFOLD)
 
 
 def _collect_descendants(root_task_id: str,
@@ -1508,6 +1610,7 @@ def _from_approve_plan(ask: TaskNode,
             "requirements_artifact_id":
                 ask.inputs.get("requirements_artifact_id"),
             "prior_goal": ask.inputs.get("prior_goal"),
+            "replan_attempt": ask.inputs.get("replan_attempt"),
             "decision_id": decision.decision_id,
         },
     )

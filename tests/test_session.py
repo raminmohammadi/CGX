@@ -4772,6 +4772,121 @@ def test_repair_executor_emits_empty_plan_for_unknown(store, tmp_path: Path):
     assert result.outputs["diff_count"] == 0
 
 
+def test_generate_repair_files_returns_validated_rewrites():
+    """The engine helper keeps only changed, syntactically-valid rewrites."""
+    import json as _json
+    from cgx.answer.engine import generate_repair_files
+    src = "def add(a, b):\n    return a - b\n"
+    fixed = "def add(a, b):\n    return a + b\n"
+    provider = _StubProvider(_json.dumps({"files": [
+        {"path": "src/calc.py", "content": fixed},
+        # unchanged file -> dropped
+        {"path": "tests/test_calc.py", "content": "T"},
+        # not in the supplied file list -> dropped
+        {"path": "src/other.py", "content": "x = 1\n"},
+        # broken Python -> dropped by the syntax gate
+        {"path": "src/broken.py", "content": "def x(:\n"},
+    ]}))
+    out = generate_repair_files(
+        provider,
+        goal="a calculator",
+        failure_text="E   assert 1 == 3",
+        files=[
+            {"path": "src/calc.py", "content": src},
+            {"path": "tests/test_calc.py", "content": "T"},
+            {"path": "src/broken.py", "content": "def x():\n    pass\n"},
+        ],
+    )
+    assert out == {"src/calc.py": fixed}
+
+
+def test_repair_executor_llm_logic_repair_emits_patch(store, tmp_path: Path):
+    """unknown assertion failure + provider -> bounded LLM patch (can_apply)."""
+    import json as _json
+    from cgx.session.tasks import repair as _repair_module  # noqa: F401
+    rel = "src/calc.py"
+    (tmp_path / "src").mkdir()
+    (tmp_path / rel).write_text(
+        "def add(a, b):\n    return a - b\n", encoding="utf-8")
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    verify_task = TaskNode.new(
+        session.session_id, TaskKind.VERIFY, "verify",
+        inputs={"mode": SessionMode.GREENFIELD.value})
+    verify_artifact = Artifact.new(
+        session_id=session.session_id,
+        produced_by_task_id=verify_task.task_id,
+        kind=ArtifactKind.VERIFY_REPORT,
+        content={
+            "outcome": "assertions_failed",
+            "returncode": 1,
+            "changed_files": [rel],
+            "stdout": "E   assert 1 == 3\nE    +  where 1 = add(2, 1)",
+            "stderr": "",
+        })
+    store.save_task(verify_task)
+    store.save_artifact(verify_artifact)
+    provider = _StubProvider(_json.dumps({"files": [
+        {"path": rel, "content": "def add(a, b):\n    return a + b\n"}]}))
+    repair_task = TaskNode.new(
+        session.session_id, TaskKind.REPAIR, "repair",
+        inputs={"verify_artifact_id": verify_artifact.artifact_id,
+                "mode": SessionMode.GREENFIELD.value,
+                "repair_attempt": 1})
+    deps = ExecutorDeps(
+        project_root=str(tmp_path), store=store, provider=provider)
+    from cgx.session.tasks.base import _REGISTRY
+    result = _REGISTRY[TaskKind.REPAIR](repair_task, deps)
+    assert result.failure is None
+    assert result.outputs["classification"] == "unknown"
+    assert result.outputs["can_apply"] is True
+    assert result.outputs["diff_count"] == 1
+    assert result.outputs["strategy"] == "patch"
+    diffs = result.artifact.content["diffs"]
+    assert diffs[0]["file"] == rel
+    assert "return a + b" in diffs[0]["patch"]
+
+
+def test_repair_executor_llm_logic_repair_respects_attempt_budget(
+        store, tmp_path: Path):
+    """Past the LLM-repair attempt cap the executor falls back to no patch."""
+    import json as _json
+    from cgx.session.tasks import repair as _repair_module  # noqa: F401
+    rel = "src/calc.py"
+    (tmp_path / "src").mkdir()
+    (tmp_path / rel).write_text(
+        "def add(a, b):\n    return a - b\n", encoding="utf-8")
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    verify_artifact = Artifact.new(
+        session_id=session.session_id, produced_by_task_id="t_verify",
+        kind=ArtifactKind.VERIFY_REPORT,
+        content={
+            "outcome": "assertions_failed",
+            "returncode": 1,
+            "changed_files": [rel],
+            "stdout": "E   assert 1 == 3",
+            "stderr": "",
+        })
+    store.save_artifact(verify_artifact)
+    provider = _StubProvider(_json.dumps({"files": [
+        {"path": rel, "content": "def add(a, b):\n    return a + b\n"}]}))
+    repair_task = TaskNode.new(
+        session.session_id, TaskKind.REPAIR, "repair",
+        inputs={"verify_artifact_id": verify_artifact.artifact_id,
+                "mode": SessionMode.GREENFIELD.value,
+                "repair_attempt": 3})
+    deps = ExecutorDeps(
+        project_root=str(tmp_path), store=store, provider=provider)
+    from cgx.session.tasks.base import _REGISTRY
+    result = _REGISTRY[TaskKind.REPAIR](repair_task, deps)
+    assert result.failure is None
+    assert result.outputs["classification"] == "unknown"
+    assert result.outputs["can_apply"] is False
+    assert result.outputs["diff_count"] == 0
+    assert provider.calls == []
+
+
 def test_repair_executor_empty_test_suite_regenerates(store, tmp_path: Path):
     """no_tests_collected -> empty_test_suite classification + regenerate."""
     from cgx.session.tasks import repair as _repair_module  # noqa: F401
@@ -6334,6 +6449,7 @@ def test_router_repair_regenerate_without_scaffold_ancestor_fails_session():
 
 
 def _build_apply_failed_chain(*, prior_regens: int = 0,
+                              prior_replans: int = 0,
                               mode: str = "greenfield",
                               with_scaffold: bool = True):
     """Build a SCAFFOLD -> APPLY chain where APPLY dropped invalid files."""
@@ -6347,7 +6463,9 @@ def _build_apply_failed_chain(*, prior_regens: int = 0,
         scaffold = TaskNode.new(
             session.session_id, TaskKind.SCAFFOLD, "scaffold",
             inputs={"work_plan_artifact_id": "art_plan",
-                    "regenerate_attempt": prior_regens})
+                    "prior_goal": "build flask api",
+                    "regenerate_attempt": prior_regens,
+                    "replan_attempt": prior_replans})
         scaffold.outputs = {"scaffold_artifact_id": "art_scaffold",
                             "generated_count": 8, "failed_count": 1,
                             "failed": [{"file": "backend/main.py",
@@ -6414,11 +6532,35 @@ def test_router_apply_failed_files_regenerates_within_budget():
     assert new_scaffold.inputs["prior_scaffold_artifact_id"] == "art_scaffold"
 
 
-def test_router_apply_failed_files_budget_exhausted_fails_session():
-    """No regenerate budget left -> greenfield session fails terminally."""
+def test_router_apply_failed_files_budget_exhausted_escalates_to_replan():
+    """C2: regenerate budget spent -> escalate once to a fresh DECOMPOSE."""
     from cgx.session.router import _REGENERATE_BUDGET
-    session, _scaffold, apply_t, tasks = _build_apply_failed_chain(
+    session, scaffold, apply_t, tasks = _build_apply_failed_chain(
         prior_regens=_REGENERATE_BUDGET)
+    plan = Router().on_task_completed(
+        session=session, completed=apply_t, tasks=tasks)
+    # No terminal failure yet -- the manifest is re-planned first.
+    assert not [a for a in plan.actions if isinstance(a, UpdateSessionStatus)]
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    assert len(creates) == 1
+    dec = creates[0].task
+    assert dec.kind is TaskKind.DECOMPOSE
+    assert dec.parent_task_id == scaffold.task_id
+    assert dec.inputs["replan_attempt"] == 1
+    # The revised goal keeps the objective and folds in the failure note.
+    assert "build flask api" in dec.inputs["prior_goal"]
+    assert "backend/models.py" in dec.inputs["prior_goal"]
+    # The DONE APPLY is not abandoned (only live descendants would be).
+    assert not [a for a in plan.actions
+                if isinstance(a, UpdateTaskStatus)
+                and a.status is TaskNodeStatus.ABANDONED]
+
+
+def test_router_apply_failed_files_replan_budget_exhausted_fails_session():
+    """C2: both regenerate and re-plan budgets spent -> terminal FAILED."""
+    from cgx.session.router import _REGENERATE_BUDGET, _REPLAN_BUDGET
+    session, _scaffold, apply_t, tasks = _build_apply_failed_chain(
+        prior_regens=_REGENERATE_BUDGET, prior_replans=_REPLAN_BUDGET)
     plan = Router().on_task_completed(
         session=session, completed=apply_t, tasks=tasks)
     assert [a for a in plan.actions if isinstance(a, CreateTask)] == []
@@ -6452,6 +6594,7 @@ def test_router_apply_failed_files_explore_mode_proceeds_normally():
 
 
 def _build_scaffold_failed_chain(*, prior_regens: int = 0,
+                                 prior_replans: int = 0,
                                  failed_count: int = 2,
                                  with_pending_child: bool = True):
     """Build a SCAFFOLD that dropped files, with an optional live APPLY child.
@@ -6470,7 +6613,9 @@ def _build_scaffold_failed_chain(*, prior_regens: int = 0,
         session.session_id, TaskKind.SCAFFOLD, "scaffold",
         parent_task_id=parent.task_id,
         inputs={"work_plan_artifact_id": "art_plan",
-                "regenerate_attempt": prior_regens})
+                "prior_goal": "build a react calculator",
+                "regenerate_attempt": prior_regens,
+                "replan_attempt": prior_replans})
     scaffold.produced_artifact_id = "art_scaffold"
     failed = [
         {"file": "src/components/Calculator.jsx",
@@ -6530,17 +6675,68 @@ def test_router_scaffold_failed_files_regenerates_within_budget():
     assert new_scaffold.inputs["prior_scaffold_artifact_id"] == "art_scaffold"
 
 
-def test_router_scaffold_failed_files_budget_exhausted_fails_session():
-    """No regenerate budget left -> greenfield session fails terminally."""
+def test_router_scaffold_failed_files_budget_exhausted_escalates_to_replan():
+    """C2: SCAFFOLD regenerate budget spent -> escalate to a fresh DECOMPOSE."""
     from cgx.session.router import _REGENERATE_BUDGET
     session, _parent, scaffold, tasks = _build_scaffold_failed_chain(
         prior_regens=_REGENERATE_BUDGET)
+    plan = Router().on_task_completed(
+        session=session, completed=scaffold, tasks=tasks)
+    assert not [a for a in plan.actions if isinstance(a, UpdateSessionStatus)]
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    assert len(creates) == 1
+    dec = creates[0].task
+    assert dec.kind is TaskKind.DECOMPOSE
+    assert dec.parent_task_id == scaffold.task_id
+    assert dec.inputs["replan_attempt"] == 1
+    assert "build a react calculator" in dec.inputs["prior_goal"]
+    assert "Calculator.jsx" in dec.inputs["prior_goal"]
+    # The live APPLY descendant is abandoned so the stale subtree cannot run.
+    abandoned = {a.task_id for a in plan.actions
+                 if isinstance(a, UpdateTaskStatus)
+                 and a.status is TaskNodeStatus.ABANDONED}
+    pending = [t for t in tasks if t.status is TaskNodeStatus.READY]
+    assert {p.task_id for p in pending} <= abandoned
+
+
+def test_router_scaffold_failed_files_replan_budget_exhausted_fails_session():
+    """C2: both regenerate and re-plan budgets spent -> terminal FAILED."""
+    from cgx.session.router import _REGENERATE_BUDGET, _REPLAN_BUDGET
+    session, _parent, scaffold, tasks = _build_scaffold_failed_chain(
+        prior_regens=_REGENERATE_BUDGET, prior_replans=_REPLAN_BUDGET)
     plan = Router().on_task_completed(
         session=session, completed=scaffold, tasks=tasks)
     assert [a for a in plan.actions if isinstance(a, CreateTask)] == []
     status = [a for a in plan.actions if isinstance(a, UpdateSessionStatus)]
     assert len(status) == 1
     assert status[0].status is SessionStatus.FAILED
+
+
+def test_router_replan_attempt_threads_decompose_to_scaffold():
+    """C2: replan_attempt propagates DECOMPOSE -> ASK(APPROVE_PLAN) -> SCAFFOLD."""
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    dec = TaskNode.new(
+        session.session_id, TaskKind.DECOMPOSE, "revise",
+        inputs={"prior_goal": "g", "requirements_artifact_id": "art_req",
+                "replan_attempt": 1})
+    dec.produced_artifact_id = "art_plan2"
+    dec.status = TaskNodeStatus.DONE
+    plan = Router().on_task_completed(
+        session=session, completed=dec, tasks=[dec])
+    ask = [a.task for a in plan.actions
+           if isinstance(a, CreateTask)][0]
+    assert ask.kind is TaskKind.ASK_USER
+    assert ask.inputs["expected_kind"] == "approve_plan"
+    assert ask.inputs["replan_attempt"] == 1
+    # Approving the revised plan carries replan_attempt onto the SCAFFOLD.
+    decision = Decision.new(
+        session.session_id, ask.task_id, DecisionKind.APPROVE_PLAN,
+        "approve plan", {"approved": True})
+    plan2 = Router().on_decision_recorded(
+        session=session, decision=decision, tasks=[ask])
+    sc = [a.task for a in plan2.actions if isinstance(a, CreateTask)][0]
+    assert sc.kind is TaskKind.SCAFFOLD
+    assert sc.inputs["replan_attempt"] == 1
 
 
 def test_router_scaffold_clean_still_spawns_apply():

@@ -3622,6 +3622,135 @@ def _regenerate_scaffold_file(
     return out
 
 
+_LOGIC_REPAIR_SYSTEM = (
+    "You are a senior software engineer repairing a project whose automated "
+    "tests FAIL.\n\n"
+    "You will be given:\n"
+    "- The project goal\n"
+    "- The failing test output (pytest / test-runner)\n"
+    "- The CURRENT complete contents of the most relevant source and test "
+    "files\n\n"
+    "Diagnose the failure and return corrected COMPLETE file contents for "
+    "ONLY the files you change. Return strict JSON:\n"
+    '{"files": [{"path": "<relative/path>", "content": "<complete new '
+    'file>"}]}\n\n'
+    "Rules:\n"
+    "- Prefer fixing the SOURCE code so the EXISTING tests pass. Only edit a "
+    "test file when the test itself is clearly wrong (asserts behaviour the "
+    "goal never asked for).\n"
+    "- Output the COMPLETE file content for every file you return -- no "
+    "stubs, placeholders, ellipsis, or unified-diff markers.\n"
+    "- Only return files that appear in the provided file list, and only "
+    "those you actually modified. Do NOT invent new files.\n"
+    "- Keep the change as small as the failure requires and consistent with "
+    "the existing imports and style.\n"
+    "- If you cannot determine a fix from the information given, return "
+    '{"files": []}.\n'
+)
+
+
+def _validate_repair_source(path: str, content: str) -> Optional[str]:
+    """Return ``None`` when ``content`` parses, else a short error string.
+
+    Mirrors the per-language syntax gate the scaffold single-file path
+    applies (Python via ``ast``, JSON via ``json``, the JS/TS/Vue family
+    via tree-sitter), so a repaired file that does not parse is rejected
+    before it ever reaches APPLY's own gate. Unknown extensions pass.
+    """
+    ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+    if ext == "py":
+        import ast as _ast
+        try:
+            _ast.parse(content)
+        except SyntaxError as e:
+            return str(e)
+    elif ext == "json":
+        import json as _json
+        try:
+            _json.loads(content)
+        except Exception as e:
+            return str(e)
+    elif ext in _JS_TS_GRAMMAR_BY_EXT:
+        from cgx.codegen.validate import validate_js_ts_source
+        diag = validate_js_ts_source(path, content, _JS_TS_GRAMMAR_BY_EXT[ext])
+        if not diag.ok:
+            return diag.error
+    return None
+
+
+def generate_repair_files(
+        provider: Any, *,
+        goal: str,
+        failure_text: str,
+        files: List[Dict[str, str]],
+        max_files: int = 8) -> Dict[str, str]:
+    """Propose corrected file contents for a logic/assertion failure.
+
+    ``files`` is a list of ``{"path", "content"}`` for the on-disk
+    source/test files most relevant to the failure. Returns
+    ``{path: new_content}`` for each file the model rewrote whose new
+    content differs from the original and passes
+    :func:`_validate_repair_source`. Returns an empty mapping on any
+    provider/parse failure, when the model declined (``{"files": []}``),
+    or when no candidate file was supplied -- the caller then falls back
+    to the regenerate path.
+    """
+    known: Dict[str, str] = {}
+    blocks: List[str] = []
+    for f in files[:max_files]:
+        p = str(f.get("path") or "").strip()
+        c = f.get("content")
+        if not p or not isinstance(c, str):
+            continue
+        known[p] = c
+        blocks.append(f"### {p}\n```\n{c}\n```")
+    if not known:
+        return {}
+    from cgx.answer.model_caps import get_summary_budget
+    budget = get_summary_budget(provider)
+    context = (
+        f"PROJECT GOAL:\n{goal}\n\n"
+        f"FAILING TEST OUTPUT:\n{failure_text}\n\n"
+        "CURRENT FILES:\n\n" + "\n\n".join(blocks)
+    )
+    try:
+        raw = provider.chat(
+            messages=[
+                {"role": "system", "content": _LOGIC_REPAIR_SYSTEM},
+                {"role": "user", "content": context},
+            ],
+            temperature=0.1,
+            max_tokens=budget["output_tokens"],
+            force_json=True,
+        ).get("content", "")
+    except Exception:  # pragma: no cover - defensive: provider hiccup
+        return {}
+    parsed = _extract_json_object(raw)
+    entries = parsed.get("files") if parsed else None
+    if not isinstance(entries, list):
+        return {}
+    out: Dict[str, str] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        p = str(entry.get("path") or "").strip()
+        c = entry.get("content")
+        if p not in known or not isinstance(c, str) or not c.strip():
+            continue
+        stripped = c.strip()
+        if stripped.startswith("```"):
+            m = re.match(r"^```[a-zA-Z0-9_+\-]*\s*\n(.*?)\n```\s*$",
+                         stripped, re.DOTALL)
+            if m:
+                c = m.group(1)
+        if c == known[p]:
+            continue
+        if _validate_repair_source(p, c) is not None:
+            continue
+        out[p] = c
+    return out
+
+
 def _render_plan_for_validation(parsed: Dict[str, Any]) -> str:
     """Render a parsed plan back into fenced-diff form for the validator."""
     parts: List[str] = []

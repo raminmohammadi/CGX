@@ -11,11 +11,15 @@ have a deterministic locator + proposer for -- emits a typed
 the next router step; APPLY's own backup mirror keeps the rewrite
 recoverable.
 
-The executor is intentionally LLM-free in v1: every supported
-classification has a deterministic fix. If classification returns
-``unknown`` the executor emits a plan with empty ``diffs`` and an
-explanatory ``rationale`` -- the router then routes to ASK_USER
-instead of looping with no progress.
+Every deterministic classification has a mechanical fix. When
+classification returns ``unknown`` (an ordinary logic/assertion
+failure with no deterministic locator), the executor attempts a
+bounded LLM-driven repair (:func:`_propose_llm_logic_repair`): it
+feeds the captured failure output plus the on-disk source/test files
+to the provider and turns any accepted rewrite into a unified diff.
+That path is a no-op without a provider or once the per-session
+repair budget is spent, in which case the executor falls back to an
+empty plan and the router escalates.
 """
 
 from __future__ import annotations
@@ -64,6 +68,16 @@ logger = logging.getLogger(__name__)
 # SCAFFOLD ancestor + remaining regenerate budget to actually take the
 # regenerate branch; otherwise the patch is applied as-is.
 _PATCH_DIFF_LIMIT = 5
+
+# Bounded LLM logic-repair caps. The router already gates the overall
+# loop via ``_REPAIR_BUDGET`` + flap detection on ``failure_signature``;
+# these caps keep a single REPAIR call's LLM cost and blast radius
+# proportional to the failure. LLM repair is only attempted on the first
+# ``_LLM_REPAIR_MAX_ATTEMPT`` repair attempts (later attempts fall back to
+# regenerate), and at most ``_LLM_REPAIR_MAX_FILES`` files are shown to
+# the provider.
+_LLM_REPAIR_MAX_ATTEMPT = 2
+_LLM_REPAIR_MAX_FILES = 8
 
 # Classifications whose only realistic fix is to re-author the offending
 # scaffold layer rather than mechanically patch what was already
@@ -186,9 +200,16 @@ def run_repair(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             "fixtures must not be named 'test_*'. Rewrite the test "
             "module(s) so every test is a top-level 'def test_*'.")
     else:
-        rationale = (
-            "No deterministic repair available for this failure class; "
-            "escalating to ASK_USER.")
+        diffs = _propose_llm_logic_repair(task, deps, content)
+        if diffs:
+            rationale = (
+                "Bounded LLM repair proposed a targeted patch for the "
+                "failing test(s) from the captured failure output and the "
+                "current source; applying and re-verifying.")
+        else:
+            rationale = (
+                "No deterministic repair available for this failure class; "
+                "escalating to ASK_USER.")
 
     strategy, extra_constraints = _select_repair_strategy(
         classification=classification, diffs=diffs,
@@ -538,6 +559,63 @@ def _select_repair_strategy(
             "limit": _PATCH_DIFF_LIMIT,
         }
     return "regenerate", constraints
+
+
+def _propose_llm_logic_repair(
+        task: TaskNode, deps: ExecutorDeps,
+        content: Dict[str, Any]) -> List[Dict[str, str]]:
+    """Bounded LLM repair for an ``unknown`` logic/assertion failure.
+
+    Reads the failing-test output plus the on-disk files APPLY wrote
+    (``changed_files`` / ``tests_selected`` from the VERIFY_REPORT),
+    asks the provider for corrected complete file contents, and turns
+    each accepted rewrite into a unified diff shaped like every other
+    ``propose_*`` result. Returns an empty list -- so the caller falls
+    back to the regenerate path -- when there is no provider, the repair
+    attempt budget is spent, no candidate file is readable, or the model
+    declined / produced nothing that parses.
+    """
+    if deps.provider is None or not deps.project_root:
+        return []
+    attempt = int(task.inputs.get("repair_attempt") or 1)
+    if attempt > _LLM_REPAIR_MAX_ATTEMPT:
+        return []
+    root = Path(deps.project_root)
+    files: List[Dict[str, str]] = []
+    originals: Dict[str, str] = {}
+    for rel in _candidate_test_files(content)[:_LLM_REPAIR_MAX_FILES]:
+        try:
+            text = (root / rel).resolve().read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        originals[rel] = text
+        files.append({"path": rel, "content": text})
+    if not files:
+        return []
+    from cgx.answer.engine import generate_repair_files
+    from cgx.session.repair.classify import failure_text
+    from cgx.session.repair.propose import _unified_diff
+    goal = str(task.inputs.get("prior_goal") or content.get("goal") or "").strip()
+    try:
+        fixed = generate_repair_files(
+            deps.provider,
+            goal=goal,
+            failure_text=failure_text(content),
+            files=files,
+            max_files=_LLM_REPAIR_MAX_FILES,
+        )
+    except Exception:  # pragma: no cover - defensive: provider hiccup
+        logger.exception("REPAIR: bounded LLM logic repair crashed")
+        return []
+    diffs: List[Dict[str, str]] = []
+    for rel, new_content in fixed.items():
+        original = originals.get(rel)
+        if original is None:
+            continue
+        patch = _unified_diff(rel, original, new_content)
+        if patch:
+            diffs.append({"file": rel, "patch": patch})
+    return diffs
 
 
 def _candidate_test_files(content: Dict[str, Any]) -> List[str]:
