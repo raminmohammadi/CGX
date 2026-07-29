@@ -25,7 +25,9 @@ from __future__ import annotations
 import time
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
+from cgx.redact import redact_text
 from cgx.session.models import Fact, FactKind
+from cgx.trace import emit_llm_call
 
 
 _PROMPT_CHAR_CAP = 8_000
@@ -153,11 +155,15 @@ class TracingProvider:
         if self._binding is None:
             return
         session_id, task_id = self._binding
-        prompt_text = _truncate(_flatten_messages(messages), _PROMPT_CHAR_CAP)
+        # Redact before truncation so a secret split across the truncation
+        # boundary can't survive in either half of the stored row.
+        prompt_text = _truncate(
+            redact_text(_flatten_messages(messages)), _PROMPT_CHAR_CAP)
         response_text = ""
         if isinstance(response, dict):
             response_text = _truncate(
-                str(response.get("content") or ""), _RESPONSE_CHAR_CAP)
+                redact_text(str(response.get("content") or "")),
+                _RESPONSE_CHAR_CAP)
         sampling: Dict[str, Any] = {
             "temperature": float(temperature),
             "max_tokens": max_tokens,
@@ -178,10 +184,18 @@ class TracingProvider:
             "streamed": bool(streamed),
         }
         if error:
-            content["error"] = error
-        self._facts.append(Fact.new(
+            content["error"] = redact_text(error)
+        fact = Fact.new(
             session_id=session_id,
             kind=FactKind.LLM_CALL,
             content=content,
             surfaced_in_task_id=task_id,
-        ))
+        )
+        self._facts.append(fact)
+        # Also drop a bounded preview into the trace timeline, correlated
+        # to the full stored payload via ``fact_id`` (+ the task_id already
+        # on the trace context), so a debugger sees the call inline.
+        emit_llm_call(
+            component="session", model=self.model, messages=messages,
+            response=response, error=error, latency_ms=latency_ms,
+            sampling=sampling, streamed=streamed, fact_id=fact.fact_id)

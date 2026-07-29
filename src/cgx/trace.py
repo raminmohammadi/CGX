@@ -278,6 +278,63 @@ def emit_trace(event: str, **fields: Any) -> None:
     _emit(event, **fields)
 
 
+_LLM_PREVIEW_CAP = 240
+
+
+def emit_llm_call(
+    *,
+    component: str,
+    model: Optional[str] = None,
+    messages: Any = None,
+    response: Any = None,
+    error: Optional[str] = None,
+    latency_ms: float = 0.0,
+    sampling: Optional[Dict[str, Any]] = None,
+    streamed: bool = False,
+    fact_id: Optional[str] = None,
+) -> None:
+    """Emit a bounded, redacted ``llm_call`` trace record.
+
+    Shared by the build-loop wrapper (:class:`cgx.agents.llm_trace.
+    LLMTraceProvider`) and the session-store wrapper
+    (:class:`cgx.session.llm_trace.TracingProvider`). Only prompt/response
+    *previews* and byte counts land in the trace; the full payload (when
+    persisted) lives in the session store, correlated via ``fact_id`` +
+    the ``task_id`` already carried on the trace context.
+    """
+    if not is_trace_enabled():
+        return
+    from cgx.redact import flatten_messages, preview_text
+
+    prompt = flatten_messages(messages)
+    if isinstance(response, dict):
+        resp_text = str(response.get("content") or "")
+    elif isinstance(response, str):
+        resp_text = response
+    else:
+        resp_text = ""
+    fields: Dict[str, Any] = {
+        "component": component,
+        "model": model,
+        "prompt_chars": len(prompt),
+        "response_chars": len(resp_text),
+        "prompt_preview": preview_text(prompt, _LLM_PREVIEW_CAP),
+        "response_preview": preview_text(resp_text, _LLM_PREVIEW_CAP),
+        "latency_ms": round(float(latency_ms), 2),
+        "streamed": bool(streamed),
+    }
+    if sampling:
+        fields["sampling"] = {
+            k: v for k, v in sampling.items()
+            if isinstance(v, (str, int, float, bool, type(None)))
+        }
+    if error:
+        fields["error"] = preview_text(str(error), 300)
+    if fact_id:
+        fields["fact_id"] = fact_id
+    _emit("llm_call", **fields)
+
+
 def reset_for_tests() -> None:
     """Reset runtime flag + fallback logger. Test-only."""
     global _runtime_enabled, _fallback_logger

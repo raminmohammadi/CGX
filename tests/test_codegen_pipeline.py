@@ -200,6 +200,54 @@ def test_rollback_rejects_backup_outside_project_root(tmp_path: Path) -> None:
     assert "outside project_root" in (out.get("error") or "")
 
 
+def test_partial_failure_logs_each_dropped_file(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A batch mixing one valid file with one that fails the syntax smoke
+    # test must write the good file, drop the bad one, and -- critically --
+    # name the dropped file plus its error in the log so a paused run is
+    # diagnosable after the fact (previously only an aggregate count was
+    # logged, leaving the dropped path unrecoverable).
+    _make_project(tmp_path)
+    good = textwrap.dedent(
+        """
+        --- /dev/null
+        +++ b/pkg/good.py
+        @@
+        +def ok():
+        +    return 1
+        """
+    ).lstrip()
+    bad = textwrap.dedent(
+        """
+        --- /dev/null
+        +++ b/pkg/bad.py
+        @@
+        +def oops(
+        +    return 1
+        """
+    ).lstrip()
+
+    with caplog.at_level("WARNING", logger="cgx.codegen.disk_apply"):
+        res = apply_diffs_to_disk(str(tmp_path), [
+            {"file": "pkg/good.py", "patch": good},
+            {"file": "pkg/bad.py", "patch": bad},
+        ])
+
+    assert res["smoke_ok"] is False
+    assert "pkg/good.py" in res["applied_files"]
+    dropped = {f["file"] for f in res["failed_files"]}
+    assert "pkg/bad.py" in dropped
+    # The good file landed; the broken one was never written.
+    assert (tmp_path / "pkg" / "good.py").exists()
+    assert not (tmp_path / "pkg" / "bad.py").exists()
+    # The dropped path + its error must appear in the warning stream.
+    assert any(
+        "dropped" in r.message and "pkg/bad.py" in r.getMessage()
+        for r in caplog.records
+    ), [r.getMessage() for r in caplog.records]
+
+
 # --------------------------------------------------------------------------
 # Standalone verify path: discover_all_tests + run_pytest_paths
 # --------------------------------------------------------------------------

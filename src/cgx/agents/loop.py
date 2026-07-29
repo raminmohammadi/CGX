@@ -34,10 +34,11 @@ import time
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
 from cgx.agents.judge import Judge
+from cgx.agents.llm_trace import LLMTraceProvider
 from cgx.agents.planner import Planner
 from cgx.agents.tracker import Tracker
 from cgx.agents.types import AgentEvent, Plan
-from cgx.trace import traced
+from cgx.trace import emit_trace, reset_trace_context, set_trace_context, traced
 
 logger = logging.getLogger(__name__)
 
@@ -1454,6 +1455,10 @@ def _stream_with_retry(
     attempts_left = max_retries
 
     while True:
+        emit_trace("agent_attempt_start", attempt=attempt,
+                   attempts_left=attempts_left,
+                   n_tasks=len(current_plan.tasks),
+                   kinds=[t.kind.value for t in current_plan.tasks])
         # Stream the current plan. The first attempt's plan events pass
         # through unchanged; subsequent retries rewrite ``plan`` →
         # ``retry_plan`` so the frontend appends new task rows rather
@@ -1483,6 +1488,9 @@ def _stream_with_retry(
         # demotion path (priority-1 / priority-2 branches below) is gated
         # on entering a new retry attempt.
         if attempts_left <= 0:
+            emit_trace("agent_retries_exhausted", attempt=attempt,
+                       n_verify_failures=len(verify_failures),
+                       n_core_failures=len(core_failures))
             if verify_failures and project_root:
                 unrecoverable = _verify_failure_is_unrecoverable(
                     verify_failures, project_root,
@@ -1559,6 +1567,8 @@ def _stream_with_retry(
                     "run_agent: verify failure on attempt %d -- no index for "
                     "re-planning; reporting failure as-is", attempt,
                 )
+                emit_trace("agent_retry_skipped", attempt=attempt,
+                           reason="verify failed; no index for re-planning")
                 yield AgentEvent(
                     type="retry_skipped",
                     payload={"attempt": attempt, "reason": (
@@ -1572,6 +1582,8 @@ def _stream_with_retry(
                     "run_agent: verify failure on attempt %d is unrecoverable -- "
                     "skipping re-plan (%s)", attempt, unrecoverable,
                 )
+                emit_trace("agent_retry_skipped", attempt=attempt,
+                           reason=unrecoverable)
                 # Only demote to SKIPPED for true environmental failures
                 # (packaging issues, missing pytest, sandbox errors) where
                 # the test runner itself couldn't run -- not for real failures.
@@ -1671,6 +1683,11 @@ def _stream_with_retry(
             stop_on_fail=stop_on_fail, progress_interval=progress_interval,
         )
 
+        emit_trace("agent_retry_decision", attempt=attempt + 1,
+                   path=("scaffold_retry" if use_scaffold_retry
+                         else "fix_plan" if use_fix_plan else "replan"),
+                   reason=retry_reason, broken_files=broken_files,
+                   fix_goal=(fix_goal or "")[:200])
         yield AgentEvent(
             type="retry_start",
             payload={"attempt": attempt + 1, "reason": retry_reason},
@@ -1728,6 +1745,22 @@ def run_agent(
         If True, return a generator of :class:`AgentEvent`. If False,
         return the final :class:`Plan` after running to completion.
     """
+    # Route this run's trace records to <project_root>/.cgx/agent.log by
+    # priming the trace ContextVar; nested @traced / emit_trace calls
+    # inherit it. Left unset (token None) when there's no working tree so
+    # records fall through to the global fallback log.
+    trace_token = (set_trace_context(project_root=project_root)
+                   if project_root else None)
+    emit_trace("agent_run_start", goal=goal[:200], stream=bool(stream),
+               max_retries=int(max_retries), continuation=bool(continuation),
+               has_provider=provider is not None)
+    # Wrap the provider so every planner / judge / capability LLM call
+    # lands as a bounded, redacted ``llm_call`` trace record in the
+    # project agent.log. The build loop has no session store, so this is
+    # the only durable LLM I/O visibility it gets. Idempotent: a provider
+    # already wrapped (nested run_agent) is left untouched.
+    if provider is not None and not isinstance(provider, LLMTraceProvider):
+        provider = LLMTraceProvider(provider)
     if planner is None:
         retriever = _build_default_retriever(
             index_dir, records_path, embed_model=embed_model,
@@ -1747,6 +1780,9 @@ def run_agent(
         planner.plan(goal, **plan_kwargs) if plan_kwargs
         else planner.plan(goal)
     )
+    emit_trace("agent_plan_ready", plan_id=plan_obj.id,
+               n_tasks=len(plan_obj.tasks),
+               kinds=[t.kind.value for t in plan_obj.tasks])
     if capabilities is None:
         capabilities = _build_default_capabilities(
             provider=provider, index_dir=index_dir,
@@ -1758,11 +1794,64 @@ def run_agent(
                       stop_on_fail=stop_on_fail,
                       progress_interval=progress_interval)
     if stream:
-        return _stream_with_retry(
-            plan_obj, tracker, planner, capabilities, judge,
-            goal, project_root, stop_on_fail, progress_interval, max_retries,
-            index_dir=index_dir,
+        return _finalize_agent_stream(
+            _stream_with_retry(
+                plan_obj, tracker, planner, capabilities, judge,
+                goal, project_root, stop_on_fail, progress_interval,
+                max_retries, index_dir=index_dir,
+            ),
+            trace_token,
         )
+    try:
+        return _run_blocking_with_retry(
+            plan_obj, tracker, planner, capabilities, judge,
+            goal, project_root, stop_on_fail, progress_interval,
+            max_retries, index_dir,
+        )
+    finally:
+        emit_trace("agent_run_complete")
+        if trace_token is not None:
+            reset_trace_context(trace_token)
+
+
+def _finalize_agent_stream(
+    inner: Iterator[Any], trace_token: Optional[Any],
+) -> Iterator[Any]:
+    """Yield through the streaming loop, then reset the trace context.
+
+    The trace ContextVar primed in :func:`run_agent` has to stay live for
+    the whole iteration so nested ``emit_trace`` / ``@traced`` records
+    route to the project ``agent.log``; this wrapper resets it (and emits
+    the terminal ``agent_run_complete`` record) once the consumer is done.
+    """
+    try:
+        for ev in inner:
+            yield ev
+        emit_trace("agent_run_complete")
+    finally:
+        if trace_token is not None:
+            reset_trace_context(trace_token)
+
+
+def _run_blocking_with_retry(
+    plan_obj: Plan,
+    tracker: Tracker,
+    planner: Planner,
+    capabilities: Dict[str, Callable[..., Dict[str, Any]]],
+    judge: Optional[Judge],
+    goal: str,
+    project_root: Optional[str],
+    stop_on_fail: bool,
+    progress_interval: float,
+    max_retries: int,
+    index_dir: Optional[str],
+) -> Plan:
+    """Run the plan to completion and apply a single retry pass.
+
+    Extracted from :func:`run_agent` so the blocking path can be wrapped
+    in a ``try/finally`` that resets the trace context. The retry
+    priority order mirrors :func:`_stream_with_retry`.
+    """
     tracker.run(plan_obj)
     if max_retries > 0:
         verify_failures = _extract_verify_failures(plan_obj)
@@ -1801,12 +1890,15 @@ def run_agent(
                     "run_agent: verify failure -- no index for re-planning; "
                     "returning plan with VERIFY as FAILED"
                 )
+                emit_trace("agent_retry_skipped",
+                           reason="verify failed; no index for re-planning")
                 return plan_obj
             if unrecoverable:
                 logger.info(
                     "run_agent: verify failure is unrecoverable -- skipping retry (%s)",
                     unrecoverable,
                 )
+                emit_trace("agent_retry_skipped", reason=unrecoverable)
                 _demote_unrecoverable_verify(plan_obj, unrecoverable)
                 return plan_obj
             fix_goal = _build_fix_goal(goal, verify_failures, plan_obj, project_root)
@@ -1824,6 +1916,14 @@ def run_agent(
             else:
                 fix_goal = None
         if fix_goal:
+            emit_trace(
+                "agent_retry_decision",
+                path=("scaffold_retry" if use_scaffold_retry
+                      else "fix_plan" if use_fix_plan else "replan"),
+                reason="blocking retry",
+                broken_files=broken_files,
+                fix_goal=(fix_goal or "")[:200],
+            )
             if use_scaffold_retry:
                 fix_plan = _build_scaffold_retry_plan(
                     plan_obj, broken_files, fix_goal,
