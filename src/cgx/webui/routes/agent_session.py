@@ -22,15 +22,18 @@ Endpoint shape:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import threading
-from typing import Any, Dict, List, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
+from sse_starlette.sse import EventSourceResponse
 
 # Importing the tasks package side-effect-registers Phase 1 executors.
 from cgx.session import tasks as _tasks  # noqa: F401
 from cgx.session import SessionRunner, SessionStore
+from cgx.session.events import Event, EventType, get_default_bus
 from cgx.session.llm_trace import TracingProvider
 from cgx.session.mode import detect_mode
 from cgx.session.models import SessionMode
@@ -71,18 +74,24 @@ def _get_runner(project_root: Optional[str]) -> SessionRunner:
 
 def _build_deps(req_provider, req_index, project_root: Optional[str],
                 store: Optional[SessionStore] = None) -> ExecutorDeps:
-    provider = _resolve_provider(
-        use_profile=req_provider.use_profile,
-        profile_name=req_provider.profile_name,
-        kind=req_provider.kind, model=req_provider.model,
-        base_url=req_provider.base_url, api_key=req_provider.api_key,
-        temperature=req_provider.temperature,
-        num_predict=req_provider.num_predict,
-        num_ctx=getattr(req_provider, "num_ctx", None),
-        endpoint_path=getattr(req_provider, "endpoint_path",
-                              "/v1/chat/completions"),
-        allow_no_auth=bool(getattr(req_provider, "allow_no_auth", False)),
-    )
+    # A missing profile (or otherwise invalid provider config) is a client
+    # error, not a server fault: surface it as a clean 400 with the
+    # underlying message instead of letting the ValueError escape as a 500.
+    try:
+        provider = _resolve_provider(
+            use_profile=req_provider.use_profile,
+            profile_name=req_provider.profile_name,
+            kind=req_provider.kind, model=req_provider.model,
+            base_url=req_provider.base_url, api_key=req_provider.api_key,
+            temperature=req_provider.temperature,
+            num_predict=req_provider.num_predict,
+            num_ctx=getattr(req_provider, "num_ctx", None),
+            endpoint_path=getattr(req_provider, "endpoint_path",
+                                  "/v1/chat/completions"),
+            allow_no_auth=bool(getattr(req_provider, "allow_no_auth", False)),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     # Wrap with TracingProvider so every chat / chat_stream invocation
     # the executor makes lands as an LLM_CALL fact attributed to the
     # producing task (Phase 5.1). Untraced providers (already wrapped
@@ -138,13 +147,121 @@ async def _drain_ready(runner: SessionRunner, session_id: str,
     mid-pipeline and left the regenerated APPLY stuck at READY.
     """
     for _ in range(max_steps):
-        task = await asyncio.to_thread(
-            runner.run_next, session_id=session_id, deps=deps)
+        # Cooperative cancel (P2.2): honour a stop request *between* tasks
+        # so the in-flight task finishes cleanly and no further READY task
+        # is dispatched. The flag is consumed here so a later message can
+        # resume the session. A hard mid-task abort is intentionally not
+        # done -- it would leave partial artifacts and a running worker
+        # thread with no owner.
+        if _consume_cancel(session_id):
+            logger.info("drain: cancel honoured for session %s; stopping "
+                        "before the next task", session_id)
+            get_default_bus().publish(Event(
+                type=EventType.SESSION_UPDATED, session_id=session_id,
+                payload={"cancelled": True}))
+            return
+        # The session may have been deleted out from under a running drain
+        # (DELETE cancels the drive but a task already in flight keeps its
+        # worker thread). Stop cleanly before dispatching the next task so
+        # we never write a child row against a vanished parent (which would
+        # trip an ``ON DELETE CASCADE`` FK error).
+        if runner.store.get_session(session_id) is None:
+            logger.info("drain: session %s no longer exists; stopping",
+                        session_id)
+            return
+        try:
+            task = await asyncio.to_thread(
+                runner.run_next, session_id=session_id, deps=deps)
+        except Exception:
+            # If the session was deleted while this task ran, persisting its
+            # result trips a FK error -- treat that as a benign stop rather
+            # than a drain failure. Any other error propagates as before.
+            if runner.store.get_session(session_id) is None:
+                logger.info("drain: session %s deleted mid-task; discarding "
+                            "in-flight result", session_id)
+                return
+            raise
         if task is None:
             return
     logger.warning(
         "drain: hit max_steps=%d for session %s without quiescing; "
         "a READY task may remain undispatched", max_steps, session_id)
+
+
+# --------------------- background drain ---------------------
+
+# Production drives the drain as a detached background task so the POST
+# returns the snapshot immediately and the UI follows progress over SSE.
+# Tests flip this off to keep the historical synchronous contract (the
+# drain finishes before the returned snapshot is taken).
+_RUN_DRAIN_IN_BACKGROUND = True
+_SESSION_DRAINS: Dict[str, "asyncio.Task[None]"] = {}
+
+# Session ids with a pending cooperative-cancel request. The drain loop
+# consumes the flag between tasks (see ``_drain_ready``). Guarded by a
+# lock only for defensiveness -- both the setter (cancel route) and the
+# consumer (drain) run on the same event loop.
+_CANCEL_REQUESTS: set[str] = set()
+_CANCEL_LOCK = threading.Lock()
+
+
+def request_cancel(session_id: str) -> None:
+    """Flag ``session_id`` so its running drain stops after the next task."""
+    with _CANCEL_LOCK:
+        _CANCEL_REQUESTS.add(session_id)
+
+
+def _consume_cancel(session_id: str) -> bool:
+    """Return True and clear the flag when a cancel is pending for ``sid``."""
+    with _CANCEL_LOCK:
+        if session_id in _CANCEL_REQUESTS:
+            _CANCEL_REQUESTS.discard(session_id)
+            return True
+        return False
+
+
+async def _schedule_drain(runner: SessionRunner, session_id: str,
+                          deps: ExecutorDeps, *, max_steps: int = 64) -> None:
+    """Start (or coalesce onto) a background drain for ``session_id``.
+
+    A single drain per session is kept in ``_SESSION_DRAINS``; if one is
+    already running it is left to pick up the freshly-created READY task on
+    its next loop rather than spawning a duplicate that would contend for
+    the same runner lock. When ``_RUN_DRAIN_IN_BACKGROUND`` is off the drain
+    runs inline (synchronous, test-only behaviour).
+    """
+    if not _RUN_DRAIN_IN_BACKGROUND:
+        await _drain_ready(runner, session_id, deps, max_steps=max_steps)
+        return
+    existing = _SESSION_DRAINS.get(session_id)
+    if existing is not None and not existing.done():
+        return
+    # Fresh drive: drop any stale cancel flag left by a prior run so a
+    # user-initiated resume isn't cancelled before its first task.
+    _consume_cancel(session_id)
+    task = asyncio.create_task(
+        _drain_ready(runner, session_id, deps, max_steps=max_steps),
+        name=f"drain:{session_id}")
+    _SESSION_DRAINS[session_id] = task
+
+    def _cleanup(t: "asyncio.Task[None]") -> None:
+        if _SESSION_DRAINS.get(session_id) is t:
+            _SESSION_DRAINS.pop(session_id, None)
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is not None:  # pragma: no cover - defensive logging
+            logger.error("drain: background task for %s failed: %s: %s",
+                         session_id, type(exc).__name__, exc)
+
+    task.add_done_callback(_cleanup)
+
+
+def _safe_json(payload: Any) -> str:
+    try:
+        return json.dumps(payload, ensure_ascii=False, default=str)
+    except Exception:  # pragma: no cover - defensive
+        return json.dumps({"_repr": str(payload)})
 
 
 # --------------------- routes ---------------------
@@ -161,7 +278,7 @@ async def create_session(req: AgentSessionCreateRequest) -> AgentSessionState:
     if req.run_initial_task:
         deps = _build_deps(req.provider, req.index, req.project_root,
                            store=runner.store)
-        await _drain_ready(runner, session.session_id, deps)
+        await _schedule_drain(runner, session.session_id, deps)
     return _snapshot(runner, session.session_id)
 
 
@@ -201,6 +318,63 @@ async def get_session(sid: str,
     return _snapshot(runner, sid)
 
 
+@router.get("/{sid}/events")
+async def session_events(sid: str, request: Request) -> EventSourceResponse:
+    """Stream live session events over SSE.
+
+    Subscribes to the process-wide :class:`EventBus`, filters to ``sid``,
+    and forwards each event as a named SSE frame. The store publishes from
+    the drain's worker thread, so events are marshalled onto the request's
+    event loop via ``call_soon_threadsafe`` and a bounded queue (newest
+    events are dropped under back-pressure rather than blocking the drain).
+    A ``snapshot`` frame is sent first so a late subscriber still renders
+    current state; periodic ``ping`` frames detect a vanished client.
+    """
+    runner = _resolve_runner_for(sid)
+    if runner.store.get_session(sid) is None:
+        raise HTTPException(status_code=404,
+                            detail=f"session {sid!r} not found")
+
+    bus = get_default_bus()
+    loop = asyncio.get_running_loop()
+    queue: "asyncio.Queue[Event]" = asyncio.Queue(maxsize=1024)
+
+    def _push(event: Event) -> None:
+        try:
+            queue.put_nowait(event)
+        except asyncio.QueueFull:  # pragma: no cover - slow consumer
+            pass
+
+    def _on_event(event: Event) -> None:
+        if event.session_id != sid:
+            return
+        try:
+            loop.call_soon_threadsafe(_push, event)
+        except RuntimeError:  # pragma: no cover - loop torn down
+            pass
+
+    unsubscribe = bus.subscribe("*", _on_event)
+
+    async def _generator() -> AsyncIterator[Dict[str, str]]:
+        try:
+            snap = _snapshot(runner, sid)
+            yield {"event": "snapshot", "data": _safe_json(snap.model_dump())}
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    yield {"event": "ping", "data": "{}"}
+                    continue
+                yield {"event": event.type.value,
+                       "data": _safe_json(event.to_dict())}
+        finally:
+            unsubscribe()
+
+    return EventSourceResponse(_generator())
+
+
 @router.post("/{sid}/message", response_model=AgentSessionState)
 async def post_message(sid: str,
                        req: AgentSessionMessageRequest) -> AgentSessionState:
@@ -214,7 +388,7 @@ async def post_message(sid: str,
     if req.run_initial_task:
         deps = _build_deps(req.provider, req.index, session.project_root,
                            store=runner.store)
-        await _drain_ready(runner, sid, deps)
+        await _schedule_drain(runner, sid, deps)
     return _snapshot(runner, sid)
 
 
@@ -239,7 +413,25 @@ async def post_decision(sid: str,
         if session is not None:
             deps = _build_deps(req.provider, req.index,
                                session.project_root, store=runner.store)
-            await _drain_ready(runner, sid, deps)
+            await _schedule_drain(runner, sid, deps)
+    return _snapshot(runner, sid)
+
+
+@router.post("/{sid}/cancel", response_model=AgentSessionState)
+async def post_cancel(sid: str) -> AgentSessionState:
+    """Request a cooperative stop of the session's running drain (P2.2).
+
+    Flags the session so its background drain stops after the current
+    task finishes -- no task is aborted mid-flight. Returns the current
+    snapshot immediately; the UI follows the stop over SSE. A later
+    message/decision re-drives the session from where it stopped.
+    """
+    runner = _resolve_runner_for(sid)
+    session = runner.store.get_session(sid)
+    if session is None:
+        raise HTTPException(status_code=404,
+                            detail=f"session {sid!r} not found")
+    request_cancel(sid)
     return _snapshot(runner, sid)
 
 
@@ -256,11 +448,22 @@ async def delete_session(sid: str,
     """
     runner = _resolve_runner_for(sid) if project_root is None \
         else _get_runner(project_root)
+    # Stop any in-flight background drain before removing the row so its
+    # worker can't race the delete and write a child row against the
+    # now-gone session (FK ``ON DELETE CASCADE`` -> IntegrityError). The
+    # cancel flag halts the loop between tasks; cancelling the task stops
+    # it from dispatching anything further; the drain's own vanished-session
+    # guard swallows the current task's result if it was already running.
+    request_cancel(sid)
+    drain = _SESSION_DRAINS.pop(sid, None)
+    if drain is not None and not drain.done():
+        drain.cancel()
     removed = await asyncio.to_thread(runner.store.delete_session, sid)
     if not removed:
         raise HTTPException(status_code=404,
                             detail=f"session {sid!r} not found")
     runner.delete_session_lock(sid)
+    _consume_cancel(sid)
     with _RUNNERS_LOCK:
         _SESSION_TO_RUNNER.pop(sid, None)
     return {"deleted": sid}

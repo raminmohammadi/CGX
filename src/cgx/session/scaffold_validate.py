@@ -20,6 +20,7 @@ from Phase 3.2.
 
 from __future__ import annotations
 
+import ast
 import logging
 import re
 from pathlib import Path
@@ -345,3 +346,152 @@ def validate_scaffold_diffs(
             adj["file"] = path
             all_adjustments.append(adj)
     return new_diffs, new_contents, all_adjustments
+
+
+# --------------------- first-party import cross-check ---------------------
+
+def _module_name_for_path(path: str) -> Optional[str]:
+    """Dotted module name for a generated ``.py`` path, or ``None``.
+
+    ``pkg/sub/mod.py`` -> ``pkg.sub.mod``; ``pkg/__init__.py`` -> ``pkg``.
+    Non-Python paths return ``None``.
+    """
+    s = (path or "").strip().replace("\\", "/")
+    if not s.endswith(".py"):
+        return None
+    parts = [x for x in s.split("/") if x and x != "."]
+    if not parts:
+        return None
+    if parts[-1] == "__init__.py":
+        parts = parts[:-1]
+    else:
+        parts[-1] = parts[-1][:-3]
+    return ".".join(parts) if parts else None
+
+
+def _top_level_symbols(content: str) -> Optional[Set[str]]:
+    """Top-level names a ``from mod import name`` could bind, or ``None``.
+
+    ``None`` signals the module could not be parsed, so the caller must
+    abstain rather than flag a false positive.
+    """
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        return None
+    names: Set[str] = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                             ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.Assign):
+            for tgt in node.targets:
+                for nm in _assign_names(tgt):
+                    names.add(nm)
+        elif isinstance(node, ast.AnnAssign):
+            if isinstance(node.target, ast.Name):
+                names.add(node.target.id)
+        elif isinstance(node, ast.Import):
+            for a in node.names:
+                names.add((a.asname or a.name).split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            for a in node.names:
+                if a.name != "*":
+                    names.add(a.asname or a.name)
+    return names
+
+
+def _assign_names(target: ast.AST) -> List[str]:
+    if isinstance(target, ast.Name):
+        return [target.id]
+    if isinstance(target, (ast.Tuple, ast.List)):
+        out: List[str] = []
+        for e in target.elts:
+            out.extend(_assign_names(e))
+        return out
+    return []
+
+
+def _resolve_from_target(node: ast.ImportFrom, importer: str,
+                         is_pkg_init: bool) -> Optional[str]:
+    """Dotted target module of a ``from ... import`` (absolute or relative)."""
+    if node.level:
+        parts = importer.split(".") if importer else []
+        base = parts if is_pkg_init else parts[:-1]
+        up = node.level - 1  # level 1 == current package
+        if up > len(base):
+            return None
+        base = base[:len(base) - up]
+        target = base + (node.module.split(".") if node.module else [])
+        return ".".join(target) if target else None
+    return node.module or None
+
+
+def cross_check_first_party_imports(
+        file_contents: Dict[str, str]) -> List[Dict[str, Any]]:
+    """Flag ``from <first-party> import <name>`` where ``name`` is absent.
+
+    Best-effort, Python-only static check run after SCAFFOLD: for every
+    generated ``.py`` file, resolve each ``from ... import`` whose target
+    module is itself a generated file and verify the imported names are
+    defined there (or are generated submodules). Third-party and
+    unresolved imports are ignored, and any parse failure abstains, so
+    the check never fails the scaffold -- it only surfaces
+    ``{file, module, name, reason}`` warnings the router can act on.
+    """
+    modules: Dict[str, str] = {}
+    packages: Set[str] = set()
+    for path in file_contents:
+        mod = _module_name_for_path(path)
+        if mod is None:
+            continue
+        modules[mod] = path
+        parts = mod.split(".")
+        for i in range(1, len(parts)):
+            packages.add(".".join(parts[:i]))
+        if path.replace("\\", "/").endswith("__init__.py"):
+            packages.add(mod)
+
+    warnings: List[Dict[str, Any]] = []
+    symbol_cache: Dict[str, Optional[Set[str]]] = {}
+    for path, content in file_contents.items():
+        importer = _module_name_for_path(path)
+        if importer is None or not isinstance(content, str):
+            continue
+        try:
+            tree = ast.parse(content)
+        except SyntaxError:
+            continue
+        is_pkg_init = path.replace("\\", "/").endswith("__init__.py")
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom):
+                continue
+            target = _resolve_from_target(node, importer, is_pkg_init)
+            if target is None:
+                continue
+            target_path = modules.get(target)
+            if target_path is None:
+                # A first-party package with no generated ``__init__`` (or a
+                # third-party module): no source to verify against -> abstain.
+                continue
+            if target_path not in symbol_cache:
+                symbol_cache[target_path] = _top_level_symbols(
+                    file_contents.get(target_path) or "")
+            defined = symbol_cache[target_path]
+            if defined is None:
+                continue
+            for alias in node.names:
+                name = alias.name
+                if name == "*":
+                    continue
+                sub = f"{target}.{name}"
+                if sub in modules or sub in packages:
+                    continue  # importing a generated submodule/subpackage
+                if name not in defined:
+                    warnings.append({
+                        "file": path,
+                        "module": target,
+                        "name": name,
+                        "reason": f"{name!r} not defined in {target_path}",
+                    })
+    return warnings

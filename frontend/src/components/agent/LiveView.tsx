@@ -1,9 +1,10 @@
 import {
   History, PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen,
-  Plus, RefreshCw, Send, Trash2,
+  Plus, RefreshCw, Send, Square, Trash2,
 } from "lucide-react";
 import type {
   AgentSessionState, AgentSessionSummary, SessionModeValue, TaskNodeDTO,
+  TaskProgress,
 } from "../../lib/api";
 import { TaskTree } from "./TaskTree";
 import { ActiveTaskPanel } from "./ActiveTask";
@@ -33,21 +34,24 @@ export function activeTask(state: AgentSessionState): TaskNodeDTO | null {
 }
 
 export function LiveView({
-  state, sessions, pending, error,
+  state, sessions, pending, error, progress, running,
   reply, setReply,
   selectedTaskId, setSelectedTaskId,
-  onDecide, onSend, onSwitch, onNew, onRefresh, onDelete,
+  onDecide, onSend, onCancel, onSwitch, onNew, onRefresh, onDelete,
 }: {
   state: AgentSessionState;
   sessions: AgentSessionSummary[];
   pending: boolean;
   error: string | null;
+  progress?: Record<string, TaskProgress>;
+  running?: boolean;
   reply: string;
   setReply: (s: string) => void;
   selectedTaskId: string | null;
   setSelectedTaskId: (id: string | null) => void;
   onDecide: (payload: { chosen: Record<string, any>; rationale?: string }) => any;
   onSend: () => void;
+  onCancel?: () => void | Promise<void>;
   onSwitch: (sid: string) => void;
   onNew: () => void;
   onRefresh: () => void;
@@ -126,6 +130,10 @@ export function LiveView({
                 {error}
               </div>
             )}
+            {focused && progress?.[focused.task_id]
+              && focused.status === "in_progress" && (
+              <LiveProgress p={progress[focused.task_id]} />
+            )}
             <ErrorBoundary label="active-task">
               <ActiveTaskPanel
                 task={focused ?? null}
@@ -141,6 +149,7 @@ export function LiveView({
         <FollowUpBar
           reply={reply} setReply={setReply}
           onSend={onSend} pending={pending}
+          running={!!running} onCancel={onCancel}
         />
       </div>
       {sidePanelCollapsed ? (
@@ -276,8 +285,12 @@ function SessionBar({
 }
 
 function FollowUpBar({
-  reply, setReply, onSend, pending,
-}: { reply: string; setReply: (s: string) => void; onSend: () => void; pending: boolean }) {
+  reply, setReply, onSend, pending, running, onCancel,
+}: {
+  reply: string; setReply: (s: string) => void; onSend: () => void;
+  pending: boolean; running?: boolean;
+  onCancel?: () => void | Promise<void>;
+}) {
   return (
     <div className="px-4 pt-2.5 pb-3 border-t border-muted bg-slate-950/60 flex items-end gap-2">
       <TextArea
@@ -288,6 +301,13 @@ function FollowUpBar({
         disabled={pending}
         className="flex-1"
       />
+      {running && onCancel && (
+        <button
+          type="button" onClick={() => { void onCancel(); }}
+          title="Stop after the current step"
+          className="av-btn-ghost text-red-300 hover:text-red-200"
+        ><Square className="h-3 w-3" /> Stop</button>
+      )}
       <button
         type="button" onClick={onSend}
         disabled={pending || !reply.trim()}
@@ -339,6 +359,33 @@ export function PriorSessions({
           </li>
         ))}
       </ul>
+    </div>
+  );
+}
+
+
+// Live scaffold progress banner. Fed by ``task.output_partial`` SSE
+// frames so a long, otherwise-silent generation shows an advancing
+// count, the file in flight, and a coarse ETA instead of a spinner.
+function LiveProgress({ p }: { p: TaskProgress }) {
+  const pct = p.total > 0
+    ? Math.min(100, Math.round((p.index / p.total) * 100)) : 0;
+  return (
+    <div className="mb-3 rounded-lg border border-emerald-500/30 bg-emerald-950/20 p-3">
+      <div className="flex items-center justify-between text-[11px] font-mono text-emerald-300">
+        <span>Generating {p.index}/{p.total}</span>
+        {p.eta_seconds != null
+          ? <span>~{p.eta_seconds}s left</span>
+          : (p.status === "stream" && p.bytes != null
+              && <span>{p.bytes} chars…</span>)}
+      </div>
+      <p className="mt-1 text-[10px] font-mono text-slate-400 truncate">{p.path}</p>
+      <div className="mt-2 h-1.5 rounded bg-slate-800 overflow-hidden">
+        <div
+          className="h-full bg-emerald-500 transition-all"
+          style={{ width: `${pct}%` }}
+        />
+      </div>
     </div>
   );
 }

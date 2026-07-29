@@ -2188,6 +2188,49 @@ def test_agent_log_writes_jsonl_with_ts_and_event(tmp_path):
     assert records[1]["duration_ms"] == 42
 
 
+def test_agent_log_mirrors_to_session_stable_path(tmp_path, monkeypatch):
+    """P3.1: each line is mirrored to a session-stable path under config.
+
+    The project-local log lives under the churn-prone project tree; the
+    stable mirror lives at ``<config>/agent-sessions/<sid>/agent.log`` so it
+    survives a re-scaffold that trashes the project directory. Both writes
+    carry identical records (same ts + fields).
+    """
+    import json
+    from cgx.session.agent_log import log_event, reset_for_tests
+    cfg = tmp_path / "cfg"
+    monkeypatch.setenv("CGX_CONFIG_DIR", str(cfg))
+    reset_for_tests()
+    proj = tmp_path / "proj"
+    log_event(str(proj), "task_started", session_id="ses_9", kind="apply")
+
+    stable = cfg / "agent-sessions" / "ses_9" / "agent.log"
+    assert stable.is_file()
+    stable_lines = [ln for ln in stable.read_text(
+        encoding="utf-8").splitlines() if ln.strip()]
+    assert len(stable_lines) == 1
+    rec = json.loads(stable_lines[0])
+    assert rec["event"] == "task_started"
+    assert rec["session_id"] == "ses_9"
+    assert rec["kind"] == "apply"
+    # The project-local log carries the same record with the same timestamp.
+    proj_records = _read_agent_log(proj)
+    assert len(proj_records) == 1
+    assert proj_records[0]["ts"] == rec["ts"]
+
+
+def test_agent_log_no_stable_mirror_without_session_id(tmp_path, monkeypatch):
+    """No ``session_id`` -> project-local only, no stray stable dir."""
+    from cgx.session.agent_log import log_event, reset_for_tests
+    cfg = tmp_path / "cfg"
+    monkeypatch.setenv("CGX_CONFIG_DIR", str(cfg))
+    reset_for_tests()
+    proj = tmp_path / "proj"
+    log_event(str(proj), "session_status_changed", status="running")
+    assert _read_agent_log(proj)
+    assert not (cfg / "agent-sessions").exists()
+
+
 def test_runner_emits_task_lifecycle_events_to_agent_log(tmp_path, store):
     """A happy stub task produces task_started + task_completed lines."""
     @register_executor(TaskKind.EXPLORE)
@@ -2891,7 +2934,7 @@ def test_scaffold_executor_happy_path_accumulates_context(
 
     def fake_generate(path, description, provider, *,
                       layer=None, existing_files_with_content=None,
-                      goal=None):
+                      goal=None, on_token=None, depends_on=None):
         seen_contexts.append(
             [c["path"] for c in (existing_files_with_content or [])])
         body = f"# {path}\nprint('{path}')\n"
@@ -2953,6 +2996,51 @@ def test_scaffold_executor_records_partial_failure(store, monkeypatch):
     assert result.outputs["failed"] == failed
 
 
+def test_scaffold_syntax_invalid_file_becomes_explicit_failure(store,
+                                                               monkeypatch):
+    """A file the generator flags ``syntax_ok=False`` must not ship a diff.
+
+    Instead of adding a broken diff to ``generated`` (which APPLY's own
+    syntax gate would then silently drop), it becomes an explicit
+    file-level failure carrying the generator's ``syntax_error`` so the
+    router can turn it into a targeted regenerate (P2.1).
+    """
+    from cgx.session.tasks.scaffold import run_scaffold
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    plan = Artifact.new(
+        session.session_id, "task_x", ArtifactKind.WORK_PLAN, {
+            "plan_md": "", "composed_goal": "g", "prior_goal": "g",
+            "layers": [{"name": "app", "files": [
+                {"path": "ok.py", "description": ""},
+                {"path": "broken.py", "description": ""}]}],
+        })
+    store.save_artifact(plan)
+
+    def fake_generate(path, *a, **kw):
+        if path == "broken.py":
+            return {"file": path, "patch": f"+++ {path}\ndef f(:\n",
+                    "content": "def f(:\n", "syntax_ok": False,
+                    "syntax_error": "invalid syntax (line 1)"}
+        return {"file": path, "patch": f"+++ {path}\nx",
+                "content": "x", "syntax_ok": True}
+
+    monkeypatch.setattr("cgx.answer.engine.generate_single_scaffold_file",
+                        fake_generate)
+    t = TaskNode.new(session.session_id, TaskKind.SCAFFOLD, "s",
+                     inputs={"work_plan_artifact_id": plan.artifact_id})
+    result = run_scaffold(
+        t, ExecutorDeps(provider=_StubProvider(""), store=store))
+    assert result.failure is None
+    assert result.outputs["generated_count"] == 1
+    assert result.outputs["failed_count"] == 1
+    # The broken file is absent from the emitted diffs entirely.
+    assert [d["file"] for d in result.artifact.content["diffs"]] == ["ok.py"]
+    failed = result.artifact.content["failed"]
+    assert failed[0]["file"] == "broken.py"
+    assert "invalid syntax" in failed[0]["error"]
+
+
 def test_scaffold_targeted_regenerate_reuses_good_diffs(store, monkeypatch):
     """regenerate_files -> only the failed path is generated; good diffs reused."""
     from cgx.answer.engine import _content_to_new_file_patch
@@ -2989,7 +3077,7 @@ def test_scaffold_targeted_regenerate_reuses_good_diffs(store, monkeypatch):
 
     def fake_generate(path, description, provider, *,
                       layer=None, existing_files_with_content=None,
-                      goal=None):
+                      goal=None, on_token=None, depends_on=None):
         seen.append({"path": path,
                      "context": [c["path"]
                                  for c in (existing_files_with_content or [])]})
@@ -3248,7 +3336,8 @@ def test_scaffold_parallel_generation_preserves_order_and_cross_layer_context(
             for p in ("src/A.jsx", "src/B.jsx", "src/C.jsx")}
 
     def fake_generate(path, description, provider, *,
-                      layer=None, existing_files_with_content=None, goal=None):
+                      layer=None, existing_files_with_content=None, goal=None,
+                      on_token=None, depends_on=None):
         with lock:
             seen[path] = [c["path"] for c in (existing_files_with_content or [])]
         if path == "src/B.jsx":
@@ -3322,6 +3411,39 @@ def test_scaffold_parallel_generation_aggregates_failures_in_order(
     assert [f["file"] for f in failed] == ["b.py"]
     assert "RuntimeError" in failed[0]["error"]
     assert result.outputs["failed"] == failed
+
+
+def test_scaffold_concurrency_is_provider_gated(monkeypatch):
+    """P2.3: cloud providers fan out by default; local GPUs stay serial.
+
+    The gate keys off the provider's ``parallel_scaffold_capable`` flag and
+    only when ``CGX_SCAFFOLD_CONCURRENCY`` is unset; the env var overrides
+    the gate in both directions.
+    """
+    from cgx.session.tasks.scaffold import (
+        _CLOUD_SCAFFOLD_CONCURRENCY, _scaffold_concurrency)
+    monkeypatch.delenv("CGX_SCAFFOLD_CONCURRENCY", raising=False)
+
+    class _Local:
+        parallel_scaffold_capable = False
+
+    class _Cloud:
+        parallel_scaffold_capable = True
+
+    # Unset env: local (and a provider that lacks the flag entirely) stays
+    # serial; a cloud-capable provider fans out to the bounded default.
+    assert _scaffold_concurrency(None) == 1
+    assert _scaffold_concurrency(_Local()) == 1
+    assert _scaffold_concurrency(_Cloud()) == _CLOUD_SCAFFOLD_CONCURRENCY
+
+    # Explicit env overrides the gate in both directions.
+    monkeypatch.setenv("CGX_SCAFFOLD_CONCURRENCY", "1")
+    assert _scaffold_concurrency(_Cloud()) == 1
+    monkeypatch.setenv("CGX_SCAFFOLD_CONCURRENCY", "6")
+    assert _scaffold_concurrency(_Local()) == 6
+    # Malformed clamps to serial.
+    monkeypatch.setenv("CGX_SCAFFOLD_CONCURRENCY", "nope")
+    assert _scaffold_concurrency(_Cloud()) == 1
 
 
 # --------------------- BOOTSTRAP_ENV executor unit tests ---------------------
@@ -6211,6 +6333,127 @@ def test_scaffold_executor_tightens_requirements_pins(store, monkeypatch):
 
 
 
+# ------------- Phase 3.3: first-party import cross-check -------------
+
+def test_cross_check_passes_when_imported_symbol_exists():
+    """A ``from <local> import <name>`` that resolves -> no warnings."""
+    from cgx.session.scaffold_validate import cross_check_first_party_imports
+    contents = {
+        "backend/auth.py": "def login():\n    return True\n",
+        "backend/app.py": "from backend.auth import login\n",
+    }
+    assert cross_check_first_party_imports(contents) == []
+
+
+def test_cross_check_flags_missing_first_party_symbol():
+    """Importing a name absent from a generated module -> one warning."""
+    from cgx.session.scaffold_validate import cross_check_first_party_imports
+    contents = {
+        "backend/auth.py": "def login():\n    return True\n",
+        "backend/app.py": "from backend.auth import logout\n",
+    }
+    warnings = cross_check_first_party_imports(contents)
+    assert len(warnings) == 1
+    w = warnings[0]
+    assert w["file"] == "backend/app.py"
+    assert w["module"] == "backend.auth"
+    assert w["name"] == "logout"
+
+
+def test_cross_check_resolves_relative_imports():
+    """``from . import name`` resolves against the importer's package."""
+    from cgx.session.scaffold_validate import cross_check_first_party_imports
+    ok = {
+        "pkg/__init__.py": "",
+        "pkg/helpers.py": "VALUE = 1\n",
+        "pkg/app.py": "from .helpers import VALUE\n",
+    }
+    assert cross_check_first_party_imports(ok) == []
+    bad = {
+        "pkg/__init__.py": "",
+        "pkg/helpers.py": "VALUE = 1\n",
+        "pkg/app.py": "from .helpers import MISSING\n",
+    }
+    warnings = cross_check_first_party_imports(bad)
+    assert [w["name"] for w in warnings] == ["MISSING"]
+
+
+def test_cross_check_ignores_third_party_and_submodule_imports():
+    """Third-party modules and generated submodules are never flagged."""
+    from cgx.session.scaffold_validate import cross_check_first_party_imports
+    contents = {
+        "backend/__init__.py": "",
+        "backend/models.py": "class User:\n    pass\n",
+        "backend/app.py": (
+            "from fastapi import FastAPI\n"
+            "from backend import models\n"),
+    }
+    # ``FastAPI`` is third-party (no generated source) and ``models`` is a
+    # generated submodule of ``backend`` -> both abstain.
+    assert cross_check_first_party_imports(contents) == []
+
+
+def test_cross_check_abstains_on_unparseable_target():
+    """A target module that fails to parse -> no false positive."""
+    from cgx.session.scaffold_validate import cross_check_first_party_imports
+    contents = {
+        "backend/auth.py": "def login(:\n",  # syntax error
+        "backend/app.py": "from backend.auth import login\n",
+    }
+    assert cross_check_first_party_imports(contents) == []
+
+
+def test_scaffold_executor_surfaces_import_warnings(store, monkeypatch):
+    """SCAFFOLD runs the cross-check and surfaces ``import_warnings``."""
+    from cgx.session.tasks.scaffold import run_scaffold
+
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    plan = Artifact.new(
+        session.session_id, "task_x", ArtifactKind.WORK_PLAN, {
+            "prior_goal": "g",
+            "composed_goal": "build api",
+            "answers": {},
+            "plan_md": "",
+            "layers": [{"name": "app", "files": [
+                {"path": "backend/auth.py", "description": "auth"},
+                {"path": "backend/app.py", "description": "entry"}]}],
+        })
+    store.save_artifact(plan)
+
+    contents = {
+        "backend/auth.py": "def login():\n    return True\n",
+        "backend/app.py": "from backend.auth import logout\n",
+    }
+
+    def fake_generate(path, *a, **kw):
+        body = contents[path]
+        patch = (f"--- /dev/null\n+++ b/{path}\n"
+                 f"@@ -0,0 +1,{len(body.splitlines())} @@\n"
+                 + "\n".join(f"+{ln}" for ln in body.splitlines()))
+        return {"file": path, "patch": patch, "content": body,
+                "syntax_ok": True, "confidence": 1.0}
+
+    monkeypatch.setattr("cgx.answer.engine.generate_single_scaffold_file",
+                        fake_generate)
+
+    class _StubProv:
+        def chat(self, *a, **kw):
+            return ""
+
+    t = TaskNode.new(session.session_id, TaskKind.SCAFFOLD, "s",
+                     inputs={"work_plan_artifact_id": plan.artifact_id})
+    store.save_task(t)
+    result = run_scaffold(t, ExecutorDeps(provider=_StubProv(), store=store))
+    assert result.failure is None
+    warnings = result.artifact.content["import_warnings"]
+    assert len(warnings) == 1
+    assert warnings[0]["name"] == "logout"
+    assert warnings[0]["module"] == "backend.auth"
+    assert result.outputs["import_warnings_count"] == 1
+
+
+
 # --------------------- Phase 5.1: LLM call tracing -------------------------
 
 class _StubChatProvider:
@@ -7030,7 +7273,7 @@ def test_scaffold_augments_goal_with_regenerate_constraints(
 
     def fake_generate(path, description, provider, *,
                       layer=None, existing_files_with_content=None,
-                      goal=None):
+                      goal=None, on_token=None, depends_on=None):
         seen_goals.append(goal)
         body = "x = 1\n"
         return {"file": path, "patch": f"+++ {path}\n{body}",
@@ -7288,7 +7531,7 @@ def test_scaffold_injects_relevant_lessons_into_goal(
 
     def fake_generate(path, description, provider, *,
                       layer=None, existing_files_with_content=None,
-                      goal=None):
+                      goal=None, on_token=None, depends_on=None):
         seen_goals.append(goal)
         body = "x = 1\n"
         return {"file": path, "patch": f"+++ {path}\n{body}",

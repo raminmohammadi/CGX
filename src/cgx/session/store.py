@@ -299,6 +299,19 @@ class SessionStore:
             )
         self._emit(EventType.FACT_ADDED, fact.session_id, fact.to_dict())
 
+    def emit_task_progress(self, session_id: str, task_id: str,
+                           progress: Dict[str, Any]) -> None:
+        """Publish an intra-task progress event.
+
+        Unlike the other emitters this writes nothing to the database:
+        progress is transient telemetry (which file a long SCAFFOLD is
+        on, ``i / total``, an ETA) surfaced live to the SSE bridge and
+        dropped afterwards. It reuses :class:`EventType.TASK_OUTPUT_PARTIAL`
+        so the bridge's switch-on-type stays uniform.
+        """
+        self._emit(EventType.TASK_OUTPUT_PARTIAL, session_id,
+                   {"task_id": task_id, "progress": progress})
+
     def mark_facts_stale(self, session_id: str,
                          fact_ids: Iterable[str]) -> int:
         ids = list(fact_ids)

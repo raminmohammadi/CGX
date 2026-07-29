@@ -666,6 +666,131 @@ def test_scaffold_py_syntax_error_flags_when_retry_still_broken():
     assert out.get("syntax_error")
 
 
+class _RecordingQueueProvider(_QueueProvider):
+    """Queue provider that also records each call's ``messages`` list."""
+
+    def __init__(self, payloads: List[str]):
+        super().__init__(payloads)
+        self.messages: List[Any] = []
+
+    def chat(self, *args: Any, **kwargs: Any) -> Dict[str, str]:
+        msgs = kwargs.get("messages")
+        if msgs is None and args:
+            msgs = args[0]
+        self.messages.append(msgs)
+        return super().chat(*args, **kwargs)
+
+
+def test_scaffold_py_syntax_retry_prompt_is_minimal():
+    """The targeted retry drops the prior-file digest, ships the broken file.
+
+    The first attempt carries the ``ALREADY GENERATED FILES`` context so
+    imports resolve; the syntax retry must instead send only the offending
+    file plus the parser error (P1.1), reclaiming the O(files) digest tax.
+    """
+    from cgx.answer.engine import generate_single_scaffold_file
+    prior = {"path": "src/db.py",
+             "content": "def unique_prior_marker():\n    return 42\n"}
+    provider = _RecordingQueueProvider([_BROKEN_PY, _VALID_PY])
+    out = generate_single_scaffold_file(
+        "src/calculator.py", "calculator core", provider,
+        layer="core", goal="build a calculator",
+        existing_files_with_content=[prior],
+    )
+    assert provider.calls == 2
+    assert out["syntax_ok"] is True and out["content"] == _VALID_PY
+    first_user = provider.messages[0][1]["content"]
+    retry_user = provider.messages[1][1]["content"]
+    # First attempt: full context (digest of the prior file present).
+    assert "ALREADY GENERATED FILES" in first_user
+    assert "unique_prior_marker" in first_user
+    # Retry: minimal -- no digest block, just the broken bytes + error.
+    assert "ALREADY GENERATED FILES" not in retry_user
+    assert "unique_prior_marker" not in retry_user
+    assert "BROKEN FILE:" in retry_user
+    assert _BROKEN_PY.strip() in retry_user
+
+
+def _chunk(text: str, n: int = 5) -> List[str]:
+    """Split ``text`` into ``n`` roughly-equal pieces (fake stream deltas)."""
+    step = max(1, len(text) // n)
+    return [text[i:i + step] for i in range(0, len(text), step)]
+
+
+class _StreamProvider:
+    """Provider whose ``chat_stream`` yields queued JSON deltas.
+
+    Advertises ``stream_json_capable`` so the scaffold generator takes the
+    streaming path when handed an ``on_token``; ``chat`` is the blocking
+    fallback and records its own call count.
+    """
+
+    model = "gpt-4o"  # cloud-tier so the summary budget stays generous
+    stream_json_capable = True
+
+    def __init__(self, stream_chunks: List[str], chat_body: str = ""):
+        self._chunks = list(stream_chunks)
+        self._chat_body = chat_body
+        self.stream_calls = 0
+        self.chat_calls = 0
+
+    def chat_stream(self, messages: Any, temperature: float = 0.2,
+                    max_tokens: Any = None, force_json: bool = False,
+                    **kwargs: Any):
+        self.stream_calls += 1
+        assert force_json is True, "scaffold stream must request JSON mode"
+        for chunk in self._chunks:
+            yield chunk
+
+    def chat(self, *args: Any, **kwargs: Any) -> Dict[str, str]:
+        self.chat_calls += 1
+        return {"content": json.dumps({"content": self._chat_body})}
+
+
+def test_scaffold_streams_tokens_and_parses_result():
+    """With ``on_token`` the file is streamed; deltas reach the callback."""
+    from cgx.answer.engine import generate_single_scaffold_file
+    body = json.dumps({"content": _VALID_PY})
+    provider = _StreamProvider(_chunk(body))
+    seen: List[str] = []
+    out = generate_single_scaffold_file(
+        "src/calculator.py", "calculator core", provider,
+        layer="core", goal="build a calculator",
+        on_token=seen.append,
+    )
+    assert provider.stream_calls == 1
+    assert provider.chat_calls == 0, "streaming must not also block-call chat"
+    assert out["syntax_ok"] is True and out["content"] == _VALID_PY
+    assert "".join(seen) == body, "every delta must reach on_token in order"
+
+
+def test_scaffold_stream_falls_back_to_chat_when_unparseable():
+    """A stream that yields non-JSON degrades to the reliable chat call."""
+    from cgx.answer.engine import generate_single_scaffold_file
+    provider = _StreamProvider(["not json ", "at all"], chat_body=_VALID_PY)
+    out = generate_single_scaffold_file(
+        "src/calculator.py", "calculator core", provider,
+        layer="core", goal="build a calculator",
+        on_token=lambda _d: None,
+    )
+    assert provider.stream_calls == 1
+    assert provider.chat_calls == 1, "unparseable stream must fall back"
+    assert out["syntax_ok"] is True and out["content"] == _VALID_PY
+
+
+def test_scaffold_without_on_token_never_streams():
+    """No callback -> the legacy blocking path, even on a stream provider."""
+    from cgx.answer.engine import generate_single_scaffold_file
+    provider = _StreamProvider([], chat_body=_VALID_PY)
+    out = generate_single_scaffold_file(
+        "src/calculator.py", "calculator core", provider,
+        layer="core", goal="build a calculator",
+    )
+    assert provider.stream_calls == 0
+    assert provider.chat_calls == 1
+    assert out["content"] == _VALID_PY
+
+
 # Unbalanced JSX: the return expression is never closed. Parsed with the
 # tree-sitter ``javascript`` grammar this reports has_error, which the
 # inline gate turns into one hardened retry.
@@ -761,6 +886,72 @@ def test_generate_single_scaffold_file_short_circuits_conftest():
     body = out["content"]
     assert "sys.path.insert" in body
     assert '"src"' in body or "'src'" in body
+
+
+# ---------------------------------------------------------------------------
+# generate_single_scaffold_file: pure-boilerplate files (.gitignore, ...)
+# short-circuit the LLM with a deterministic template (P1.3).
+# ---------------------------------------------------------------------------
+def test_generate_single_scaffold_file_short_circuits_trivial_boilerplate():
+    from cgx.answer.engine import generate_single_scaffold_file
+
+    class _Boom:
+        def chat(self, *a, **kw):
+            raise AssertionError("provider must not be called for boilerplate")
+
+    cases = {
+        ".gitignore": "__pycache__/",
+        ".dockerignore": ".git",
+        ".gitattributes": "text=auto",
+        ".editorconfig": "root = true",
+    }
+    for path, marker in cases.items():
+        out = generate_single_scaffold_file(path, "boilerplate", _Boom())
+        assert out["file"].rsplit("/", 1)[-1] == path
+        assert out["syntax_ok"] is True
+        assert out["patch"], "patch must be non-empty"
+        assert marker in out["content"]
+
+
+def test_generate_single_scaffold_file_depends_on_scopes_digest():
+    """With ``depends_on`` the digest carries only the declared deps."""
+    from cgx.answer.engine import generate_single_scaffold_file
+
+    dep = {"path": "src/dep.py",
+           "content": "def dep_marker_fn():\n    return 1\n"}
+    other = {"path": "src/other.py",
+             "content": "def other_marker_fn():\n    return 2\n"}
+
+    scoped = _RecordingQueueProvider([_VALID_PY])
+    generate_single_scaffold_file(
+        "src/calculator.py", "calculator core", scoped,
+        layer="core", goal="build a calculator",
+        existing_files_with_content=[dep, other],
+        depends_on=["src/dep.py"],
+    )
+    scoped_user = scoped.messages[0][1]["content"]
+    assert "dep_marker_fn" in scoped_user
+    assert "other_marker_fn" not in scoped_user
+
+    # No depends_on -> legacy full-context digest (both siblings present).
+    full = _RecordingQueueProvider([_VALID_PY])
+    generate_single_scaffold_file(
+        "src/calculator.py", "calculator core", full,
+        layer="core", goal="build a calculator",
+        existing_files_with_content=[dep, other],
+    )
+    full_user = full.messages[0][1]["content"]
+    assert "dep_marker_fn" in full_user
+    assert "other_marker_fn" in full_user
+
+
+def test_trivial_boilerplate_content_returns_none_for_normal_files():
+    from cgx.answer.engine import _trivial_boilerplate_content
+
+    assert _trivial_boilerplate_content("src/app.py") is None
+    assert _trivial_boilerplate_content("README.md") is None
+    assert _trivial_boilerplate_content(".gitignore") is not None
+    assert _trivial_boilerplate_content("nested/dir/.gitignore") is not None
 
 
 # ---------------------------------------------------------------------

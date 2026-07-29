@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import time
 from logging.handlers import RotatingFileHandler
@@ -42,7 +43,15 @@ _LOG_FILE_NAME = "agent.log"
 _MAX_BYTES = 1 * 1024 * 1024  # 1 MiB
 _BACKUP_COUNT = 3
 
-# Handler cache keyed by resolved project_root so re-opening the same
+# Session-stable mirror lives under the config dir (``$CGX_CONFIG_DIR`` or
+# ``~/.cgx``), keyed by session id, so it survives the project directory
+# being regenerated / sent to Trash on a re-scaffold -- the project-local
+# ``<project_root>/.cgx/agent.log`` goes with the trashed tree, but the
+# mirror does not. A distinct subdir keeps it clear of the chat-session
+# JSONL store under ``<config>/sessions``.
+_STABLE_SUBDIR = "agent-sessions"
+
+# Handler cache keyed by resolved log-file path so re-opening the same
 # file across many log_event calls doesn't churn file descriptors.
 _handlers: Dict[str, RotatingFileHandler] = {}
 _handlers_lock = threading.Lock()
@@ -76,13 +85,20 @@ def _resolve_path(project_root: str) -> Path:
     return Path(project_root).resolve() / _LOG_DIR_NAME / _LOG_FILE_NAME
 
 
-def _handler_for(project_root: str) -> Optional[RotatingFileHandler]:
-    key = str(Path(project_root).resolve())
+def _config_dir() -> Path:
+    return Path(os.environ.get("CGX_CONFIG_DIR", str(Path.home() / _LOG_DIR_NAME)))
+
+
+def _stable_path(session_id: str) -> Path:
+    return _config_dir() / _STABLE_SUBDIR / session_id / _LOG_FILE_NAME
+
+
+def _handler_for_path(path: Path) -> Optional[RotatingFileHandler]:
+    key = str(path)
     with _handlers_lock:
         h = _handlers.get(key)
         if h is not None:
             return h
-        path = _resolve_path(project_root)
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             h = RotatingFileHandler(
@@ -94,31 +110,43 @@ def _handler_for(project_root: str) -> Optional[RotatingFileHandler]:
             return h
         except Exception as exc:
             logger.warning(
-                "agent_log: failed to open %s (%s); disabling for this root",
+                "agent_log: failed to open %s (%s); disabling for this path",
                 path, exc)
             return None
 
 
-def log_event(project_root: Optional[str], event: str, **fields: Any) -> None:
-    """Append one JSON line to the project-local agent log.
-
-    No-op when ``project_root`` is falsy. All exceptions are swallowed
-    so a busted log file never fails an executor -- a WARNING is
-    emitted to the stdout logger instead.
-    """
-    if not project_root:
-        return
-    handler = _handler_for(project_root)
+def _emit_to(path: Path, event: str, ts: float, fields: Dict[str, Any]) -> None:
+    handler = _handler_for_path(path)
     if handler is None:
         return
     record = logging.LogRecord(
         name="cgx.session.agent_log", level=logging.INFO, pathname=__file__,
         lineno=0, msg=event, args=None, exc_info=None)
-    record.agent_event = {"ts": time.time(), "event": event, **fields}
+    record.agent_event = {"ts": ts, "event": event, **fields}
     try:
         handler.emit(record)
     except Exception as exc:  # pragma: no cover - defensive
         logger.warning("agent_log: emit failed for %s (%s)", event, exc)
+
+
+def log_event(project_root: Optional[str], event: str, **fields: Any) -> None:
+    """Append one JSON line to the project-local agent log.
+
+    No-op when ``project_root`` is falsy. When a ``session_id`` field is
+    present the same line is also mirrored to a session-stable log under
+    the config dir (``<config>/agent-sessions/<session_id>/agent.log``) so
+    the trail survives the project directory being regenerated / trashed on
+    a re-scaffold. Both writes share one timestamp so the lines match
+    exactly. All exceptions are swallowed so a busted log file never fails
+    an executor -- a WARNING is emitted to the stdout logger instead.
+    """
+    if not project_root:
+        return
+    ts = time.time()
+    _emit_to(_resolve_path(project_root), event, ts, fields)
+    session_id = fields.get("session_id")
+    if session_id:
+        _emit_to(_stable_path(str(session_id)), event, ts, fields)
 
 
 def reset_for_tests() -> None:

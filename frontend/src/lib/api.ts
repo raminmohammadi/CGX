@@ -265,6 +265,20 @@ export interface DecisionDTO {
   made_at: number;
 }
 
+// Transient intra-task progress carried by ``task.output_partial`` SSE
+// frames (not persisted). SCAFFOLD emits one per file so the UI can show
+// a live "i / total", the active path, and a coarse ETA.
+export interface TaskProgress {
+  index: number;
+  total: number;
+  path: string;
+  layer?: string;
+  status: "start" | "done" | "failed" | string;
+  bytes?: number;
+  elapsed_ms?: number;
+  eta_seconds: number | null;
+}
+
 export interface AgentSessionState {
   session: AgentSessionSummary;
   tasks: TaskNodeDTO[];
@@ -468,6 +482,15 @@ export const api = {
       `/api/agent-session/${encodeURIComponent(sid)}/decision`,
       "POST",
       body,
+    ),
+  // Same-origin SSE stream URL for a session's live events. Consumed by
+  // the native ``EventSource`` (GET); the dev proxy forwards /api to :8765.
+  agentSessionEventsUrl: (sid: string) =>
+    `/api/agent-session/${encodeURIComponent(sid)}/events`,
+  agentSessionCancel: (sid: string) =>
+    jsonReq<AgentSessionState>(
+      `/api/agent-session/${encodeURIComponent(sid)}/cancel`,
+      "POST",
     ),
   agentSessionDelete: (sid: string, projectRoot?: string | null) => {
     const q = projectRoot

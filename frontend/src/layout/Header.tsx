@@ -1,9 +1,11 @@
 import { Cpu } from "lucide-react";
+import { useState } from "react";
 import { useConnection } from "../store/connection";
 import { useWorkspace } from "../store/workspace";
 import { useTrace } from "../store/trace";
-import { Pill, StatusDot } from "../components/Pill";
-import type { HardwareInfo, RunningModel } from "../lib/api";
+import { StatusDot } from "../components/Pill";
+import { cn } from "../lib/utils";
+import { api, type HardwareInfo, type RunningModel } from "../lib/api";
 
 // Top platform header: brand + provider health pulse + mode badge.
 // Reads from the shared connection store and active workspace provider.
@@ -73,6 +75,28 @@ export default function Header() {
   const offline = useConnection((s) => s.offline);
   const provider = useWorkspace((s) => s.provider);
   const traceSettings = useTrace((s) => s.settings);
+  const setTrace = useTrace((s) => s.set);
+  const [traceBusy, setTraceBusy] = useState(false);
+
+  // Header trace toggle. The pill is always visible so tracing can be flipped
+  // from anywhere without navigating to Settings (which owns the same control
+  // via the shared store). Env-pinned (CGX_TRACE) state is non-interactive.
+  const traceOn = !!traceSettings?.enabled;
+  const traceEnvPinned = traceSettings?.source === "env";
+  const traceLocked = traceSettings === null || traceEnvPinned || traceBusy;
+
+  const toggleTrace = async () => {
+    if (!traceSettings || traceEnvPinned || traceBusy) return;
+    setTraceBusy(true);
+    try {
+      const updated = await api.setTraceSettings(!traceSettings.enabled);
+      setTrace(updated);
+    } catch {
+      // Detailed errors are surfaced on the Settings page; keep the header quiet.
+    } finally {
+      setTraceBusy(false);
+    }
+  };
 
   const isLocal = provider.kind === "ollama";
   const ollamaOK = !offline && !!status?.ollama?.ok;
@@ -194,26 +218,31 @@ export default function Header() {
           <Cpu className="h-3.5 w-3.5 text-slate-600" /> Mode:{" "}
           <span className={modeClass}>{modeLabel}</span>
         </div>
-        {traceSettings?.enabled && (
-          <Pill
-            tone="amber"
-            className={
-              traceSettings.source === "env"
-                ? "cursor-help"
-                : undefined
-            }
-          >
-            <span
-              title={
-                traceSettings.source === "env"
-                  ? "Curated function-call tracing is on (pinned by CGX_TRACE)"
-                  : "Curated function-call tracing is on (toggle in Settings)"
-              }
-            >
-              TRACE
-            </span>
-          </Pill>
-        )}
+        <button
+          type="button"
+          onClick={toggleTrace}
+          disabled={traceLocked}
+          title={
+            traceSettings === null
+              ? "Trace state loading…"
+              : traceEnvPinned
+                ? "Curated function-call tracing is pinned ON by CGX_TRACE; unset it to toggle from the UI"
+                : traceOn
+                  ? "Function-call tracing is ON — click to turn off"
+                  : "Function-call tracing is OFF — click to turn on"
+          }
+          className={cn(
+            "inline-flex items-center gap-1.5 px-2 py-0.5 rounded font-mono text-[10px] font-bold border uppercase tracking-wider transition-colors",
+            traceOn
+              ? "bg-amber-500/10 text-amber-400 border-amber-500/20 hover:bg-amber-500/20"
+              : "bg-slate-800 text-slate-400 border-white/5 hover:bg-slate-700",
+            traceLocked && "opacity-60 cursor-not-allowed",
+          )}
+        >
+          <StatusDot tone={traceOn ? "amber" : "slate"} />
+          TRACE {traceOn ? "ON" : "OFF"}
+          {traceEnvPinned && " ·"}
+        </button>
       </div>
     </header>
   );

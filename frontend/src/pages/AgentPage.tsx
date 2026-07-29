@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   api, ApiError,
-  type AgentSessionState, type AgentSessionSummary,
+  type AgentSessionState, type AgentSessionSummary, type TaskProgress,
 } from "../lib/api";
 import { useWorkspace } from "../store/workspace";
 import { useAgentSession } from "../store/agentSession";
@@ -22,7 +22,12 @@ export default function AgentPage() {
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [reply, setReply] = useState("");
+  const [progress, setProgress] = useState<Record<string, TaskProgress>>({});
   const pollRef = useRef<number | null>(null);
+  // True while the SSE stream is healthy; the poll below only fires as a
+  // fallback when the stream is down so the two never double-fetch.
+  const sseOkRef = useRef(false);
+  const refetchTimer = useRef<number | null>(null);
 
   const refreshSessions = useCallback(async () => {
     try {
@@ -60,14 +65,62 @@ export default function AgentPage() {
     else setState(null);
   }, [activeId, loadState]);
 
-  // Poll while any task is in-flight (running executors, not human asks).
+  // Live updates over SSE: the backend drains the pipeline in the
+  // background and streams events here. State-changing events trigger a
+  // (debounced) authoritative refetch; ``task.output_partial`` carries
+  // transient per-file scaffold progress that never lands in a snapshot.
+  useEffect(() => {
+    if (!activeId) return;
+    setProgress({});
+    sseOkRef.current = false;
+    const es = new EventSource(api.agentSessionEventsUrl(activeId));
+    const scheduleRefetch = () => {
+      if (refetchTimer.current) return;
+      refetchTimer.current = window.setTimeout(() => {
+        refetchTimer.current = null;
+        loadState(activeId);
+      }, 250);
+    };
+    es.addEventListener("snapshot", (e: MessageEvent) => {
+      sseOkRef.current = true;
+      try { setState(JSON.parse(e.data)); } catch { /* ignore */ }
+    });
+    es.addEventListener("task.output_partial", (e: MessageEvent) => {
+      sseOkRef.current = true;
+      try {
+        const ev = JSON.parse(e.data);
+        const p = ev?.payload?.progress;
+        const tid = ev?.payload?.task_id;
+        if (tid && p) setProgress((prev) => ({ ...prev, [tid]: p }));
+      } catch { /* ignore */ }
+    });
+    [
+      "session.updated", "task.created", "task.status_changed",
+      "task.completed", "task.failed", "decision.recorded",
+      "fact.added", "fact.stale", "artifact.created",
+    ].forEach((name) => es.addEventListener(name, () => {
+      sseOkRef.current = true;
+      scheduleRefetch();
+    }));
+    es.onerror = () => { sseOkRef.current = false; };
+    return () => {
+      es.close();
+      if (refetchTimer.current) {
+        window.clearTimeout(refetchTimer.current);
+        refetchTimer.current = null;
+      }
+    };
+  }, [activeId, loadState]);
+
+  // Fallback poll: only runs while a task is in-flight *and* the SSE
+  // stream is unavailable, so a dropped stream still converges.
   useEffect(() => {
     if (!activeId || !state) return;
     const hasInFlight = state.tasks.some(
       (t) => t.kind !== "ask_user"
         && (t.status === "in_progress" || t.status === "ready"),
     );
-    if (!hasInFlight) {
+    if (!hasInFlight || sseOkRef.current) {
       if (pollRef.current) { window.clearInterval(pollRef.current); pollRef.current = null; }
       return;
     }
@@ -148,6 +201,20 @@ export default function AgentPage() {
     } finally { setPending(false); }
   }, [activeId, index, provider, reply]);
 
+  // Cooperative cancel (P2.2): ask the backend to stop the drain after
+  // the current task. SSE then converges the snapshot to the stopped
+  // state, so we only need the request here.
+  const cancelSession = useCallback(async () => {
+    if (!activeId) return;
+    setError(null);
+    try {
+      const next = await api.agentSessionCancel(activeId);
+      setState(next);
+    } catch (e) {
+      setError(String((e as Error)?.message || e));
+    }
+  }, [activeId]);
+
   if (!activeId || !state) {
     return (
       <div className="flex h-full w-full overflow-hidden">
@@ -167,9 +234,15 @@ export default function AgentPage() {
       </div>
     );
   }
+  const running = !!state && state.tasks.some(
+    (t) => t.kind !== "ask_user"
+      && (t.status === "in_progress" || t.status === "ready"),
+  );
+
   return (
     <LiveView
       state={state} sessions={sessions} pending={pending} error={error}
+      progress={progress} running={running}
       reply={reply} setReply={setReply}
       selectedTaskId={selectedTaskId} setSelectedTaskId={setSelectedTaskId}
       onDecide={(payload) => {
@@ -178,6 +251,7 @@ export default function AgentPage() {
         if (taskId) return postDecision(taskId, payload);
       }}
       onSend={postMessage}
+      onCancel={cancelSession}
       onSwitch={(sid) => { setActiveId(sid); setSelectedTaskId(null); }}
       onNew={() => { setActiveId(null); setSelectedTaskId(null); setState(null); }}
       onRefresh={() => loadState(activeId)}

@@ -3,7 +3,7 @@
 from __future__ import annotations
 import logging
 import os, json, re
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 from pathlib import Path
 
 from cgx.io.persist import load_indices, load_jsonl
@@ -3009,12 +3009,24 @@ def generate_single_scaffold_file(
     existing_files_with_content: Optional[List[Dict[str, str]]] = None,
     goal: str = "",
     skills: Optional[List[str]] = None,
+    on_token: Optional[Callable[[str], None]] = None,
+    depends_on: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Generate the content of a single file in a new-project scaffold.
 
-    Each call generates exactly one file, with the content of all
-    previously-generated files provided as context so imports resolve
-    correctly. Runs inline syntax validation before returning.
+    Each call generates exactly one file. The signatures of previously
+    generated files are provided as context so imports resolve correctly;
+    when ``depends_on`` is supplied the context digest is scoped to just
+    those paths (a file only needs the modules it imports), which bounds
+    the prompt at O(depends_on) instead of O(files-so-far). Runs inline
+    syntax validation before returning.
+
+    When ``on_token`` is supplied the primary generation is streamed via
+    ``provider.chat_stream`` and each raw delta is handed to the callback
+    so the caller can surface live progress; the accumulated text is then
+    parsed exactly as the non-streamed path, with a non-streaming
+    ``provider.chat`` fallback if the stream yields nothing parseable, so
+    success rate is never traded for the perceived-speed win.
 
     Returns a dict with keys: ``file``, ``patch``, ``content``,
     ``syntax_ok``, ``confidence``.
@@ -3071,6 +3083,25 @@ def generate_single_scaffold_file(
             "file": path,
             "patch": patch,
             "content": content,
+            "diffs": [{"file": path, "patch": patch}],
+            "syntax_ok": True,
+            "confidence": 1.0,
+        }
+
+    # Deterministic short-circuit for pure-boilerplate files whose content
+    # is fully determined by convention (.gitignore, .dockerignore, ...).
+    # Generating these with the LLM spends a full round-trip reproducing a
+    # template from memory; emitting a fixed one instead removes those
+    # calls from the critical path (P1.3), the same way __init__.py and
+    # conftest.py are short-circuited above. Kept narrow to files with no
+    # project-specific content.
+    trivial = _trivial_boilerplate_content(path)
+    if trivial is not None:
+        patch = _content_to_new_file_patch(path, trivial)
+        return {
+            "file": path,
+            "patch": patch,
+            "content": trivial,
             "diffs": [{"file": path, "patch": patch}],
             "syntax_ok": True,
             "confidence": 1.0,
@@ -3148,8 +3179,21 @@ def generate_single_scaffold_file(
         # already exist, not how they are implemented. The full content
         # is still kept in ``existing_files_with_content`` for the
         # downstream duplicate-content guard.
+        #
+        # When the manifest declares this file's dependencies, scope the
+        # digest to just those paths: importing ``foo`` needs foo's
+        # signatures, not every unrelated sibling. This is the dominant
+        # prompt-growth lever late in a scaffold. Falls back to all prior
+        # files (capped by budget) when no usable dependency set is given.
+        dep_set = {d.strip() for d in (depends_on or []) if d and d.strip()}
+        digest_pool = existing_files_with_content
+        if dep_set:
+            scoped = [ef for ef in existing_files_with_content
+                      if ef.get("path") in dep_set]
+            if scoped:
+                digest_pool = scoped
         context_blocks: List[str] = []
-        for ef in existing_files_with_content[: budget["max_files"]]:
+        for ef in digest_pool[: budget["max_files"]]:
             ep = ef.get("path", "")
             ec = ef.get("content", "")
             if not ep or not ec:
@@ -3168,15 +3212,8 @@ def generate_single_scaffold_file(
 
     context = "\n\n".join(parts)
 
-    raw = provider.chat(
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": context},
-        ],
-        temperature=0.2,
-        max_tokens=budget["output_tokens"],
-        force_json=True,
-    ).get("content", "")
+    raw = _scaffold_primary_call(
+        provider, system, context, budget, on_token)
     parsed = _extract_json_object(raw)
     content = str(parsed.get("content") or "") if parsed else ""
 
@@ -3229,14 +3266,14 @@ def generate_single_scaffold_file(
         try:
             _ast.parse(content)
         except SyntaxError as e:
-            # One hardened retry with the exact SyntaxError surfaced.
+            # One targeted retry with the exact SyntaxError surfaced.
             # Broken Python that slips through here is silently dropped by
             # APPLY's own syntax gate, which can leave the project without
             # its entry point or its only test file (VERIFY then reports
             # "no tests located" and the loop declares a false success).
-            retry = _regenerate_scaffold_file(
-                provider, system, context, budget,
-                _SYNTAX_RETRY_INSTR.format(lang="Python", error=e))
+            retry = _syntax_repair_retry(
+                provider, path=path, lang="Python", error=str(e),
+                broken=content, budget=budget)
             retry_ok = False
             if retry:
                 try:
@@ -3254,14 +3291,14 @@ def generate_single_scaffold_file(
         try:
             _json.loads(content)
         except Exception as e:
-            # One hardened retry with the exact parse error surfaced --
+            # One targeted retry with the exact parse error surfaced --
             # symmetric with the .py path above. A malformed data file
             # (e.g. users.json the app reads at startup) is otherwise
             # silently dropped by APPLY's syntax gate, so the app boots
             # against a missing file and SMOKE/VERIFY fail downstream.
-            retry = _regenerate_scaffold_file(
-                provider, system, context, budget,
-                _SYNTAX_RETRY_INSTR.format(lang="JSON", error=e))
+            retry = _syntax_repair_retry(
+                provider, path=path, lang="JSON", error=str(e),
+                broken=content, budget=budget)
             retry_ok = False
             if retry:
                 try:
@@ -3293,9 +3330,9 @@ def generate_single_scaffold_file(
         _grammar = _JS_TS_GRAMMAR_BY_EXT[ext]
         diag = validate_js_ts_source(path, content, _grammar)
         if not diag.ok:
-            retry = _regenerate_scaffold_file(
-                provider, system, context, budget,
-                _SYNTAX_RETRY_INSTR.format(lang=_grammar, error=diag.error))
+            retry = _syntax_repair_retry(
+                provider, path=path, lang=_grammar, error=diag.error,
+                broken=content, budget=budget)
             if retry and validate_js_ts_source(path, retry, _grammar).ok:
                 content = retry
             else:
@@ -3575,15 +3612,200 @@ _JS_TS_GRAMMAR_BY_EXT = {
 }
 
 
-_SYNTAX_RETRY_INSTR = (
-    "\n\nCRITICAL RETRY -- YOUR PREVIOUS ATTEMPT WAS REJECTED:\n"
-    "The file you produced is not valid {lang} and failed to parse with:\n"
-    "  {error}\n"
-    "Return the COMPLETE, corrected file. It MUST parse cleanly: balance "
-    "all quotes/brackets/parentheses, close every triple-quoted string, "
-    "and terminate every block header (def/if/for/class) with a colon. "
-    "Do NOT include markdown fences, comments about the fix, or ellipsis."
+_SYNTAX_FIX_SYSTEM = (
+    "You are a code-repair tool. You are given exactly ONE source file that "
+    "failed to parse, together with the parser's error. Fix ONLY the syntax "
+    "so the file parses cleanly; preserve the code's intent, structure, and "
+    "every identifier. Do not add, remove, or rename any functionality.\n\n"
+    "Return strict JSON only:\n"
+    '{"content": "<the complete corrected file>"}\n'
+    "The content MUST be the whole file: no markdown fences, no commentary, "
+    "no ellipsis, no unified-diff markers."
 )
+
+
+def _syntax_repair_retry(
+        provider: Any, *, path: str, lang: str, error: str,
+        broken: str, budget: Dict[str, Any]) -> str:
+    """Targeted syntax fix: re-ask with only the broken file + the error.
+
+    Unlike :func:`_regenerate_scaffold_file`, which resends the full
+    scaffold context (goal + every prior file's signature digest), this
+    ships just the offending file and the parser's message. A syntax error
+    is local -- the model needs the broken bytes, not the rest of the
+    project -- so the smaller prompt is both cheaper (it drops the
+    O(files) digest block that dominates a late-layer retry) and more
+    focused. Pinned to temperature 0 for a deterministic correction.
+    Returns the fence-stripped ``content`` string, or ``""`` on any
+    provider/parse failure.
+    """
+    user = (
+        f"File: {path}\n"
+        f"Language: {lang}\n"
+        f"The file below is not valid {lang}. The parser reported:\n"
+        f"  {error}\n\n"
+        "Return the COMPLETE corrected file. Balance all "
+        "quotes/brackets/parentheses, close every string (including "
+        "triple-quoted ones), and terminate every block header with the "
+        "correct delimiter.\n\n"
+        f"BROKEN FILE:\n{broken}"
+    )
+    try:
+        raw = provider.chat(
+            messages=[
+                {"role": "system", "content": _SYNTAX_FIX_SYSTEM},
+                {"role": "user", "content": user},
+            ],
+            temperature=0.0,
+            max_tokens=budget["output_tokens"],
+            force_json=True,
+        ).get("content", "")
+    except Exception:  # pragma: no cover - defensive: provider hiccup
+        return ""
+    parsed = _extract_json_object(raw)
+    out = str(parsed.get("content") or "") if parsed else ""
+    if out:
+        stripped = out.strip()
+        if stripped.startswith("```"):
+            m = re.match(r"^```[a-zA-Z0-9_+\-]*\s*\n(.*?)\n```\s*$",
+                         stripped, re.DOTALL)
+            if m:
+                out = m.group(1)
+    return out
+
+
+_GITIGNORE_TEMPLATE = (
+    "# Python\n"
+    "__pycache__/\n"
+    "*.py[cod]\n"
+    "*.egg-info/\n"
+    ".eggs/\n"
+    "build/\n"
+    "dist/\n"
+    ".pytest_cache/\n"
+    ".mypy_cache/\n"
+    ".ruff_cache/\n"
+    ".coverage\n"
+    "htmlcov/\n"
+    ".venv/\n"
+    "venv/\n"
+    "env/\n\n"
+    "# Node\n"
+    "node_modules/\n"
+    "npm-debug.log*\n"
+    "yarn-debug.log*\n"
+    "yarn-error.log*\n"
+    ".pnpm-debug.log*\n\n"
+    "# Env / secrets\n"
+    ".env\n"
+    ".env.local\n"
+    ".env.*.local\n\n"
+    "# Editor / OS\n"
+    ".DS_Store\n"
+    ".idea/\n"
+    ".vscode/\n"
+    "*.swp\n"
+)
+
+_DOCKERIGNORE_TEMPLATE = (
+    ".git\n"
+    ".gitignore\n"
+    "__pycache__/\n"
+    "*.py[cod]\n"
+    ".venv/\n"
+    "venv/\n"
+    "node_modules/\n"
+    "dist/\n"
+    "build/\n"
+    ".env\n"
+    ".pytest_cache/\n"
+    ".mypy_cache/\n"
+)
+
+_GITATTRIBUTES_TEMPLATE = "* text=auto eol=lf\n"
+
+_EDITORCONFIG_TEMPLATE = (
+    "root = true\n\n"
+    "[*]\n"
+    "charset = utf-8\n"
+    "end_of_line = lf\n"
+    "insert_final_newline = true\n"
+    "trim_trailing_whitespace = true\n"
+    "indent_style = space\n"
+    "indent_size = 4\n\n"
+    "[*.{js,jsx,ts,tsx,json,yml,yaml,css,html,vue}]\n"
+    "indent_size = 2\n"
+)
+
+# Basename -> fixed template for pure-boilerplate files that carry no
+# project-specific content. Deterministic generation removes one LLM
+# round-trip per matched file from the SCAFFOLD critical path (P1.3).
+_TRIVIAL_BOILERPLATE: Dict[str, str] = {
+    ".gitignore": _GITIGNORE_TEMPLATE,
+    ".dockerignore": _DOCKERIGNORE_TEMPLATE,
+    ".gitattributes": _GITATTRIBUTES_TEMPLATE,
+    ".editorconfig": _EDITORCONFIG_TEMPLATE,
+}
+
+
+def _trivial_boilerplate_content(path: str) -> Optional[str]:
+    """Return fixed content for a pure-boilerplate file, else ``None``.
+
+    Matches on the basename only, so ``.gitignore`` resolves whether it is
+    at the repo root or nested. Non-boilerplate paths return ``None`` and
+    fall through to normal LLM generation.
+    """
+    base = path.rsplit("/", 1)[-1]
+    return _TRIVIAL_BOILERPLATE.get(base)
+
+
+def _scaffold_primary_call(
+        provider: Any, system: str, context: str,
+        budget: Dict[str, Any],
+        on_token: Optional[Callable[[str], None]]) -> str:
+    """Return the raw primary-generation response for one scaffold file.
+
+    Without ``on_token`` this is a single JSON-mode ``provider.chat`` --
+    identical to the legacy call. With ``on_token`` the same request is
+    streamed through ``provider.chat_stream`` (still JSON-mode, so the
+    accumulated text parses exactly like the blocking response) and each
+    delta is forwarded to the callback for live progress. Streaming is
+    purely additive: on any exception, or when the stream produces nothing
+    parseable, it falls back to the blocking ``chat`` so the file's success
+    rate is unchanged.
+    """
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": context},
+    ]
+    max_tokens = budget["output_tokens"]
+    if on_token is not None and getattr(provider, "stream_json_capable", False):
+        chunks: List[str] = []
+        try:
+            for delta in provider.chat_stream(
+                    messages, temperature=0.2, max_tokens=max_tokens,
+                    force_json=True):
+                if not delta:
+                    continue
+                chunks.append(delta)
+                try:
+                    on_token(delta)
+                except Exception:  # pragma: no cover - callback is best-effort
+                    pass
+        except Exception:  # pragma: no cover - defensive: stream hiccup
+            chunks = []
+        raw = "".join(chunks)
+        parsed = _extract_json_object(raw)
+        if parsed and str(parsed.get("content") or ""):
+            return raw
+        # Stream failed or produced unparseable text -- fall back to the
+        # reliable blocking call so we never regress generation success.
+    return provider.chat(
+        messages=messages,
+        temperature=0.2,
+        max_tokens=max_tokens,
+        force_json=True,
+    ).get("content", "")
 
 
 def _regenerate_scaffold_file(
