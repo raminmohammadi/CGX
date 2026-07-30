@@ -4080,11 +4080,15 @@ def generate_repair_files(
         goal: str,
         failure_text: str,
         files: List[Dict[str, str]],
-        max_files: int = 8) -> Dict[str, str]:
+        max_files: int = 8,
+        localized_files: Optional[List[str]] = None) -> Dict[str, str]:
     """Propose corrected file contents for a logic/assertion failure.
 
     ``files`` is a list of ``{"path", "content"}`` for the on-disk
-    source/test files most relevant to the failure. Returns
+    source/test files most relevant to the failure. ``localized_files``
+    (optional) names the subset the failure traceback pointed at; those
+    blocks are flagged and called out in the prompt so the model starts
+    from the failing frames instead of re-deriving the culprit. Returns
     ``{path: new_content}`` for each file the model rewrote whose new
     content differs from the original and passes
     :func:`_validate_repair_source`. Returns an empty mapping on any
@@ -4092,6 +4096,7 @@ def generate_repair_files(
     or when no candidate file was supplied -- the caller then falls back
     to the regenerate path.
     """
+    localized = {str(p).strip() for p in (localized_files or []) if str(p).strip()}
     known: Dict[str, str] = {}
     blocks: List[str] = []
     for f in files[:max_files]:
@@ -4100,15 +4105,24 @@ def generate_repair_files(
         if not p or not isinstance(c, str):
             continue
         known[p] = c
-        blocks.append(f"### {p}\n```\n{c}\n```")
+        marker = " (traceback points here)" if p in localized else ""
+        blocks.append(f"### {p}{marker}\n```\n{c}\n```")
     if not known:
         return {}
     from cgx.answer.model_caps import get_summary_budget
     budget = get_summary_budget(provider)
+    shown_localized = [p for p in known if p in localized]
+    localized_note = ""
+    if shown_localized:
+        localized_note = (
+            "TRACEBACK LOCALIZATION: the failure traceback flows through "
+            + ", ".join(shown_localized)
+            + " -- start your diagnosis there.\n\n")
     context = (
         f"PROJECT GOAL:\n{goal}\n\n"
         f"FAILING TEST OUTPUT:\n{failure_text}\n\n"
-        "CURRENT FILES:\n\n" + "\n\n".join(blocks)
+        + localized_note
+        + "CURRENT FILES:\n\n" + "\n\n".join(blocks)
     )
     try:
         raw = provider.chat(

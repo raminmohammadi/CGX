@@ -5466,6 +5466,35 @@ def test_failure_signature_differs_on_different_error():
     assert failure_signature(a) != failure_signature(b)
 
 
+def test_traceback_source_files_extracts_both_frame_shapes():
+    """pytest (``file.py:12``) + captured (``File "f.py"``) frames merge."""
+    from cgx.session.repair.classify import traceback_source_files
+    content = {
+        "outcome": "assertions_failed",
+        "returncode": 1,
+        "stdout": (
+            "tests/test_util.py:5: in test_scale\n"
+            "    assert scale(2) == 4\n"
+            "src/util.py:2: in scale\n"
+            "    return x - 1\n"
+            "E   assert 1 == 4"),
+        "stderr": (
+            'Traceback (most recent call last):\n'
+            '  File "src/util.py", line 2, in scale\n'
+            '    return x - 1\n'),
+    }
+    files = traceback_source_files(content)
+    # order-preserving + de-duplicated across both regexes/streams
+    assert files == ("src/util.py", "tests/test_util.py")
+
+
+def test_traceback_source_files_empty_without_frames():
+    """No frame shapes in the blob -> empty tuple (regenerate fallback)."""
+    from cgx.session.repair.classify import traceback_source_files
+    assert traceback_source_files(
+        {"stdout": "E   assert 1 == 3", "stderr": ""}) == ()
+
+
 def test_locate_unittest_pytest_mix_finds_offending_class(tmp_path: Path):
     from cgx.session.repair.locate import locate_unittest_pytest_mix
     rel = "tests/test_app.py"
@@ -5647,6 +5676,31 @@ def test_generate_repair_files_returns_validated_rewrites():
     assert out == {"src/calc.py": fixed}
 
 
+def test_generate_repair_files_flags_localized_files():
+    """``localized_files`` adds a traceback note + per-file marker."""
+    import json as _json
+    from cgx.answer.engine import generate_repair_files
+    src = "def add(a, b):\n    return a - b\n"
+    fixed = "def add(a, b):\n    return a + b\n"
+    provider = _StubProvider(_json.dumps({"files": [
+        {"path": "src/calc.py", "content": fixed}]}))
+    out = generate_repair_files(
+        provider,
+        goal="a calculator",
+        failure_text="E   assert 1 == 3",
+        files=[
+            {"path": "src/calc.py", "content": src},
+            {"path": "tests/test_calc.py", "content": "T"},
+        ],
+        localized_files=["src/calc.py"],
+    )
+    assert out == {"src/calc.py": fixed}
+    prompt = provider.calls[0]["messages"][-1]["content"]
+    assert "TRACEBACK LOCALIZATION" in prompt
+    assert "src/calc.py" in prompt
+    assert "(traceback points here)" in prompt
+
+
 def test_repair_executor_llm_logic_repair_emits_patch(store, tmp_path: Path):
     """unknown assertion failure + provider -> bounded LLM patch (can_apply)."""
     import json as _json
@@ -5722,7 +5776,7 @@ def test_repair_executor_llm_logic_repair_respects_attempt_budget(
         session.session_id, TaskKind.REPAIR, "repair",
         inputs={"verify_artifact_id": verify_artifact.artifact_id,
                 "mode": SessionMode.GREENFIELD.value,
-                "repair_attempt": 3})
+                "repair_attempt": 5})
     deps = ExecutorDeps(
         project_root=str(tmp_path), store=store, provider=provider)
     from cgx.session.tasks.base import _REGISTRY
@@ -5732,6 +5786,66 @@ def test_repair_executor_llm_logic_repair_respects_attempt_budget(
     assert result.outputs["can_apply"] is False
     assert result.outputs["diff_count"] == 0
     assert provider.calls == []
+
+
+def test_repair_executor_localizes_traceback_source_file(
+        store, tmp_path: Path):
+    """A source file named only in the traceback is repaired + flagged.
+
+    ``changed_files`` lists the test file APPLY wrote, but the failure
+    flows through ``src/util.py`` (named only in the traceback frames).
+    The executor must pull that source file into the repair context,
+    flag it to the provider, and emit a patch against it.
+    """
+    import json as _json
+    from cgx.session.tasks import repair as _repair_module  # noqa: F401
+    src_rel = "src/util.py"
+    test_rel = "tests/test_util.py"
+    (tmp_path / "src").mkdir()
+    (tmp_path / "tests").mkdir()
+    (tmp_path / src_rel).write_text(
+        "def scale(x):\n    return x - 1\n", encoding="utf-8")
+    (tmp_path / test_rel).write_text(
+        "from src.util import scale\n\n\ndef test_scale():\n"
+        "    assert scale(2) == 4\n", encoding="utf-8")
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    verify_artifact = Artifact.new(
+        session_id=session.session_id, produced_by_task_id="t_verify",
+        kind=ArtifactKind.VERIFY_REPORT,
+        content={
+            "outcome": "assertions_failed",
+            "returncode": 1,
+            "changed_files": [test_rel],
+            "stdout": (
+                "tests/test_util.py:5: in test_scale\n"
+                "    assert scale(2) == 4\n"
+                "src/util.py:2: in scale\n"
+                "    return x - 1\n"
+                "E   assert 1 == 4"),
+            "stderr": "",
+        })
+    store.save_artifact(verify_artifact)
+    provider = _StubProvider(_json.dumps({"files": [
+        {"path": src_rel, "content": "def scale(x):\n    return x * 2\n"}]}))
+    repair_task = TaskNode.new(
+        session.session_id, TaskKind.REPAIR, "repair",
+        inputs={"verify_artifact_id": verify_artifact.artifact_id,
+                "mode": SessionMode.GREENFIELD.value,
+                "repair_attempt": 1})
+    deps = ExecutorDeps(
+        project_root=str(tmp_path), store=store, provider=provider)
+    from cgx.session.tasks.base import _REGISTRY
+    result = _REGISTRY[TaskKind.REPAIR](repair_task, deps)
+    assert result.failure is None
+    assert result.outputs["can_apply"] is True
+    diffs = result.artifact.content["diffs"]
+    assert diffs[0]["file"] == src_rel
+    assert "return x * 2" in diffs[0]["patch"]
+    prompt = provider.calls[0]["messages"][-1]["content"]
+    assert "TRACEBACK LOCALIZATION" in prompt
+    assert "src/util.py" in prompt
+    assert "(traceback points here)" in prompt
 
 
 def test_repair_executor_empty_test_suite_regenerates(store, tmp_path: Path):

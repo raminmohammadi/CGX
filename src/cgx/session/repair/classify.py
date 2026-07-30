@@ -71,6 +71,18 @@ _FIXTURE_NOT_FOUND_RE = re.compile(
     r"fixture\s+'([A-Za-z_][A-Za-z0-9_]*)'\s+not found"
 )
 
+# Traceback frame shapes that name a source file + line. Pytest renders
+# its own frames as ``path/to/file.py:123: in func`` (and a trailing
+# ``path/to/file.py:123: SomeError`` summary), while a captured Python
+# traceback uses ``File "path/to/file.py", line 123``. Both let us
+# localize the repair to the files the failure actually flowed through
+# instead of only the files APPLY happened to write. Character classes
+# are spelled out (no ``\d``/``\w``) for cross-engine portability.
+_TB_PYTEST_FRAME_RE = re.compile(
+    r"([A-Za-z0-9_./\\-]+\.py):[0-9]+")
+_TB_FILE_LINE_RE = re.compile(
+    r'File "([A-Za-z0-9_./\\-]+\.py)", line [0-9]+')
+
 # Third-party API break: ``ImportError: cannot import name '<sym>' from
 # '<pkg>'`` is emitted when the named module exists (the install
 # succeeded) but the requested attribute is missing -- the canonical
@@ -187,6 +199,27 @@ def missing_fixture_names(content: Dict[str, Any]) -> Tuple[str, ...]:
         name = m.group(1)
         if name and name not in out:
             out.append(name)
+    return tuple(out)
+
+
+def traceback_source_files(content: Dict[str, Any]) -> Tuple[str, ...]:
+    """Return the ``.py`` paths named in the failure traceback(s).
+
+    Scans the concatenated failure text for both pytest (``file.py:12:
+    in func``) and standard (``File "file.py", line 12``) frame shapes so
+    the REPAIR executor can localize the fix to the files the failure
+    actually flowed through -- not just the files APPLY wrote. The paths
+    are returned verbatim (still runner-relative or absolute), order-
+    preserving and de-duplicated; the caller resolves them against the
+    project root and drops anything not on disk.
+    """
+    blob = _failure_text(content)
+    out: List[str] = []
+    for regex in (_TB_FILE_LINE_RE, _TB_PYTEST_FRAME_RE):
+        for m in regex.finditer(blob):
+            path = m.group(1).replace("\\", "/").strip()
+            if path and path not in out:
+                out.append(path)
     return tuple(out)
 
 

@@ -40,6 +40,7 @@ from cgx.session.repair.classify import (
     failure_signature,
     runtime_failure_text,
     third_party_import_breaks,
+    traceback_source_files,
 )
 from cgx.session.repair.locate import (
     MissingFixtureLocation,
@@ -72,13 +73,15 @@ logger = logging.getLogger(__name__)
 _PATCH_DIFF_LIMIT = 5
 
 # Bounded LLM logic-repair caps. The router already gates the overall
-# loop via ``_REPAIR_BUDGET`` + flap detection on ``failure_signature``;
-# these caps keep a single REPAIR call's LLM cost and blast radius
-# proportional to the failure. LLM repair is only attempted on the first
-# ``_LLM_REPAIR_MAX_ATTEMPT`` repair attempts (later attempts fall back to
-# regenerate), and at most ``_LLM_REPAIR_MAX_FILES`` files are shown to
-# the provider.
-_LLM_REPAIR_MAX_ATTEMPT = 2
+# loop via ``_REPAIR_BUDGET`` + the progress-aware failing-test-count
+# trend (P2) + flap detection on ``failure_signature``; these caps keep a
+# single REPAIR call's LLM cost and blast radius proportional to the
+# failure. LLM repair is attempted on every repair attempt the router
+# still funds (#4: it used to give up after 2 shots even while the router
+# was willing to keep going on a genuinely-shrinking failure) -- the
+# progress gate, not this executor, decides when to stop iterating. At
+# most ``_LLM_REPAIR_MAX_FILES`` files are shown to the provider.
+_LLM_REPAIR_MAX_ATTEMPT = 4
 _LLM_REPAIR_MAX_FILES = 8
 
 # Classifications whose only realistic fix is to re-author the offending
@@ -663,14 +666,23 @@ def _propose_llm_logic_repair(
         content: Dict[str, Any]) -> List[Dict[str, str]]:
     """Bounded LLM repair for an ``unknown`` logic/assertion failure.
 
-    Reads the failing-test output plus the on-disk files APPLY wrote
-    (``changed_files`` / ``tests_selected`` from the VERIFY_REPORT),
-    asks the provider for corrected complete file contents, and turns
-    each accepted rewrite into a unified diff shaped like every other
-    ``propose_*`` result. Returns an empty list -- so the caller falls
-    back to the regenerate path -- when there is no provider, the repair
-    attempt budget is spent, no candidate file is readable, or the model
-    declined / produced nothing that parses.
+    Reads the failing-test output plus the on-disk files most relevant to
+    the failure and asks the provider for corrected complete file
+    contents, turning each accepted rewrite into a unified diff shaped
+    like every other ``propose_*`` result.
+
+    Candidate files are localized from the failure itself (#4): the source
+    files named in the traceback frames come *first* (that is where the
+    error actually flowed, and it may be a source file APPLY never touched
+    this attempt), followed by the files APPLY wrote / selected
+    (``changed_files`` / ``tests_selected``). The traceback-referenced
+    subset is passed to the generator so the prompt can point the model at
+    the failing frames instead of asking it to re-derive the culprit.
+
+    Returns an empty list -- so the caller falls back to the regenerate
+    path -- when there is no provider, the repair attempt budget is spent,
+    no candidate file is readable, or the model declined / produced
+    nothing that parses.
     """
     if deps.provider is None or not deps.project_root:
         return []
@@ -678,15 +690,20 @@ def _propose_llm_logic_repair(
     if attempt > _LLM_REPAIR_MAX_ATTEMPT:
         return []
     root = Path(deps.project_root)
+    localized = _localized_source_files(content, root)
+    localized_set = set(localized)
     files: List[Dict[str, str]] = []
     originals: Dict[str, str] = {}
-    for rel in _candidate_test_files(content)[:_LLM_REPAIR_MAX_FILES]:
+    shown_localized: List[str] = []
+    for rel in _repair_candidate_files(content, root)[:_LLM_REPAIR_MAX_FILES]:
         try:
             text = (root / rel).resolve().read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             continue
         originals[rel] = text
         files.append({"path": rel, "content": text})
+        if rel in localized_set:
+            shown_localized.append(rel)
     if not files:
         return []
     from cgx.answer.engine import generate_repair_files
@@ -700,6 +717,7 @@ def _propose_llm_logic_repair(
             failure_text=failure_text(content),
             files=files,
             max_files=_LLM_REPAIR_MAX_FILES,
+            localized_files=shown_localized,
         )
     except Exception:  # pragma: no cover - defensive: provider hiccup
         logger.exception("REPAIR: bounded LLM logic repair crashed")
@@ -731,6 +749,57 @@ def _candidate_test_files(content: Dict[str, Any]) -> List[str]:
                 s = str(entry).strip()
                 if s and s not in out:
                     out.append(s)
+    return out
+
+
+def _localized_source_files(content: Dict[str, Any], root: Path) -> List[str]:
+    """Resolve the traceback-named ``.py`` frames to on-disk repo paths.
+
+    Each raw frame path (which may be runner-relative or absolute) is
+    resolved against ``root``; only paths that resolve to an existing file
+    inside the project are kept, order-preserving and de-duplicated.
+    Anything outside the tree (stdlib / site-packages frames) is dropped
+    so the repair context stays scoped to first-party code.
+    """
+    out: List[str] = []
+    for raw in traceback_source_files(content):
+        rel = _resolve_repo_relative(root, raw)
+        if rel and rel not in out:
+            out.append(rel)
+    return out
+
+
+def _resolve_repo_relative(root: Path, raw: str) -> Optional[str]:
+    """Return ``raw`` as a repo-relative path when it names a project file.
+
+    Handles both an absolute frame path under ``root`` and an already-
+    relative one (optionally ``./``-prefixed). Returns ``None`` when the
+    path escapes the tree or does not exist on disk.
+    """
+    candidate = raw[2:] if raw.startswith("./") else raw
+    p = Path(candidate)
+    if p.is_absolute():
+        try:
+            candidate = str(p.resolve().relative_to(root.resolve()))
+        except (ValueError, OSError):
+            return None
+    if ".." in Path(candidate).parts:
+        return None
+    return candidate if (root / candidate).is_file() else None
+
+
+def _repair_candidate_files(content: Dict[str, Any], root: Path) -> List[str]:
+    """Order the files shown to the LLM repair, traceback frames first.
+
+    The traceback-localized source files lead (that is where the failure
+    actually flowed, and the culprit is often a source file APPLY did not
+    touch this attempt), followed by the APPLY-written / selected files
+    from :func:`_candidate_test_files`. De-duplicated, order-preserving.
+    """
+    out: List[str] = list(_localized_source_files(content, root))
+    for rel in _candidate_test_files(content):
+        if rel not in out:
+            out.append(rel)
     return out
 
 
