@@ -5906,6 +5906,106 @@ def test_repair_executor_localizes_traceback_source_file(
     assert "(traceback points here)" in prompt
 
 
+def test_repair_executor_retrieval_feeds_candidate_files(
+        store, tmp_path: Path, monkeypatch):
+    """#6: with an index wired in, retrieval fills the unused repair slots.
+
+    ``changed_files`` names only the test file and the plain assertion
+    failure carries no traceback frames, so the failure-localized
+    candidates leave slots free. A stubbed hybrid-retrieval result points
+    at ``src/helper.py``; the executor must pull that source file into the
+    repair context and emit a patch against it.
+    """
+    import json as _json
+    from cgx.session.tasks import repair as _repair_module  # noqa: F401
+    src_rel = "src/helper.py"
+    test_rel = "tests/test_helper.py"
+    (tmp_path / "src").mkdir()
+    (tmp_path / "tests").mkdir()
+    (tmp_path / src_rel).write_text(
+        "def scale(x):\n    return x - 1\n", encoding="utf-8")
+    (tmp_path / test_rel).write_text(
+        "def test_scale():\n    assert 1 == 3\n", encoding="utf-8")
+    monkeypatch.setattr(
+        "cgx.pipeline.auto.run_query_auto",
+        lambda **kwargs: {"top_files": [{"file": src_rel}]})
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    verify_artifact = Artifact.new(
+        session_id=session.session_id, produced_by_task_id="t_verify",
+        kind=ArtifactKind.VERIFY_REPORT,
+        content={
+            "outcome": "assertions_failed",
+            "returncode": 1,
+            "changed_files": [test_rel],
+            "stdout": "E   assert 1 == 3",
+            "stderr": "",
+        })
+    store.save_artifact(verify_artifact)
+    provider = _StubProvider(_json.dumps({"files": [
+        {"path": src_rel, "content": "def scale(x):\n    return x * 2\n"}]}))
+    repair_task = TaskNode.new(
+        session.session_id, TaskKind.REPAIR, "repair",
+        inputs={"verify_artifact_id": verify_artifact.artifact_id,
+                "mode": SessionMode.GREENFIELD.value,
+                "repair_attempt": 1})
+    deps = ExecutorDeps(
+        project_root=str(tmp_path), store=store, provider=provider,
+        index_dir="idx", records_path="rec")
+    from cgx.session.tasks.base import _REGISTRY
+    result = _REGISTRY[TaskKind.REPAIR](repair_task, deps)
+    assert result.failure is None
+    assert result.outputs["can_apply"] is True
+    diffs = result.artifact.content["diffs"]
+    assert any(d["file"] == src_rel for d in diffs)
+    prompt = provider.calls[0]["messages"][-1]["content"]
+    assert "src/helper.py" in prompt
+
+
+def test_repair_executor_retrieval_noop_without_index(
+        store, tmp_path: Path, monkeypatch):
+    """#6: no index in deps -> retrieval is never invoked (greenfield)."""
+    import json as _json
+    from cgx.session.tasks import repair as _repair_module  # noqa: F401
+    called = {"n": 0}
+
+    def _boom(**kwargs):
+        called["n"] += 1
+        return {"top_files": []}
+
+    monkeypatch.setattr("cgx.pipeline.auto.run_query_auto", _boom)
+    rel = "src/calc.py"
+    (tmp_path / "src").mkdir()
+    (tmp_path / rel).write_text(
+        "def add(a, b):\n    return a - b\n", encoding="utf-8")
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    verify_artifact = Artifact.new(
+        session_id=session.session_id, produced_by_task_id="t_verify",
+        kind=ArtifactKind.VERIFY_REPORT,
+        content={
+            "outcome": "assertions_failed",
+            "returncode": 1,
+            "changed_files": [rel],
+            "stdout": "E   assert 1 == 3",
+            "stderr": "",
+        })
+    store.save_artifact(verify_artifact)
+    provider = _StubProvider(_json.dumps({"files": [
+        {"path": rel, "content": "def add(a, b):\n    return a + b\n"}]}))
+    repair_task = TaskNode.new(
+        session.session_id, TaskKind.REPAIR, "repair",
+        inputs={"verify_artifact_id": verify_artifact.artifact_id,
+                "mode": SessionMode.GREENFIELD.value,
+                "repair_attempt": 1})
+    deps = ExecutorDeps(
+        project_root=str(tmp_path), store=store, provider=provider)
+    from cgx.session.tasks.base import _REGISTRY
+    result = _REGISTRY[TaskKind.REPAIR](repair_task, deps)
+    assert result.outputs["can_apply"] is True
+    assert called["n"] == 0
+
+
 def test_repair_executor_empty_test_suite_regenerates(store, tmp_path: Path):
     """no_tests_collected -> empty_test_suite classification + regenerate."""
     from cgx.session.tasks import repair as _repair_module  # noqa: F401

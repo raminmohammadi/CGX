@@ -84,6 +84,16 @@ _PATCH_DIFF_LIMIT = 5
 _LLM_REPAIR_MAX_ATTEMPT = 4
 _LLM_REPAIR_MAX_FILES = 8
 
+# Retrieval-fed repair (#6). When an index is wired into ``deps``
+# (existing-repo / explore mode -- greenfield sessions have none), any
+# file-slot the failure-localized candidates leave unused is filled with
+# the source files hybrid retrieval judges most relevant to the failure,
+# so a fix that must touch a symbol APPLY never wrote this attempt is not
+# invisible to the provider. Retrieval widens ``top_k_per_view`` by this
+# slack so path-resolution / de-dup drops still leave enough hits to fill
+# the remaining budget.
+_LLM_REPAIR_RETRIEVAL_SLACK = 4
+
 # Classifications whose only realistic fix is to re-author the offending
 # scaffold layer rather than mechanically patch what was already
 # written. Used by :func:`_select_repair_strategy` when no diff was
@@ -675,9 +685,13 @@ def _propose_llm_logic_repair(
     files named in the traceback frames come *first* (that is where the
     error actually flowed, and it may be a source file APPLY never touched
     this attempt), followed by the files APPLY wrote / selected
-    (``changed_files`` / ``tests_selected``). The traceback-referenced
-    subset is passed to the generator so the prompt can point the model at
-    the failing frames instead of asking it to re-derive the culprit.
+    (``changed_files`` / ``tests_selected``). Any file-slot those leave
+    unused is then filled by hybrid retrieval over the project index (#6)
+    so a fix that must reach a symbol in an existing file neither the
+    traceback nor APPLY named is still in scope -- a no-op in greenfield
+    (no index). The traceback-referenced subset is passed to the generator
+    so the prompt can point the model at the failing frames instead of
+    asking it to re-derive the culprit.
 
     Returns an empty list -- so the caller falls back to the regenerate
     path -- when there is no provider, the repair attempt budget is spent,
@@ -689,13 +703,25 @@ def _propose_llm_logic_repair(
     attempt = int(task.inputs.get("repair_attempt") or 1)
     if attempt > _LLM_REPAIR_MAX_ATTEMPT:
         return []
+    from cgx.answer.engine import generate_repair_files
+    from cgx.session.repair.classify import failure_text
+    from cgx.session.repair.propose import _unified_diff
     root = Path(deps.project_root)
     localized = _localized_source_files(content, root)
     localized_set = set(localized)
+    goal = str(task.inputs.get("prior_goal") or content.get("goal") or "").strip()
+    blob = failure_text(content)
+    candidates = _repair_candidate_files(content, root)
+    if len(candidates) < _LLM_REPAIR_MAX_FILES:
+        query = _repair_retrieval_query(goal, blob)
+        limit = _LLM_REPAIR_MAX_FILES - len(candidates)
+        for rel in _retrieval_relevant_files(deps, query, root, limit):
+            if rel not in candidates:
+                candidates.append(rel)
     files: List[Dict[str, str]] = []
     originals: Dict[str, str] = {}
     shown_localized: List[str] = []
-    for rel in _repair_candidate_files(content, root)[:_LLM_REPAIR_MAX_FILES]:
+    for rel in candidates[:_LLM_REPAIR_MAX_FILES]:
         try:
             text = (root / rel).resolve().read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
@@ -706,15 +732,11 @@ def _propose_llm_logic_repair(
             shown_localized.append(rel)
     if not files:
         return []
-    from cgx.answer.engine import generate_repair_files
-    from cgx.session.repair.classify import failure_text
-    from cgx.session.repair.propose import _unified_diff
-    goal = str(task.inputs.get("prior_goal") or content.get("goal") or "").strip()
     try:
         fixed = generate_repair_files(
             deps.provider,
             goal=goal,
-            failure_text=failure_text(content),
+            failure_text=blob,
             files=files,
             max_files=_LLM_REPAIR_MAX_FILES,
             localized_files=shown_localized,
@@ -801,6 +823,64 @@ def _repair_candidate_files(content: Dict[str, Any], root: Path) -> List[str]:
         if rel not in out:
             out.append(rel)
     return out
+
+
+def _repair_retrieval_query(goal: str, failure_blob: str) -> str:
+    """Compose the retrieval query for the #6 candidate-fill step.
+
+    Pairs the original goal (what the code is supposed to do) with the
+    first exception / pytest error line from the failure blob (what broke),
+    which together steer hybrid retrieval at the symbols the fix is most
+    likely to touch. Falls back to whichever half is present.
+    """
+    first = ""
+    for raw in failure_blob.splitlines():
+        line = raw.strip()
+        if (line.startswith("E ") or line.startswith("E\t")
+                or "Error:" in line or "Exception:" in line):
+            first = line
+            break
+    return " ".join(p for p in (goal, first) if p).strip()
+
+
+def _retrieval_relevant_files(
+        deps: ExecutorDeps, query: str, root: Path, limit: int) -> List[str]:
+    """Return up to ``limit`` repo-relative source files hybrid retrieval
+    judges most relevant to ``query`` (#6).
+
+    Best-effort and self-disabling: returns ``[]`` when no index is wired
+    into ``deps`` (every greenfield session), when the query is empty, or
+    when retrieval raises -- the caller then keeps its failure-localized
+    candidates unchanged. Retrieval ``top_files`` are resolved against the
+    project root and de-duplicated the same way traceback frames are, so
+    only existing first-party files are ever handed to the provider.
+    """
+    if limit <= 0 or not query or not deps.index_dir or not deps.records_path:
+        return []
+    try:
+        from cgx.pipeline.auto import run_query_auto
+        out = run_query_auto(
+            index_dir=deps.index_dir,
+            records_path=deps.records_path,
+            query=query,
+            embedder=(deps.extra.get("embedder") if deps.extra else None),
+            top_k_per_view=limit + _LLM_REPAIR_RETRIEVAL_SLACK,
+        )
+    except Exception:  # pragma: no cover - defensive: retrieval hiccup
+        logger.exception("REPAIR: retrieval-fed candidate lookup crashed")
+        return []
+    files: List[str] = []
+    for entry in (out or {}).get("top_files") or []:
+        raw = (str((entry or {}).get("file") or "").strip()
+               if isinstance(entry, dict) else str(entry).strip())
+        if not raw:
+            continue
+        rel = _resolve_repo_relative(root, raw)
+        if rel and rel not in files:
+            files.append(rel)
+        if len(files) >= limit:
+            break
+    return files
 
 
 def _unittest_rationale(locations: List[StyleMixLocation]) -> str:
