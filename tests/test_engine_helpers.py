@@ -954,6 +954,73 @@ def test_trivial_boilerplate_content_returns_none_for_normal_files():
     assert _trivial_boilerplate_content("nested/dir/.gitignore") is not None
 
 
+# ---------------------------------------------------------------------------
+# P0 contract-first planning: plan_scaffold_manifest emits a normalized
+# ``contracts`` block and generate_single_scaffold_file threads it into the
+# per-file prompt so cross-file interfaces are declared, not re-derived.
+# ---------------------------------------------------------------------------
+def test_plan_scaffold_manifest_normalizes_and_returns_contracts():
+    from cgx.answer.engine import plan_scaffold_manifest
+
+    reply = json.dumps({
+        "plan_md": "flask + react calculator",
+        "contracts": {
+            "endpoints": [
+                {"method": "post", "path": "/api/calc",
+                 "request": {"expr": "str"},
+                 "response": {"result": "number"},
+                 "description": "evaluate an expression"},
+                {},  # malformed (empty) -> dropped by the normalizer
+            ],
+            "schemas": [{"name": "CalcRequest", "fields": {"expr": "str"}}],
+            "functions": [{"name": "evaluate",
+                           "signature": "evaluate(expr: str) -> float",
+                           "module": "backend/calc.py"}],
+            "constants": [{"name": "API_BASE", "value": "/api"}],
+            "junk": "unknown category ignored",
+        },
+        "layers": [{"name": "core", "files": [
+            {"path": "backend/calc.py", "description": "core"}]}],
+    })
+    out = plan_scaffold_manifest(
+        "build a calculator", _OneShotProvider(reply), goal="build a calculator")
+    contracts = out["contracts"]
+    assert set(contracts.keys()) == {
+        "endpoints", "schemas", "functions", "constants"}
+    # The empty endpoint dict is dropped; the well-formed one survives.
+    assert len(contracts["endpoints"]) == 1
+    assert contracts["endpoints"][0]["path"] == "/api/calc"
+    # Unknown top-level categories never make it into the stored block.
+    assert "junk" not in contracts
+
+
+def test_generate_single_scaffold_file_threads_contracts_into_prompt():
+    from cgx.answer.engine import generate_single_scaffold_file
+
+    contracts = {
+        "endpoints": [{"method": "GET", "path": "/api/ping",
+                       "response": {"ok": "bool"}}],
+        "functions": [{"signature": "ping() -> dict", "module": "app.py"}],
+    }
+    provider = _RecordingQueueProvider([_VALID_PY])
+    generate_single_scaffold_file(
+        "app.py", "flask app", provider,
+        layer="core", goal="build an api", contracts=contracts,
+    )
+    user = provider.messages[0][1]["content"]
+    assert "PROJECT CONTRACTS" in user
+    assert "GET /api/ping" in user
+    assert "ping() -> dict" in user
+
+    # No contracts -> the section is absent (prompt unchanged).
+    plain = _RecordingQueueProvider([_VALID_PY])
+    generate_single_scaffold_file(
+        "app.py", "flask app", plain,
+        layer="core", goal="build an api",
+    )
+    assert "PROJECT CONTRACTS" not in plain.messages[0][1]["content"]
+
+
 # ---------------------------------------------------------------------
 # clarify_paths structured generation
 # ---------------------------------------------------------------------

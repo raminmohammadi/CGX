@@ -74,6 +74,15 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         return ExecutorResult(
             failure="SCAFFOLD: work plan carries no layers")
 
+    # Contract-first (P0): the WORK_PLAN carries a ``contracts`` block --
+    # the shared interfaces (endpoints, schemas, function signatures,
+    # constants) DECOMPOSE declared. Thread it into every per-file
+    # generation so cross-file assumptions are honoured, not re-derived.
+    # Absent/malformed -> ``None`` so the generator prompt is unchanged.
+    contracts = content.get("contracts")
+    if not isinstance(contracts, dict) or not contracts:
+        contracts = None
+
     # Phase 6.1: when REPAIR routed a regenerate verdict here, fold the
     # accumulated constraint payloads into the goal so the per-file
     # generator sees the prior-failure context. Each entry is a small
@@ -223,7 +232,7 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
                     pool.submit(
                         _generate_one, p, d, layer_name,
                         list(context_snapshot), deps.provider, goal,
-                        depends_on=dep): i
+                        depends_on=dep, contracts=contracts): i
                     for i, (p, d, dep) in enumerate(pending)
                 }
                 for fut in as_completed(fut_to_idx):
@@ -248,7 +257,7 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
                 ok, fail = _generate_one(
                     p, d, layer_name, list(existing_with_content),
                     deps.provider, goal, on_token=on_token,
-                    depends_on=dep)
+                    depends_on=dep, contracts=contracts)
                 elapsed_ms = int((time.time() - started) * 1000)
                 layer_results.append((ok, fail))
                 if ok is not None:
@@ -369,6 +378,7 @@ def _generate_one(
         context: List[Dict[str, str]], provider: Any, goal: str,
         on_token: Optional[Callable[[str], None]] = None,
         depends_on: Optional[List[str]] = None,
+        contracts: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, str]]]:
     """Generate one scaffold file. Returns ``(ok_entry, fail_entry)``.
 
@@ -380,7 +390,9 @@ def _generate_one(
     call so monkeypatched stubs (and any hot-swapped prompt templates) take
     effect. ``on_token`` (serial path only) forwards streamed generation
     deltas for live progress. ``depends_on`` scopes the context digest to
-    the manifest-declared dependency paths.
+    the manifest-declared dependency paths. ``contracts`` is the WORK_PLAN
+    shared-interface block, threaded verbatim so every file honours the
+    same declared endpoints/schemas/signatures.
     """
     from cgx.answer.engine import generate_single_scaffold_file
     try:
@@ -391,6 +403,7 @@ def _generate_one(
             goal=goal,
             on_token=on_token,
             depends_on=depends_on,
+            contracts=contracts,
         )
     except Exception as exc:
         logger.exception(

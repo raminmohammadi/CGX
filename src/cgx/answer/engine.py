@@ -2233,6 +2233,16 @@ _MANIFEST_SYSTEM = (
     "Return strict JSON only:\n"
     "{\n"
     '  "plan_md": "2-4 sentence architecture overview",\n'
+    '  "contracts": {\n'
+    '    "endpoints": [{"method": "POST", "path": "/api/x",\n'
+    '      "request": {"a": "number"}, "response": {"result": "number"},\n'
+    '      "description": "one-line purpose"}],\n'
+    '    "schemas": [{"name": "Thing", "fields": {"id": "int", "name": "str"}}],\n'
+    '    "functions": [{"name": "compute",\n'
+    '      "signature": "compute(a: float, b: float) -> float",\n'
+    '      "module": "src/core.py"}],\n'
+    '    "constants": [{"name": "API_BASE", "value": "/api"}]\n'
+    "  },\n"
     '  "layers": [\n'
     '    {\n'
     '      "name": "core|ui|config|tests",\n'
@@ -2251,6 +2261,12 @@ _MANIFEST_SYSTEM = (
     "- Optional per file: \"depends_on\" lists sibling manifest paths this "
     "file imports/needs so files generate dependency-first. Reference only "
     "paths present in this manifest; never form a cycle.\n"
+    "- contracts (optional, but STRONGLY preferred for any multi-file or "
+    "client/server project): declare the shared interfaces every file must "
+    "agree on -- HTTP endpoints (method/path/request/response), data schemas "
+    "(name + fields), shared function signatures (name/signature/module) and "
+    "shared constants. Files then implement these EXACTLY instead of "
+    "re-inventing endpoint paths, field names, or signatures per file.\n"
     "- 3 to 15 files total. Prefer completeness over brevity.\n"
     "- Canonical top-level dirs: src/, backend/, tests/, public/, docs/.\n"
 )
@@ -2366,8 +2382,158 @@ def plan_scaffold_manifest(
     layers = _inject_readme(layers, goal=goal_clean or idea_clean)
     return {
         "plan_md": str(parsed.get("plan_md") or "").strip(),
+        "contracts": _normalize_contracts(parsed.get("contracts")),
         "layers": layers,
     }
+
+
+# Recognised contract categories, in render order. Anything outside this
+# set is dropped so a noisy planner reply cannot bloat the per-file prompt.
+_CONTRACT_KEYS = ("endpoints", "schemas", "functions", "constants")
+
+
+def _normalize_contracts(raw: Any) -> Dict[str, Any]:
+    """Normalize a planner ``contracts`` block to a clean, bounded dict.
+
+    Keeps only the four recognised interface categories (HTTP endpoints,
+    data schemas, shared function signatures, shared constants); each is a
+    list of small string-keyed dicts with empty/malformed entries dropped.
+    Absent or unusable categories are omitted so an empty block returns
+    ``{}`` and callers can skip the section entirely.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    out: Dict[str, Any] = {}
+    for key in _CONTRACT_KEYS:
+        items = raw.get(key)
+        if not isinstance(items, list):
+            continue
+        cleaned: List[Dict[str, Any]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            entry = {
+                str(k): v for k, v in item.items()
+                if isinstance(k, str) and str(k).strip()
+                and isinstance(v, (str, int, float, bool, list, dict))
+            }
+            if entry:
+                cleaned.append(entry)
+        if cleaned:
+            out[key] = cleaned
+    return out
+
+
+def _compact_json_fragment(value: Any, max_chars: int = 300) -> str:
+    """Render a contract sub-value (schema fields, request body) compactly.
+
+    Returns an empty string for empty/absent values so the caller can omit
+    the fragment; non-empty values are single-line JSON (or the raw string)
+    clamped to ``max_chars`` so one verbose schema cannot dominate a prompt.
+    """
+    if value is None or value == "" or value == [] or value == {}:
+        return ""
+    try:
+        if isinstance(value, str):
+            s = value.strip()
+        else:
+            s = json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+    except Exception:  # pragma: no cover - defensive
+        s = str(value)
+    s = s.strip()
+    if len(s) > max_chars:
+        s = s[: max_chars - 1] + "\u2026"
+    return s
+
+
+def _render_contracts_for_prompt(contracts: Any) -> str:
+    """Render a normalized ``contracts`` block as a compact prompt fragment.
+
+    Declares the shared interfaces every file must honour so cross-file
+    assumptions (endpoint paths, schema field names, function signatures,
+    constant values) are stated once instead of re-derived per file.
+    Returns an empty string when there is nothing usable.
+    """
+    if not isinstance(contracts, dict) or not contracts:
+        return ""
+    sections: List[str] = []
+
+    endpoints = contracts.get("endpoints")
+    if isinstance(endpoints, list) and endpoints:
+        lines: List[str] = []
+        for ep in endpoints:
+            if not isinstance(ep, dict):
+                continue
+            path = str(ep.get("path") or "").strip()
+            if not path:
+                continue
+            method = str(ep.get("method") or "").strip().upper()
+            head = " ".join(p for p in (method, path) if p)
+            tail: List[str] = []
+            req = _compact_json_fragment(ep.get("request"))
+            resp = _compact_json_fragment(ep.get("response"))
+            if req:
+                tail.append(f"request={req}")
+            if resp:
+                tail.append(f"response={resp}")
+            desc = str(ep.get("description") or "").strip()
+            if desc:
+                tail.append(desc)
+            lines.append(f"- {head}"
+                         + (f" -- {'; '.join(tail)}" if tail else ""))
+        if lines:
+            sections.append("Endpoints:\n" + "\n".join(lines))
+
+    schemas = contracts.get("schemas")
+    if isinstance(schemas, list) and schemas:
+        lines = []
+        for sc in schemas:
+            if not isinstance(sc, dict):
+                continue
+            name = str(sc.get("name") or "").strip()
+            if not name:
+                continue
+            bits = [b for b in (_compact_json_fragment(sc.get("fields")),
+                                str(sc.get("description") or "").strip()) if b]
+            lines.append(f"- {name}"
+                         + (f": {'; '.join(bits)}" if bits else ""))
+        if lines:
+            sections.append("Schemas:\n" + "\n".join(lines))
+
+    functions = contracts.get("functions")
+    if isinstance(functions, list) and functions:
+        lines = []
+        for fn in functions:
+            if not isinstance(fn, dict):
+                continue
+            sig = str(fn.get("signature") or fn.get("name") or "").strip()
+            if not sig:
+                continue
+            module = str(fn.get("module") or "").strip()
+            lines.append(f"- {sig}" + (f" (in {module})" if module else ""))
+        if lines:
+            sections.append("Shared functions:\n" + "\n".join(lines))
+
+    constants = contracts.get("constants")
+    if isinstance(constants, list) and constants:
+        lines = []
+        for c in constants:
+            if not isinstance(c, dict):
+                continue
+            name = str(c.get("name") or "").strip()
+            if not name:
+                continue
+            val = c.get("value")
+            lines.append(f"- {name}"
+                         + (f" = {val!r}" if val is not None else ""))
+        if lines:
+            sections.append("Shared constants:\n" + "\n".join(lines))
+
+    if not sections:
+        return ""
+    return ("PROJECT CONTRACTS (shared interfaces every file MUST honour "
+            "exactly -- do not rename paths, fields, or signatures):\n"
+            + "\n\n".join(sections))
 
 
 def _inject_required_manifest_files(
@@ -3011,6 +3177,7 @@ def generate_single_scaffold_file(
     skills: Optional[List[str]] = None,
     on_token: Optional[Callable[[str], None]] = None,
     depends_on: Optional[List[str]] = None,
+    contracts: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Generate the content of a single file in a new-project scaffold.
 
@@ -3020,6 +3187,11 @@ def generate_single_scaffold_file(
     those paths (a file only needs the modules it imports), which bounds
     the prompt at O(depends_on) instead of O(files-so-far). Runs inline
     syntax validation before returning.
+
+    When ``contracts`` is supplied (the WORK_PLAN ``contracts`` block) the
+    shared interfaces -- endpoint paths, schema field names, function
+    signatures, constants -- are rendered into the prompt so every file
+    implements the same declared contract instead of re-deriving it.
 
     When ``on_token`` is supplied the primary generation is streamed via
     ``provider.chat_stream`` and each raw delta is handed to the callback
@@ -3161,6 +3333,9 @@ def generate_single_scaffold_file(
     parts: List[str] = []
     if goal:
         parts.append(f"PROJECT GOAL:\n{goal}")
+    contract_block = _render_contracts_for_prompt(contracts)
+    if contract_block:
+        parts.append(contract_block)
     parts.append(f"FILE TO GENERATE:\nPath: {path}\nPurpose: {description}")
     if layer:
         parts.append(f"Layer: {layer}")

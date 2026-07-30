@@ -2890,6 +2890,59 @@ def test_decompose_executor_happy_path_emits_work_plan(
     assert "Python + Flask" in result.artifact.content["composed_goal"]
 
 
+def test_decompose_executor_stores_contracts_on_work_plan(store, monkeypatch):
+    """P0: a planner ``contracts`` block is normalized onto the WORK_PLAN."""
+    from cgx.session.tasks.decompose import run_decompose
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+
+    def fake_manifest(composed, provider, goal=None):
+        return {
+            "plan_md": "p",
+            "contracts": {
+                "endpoints": [{"method": "POST", "path": "/api/calc",
+                               "request": {"expr": "str"}}],
+                "functions": [{"signature": "evaluate(expr: str) -> float",
+                               "module": "backend/calc.py"}],
+                "junk": "dropped",
+            },
+            "layers": [{"name": "core", "files": [
+                {"path": "backend/calc.py", "description": "core"}]}],
+        }
+
+    monkeypatch.setattr("cgx.answer.engine.plan_scaffold_manifest",
+                        fake_manifest)
+    t = TaskNode.new(session.session_id, TaskKind.DECOMPOSE, "d",
+                     inputs={"prior_goal": "build a calc", "answers": {}})
+    result = run_decompose(
+        t, ExecutorDeps(provider=_StubProvider(""), store=store))
+    assert result.failure is None
+    contracts = result.artifact.content["contracts"]
+    assert set(contracts.keys()) == {"endpoints", "functions"}
+    assert contracts["endpoints"][0]["path"] == "/api/calc"
+    # One endpoint + one function = two declared contract entries.
+    assert result.outputs["contract_count"] == 2
+
+
+def test_decompose_executor_defaults_contracts_to_empty(store, monkeypatch):
+    """A planner that omits contracts stores an empty (not missing) block."""
+    from cgx.session.tasks.decompose import run_decompose
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    monkeypatch.setattr(
+        "cgx.answer.engine.plan_scaffold_manifest",
+        lambda *a, **kw: {"plan_md": "p", "layers": [
+            {"name": "core", "files": [
+                {"path": "app.py", "description": "entry"}]}]})
+    t = TaskNode.new(session.session_id, TaskKind.DECOMPOSE, "d",
+                     inputs={"prior_goal": "g", "answers": {}})
+    result = run_decompose(
+        t, ExecutorDeps(provider=_StubProvider(""), store=store))
+    assert result.failure is None
+    assert result.artifact.content["contracts"] == {}
+    assert result.outputs["contract_count"] == 0
+
+
 def test_decompose_executor_empty_manifest_is_failure(store, monkeypatch):
     from cgx.session.tasks.decompose import run_decompose
     session = Session.new("g", mode=SessionMode.GREENFIELD)
@@ -3025,7 +3078,8 @@ def test_scaffold_executor_happy_path_accumulates_context(
 
     def fake_generate(path, description, provider, *,
                       layer=None, existing_files_with_content=None,
-                      goal=None, on_token=None, depends_on=None):
+                      goal=None, on_token=None, depends_on=None,
+                      contracts=None):
         seen_contexts.append(
             [c["path"] for c in (existing_files_with_content or [])])
         body = f"# {path}\nprint('{path}')\n"
@@ -3049,6 +3103,72 @@ def test_scaffold_executor_happy_path_accumulates_context(
     # The README generation saw app.py as accumulated context (the order
     # is essential -- otherwise cross-file imports won't resolve).
     assert seen_contexts == [[], ["app.py"]]
+
+
+def test_scaffold_threads_contracts_to_generator(store, monkeypatch):
+    """P0: the WORK_PLAN contracts block is threaded into every file gen."""
+    from cgx.session.tasks.scaffold import run_scaffold
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    contracts = {"endpoints": [{"method": "GET", "path": "/api/ping"}]}
+    plan = Artifact.new(
+        session.session_id, "task_x", ArtifactKind.WORK_PLAN, {
+            "prior_goal": "g", "composed_goal": "build an api",
+            "answers": {}, "plan_md": "", "contracts": contracts,
+            "layers": [{"name": "app", "files": [
+                {"path": "app.py", "description": "entry"}]}],
+        })
+    store.save_artifact(plan)
+
+    seen: list = []
+
+    def fake_generate(path, description, provider, *,
+                      layer=None, existing_files_with_content=None,
+                      goal=None, on_token=None, depends_on=None,
+                      contracts=None):
+        seen.append(contracts)
+        return {"file": path, "patch": f"+++ {path}\nx",
+                "content": "x", "syntax_ok": True}
+
+    monkeypatch.setattr("cgx.answer.engine.generate_single_scaffold_file",
+                        fake_generate)
+    t = TaskNode.new(session.session_id, TaskKind.SCAFFOLD, "s",
+                     inputs={"work_plan_artifact_id": plan.artifact_id})
+    result = run_scaffold(
+        t, ExecutorDeps(provider=_StubProvider(""), store=store))
+    assert result.failure is None
+    assert seen == [contracts]
+
+
+def test_scaffold_passes_none_contracts_when_absent(store, monkeypatch):
+    """A WORK_PLAN without contracts threads ``None`` (prompt unchanged)."""
+    from cgx.session.tasks.scaffold import run_scaffold
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    plan = Artifact.new(
+        session.session_id, "task_x", ArtifactKind.WORK_PLAN, {
+            "prior_goal": "g", "composed_goal": "g", "answers": {},
+            "plan_md": "",
+            "layers": [{"name": "app", "files": [
+                {"path": "app.py", "description": "entry"}]}],
+        })
+    store.save_artifact(plan)
+
+    seen: list = []
+
+    def fake_generate(path, *a, contracts=None, **kw):
+        seen.append(contracts)
+        return {"file": path, "patch": f"+++ {path}\nx",
+                "content": "x", "syntax_ok": True}
+
+    monkeypatch.setattr("cgx.answer.engine.generate_single_scaffold_file",
+                        fake_generate)
+    t = TaskNode.new(session.session_id, TaskKind.SCAFFOLD, "s",
+                     inputs={"work_plan_artifact_id": plan.artifact_id})
+    result = run_scaffold(
+        t, ExecutorDeps(provider=_StubProvider(""), store=store))
+    assert result.failure is None
+    assert seen == [None]
 
 
 def test_scaffold_executor_records_partial_failure(store, monkeypatch):
@@ -3168,7 +3288,8 @@ def test_scaffold_targeted_regenerate_reuses_good_diffs(store, monkeypatch):
 
     def fake_generate(path, description, provider, *,
                       layer=None, existing_files_with_content=None,
-                      goal=None, on_token=None, depends_on=None):
+                      goal=None, on_token=None, depends_on=None,
+                      contracts=None):
         seen.append({"path": path,
                      "context": [c["path"]
                                  for c in (existing_files_with_content or [])]})
@@ -3428,7 +3549,7 @@ def test_scaffold_parallel_generation_preserves_order_and_cross_layer_context(
 
     def fake_generate(path, description, provider, *,
                       layer=None, existing_files_with_content=None, goal=None,
-                      on_token=None, depends_on=None):
+                      on_token=None, depends_on=None, contracts=None):
         with lock:
             seen[path] = [c["path"] for c in (existing_files_with_content or [])]
         if path == "src/B.jsx":
@@ -7433,7 +7554,8 @@ def test_scaffold_augments_goal_with_regenerate_constraints(
 
     def fake_generate(path, description, provider, *,
                       layer=None, existing_files_with_content=None,
-                      goal=None, on_token=None, depends_on=None):
+                      goal=None, on_token=None, depends_on=None,
+                      contracts=None):
         seen_goals.append(goal)
         body = "x = 1\n"
         return {"file": path, "patch": f"+++ {path}\n{body}",
@@ -7691,7 +7813,8 @@ def test_scaffold_injects_relevant_lessons_into_goal(
 
     def fake_generate(path, description, provider, *,
                       layer=None, existing_files_with_content=None,
-                      goal=None, on_token=None, depends_on=None):
+                      goal=None, on_token=None, depends_on=None,
+                      contracts=None):
         seen_goals.append(goal)
         body = "x = 1\n"
         return {"file": path, "patch": f"+++ {path}\n{body}",
