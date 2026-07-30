@@ -183,11 +183,18 @@ def run_verify(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             "tests_passed": tests_passed,
             "outcome": verify_outcome,
             "tests_selected_count": len(combined.pytest_tests_selected),
-            # Number of failing/erroring tests parsed from the junit sink;
-            # the router's progress-aware repair budget compares this
-            # count round over round (see cgx.session.router.
-            # _repair_progress_stalled).
+            # Progress-ledger counts read by the router's coverage-aware
+            # repair budget (#5, see cgx.session.router.
+            # _repair_progress_stalled). ``failing_count`` is the primary
+            # trend; ``passing_count`` / ``collected_count`` let a round
+            # that fixed nothing net-new still count as forward progress
+            # when it made MORE tests pass or collected more tests than the
+            # previous round. All three are junit-derived (pytest only), so
+            # they stay comparable round over round.
             "failing_count": len(failures),
+            "collected_count": len(combined.pytest_tests_selected),
+            "passing_count": max(
+                0, len(combined.pytest_tests_selected) - len(failures)),
             "failure_signature": sig,
             "returncode": combined.returncode,
         },

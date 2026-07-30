@@ -266,6 +266,8 @@ def _apply_to_verify(parent: TaskNode) -> List[TaskNode]:
                 list(parent.inputs.get("prior_failure_signatures") or []),
             "prior_failing_counts":
                 list(parent.inputs.get("prior_failing_counts") or []),
+            "prior_passing_counts":
+                list(parent.inputs.get("prior_passing_counts") or []),
         },
     )]
 
@@ -503,24 +505,39 @@ def _coerce_count(value: Any) -> Optional[int]:
         return None
 
 
-def _repair_progress_stalled(new_count: Optional[int],
-                             prior_counts: List[int]) -> bool:
-    """True when the failing-test-count trend shows no forward progress.
+def _repair_progress_stalled(
+        new_count: Optional[int],
+        prior_counts: List[int],
+        new_passing: Optional[int] = None,
+        prior_passing: Optional[List[int]] = None) -> bool:
+    """True when the coverage-aware progress ledger shows no forward step.
 
     ``new_count`` is the number of tests failing in the just-finished
     VERIFY; ``prior_counts`` is the ordered history of failing counts from
-    earlier rounds of the *same* repair loop. Forward progress means the
-    count strictly drops round over round, so the loop has stalled (and
-    another REPAIR would likely churn) once the newest count is not
-    strictly below the most recent prior count. A missing count (``None``
-    -- e.g. a non-assertion outcome where a test count is not a meaningful
-    progress signal) is inconclusive and never on its own declares a
-    stall: the caller still applies the signature-flap backstop and the
-    absolute :data:`_REPAIR_BUDGET` cap.
+    earlier rounds of the *same* repair loop. The primary progress signal
+    is the failing count strictly dropping round over round.
+
+    ``new_passing`` / ``prior_passing`` extend that with the passing-test
+    trend (#5): a round that did not lower the failing count can still be
+    real forward progress if it made *more* tests pass than the previous
+    round -- e.g. it fixed one assertion while a newly-unskipped test began
+    failing, holding the failing count flat. Such a round is NOT a stall.
+    So the loop is stalled only when neither lever moved forward: the
+    failing count did not drop AND the passing count did not rise.
+
+    A missing failing count (``None`` -- e.g. a non-assertion outcome
+    where a test count is not a meaningful progress signal) is
+    inconclusive and never on its own declares a stall: the caller still
+    applies the signature-flap backstop and the absolute
+    :data:`_REPAIR_BUDGET` cap.
     """
     if new_count is None or not prior_counts:
         return False
-    return new_count >= prior_counts[-1]
+    failing_dropped = new_count < prior_counts[-1]
+    passing_rose = (new_passing is not None
+                    and bool(prior_passing)
+                    and new_passing > prior_passing[-1])
+    return not (failing_dropped or passing_rose)
 
 # Maximum number of targeted regenerate attempts per SCAFFOLD ancestor
 # chain. Each attempt re-generates only the files that dropped, seeding
@@ -611,20 +628,30 @@ def _verify_to_repair_or_terminal(parent: TaskNode) -> List[TaskNode]:
     repair_attempt = int(parent.inputs.get("repair_attempt") or 0)
     if repair_attempt >= _REPAIR_BUDGET:
         return []
-    # Progress-aware gate: for a real test failure the failing-test count
-    # is a truer progress signal than failure-signature identity -- a loop
-    # can keep churning fresh signatures while fixing nothing. Keep
-    # repairing only while that count strictly drops; a stall (count not
-    # below the previous round's) ends the loop. The count is trusted only
-    # for ``assertions_failed`` (where "N tests failing" is meaningful);
-    # every other outcome falls back to the signature-flap backstop below.
+    # Coverage-aware progress gate (#5): for a real test failure the
+    # failing-test count is a truer progress signal than failure-signature
+    # identity -- a loop can keep churning fresh signatures while fixing
+    # nothing. Keep repairing while the failing count strictly drops OR the
+    # passing count strictly rises (a round that fixed one test while
+    # another newly began failing held the failing count flat but still
+    # made forward progress). A stall (neither lever moved forward) ends
+    # the loop. The counts are trusted only for ``assertions_failed``
+    # (where "N tests failing / M passing" is meaningful); every other
+    # outcome falls back to the signature-flap backstop below.
     new_count = (_coerce_count(outputs.get("failing_count"))
                  if outcome == "assertions_failed" else None)
     prior_counts = [c for c in (
         _coerce_count(x)
         for x in (parent.inputs.get("prior_failing_counts") or []))
         if c is not None]
-    if _repair_progress_stalled(new_count, prior_counts):
+    new_passing = (_coerce_count(outputs.get("passing_count"))
+                   if outcome == "assertions_failed" else None)
+    prior_passing = [c for c in (
+        _coerce_count(x)
+        for x in (parent.inputs.get("prior_passing_counts") or []))
+        if c is not None]
+    if _repair_progress_stalled(
+            new_count, prior_counts, new_passing, prior_passing):
         return []
     # Read the VERIFY_REPORT's failure_signature lazily by deferring to
     # the classifier; the router stays free of I/O by using a precomputed
@@ -639,6 +666,8 @@ def _verify_to_repair_or_terminal(parent: TaskNode) -> List[TaskNode]:
         return []
     next_counts = (prior_counts + [new_count] if new_count is not None
                    else prior_counts)
+    next_passing = (prior_passing + [new_passing] if new_passing is not None
+                    else prior_passing)
     verify_artifact_id = parent.produced_artifact_id
     return [TaskNode.new(
         session_id=parent.session_id,
@@ -656,6 +685,7 @@ def _verify_to_repair_or_terminal(parent: TaskNode) -> List[TaskNode]:
             "repair_attempt": repair_attempt + 1,
             "prior_failure_signatures": prior + [new_signature],
             "prior_failing_counts": next_counts,
+            "prior_passing_counts": next_passing,
         },
     )]
 
@@ -704,6 +734,8 @@ def _runtime_verify_node(parent: TaskNode) -> List[TaskNode]:
                 list(parent.inputs.get("prior_failure_signatures") or []),
             "prior_failing_counts":
                 list(parent.inputs.get("prior_failing_counts") or []),
+            "prior_passing_counts":
+                list(parent.inputs.get("prior_passing_counts") or []),
         },
     )]
 
@@ -762,6 +794,8 @@ def _runtime_verify_to_repair_or_terminal(parent: TaskNode) -> List[TaskNode]:
             "prior_failure_signatures": prior + [new_signature],
             "prior_failing_counts":
                 list(parent.inputs.get("prior_failing_counts") or []),
+            "prior_passing_counts":
+                list(parent.inputs.get("prior_passing_counts") or []),
         },
     )]
 
@@ -802,6 +836,8 @@ def _repair_to_apply_or_ask(parent: TaskNode) -> List[TaskNode]:
                 prior if signature in prior else prior + [signature]),
             "prior_failing_counts":
                 list(parent.inputs.get("prior_failing_counts") or []),
+            "prior_passing_counts":
+                list(parent.inputs.get("prior_passing_counts") or []),
         },
     )]
 

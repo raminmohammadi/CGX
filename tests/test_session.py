@@ -1439,6 +1439,8 @@ def _greenfield_failed_verify(*, signature: str, outcome: str = "assertions_fail
                               repair_attempt: int = 0, prior: list | None = None,
                               failing_count: int | None = None,
                               prior_counts: list | None = None,
+                              passing_count: int | None = None,
+                              prior_passing: list | None = None,
                               session=None) -> TaskNode:
     """Build a DONE VERIFY task that the repair successor should react to."""
     from cgx.session.models import SessionMode
@@ -1450,12 +1452,15 @@ def _greenfield_failed_verify(*, signature: str, outcome: str = "assertions_fail
                 "mode": SessionMode.GREENFIELD.value,
                 "repair_attempt": repair_attempt,
                 "prior_failure_signatures": list(prior or []),
-                "prior_failing_counts": list(prior_counts or [])})
+                "prior_failing_counts": list(prior_counts or []),
+                "prior_passing_counts": list(prior_passing or [])})
     ver.produced_artifact_id = "art_verify"
     ver.outputs = {"outcome": outcome, "failure_signature": signature,
                    "returncode": 1}
     if failing_count is not None:
         ver.outputs["failing_count"] = failing_count
+    if passing_count is not None:
+        ver.outputs["passing_count"] = passing_count
     ver.status = TaskNodeStatus.DONE
     return ver
 
@@ -1819,8 +1824,54 @@ def test_router_verify_progress_stall_refuses_repair():
     assert status[0].status is SessionStatus.FAILED
 
 
+def test_router_verify_passing_rise_rescues_flat_failing():
+    """#5: a flat failing count still progresses when MORE tests pass.
+
+    The failing count held at 3 (the P2 gate alone would call this a
+    stall), but the passing count rose 2 -> 4 -- a round that fixed a test
+    while another newly-collected one began failing. The coverage-aware
+    ledger treats that as forward progress: REPAIR is spawned and both
+    trends are threaded onto the next round.
+    """
+    from cgx.session.models import SessionMode
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    ver = _greenfield_failed_verify(
+        signature="fresh", repair_attempt=1, prior=["r1"],
+        failing_count=3, prior_counts=[3],
+        passing_count=4, prior_passing=[2], session=session)
+    plan = Router().on_task_completed(
+        session=session, completed=ver, tasks=[ver])
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    assert len(creates) == 1
+    rep = creates[0].task
+    assert rep.kind is TaskKind.REPAIR
+    assert rep.inputs["prior_failing_counts"] == [3, 3]
+    assert rep.inputs["prior_passing_counts"] == [2, 4]
+
+
+def test_router_verify_stall_when_failing_flat_and_passing_flat():
+    """#5: flat failing AND flat passing is a genuine stall -> terminal.
+
+    A fresh signature would slip past the flap guard, but neither lever
+    moved (failing 3 -> 3, passing 2 -> 2), so the coverage-aware gate
+    ends the loop.
+    """
+    from cgx.session.models import SessionMode
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    ver = _greenfield_failed_verify(
+        signature="fresh", repair_attempt=1, prior=["r1"],
+        failing_count=3, prior_counts=[3],
+        passing_count=2, prior_passing=[2], session=session)
+    plan = Router().on_task_completed(
+        session=session, completed=ver, tasks=[ver])
+    assert [a for a in plan.actions if isinstance(a, CreateTask)] == []
+    status = [a for a in plan.actions if isinstance(a, UpdateSessionStatus)]
+    assert len(status) == 1
+    assert status[0].status is SessionStatus.FAILED
+
+
 def test_router_repair_apply_verify_chain_carries_failing_counts():
-    """P2: the failing-count trend survives REPAIR -> APPLY -> VERIFY."""
+    """P2/#5: the failing + passing ledgers survive REPAIR -> APPLY -> VERIFY."""
     from cgx.session.models import SessionMode
     session = Session.new("g", mode=SessionMode.GREENFIELD)
     # REPAIR -> APPLY carries the trend forward.
@@ -1831,7 +1882,8 @@ def test_router_repair_apply_verify_chain_carries_failing_counts():
                 "mode": SessionMode.GREENFIELD.value,
                 "repair_attempt": 1,
                 "prior_failure_signatures": ["r1"],
-                "prior_failing_counts": [5, 3]})
+                "prior_failing_counts": [5, 3],
+                "prior_passing_counts": [1, 3]})
     rep.produced_artifact_id = "art_repair_plan"
     rep.outputs = {"can_apply": True, "failure_signature": "r1",
                    "repair_attempt": 1, "diff_count": 2}
@@ -1841,6 +1893,7 @@ def test_router_repair_apply_verify_chain_carries_failing_counts():
     ap = [a for a in plan.actions if isinstance(a, CreateTask)][0].task
     assert ap.kind is TaskKind.APPLY
     assert ap.inputs["prior_failing_counts"] == [5, 3]
+    assert ap.inputs["prior_passing_counts"] == [1, 3]
     # APPLY -> VERIFY carries it the rest of the way.
     ap.produced_artifact_id = "art_applied"
     ap.status = TaskNodeStatus.DONE
@@ -1849,6 +1902,7 @@ def test_router_repair_apply_verify_chain_carries_failing_counts():
     ver = [a for a in plan2.actions if isinstance(a, CreateTask)][0].task
     assert ver.kind is TaskKind.VERIFY
     assert ver.inputs["prior_failing_counts"] == [5, 3]
+    assert ver.inputs["prior_passing_counts"] == [1, 3]
 
 
 def test_router_repair_with_diffs_spawns_apply():
@@ -2172,6 +2226,10 @@ def test_verify_parses_junitxml_failures(tmp_path, store, monkeypatch):
     assert isinstance(failures, list) and len(failures) == 2
     # The router's progress-aware repair budget reads this count.
     assert result.outputs["failing_count"] == 2
+    # #5: coverage-ledger counts. Here junit reported 2 failures against a
+    # single collected pytest node, so passing clamps at 0 (never negative).
+    assert result.outputs["collected_count"] == 1
+    assert result.outputs["passing_count"] == 0
     assert failures[0] == {
         "nodeid": "tests.test_x::test_x",
         "kind": "failure",
