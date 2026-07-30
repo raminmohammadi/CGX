@@ -7042,6 +7042,108 @@ def test_scaffold_executor_surfaces_import_warnings(store, monkeypatch):
     assert result.outputs["import_warnings_count"] == 1
 
 
+def test_scaffold_executor_reconciles_import_warnings(store, monkeypatch):
+    """#2: the coherence pass regenerates an importer so imports resolve."""
+    from cgx.session.tasks.scaffold import run_scaffold
+
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    plan = Artifact.new(
+        session.session_id, "task_x", ArtifactKind.WORK_PLAN, {
+            "prior_goal": "g", "composed_goal": "build api", "answers": {},
+            "plan_md": "",
+            "layers": [{"name": "app", "files": [
+                {"path": "backend/auth.py", "description": "auth"},
+                {"path": "backend/app.py", "description": "entry"}]}],
+        })
+    store.save_artifact(plan)
+
+    calls = {"backend/app.py": 0}
+
+    def fake_generate(path, description, provider, *, goal="", **kw):
+        if path == "backend/auth.py":
+            body = "def login():\n    return True\n"
+        else:
+            calls[path] += 1
+            # First generation imports a symbol that does not exist; the
+            # coherence regeneration (second call, carrying the mismatch
+            # constraint) aligns to the real symbol.
+            body = ("from backend.auth import logout\n" if calls[path] == 1
+                    else "from backend.auth import login\n")
+        patch = (f"--- /dev/null\n+++ b/{path}\n"
+                 f"@@ -0,0 +1,{len(body.splitlines())} @@\n"
+                 + "\n".join(f"+{ln}" for ln in body.splitlines()))
+        return {"file": path, "patch": patch, "content": body,
+                "syntax_ok": True, "confidence": 1.0}
+
+    monkeypatch.setattr("cgx.answer.engine.generate_single_scaffold_file",
+                        fake_generate)
+
+    class _StubProv:
+        def chat(self, *a, **kw):
+            return ""
+
+    t = TaskNode.new(session.session_id, TaskKind.SCAFFOLD, "s",
+                     inputs={"work_plan_artifact_id": plan.artifact_id})
+    store.save_task(t)
+    result = run_scaffold(t, ExecutorDeps(provider=_StubProv(), store=store))
+    assert result.failure is None
+    assert result.outputs["reconciled_count"] == 1
+    # After reconciliation the import resolves -> no residual warnings, and
+    # the persisted diff carries the corrected import.
+    assert result.artifact.content["import_warnings"] == []
+    assert result.outputs["import_warnings_count"] == 0
+    app_diff = next(d for d in result.artifact.content["diffs"]
+                    if d["file"] == "backend/app.py")
+    assert "import login" in app_diff["patch"]
+    assert calls["backend/app.py"] == 2
+
+
+def test_scaffold_coherence_noop_when_tree_resolves(store, monkeypatch):
+    """#2: a tree whose imports already resolve is left untouched."""
+    from cgx.session.tasks.scaffold import run_scaffold
+
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    plan = Artifact.new(
+        session.session_id, "task_x", ArtifactKind.WORK_PLAN, {
+            "prior_goal": "g", "composed_goal": "build api", "answers": {},
+            "plan_md": "",
+            "layers": [{"name": "app", "files": [
+                {"path": "backend/auth.py", "description": "auth"},
+                {"path": "backend/app.py", "description": "entry"}]}],
+        })
+    store.save_artifact(plan)
+
+    contents = {
+        "backend/auth.py": "def login():\n    return True\n",
+        "backend/app.py": "from backend.auth import login\n",
+    }
+
+    def fake_generate(path, *a, **kw):
+        body = contents[path]
+        patch = (f"--- /dev/null\n+++ b/{path}\n"
+                 f"@@ -0,0 +1,{len(body.splitlines())} @@\n"
+                 + "\n".join(f"+{ln}" for ln in body.splitlines()))
+        return {"file": path, "patch": patch, "content": body,
+                "syntax_ok": True, "confidence": 1.0}
+
+    monkeypatch.setattr("cgx.answer.engine.generate_single_scaffold_file",
+                        fake_generate)
+
+    class _StubProv:
+        def chat(self, *a, **kw):
+            return ""
+
+    t = TaskNode.new(session.session_id, TaskKind.SCAFFOLD, "s",
+                     inputs={"work_plan_artifact_id": plan.artifact_id})
+    store.save_task(t)
+    result = run_scaffold(t, ExecutorDeps(provider=_StubProv(), store=store))
+    assert result.failure is None
+    assert result.outputs["reconciled_count"] == 0
+    assert result.artifact.content["import_warnings"] == []
+
+
 def test_scaffold_executor_surfaces_contract_warnings(store, monkeypatch):
     """SCAFFOLD enforces the WORK_PLAN contracts and surfaces mismatches."""
     from cgx.session.tasks.scaffold import run_scaffold

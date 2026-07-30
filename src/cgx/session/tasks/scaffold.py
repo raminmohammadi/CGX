@@ -48,6 +48,13 @@ logger = logging.getLogger(__name__)
 # files never opens an unreasonable number of concurrent HTTP requests.
 _CLOUD_SCAFFOLD_CONCURRENCY = 4
 
+# Number of global coherence passes run after the main scaffold loop
+# (#2). Each pass re-checks first-party imports across the finished tree
+# and regenerates only the importer files that reference a symbol no
+# sibling defines. One pass clears the common single-hop mismatch; a hard
+# cap stops a stubborn model from looping and keeps the retry bounded.
+_COHERENCE_PASS_BUDGET = 1
+
 
 @register_executor(TaskKind.SCAFFOLD)
 def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
@@ -318,6 +325,29 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         return ExecutorResult(
             failure="SCAFFOLD: every file generation failed")
 
+    # Global coherence pass (#2): the per-file loop resolves imports
+    # against whichever siblings existed when each file was generated (and
+    # the parallel path freezes a per-layer snapshot), so a file can still
+    # reference a symbol another sibling never defined. Before APPLY writes
+    # anything, re-check first-party imports across the whole tree and
+    # regenerate just the importer files that don't resolve, folding the
+    # unresolved symbols in as a constraint so cross-file mismatches
+    # self-heal. Best-effort and bounded -- a failure leaves the bundle
+    # untouched.
+    reconciled_count = 0
+    try:
+        reconciled_count = _reconcile_import_warnings(
+            diffs=diffs, generated=generated,
+            existing_with_content=existing_with_content,
+            layers=layers, goal=goal, provider=deps.provider,
+            contracts=contracts)
+    except Exception:  # pragma: no cover - defensive: pass is best-effort
+        logger.exception(
+            "SCAFFOLD: coherence reconciliation raised; skipping")
+        reconciled_count = 0
+    if reconciled_count:
+        _checkpoint_progress(deps, artifact)
+
     # Phase 4.1: tighten upper bounds on known-fragile peers using the
     # consumer's PyPI ``requires_dist`` *before* APPLY writes the file.
     # Network / fetch failures degrade to no-op (returns the original
@@ -377,6 +407,7 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     artifact.content["pin_adjustments"] = pin_adjustments
     artifact.content["import_warnings"] = import_warnings
     artifact.content["contract_warnings"] = contract_warnings
+    artifact.content["reconciled_count"] = reconciled_count
     artifact.content["complete"] = True
     return ExecutorResult(
         outputs={
@@ -387,6 +418,7 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             "pin_adjustments_count": len(pin_adjustments),
             "import_warnings_count": len(import_warnings),
             "contract_warnings_count": len(contract_warnings),
+            "reconciled_count": reconciled_count,
         },
         artifact=artifact,
     )
@@ -727,6 +759,108 @@ def _augment_goal_with_constraints(
     if len(lines) == 2:
         return goal
     return f"{goal}\n" + "\n".join(lines) if goal else "\n".join(lines[1:])
+
+
+def _reconcile_import_warnings(
+        *,
+        diffs: List[Dict[str, str]],
+        generated: List[Dict[str, Any]],
+        existing_with_content: List[Dict[str, str]],
+        layers: List[Any],
+        goal: str,
+        provider: Any,
+        contracts: Optional[Dict[str, Any]],
+) -> int:
+    """Regenerate importer files whose first-party imports don't resolve.
+
+    Re-checks first-party imports across the finished scaffold tree and
+    regenerates only the importer files carrying an unresolved symbol,
+    folding the missing ``module.name`` list in as a constraint so the
+    model aligns each file to what its siblings actually define. Mutates
+    ``diffs``/``generated``/``existing_with_content`` in place and returns
+    the number of files rewritten. Bounded by
+    :data:`_COHERENCE_PASS_BUDGET`; a regeneration that fails or raises
+    leaves the original file untouched, so the pass can only improve (or
+    no-op) the bundle.
+    """
+    if provider is None:
+        return 0
+    # Manifest lookup: path -> (description, layer_name, depends_on).
+    meta: Dict[str, Tuple[str, str, List[str]]] = {}
+    for layer in layers:
+        if not isinstance(layer, dict):
+            continue
+        layer_name = str(layer.get("name") or "project").strip()
+        for entry in (layer.get("files") or []):
+            if not isinstance(entry, dict):
+                continue
+            path = str(entry.get("path") or "").strip()
+            if not path:
+                continue
+            raw_deps = entry.get("depends_on")
+            dep = [str(d).strip() for d in raw_deps
+                   if isinstance(d, str) and str(d).strip()] \
+                if isinstance(raw_deps, list) else []
+            desc = str(entry.get("description") or path).strip()
+            meta[path] = (desc, layer_name, dep)
+
+    def _find(seq: List[Dict[str, Any]], key: str, value: str) -> int:
+        for i, e in enumerate(seq):
+            if str(e.get(key) or "") == value:
+                return i
+        return -1
+
+    reconciled = 0
+    for _ in range(_COHERENCE_PASS_BUDGET):
+        contents = {e["path"]: e["content"] for e in existing_with_content
+                    if e.get("path") and isinstance(e.get("content"), str)}
+        by_file: Dict[str, List[Dict[str, Any]]] = {}
+        for w in cross_check_first_party_imports(contents):
+            f = str(w.get("file") or "").strip()
+            if f and f in meta:
+                by_file.setdefault(f, []).append(w)
+        if not by_file:
+            break
+        rewritten = 0
+        for path, file_warnings in by_file.items():
+            desc, layer_name, dep = meta[path]
+            constraints = [{
+                "kind": "unresolved import",
+                "rationale": (
+                    f"`{w.get('name')}` imported from `{w.get('module')}` "
+                    "is not defined there; import only names that exist in "
+                    "the referenced sibling modules, or define what you use"),
+            } for w in file_warnings]
+            aug_goal = _augment_goal_with_constraints(
+                goal, constraints,
+                header="Cross-file import mismatches to fix this pass:")
+            context = [e for e in existing_with_content
+                       if e.get("path") != path]
+            ok, _fail = _generate_one(
+                path, desc, layer_name, context, provider, aug_goal,
+                depends_on=dep, contracts=contracts)
+            if ok is None:
+                continue
+            di = _find(diffs, "file", path)
+            if di >= 0:
+                diffs[di] = {"file": ok["file"], "patch": ok["patch"]}
+            gi = _find(generated, "file", path)
+            if gi >= 0:
+                generated[gi] = {
+                    "file": ok["file"], "layer": ok["layer"],
+                    "syntax_ok": ok["syntax_ok"],
+                    "confidence": ok["confidence"],
+                    "bytes": len(ok["content"]), "reconciled": True,
+                }
+            ei = _find(existing_with_content, "path", path)
+            if ei >= 0:
+                existing_with_content[ei] = {
+                    "path": ok["file"], "content": ok["content"]}
+            rewritten += 1
+        reconciled += rewritten
+        if rewritten == 0:
+            break
+    return reconciled
 
 
 def _lessons_as_constraints(
