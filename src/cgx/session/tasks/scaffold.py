@@ -30,6 +30,7 @@ from cgx.session.models import (
 )
 from cgx.session.repair.pypi_client import PyPIClient
 from cgx.session.scaffold_validate import (
+    check_contract_compliance,
     cross_check_first_party_imports,
     validate_scaffold_diffs,
 )
@@ -350,6 +351,22 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             "SCAFFOLD: import cross-check raised; skipping")
         import_warnings = []
 
+    # Contract enforcement gate (#1, deepens P0): statically verify the
+    # generated files honour the WORK_PLAN ``contracts`` block (declared
+    # endpoints/schemas/functions/constants) so a mismatch surfaces here
+    # rather than only when VERIFY runs the suite. Best-effort and
+    # non-fatal -- like the import cross-check it only records
+    # ``contract_warnings`` the router can turn into a regenerate
+    # constraint; a raised checker degrades to an empty list.
+    contract_warnings: List[Dict[str, Any]] = []
+    try:
+        contract_warnings = check_contract_compliance(
+            xcheck_contents, contracts)
+    except Exception:  # pragma: no cover - defensive: checker is best-effort
+        logger.exception(
+            "SCAFFOLD: contract compliance check raised; skipping")
+        contract_warnings = []
+
     # Finalise the checkpoint artifact in place: pin validation reassigns
     # ``diffs`` to a new list, so re-point the content at it, attach the
     # adjustment log, and flip ``complete``. Same artifact_id, so the
@@ -359,6 +376,7 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     artifact.content["failed"] = failed
     artifact.content["pin_adjustments"] = pin_adjustments
     artifact.content["import_warnings"] = import_warnings
+    artifact.content["contract_warnings"] = contract_warnings
     artifact.content["complete"] = True
     return ExecutorResult(
         outputs={
@@ -368,6 +386,7 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             "failed": failed,
             "pin_adjustments_count": len(pin_adjustments),
             "import_warnings_count": len(import_warnings),
+            "contract_warnings_count": len(contract_warnings),
         },
         artifact=artifact,
     )

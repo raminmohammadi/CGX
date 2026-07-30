@@ -495,3 +495,128 @@ def cross_check_first_party_imports(
                         "reason": f"{name!r} not defined in {target_path}",
                     })
     return warnings
+
+
+# --------------------- work-plan contract enforcement ---------------------
+
+def check_contract_compliance(
+        file_contents: Dict[str, str],
+        contracts: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Flag WORK_PLAN contract items no generated file satisfies.
+
+    Best-effort static gate run after SCAFFOLD (companion to
+    :func:`cross_check_first_party_imports`): checks each declared shared
+    interface against the generated file set so a mismatch is caught here,
+    not only when VERIFY runs the suite. Four categories are checked:
+
+    * ``endpoints`` -- the declared ``path`` string must appear verbatim
+      in some generated file (route decorators embed the path literally,
+      so this scan is language-agnostic);
+    * ``schemas`` -- a class/name ``name`` must be defined in some
+      generated Python module;
+    * ``functions`` -- a function named ``name`` must be defined, in the
+      declared ``module`` when it is a generated Python file, otherwise in
+      any generated module;
+    * ``constants`` -- a module-level name ``name`` must be assigned in
+      some generated Python module.
+
+    The symbol checks only run when at least one Python module parsed (a
+    pure JS/TS scaffold has no AST here, so they abstain); the endpoint
+    substring scan always runs. Any item that cannot be evaluated is
+    skipped, so the gate never fails a scaffold on its own -- it returns
+    ``{kind, name, reason, ...}`` warnings the router can turn into a
+    targeted regenerate constraint.
+    """
+    if not isinstance(contracts, dict) or not contracts:
+        return []
+
+    per_module: Dict[str, Set[str]] = {}
+    all_symbols: Set[str] = set()
+    for path, content in file_contents.items():
+        if not isinstance(content, str):
+            continue
+        if _module_name_for_path(path) is None:
+            continue
+        syms = _top_level_symbols(content)
+        if syms is None:
+            continue
+        per_module[path.replace("\\", "/")] = syms
+        all_symbols |= syms
+
+    have_python = bool(per_module)
+    haystack = "\n".join(
+        c for c in file_contents.values() if isinstance(c, str))
+
+    warnings: List[Dict[str, Any]] = []
+
+    for ep in contracts.get("endpoints") or []:
+        if not isinstance(ep, dict):
+            continue
+        path = str(ep.get("path") or "").strip()
+        if not path:
+            continue
+        if path not in haystack:
+            warnings.append({
+                "kind": "endpoint",
+                "name": path,
+                "method": str(ep.get("method") or "").strip().upper(),
+                "reason": (f"declared endpoint {path!r} not found in any "
+                           "generated file"),
+            })
+
+    if have_python:
+        for sc in contracts.get("schemas") or []:
+            if not isinstance(sc, dict):
+                continue
+            name = str(sc.get("name") or "").strip()
+            if not name:
+                continue
+            if name not in all_symbols:
+                warnings.append({
+                    "kind": "schema",
+                    "name": name,
+                    "reason": (f"declared schema {name!r} has no definition "
+                               "in any generated module"),
+                })
+
+        for fn in contracts.get("functions") or []:
+            if not isinstance(fn, dict):
+                continue
+            name = str(fn.get("name") or "").strip()
+            if not name:
+                continue
+            module = str(fn.get("module") or "").strip().replace("\\", "/")
+            scope = per_module.get(module)
+            if scope is not None:
+                if name not in scope:
+                    warnings.append({
+                        "kind": "function",
+                        "name": name,
+                        "module": module,
+                        "reason": (f"declared function {name!r} not defined "
+                                   f"in {module}"),
+                    })
+            elif name not in all_symbols:
+                warnings.append({
+                    "kind": "function",
+                    "name": name,
+                    "module": module or None,
+                    "reason": (f"declared function {name!r} not defined in "
+                               "any generated module"),
+                })
+
+        for c in contracts.get("constants") or []:
+            if not isinstance(c, dict):
+                continue
+            name = str(c.get("name") or "").strip()
+            if not name:
+                continue
+            if name not in all_symbols:
+                warnings.append({
+                    "kind": "constant",
+                    "name": name,
+                    "reason": (f"declared constant {name!r} not assigned in "
+                               "any generated module"),
+                })
+
+    return warnings

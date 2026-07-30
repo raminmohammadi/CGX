@@ -6921,6 +6921,77 @@ def test_cross_check_abstains_on_unparseable_target():
     assert cross_check_first_party_imports(contents) == []
 
 
+# ------------- #1: work-plan contract enforcement gate -------------
+
+def test_contract_check_passes_when_all_satisfied():
+    """Every declared endpoint/schema/function/constant is present -> []."""
+    from cgx.session.scaffold_validate import check_contract_compliance
+    contracts = {
+        "endpoints": [{"method": "GET", "path": "/api/ping"}],
+        "schemas": [{"name": "Thing"}],
+        "functions": [{"name": "compute", "module": "src/core.py"}],
+        "constants": [{"name": "API_BASE"}],
+    }
+    contents = {
+        "src/core.py": (
+            "API_BASE = '/api'\n\n"
+            "class Thing:\n    pass\n\n"
+            "def compute(a, b):\n    return a + b\n"),
+        "src/app.py": (
+            "@app.route('/api/ping')\ndef ping():\n    return 'ok'\n"),
+    }
+    assert check_contract_compliance(contents, contracts) == []
+
+
+def test_contract_check_flags_missing_items():
+    """A missing endpoint, schema, function and constant each warn once."""
+    from cgx.session.scaffold_validate import check_contract_compliance
+    contracts = {
+        "endpoints": [{"method": "POST", "path": "/api/orders"}],
+        "schemas": [{"name": "Order"}],
+        "functions": [{"name": "place_order", "module": "src/core.py"}],
+        "constants": [{"name": "MAX_ITEMS"}],
+    }
+    contents = {"src/core.py": "def unrelated():\n    return 1\n"}
+    warnings = check_contract_compliance(contents, contracts)
+    kinds = sorted(w["kind"] for w in warnings)
+    assert kinds == ["constant", "endpoint", "function", "schema"]
+    ep = next(w for w in warnings if w["kind"] == "endpoint")
+    assert ep["name"] == "/api/orders" and ep["method"] == "POST"
+    fn = next(w for w in warnings if w["kind"] == "function")
+    assert fn["module"] == "src/core.py"
+
+
+def test_contract_check_function_falls_back_to_any_module():
+    """A function whose declared module was not generated is sought anywhere."""
+    from cgx.session.scaffold_validate import check_contract_compliance
+    contracts = {"functions": [
+        {"name": "compute", "module": "src/missing.py"}]}
+    # ``src/missing.py`` is not generated, so the check falls back to the
+    # union of symbols across every generated module -> found, no warning.
+    ok = {"src/core.py": "def compute():\n    return 1\n"}
+    assert check_contract_compliance(ok, contracts) == []
+    bad = {"src/core.py": "def other():\n    return 1\n"}
+    warns = check_contract_compliance(bad, contracts)
+    assert [w["name"] for w in warns] == ["compute"]
+
+
+def test_contract_check_abstains_without_python_and_on_empty():
+    """No Python files -> symbol checks abstain; empty contracts -> []."""
+    from cgx.session.scaffold_validate import check_contract_compliance
+    contracts = {
+        "endpoints": [{"method": "GET", "path": "/health"}],
+        "schemas": [{"name": "Widget"}],
+    }
+    # A pure JS scaffold: the endpoint scan still runs (path present ->
+    # no warning), but the schema symbol check abstains (no AST).
+    js = {"src/app.js": "app.get('/health', () => {})\n"}
+    assert check_contract_compliance(js, contracts) == []
+    # No contracts at all -> nothing to enforce.
+    assert check_contract_compliance(js, None) == []
+    assert check_contract_compliance(js, {}) == []
+
+
 def test_scaffold_executor_surfaces_import_warnings(store, monkeypatch):
     """SCAFFOLD runs the cross-check and surfaces ``import_warnings``."""
     from cgx.session.tasks.scaffold import run_scaffold
@@ -6970,6 +7041,55 @@ def test_scaffold_executor_surfaces_import_warnings(store, monkeypatch):
     assert warnings[0]["module"] == "backend.auth"
     assert result.outputs["import_warnings_count"] == 1
 
+
+def test_scaffold_executor_surfaces_contract_warnings(store, monkeypatch):
+    """SCAFFOLD enforces the WORK_PLAN contracts and surfaces mismatches."""
+    from cgx.session.tasks.scaffold import run_scaffold
+
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    contracts = {
+        "endpoints": [{"method": "GET", "path": "/api/orders"}],
+        "functions": [{"name": "place_order", "module": "backend/core.py"}],
+    }
+    plan = Artifact.new(
+        session.session_id, "task_x", ArtifactKind.WORK_PLAN, {
+            "prior_goal": "g",
+            "composed_goal": "build api",
+            "answers": {},
+            "plan_md": "",
+            "contracts": contracts,
+            "layers": [{"name": "app", "files": [
+                {"path": "backend/core.py", "description": "core"}]}],
+        })
+    store.save_artifact(plan)
+
+    # The generated file honours neither the endpoint nor the function.
+    contents = {"backend/core.py": "def unrelated():\n    return 1\n"}
+
+    def fake_generate(path, *a, **kw):
+        body = contents[path]
+        patch = (f"--- /dev/null\n+++ b/{path}\n"
+                 f"@@ -0,0 +1,{len(body.splitlines())} @@\n"
+                 + "\n".join(f"+{ln}" for ln in body.splitlines()))
+        return {"file": path, "patch": patch, "content": body,
+                "syntax_ok": True, "confidence": 1.0}
+
+    monkeypatch.setattr("cgx.answer.engine.generate_single_scaffold_file",
+                        fake_generate)
+
+    class _StubProv:
+        def chat(self, *a, **kw):
+            return ""
+
+    t = TaskNode.new(session.session_id, TaskKind.SCAFFOLD, "s",
+                     inputs={"work_plan_artifact_id": plan.artifact_id})
+    store.save_task(t)
+    result = run_scaffold(t, ExecutorDeps(provider=_StubProv(), store=store))
+    assert result.failure is None
+    warns = result.artifact.content["contract_warnings"]
+    assert sorted(w["kind"] for w in warns) == ["endpoint", "function"]
+    assert result.outputs["contract_warnings_count"] == 2
 
 
 # --------------------- Phase 5.1: LLM call tracing -------------------------
