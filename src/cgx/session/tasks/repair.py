@@ -35,8 +35,10 @@ from cgx.session.models import (
     TaskNode,
 )
 from cgx.session.repair.classify import (
+    classify_runtime_report,
     classify_verify_report,
     failure_signature,
+    runtime_failure_text,
     third_party_import_breaks,
 )
 from cgx.session.repair.locate import (
@@ -87,6 +89,7 @@ _REGENERATE_CLASSES = frozenset({
     "third_party_import_break",
     "smoke_import_failure",
     "api_check_failure",
+    "runtime_failure",
     "empty_test_suite",
     "missing_fixture",
     "missing_module_pythonpath",
@@ -112,11 +115,22 @@ def run_repair(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
       caught before SMOKE/VERIFY. Same v1 contract as SMOKE: structured
       rationale + ``can_apply=False`` so the router escalates to
       ASK_USER until Phase 3.2's dependency-aware proposer lands.
+    * ``RUNTIME_REPORT`` -- the unit suite passed but the app failed to
+      boot under RUNTIME_VERIFY (bottleneck #3). There is no mechanical
+      locator for a boot failure, so REPAIR records the captured
+      import/create_app traceback with classification ``runtime_failure``
+      and ``strategy='regenerate'`` so the router re-authors the failing
+      entry module(s) via the nearest SCAFFOLD ancestor.
     """
     if not deps.project_root:
         return ExecutorResult(failure="REPAIR requires project_root in deps")
     if deps.store is None:
         return ExecutorResult(failure="REPAIR requires a session store in deps")
+
+    runtime_artifact_id = str(
+        task.inputs.get("runtime_artifact_id") or "").strip()
+    if runtime_artifact_id:
+        return _run_runtime_repair(task, deps, runtime_artifact_id)
 
     api_check_artifact_id = str(
         task.inputs.get("api_check_artifact_id") or "").strip()
@@ -343,6 +357,89 @@ def _run_smoke_repair(task: TaskNode, deps: ExecutorDeps,
             "extra_constraints": extra_constraints,
         },
         artifact=artifact,
+    )
+
+
+def _run_runtime_repair(task: TaskNode, deps: ExecutorDeps,
+                        runtime_artifact_id: str) -> ExecutorResult:
+    """Emit a REPAIR_PLAN from a RUNTIME_REPORT boot failure (#3).
+
+    The unit suite is green but the app did not boot, so there is no
+    failing test to patch and no mechanical locator to run. The plan
+    therefore carries ``strategy='regenerate'`` with the captured
+    import/``create_app`` traceback folded into ``extra_constraints`` so
+    the router re-authors the failing entry module(s) -- and whatever they
+    import -- via the nearest SCAFFOLD ancestor. ``can_apply=False`` keeps
+    the empty-diff plan off the patch path.
+    """
+    artifact = deps.store.get_artifact(runtime_artifact_id)
+    if (artifact is None
+            or artifact.kind is not ArtifactKind.RUNTIME_REPORT):
+        return ExecutorResult(
+            failure=f"REPAIR: artifact {runtime_artifact_id!r} missing or "
+                    "wrong kind (need RUNTIME_REPORT)")
+    content = dict(artifact.content or {})
+    classification = classify_runtime_report(content)
+    failed = [str(f).strip() for f in content.get("failed_entries") or []
+              if str(f).strip()]
+    outcome = str(content.get("outcome") or "").strip()
+    signature = str(content.get("failure_signature") or "").strip()
+    if not signature:
+        signature = "runtime_boot|" + ",".join(sorted(failed))
+    attempt = int(task.inputs.get("repair_attempt") or 1)
+    error_text = runtime_failure_text(content)
+    if failed:
+        rationale = (
+            f"The application failed to boot ({outcome}): entry module(s) "
+            f"{', '.join(failed)} raised at import or create_app() time. The "
+            "unit tests pass but the app itself does not run. Re-author the "
+            "failing entry module(s) and any first-party module they import "
+            "so the module imports cleanly and, when a create_app() factory "
+            "is present, it returns without raising. Boot error:\n"
+            + (error_text or "(no captured output)"))
+    else:
+        rationale = (
+            "RUNTIME_VERIFY reported a boot failure but no failing entry "
+            "files were recorded; escalating to ASK_USER.")
+    extra_constraints: Dict[str, Any] = {
+        "kind": "runtime_failure",
+        "failed_entries": failed,
+        "outcome": outcome,
+        "runtime_error": error_text,
+        "rationale": rationale,
+    }
+    plan = Artifact.new(
+        session_id=task.session_id,
+        produced_by_task_id=task.task_id,
+        kind=ArtifactKind.REPAIR_PLAN,
+        content={
+            "runtime_artifact_id": runtime_artifact_id,
+            "build_artifact_id": content.get("build_artifact_id"),
+            "apply_artifact_id": content.get("apply_artifact_id"),
+            "scaffold_artifact_id": content.get("scaffold_artifact_id"),
+            "classification": classification,
+            "failure_signature": signature,
+            "repair_attempt": attempt,
+            "rationale": rationale,
+            "failed_entries": failed,
+            "diffs": [],
+            "strategy": "regenerate",
+            "extra_constraints": extra_constraints,
+            "mode": task.inputs.get("mode"),
+        },
+    )
+    return ExecutorResult(
+        outputs={
+            "repair_artifact_id": plan.artifact_id,
+            "classification": classification,
+            "failure_signature": signature,
+            "repair_attempt": attempt,
+            "diff_count": 0,
+            "can_apply": False,
+            "strategy": "regenerate",
+            "extra_constraints": extra_constraints,
+        },
+        artifact=plan,
     )
 
 

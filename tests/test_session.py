@@ -1637,13 +1637,45 @@ def test_router_runtime_verify_skipped_completes_session():
     assert status[0].status is SessionStatus.COMPLETED
 
 
-def test_router_runtime_verify_failed_fails_session():
-    """An app that does not boot is a definitive greenfield FAILED."""
+def test_router_runtime_verify_failed_spawns_repair():
+    """#3: a boot failure within budget routes to REPAIR, not a terminal.
+
+    The first RUNTIME_VERIFY boot failure hands off to a REPAIR carrying
+    the RUNTIME_REPORT so the failing entry module can be re-authored; the
+    session stays open (no status flip) while the repair chain runs.
+    """
     from cgx.session.models import SessionMode
     session = Session.new("g", mode=SessionMode.GREENFIELD)
     rv = TaskNode.new(
         session.session_id, TaskKind.RUNTIME_VERIFY, "runtime",
         inputs={"mode": SessionMode.GREENFIELD.value})
+    rv.produced_artifact_id = "art_runtime"
+    rv.outputs = {"outcome": "failed",
+                  "failure_signature": "runtime_boot|app.py"}
+    rv.status = TaskNodeStatus.DONE
+    plan = Router().on_task_completed(
+        session=session, completed=rv, tasks=[rv])
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    assert len(creates) == 1
+    repair = creates[0].task
+    assert repair.kind is TaskKind.REPAIR
+    assert repair.inputs["runtime_artifact_id"] == "art_runtime"
+    assert repair.inputs["repair_attempt"] == 1
+    assert repair.inputs["prior_failure_signatures"] == ["runtime_boot|app.py"]
+    # Session status is not flipped while a repair successor exists.
+    assert not any(isinstance(a, UpdateSessionStatus) for a in plan.actions)
+
+
+def test_router_runtime_verify_failed_budget_spent_fails_session():
+    """A boot failure with the repair budget exhausted is a terminal FAILED."""
+    from cgx.session.models import SessionMode
+    from cgx.session.router import _REPAIR_BUDGET
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    rv = TaskNode.new(
+        session.session_id, TaskKind.RUNTIME_VERIFY, "runtime",
+        inputs={"mode": SessionMode.GREENFIELD.value,
+                "repair_attempt": _REPAIR_BUDGET})
+    rv.produced_artifact_id = "art_runtime"
     rv.outputs = {"outcome": "failed",
                   "failure_signature": "runtime_boot|app.py"}
     rv.status = TaskNodeStatus.DONE
@@ -4900,6 +4932,54 @@ def test_repair_handles_api_check_report(tmp_path, store):
     assert "REMOVE" in plan.content["rationale"]
     assert "ASK_USER" not in plan.content["rationale"]
     assert plan.content["diffs"] == []
+
+
+def test_repair_handles_runtime_report(tmp_path, store):
+    """#3: REPAIR(runtime_artifact_id) -> regenerate with the boot error.
+
+    A RUNTIME_REPORT boot failure has no test to patch, so REPAIR emits a
+    non-applicable plan whose ``strategy='regenerate'`` and whose
+    constraint carries the captured import/create_app traceback for the
+    scaffold prompt to act on.
+    """
+    from cgx.session.tasks.repair import run_repair
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    report = Artifact.new(
+        session_id=session.session_id, produced_by_task_id="t_runtime",
+        kind=ArtifactKind.RUNTIME_REPORT,
+        content={
+            "outcome": "failed",
+            "failed_entries": ["backend/app.py"],
+            "failure_signature": "runtime_boot|backend/app.py",
+            "probes": [{
+                "file": "backend/app.py", "ok": False,
+                "kind": "import_error",
+                "stderr_tail": "NameError: name 'db' is not defined",
+            }],
+        })
+    store.save_artifact(report)
+    t = TaskNode.new(
+        session.session_id, TaskKind.REPAIR, "repair",
+        inputs={"runtime_artifact_id": report.artifact_id,
+                "repair_attempt": 1,
+                "mode": SessionMode.GREENFIELD.value})
+    result = run_repair(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    assert result.failure is None
+    assert result.outputs["can_apply"] is False
+    assert result.outputs["classification"] == "runtime_failure"
+    assert result.outputs["strategy"] == "regenerate"
+    assert result.outputs["failure_signature"] == "runtime_boot|backend/app.py"
+    plan = result.artifact
+    assert plan.kind is ArtifactKind.REPAIR_PLAN
+    assert plan.content["diffs"] == []
+    assert plan.content["failed_entries"] == ["backend/app.py"]
+    constraints = plan.content["extra_constraints"]
+    assert constraints["kind"] == "runtime_failure"
+    assert "NameError: name 'db' is not defined" in constraints["runtime_error"]
+    assert "backend/app.py" in plan.content["rationale"]
+    assert "ASK_USER" not in plan.content["rationale"]
 
 
 def test_repair_api_check_missing_dependency_installs(tmp_path, store):

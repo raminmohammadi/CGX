@@ -696,19 +696,74 @@ def _runtime_verify_node(parent: TaskNode) -> List[TaskNode]:
             "plan_artifact_id": parent.inputs.get("plan_artifact_id"),
             "prior_goal": parent.inputs.get("prior_goal"),
             "mode": SessionMode.GREENFIELD.value,
+            # Thread the shared repair budget through the runtime gate so a
+            # boot failure can route to REPAIR under the same attempt cap +
+            # flap detector as the pre-VERIFY gates (#3).
+            "repair_attempt": int(parent.inputs.get("repair_attempt") or 0),
+            "prior_failure_signatures":
+                list(parent.inputs.get("prior_failure_signatures") or []),
+            "prior_failing_counts":
+                list(parent.inputs.get("prior_failing_counts") or []),
         },
     )]
 
 
-def _runtime_verify_to_terminal(parent: TaskNode) -> List[TaskNode]:
-    """RUNTIME_VERIFY is terminal in the MVP -- it spawns no successor.
+# RUNTIME_REPORT outcomes REPAIR knows how to attempt a fix for: a hard
+# boot failure. ``passed`` / ``skipped`` complete the session and never
+# reach this edge.
+_REPAIRABLE_RUNTIME_OUTCOMES = frozenset({"failed", "timeout", "error"})
 
-    Runtime-failure classification and a repair edge arrive with
-    bottleneck #3; for now a clean boot completes the session and a boot
-    failure ends it (see
-    :func:`_runtime_verify_terminal_session_actions`).
+
+def _runtime_verify_to_repair_or_terminal(parent: TaskNode) -> List[TaskNode]:
+    """Spawn REPAIR on a boot failure; otherwise terminal (#3).
+
+    A ``passed`` / ``skipped`` RUNTIME_VERIFY spawns no successor and the
+    session COMPLETES via :func:`_runtime_verify_terminal_session_actions`.
+    A hard boot outcome (``failed`` / ``timeout`` / ``error``) routes to
+    REPAIR with the RUNTIME_REPORT as the source artifact, gated by the
+    same shared retry budget and failure-signature flap detector used by
+    the SMOKE/API_CHECK gates. When the budget is spent or the signature
+    flaps the helper declines to spawn REPAIR and the terminal action
+    marks the session FAILED. Explore mode never reaches RUNTIME_VERIFY.
     """
-    return []
+    outputs = parent.outputs or {}
+    outcome = str(outputs.get("outcome") or "").strip()
+    mode = str(parent.inputs.get("mode") or "").strip()
+    if mode != SessionMode.GREENFIELD.value:
+        return []
+    if outcome not in _REPAIRABLE_RUNTIME_OUTCOMES:
+        return []
+    repair_attempt = int(parent.inputs.get("repair_attempt") or 0)
+    if repair_attempt >= _REPAIR_BUDGET:
+        return []
+    new_signature = str(outputs.get("failure_signature") or "").strip()
+    if not new_signature:
+        failed = outputs.get("failed_count")
+        new_signature = f"runtime_failed|count={failed}"
+    prior = list(parent.inputs.get("prior_failure_signatures") or [])
+    if new_signature in prior:
+        return []
+    return [TaskNode.new(
+        session_id=parent.session_id,
+        kind=TaskKind.REPAIR,
+        name="Repair failed app boot",
+        description=("Classify the upstream RUNTIME_VERIFY boot failure and "
+                     "re-author the failing entry module(s) so the app "
+                     "imports and starts, not just passes its unit tests."),
+        parent_task_id=parent.task_id,
+        inputs={
+            "runtime_artifact_id": parent.produced_artifact_id,
+            "build_artifact_id": parent.inputs.get("build_artifact_id"),
+            "apply_artifact_id": parent.inputs.get("apply_artifact_id"),
+            "scaffold_artifact_id": parent.inputs.get("scaffold_artifact_id"),
+            "prior_goal": parent.inputs.get("prior_goal"),
+            "mode": mode,
+            "repair_attempt": repair_attempt + 1,
+            "prior_failure_signatures": prior + [new_signature],
+            "prior_failing_counts":
+                list(parent.inputs.get("prior_failing_counts") or []),
+        },
+    )]
 
 
 def _repair_to_apply_or_ask(parent: TaskNode) -> List[TaskNode]:
@@ -887,7 +942,8 @@ def _scaffold_to_apply(parent: TaskNode) -> List[TaskNode]:
 # tasks. Greenfield kinds (CLARIFY_REQUIREMENTS, DECOMPOSE, SCAFFOLD,
 # BOOTSTRAP_ENV) chain to ASK_USER / APPLY / VERIFY respectively. A
 # passing greenfield VERIFY hands off to RUNTIME_VERIFY (the app-boot
-# gate); RUNTIME_VERIFY is terminal.
+# gate); a booting RUNTIME_VERIFY is terminal while a boot failure routes
+# to REPAIR under the shared budget (#3).
 TASK_SUCCESSOR = {
     TaskKind.EXPLORE: _explore_to_ask,
     TaskKind.INVESTIGATE: _investigate_to_recommend,
@@ -901,7 +957,7 @@ TASK_SUCCESSOR = {
     TaskKind.API_CHECK: _api_check_to_smoke_or_repair,
     TaskKind.SMOKE: _smoke_to_verify_or_repair,
     TaskKind.VERIFY: _verify_successors,
-    TaskKind.RUNTIME_VERIFY: _runtime_verify_to_terminal,
+    TaskKind.RUNTIME_VERIFY: _runtime_verify_to_repair_or_terminal,
     TaskKind.REPAIR: _repair_to_apply_or_ask,
 }
 

@@ -216,6 +216,54 @@ def failure_text(content: Dict[str, Any]) -> str:
     return _failure_text(content)
 
 
+# Classification token for a RUNTIME_REPORT whose app failed to boot
+# (import-time error, ``create_app`` wiring, or a boot that hangs). Unlike
+# the VERIFY tokens in :data:`REPAIR_CLASSIFICATIONS` this never has a
+# mechanical locator -- the fix is to re-author the failing entry module
+# and what it imports -- so REPAIR routes it straight to a regenerate with
+# the captured boot error folded in as a constraint.
+RUNTIME_REPAIR_CLASSIFICATION = "runtime_failure"
+
+# RUNTIME_REPORT outcomes that mean the app did not boot cleanly. A
+# ``passed`` / ``skipped`` report never reaches classification (the router
+# completes the session on those), so this covers the hard boot failures.
+_RUNTIME_FAILED_OUTCOMES = frozenset({"failed", "timeout", "error"})
+
+
+def classify_runtime_report(content: Dict[str, Any]) -> RepairClassification:
+    """Map a RUNTIME_REPORT content dict to a classification token.
+
+    Returns :data:`RUNTIME_REPAIR_CLASSIFICATION` for any hard boot
+    outcome (``failed`` / ``timeout`` / ``error``) and ``unknown``
+    otherwise, mirroring the conservative contract of
+    :func:`classify_verify_report`.
+    """
+    outcome = str(content.get("outcome") or "").strip()
+    if outcome in _RUNTIME_FAILED_OUTCOMES:
+        return RUNTIME_REPAIR_CLASSIFICATION
+    return "unknown"
+
+
+def runtime_failure_text(content: Dict[str, Any]) -> str:
+    """Concatenate the captured boot error of every failing entry probe.
+
+    Each failing ``probes`` entry contributes a ``<file> (<kind>):`` header
+    followed by its ``stderr_tail`` so the regenerate constraint carries
+    the concrete traceback the model must fix, not just the entry name.
+    Order-stable; returns an empty string when nothing failed.
+    """
+    parts: List[str] = []
+    for probe in content.get("probes") or []:
+        if not isinstance(probe, dict) or probe.get("ok"):
+            continue
+        rel = str(probe.get("file") or "").strip()
+        kind = str(probe.get("kind") or "").strip()
+        tail = str(probe.get("stderr_tail") or "").strip()
+        header = f"{rel} ({kind}):" if kind else f"{rel}:"
+        parts.append(f"{header}\n{tail}".rstrip())
+    return "\n\n".join(parts)
+
+
 # --------------------- helpers ---------------------
 
 def _failure_text(content: Dict[str, Any]) -> str:
