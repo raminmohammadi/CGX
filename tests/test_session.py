@@ -1437,6 +1437,8 @@ def test_router_smoke_failed_flap_detector_blocks_repeat():
 
 def _greenfield_failed_verify(*, signature: str, outcome: str = "assertions_failed",
                               repair_attempt: int = 0, prior: list | None = None,
+                              failing_count: int | None = None,
+                              prior_counts: list | None = None,
                               session=None) -> TaskNode:
     """Build a DONE VERIFY task that the repair successor should react to."""
     from cgx.session.models import SessionMode
@@ -1447,10 +1449,13 @@ def _greenfield_failed_verify(*, signature: str, outcome: str = "assertions_fail
                 "build_artifact_id": "art_build",
                 "mode": SessionMode.GREENFIELD.value,
                 "repair_attempt": repair_attempt,
-                "prior_failure_signatures": list(prior or [])})
+                "prior_failure_signatures": list(prior or []),
+                "prior_failing_counts": list(prior_counts or [])})
     ver.produced_artifact_id = "art_verify"
     ver.outputs = {"outcome": outcome, "failure_signature": signature,
                    "returncode": 1}
+    if failing_count is not None:
+        ver.outputs["failing_count"] = failing_count
     ver.status = TaskNodeStatus.DONE
     return ver
 
@@ -1720,12 +1725,13 @@ def test_router_verify_repeat_signature_refuses_repair():
 
 
 def test_router_verify_exceeds_budget_refuses_repair():
-    """Retry budget exhausted (>= 2 attempts) -> no REPAIR (loop guard)."""
+    """Absolute repair cap exhausted -> no REPAIR (loop guard)."""
     from cgx.session.models import SessionMode
+    from cgx.session.router import _REPAIR_BUDGET
     session = Session.new("g", mode=SessionMode.GREENFIELD)
     ver = _greenfield_failed_verify(
-        signature="new", repair_attempt=2, prior=["old1", "old2"],
-        session=session)
+        signature="new", repair_attempt=_REPAIR_BUDGET,
+        prior=[f"old{i}" for i in range(_REPAIR_BUDGET)], session=session)
     plan = Router().on_task_completed(
         session=session, completed=ver, tasks=[ver])
     creates = [a for a in plan.actions if isinstance(a, CreateTask)]
@@ -1734,6 +1740,83 @@ def test_router_verify_exceeds_budget_refuses_repair():
     status = [a for a in plan.actions if isinstance(a, UpdateSessionStatus)]
     assert len(status) == 1
     assert status[0].status is SessionStatus.FAILED
+
+
+def test_router_verify_progress_drop_allows_repair_past_old_cap():
+    """P2: a strictly-dropping failing-test count keeps the loop repairing.
+
+    With the old 2-shot cap this third round (repair_attempt=2) would have
+    terminated; the progress-aware budget lets it continue because the
+    count fell 5 -> 3 -> 2, and threads the new count onto the trend.
+    """
+    from cgx.session.models import SessionMode
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    ver = _greenfield_failed_verify(
+        signature="round3", repair_attempt=2, prior=["r1", "r2"],
+        failing_count=2, prior_counts=[5, 3], session=session)
+    plan = Router().on_task_completed(
+        session=session, completed=ver, tasks=[ver])
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    assert len(creates) == 1
+    rep = creates[0].task
+    assert rep.kind is TaskKind.REPAIR
+    assert rep.inputs["prior_failing_counts"] == [5, 3, 2]
+    assert rep.inputs["repair_attempt"] == 3
+    # A spawned REPAIR defers the terminal status decision.
+    assert not any(isinstance(a, UpdateSessionStatus) for a in plan.actions)
+
+
+def test_router_verify_progress_stall_refuses_repair():
+    """P2: a failing-test count that stops dropping ends the loop.
+
+    The signature is brand new (the old flap guard would allow another
+    REPAIR), but the count did not fall (3 -> 3), so the progress-aware
+    gate declares a stall and the session fails terminally.
+    """
+    from cgx.session.models import SessionMode
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    ver = _greenfield_failed_verify(
+        signature="fresh", repair_attempt=1, prior=["r1"],
+        failing_count=3, prior_counts=[3], session=session)
+    plan = Router().on_task_completed(
+        session=session, completed=ver, tasks=[ver])
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    assert creates == []
+    status = [a for a in plan.actions if isinstance(a, UpdateSessionStatus)]
+    assert len(status) == 1
+    assert status[0].status is SessionStatus.FAILED
+
+
+def test_router_repair_apply_verify_chain_carries_failing_counts():
+    """P2: the failing-count trend survives REPAIR -> APPLY -> VERIFY."""
+    from cgx.session.models import SessionMode
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    # REPAIR -> APPLY carries the trend forward.
+    rep = TaskNode.new(
+        session.session_id, TaskKind.REPAIR, "repair",
+        inputs={"verify_artifact_id": "art_verify",
+                "build_artifact_id": "art_build",
+                "mode": SessionMode.GREENFIELD.value,
+                "repair_attempt": 1,
+                "prior_failure_signatures": ["r1"],
+                "prior_failing_counts": [5, 3]})
+    rep.produced_artifact_id = "art_repair_plan"
+    rep.outputs = {"can_apply": True, "failure_signature": "r1",
+                   "repair_attempt": 1, "diff_count": 2}
+    rep.status = TaskNodeStatus.DONE
+    plan = Router().on_task_completed(
+        session=session, completed=rep, tasks=[rep])
+    ap = [a for a in plan.actions if isinstance(a, CreateTask)][0].task
+    assert ap.kind is TaskKind.APPLY
+    assert ap.inputs["prior_failing_counts"] == [5, 3]
+    # APPLY -> VERIFY carries it the rest of the way.
+    ap.produced_artifact_id = "art_applied"
+    ap.status = TaskNodeStatus.DONE
+    plan2 = Router().on_task_completed(
+        session=session, completed=ap, tasks=[ap])
+    ver = [a for a in plan2.actions if isinstance(a, CreateTask)][0].task
+    assert ver.kind is TaskKind.VERIFY
+    assert ver.inputs["prior_failing_counts"] == [5, 3]
 
 
 def test_router_repair_with_diffs_spawns_apply():
@@ -2055,6 +2138,8 @@ def test_verify_parses_junitxml_failures(tmp_path, store, monkeypatch):
     assert result.failure is None
     failures = result.artifact.content["failures"]
     assert isinstance(failures, list) and len(failures) == 2
+    # The router's progress-aware repair budget reads this count.
+    assert result.outputs["failing_count"] == 2
     assert failures[0] == {
         "nodeid": "tests.test_x::test_x",
         "kind": "failure",

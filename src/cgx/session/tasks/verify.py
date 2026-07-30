@@ -183,6 +183,11 @@ def run_verify(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             "tests_passed": tests_passed,
             "outcome": verify_outcome,
             "tests_selected_count": len(combined.pytest_tests_selected),
+            # Number of failing/erroring tests parsed from the junit sink;
+            # the router's progress-aware repair budget compares this
+            # count round over round (see cgx.session.router.
+            # _repair_progress_stalled).
+            "failing_count": len(failures),
             "failure_signature": sig,
             "returncode": combined.returncode,
         },

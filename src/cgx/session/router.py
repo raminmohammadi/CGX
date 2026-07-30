@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Union
+from typing import Any, Dict, Iterable, List, Optional, Union
 
 from cgx.session.models import (
     Decision,
@@ -264,6 +264,8 @@ def _apply_to_verify(parent: TaskNode) -> List[TaskNode]:
             "repair_attempt": repair_attempt,
             "prior_failure_signatures":
                 list(parent.inputs.get("prior_failure_signatures") or []),
+            "prior_failing_counts":
+                list(parent.inputs.get("prior_failing_counts") or []),
         },
     )]
 
@@ -483,7 +485,42 @@ def _decompose_to_ask(parent: TaskNode) -> List[TaskNode]:
     )]
 
 
-_REPAIR_BUDGET = 2
+# Absolute ceiling on repair rounds for a single greenfield write loop.
+# The progress-aware gate (see :func:`_repair_progress_stalled`) ends a
+# loop as soon as the failing-test count stops strictly dropping, so most
+# loops terminate well before this cap; the cap only bounds a loop whose
+# failure signature keeps mutating with no usable count trend. Raised from
+# the original 2-shot limit so a genuinely-progressing hard task can
+# iterate further without ever running unbounded.
+_REPAIR_BUDGET = 4
+
+
+def _coerce_count(value: Any) -> Optional[int]:
+    """Best-effort ``int`` coercion; returns ``None`` for missing/garbage."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _repair_progress_stalled(new_count: Optional[int],
+                             prior_counts: List[int]) -> bool:
+    """True when the failing-test-count trend shows no forward progress.
+
+    ``new_count`` is the number of tests failing in the just-finished
+    VERIFY; ``prior_counts`` is the ordered history of failing counts from
+    earlier rounds of the *same* repair loop. Forward progress means the
+    count strictly drops round over round, so the loop has stalled (and
+    another REPAIR would likely churn) once the newest count is not
+    strictly below the most recent prior count. A missing count (``None``
+    -- e.g. a non-assertion outcome where a test count is not a meaningful
+    progress signal) is inconclusive and never on its own declares a
+    stall: the caller still applies the signature-flap backstop and the
+    absolute :data:`_REPAIR_BUDGET` cap.
+    """
+    if new_count is None or not prior_counts:
+        return False
+    return new_count >= prior_counts[-1]
 
 # Maximum number of targeted regenerate attempts per SCAFFOLD ancestor
 # chain. Each attempt re-generates only the files that dropped, seeding
@@ -538,12 +575,20 @@ def _verify_to_repair_or_terminal(parent: TaskNode) -> List[TaskNode]:
 
     Triggers only in greenfield mode (auto-apply is part of the
     greenfield contract; explore-mode write loops keep their existing
-    approval gates). The progress detector reads
-    ``prior_failure_signatures`` off the parent: if the just-finished
-    VERIFY's signature already appears in the list, the loop is
-    flapping and we refuse to spawn another REPAIR.
+    approval gates). Progress is judged two ways, both read off the
+    parent's inputs so the router stays IO-free:
 
-    The retry budget is :data:`_REPAIR_BUDGET` attempts. The attempt
+    * a failing-test-count *trend* (``prior_failing_counts``): for a real
+      ``assertions_failed`` outcome the loop keeps going only while the
+      count strictly drops round over round (see
+      :func:`_repair_progress_stalled`) -- the primary, progress-aware
+      guard that lets a genuinely-improving hard task iterate further;
+    * a failure-*signature* flap backstop (``prior_failure_signatures``):
+      if the just-finished VERIFY's signature already appears in the
+      list the loop is churning and we refuse another REPAIR. This still
+      covers non-assertion outcomes where a test count is meaningless.
+
+    Both sit under the absolute :data:`_REPAIR_BUDGET` cap. The attempt
     counter lives in ``parent.inputs["repair_attempt"]`` (incremented by
     the REPAIR -> APPLY -> VERIFY chain), so the router can read it
     without walking the task tree.
@@ -566,6 +611,21 @@ def _verify_to_repair_or_terminal(parent: TaskNode) -> List[TaskNode]:
     repair_attempt = int(parent.inputs.get("repair_attempt") or 0)
     if repair_attempt >= _REPAIR_BUDGET:
         return []
+    # Progress-aware gate: for a real test failure the failing-test count
+    # is a truer progress signal than failure-signature identity -- a loop
+    # can keep churning fresh signatures while fixing nothing. Keep
+    # repairing only while that count strictly drops; a stall (count not
+    # below the previous round's) ends the loop. The count is trusted only
+    # for ``assertions_failed`` (where "N tests failing" is meaningful);
+    # every other outcome falls back to the signature-flap backstop below.
+    new_count = (_coerce_count(outputs.get("failing_count"))
+                 if outcome == "assertions_failed" else None)
+    prior_counts = [c for c in (
+        _coerce_count(x)
+        for x in (parent.inputs.get("prior_failing_counts") or []))
+        if c is not None]
+    if _repair_progress_stalled(new_count, prior_counts):
+        return []
     # Read the VERIFY_REPORT's failure_signature lazily by deferring to
     # the classifier; the router stays free of I/O by using a precomputed
     # signature stashed by the runner-style ``outputs``. Falls back to a
@@ -577,6 +637,8 @@ def _verify_to_repair_or_terminal(parent: TaskNode) -> List[TaskNode]:
     prior = list(parent.inputs.get("prior_failure_signatures") or [])
     if new_signature in prior:
         return []
+    next_counts = (prior_counts + [new_count] if new_count is not None
+                   else prior_counts)
     verify_artifact_id = parent.produced_artifact_id
     return [TaskNode.new(
         session_id=parent.session_id,
@@ -593,6 +655,7 @@ def _verify_to_repair_or_terminal(parent: TaskNode) -> List[TaskNode]:
             "mode": mode,
             "repair_attempt": repair_attempt + 1,
             "prior_failure_signatures": prior + [new_signature],
+            "prior_failing_counts": next_counts,
         },
     )]
 
@@ -682,6 +745,8 @@ def _repair_to_apply_or_ask(parent: TaskNode) -> List[TaskNode]:
             "repair_attempt": attempt,
             "prior_failure_signatures": (
                 prior if signature in prior else prior + [signature]),
+            "prior_failing_counts":
+                list(parent.inputs.get("prior_failing_counts") or []),
         },
     )]
 
