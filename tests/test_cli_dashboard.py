@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import threading
 
+from cgx.cli import main as cli_main
 from cgx.cli.tui import ansi, ops, render
 from cgx.cli.tui.app import Dashboard, DashboardState
 from cgx.cli.tui.runner import Printer, run_stream
@@ -316,3 +317,82 @@ def test_probe_status_shows_build_time_and_model(tmp_path):
     state = DashboardState(project_root=proj, model="test-model")
     out = ops.probe_status(state)
     assert "ready" in out and "2026-07-14T18:00:00" in out and "jina" in out
+
+
+# --- cgx CLI subcommands (ask / plan / agent / status) ---------------
+# These drive the real streaming path (Printer + run_stream + map_event)
+# but stub the engine-touching ``ops`` generators so no network/model work
+# happens; they assert the argparse wiring and DashboardState resolution.
+
+def test_cli_ask_wires_question_and_provider(monkeypatch, tmp_path):
+    seen: dict = {}
+
+    def fake_ask_events(state, question, *, index_dir=None, records=None,
+                        think=False, cancel_event=None):
+        seen.update(question=question, think=think, index_dir=index_dir,
+                    records=records, kind=state.provider_kind, model=state.model)
+        yield "answer_delta", {"delta": "hi"}
+        yield "answer", {"sources": []}
+
+    monkeypatch.setattr(ops, "ask_events", fake_ask_events)
+    cli_main.main(["ask", "how", "does", "indexing", "work?",
+                   "--project-root", str(tmp_path), "--provider", "openai",
+                   "--model", "gpt-4o", "--think", "--index-dir", "/i",
+                   "--records", "/r"])
+    assert seen["question"] == "how does indexing work?"
+    assert seen["think"] is True
+    assert seen["index_dir"] == "/i" and seen["records"] == "/r"
+    assert seen["kind"] == "openai" and seen["model"] == "gpt-4o"
+
+
+def test_cli_plan_wires_task_and_flags(monkeypatch, tmp_path):
+    seen: dict = {}
+
+    def fake_plan_events(state, task, *, index_dir=None, records=None,
+                         self_test=False, run_tests=False, cancel_event=None):
+        seen.update(task=task, self_test=self_test, run_tests=run_tests)
+        yield "plan", {"plan_md": "do it", "diffs": [{"file": "a.py"}]}
+
+    monkeypatch.setattr(ops, "plan_events", fake_plan_events)
+    cli_main.main(["plan", "add", "a", "flag", "--project-root", str(tmp_path),
+                   "--model", "gpt-4o", "--provider", "openai",
+                   "--self-test", "--run-tests"])
+    assert seen["task"] == "add a flag"
+    assert seen["self_test"] is True and seen["run_tests"] is True
+
+
+def test_cli_agent_wires_goal_and_stop_on_fail(monkeypatch, tmp_path):
+    seen: dict = {}
+
+    def fake_agent_events(state, goal, *, index_dir=None, records=None,
+                          stop_on_fail=False, cancel_event=None):
+        seen.update(goal=goal, stop_on_fail=stop_on_fail)
+        yield "summary", {"completed": 1, "failed": 0, "skipped": 0}
+
+    monkeypatch.setattr(ops, "agent_events", fake_agent_events)
+    cli_main.main(["agent", "build", "a", "CLI", "--project-root", str(tmp_path),
+                   "--model", "gpt-4o", "--provider", "openai", "--stop-on-fail"])
+    assert seen["goal"] == "build a CLI"
+    assert seen["stop_on_fail"] is True
+
+
+def test_cli_status_prints_probe(monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(ops, "probe_status", lambda state: "PROBE-OK")
+    cli_main.main(["status", "--project-root", str(tmp_path),
+                   "--provider", "openai", "--model", "gpt-4o"])
+    assert "PROBE-OK" in capsys.readouterr().out
+
+
+def test_cli_state_from_args_prefers_profile(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    prof = SimpleNamespace(name="cloud", kind="openai", model="gpt-4o",
+                           base_url="https://api.example")
+    monkeypatch.setattr("cgx.answer.profiles.get_profile", lambda name: prof)
+    args = cli_main.argparse.Namespace(
+        project_root=str(tmp_path), model=None, provider="ollama",
+        base_url="http://localhost:11434", profile="cloud",
+        index_dir=None, records=None)
+    state = cli_main._state_from_args(args)
+    assert state.profile_name == "cloud" and state.provider_kind == "openai"
+    assert state.model == "gpt-4o" and state.base_url == "https://api.example"

@@ -127,6 +127,51 @@ def _ask_llm_for_questions(goal: str,
     return _parse_questions(raw)
 
 
+_HINT_MARKERS = (
+    "for example:", "for example", "examples:", "example:",
+    "e.g.:", "e.g.", "e.g", "eg.", "ex:",
+)
+
+
+def _chips_from_hint(hint: str) -> List[str]:
+    """Derive suggestion chips from a hint when the model omits ``suggested``.
+
+    Weaker models often return the ``hint`` (``"e.g. SQLite, Postgres"``)
+    but drop the ``suggested`` array, which would force the user to type
+    every answer. We recover chips deterministically: only when the hint
+    carries an explicit example marker or an ``or``-list, so plain
+    instructions like ``"Pick a storage layer"`` yield nothing.
+    """
+    text = (hint or "").strip()
+    if not text:
+        return []
+    low = text.lower()
+    has_marker = False
+    for marker in _HINT_MARKERS:
+        idx = low.find(marker)
+        if idx != -1:
+            text = text[idx + len(marker):].strip(" :")
+            has_marker = True
+            break
+    parts: List[str] = []
+    for piece in text.split(","):
+        for sub in piece.replace(" OR ", " or ").split(" or "):
+            t = sub.strip(" .")
+            if t and len(t) <= 40:
+                parts.append(t)
+    # Dedupe (case-insensitive) while preserving order.
+    seen: set = set()
+    chips: List[str] = []
+    for p in parts:
+        key = p.lower()
+        if key not in seen:
+            seen.add(key)
+            chips.append(p)
+    if has_marker:
+        return chips[:4]
+    return chips[:4] if len(chips) >= 2 else []
+
+
 def _parse_questions(raw: str) -> List[Dict[str, Any]]:
     raw = (raw or "").strip()
     if not raw:
@@ -145,6 +190,7 @@ def _parse_questions(raw: str) -> List[Dict[str, Any]]:
         prompt = str(q.get("prompt") or "").strip()
         if not prompt:
             continue
+        hint = str(q.get("hint") or "").strip()
         suggested = q.get("suggested")
         suggested_clean: List[str] = []
         if isinstance(suggested, list):
@@ -152,10 +198,12 @@ def _parse_questions(raw: str) -> List[Dict[str, Any]]:
                 t = str(s or "").strip()
                 if t:
                     suggested_clean.append(t)
+        if not suggested_clean:
+            suggested_clean = _chips_from_hint(hint)
         out.append({
             "id": str(q.get("id") or f"q{idx + 1}"),
             "prompt": prompt,
-            "hint": str(q.get("hint") or "").strip(),
+            "hint": hint,
             "suggested": suggested_clean,
         })
     return out if len(out) >= 3 else []

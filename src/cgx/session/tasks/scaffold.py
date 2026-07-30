@@ -167,6 +167,12 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         for e in (lay.get("files") or [])
         if isinstance(e, dict) and str(e.get("path") or "").strip())
     progress_done = len(generated)
+    # Running count of files whose generation failed. Threaded into every
+    # beat so the UI can distinguish a genuine failure from a counter that
+    # simply hasn't advanced: on failure ``progress_done`` stays put, so
+    # without this the next file's ``start`` reuses the same index and looks
+    # like a silent restart.
+    progress_failed = 0
 
     for layer in layers:
         if not isinstance(layer, dict):
@@ -233,11 +239,12 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
                 _emit_scaffold_progress(
                     deps, task, file=p, layer=layer_name,
                     index=progress_done + 1, total=total_files,
-                    status="start")
+                    status="start", failed_count=progress_failed)
                 started = time.time()
                 on_token = _make_stream_beat(
                     deps, task, file=p, layer=layer_name,
-                    index=progress_done + 1, total=total_files)
+                    index=progress_done + 1, total=total_files,
+                    failed_count=progress_failed)
                 ok, fail = _generate_one(
                     p, d, layer_name, list(existing_with_content),
                     deps.provider, goal, on_token=on_token,
@@ -252,12 +259,15 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
                         deps, task, file=p, layer=layer_name,
                         index=progress_done, total=total_files,
                         status="done", bytes=len(ok["content"]),
-                        elapsed_ms=elapsed_ms)
+                        elapsed_ms=elapsed_ms,
+                        failed_count=progress_failed)
                 else:
+                    progress_failed += 1
                     _emit_scaffold_progress(
                         deps, task, file=p, layer=layer_name,
                         index=progress_done, total=total_files,
-                        status="failed", elapsed_ms=elapsed_ms)
+                        status="failed", elapsed_ms=elapsed_ms,
+                        failed_count=progress_failed)
 
         # Fold the layer's outcomes into the running state in manifest
         # order. In the parallel path the context snapshot was frozen, so
@@ -266,10 +276,12 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             if fail is not None:
                 failed.append(fail)
                 if parallel:
+                    progress_failed += 1
                     _emit_scaffold_progress(
                         deps, task, file=str(fail.get("file") or ""),
                         layer=layer_name, index=progress_done,
-                        total=total_files, status="failed")
+                        total=total_files, status="failed",
+                        failed_count=progress_failed)
                 continue
             diffs.append({"file": ok["file"], "patch": ok["patch"]})
             generated.append({
@@ -286,7 +298,8 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
                 _emit_scaffold_progress(
                     deps, task, file=ok["file"], layer=layer_name,
                     index=progress_done, total=total_files,
-                    status="done", bytes=len(ok["content"]))
+                    status="done", bytes=len(ok["content"]),
+                    failed_count=progress_failed)
 
         # Checkpoint after each layer so a crash mid-run is resumable.
         _checkpoint_progress(deps, artifact)
@@ -420,21 +433,25 @@ def _emit_scaffold_progress(
         deps: ExecutorDeps, task: TaskNode, *, file: str, layer: str,
         index: int, total: int, status: str,
         bytes: Optional[int] = None,
-        elapsed_ms: Optional[int] = None) -> None:
+        elapsed_ms: Optional[int] = None,
+        failed_count: int = 0) -> None:
     """Publish one intra-SCAFFOLD progress beat (best-effort).
 
     ``status`` is one of ``start`` / ``done`` / ``failed``. A rough ETA is
     derived from the just-finished file's wall time projected over the
     remaining manifest entries -- coarse, but enough for the UI to show a
-    shrinking countdown instead of a frozen spinner. Never raises: progress
-    telemetry must not be able to fail a generation run.
+    shrinking countdown instead of a frozen spinner. ``failed_count`` carries
+    the running number of files that failed so far; on failure ``index`` does
+    not advance, so this lets the UI show the failure instead of rendering an
+    apparent counter reset. Never raises: progress telemetry must not be able
+    to fail a generation run.
     """
     store = getattr(deps, "store", None)
     if store is None:
         return
     progress: Dict[str, Any] = {
         "index": index, "total": total, "path": file,
-        "layer": layer, "status": status,
+        "layer": layer, "status": status, "failed_count": failed_count,
     }
     if bytes is not None:
         progress["bytes"] = bytes
@@ -458,13 +475,15 @@ _STREAM_BEAT_MIN_INTERVAL_S = 0.25
 
 def _make_stream_beat(
         deps: ExecutorDeps, task: TaskNode, *, file: str, layer: str,
-        index: int, total: int) -> Callable[[str], None]:
+        index: int, total: int,
+        failed_count: int = 0) -> Callable[[str], None]:
     """Return an ``on_token`` callback that emits throttled ``stream`` beats.
 
     Accumulates the streamed character count for the file being generated
     and publishes a ``status="stream"`` progress beat at most every
     :data:`_STREAM_BEAT_MIN_INTERVAL_S` seconds, so the UI shows the active
-    file growing in real time instead of a frozen ``start``. Best-effort:
+    file growing in real time instead of a frozen ``start``. ``failed_count``
+    is the running failure tally carried into each beat. Best-effort:
     delegates to :func:`_emit_scaffold_progress`, which never raises.
     """
     state = {"chars": 0, "last": 0.0}
@@ -478,7 +497,7 @@ def _make_stream_beat(
         _emit_scaffold_progress(
             deps, task, file=file, layer=layer,
             index=index, total=total, status="stream",
-            bytes=state["chars"])
+            bytes=state["chars"], failed_count=failed_count)
 
     return _beat
 

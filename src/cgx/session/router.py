@@ -485,20 +485,25 @@ def _decompose_to_ask(parent: TaskNode) -> List[TaskNode]:
 
 _REPAIR_BUDGET = 2
 
-# Maximum number of regenerate attempts per SCAFFOLD ancestor chain.
-# One full re-scaffold is enough to incorporate the failure-derived
-# constraints; two would risk a regenerate loop and waste tokens. When
-# the budget is exhausted the regenerate branch falls back to the
-# patch branch's ASK_USER escalation.
-_REGENERATE_BUDGET = 1
+# Maximum number of targeted regenerate attempts per SCAFFOLD ancestor
+# chain. Each attempt re-generates only the files that dropped, seeding
+# the survivors from the prior checkpoint, so a retry is fast and does
+# not disturb good work. A local/flaky model routinely drops a single
+# file to a read timeout or an empty patch, so a shallow budget escalated
+# straight to a disruptive re-plan (and re-approval); a few in-place
+# retries clear the common case before the manifest is ever blamed.
+_REGENERATE_BUDGET = 3
 
 # Maximum number of *re-plan* escalations per session. When a SCAFFOLD or
 # APPLY spends its per-manifest regenerate budget the manifest itself is
-# the suspect (not the generation of any single file), so before failing
-# terminally the router escalates once to a fresh DECOMPOSE that revises
-# the plan with the accumulated failure folded into its goal. A single
-# revision is enough; a second exhaustion on the revised manifest is a
-# genuine dead end and terminates the session.
+# the suspect (not the generation of any single file), so the router
+# escalates once to a fresh DECOMPOSE that revises the plan with the
+# accumulated failure folded into its goal. When the re-plan budget is
+# also spent the router does NOT discard the run: as long as the partial
+# scaffold produced survivors it proceeds along the normal edge (APPLY
+# writes them, VERIFY judges them) rather than failing terminally and
+# throwing away every successfully generated file. Only a scaffold that
+# produced nothing usable is a genuine dead end.
 _REPLAN_BUDGET = 1
 
 
@@ -684,6 +689,36 @@ def _verify_terminal_session_actions(
                                 status=status)]
 
 
+def _preverify_gate_terminal_actions(
+        completed: TaskNode) -> List[RouterAction]:
+    """Terminate a greenfield run when a pre-VERIFY gate stalls.
+
+    API_CHECK / SMOKE hand off to their successor on ``passed`` /
+    ``skipped`` (SMOKE, then VERIFY) and to REPAIR on ``failed`` -- but
+    only while the shared repair budget holds and the failure signature
+    keeps changing. Once the budget is spent or the signature flaps, the
+    gate helper declines to spawn REPAIR and returns no successor. A
+    ``failed`` gate with no successor is a genuine dead end (the applied
+    files reference symbols that cannot resolve, and repairing them is no
+    longer making progress); without an explicit transition the drain
+    loop would exit with the session still ``active`` -- idle, with no
+    terminal status the UI can settle on. Mirroring
+    :func:`_verify_terminal_session_actions`, end the session ``FAILED``
+    so the run resolves instead of hanging. A non-``failed`` gate that
+    somehow produced no successor is left untouched (empty list) so the
+    normal edge is not overridden. Explore-mode keeps its own lifecycle.
+    """
+    mode = str(completed.inputs.get("mode") or "").strip()
+    if mode != SessionMode.GREENFIELD.value:
+        return []
+    outputs = completed.outputs or {}
+    outcome = str(outputs.get("outcome") or "").strip()
+    if outcome != "failed":
+        return []
+    return [UpdateSessionStatus(session_id=completed.session_id,
+                                status=SessionStatus.FAILED)]
+
+
 def _scaffold_to_apply(parent: TaskNode) -> List[TaskNode]:
     """Spawn the APPLY follow-up for a finished SCAFFOLD."""
     return [TaskNode.new(
@@ -827,6 +862,10 @@ class Router:
         if completed.kind is TaskKind.VERIFY and not children:
             plan.actions.extend(
                 _verify_terminal_session_actions(completed))
+        if (completed.kind in (TaskKind.API_CHECK, TaskKind.SMOKE)
+                and not children):
+            plan.actions.extend(
+                _preverify_gate_terminal_actions(completed))
         return plan
 
     @traced("router")
@@ -1068,12 +1107,13 @@ def _apply_failed_files_actions(completed: TaskNode,
     APPLY that dropped a file re-scaffolds within
     :data:`_REGENERATE_BUDGET` instead of limping forward. When the
     regenerate budget is spent the router escalates once to a revised
-    manifest via :func:`_replan_or_fail` (a fresh DECOMPOSE) before ending
-    the session terminally ``FAILED``. When no SCAFFOLD ancestor exists the
-    session fails terminally -- it never proceeds on a known-broken tree,
-    and never asks the user to hand-fix generated code. Returns an empty
-    list for explore mode or a clean apply so the dispatcher takes the
-    normal APPLY -> VERIFY edge.
+    manifest via :func:`_replan_or_fail` (a fresh DECOMPOSE); when the
+    re-plan budget is also spent that helper proceeds with the survivors
+    rather than discarding the run, and only fails terminally when nothing
+    usable was generated. When no SCAFFOLD ancestor exists the session
+    fails terminally -- it cannot re-scaffold a tree it cannot find.
+    Returns an empty list for explore mode or a clean apply so the
+    dispatcher takes the normal APPLY -> VERIFY edge.
     """
     from cgx.session.repair.propose import propose_regenerate  # dep direction
 
@@ -1160,7 +1200,15 @@ def _replan_or_fail(completed: TaskNode, tasks: List[TaskNode], *,
         return fail
     prior_replans = int(scaffold.inputs.get("replan_attempt") or 0)
     if prior_replans >= _REPLAN_BUDGET:
-        return fail
+        # Budgets spent. Rather than discard every file that generated
+        # cleanly, proceed with the survivors on the normal edge (the
+        # empty return lets the dispatcher take SCAFFOLD -> APPLY /
+        # APPLY -> VERIFY) whenever the partial scaffold produced output;
+        # the dropped files are already surfaced to the UI via the
+        # scaffold ``failed_count`` progress beats. Only a scaffold that
+        # produced nothing usable is a terminal dead end.
+        survivors = int((scaffold.outputs or {}).get("generated_count") or 0)
+        return [] if survivors > 0 else fail
     prior_goal = str(scaffold.inputs.get("prior_goal") or "").strip()
     decompose = _find_ancestor_by_kind(scaffold, tasks, TaskKind.DECOMPOSE)
     answers: Dict[str, object] = {}
@@ -1211,10 +1259,11 @@ def _scaffold_failed_files_actions(completed: TaskNode,
     per-file errors into the regenerate constraint so the retry has
     actionable feedback. When that budget is spent the router escalates
     once to a revised manifest via :func:`_replan_or_fail` (a fresh
-    DECOMPOSE) before ending the session terminally ``FAILED`` -- it never
-    limps forward on a known-incomplete tree. Returns an empty list for a
-    clean scaffold so the dispatcher takes the normal SCAFFOLD -> APPLY
-    edge.
+    DECOMPOSE); when the re-plan budget is also spent that helper proceeds
+    with the survivors on the normal SCAFFOLD -> APPLY edge rather than
+    discarding them, failing terminally only when nothing usable was
+    generated. Returns an empty list for a clean scaffold so the
+    dispatcher takes the normal SCAFFOLD -> APPLY edge.
     """
     from cgx.session.repair.propose import propose_regenerate  # dep direction
 

@@ -29,6 +29,7 @@ stderr for the UI to surface.
 from __future__ import annotations
 
 import logging
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -91,6 +92,14 @@ def run_bootstrap_env(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     # Lazy imports: pull subprocess + env_manager only when needed.
     from cgx.codegen.test_runner import ensure_project_venv
     from cgx.codegen.env_manager import preflight_install, update_requirements
+
+    # Deterministic guard: a scaffold that pins an old framework without
+    # capping its transitive deps (e.g. ``flask==2.2.2`` while Werkzeug
+    # floats to 3.x, which deleted ``url_quote``) installs a combination
+    # that cannot import. Cap the known-incompatible transitives in
+    # requirements.txt *before* the venv installs so the fix is durable
+    # (survives re-bootstrap) and model-independent.
+    _pin_transitive_constraints(root)
 
     try:
         python_exe = ensure_project_venv(str(root), timeout=timeout)
@@ -211,6 +220,74 @@ def _detect_project_type(root: Path) -> str:
     if (root / "package.json").is_file():
         return "node"
     return "unknown"
+
+
+# Known transitive incompatibilities a scaffold routinely pins without a
+# matching cap. Each entry maps a *declared* package + version predicate
+# to the transitive constraint that must be present for the declared pin
+# to import. Keeping this a tiny, explicit table (rather than a resolver)
+# keeps the guard deterministic and auditable: we only touch a line when
+# we are certain the pinned combination is broken.
+#
+# Flask 2.2/2.1 import ``url_quote`` from ``werkzeug.urls``, which
+# Werkzeug 3.0 removed; an uncapped Werkzeug therefore floats to 3.x and
+# every ``import flask`` raises ``ImportError: cannot import name
+# 'url_quote'``. Capping Werkzeug < 2.3 restores a compatible pair.
+_TRANSITIVE_CAPS: Tuple[Tuple[str, str, str, str], ...] = (
+    ("flask", r"^2\.[12](\.|$)", "werkzeug", "werkzeug<2.3"),
+)
+
+
+def _pin_transitive_constraints(root: Path) -> List[str]:
+    """Cap known-incompatible transitive deps in ``requirements.txt``.
+
+    Scans the project's ``requirements.txt`` for any declared pin listed
+    in :data:`_TRANSITIVE_CAPS` and, when the pinned version matches the
+    predicate and the required transitive is not already constrained,
+    appends the cap. Idempotent (a cap already present is left alone) and
+    best-effort (a missing/unreadable file is a no-op). Returns the list
+    of constraint lines added, for logging/observability.
+    """
+    req_path = root / "requirements.txt"
+    if not req_path.is_file():
+        return []
+    try:
+        text = req_path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:  # pragma: no cover - defensive
+        return []
+    lines = text.splitlines()
+    declared: Dict[str, str] = {}
+    for raw in lines:
+        line = raw.split("#")[0].strip()
+        if not line or line.startswith("-"):
+            continue
+        name = re.split(r"[>=<!~;\[ ]", line, maxsplit=1)[0].strip()
+        if name:
+            declared[name.lower().replace("-", "_")] = line
+
+    added: List[str] = []
+    for pkg, version_re, transitive, cap in _TRANSITIVE_CAPS:
+        pkg_key = pkg.lower().replace("-", "_")
+        trans_key = transitive.lower().replace("-", "_")
+        spec = declared.get(pkg_key)
+        if not spec or trans_key in declared:
+            continue
+        version = spec[len(pkg):].lstrip(" =<>!~").strip()
+        if not re.match(version_re, version):
+            continue
+        added.append(cap)
+
+    if not added:
+        return []
+    tail = "\n" if text and not text.endswith("\n") else ""
+    try:
+        req_path.write_text(text + tail + "\n".join(added) + "\n",
+                            encoding="utf-8")
+    except Exception:  # pragma: no cover - defensive
+        return []
+    logger.info("BOOTSTRAP_ENV: pinned %d transitive constraint(s): %s",
+                len(added), added)
+    return added
 
 
 def _bootstrap_node(task: TaskNode, root: Path,

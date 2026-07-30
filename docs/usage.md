@@ -76,6 +76,127 @@ Colour is auto-disabled when stdout is not a TTY or when `NO_COLOR` /
 explicit subcommands below (`cgx index`, `cgx ask`, `cgx serve`, ...)
 remain available for scripted, non-interactive use.
 
+## The CLI (non-interactive subcommands)
+
+Every capability the dashboard and web UI expose is also available as a
+plain, scriptable subcommand. Run `cgx <command> --help` for the full,
+authoritative flag list; this section is the reference.
+
+| Command       | What it does                                                        |
+| ------------- | ------------------------------------------------------------------- |
+| `cgx`         | Open the interactive dashboard (same as `cgx dash`).                |
+| `cgx index`   | Parse → embed (two views) → FAISS → persist an index on disk.       |
+| `cgx query`   | Raw hybrid retrieval; prints the ranked chunks as JSON (no LLM).    |
+| `cgx ask`     | Grounded, read-only LLM answer streamed to the terminal.            |
+| `cgx plan`    | Generate a code-change plan (`plan_md` + structured diffs).         |
+| `cgx agent`   | Run the full Planner → Tracker → Judge loop toward a goal.          |
+| `cgx status`  | Print provider, hardware, and index status for a project.           |
+| `cgx serve`   | Launch the FastAPI + React web UI (`--host` / `--port`).            |
+| `cgx dash`    | Launch the interactive terminal dashboard.                          |
+
+`ask`, `plan`, `agent`, and `status` share the same **streaming engine**
+as the dashboard and web UI (`cgx.webui.handlers`): tokens stream as they
+arrive under a Braille spinner, and **Ctrl-C** cancels the running task
+(exit code `130`) by flipping the same `cancel_event` the UI's Stop
+button uses. Any other failure exits non-zero (`1`). Colour follows the
+same TTY / `NO_COLOR` / `CGX_FORCE_COLOR` rules as the dashboard, so
+piping to a file yields clean, escape-free text.
+
+### Shared provider & index flags
+
+`ask`, `plan`, `agent`, and `status` accept a common set of flags:
+
+| Flag             | Default                    | Purpose                                                     |
+| ---------------- | -------------------------- | ---------------------------------------------------------- |
+| `--project-root` | current directory          | Project whose index is queried / written.                  |
+| `--provider`     | `ollama`                   | One of `ollama`, `openai`, `openai-compat`, `gemini`, `custom`. |
+| `--model`        | provider default           | LLM name; always overrides a profile's model when given.   |
+| `--base-url`     | `http://localhost:11434`   | Provider endpoint (Ollama / OpenAI-compatible).            |
+| `--profile`      | none                       | A saved provider profile (see §1) — takes precedence over `--provider`/`--base-url`. |
+| `--index-dir`    | auto-discovered            | Override the FAISS `indices/` directory to read.           |
+| `--records`      | auto-discovered            | Override the `records.jsonl` path to read.                 |
+
+**Provider resolution.** `--profile` wins: its `kind`, `model`, and
+`base_url` are loaded from `~/.cgx/profiles.json`, with `--model` still
+able to override the model. Otherwise the explicit `--provider` /
+`--model` / `--base-url` values are used. When the provider is `ollama`
+and no model is given, CGX picks a hardware-appropriate default via
+`ollama_discovery.recommend_default_model()`. **API keys are never passed
+on the command line** — cloud providers read them from the environment
+(`OPENAI_API_KEY`, `GEMINI_API_KEY`) or the keyring-backed profile store,
+so nothing secret lands in your shell history.
+
+**Index discovery.** `ask`, `plan`, and `status` look for a *completed*
+index at `<project-root>/.cgx/index` (the same layout the dashboard's
+`/index` builds); `agent` uses it when present and can also run without
+one for greenfield generation. To make an index discoverable, build it
+into that path:
+
+```bash
+cgx index --project-root . --out-dir .cgx/index
+cgx ask "How does parse_codebase work?"
+```
+
+Or build it anywhere and point the reader at it explicitly:
+
+```bash
+cgx index --project-root . --out-dir /tmp/cgx_index
+cgx ask "How does parse_codebase work?" \
+        --index-dir /tmp/cgx_index/indices \
+        --records  /tmp/cgx_index/records.jsonl
+```
+
+> The index is read back with the **default Jina code-embedding model**,
+> so an index passed via `--index-dir` / `--records` must have been built
+> with that model (a mismatched embedding dimension is rejected at load).
+
+### `cgx ask` — grounded question answering
+
+```bash
+cgx ask "What does the retrieval orchestrator fuse?" \
+        --provider openai --model gpt-4o-mini --think
+```
+
+Streams a read-only, citation-grounded answer over the project's index.
+Add `--think` to also stream the model's reasoning sketch before the
+answer. The multi-word question is a positional argument (no quoting
+required, though quoting is fine).
+
+### `cgx plan` — self-testing change plans
+
+```bash
+cgx plan "Add a --json flag to the query command" \
+         --self-test --run-tests --profile my-ollama
+```
+
+Emits a markdown plan plus structured diffs. `--self-test` has the
+planner validate and repair its own diffs (parse + dry-apply +
+`ast.parse`); `--run-tests` executes the project's impacted tests in a
+sandbox. See §4 for the UI equivalent and the report shape.
+
+### `cgx agent` — multi-step agent loop
+
+```bash
+cgx agent "Add docstrings to every public function in cgx.parser" \
+          --stop-on-fail
+```
+
+Runs the batch Planner → Tracker → Judge loop (§7) and streams each
+task's start / progress / done / retry events. `--stop-on-fail` halts on
+the first failed task instead of continuing. With no discoverable index
+the loop can still scaffold a brand-new project into `--project-root`.
+
+### `cgx status` — environment & index summary
+
+```bash
+cgx status --provider ollama
+```
+
+Prints the resolved provider and model, a live Ollama reachability check
+(when applicable), detected RAM / VRAM, and whether the project's index
+is built (with its build timestamp and embedding model). This is the
+non-interactive form of the dashboard's `/status` command.
+
 ## 1. Pick a provider
 
 CGX supports four provider kinds, all configurable from the **⚙️ Setup**
@@ -247,10 +368,22 @@ Implementation lives in `src/cgx/embeddings/cache.py`.
 
 ## 3. Ask a question
 
+There are two CLI entry points here. `cgx query` runs **raw hybrid
+retrieval** and prints the ranked chunks as JSON — no LLM is involved,
+which is ideal for debugging retrieval or piping into other tooling:
+
 ```bash
 cgx query --index-dir /tmp/cgx_index/indices \
           --records  /tmp/cgx_index/records.jsonl \
           --query    "What does parse_codebase do?"
+```
+
+`cgx ask` runs the full **grounded-answer** path — retrieval plus an LLM
+that streams a cited answer to the terminal (see the CLI reference above
+for provider flags and index discovery):
+
+```bash
+cgx ask "What does parse_codebase do?" --think
 ```
 
 Or open the **Ask** tab. The streaming panel shows the model's
@@ -264,6 +397,16 @@ keeps streaming in the background and the accumulated messages are
 restored when you return to the Ask tab.
 
 ## 4. Generate a change plan
+
+From the CLI:
+
+```bash
+cgx plan "Add a --json flag to the query command" --self-test --run-tests
+```
+
+`--self-test` maps to **Validate diffs** and `--run-tests` to **Run
+impacted tests** (both described below); the plan and its report stream
+to the terminal.
 
 The **Plan** tab accepts a free-form task description. Recommended
 options:
@@ -766,6 +909,18 @@ The legacy Agent view at `/agent-legacy` runs a Planner → Tracker →
 Judge loop in batch mode. This is the original `cgx.agents` shape,
 preserved for fire-and-forget goals and for the `cgx agent` CLI; the
 new session-based view at `/agent` (§6) is the default.
+
+From the CLI:
+
+```bash
+cgx agent "Add docstrings to every public function in cgx.parser" \
+          --stop-on-fail
+```
+
+`--stop-on-fail` halts on the first failed task; omit it to let the loop
+continue and report per-task outcomes at the end (see the CLI reference
+for provider flags). This is the exact same loop as the programmatic
+`run_agent` shown below.
 
 A picture-first overview lives in [flowcharts.md](flowcharts.md) -- the
 "general user" SVG matches the UI flow described below.

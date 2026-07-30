@@ -19,13 +19,18 @@ compatible with prior flags seen in the project.
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Callable, Dict
 
 from cgx.pipeline.auto import run_index_auto, run_query_auto
 from cgx.config import EmbeddingConfig, FaissConfig, HybridSearchConfig
 from cgx.embeddings.loader import load_embedder_from_spec
+
+# Provider kinds accepted by ``--provider``; mirrors the dashboard so the
+# non-interactive CLI and the TUI resolve providers identically.
+_PROVIDER_KINDS = ("ollama", "openai", "openai-compat", "gemini", "custom")
 
 
 def _resolve_embedder_or_model(args: argparse.Namespace) -> tuple[Any, str]:
@@ -108,6 +113,144 @@ def _cmd_dash(args: argparse.Namespace) -> None:
     run_dashboard(project_root=getattr(args, "project_root", None))
 
 
+# --- grounded ask / plan / agent (shared streaming path) ----------------
+
+def _ensure_model(state: Any) -> None:
+    """Fill in a sensible default Ollama model when none was supplied."""
+    if state.model or state.provider_kind != "ollama":
+        return
+    try:
+        from cgx.answer import ollama_discovery
+        state.model = ollama_discovery.recommend_default_model()
+    except Exception:
+        state.model = "qwen2.5-coder:3b"
+
+
+def _state_from_args(args: argparse.Namespace) -> Any:
+    """Build a :class:`DashboardState` from shared provider flags.
+
+    A ``--profile`` takes precedence (kind/model/base_url come from the saved
+    profile); otherwise the explicit ``--provider``/``--model``/``--base-url``
+    values are used. ``--model`` always overrides a profile's model when given.
+    """
+    from cgx.cli.tui.app import DashboardState
+
+    root = os.path.abspath(getattr(args, "project_root", None) or os.getcwd())
+    state = DashboardState(project_root=root)
+    profile = getattr(args, "profile", None)
+    if profile:
+        from cgx.answer.profiles import get_profile
+        prof = get_profile(profile)
+        if prof is None:
+            raise SystemExit(f"unknown provider profile: {profile!r}")
+        state.profile_name = prof.name
+        state.provider_kind = prof.kind
+        state.model = prof.model or ""
+        if prof.base_url:
+            state.base_url = prof.base_url
+    else:
+        state.provider_kind = getattr(args, "provider", None) or "ollama"
+        state.base_url = getattr(args, "base_url", None) or state.base_url
+    if getattr(args, "model", None):
+        state.model = args.model
+    _ensure_model(state)
+    return state
+
+
+def _run_cli_stream(make_iter: Callable[[Any], Any]) -> None:
+    """Drive a handler event stream to the terminal (spinner + tokens).
+
+    Mirrors the dashboard's :meth:`Dashboard._stream` but for a one-shot
+    command: maps ``(type, payload)`` events through :func:`ops.map_event`
+    onto a :class:`~cgx.cli.tui.runner.Printer`, honouring Ctrl-C cancel.
+    """
+    import threading
+
+    from cgx.cli.tui import ansi, ops
+    from cgx.cli.tui.runner import Printer, run_stream
+
+    enabled = ansi.color_enabled()
+    printer = Printer(is_tty=sys.stdout.isatty(), enabled=enabled)
+    cancel = threading.Event()
+
+    def on_event(item: Any) -> None:
+        etype, payload = item
+        instr = ops.map_event(etype, payload, enabled=enabled)
+        if instr.op == "status":
+            printer.set_status(instr.text)
+        elif instr.op == "inline":
+            printer.inline(instr.text)
+        elif instr.op == "line":
+            printer.line(instr.text)
+
+    try:
+        status = run_stream(lambda: make_iter(cancel), on_event=on_event,
+                            printer=printer, cancel_event=cancel)
+    except Exception as exc:
+        printer.line(f"error: {type(exc).__name__}: {exc}")
+        raise SystemExit(1)
+    if status == "cancelled":
+        raise SystemExit(130)
+
+
+def _cmd_ask(args: argparse.Namespace) -> None:
+    """Stream a grounded, read-only answer over the project's index."""
+    from cgx.cli.tui import ops
+
+    state = _state_from_args(args)
+    question = " ".join(args.question)
+    _run_cli_stream(lambda ce: ops.ask_events(
+        state, question, index_dir=args.index_dir, records=args.records,
+        think=args.think, cancel_event=ce))
+
+
+def _cmd_plan(args: argparse.Namespace) -> None:
+    """Stream a code-change plan (plan_md + structured diffs)."""
+    from cgx.cli.tui import ops
+
+    state = _state_from_args(args)
+    task = " ".join(args.task)
+    _run_cli_stream(lambda ce: ops.plan_events(
+        state, task, index_dir=args.index_dir, records=args.records,
+        self_test=args.self_test, run_tests=args.run_tests, cancel_event=ce))
+
+
+def _cmd_agent(args: argparse.Namespace) -> None:
+    """Stream the full Planner → Tracker → Judge agent loop."""
+    from cgx.cli.tui import ops
+
+    state = _state_from_args(args)
+    goal = " ".join(args.goal)
+    _run_cli_stream(lambda ce: ops.agent_events(
+        state, goal, index_dir=args.index_dir, records=args.records,
+        stop_on_fail=args.stop_on_fail, cancel_event=ce))
+
+
+def _cmd_status(args: argparse.Namespace) -> None:
+    """Print provider + hardware + index status for the project."""
+    from cgx.cli.tui import ops
+
+    print(ops.probe_status(_state_from_args(args)))
+
+
+def _add_provider_flags(p: argparse.ArgumentParser) -> None:
+    """Register the provider/index flags shared by ask/plan/agent/status."""
+    p.add_argument("--project-root", default=None,
+                   help="Project directory (default: current dir).")
+    p.add_argument("--model", default=None,
+                   help="LLM model name (overrides a profile's model).")
+    p.add_argument("--provider", default="ollama", choices=_PROVIDER_KINDS,
+                   help="Provider kind when no --profile is given.")
+    p.add_argument("--base-url", default="http://localhost:11434",
+                   help="Provider base URL (ollama/openai-compat).")
+    p.add_argument("--profile", default=None,
+                   help="Saved provider profile (overrides --provider/--model).")
+    p.add_argument("--index-dir", default=None,
+                   help="Override auto-discovered index dir (<project>/.cgx/index).")
+    p.add_argument("--records", default=None,
+                   help="Override auto-discovered records.jsonl.")
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="cgx", description="Codebase RAG CLI")
     # No subcommand -> launch the interactive dashboard (the friendly
@@ -172,6 +315,41 @@ def main(argv: list[str] | None = None) -> None:
     p_d.add_argument("--project-root", default=None,
                      help="Project directory to open (default: current dir).")
     p_d.set_defaults(func=_cmd_dash)
+
+    # ask -- grounded, read-only Q&A over the project index
+    p_ask = sub.add_parser(
+        "ask", help="Ask a grounded question about the indexed project.")
+    p_ask.add_argument("question", nargs="+", help="The question to ask.")
+    p_ask.add_argument("--think", action="store_true",
+                       help="Stream the model's reasoning before the answer.")
+    _add_provider_flags(p_ask)
+    p_ask.set_defaults(func=_cmd_ask)
+
+    # plan -- generate a code-change plan (plan_md + structured diffs)
+    p_plan = sub.add_parser(
+        "plan", help="Generate a code-change plan for a task.")
+    p_plan.add_argument("task", nargs="+", help="What to plan/change.")
+    p_plan.add_argument("--self-test", action="store_true",
+                        help="Have the planner critique/repair its own plan.")
+    p_plan.add_argument("--run-tests", action="store_true",
+                        help="Execute the project's tests as part of planning.")
+    _add_provider_flags(p_plan)
+    p_plan.set_defaults(func=_cmd_plan)
+
+    # agent -- full Planner -> Tracker -> Judge loop
+    p_ag = sub.add_parser(
+        "agent", help="Run the multi-step agent loop toward a goal.")
+    p_ag.add_argument("goal", nargs="+", help="The goal for the agent.")
+    p_ag.add_argument("--stop-on-fail", action="store_true",
+                      help="Halt the loop on the first failed task.")
+    _add_provider_flags(p_ag)
+    p_ag.set_defaults(func=_cmd_agent)
+
+    # status -- provider + hardware + index summary
+    p_st = sub.add_parser(
+        "status", help="Show provider, hardware, and index status.")
+    _add_provider_flags(p_st)
+    p_st.set_defaults(func=_cmd_status)
 
     args = parser.parse_args(argv)
     # Bare `cgx` (no subcommand) opens the dashboard.

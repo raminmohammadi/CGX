@@ -23,6 +23,11 @@ export const SIDE_PANEL_DEFAULT = 288;
 export interface AgentSessionUIState {
   activeId: string | null;
   selectedTaskId: string | null;
+  // Model each run was dispatched with, keyed by session id. The provider is
+  // frozen into the backend drain at dispatch time, so a mid-run profile
+  // switch can't retro-apply; this lets the UI show which model the in-flight
+  // run is actually using versus the currently-selected profile.
+  runModels: Record<string, string>;
   sessionBarWidth: number;
   sessionBarCollapsed: boolean;
   taskTreeWidth: number;
@@ -30,6 +35,7 @@ export interface AgentSessionUIState {
   sidePanelCollapsed: boolean;
   setActiveId: (id: string | null) => void;
   setSelectedTaskId: (id: string | null) => void;
+  setRunModel: (sid: string, model: string) => void;
   setSessionBarWidth: (w: number) => void;
   setSessionBarCollapsed: (v: boolean) => void;
   setTaskTreeWidth: (w: number) => void;
@@ -45,6 +51,7 @@ export const useAgentSession = create<AgentSessionUIState>()(
     (set) => ({
       activeId: null,
       selectedTaskId: null,
+      runModels: {},
       sessionBarWidth: SESSION_BAR_DEFAULT,
       sessionBarCollapsed: false,
       taskTreeWidth: TASK_TREE_DEFAULT,
@@ -52,6 +59,8 @@ export const useAgentSession = create<AgentSessionUIState>()(
       sidePanelCollapsed: false,
       setActiveId: (id) => set({ activeId: id }),
       setSelectedTaskId: (id) => set({ selectedTaskId: id }),
+      setRunModel: (sid, model) =>
+        set((s) => ({ runModels: { ...s.runModels, [sid]: model } })),
       setSessionBarWidth: (w) =>
         set({ sessionBarWidth: clamp(w, SESSION_BAR_MIN, SESSION_BAR_MAX) }),
       setSessionBarCollapsed: (v) => set({ sessionBarCollapsed: v }),

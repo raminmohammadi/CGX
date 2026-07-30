@@ -15,6 +15,7 @@ export default function AgentPage() {
   const { provider, index, projectRoot, setProjectRoot } = useWorkspace();
   const {
     activeId, setActiveId, selectedTaskId, setSelectedTaskId,
+    runModels, setRunModel,
   } = useAgentSession();
 
   const [state, setState] = useState<AgentSessionState | null>(null);
@@ -147,6 +148,7 @@ export default function AgentPage() {
         run_initial_task: true,
       });
       setState(next);
+      setRunModel(next.session.session_id, provider.model);
       setActiveId(next.session.session_id);
       setSelectedTaskId(next.session.root_task_id);
       await refreshSessions();
@@ -154,7 +156,7 @@ export default function AgentPage() {
       setError(String((e as Error)?.message || e));
     } finally { setPending(false); }
   }, [index, provider, projectRoot, setProjectRoot, refreshSessions,
-      setActiveId, setSelectedTaskId]);
+      setActiveId, setSelectedTaskId, setRunModel]);
 
   const deleteSession = useCallback(async (sid: string) => {
     setError(null);
@@ -181,11 +183,12 @@ export default function AgentPage() {
         rationale: payload.rationale ?? null,
         index, provider, run_initial_task: true,
       });
+      setRunModel(activeId, provider.model);
       setState(next);
     } catch (e) {
       setError(String((e as Error)?.message || e));
     } finally { setPending(false); }
-  }, [activeId, index, provider]);
+  }, [activeId, index, provider, setRunModel]);
 
   const postMessage = useCallback(async () => {
     if (!activeId || !reply.trim()) return;
@@ -195,11 +198,12 @@ export default function AgentPage() {
         message: reply.trim(),
         index, provider, run_initial_task: true,
       });
+      setRunModel(activeId, provider.model);
       setState(next); setReply("");
     } catch (e) {
       setError(String((e as Error)?.message || e));
     } finally { setPending(false); }
-  }, [activeId, index, provider, reply]);
+  }, [activeId, index, provider, reply, setRunModel]);
 
   // Cooperative cancel (P2.2): ask the backend to stop the drain after
   // the current task. SSE then converges the snapshot to the stopped
@@ -243,6 +247,7 @@ export default function AgentPage() {
     <LiveView
       state={state} sessions={sessions} pending={pending} error={error}
       progress={progress} running={running}
+      runModel={runModels[activeId] ?? null} selectedModel={provider.model}
       reply={reply} setReply={setReply}
       selectedTaskId={selectedTaskId} setSelectedTaskId={setSelectedTaskId}
       onDecide={(payload) => {

@@ -273,10 +273,14 @@ export interface TaskProgress {
   total: number;
   path: string;
   layer?: string;
-  status: "start" | "done" | "failed" | string;
+  status: "start" | "stream" | "done" | "failed" | string;
   bytes?: number;
   elapsed_ms?: number;
   eta_seconds: number | null;
+  // Running count of files that failed so far. On failure ``index`` does not
+  // advance, so this lets the UI surface the failure instead of showing what
+  // looks like a counter reset.
+  failed_count?: number;
 }
 
 export interface AgentSessionState {

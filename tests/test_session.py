@@ -1238,6 +1238,53 @@ def test_router_api_check_failed_skips_repair_when_flapping():
         session=session, completed=api, tasks=[api])
     creates = [a for a in plan.actions if isinstance(a, CreateTask)]
     assert creates == []
+    # C: a failed gate that declines to spawn REPAIR must resolve the
+    # session terminally rather than leave the drain loop idle.
+    status = [a for a in plan.actions if isinstance(a, UpdateSessionStatus)]
+    assert len(status) == 1
+    assert status[0].status is SessionStatus.FAILED
+
+
+def test_router_api_check_failed_budget_exhausted_terminates_session():
+    """C: API_CHECK failed with the repair budget spent -> terminal FAILED."""
+    from cgx.session.models import SessionMode
+    from cgx.session.router import _REPAIR_BUDGET
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    api = TaskNode.new(
+        session.session_id, TaskKind.API_CHECK, "api",
+        inputs={"build_artifact_id": "art_build",
+                "mode": SessionMode.GREENFIELD.value,
+                "repair_attempt": _REPAIR_BUDGET,
+                "prior_failure_signatures": []})
+    api.produced_artifact_id = "art_api"
+    api.outputs = {"outcome": "failed", "failed_count": 1,
+                   "failure_signature": "api_check|werkzeug.urls.url_quote"}
+    api.status = TaskNodeStatus.DONE
+    plan = Router().on_task_completed(
+        session=session, completed=api, tasks=[api])
+    assert [a for a in plan.actions if isinstance(a, CreateTask)] == []
+    status = [a for a in plan.actions if isinstance(a, UpdateSessionStatus)]
+    assert len(status) == 1
+    assert status[0].status is SessionStatus.FAILED
+
+
+def test_router_api_check_passed_does_not_terminate_session():
+    """C guard is scoped to failures: a passed gate spawns SMOKE, no status."""
+    from cgx.session.models import SessionMode
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    api = TaskNode.new(
+        session.session_id, TaskKind.API_CHECK, "api",
+        inputs={"build_artifact_id": "art_build",
+                "mode": SessionMode.GREENFIELD.value})
+    api.produced_artifact_id = "art_api"
+    api.outputs = {"outcome": "passed", "failed_count": 0}
+    api.status = TaskNodeStatus.DONE
+    plan = Router().on_task_completed(
+        session=session, completed=api, tasks=[api])
+    assert not [a for a in plan.actions if isinstance(a, UpdateSessionStatus)]
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    assert len(creates) == 1
+    assert creates[0].task.kind is TaskKind.SMOKE
 
 
 def test_router_repair_install_deps_spawns_bootstrap_env():
@@ -1360,6 +1407,9 @@ def test_router_smoke_failed_respects_repair_budget():
     plan = Router().on_task_completed(
         session=session, completed=sm, tasks=[sm])
     assert [a for a in plan.actions if isinstance(a, CreateTask)] == []
+    status = [a for a in plan.actions if isinstance(a, UpdateSessionStatus)]
+    assert len(status) == 1
+    assert status[0].status is SessionStatus.FAILED
 
 
 def test_router_smoke_failed_flap_detector_blocks_repeat():
@@ -1378,6 +1428,9 @@ def test_router_smoke_failed_flap_detector_blocks_repeat():
     plan = Router().on_task_completed(
         session=session, completed=sm, tasks=[sm])
     assert [a for a in plan.actions if isinstance(a, CreateTask)] == []
+    status = [a for a in plan.actions if isinstance(a, UpdateSessionStatus)]
+    assert len(status) == 1
+    assert status[0].status is SessionStatus.FAILED
 
 
 # --------------------- repair-loop router transitions ---------------------
@@ -2744,6 +2797,44 @@ def test_clarify_executor_falls_back_when_llm_returns_too_few():
     assert result.artifact.content["source"] == "fallback"
 
 
+def test_chips_from_hint_derives_from_example_marker():
+    from cgx.session.tasks.clarify_requirements import _chips_from_hint
+    assert _chips_from_hint("e.g. Python + FastAPI, Node + Express") == [
+        "Python + FastAPI", "Node + Express"]
+    assert _chips_from_hint("Example: SQLite, PostgreSQL") == [
+        "SQLite", "PostgreSQL"]
+    assert _chips_from_hint("SQLite or Postgres") == ["SQLite", "Postgres"]
+    # Plain instruction with no marker/list yields nothing.
+    assert _chips_from_hint("Pick a storage layer") == []
+    assert _chips_from_hint("") == []
+
+
+def test_clarify_parse_backfills_chips_from_hint_when_suggested_missing():
+    import json
+    from cgx.session.tasks.clarify_requirements import (
+        run_clarify_requirements,
+    )
+    payload = json.dumps({"questions": [
+        {"id": "q1", "prompt": "Which framework?",
+         "hint": "e.g. FastAPI, Flask"},
+        {"id": "q2", "prompt": "Which database?",
+         "hint": "Example: SQLite, Postgres"},
+        {"id": "q3", "prompt": "Need auth?", "hint": "Pick a scope"},
+    ]})
+    provider = _StubProvider(payload)
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    t = TaskNode.new(session.session_id, TaskKind.CLARIFY_REQUIREMENTS,
+                     "c", inputs={"goal": "build a Flask app"})
+    result = run_clarify_requirements(t, ExecutorDeps(provider=provider))
+    assert result.failure is None
+    assert result.artifact.content["source"] == "llm"
+    qs = {q["id"]: q for q in result.artifact.content["questions"]}
+    assert qs["q1"]["suggested"] == ["FastAPI", "Flask"]
+    assert qs["q2"]["suggested"] == ["SQLite", "Postgres"]
+    # No example marker/list -> stays empty (no bogus chip).
+    assert qs["q3"]["suggested"] == []
+
+
 def test_decompose_executor_requires_provider_and_store(store):
     from cgx.session.tasks.decompose import run_decompose
     session = Session.new("g", mode=SessionMode.GREENFIELD)
@@ -3483,6 +3574,41 @@ def test_bootstrap_env_python_takes_priority_over_package_json(tmp_path):
     assert _detect_project_type(tmp_path) == "node"
     (tmp_path / "requirements.txt").write_text("flask\n", encoding="utf-8")
     assert _detect_project_type(tmp_path) == "python"
+
+
+def test_pin_transitive_caps_werkzeug_for_flask_22(tmp_path):
+    """B: Flask 2.2.x without a Werkzeug pin gets ``werkzeug<2.3`` appended."""
+    from cgx.session.tasks.bootstrap_env import _pin_transitive_constraints
+    req = tmp_path / "requirements.txt"
+    req.write_text("flask==2.2.2\ngunicorn==20.1.0\n", encoding="utf-8")
+    added = _pin_transitive_constraints(tmp_path)
+    assert added == ["werkzeug<2.3"]
+    text = req.read_text(encoding="utf-8")
+    assert "werkzeug<2.3" in text
+    # Idempotent: a second pass sees the cap already present and no-ops.
+    assert _pin_transitive_constraints(tmp_path) == []
+
+
+def test_pin_transitive_noop_when_werkzeug_already_pinned(tmp_path):
+    """B: an explicit Werkzeug constraint is respected (no double-cap)."""
+    from cgx.session.tasks.bootstrap_env import _pin_transitive_constraints
+    req = tmp_path / "requirements.txt"
+    req.write_text("flask==2.2.2\nWerkzeug==2.2.3\n", encoding="utf-8")
+    assert _pin_transitive_constraints(tmp_path) == []
+
+
+def test_pin_transitive_noop_for_flask_3x(tmp_path):
+    """B: Flask 3.x ships a compatible Werkzeug -- no cap is injected."""
+    from cgx.session.tasks.bootstrap_env import _pin_transitive_constraints
+    req = tmp_path / "requirements.txt"
+    req.write_text("flask==3.0.0\n", encoding="utf-8")
+    assert _pin_transitive_constraints(tmp_path) == []
+
+
+def test_pin_transitive_noop_when_no_requirements(tmp_path):
+    """B: a project without requirements.txt is a graceful no-op."""
+    from cgx.session.tasks.bootstrap_env import _pin_transitive_constraints
+    assert _pin_transitive_constraints(tmp_path) == []
 
 
 def test_bootstrap_env_node_runs_npm_install(tmp_path, store, monkeypatch):
@@ -6821,7 +6947,8 @@ def test_router_repair_regenerate_without_scaffold_ancestor_fails_session():
 def _build_apply_failed_chain(*, prior_regens: int = 0,
                               prior_replans: int = 0,
                               mode: str = "greenfield",
-                              with_scaffold: bool = True):
+                              with_scaffold: bool = True,
+                              survivors: int = 8):
     """Build a SCAFFOLD -> APPLY chain where APPLY dropped invalid files."""
     from cgx.session.models import SessionMode
     session = Session.new("g", mode=(SessionMode.GREENFIELD
@@ -6837,7 +6964,7 @@ def _build_apply_failed_chain(*, prior_regens: int = 0,
                     "regenerate_attempt": prior_regens,
                     "replan_attempt": prior_replans})
         scaffold.outputs = {"scaffold_artifact_id": "art_scaffold",
-                            "generated_count": 8, "failed_count": 1,
+                            "generated_count": survivors, "failed_count": 1,
                             "failed": [{"file": "backend/main.py",
                                         "error": "generator returned empty "
                                                  "patch"}]}
@@ -6926,11 +7053,27 @@ def test_router_apply_failed_files_budget_exhausted_escalates_to_replan():
                 and a.status is TaskNodeStatus.ABANDONED]
 
 
-def test_router_apply_failed_files_replan_budget_exhausted_fails_session():
-    """C2: both regenerate and re-plan budgets spent -> terminal FAILED."""
+def test_router_apply_failed_files_replan_budget_exhausted_proceeds_with_survivors():
+    """B: budgets spent but survivors exist -> proceed on the normal
+    APPLY -> BOOTSTRAP_ENV edge instead of discarding the run."""
     from cgx.session.router import _REGENERATE_BUDGET, _REPLAN_BUDGET
     session, _scaffold, apply_t, tasks = _build_apply_failed_chain(
         prior_regens=_REGENERATE_BUDGET, prior_replans=_REPLAN_BUDGET)
+    plan = Router().on_task_completed(
+        session=session, completed=apply_t, tasks=tasks)
+    # No terminal failure: the successfully applied files carry forward.
+    assert not [a for a in plan.actions if isinstance(a, UpdateSessionStatus)]
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    assert len(creates) == 1
+    assert creates[0].task.kind is TaskKind.BOOTSTRAP_ENV
+
+
+def test_router_apply_failed_files_replan_budget_exhausted_no_survivors_fails():
+    """B: budgets spent and nothing generated cleanly -> terminal FAILED."""
+    from cgx.session.router import _REGENERATE_BUDGET, _REPLAN_BUDGET
+    session, _scaffold, apply_t, tasks = _build_apply_failed_chain(
+        prior_regens=_REGENERATE_BUDGET, prior_replans=_REPLAN_BUDGET,
+        survivors=0)
     plan = Router().on_task_completed(
         session=session, completed=apply_t, tasks=tasks)
     assert [a for a in plan.actions if isinstance(a, CreateTask)] == []
@@ -6966,7 +7109,8 @@ def test_router_apply_failed_files_explore_mode_proceeds_normally():
 def _build_scaffold_failed_chain(*, prior_regens: int = 0,
                                  prior_replans: int = 0,
                                  failed_count: int = 2,
-                                 with_pending_child: bool = True):
+                                 with_pending_child: bool = True,
+                                 survivors: int = 8):
     """Build a SCAFFOLD that dropped files, with an optional live APPLY child.
 
     Mirrors :func:`_build_apply_failed_chain` but the failure surfaces on
@@ -6993,7 +7137,7 @@ def _build_scaffold_failed_chain(*, prior_regens: int = 0,
         {"file": "backend/main.py",
          "error": "generator returned empty patch"}][:failed_count]
     scaffold.outputs = {"scaffold_artifact_id": "art_scaffold",
-                        "generated_count": 8,
+                        "generated_count": survivors,
                         "failed_count": failed_count, "failed": failed}
     scaffold.status = TaskNodeStatus.DONE
     tasks = [parent, scaffold]
@@ -7069,11 +7213,27 @@ def test_router_scaffold_failed_files_budget_exhausted_escalates_to_replan():
     assert {p.task_id for p in pending} <= abandoned
 
 
-def test_router_scaffold_failed_files_replan_budget_exhausted_fails_session():
-    """C2: both regenerate and re-plan budgets spent -> terminal FAILED."""
+def test_router_scaffold_failed_files_replan_budget_exhausted_proceeds_with_survivors():
+    """B: budgets spent but survivors exist -> proceed on the normal
+    SCAFFOLD -> APPLY edge instead of discarding the run."""
     from cgx.session.router import _REGENERATE_BUDGET, _REPLAN_BUDGET
     session, _parent, scaffold, tasks = _build_scaffold_failed_chain(
-        prior_regens=_REGENERATE_BUDGET, prior_replans=_REPLAN_BUDGET)
+        prior_regens=_REGENERATE_BUDGET, prior_replans=_REPLAN_BUDGET,
+        with_pending_child=False)
+    plan = Router().on_task_completed(
+        session=session, completed=scaffold, tasks=tasks)
+    assert not [a for a in plan.actions if isinstance(a, UpdateSessionStatus)]
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    assert len(creates) == 1
+    assert creates[0].task.kind is TaskKind.APPLY
+
+
+def test_router_scaffold_failed_files_replan_budget_exhausted_no_survivors_fails():
+    """B: budgets spent and nothing generated cleanly -> terminal FAILED."""
+    from cgx.session.router import _REGENERATE_BUDGET, _REPLAN_BUDGET
+    session, _parent, scaffold, tasks = _build_scaffold_failed_chain(
+        prior_regens=_REGENERATE_BUDGET, prior_replans=_REPLAN_BUDGET,
+        with_pending_child=False, survivors=0)
     plan = Router().on_task_completed(
         session=session, completed=scaffold, tasks=tasks)
     assert [a for a in plan.actions if isinstance(a, CreateTask)] == []
