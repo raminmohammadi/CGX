@@ -592,6 +592,197 @@ Four entry points cover every transition:
   | `APPROVE_PLAN` `approved=false` | No successor (loop halts; user can restart with a new objective) |
   | `FREEFORM`                 | None (handled as a new user message by the caller) |
 
+### Contract-first greenfield write loop
+
+The greenfield write loop is the deepest chain the router drives, and
+recent work turned it from "generate files, run the tests the model
+wrote, hope" into a **contract-first, runtime-verified, progress-gated**
+pipeline. A contributor touching any greenfield executor should read
+this subsection first; the six moving parts are:
+
+1. **Contract-first `DECOMPOSE`.** The planner emits a `WORK_PLAN`
+   artifact that now carries a `contracts` block alongside `layers`.
+   `contracts` is a bounded dict over four categories -- `endpoints`
+   (HTTP method + path), `schemas` (class/model names), `functions`
+   (name + owning module) and `constants` (module-level names) -- the
+   *shared interfaces* every file must agree on. `_coerce_contracts`
+   (`cgx.session.tasks.decompose`) normalises it defensively;
+   `_contract_entry_count` is surfaced on the task output. The block is
+   threaded verbatim into each `generate_single_scaffold_file(...,
+   contracts=...)` call so cross-file assumptions are *declared once and
+   honoured*, not independently re-derived per file (the historical
+   source of most cross-file breakage that only surfaced at `VERIFY`).
+
+2. **Contract enforcement gate + coherence pass (`SCAFFOLD`).** After
+   the per-file loop, `run_scaffold` runs two best-effort static gates
+   from `cgx.session.scaffold_validate` before `APPLY` writes anything:
+   * `cross_check_first_party_imports` -- parses every generated `.py`
+     file and flags each `from <first-party> import <name>` whose target
+     is a sibling module that never defines `<name>`. The
+     `_reconcile_import_warnings` **coherence pass** then regenerates
+     *only* the importer files that reference an undefined sibling
+     symbol, bounded by `_COHERENCE_PASS_BUDGET` (one hop) so a stubborn
+     model cannot loop. This closes the window where the parallel path
+     froze a per-layer snapshot and a late file referenced a symbol an
+     earlier sibling never wrote.
+   * `check_contract_compliance` -- verifies the finished tree honours
+     the `WORK_PLAN` `contracts` block (declared endpoints appear
+     verbatim, declared schemas/functions/constants are defined). Both
+     record `import_warnings` / `contract_warnings` on the
+     `SCAFFOLD_PATCHES` artifact rather than failing the scaffold; the
+     router can fold a warning into a targeted regenerate constraint.
+
+3. **`RUNTIME_VERIFY` -- boot the app, not just its tests.** A brand-new
+   `TaskKind.RUNTIME_VERIFY` executor
+   (`cgx.session.tasks.runtime_verify`) sits after a *passing* greenfield
+   `VERIFY`. A unit suite the model wrote can be green while the app
+   never boots (an import-time `NameError`, a broken `create_app`
+   wiring, a config read that throws at module load). For each detected
+   entry module (`app.py` / `main.py` / a file that statically
+   references `Flask(` / `FastAPI(` / `create_app`) it runs an
+   import-and-call smoke *under the bootstrapped venv* and emits a
+   `RUNTIME_REPORT` whose `probes` pair each entry with `ok` / `kind` /
+   `stderr_tail`. The `outcome` token (`passed` / `failed` / `timeout` /
+   `error` / `skipped`) drives the terminal branch; a boot failure never
+   raises `ExecutorResult.failure`, so the structured report is always
+   persisted for the classifier.
+
+4. **Runtime-failure classification + routing.** `_verify_successors`
+   is the new fork: greenfield + `passed` hands off to `RUNTIME_VERIFY`;
+   everything else keeps the existing repair-or-terminal path.
+   `_runtime_verify_to_repair_or_terminal` routes a hard boot outcome
+   (`_REPAIRABLE_RUNTIME_OUTCOMES = {failed, timeout, error}`) to
+   `REPAIR` with the `RUNTIME_REPORT` as the source artifact, under the
+   same shared budget + `failure_signature` flap detector as the
+   `SMOKE` / `API_CHECK` gates. `passed` / `skipped` COMPLETE the session
+   via `_runtime_verify_terminal_session_actions`.
+
+5. **Progress-aware + coverage-aware budgets.** The old loop gave up
+   after two shots even while it was genuinely improving.
+   `_repair_progress_stalled` replaces the flat cap with a *ledger*: the
+   loop keeps going while the **failing-test count strictly drops** round
+   over round, backed by a **passing-count** trend
+   (`prior_passing_counts`) so a repair that trades one failure for a new
+   pass still counts as forward motion. A `failure_signature` flap
+   backstop covers non-assertion outcomes, and everything sits under the
+   absolute `_REPAIR_BUDGET` (raised to 4). The ledgers
+   (`prior_failing_counts`, `prior_passing_counts`,
+   `prior_failure_signatures`) are threaded through every intermediate
+   node (`REPAIR -> APPLY -> VERIFY -> RUNTIME_VERIFY`) so the router
+   stays IO-free.
+
+6. **Traceback-localized, retrieval-fed `REPAIR`.** When no
+   deterministic classifier matches, `_propose_llm_logic_repair` builds
+   its candidate file set failure-first: `traceback_source_files`
+   surfaces the files named in the crash frames (that is where the error
+   actually flowed, and may be a file `APPLY` never touched), then the
+   files `APPLY` wrote/selected. Any remaining slot up to
+   `_LLM_REPAIR_MAX_FILES` is filled by **hybrid retrieval**
+   (`_retrieval_relevant_files` -> `run_query_auto`) over the project
+   index so a fix that must reach a symbol neither the traceback nor
+   `APPLY` named is still in scope -- a no-op in greenfield (no index),
+   and self-disabling on any retrieval error.
+
+#### Flow view -- the interstate highway system
+
+Read tasks as **highways**, the router as the **interchange system**
+deciding which on-ramp each artifact takes, and artifacts
+(`WORK_PLAN`, `SCAFFOLD_PATCHES`, `VERIFY_REPORT`, `RUNTIME_REPORT`,
+`REPAIR_PLAN`) as the **freight** trucked between them.
+
+```mermaid
+flowchart LR
+    subgraph FREIGHT[Freight = artifacts]
+      direction TB
+      WP[["WORK_PLAN<br/>layers + contracts"]]
+      SP[["SCAFFOLD_PATCHES<br/>+ import/contract warnings"]]
+      VR[["VERIFY_REPORT<br/>failing/passing counts"]]
+      RR[["RUNTIME_REPORT<br/>boot probes"]]
+      RP[["REPAIR_PLAN<br/>diffs"]]
+    end
+
+    DEC(["DECOMPOSE hwy<br/>contract-first plan"]) --> WP
+    WP --> SCA(["SCAFFOLD hwy<br/>gen + coherence + gates"])
+    SCA --> SP --> APP(["APPLY hwy<br/>write + backup"])
+    APP --> VER(["VERIFY hwy<br/>unit suite"]) --> VR
+
+    VR --> IC{"Interchange<br/>_verify_successors"}
+    IC -- "passed (greenfield)" --> RUN(["RUNTIME_VERIFY hwy<br/>boot the app"]) --> RR
+    IC -- "fixable failure" --> REP(["REPAIR hwy"])
+    RR --> IC2{"Interchange<br/>runtime terminal?"}
+    IC2 -- "passed / skipped" --> DONE((COMPLETED))
+    IC2 -- "failed / timeout / error" --> REP
+    REP --> RP --> APP
+
+    IC -- "budget spent / flap" --> FAIL((FAILED))
+    IC2 -- "budget spent" --> FAIL
+
+    classDef road fill:#3b6ea5,stroke:#274c73,color:#fff;
+    classDef freight fill:#e9d8a6,stroke:#b08968,color:#222;
+    classDef gate fill:#7d5ba6,stroke:#4c3575,color:#fff;
+    classDef term fill:#4c956c,stroke:#2c6e49,color:#fff;
+    class DEC,SCA,APP,VER,RUN,REP road;
+    class WP,SP,VR,RR,RP freight;
+    class IC,IC2 gate;
+    class DONE,FAIL term;
+```
+
+The progress ledger is the **weigh-station** riding along every truck:
+`_repair_progress_stalled` reads the failing/passing counts off the
+freight and closes the on-ramp to `REPAIR` the moment the load stops
+getting lighter.
+
+#### Component view -- the chocolate box map
+
+Each module is a **chocolate** in the box; a connector is a **flavour
+pairing** (module A hands a typed value to module B). The box has three
+trays: planning, generation/verification, and repair.
+
+```mermaid
+flowchart TB
+    subgraph BOX["The greenfield write-loop chocolate box"]
+      direction TB
+      subgraph T1["Tray 1 - planning"]
+        DECM["decompose.py<br/>_coerce_contracts"]
+        ENG["engine.py<br/>generate_single_scaffold_file(contracts=)"]
+      end
+      subgraph T2["Tray 2 - generate + verify"]
+        SCAF["scaffold.py<br/>_reconcile_import_warnings"]
+        SV["scaffold_validate.py<br/>cross_check + check_contract"]
+        RTV["runtime_verify.py<br/>boot probes"]
+        VFY["verify.py<br/>passing/collected counts"]
+      end
+      subgraph T3["Tray 3 - repair"]
+        RTR["router.py<br/>_repair_progress_stalled"]
+        RPR["repair.py<br/>_retrieval_relevant_files"]
+        CLS["classify.py<br/>traceback_source_files"]
+        AUTO["pipeline/auto.py<br/>run_query_auto"]
+      end
+    end
+
+    DECM -->|"contracts block"| ENG
+    ENG -->|"per-file source"| SCAF
+    SCAF -->|"generated tree"| SV
+    SV -->|"import/contract warnings"| SCAF
+    SCAF -->|"green suite"| RTV
+    VFY -->|"VERIFY_REPORT counts"| RTR
+    RTV -->|"RUNTIME_REPORT"| RTR
+    RTR -->|"funds another round?"| RPR
+    CLS -->|"crash-frame files"| RPR
+    AUTO -->|"index-relevant files"| RPR
+
+    classDef choc fill:#6f4e37,stroke:#3e2723,color:#fff;
+    classDef tray fill:#f3e5d8,stroke:#c9a27e,color:#222;
+    class DECM,ENG,SCAF,SV,RTV,VFY,RTR,RPR,CLS,AUTO choc;
+```
+
+Flavour-pairing key: `decompose -> engine` (contracts sweeten every
+file), `scaffold <-> scaffold_validate` (a bitter warning sent back for
+one regenerate hop), `verify/runtime_verify -> router` (counts and boot
+outcomes season the budget), and `classify + auto -> repair` (two
+localisation flavours -- crash frames and index relevance -- blended into
+one candidate set).
+
 ### Runner (`cgx.session.runner`)
 
 `SessionRunner` is the orchestrator the HTTP routes call. It sits

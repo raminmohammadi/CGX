@@ -186,8 +186,74 @@ the project's runtime is provisioned, third-party imports are
 statically resolved, and a runtime `python -c "import …"` smoke
 batch catches third-party import breaks (e.g. a stale
 `Flask 2.1.x` pulling Werkzeug 3.x that removes `url_quote`) before
-pytest collection runs. Every `ASK_USER` in either path is a
+pytest collection runs. A green greenfield `VERIFY` then hands off to
+a `RUNTIME_VERIFY` gate that boots the scaffolded app before the
+session is declared complete. Every `ASK_USER` in either path is a
 structured checkpoint, not a freeform prompt.
+
+### The session write loop as two maps
+
+Before the exit-by-exit ASCII, two analogies for the same greenfield
+pipeline. Contributors tend to hold one of these in their head.
+
+**Interstate highway system (flow).** Tasks are highways, the router
+is the interchange system, artifacts are the freight, and the progress
+ledger is the roadside weigh-station that closes the `REPAIR` on-ramp
+once the load stops getting lighter.
+
+```mermaid
+flowchart LR
+    U([goal]) --> CQ(["CLARIFY_REQUIREMENTS"]) --> DEC(["DECOMPOSE<br/>contracts + layers"])
+    DEC --> SCA(["SCAFFOLD<br/>coherence + contract gates"]) --> APP(["APPLY"])
+    APP --> BS(["BOOTSTRAP_ENV"]) --> AC(["API_CHECK"]) --> SM(["SMOKE"]) --> VER(["VERIFY"])
+    VER --> IC{"router"}
+    IC -- "passed" --> RUN(["RUNTIME_VERIFY"])
+    IC -- "fixable failure" --> REP(["REPAIR"])
+    RUN --> IC2{"router"}
+    IC2 -- "boots / no entry" --> DONE((COMPLETED))
+    IC2 -- "boot fails" --> REP
+    REP --> APP
+    IC -- "budget spent / flap" --> FAIL((FAILED))
+    IC2 -- "budget spent" --> FAIL
+
+    classDef road fill:#3b6ea5,stroke:#274c73,color:#fff;
+    classDef gate fill:#7d5ba6,stroke:#4c3575,color:#fff;
+    classDef term fill:#4c956c,stroke:#2c6e49,color:#fff;
+    class CQ,DEC,SCA,APP,BS,AC,SM,VER,RUN,REP road;
+    class IC,IC2 gate;
+    class DONE,FAIL term;
+```
+
+**Chocolate box map (components).** Each module is a chocolate; a
+connector is a flavour pairing (a typed value handed between modules).
+
+```mermaid
+flowchart TB
+    subgraph BOX["Session write-loop chocolate box"]
+      direction TB
+      RUNR["runner.py<br/>sequencer + lock"]
+      ROUT["router.py<br/>edges + progress ledger"]
+      DEC["tasks/decompose.py<br/>contracts"]
+      SCA["tasks/scaffold.py<br/>coherence pass"]
+      SVAL["scaffold_validate.py<br/>contract gate"]
+      RTV["tasks/runtime_verify.py<br/>boot probes"]
+      VER["tasks/verify.py<br/>pass/collect counts"]
+      REP["tasks/repair.py<br/>traceback + retrieval"]
+      CLS["repair/classify.py"]
+    end
+    RUNR --> ROUT
+    DEC -->|contracts| SCA
+    SCA -->|tree| SVAL
+    SVAL -->|warnings| SCA
+    VER -->|counts| ROUT
+    RTV -->|boot outcome| ROUT
+    CLS -->|classification| REP
+    ROUT -->|funds a round?| REP
+    REP -->|REPAIR_PLAN| RUNR
+
+    classDef choc fill:#6f4e37,stroke:#3e2723,color:#fff;
+    class RUNR,ROUT,DEC,SCA,SVAL,RTV,VER,REP,CLS choc;
+```
 
 ### Explore loop
 
@@ -318,24 +384,42 @@ structured checkpoint, not a freeform prompt.
                        +--------+
                        | VERIFY |  pytest inside the project venv
                        +--------+   (uses BUILD_REPORT.python_exe);
-                                    runs with `--junitxml` and parses
-                                    structured failures (Phase 3.1);
-                                    persists a single-shot
-                                    `reproduce_cmd` (Phase 1.2);
-                                    classifies rc into outcome; in
-                                    greenfield with no tests yet
-                                    -> ran=False + skipped_reason
+                            |        runs with `--junitxml` and parses
+                            |        structured failures (Phase 3.1);
+                            |        persists a single-shot
+                            |        `reproduce_cmd` (Phase 1.2);
+                            |        classifies rc into outcome; also
+                            |        emits passing_count/collected_count
+                            |        for the coverage-aware budget (#5);
+                            |        in greenfield with no tests yet
+                            |        -> ran=False + skipped_reason
+                            v  passed (greenfield only)
+                  +----------------+
+                  | RUNTIME_VERIFY |  boots each detected entry module
+                  +----------------+  (app.py/main.py/Flask()/FastAPI()/
+                                       create_app) under the venv -> a
+                                       RUNTIME_REPORT (P1; outcome=passed|
+                                       failed|timeout|error|skipped).
+                                       passed/skipped -> COMPLETED;
+                                       a hard boot failure -> REPAIR (#3)
 ```
 
 ### Autonomous repair loop (greenfield only)
 
-The router fires a deterministic repair cycle from three upstream
+The router fires a deterministic repair cycle from four upstream
 sources: an `API_CHECK` that ends `failed` (**Phase 2.2**), a
-`SMOKE` that ends `failed` (**Phase 2.1**), or a `VERIFY` that ends
-`assertions_failed` / `collection_error`. The cycle is capped by
-`repair_attempt < 2` AND a `failure_signature`-hash flap detector,
-plus a per-ancestor-chain `_REGENERATE_BUDGET=1` for the regenerate
-branch added in **Phase 6.1**:
+`SMOKE` that ends `failed` (**Phase 2.1**), a `VERIFY` that ends
+`assertions_failed` / `collection_error`, or a `RUNTIME_VERIFY` whose
+app boot ends `failed` / `timeout` / `error` (**P1 / #3**). The cycle
+is bounded by a **progress-aware budget** (`_repair_progress_stalled`:
+keep going while the failing-test count strictly drops round over
+round, backed by a passing-count trend, #5) under an absolute
+`_REPAIR_BUDGET=4` ceiling AND a `failure_signature`-hash flap
+detector, plus a per-ancestor-chain `_REGENERATE_BUDGET=1` for the
+regenerate branch added in **Phase 6.1**. When no deterministic
+classifier matches, the bounded LLM repair is **traceback-localized**
+(crash-frame files first) and **retrieval-fed** (remaining candidate
+slots filled from the project index; a no-op in greenfield):
 
 ```
    +-----------+   +-------+   +--------+
@@ -395,7 +479,8 @@ branch added in **Phase 6.1**:
    present) -> ASK_USER(freeform) carrying classification + rationale
 
    loop guards (terminal if any fires):
-     - repair_attempt >= 2
+     - repair_attempt >= _REPAIR_BUDGET (4)
+     - failing-test count stopped strictly dropping (progress ledger, #5)
      - new failure_signature already in prior_failure_signatures
      - regenerate_attempt would exceed _REGENERATE_BUDGET on the chain
 ```
@@ -460,7 +545,8 @@ Where to look in the repo:
 | Repair classify / locate / propose | `src/cgx/session/repair/{classify,locate,propose}.py` |
 | PyPI metadata client     | `src/cgx/session/repair/pypi_client.py` (Phase 3.2) |
 | Explore executors        | `src/cgx/session/tasks/{explore,investigate,recommend,plan_change}.py` |
-| Greenfield executors     | `src/cgx/session/tasks/{clarify_requirements,decompose,scaffold,bootstrap_env,api_check,smoke,repair}.py` |
+| Greenfield executors     | `src/cgx/session/tasks/{clarify_requirements,decompose,scaffold,bootstrap_env,api_check,smoke,runtime_verify,repair}.py` |
+| Contract + coherence gates | `src/cgx/session/scaffold_validate.py :: {check_contract_compliance, cross_check_first_party_imports}` |
 | Shared write executors   | `src/cgx/session/tasks/{apply,verify,ask}.py` |
 | Decision validation      | `src/cgx/session/tasks/ask.py :: build_decision` |
 | HTTP routes              | `src/cgx/webui/routes/agent_session.py` |

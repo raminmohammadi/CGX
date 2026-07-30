@@ -578,11 +578,12 @@ CLARIFY_REQUIREMENTS -> ASK_USER(clarify_answers)
                                   |
                                   v
                             DECOMPOSE -> ASK_USER(approve_plan)
-                                                  |
+                            (contracts + layers)   |
                                           approved=true | approved=false
                                                   v        |
                                               SCAFFOLD     (loop halts;
-                                                  |         no files written)
+                          (contract gate + coherence pass)  no files written)
+                                                  |
                                                   v
                                               APPLY
                                                   |
@@ -598,11 +599,16 @@ CLARIFY_REQUIREMENTS -> ASK_USER(clarify_answers)
                                                   v
                                               VERIFY <-----+
                                                   |        |
-                                                  v        |
-                                              REPAIR ------+ (fixable failure,
-                                                  |          attempt < 2,
-                                          patch | regenerate new signature)
-                                          (<=5 diffs) | (Phase 6.1)
+                          passed (greenfield) |   | fixable failure
+                                              v   |
+                                      RUNTIME_VERIFY (boot the app; P1)
+                                          |       |
+                          passed/skipped  |       | failed/timeout/error
+                                          v       v
+                                     COMPLETED   REPAIR ------+ (progress-aware
+                                                  |            budget: keep going
+                                          patch | regenerate  while failing count
+                                          (<=5 diffs) | (6.1)  strictly drops, #5)
                                               v        v
                                             APPLY    SCAFFOLD (re-enters loop)
 ```
@@ -619,7 +625,16 @@ manifest). `SCAFFOLD` walks the approved manifest layer-by-layer,
 calls `generate_single_scaffold_file` for each entry while
 accumulating sibling-file context (so cross-file imports resolve
 correctly), captures per-file failures into a `failed` list, and
-emits a `SCAFFOLD_PATCHES` artifact. The shared `APPLY` executor
+emits a `SCAFFOLD_PATCHES` artifact. As of the contract-first work,
+the `WORK_PLAN` also carries a `contracts` block (the declared
+endpoints / schemas / functions / constants every file must share);
+it is threaded into each `generate_single_scaffold_file` call, and
+after the per-file loop two best-effort gates run before `APPLY`: a
+**coherence pass** that regenerates only importer files referencing a
+first-party symbol no sibling defines, and a **contract enforcement
+gate** that flags declared interfaces no generated file satisfies.
+Both attach `import_warnings` / `contract_warnings` to
+`SCAFFOLD_PATCHES` rather than failing the scaffold. The shared `APPLY` executor
 accepts either a `CODE_CHANGE_PLAN` (explore) or `SCAFFOLD_PATCHES`
 (greenfield). In greenfield mode a `BOOTSTRAP_ENV` step then
 provisions a project-local `.venv` (via
@@ -693,14 +708,34 @@ v1 recognises three classifications:
   `ASK_USER` -- a fixture nobody wrote isn't something the loop can
   invent without an LLM.
 
+When no deterministic classifier matches, `REPAIR` falls back to a
+bounded LLM repair that is **traceback-localized** (candidate files
+come from the crash frames first, then the files `APPLY` wrote) and
+**retrieval-fed** (any remaining candidate slot is filled by hybrid
+retrieval over the project index -- a no-op in greenfield, where there
+is no index).
+
 The executor emits a `REPAIR_PLAN` artifact shaped exactly like a
 `CODE_CHANGE_PLAN`. The shared `APPLY` executor consumes it,
 carries the `build_artifact_id` forward (so `BOOTSTRAP_ENV` is
-skipped on the repair pass), and re-runs `VERIFY`. The cycle is
-capped at two attempts and refuses to retry when the new
-`failure_signature` matches one already seen on the chain, so a
-fix that "succeeds" without actually resolving the failure
-escalates to a freeform `ASK_USER` instead of looping.
+skipped on the repair pass), and re-runs `VERIFY`. The cycle is no
+longer a flat two-shot cap: a **progress-aware budget** keeps the loop
+running while the failing-test count strictly drops round over round
+(backed by a passing-count trend so a repair that trades a failure for
+a new pass still counts as progress), under an absolute ceiling of four
+rounds and a `failure_signature` flap backstop. A fix that "succeeds"
+without actually shrinking the failure -- or that churns the same
+signature -- escalates to a freeform `ASK_USER` instead of looping.
+
+Once `VERIFY` is green in greenfield mode, the router runs a
+`RUNTIME_VERIFY` gate before declaring the session complete: it boots
+each detected entry module (`app.py` / `main.py` / any file that
+constructs a Flask / FastAPI app or defines `create_app`) under the
+bootstrapped venv and emits a `RUNTIME_REPORT`. A clean boot
+(`passed`) -- or a run with no detectable entry to boot (`skipped`) --
+COMPLETES the session; a hard boot failure routes back to `REPAIR`
+under the same budget. This is what turns "the tests the model wrote
+pass" into "the app actually runs".
 
 Every greenfield failure path is terminal. A *hard* executor
 failure -- one that returns no `outputs`, such as a `BOOTSTRAP_ENV`
@@ -720,6 +755,65 @@ list to the `BUILD_REPORT` artifact. The lint is informational --
 it does not change the bootstrap outcome -- but the UI renders the
 list under the manifests block so the user sees a named issue
 before `VERIFY` runs, even though `REPAIR` will still auto-fix it.
+
+#### Two maps of the greenfield loop
+
+To make the write loop legible at a glance, here it is as **flow** and
+as **components** -- the same picture the architecture doc uses, kept
+here so a first-time user can follow along without switching files.
+
+**The interstate highway system (data flow).** Each task is a highway,
+the router is the interchange choosing the next on-ramp, and artifacts
+are the freight.
+
+```mermaid
+flowchart LR
+    G([your goal]) --> C(["CLARIFY_REQUIREMENTS"]) --> D(["DECOMPOSE<br/>contracts + layers"])
+    D --> S(["SCAFFOLD<br/>+ coherence & contract gates"]) --> A(["APPLY"])
+    A --> B(["BOOTSTRAP_ENV"]) --> AC(["API_CHECK"]) --> SM(["SMOKE"]) --> V(["VERIFY"])
+    V --> I{"router"}
+    I -- "passed" --> R(["RUNTIME_VERIFY<br/>boot the app"])
+    I -- "fixable failure" --> RE(["REPAIR"])
+    R --> I2{"router"}
+    I2 -- "boots" --> OK((COMPLETED))
+    I2 -- "boot fails" --> RE
+    RE --> A
+    I -- "budget spent" --> NO((FAILED))
+
+    classDef road fill:#3b6ea5,stroke:#274c73,color:#fff;
+    classDef gate fill:#7d5ba6,stroke:#4c3575,color:#fff;
+    classDef term fill:#4c956c,stroke:#2c6e49,color:#fff;
+    class C,D,S,A,B,AC,SM,V,R,RE road;
+    class I,I2 gate;
+    class OK,NO term;
+```
+
+**The chocolate box map (components).** Each module is a chocolate; a
+connector is a flavour pairing (a typed value handed between modules).
+
+```mermaid
+flowchart TB
+    subgraph BOX["Greenfield agent chocolate box"]
+      direction TB
+      DEC["decompose.py"]
+      SCA["scaffold.py"]
+      SVAL["scaffold_validate.py"]
+      RTV["runtime_verify.py"]
+      VER["verify.py"]
+      REP["repair.py"]
+      ROU["router.py"]
+    end
+    DEC -->|contracts| SCA
+    SCA -->|generated tree| SVAL
+    SVAL -->|warnings| SCA
+    VER -->|pass/fail counts| ROU
+    RTV -->|boot outcome| ROU
+    ROU -->|funds a round?| REP
+    REP -->|REPAIR_PLAN| SCA
+
+    classDef choc fill:#6f4e37,stroke:#3e2723,color:#fff;
+    class DEC,SCA,SVAL,RTV,VER,REP,ROU choc;
+```
 
 ### UI controls
 
