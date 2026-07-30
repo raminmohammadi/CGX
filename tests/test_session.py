@@ -1549,24 +1549,118 @@ def test_router_verify_no_tests_collected_empty_selection_is_terminal():
     assert status[0].status is SessionStatus.FAILED
 
 
-def test_router_verify_passed_has_no_successor():
-    """A passing VERIFY in greenfield is terminal -- no REPAIR spawn."""
+def test_router_verify_passed_spawns_runtime_verify():
+    """P1: a passing greenfield VERIFY hands off to RUNTIME_VERIFY.
+
+    The unit suite is green, but the session is not COMPLETED yet -- the
+    app-boot gate must pass first, so the terminal status is deferred.
+    """
     from cgx.session.models import SessionMode
     session = Session.new("g", mode=SessionMode.GREENFIELD)
     ver = TaskNode.new(
         session.session_id, TaskKind.VERIFY, "verify",
-        inputs={"mode": SessionMode.GREENFIELD.value})
+        inputs={"mode": SessionMode.GREENFIELD.value,
+                "build_artifact_id": "art_build",
+                "apply_artifact_id": "art_apply",
+                "scaffold_artifact_id": "art_scaffold"})
+    ver.produced_artifact_id = "art_verify"
     ver.outputs = {"outcome": "passed", "failure_signature": "p",
                    "returncode": 0}
     ver.status = TaskNodeStatus.DONE
     plan = Router().on_task_completed(
         session=session, completed=ver, tasks=[ver])
     creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    assert len(creates) == 1
+    rv = creates[0].task
+    assert rv.kind is TaskKind.RUNTIME_VERIFY
+    assert rv.inputs["verify_artifact_id"] == "art_verify"
+    assert rv.inputs["build_artifact_id"] == "art_build"
+    assert rv.inputs["apply_artifact_id"] == "art_apply"
+    # The session status is deferred to the runtime gate, not set here.
+    assert not any(isinstance(a, UpdateSessionStatus) for a in plan.actions)
+
+
+def test_router_verify_skipped_stays_terminal_completed():
+    """A skipped (test-free) greenfield VERIFY completes without a boot gate."""
+    from cgx.session.models import SessionMode
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    ver = TaskNode.new(
+        session.session_id, TaskKind.VERIFY, "verify",
+        inputs={"mode": SessionMode.GREENFIELD.value})
+    ver.outputs = {"outcome": "skipped", "failure_signature": "",
+                   "returncode": 5}
+    ver.status = TaskNodeStatus.DONE
+    plan = Router().on_task_completed(
+        session=session, completed=ver, tasks=[ver])
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
     assert creates == []
-    # A passing suite completes the greenfield session.
     status = [a for a in plan.actions if isinstance(a, UpdateSessionStatus)]
     assert len(status) == 1
     assert status[0].status is SessionStatus.COMPLETED
+
+
+def test_router_runtime_verify_passed_completes_session():
+    """A booting app completes the greenfield session."""
+    from cgx.session.models import SessionMode
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    rv = TaskNode.new(
+        session.session_id, TaskKind.RUNTIME_VERIFY, "runtime",
+        inputs={"mode": SessionMode.GREENFIELD.value})
+    rv.outputs = {"outcome": "passed", "failure_signature": ""}
+    rv.status = TaskNodeStatus.DONE
+    plan = Router().on_task_completed(
+        session=session, completed=rv, tasks=[rv])
+    assert [a for a in plan.actions if isinstance(a, CreateTask)] == []
+    status = [a for a in plan.actions if isinstance(a, UpdateSessionStatus)]
+    assert len(status) == 1
+    assert status[0].status is SessionStatus.COMPLETED
+
+
+def test_router_runtime_verify_skipped_completes_session():
+    """No detectable entry to boot is an explicit no-op -> COMPLETED."""
+    from cgx.session.models import SessionMode
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    rv = TaskNode.new(
+        session.session_id, TaskKind.RUNTIME_VERIFY, "runtime",
+        inputs={"mode": SessionMode.GREENFIELD.value})
+    rv.outputs = {"outcome": "skipped"}
+    rv.status = TaskNodeStatus.DONE
+    plan = Router().on_task_completed(
+        session=session, completed=rv, tasks=[rv])
+    status = [a for a in plan.actions if isinstance(a, UpdateSessionStatus)]
+    assert len(status) == 1
+    assert status[0].status is SessionStatus.COMPLETED
+
+
+def test_router_runtime_verify_failed_fails_session():
+    """An app that does not boot is a definitive greenfield FAILED."""
+    from cgx.session.models import SessionMode
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    rv = TaskNode.new(
+        session.session_id, TaskKind.RUNTIME_VERIFY, "runtime",
+        inputs={"mode": SessionMode.GREENFIELD.value})
+    rv.outputs = {"outcome": "failed",
+                  "failure_signature": "runtime_boot|app.py"}
+    rv.status = TaskNodeStatus.DONE
+    plan = Router().on_task_completed(
+        session=session, completed=rv, tasks=[rv])
+    assert [a for a in plan.actions if isinstance(a, CreateTask)] == []
+    status = [a for a in plan.actions if isinstance(a, UpdateSessionStatus)]
+    assert len(status) == 1
+    assert status[0].status is SessionStatus.FAILED
+
+
+def test_router_runtime_verify_explore_is_noop():
+    """RUNTIME_VERIFY is greenfield-only -- explore mode flips no status."""
+    session = Session.new("e")
+    rv = TaskNode.new(
+        session.session_id, TaskKind.RUNTIME_VERIFY, "runtime",
+        inputs={"mode": "explore"})
+    rv.outputs = {"outcome": "failed"}
+    rv.status = TaskNodeStatus.DONE
+    plan = Router().on_task_completed(
+        session=session, completed=rv, tasks=[rv])
+    assert not any(isinstance(a, UpdateSessionStatus) for a in plan.actions)
 
 
 def test_router_on_task_failed_greenfield_marks_session_failed():
@@ -2115,6 +2209,98 @@ def test_verify_polyglot_npm_failure_surfaces_over_pytest_pass(
     assert result.failure is None
     assert result.outputs["outcome"] == "failed"
     assert result.outputs["tests_passed"] is False
+
+
+def test_runtime_verify_skipped_without_python_exe(tmp_path, store):
+    """No bootstrapped interpreter -> the boot gate is an explicit no-op."""
+    from cgx.session.models import SessionMode
+    from cgx.session.tasks.runtime_verify import run_runtime_verify
+    (tmp_path / "app.py").write_text(
+        "def create_app():\n    return object()\n", encoding="utf-8")
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    t = TaskNode.new(session.session_id, TaskKind.RUNTIME_VERIFY, "runtime",
+                     inputs={"applied_files": ["app.py"],
+                             "mode": SessionMode.GREENFIELD.value})
+    store.save_task(t)
+    result = run_runtime_verify(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    assert result.failure is None
+    assert result.outputs["outcome"] == "skipped"
+    assert result.outputs["tested_count"] == 0
+
+
+def test_runtime_verify_skipped_without_entry_candidates(tmp_path, store):
+    """A green suite with no bootable entry module skips the runtime gate."""
+    import sys
+    from cgx.session.models import SessionMode
+    from cgx.session.tasks.runtime_verify import run_runtime_verify
+    (tmp_path / "helpers.py").write_text("VALUE = 1\n", encoding="utf-8")
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    t = TaskNode.new(session.session_id, TaskKind.RUNTIME_VERIFY, "runtime",
+                     inputs={"applied_files": ["helpers.py"],
+                             "python_exe": sys.executable,
+                             "mode": SessionMode.GREENFIELD.value})
+    store.save_task(t)
+    result = run_runtime_verify(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    assert result.failure is None
+    assert result.outputs["outcome"] == "skipped"
+    assert result.outputs["tested_count"] == 0
+
+
+def test_runtime_verify_passed_when_app_boots(tmp_path, store):
+    """A create_app factory that constructs cleanly -> passed with a probe."""
+    import sys
+    from cgx.session.models import SessionMode
+    from cgx.session.tasks.runtime_verify import run_runtime_verify
+    (tmp_path / "app.py").write_text(
+        "def create_app():\n    return {'ok': True}\n", encoding="utf-8")
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    t = TaskNode.new(session.session_id, TaskKind.RUNTIME_VERIFY, "runtime",
+                     inputs={"applied_files": ["app.py"],
+                             "python_exe": sys.executable,
+                             "mode": SessionMode.GREENFIELD.value})
+    store.save_task(t)
+    result = run_runtime_verify(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    assert result.failure is None
+    assert result.outputs["outcome"] == "passed"
+    assert result.outputs["tested_count"] == 1
+    assert result.outputs["failed_count"] == 0
+    assert result.artifact is not None
+    assert result.artifact.kind is ArtifactKind.RUNTIME_REPORT
+    assert result.artifact.content["probes"][0]["file"] == "app.py"
+
+
+def test_runtime_verify_failed_on_import_time_error(tmp_path, store):
+    """An import-time error the unit suite missed -> failed with a signature."""
+    import sys
+    from cgx.session.models import SessionMode
+    from cgx.session.tasks.runtime_verify import run_runtime_verify
+    # A raise at module load -- exactly the class of bug a passing unit
+    # suite can miss when it never imports the entry module.
+    (tmp_path / "main.py").write_text(
+        "raise RuntimeError('boot boom')\n", encoding="utf-8")
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    t = TaskNode.new(session.session_id, TaskKind.RUNTIME_VERIFY, "runtime",
+                     inputs={"applied_files": ["main.py"],
+                             "python_exe": sys.executable,
+                             "mode": SessionMode.GREENFIELD.value})
+    store.save_task(t)
+    result = run_runtime_verify(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    assert result.failure is None
+    assert result.outputs["outcome"] == "failed"
+    assert result.outputs["failed_count"] == 1
+    assert result.outputs["failure_signature"] == "runtime_boot|main.py"
+    probe = result.artifact.content["probes"][0]
+    assert probe["ok"] is False
+    assert probe["kind"] == "import_error"
+    assert "boot boom" in probe["stderr_tail"]
 
 
 def test_plan_change_executor_needs_provider():

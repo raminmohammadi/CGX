@@ -31,6 +31,7 @@ from cgx.session.tasks import recommend as _recommend  # noqa: F401
 from cgx.session.tasks import plan_change as _plan_change  # noqa: F401
 from cgx.session.tasks import apply as _apply  # noqa: F401
 from cgx.session.tasks import verify as _verify  # noqa: F401
+from cgx.session.tasks import runtime_verify as _runtime_verify  # noqa: F401
 from cgx.session.tasks import clarify_requirements as _clarify_requirements  # noqa: F401
 from cgx.session.tasks import decompose as _decompose  # noqa: F401
 from cgx.session.tasks import scaffold as _scaffold  # noqa: F401

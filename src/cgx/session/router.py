@@ -597,6 +597,57 @@ def _verify_to_repair_or_terminal(parent: TaskNode) -> List[TaskNode]:
     )]
 
 
+def _verify_successors(parent: TaskNode) -> List[TaskNode]:
+    """Route a finished VERIFY to RUNTIME_VERIFY, REPAIR, or a terminal.
+
+    Greenfield + a *passing* unit suite hands off to RUNTIME_VERIFY: the
+    tests the model wrote are green, but the app itself may still fail to
+    boot (an import-time error, a bad ``create_app`` wiring), so a
+    runtime gate runs before the session is declared COMPLETED. Every
+    other case -- a fixable failure, a skipped/test-free suite, or an
+    explore-mode VERIFY -- keeps the existing repair-or-terminal path.
+    """
+    mode = str(parent.inputs.get("mode") or "").strip()
+    outputs = parent.outputs or {}
+    outcome = str(outputs.get("outcome") or "").strip()
+    if mode == SessionMode.GREENFIELD.value and outcome == "passed":
+        return _runtime_verify_node(parent)
+    return _verify_to_repair_or_terminal(parent)
+
+
+def _runtime_verify_node(parent: TaskNode) -> List[TaskNode]:
+    """Spawn the RUNTIME_VERIFY gate carrying the upstream artifact ids."""
+    return [TaskNode.new(
+        session_id=parent.session_id,
+        kind=TaskKind.RUNTIME_VERIFY,
+        name="Boot the scaffolded app",
+        description=("Import-and-call smoke each entry module under the "
+                     "bootstrapped venv to confirm the app actually runs, "
+                     "not just that its unit tests pass."),
+        parent_task_id=parent.task_id,
+        inputs={
+            "verify_artifact_id": parent.produced_artifact_id,
+            "build_artifact_id": parent.inputs.get("build_artifact_id"),
+            "apply_artifact_id": parent.inputs.get("apply_artifact_id"),
+            "scaffold_artifact_id": parent.inputs.get("scaffold_artifact_id"),
+            "plan_artifact_id": parent.inputs.get("plan_artifact_id"),
+            "prior_goal": parent.inputs.get("prior_goal"),
+            "mode": SessionMode.GREENFIELD.value,
+        },
+    )]
+
+
+def _runtime_verify_to_terminal(parent: TaskNode) -> List[TaskNode]:
+    """RUNTIME_VERIFY is terminal in the MVP -- it spawns no successor.
+
+    Runtime-failure classification and a repair edge arrive with
+    bottleneck #3; for now a clean boot completes the session and a boot
+    failure ends it (see
+    :func:`_runtime_verify_terminal_session_actions`).
+    """
+    return []
+
+
 def _repair_to_apply_or_ask(parent: TaskNode) -> List[TaskNode]:
     """Spawn APPLY when REPAIR produced an applicable patch.
 
@@ -689,6 +740,36 @@ def _verify_terminal_session_actions(
                                 status=status)]
 
 
+# Terminal RUNTIME_VERIFY outcomes that mean the greenfield write loop
+# delivered an app that actually boots. ``skipped`` (no detectable entry
+# module to boot) counts as success -- it is an explicit no-op, not a
+# broken app. Everything else (``failed`` / ``timeout`` / ``error``) is a
+# definitive failure.
+_RUNTIME_VERIFY_SUCCESS_OUTCOMES = frozenset({"passed", "skipped"})
+
+
+def _runtime_verify_terminal_session_actions(
+        completed: TaskNode) -> List[RouterAction]:
+    """Set the greenfield session's terminal status after RUNTIME_VERIFY.
+
+    A booting app (``passed``) -- or a run with no detectable entry to
+    boot (``skipped``) -- COMPLETES the session; any hard boot outcome
+    (``failed`` / ``timeout`` / ``error``) is a definitive ``FAILED``.
+    Mirrors :func:`_verify_terminal_session_actions`; explore mode never
+    reaches RUNTIME_VERIFY, so this is a no-op there.
+    """
+    mode = str(completed.inputs.get("mode") or "").strip()
+    if mode != SessionMode.GREENFIELD.value:
+        return []
+    outputs = completed.outputs or {}
+    outcome = str(outputs.get("outcome") or "").strip()
+    status = (SessionStatus.COMPLETED
+              if outcome in _RUNTIME_VERIFY_SUCCESS_OUTCOMES
+              else SessionStatus.FAILED)
+    return [UpdateSessionStatus(session_id=completed.session_id,
+                                status=status)]
+
+
 def _preverify_gate_terminal_actions(
         completed: TaskNode) -> List[RouterAction]:
     """Terminate a greenfield run when a pre-VERIFY gate stalls.
@@ -739,8 +820,9 @@ def _scaffold_to_apply(parent: TaskNode) -> List[TaskNode]:
 
 # Maps the parent's kind to a function that produces the successor
 # tasks. Greenfield kinds (CLARIFY_REQUIREMENTS, DECOMPOSE, SCAFFOLD,
-# BOOTSTRAP_ENV) chain to ASK_USER / APPLY / VERIFY respectively.
-# VERIFY is terminal.
+# BOOTSTRAP_ENV) chain to ASK_USER / APPLY / VERIFY respectively. A
+# passing greenfield VERIFY hands off to RUNTIME_VERIFY (the app-boot
+# gate); RUNTIME_VERIFY is terminal.
 TASK_SUCCESSOR = {
     TaskKind.EXPLORE: _explore_to_ask,
     TaskKind.INVESTIGATE: _investigate_to_recommend,
@@ -753,7 +835,8 @@ TASK_SUCCESSOR = {
     TaskKind.BOOTSTRAP_ENV: _bootstrap_to_api_check,
     TaskKind.API_CHECK: _api_check_to_smoke_or_repair,
     TaskKind.SMOKE: _smoke_to_verify_or_repair,
-    TaskKind.VERIFY: _verify_to_repair_or_terminal,
+    TaskKind.VERIFY: _verify_successors,
+    TaskKind.RUNTIME_VERIFY: _runtime_verify_to_terminal,
     TaskKind.REPAIR: _repair_to_apply_or_ask,
 }
 
@@ -862,6 +945,9 @@ class Router:
         if completed.kind is TaskKind.VERIFY and not children:
             plan.actions.extend(
                 _verify_terminal_session_actions(completed))
+        if completed.kind is TaskKind.RUNTIME_VERIFY and not children:
+            plan.actions.extend(
+                _runtime_verify_terminal_session_actions(completed))
         if (completed.kind in (TaskKind.API_CHECK, TaskKind.SMOKE)
                 and not children):
             plan.actions.extend(
