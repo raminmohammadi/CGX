@@ -8010,6 +8010,85 @@ def test_router_repair_regenerate_abandons_subtree_and_requeues_scaffold():
     assert abandoned_ids.isdisjoint(done_ids)
 
 
+def test_actionable_contract_warnings_filters_endpoints_and_unattributed():
+    from cgx.session.router import _actionable_contract_warnings
+    got = _actionable_contract_warnings({"contract_warnings": [
+        {"kind": "endpoint", "name": "/api/x", "method": "POST"},
+        {"kind": "constant", "name": "API_BASE"},  # no module -> skip
+        {"kind": "function", "name": "compute", "module": "src/core.py"},
+        {"kind": "schema", "name": "User", "module": "src/db.py"},
+        "not-a-dict",
+    ]})
+    assert {w["name"] for w in got} == {"compute", "User"}
+
+
+def _make_clean_scaffold_with_contracts(warnings, *, prior_regens=0,
+                                        failed_count=0):
+    from cgx.session.models import SessionMode
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    scaffold = TaskNode.new(
+        session.session_id, TaskKind.SCAFFOLD, "scaffold",
+        inputs={"work_plan_artifact_id": "art_plan",
+                "regenerate_attempt": prior_regens})
+    scaffold.status = TaskNodeStatus.DONE
+    scaffold.outputs = {"scaffold_artifact_id": "art_s",
+                        "generated_count": 5, "failed_count": failed_count,
+                        "contract_warnings": warnings}
+    return session, scaffold
+
+
+def test_router_scaffold_unmet_contract_regenerates_within_budget():
+    # A clean scaffold whose named module lacks a declared function
+    # regenerates with the unmet contract folded in (early return, so the
+    # only created task is the fresh SCAFFOLD -- not the APPLY successor).
+    session, scaffold = _make_clean_scaffold_with_contracts(
+        [{"kind": "function", "name": "compute", "module": "src/core.py"}])
+    plan = Router().on_task_completed(
+        session=session, completed=scaffold, tasks=[scaffold])
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    assert len(creates) == 1
+    new_scaffold = creates[0].task
+    assert new_scaffold.kind is TaskKind.SCAFFOLD
+    assert new_scaffold.inputs["regenerate_attempt"] == 1
+    payloads = new_scaffold.inputs["regenerate_constraints"]
+    assert payloads and payloads[0]["kind"] == "unmet_contract"
+    assert "compute" in payloads[0]["rationale"]
+
+
+def test_router_scaffold_placeholder_endpoint_does_not_regenerate():
+    # The exact shape from ses_fc44ba67d1cc4835: placeholder endpoints and
+    # unattributed constants must NOT force a regenerate.
+    from cgx.session.router import _scaffold_contract_regenerate_actions
+    _session, scaffold = _make_clean_scaffold_with_contracts([
+        {"kind": "endpoint", "name": "/api/x", "method": "POST"},
+        {"kind": "endpoint", "name": "/api/protected", "method": "GET"},
+        {"kind": "constant", "name": "API_BASE"},
+        {"kind": "constant", "name": "JWT_SECRET_KEY"},
+    ])
+    assert _scaffold_contract_regenerate_actions(scaffold, [scaffold]) == []
+
+
+def test_router_scaffold_unmet_contract_non_terminal_when_budget_spent():
+    # Budget spent -> helper returns nothing (non-terminal): the caller
+    # then takes the normal SCAFFOLD -> APPLY edge instead of failing.
+    from cgx.session.router import (_scaffold_contract_regenerate_actions,
+                                    _REGENERATE_BUDGET)
+    _session, scaffold = _make_clean_scaffold_with_contracts(
+        [{"kind": "function", "name": "compute", "module": "src/core.py"}],
+        prior_regens=_REGENERATE_BUDGET)
+    assert _scaffold_contract_regenerate_actions(scaffold, [scaffold]) == []
+
+
+def test_router_scaffold_contract_skipped_when_files_dropped():
+    # failed_count > 0 belongs to the dropped-files path; the contract
+    # path must defer even if contract warnings are also present.
+    from cgx.session.router import _scaffold_contract_regenerate_actions
+    _session, scaffold = _make_clean_scaffold_with_contracts(
+        [{"kind": "function", "name": "compute", "module": "src/core.py"}],
+        failed_count=1)
+    assert _scaffold_contract_regenerate_actions(scaffold, [scaffold]) == []
+
+
 def test_router_repair_regenerate_budget_exhausted_fails_session():
     """Once the regenerate budget is hit the session fails terminally."""
     from cgx.session.router import _REGENERATE_BUDGET

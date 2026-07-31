@@ -1092,6 +1092,11 @@ class Router:
             if dropped_actions:
                 plan.actions.extend(dropped_actions)
                 return plan
+            contract_actions = _scaffold_contract_regenerate_actions(
+                completed, tasks)
+            if contract_actions:
+                plan.actions.extend(contract_actions)
+                return plan
         if completed.kind is TaskKind.APPLY:
             dropped_actions = _apply_failed_files_actions(completed, tasks)
             if dropped_actions:
@@ -1542,6 +1547,87 @@ def _scaffold_failed_files_actions(completed: TaskNode,
         completed, constraint,
         regenerate_files=regen_files,
         prior_scaffold_artifact_id=prior_id)))
+    return actions
+
+
+# Contract-warning kinds a regenerate can actually satisfy: a declared
+# function/constant/schema names the module that must provide it, so the
+# retry has a concrete, satisfiable target. Endpoints are omitted -- a
+# planner placeholder path (e.g. ``/api/x``) is frequently unsatisfiable
+# and would only spin the budget.
+_CONTRACT_REGENERATE_KINDS = {"function", "constant", "schema"}
+
+
+def _actionable_contract_warnings(
+        outputs: Dict[str, object]) -> List[Dict[str, object]]:
+    """Return the contract warnings a regenerate can act on.
+
+    Keeps only a declared function/constant/schema that names a concrete
+    ``module`` -- the offending module is known and the goal is
+    satisfiable. Endpoint warnings and any warning without a module are
+    dropped so an unsatisfiable planner contract never forces a retry.
+    """
+    out: List[Dict[str, object]] = []
+    for w in outputs.get("contract_warnings") or []:
+        if not isinstance(w, dict):
+            continue
+        if (w.get("kind") in _CONTRACT_REGENERATE_KINDS
+                and str(w.get("module") or "").strip()):
+            out.append(w)
+    return out
+
+
+def _contract_regenerate_constraint(
+        warnings: List[Dict[str, object]]) -> Dict[str, object]:
+    """Fold unmet contract items into a SCAFFOLD regenerate constraint."""
+    items = [f"{w.get('kind')} {w.get('name')!r} in module "
+             f"{str(w.get('module'))!r}" for w in warnings[:6]]
+    rationale = ("the generated files do not satisfy declared contract(s): "
+                 + "; ".join(items)
+                 + ". Implement each named symbol in its module.")
+    return {"kind": "unmet_contract", "rationale": rationale,
+            "unmet_contracts": items}
+
+
+def _scaffold_contract_regenerate_actions(
+        completed: TaskNode,
+        tasks: List[TaskNode]) -> List[RouterAction]:
+    """Regenerate a clean-but-noncompliant SCAFFOLD once per budget step.
+
+    Complements :func:`_scaffold_failed_files_actions`: that path owns a
+    scaffold that *dropped* files (``failed_count > 0``); this one handles
+    a scaffold where every file generated but a file-attributable contract
+    (a declared function/constant/schema whose named module never provides
+    it) is unmet, folding the unmet contracts in as a whole-tree
+    regenerate constraint. Bounded by :data:`_REGENERATE_BUDGET` and
+    deliberately **non-terminal**: once the budget is spent the empty
+    return lets the dispatcher take SCAFFOLD -> APPLY so VERIFY -- which
+    exercises the contract against a real suite -- makes the final call
+    rather than failing the session on a static gate. Returns an empty
+    list (normal edge) for a compliant scaffold, one that dropped files,
+    or a spent budget.
+    """
+    from cgx.session.repair.propose import propose_regenerate  # dep direction
+
+    outputs = completed.outputs or {}
+    if int(outputs.get("failed_count") or 0) > 0:
+        return []
+    actionable = _actionable_contract_warnings(outputs)
+    if not actionable:
+        return []
+    prior_regens = int(completed.inputs.get("regenerate_attempt") or 0)
+    if prior_regens >= _REGENERATE_BUDGET:
+        return []
+    constraint = _contract_regenerate_constraint(actionable)
+    actions: List[RouterAction] = []
+    skip_states = {TaskNodeStatus.DONE, TaskNodeStatus.FAILED,
+                   TaskNodeStatus.ABANDONED}
+    for t in _collect_descendants(completed.task_id, tasks):
+        if t.status in skip_states:
+            continue
+        actions.append(UpdateTaskStatus(
+            task_id=t.task_id, status=TaskNodeStatus.ABANDONED))
+    actions.append(CreateTask(propose_regenerate(completed, constraint)))
     return actions
 
 

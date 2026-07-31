@@ -418,6 +418,7 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             "pin_adjustments_count": len(pin_adjustments),
             "import_warnings_count": len(import_warnings),
             "contract_warnings_count": len(contract_warnings),
+            "contract_warnings": contract_warnings,
             "reconciled_count": reconciled_count,
         },
         artifact=artifact,
