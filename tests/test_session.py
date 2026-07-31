@@ -4777,6 +4777,36 @@ def test_smoke_node_build_failure_is_failed(tmp_path, store, monkeypatch):
     assert "npm run build" in result.outputs["failure_signature"]
 
 
+def test_smoke_node_build_error_head_survives_truncation(
+        tmp_path, store, monkeypatch):
+    """Vite/rolldown print the cause at the HEAD then a long generic stack.
+
+    A tail-only clip drops the actionable line; the head+tail window must
+    keep it so REPAIR's ``build_error`` constraint stays actionable.
+    """
+    from cgx.session.tasks import smoke as smoke_mod
+    t = _node_smoke_task(store, tmp_path)
+    head = "[UNRESOLVED_ENTRY] Cannot resolve entry module index.html."
+    tail = "at CAC.<anonymous> (vite/dist/node/cli.js:776:3)"
+    long_stack = "\n".join(f"    at frame_{i} (rolldown.mjs:{i}:1)"
+                           for i in range(400))
+
+    class _P:
+        returncode = 1
+        stdout = ""
+        stderr = head + "\n" + long_stack + "\n" + tail
+
+    monkeypatch.setattr(smoke_mod.shutil, "which", lambda name: "/usr/bin/npm")
+    monkeypatch.setattr(smoke_mod.subprocess, "run", lambda *a, **k: _P())
+    result = smoke_mod.run_smoke(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    bs = result.artifact.content["build_smoke"]
+    assert bs["ok"] is False
+    assert head in bs["stderr_tail"], "actionable cause (head) must survive"
+    assert tail in bs["stderr_tail"], "trailing summary (tail) must survive"
+    assert "...[truncated]..." in bs["stderr_tail"]
+
+
 def test_smoke_node_build_pass_is_passed(tmp_path, store, monkeypatch):
     """A clean JS build -> outcome=passed (chains on to VERIFY)."""
     from cgx.session.tasks import smoke as smoke_mod
