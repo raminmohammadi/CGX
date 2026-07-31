@@ -7273,6 +7273,36 @@ def test_cross_check_abstains_on_unparseable_target():
     assert cross_check_first_party_imports(contents) == []
 
 
+def test_cross_check_flags_phantom_relative_import():
+    """``from ..config import X`` where ``config`` was never generated."""
+    from cgx.session.scaffold_validate import cross_check_first_party_imports
+    contents = {
+        "pkg/__init__.py": "",
+        "pkg/sub/__init__.py": "",
+        "pkg/sub/app.py": "from ..config import API_BASE\n",
+    }
+    warnings = cross_check_first_party_imports(contents)
+    assert len(warnings) == 1
+    w = warnings[0]
+    assert w["file"] == "pkg/sub/app.py"
+    assert w["module"] == "..config"
+    assert w["name"] == "API_BASE"
+
+
+def test_cross_check_flags_relative_import_beyond_top_level():
+    """A relative import that walks above the top package -> warning.
+
+    ``_resolve_from_target`` returns ``None`` for a level that exceeds the
+    importer's package depth ("attempted relative import beyond top-level
+    package" at runtime); the checker must flag it rather than abstain.
+    """
+    from cgx.session.scaffold_validate import cross_check_first_party_imports
+    contents = {"app.py": "from ..config import API_BASE\n"}
+    warnings = cross_check_first_party_imports(contents)
+    assert [w["name"] for w in warnings] == ["API_BASE"]
+    assert warnings[0]["module"] == "..config"
+
+
 # ------------- #1: work-plan contract enforcement gate -------------
 
 def test_contract_check_passes_when_all_satisfied():

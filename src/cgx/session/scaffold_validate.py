@@ -467,6 +467,29 @@ def cross_check_first_party_imports(
             if not isinstance(node, ast.ImportFrom):
                 continue
             target = _resolve_from_target(node, importer, is_pkg_init)
+            if node.level:
+                # Relative imports can only reference first-party siblings in
+                # the same package tree, so -- unlike absolute/third-party
+                # targets -- an unresolved one is never something to abstain
+                # on. Flag it when resolution fell off the top of the tree
+                # (``_resolve_from_target`` -> ``None``: "attempted relative
+                # import beyond top-level package") or the resolved module was
+                # never generated (a phantom sibling), so the router
+                # regenerates instead of shipping a scaffold that cannot
+                # import. A target that resolves to a generated package with
+                # no ``__init__`` still abstains via the fall-through below.
+                if target is None or (
+                        target not in modules and target not in packages):
+                    spec = "." * node.level + (node.module or "")
+                    for alias in node.names:
+                        warnings.append({
+                            "file": path,
+                            "module": spec,
+                            "name": alias.name,
+                            "reason": (f"relative import {spec!r} does not "
+                                       "resolve to a generated module"),
+                        })
+                    continue
             if target is None:
                 continue
             target_path = modules.get(target)
