@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { Check, ChevronDown, ChevronRight, Loader2 } from "lucide-react";
+import { Brain, Check, ChevronDown, ChevronRight, Loader2 } from "lucide-react";
 import type {
   ArtifactDTO, DecisionDTO, FactDTO, TaskNodeDTO,
 } from "../../lib/api";
@@ -109,6 +109,7 @@ function LLMTraceRow({ fact, index }: { fact: FactDTO; index: number }) {
       >
         {open ? <ChevronDown className="h-3 w-3 text-slate-500" />
               : <ChevronRight className="h-3 w-3 text-slate-500" />}
+        <Brain className="h-3 w-3 text-purple-400 shrink-0" />
         <span className="text-[10px] font-mono text-slate-500">#{index}</span>
         <span className="text-[11px] font-mono text-slate-200 truncate">{model}</span>
         {latency && (

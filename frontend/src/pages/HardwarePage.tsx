@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { AlertTriangle, CheckCircle, Microchip, RefreshCcw, XCircle } from "lucide-react";
 import { api, type HardwareMatrixResponse } from "../lib/api";
 import { Card, CardHeader } from "../components/Card";
+import { StatCard } from "../components/StatCard";
 
 export default function HardwarePage() {
   const [data, setData] = useState<HardwareMatrixResponse | null>(null);
@@ -42,13 +43,13 @@ export default function HardwarePage() {
       />
 
       <div className="grid grid-cols-3 gap-3">
-        <Stat label="System RAM" value={ram != null ? `${ram.toFixed(1)} GB` : "--"} tone="emerald" />
-        <Stat
+        <StatCard label="System RAM" value={ram != null ? `${ram.toFixed(1)} GB` : "--"} tone="neon" />
+        <StatCard
           label="GPU VRAM"
           value={vram != null ? `${vram.toFixed(1)} GB` : "--"}
-          tone={vram != null ? "emerald" : "slate"}
+          tone={vram != null ? "neon" : "slate"}
         />
-        <Stat
+        <StatCard
           label="Catalog rows"
           value={data ? `${data.rows.length}` : "--"}
           tone="slate"
@@ -132,27 +133,6 @@ export default function HardwarePage() {
         </Card>
       )}
     </div>
-  );
-}
-
-function Stat({
-  label,
-  value,
-  tone,
-}: {
-  label: string;
-  value: string;
-  tone: "emerald" | "slate";
-}) {
-  return (
-    <Card padded className={tone === "emerald" ? "border-bright" : undefined}>
-      <p className="av-section-eyebrow mb-1">{label}</p>
-      <p
-        className={`text-xl font-bold font-mono ${tone === "emerald" ? "text-emerald-400" : "text-slate-200"}`}
-      >
-        {value}
-      </p>
-    </Card>
   );
 }
 

@@ -666,6 +666,56 @@ def test_scaffold_py_syntax_error_flags_when_retry_still_broken():
     assert out.get("syntax_error")
 
 
+def test_unwrap_wrapping_code_fence_variants():
+    from cgx.answer.engine import _unwrap_wrapping_code_fence as unwrap
+    # Whole-wrap with trailing prose after the closing fence.
+    assert unwrap("```python\ndef f():\n    return 1\n```\n\nDone.") == (
+        "def f():\n    return 1")
+    # Unclosed fence (model forgot the closing ```).
+    assert unwrap("```python\ndef f():\n    return 1") == (
+        "def f():\n    return 1")
+    # Short natural-language preamble before the opening fence.
+    assert unwrap("Here is the file:\n```py\nx = 1\n```") == "x = 1"
+    # No fence at all -> content is returned untouched.
+    assert unwrap("x = 1\n") == "x = 1\n"
+    # A docstring-embedded fence must NOT be stripped (guard on triple
+    # quotes in the preamble) so real Python survives verbatim.
+    doc = '"""Doc.\n\n```python\nnope\n```\n"""\nx = 1\n'
+    assert unwrap(doc) == doc
+
+
+def test_format_syntax_error_surfaces_offending_line():
+    from cgx.answer.engine import _format_syntax_error
+    e = SyntaxError("invalid syntax")
+    e.lineno = 1
+    e.text = "```python\n"
+    msg = _format_syntax_error(e)
+    assert "line 1" in msg
+    assert "```python" in msg
+
+
+def test_format_syntax_error_without_text_is_base():
+    from cgx.answer.engine import _format_syntax_error
+    assert _format_syntax_error(SyntaxError("invalid syntax")) == (
+        str(SyntaxError("invalid syntax")))
+
+
+def test_scaffold_fence_wrapped_python_parses_without_retry():
+    """A fence-wrapped body is unwrapped before the syntax gate, so a
+    valid file no longer burns a retry on a bogus line-1 error."""
+    from cgx.answer.engine import generate_single_scaffold_file
+    wrapped = "```python\n" + _VALID_PY + "```\n\nLet me know if you need more."
+    provider = _QueueProvider([wrapped])
+    out = generate_single_scaffold_file(
+        "src/calculator.py", "calculator core", provider,
+        layer="core", goal="build a calculator",
+    )
+    assert provider.calls == 1, "unwrap must avoid a line-1 syntax retry"
+    assert out["syntax_ok"] is True
+    assert out["content"] == _VALID_PY.rstrip("\n")
+    assert out["patch"]
+
+
 class _RecordingQueueProvider(_QueueProvider):
     """Queue provider that also records each call's ``messages`` list."""
 

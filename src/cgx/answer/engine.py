@@ -3165,6 +3165,55 @@ def _summarize_file_for_context(
     return text
 
 
+def _unwrap_wrapping_code_fence(content: str) -> str:
+    """Strip a markdown code fence a small model wraps the file body in.
+
+    Extends the old whole-content regex (which only matched a clean
+    ```lang\\n…\\n``` block) to the shapes that leak a fence onto line 1
+    and fail ``ast.parse`` there: a fence with trailing prose after the
+    closing ```, an *unclosed* fence, and a short natural-language
+    preamble ("Here is the file:") before the opening fence. Only a
+    column-0 fence within the first few lines is treated as a wrapper --
+    an indented or docstring-embedded fence (any preamble line carrying a
+    triple-quote) is left untouched so real Markdown/docstrings survive.
+    """
+    if not content or "```" not in content:
+        return content
+    lines = content.splitlines()
+    open_idx: Optional[int] = None
+    for i, line in enumerate(lines[:4]):
+        if line.startswith("```"):
+            open_idx = i
+            break
+    if open_idx is None:
+        return content
+    preamble = [ln for ln in lines[:open_idx] if ln.strip()]
+    if any(("\"\"\"" in ln) or ("'''" in ln) for ln in preamble):
+        return content
+    body = lines[open_idx + 1:]
+    for j, line in enumerate(body):
+        if line.startswith("```"):
+            body = body[:j]
+            break
+    return "\n".join(body)
+
+
+def _format_syntax_error(exc: SyntaxError) -> str:
+    """Render a SyntaxError with the offending source line.
+
+    ``str(SyntaxError)`` reports only *where* ("line 1"), never *what* --
+    so a leftover fence or prose line yields a bare, unlocalisable
+    "invalid syntax" that neither the inline retry nor the router's
+    regenerate constraint can act on. Appending ``exc.text`` gives both
+    the retry prompt and the constraint the actual bad line to fix.
+    """
+    base = str(exc)
+    text = (getattr(exc, "text", None) or "").strip()
+    if not text:
+        return base
+    return f"{base}; offending line {getattr(exc, 'lineno', '?')}: {text[:120]!r}"
+
+
 @traced("llm")
 def generate_single_scaffold_file(
     path: str,
@@ -3418,17 +3467,13 @@ def generate_single_scaffold_file(
     syntax_ok = True
     syntax_error: Optional[str] = None
     ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
-    # Strip leading/trailing markdown code fences a 3B model occasionally
-    # wraps around the file body even when asked for raw content
-    # (```python\n…\n```). We only strip when the WHOLE content is
-    # wrapped, never an inner fence.
+    # Strip a markdown code fence a small model wraps the file body in.
+    # Covers a trailing-prose or unclosed fence and a short prose preamble
+    # in addition to the clean whole-wrap case -- an unstripped leading
+    # fence otherwise fails ast.parse on line 1 with a bare, unactionable
+    # "invalid syntax" the retry can never localise.
     if content:
-        stripped = content.strip()
-        if stripped.startswith("```"):
-            m = re.match(r"^```[a-zA-Z0-9_+\-]*\s*\n(.*?)\n```\s*$",
-                         stripped, re.DOTALL)
-            if m:
-                content = m.group(1)
+        content = _unwrap_wrapping_code_fence(content)
     # Reject unified-diff fragments that leak through the freeform parser
     # into the file body (`--- /dev/null`, `+++ b/...`, `@@ ...`).
     if content:
@@ -3441,13 +3486,17 @@ def generate_single_scaffold_file(
         try:
             _ast.parse(content)
         except SyntaxError as e:
-            # One targeted retry with the exact SyntaxError surfaced.
-            # Broken Python that slips through here is silently dropped by
-            # APPLY's own syntax gate, which can leave the project without
-            # its entry point or its only test file (VERIFY then reports
-            # "no tests located" and the loop declares a false success).
+            # One targeted retry with the exact SyntaxError surfaced --
+            # including the offending source line so the fix (and the
+            # router's regenerate constraint on failure) is localised, not
+            # a bare "invalid syntax (line 1)". Broken Python that slips
+            # through here is silently dropped by APPLY's own syntax gate,
+            # which can leave the project without its entry point or its
+            # only test file (VERIFY then reports "no tests located" and
+            # the loop declares a false success).
+            syntax_msg = _format_syntax_error(e)
             retry = _syntax_repair_retry(
-                provider, path=path, lang="Python", error=str(e),
+                provider, path=path, lang="Python", error=syntax_msg,
                 broken=content, budget=budget)
             retry_ok = False
             if retry:
@@ -3460,7 +3509,7 @@ def generate_single_scaffold_file(
                 content = retry
             else:
                 syntax_ok = False
-                syntax_error = str(e)
+                syntax_error = syntax_msg
     elif syntax_ok and ext == "json" and content:
         import json as _json
         try:

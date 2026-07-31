@@ -1,17 +1,69 @@
-import type { ArtifactDTO } from "../../lib/api";
+import {
+  CheckCircle2, ClipboardList, FileEdit, FlaskConical, GitBranch,
+  HelpCircle, ListChecks, Package, Search, TerminalSquare, Wrench, XCircle,
+} from "lucide-react";
+import type { ArtifactDTO, ArtifactKind } from "../../lib/api";
 import { Markdown } from "../Markdown";
 import { DiffView } from "../DiffView";
 import { ErrorBoundary } from "../ErrorBoundary";
+
+// Icon per artifact kind so each card reads at a glance as "tool call: X",
+// mirroring how tool invocations are shown in richer agent-chat UIs.
+const ARTIFACT_ICONS: Partial<Record<ArtifactKind, typeof HelpCircle>> = {
+  directions_list: GitBranch,
+  findings_bundle: Search,
+  recommendation_list: ListChecks,
+  code_change_plan: FileEdit,
+  applied_changes: FileEdit,
+  verify_report: FlaskConical,
+  requirements_sheet: ClipboardList,
+  work_plan: ClipboardList,
+  scaffold_patches: FileEdit,
+  build_report: Package,
+  repair_plan: Wrench,
+  smoke_report: TerminalSquare,
+  api_check_report: TerminalSquare,
+};
+
+// Best-effort ok/fail read per kind, purely for a small header status icon --
+// the detailed outcome is still rendered by each kind's own Body below.
+function artifactStatus(artifact: ArtifactDTO): "ok" | "fail" | null {
+  const c = artifact.content || {};
+  switch (artifact.kind) {
+    case "verify_report":
+      return c.ran ? (c.tests_passed ? "ok" : "fail") : null;
+    case "build_report":
+      if (c.outcome === "succeeded") return "ok";
+      if (c.outcome === "failed") return "fail";
+      return null;
+    case "applied_changes":
+      return Array.isArray(c.failed_files) && c.failed_files.length > 0 ? "fail" : "ok";
+    case "scaffold_patches":
+      return Array.isArray(c.failed) && c.failed.length > 0 ? "fail" : "ok";
+    case "smoke_report":
+    case "api_check_report":
+      if (c.outcome === "passed") return "ok";
+      if (c.outcome === "failed") return "fail";
+      return null;
+    default:
+      return null;
+  }
+}
 
 // Render any session artifact in a kind-aware preview. Falls back to a
 // JSON dump for kinds we don't yet have a dedicated view for so the user
 // still sees something useful.
 export function ArtifactPreview({ artifact }: { artifact: ArtifactDTO }) {
+  const Icon = ARTIFACT_ICONS[artifact.kind] || HelpCircle;
+  const status = artifactStatus(artifact);
   return (
     <section className="rounded-lg border border-white/5 bg-slate-950/40 p-3 space-y-2">
-      <header className="flex items-center justify-between gap-2 text-[10px] font-mono text-slate-400 uppercase tracking-wider">
-        <span>artifact · {artifact.kind}</span>
-        <span className="text-slate-600">{artifact.artifact_id.slice(0, 8)}</span>
+      <header className="flex items-center gap-2 text-[10px] font-mono text-slate-400 uppercase tracking-wider">
+        <Icon className="h-3 w-3 text-emerald-400 shrink-0" />
+        <span>{artifact.kind}</span>
+        {status === "ok" && <CheckCircle2 className="h-3 w-3 text-emerald-400" />}
+        {status === "fail" && <XCircle className="h-3 w-3 text-red-400" />}
+        <span className="text-slate-600 ml-auto">{artifact.artifact_id.slice(0, 8)}</span>
       </header>
       <ErrorBoundary label={`artifact ${artifact.kind}`}>
         <Body artifact={artifact} />

@@ -1,13 +1,16 @@
 import { Cpu } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { useLocation } from "react-router-dom";
 import { useConnection } from "../store/connection";
 import { useWorkspace } from "../store/workspace";
 import { useTrace } from "../store/trace";
 import { StatusDot } from "../components/Pill";
+import { Breadcrumb } from "../components/Breadcrumb";
 import { cn } from "../lib/utils";
-import { api, type HardwareInfo, type RunningModel } from "../lib/api";
+import { formatCtx, placementLabel, embedPillState, findActiveRunningModel } from "../lib/hardware";
+import { api, type RunningModel, type SessionSummary } from "../lib/api";
 
-// Top platform header: brand + provider health pulse + mode badge.
+// Top platform header: brand + breadcrumb + provider health pulse + mode badge.
 // Reads from the shared connection store and active workspace provider.
 
 const PROVIDER_LABELS: Record<string, string> = {
@@ -17,58 +20,16 @@ const PROVIDER_LABELS: Record<string, string> = {
   custom: "Custom",
 };
 
-// Render a token count as a short human label: 4096 → "4K", 131072 → "131K".
-function formatCtx(n: number | null | undefined): string {
-  if (!n || n <= 0) return "—";
-  if (n >= 1000) return `${Math.round(n / 1024)}K`;
-  return String(n);
-}
-
-// Classify Ollama placement from the two byte counts in /api/ps.
-function placementLabel(m: RunningModel): { label: string; tone: string } {
-  const total = Number(m.size || 0);
-  const vram = Number(m.size_vram || 0);
-  if (total > 0 && vram >= total) return { label: "GPU", tone: "text-emerald-300" };
-  if (vram === 0) return { label: "CPU", tone: "text-amber-300" };
-  const pct = total > 0 ? Math.round((vram / total) * 100) : 0;
-  return { label: `GPU ${pct}%`, tone: "text-amber-300" };
-}
-
-// Decide the Embed (torch/CUDA) pill state from the hardware probe.
-//   - returns null when torch isn't installed (core-only install -- nothing
-//     to surface; the user isn't running local embeddings)
-//   - "warn" when nvidia-smi sees a GPU but torch can't use it (the regression
-//     this whole check exists to catch)
-//   - "gpu" / "cpu" for the healthy cases
-function embedPillState(hw: HardwareInfo | undefined): {
-  tone: "neon" | "red" | "amber" | "slate";
-  label: string;
-  title: string;
-} | null {
-  if (!hw || hw.torch_installed !== true) return null;
-  if (hw.torch_cuda_warning) {
-    return {
-      tone: "red",
-      label: "Embed: CPU ⚠",
-      title: hw.torch_cuda_warning,
-    };
-  }
-  if (hw.torch_cuda_available) {
-    const buildTag = hw.torch_cuda_build ? ` (CUDA ${hw.torch_cuda_build})` : "";
-    return {
-      tone: "neon",
-      label: "Embed: GPU",
-      title: `torch ${hw.torch_version || "?"}${buildTag} -- embeddings run on the GPU`,
-    };
-  }
-  return {
-    tone: "slate",
-    label: "Embed: CPU",
-    title: hw.gpu_vram_gb
-      ? "torch is CPU-only despite a GPU being present"
-      : "No NVIDIA GPU detected; embeddings run on CPU",
-  };
-}
+const PAGE_TITLES: Record<string, string> = {
+  "/": "Overview",
+  "/ask": "Ask",
+  "/plan": "Plan",
+  "/agent": "Agent",
+  "/agent-legacy": "Agent (legacy)",
+  "/index": "Index",
+  "/hardware": "Hardware",
+  "/settings": "Settings",
+};
 
 export default function Header() {
   const status = useConnection((s) => s.status);
@@ -122,13 +83,7 @@ export default function Header() {
   // what effective context window and GPU/CPU placement.
   const running = (status?.ollama?.running_models || []) as RunningModel[];
   const activeRunning =
-    isLocal && provider.model
-      ? running.find(
-          (m) =>
-            (m.name || m.model || "").toLowerCase() ===
-            provider.model.toLowerCase(),
-        )
-      : undefined;
+    isLocal && provider.model ? findActiveRunningModel(running, provider.model) : undefined;
   const placement = activeRunning ? placementLabel(activeRunning) : null;
 
   const modeLabel = isLocal ? "Local / Air-Gapped" : "Cloud";
@@ -144,26 +99,27 @@ export default function Header() {
           ? "text-amber-300"
           : "text-slate-400";
 
+  const location = useLocation();
+  const pageTitle = PAGE_TITLES[location.pathname] || null;
+
   return (
     <header
-      className="h-14 border-b flex items-center justify-between px-6 bg-header flex-shrink-0"
+      className="h-14 border-b flex items-center justify-between px-6 bg-header flex-shrink-0 gap-4"
       style={{ borderColor: "rgba(255,255,255,0.06)" }}
     >
-      <div className="flex items-center space-x-3">
-        <div className="h-7 w-7 bg-emerald-500 rounded flex items-center justify-center text-slate-950 font-bold text-sm shadow-md shadow-emerald-500/10">
+      <div className="flex items-center gap-4 min-w-0">
+        <div
+          className="h-7 w-7 bg-emerald-500 rounded flex items-center justify-center text-slate-950 font-bold text-sm shadow-md shadow-emerald-500/10 shrink-0"
+          title={`cgx.webui v${status?.version || "0.2.0"}`}
+        >
           C
         </div>
-        <div className="flex items-baseline space-x-2">
-          <span className="font-bold tracking-tight text-white text-base font-mono">
-            CGX
-          </span>
-          <span className="text-[10px] text-slate-500 font-mono">
-            cgx.webui v{status?.version || "0.2.0"}
-          </span>
-        </div>
+        <Breadcrumb items={pageTitle ? ["CGX", pageTitle] : ["CGX"]} />
       </div>
 
-      <div className="flex items-center space-x-6 text-xs font-mono">
+      {location.pathname === "/ask" && <AskSessionDropdown />}
+
+      <div className="flex items-center space-x-4 text-xs font-mono">
         <div className="flex items-center gap-2 bg-slate-950 px-2.5 py-1 rounded border border-white/5">
           <StatusDot tone={statusTone as any} />
           <span className="text-slate-400">
@@ -245,5 +201,34 @@ export default function Header() {
         </button>
       </div>
     </header>
+  );
+}
+
+// Thin "jump to session" dropdown shown only on /ask. The Sidebar already
+// owns full session CRUD (create/delete/list); this is just a fast switcher
+// so a session can be picked without leaving the header.
+function AskSessionDropdown() {
+  const [sessions, setSessions] = useState<SessionSummary[]>([]);
+  const selected = useWorkspace((s) => s.selectedSessionId);
+  const setSelected = useWorkspace((s) => s.setSelectedSession);
+
+  useEffect(() => {
+    api.listSessions().then(setSessions).catch(() => setSessions([]));
+  }, []);
+
+  return (
+    <select
+      value={selected || ""}
+      onChange={(e) => setSelected(e.target.value || null)}
+      title="Jump to session"
+      className="av-input appearance-none text-xs py-1 max-w-[220px] shrink-0"
+    >
+      <option value="">New session</option>
+      {sessions.map((s) => (
+        <option key={s.id} value={s.id}>
+          {s.title || s.id.slice(0, 8)}
+        </option>
+      ))}
+    </select>
   );
 }
