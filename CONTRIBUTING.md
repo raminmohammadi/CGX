@@ -21,10 +21,10 @@ reranker stack locally.
 
 ## Project layout
 
-- `src/cgx/` -- runtime library (`agents/`, `answer/`, `codegen/`,
+- `src/cgx/` -- runtime library (`session/`, `answer/`, `codegen/`,
   `embeddings/`, `retrieval/`, `pipeline/`, `webui/`, `cli/`).
 - `skills/` -- pluggable per-technology bundles consumed by
-  `cgx.agents.planner`, `cgx.answer.engine`, and `cgx.agents.judge`.
+  `cgx.answer.engine` and the session-loop executors (`cgx.session.tasks`).
 - `frontend/` -- React/Vite SPA bundled into `src/cgx/webui/static/`.
 - `extension/` -- VS Code webview extension scaffold.
 - `tests/` -- pytest suite (mirrors `src/cgx/` package structure).
@@ -101,7 +101,7 @@ Run `pytest tests/test_skills_<name>.py -q` before opening a PR.
 ### Skill design rules
 
 - **No agent-layer edits.** A new skill must not require changes to
-  `cgx.agents.*` or `cgx.answer.engine`. If you find yourself doing
+  `cgx.session.*` or `cgx.answer.engine`. If you find yourself doing
   that, the abstraction is missing -- open an issue first.
 - **Validators are structural, not stylistic.** A failing verdict
   should mean *"the output cannot possibly satisfy this technology"*,

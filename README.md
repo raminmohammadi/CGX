@@ -78,38 +78,27 @@ backend that streams progress over Server-Sent Events.
   task/fact/artifact/decision), so a session can be resumed days
   later. See the **🤖 Agent** tab and
   [docs/flowcharts.md § Session-shaped write loop](docs/flowcharts.md#session-shaped-write-loop-agent).
-- **Legacy batch agent (`/agent-legacy`).** The original
-  Planner / Tracker / Judge loop is preserved for fire-and-forget
-  goals and new-project scaffolds. It decomposes a request into
-  atomic tasks (`ask`, `plan`, `scaffold`, `scaffold_manifest`,
-  `scaffold_file`, `search`, `summarize`, `apply`, `verify`,
-  `fill_logic`) and validates each artefact before moving on
-  (`cgx.agents`). The planner routes scaffold goals through a
-  manifest-then-per-file chain, downgrades expensive code-gen tasks
-  to plain Q&A for read-only goals, and the tracker streams live
-  `task_progress` heartbeats so the UI never looks frozen on long
-  LLM calls. Still the entry point exposed by the `cgx agent` CLI
-  and by `cgx.agents.run_agent`.
 - **New project generation.** Give CGX a plain-language idea
   (e.g. *"create a FastAPI todo app"* or *"create a React calculator
   app"*), set a destination directory as Project Root, and the
-  `scaffold_manifest → scaffold_file × N → apply → verify` chain
-  generates a complete, working project from scratch -- no existing
-  codebase or index required. The `apply` step writes a per-run backup
-  mirror under `<project_root>/.cgx-backups/` so the whole run can
-  be undone via `POST /api/rollback`.
+  greenfield session chain (`CLARIFY_REQUIREMENTS → DECOMPOSE →
+  SCAFFOLD → APPLY → VERIFY`) generates a complete, working project
+  from scratch -- no existing codebase or index required. The `APPLY`
+  step writes a per-run backup mirror under
+  `<project_root>/.cgx-backups/` so the whole run can be undone via
+  `POST /api/rollback`.
 - **Modular skills registry** (`skills/`). Each supported technology
   lives in its own folder (`skills/react/`, `skills/fastapi/`,
   `skills/nextjs/`, `skills/vue/`, `skills/tailwind/`, `skills/flask/`,
   `skills/django/`, `skills/express/`, `skills/python_cli/`,
   `skills/sqlite/`) and bundles three things: detection from the goal,
   the prompt fragment the LLM sees while generating, and a structural
-  validator the Judge runs against the produced diffs. Multi-skill
-  goals compose naturally -- *"React UI + FastAPI backend"* activates
-  both, so the scaffold prompt carries both layouts and the Judge
-  refuses to silently pass an output that only honours one half. Adding
-  a new framework is a single-folder change with no agent-layer edits.
-  See [docs/usage.md](docs/usage.md#generating-a-new-project-from-scratch)
+  validator (`skills.validate_scaffold` / `validate_plan`) that checks
+  the produced diffs. Multi-skill goals compose naturally -- *"React UI
+  + FastAPI backend"* activates both, so the scaffold prompt carries
+  both layouts. Adding a new framework is a single-folder change with
+  no agent-layer edits. See
+  [docs/usage.md](docs/usage.md#skills-technology-aware-scaffolding)
   for the full table and [docs/architecture.md](docs/architecture.md#skills)
   for the protocol.
 - **Persistent chat sessions.** Conversations are saved as JSONL
@@ -335,12 +324,10 @@ Tabs (left → right):
    the run back via `POST /api/rollback`. Session state is
    persisted to `<project_root>/.cgx/sessions.db`; the active
    session id and selection are persisted client-side so a tab
-   switch / reload resumes the same view. The original batch
-   Planner → Tracker → Judge loop is preserved at
-   **`/agent-legacy`** -- pick it from the sidebar (or reach it
-   via the `cgx agent` CLI) for one-shot goals where you want a
-   single fire-and-forget run with no checkpoints. Both views
-   surface a **Cancel** button on long-running tasks.
+   switch / reload resumes the same view. The same loop backs the
+   `cgx agent` CLI, which runs a single unattended turn (clarify /
+   approval questions answered with sensible defaults) for one-shot
+   goals. A **Cancel** button is surfaced on long-running tasks.
 6. **Hardware** -- click **Detect hardware** to annotate the local
    model catalogue with ✅/⚠️/❌ fit verdicts against your machine. The
    second table shows the editorial local-vs-cloud trade-off across
@@ -375,7 +362,7 @@ cgx ask "What does parse_codebase do?" --think
 # 4. Generate a self-tested code-change plan
 cgx plan "Add a --json flag to the query command" --self-test --run-tests
 
-# 5. Run the Planner -> Tracker -> Judge agent loop
+# 5. Run an unattended turn of the session agent loop
 cgx agent "Add docstrings to every public function in cgx.parser"
 
 # Provider + hardware + index status
@@ -430,8 +417,8 @@ Three picture-first views of the same system live in
 - **For users** ([flow_user.svg](docs/diagrams/flow_user.svg)) -- the
   install → index → ask/plan/agent → grounded-answer journey.
 - **For developers** ([flow_developer.svg](docs/diagrams/flow_developer.svg)) --
-  the Planner → Tracker → Judge loop, the capability dispatch table,
-  and the full SSE event timeline (including `task_progress`).
+  the session loop's Router → executor dispatch and the full SSE
+  event timeline.
 - **For companies** ([flow_company.svg](docs/diagrams/flow_company.svg)) --
   trust boundaries: what stays on the local machine, where credentials
   live, and the single opt-in egress path to a remote LLM.
@@ -585,86 +572,6 @@ task = runner.run_next(session_id=session.session_id, deps=deps)
 See [docs/Agent.md](docs/Agent.md), [docs/usage.md](docs/usage.md#6-session-based-agent-agent),
 and [docs/flowcharts.md](docs/flowcharts.md#session-shaped-write-loop-agent)
 for full reference.
-
----
-
-## Legacy batch agent (`/agent-legacy`)
-
-For one-shot goals -- *"add docstrings to every public function in
-`cgx.parser`"*, *"create a FastAPI todo app with SQLite and pytest
-tests"* -- the original Planner → Tracker → Judge loop is preserved
-at `/agent-legacy` (and via the `cgx agent` CLI). It is also the
-only path that runs the new-project scaffold pipeline
-(`scaffold_manifest → scaffold_file × N → apply → verify`).
-
-1. The **Planner** decomposes your goal into 1–5 ordered atomic
-   `Task`s, each tagged with a short `name`, a `description`, a `kind`
-   (`ask`, `plan`, `scaffold`, `search`, `summarize`, `apply`,
-   `verify`, `fill_logic`) and plain-English `criteria`. It prefers a strict JSON
-   plan from the LLM but falls back to a deterministic single-task
-   plan derived from `cgx.answer.intent.detect_intent` when no
-   provider is available. A kind-policy pass:
-   - Routes *new-project* goals to a `scaffold → apply → verify` chain.
-   - Downgrades `plan` → `ask` for read-only goals so informational
-     queries don't pay for code-generation work.
-   - Appends `apply` + `verify` after the final `plan` or `scaffold`
-     task so generated code always reaches disk and gets tested.
-2. The **Tracker** is a state machine that walks the plan task by
-   task, dispatching each one to the matching capability callable on a
-   worker thread. It emits `AgentEvent`s (`plan`, `task_start`,
-   `task_progress`, `task_done`, `task_failed`, `task_skipped`,
-   `judge`, `summary`) that stream as SSE into the UI. `task_progress`
-   ticks every `progress_interval` seconds (default `2.0`) with the
-   elapsed running time.
-3. The **Judge** validates each completed task against its criteria
-   with cheap structural short-circuits (*search* passes when
-   `hits > 0`; *plan* hard-fails only when both `plan_md` and `diffs`
-   are absent; *scaffold* hard-fails only when no files were produced)
-   before optionally asking the LLM for a strict
-   `{verdict, confidence, rationale}` JSON.
-
-Use it from the **🤖 Agent** tab's **`/agent-legacy`** view, or
-programmatically:
-
-```python
-from cgx.agents import run_agent
-from cgx.answer.providers import OllamaProvider
-
-prov = OllamaProvider(model="qwen2.5-coder:3b")
-
-# Modify an existing codebase -- stream=True yields AgentEvent objects.
-for event in run_agent(
-    goal="Add docstrings to every public function in cgx.parser",
-    provider=prov,
-    index_dir="/tmp/cgx_index/indices",
-    records_path="/tmp/cgx_index/records.jsonl",
-    project_root="./",
-    stop_on_fail=True,
-    stream=True,
-):
-    print(event.type, event.payload)
-
-# Generate a brand-new project -- no index required.
-for event in run_agent(
-    goal="Create a FastAPI todo app with SQLite and pytest tests",
-    provider=prov,
-    project_root="/tmp/my_todo_app",   # destination directory
-    stream=True,
-):
-    print(event.type, event.payload)
-
-# stream=False (default) blocks until done and returns the final Plan.
-plan = run_agent(
-    goal="Add docstrings to every public function in cgx.parser",
-    provider=prov, index_dir="/tmp/cgx_index/indices",
-    records_path="/tmp/cgx_index/records.jsonl",
-)
-for task in plan.tasks:
-    print(task.kind, task.status, task.output)
-```
-
-The `/agent-legacy` view renders the same `AgentEvent` stream as a
-live status table + DAG (`src/cgx/agents/viz.py`).
 
 ---
 
@@ -892,11 +799,10 @@ pytest -q
 ```
 
 The suite covers parser, embeddings cache, hybrid retrieval / rerank,
-codegen pipeline, agents (planner / tracker / judge / viz), sessions,
+codegen pipeline, the session agent loop (router / executors / store),
 hardware matrix, rate limiter, telemetry, profiles, and an end-to-end
 index → query smoke test with a deterministic fake embedder (no model
-download, no GPU). Expected count is in the high 90s and grows with
-each feature.
+download, no GPU).
 
 CI is configured in [`.github/workflows/ci.yml`](.github/workflows/ci.yml)
 as a **two-job matrix**:
