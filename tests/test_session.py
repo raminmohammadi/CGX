@@ -7374,6 +7374,24 @@ def test_contract_check_abstains_without_python_and_on_empty():
     assert check_contract_compliance(js, {}) == []
 
 
+def test_contract_check_constant_import_only_does_not_satisfy():
+    """A constant that is only *imported* (never assigned) still warns.
+
+    ``from ..config import API_BASE`` re-exports the name into the module's
+    namespace, but nothing in the generated tree actually assigns it, so the
+    constant contract is unsatisfied and must be flagged for regeneration.
+    """
+    from cgx.session.scaffold_validate import check_contract_compliance
+    contracts = {"constants": [{"name": "API_BASE"}]}
+    import_only = {"src/core.py": "from ..config import API_BASE\n"}
+    warns = check_contract_compliance(import_only, contracts)
+    assert [w["kind"] for w in warns] == ["constant"]
+    assert warns[0]["name"] == "API_BASE"
+    # An actual assignment satisfies the same contract.
+    assigned = {"src/core.py": "API_BASE = 'https://x'\n"}
+    assert check_contract_compliance(assigned, contracts) == []
+
+
 def test_scaffold_executor_surfaces_import_warnings(store, monkeypatch):
     """SCAFFOLD runs the cross-check and surfaces ``import_warnings``."""
     from cgx.session.tasks.scaffold import run_scaffold

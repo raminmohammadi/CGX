@@ -369,11 +369,16 @@ def _module_name_for_path(path: str) -> Optional[str]:
     return ".".join(parts) if parts else None
 
 
-def _top_level_symbols(content: str) -> Optional[Set[str]]:
+def _top_level_symbols(content: str,
+                       include_imports: bool = True) -> Optional[Set[str]]:
     """Top-level names a ``from mod import name`` could bind, or ``None``.
 
     ``None`` signals the module could not be parsed, so the caller must
-    abstain rather than flag a false positive.
+    abstain rather than flag a false positive. When ``include_imports`` is
+    ``False`` the names merely *bound* by an ``import`` / ``from ... import``
+    are omitted, leaving only the names the module actually *defines*
+    (functions, classes, assignments). Contract checks that require a name
+    to be authored -- not just re-exported -- use that stricter view.
     """
     try:
         tree = ast.parse(content)
@@ -392,12 +397,14 @@ def _top_level_symbols(content: str) -> Optional[Set[str]]:
             if isinstance(node.target, ast.Name):
                 names.add(node.target.id)
         elif isinstance(node, ast.Import):
-            for a in node.names:
-                names.add((a.asname or a.name).split(".")[0])
+            if include_imports:
+                for a in node.names:
+                    names.add((a.asname or a.name).split(".")[0])
         elif isinstance(node, ast.ImportFrom):
-            for a in node.names:
-                if a.name != "*":
-                    names.add(a.asname or a.name)
+            if include_imports:
+                for a in node.names:
+                    if a.name != "*":
+                        names.add(a.asname or a.name)
     return names
 
 
@@ -555,6 +562,10 @@ def check_contract_compliance(
 
     per_module: Dict[str, Set[str]] = {}
     all_symbols: Set[str] = set()
+    # Names actually *defined* (assigned / functions / classes) across every
+    # module, excluding names merely re-exported via an import. Constants must
+    # be assigned, not just imported, to satisfy their contract.
+    assigned_symbols: Set[str] = set()
     for path, content in file_contents.items():
         if not isinstance(content, str):
             continue
@@ -565,6 +576,9 @@ def check_contract_compliance(
             continue
         per_module[path.replace("\\", "/")] = syms
         all_symbols |= syms
+        defined = _top_level_symbols(content, include_imports=False)
+        if defined is not None:
+            assigned_symbols |= defined
 
     have_python = bool(per_module)
     haystack = "\n".join(
@@ -634,7 +648,7 @@ def check_contract_compliance(
             name = str(c.get("name") or "").strip()
             if not name:
                 continue
-            if name not in all_symbols:
+            if name not in assigned_symbols:
                 warnings.append({
                     "kind": "constant",
                     "name": name,
