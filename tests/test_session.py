@@ -7939,6 +7939,7 @@ def test_propose_regenerate_increments_attempt_and_accumulates_constraints():
 
 
 def _build_regenerate_chain(*, prior_regens: int = 0,
+                            prior_repair_regens: int = 0,
                             extra_descendants: bool = True):
     """Build a SCAFFOLD -> APPLY -> VERIFY -> REPAIR(regenerate) chain."""
     from cgx.session.models import SessionMode
@@ -7946,7 +7947,8 @@ def _build_regenerate_chain(*, prior_regens: int = 0,
     scaffold = TaskNode.new(
         session.session_id, TaskKind.SCAFFOLD, "scaffold",
         inputs={"work_plan_artifact_id": "art_plan",
-                "regenerate_attempt": prior_regens})
+                "regenerate_attempt": prior_regens,
+                "repair_regenerate_attempt": prior_repair_regens})
     scaffold.status = TaskNodeStatus.DONE
     apply_t = TaskNode.new(
         session.session_id, TaskKind.APPLY, "apply",
@@ -7998,6 +8000,9 @@ def test_router_repair_regenerate_abandons_subtree_and_requeues_scaffold():
     assert new_scaffold.kind is TaskKind.SCAFFOLD
     assert new_scaffold.parent_task_id == scaffold.parent_task_id
     assert new_scaffold.inputs["regenerate_attempt"] == 1
+    # A semantic-repair regenerate bumps its OWN counter, not just the
+    # shared syntax-churn one, so the loop stays bounded across scaffolds.
+    assert new_scaffold.inputs["repair_regenerate_attempt"] == 1
     assert new_scaffold.inputs["regenerated_from_task_id"] == scaffold.task_id
     payloads = new_scaffold.inputs["regenerate_constraints"]
     assert payloads and payloads[0]["kind"] == "unittest_pytest_mix"
@@ -8090,10 +8095,10 @@ def test_router_scaffold_contract_skipped_when_files_dropped():
 
 
 def test_router_repair_regenerate_budget_exhausted_fails_session():
-    """Once the regenerate budget is hit the session fails terminally."""
-    from cgx.session.router import _REGENERATE_BUDGET
+    """Once the repair-regenerate budget is hit the session fails terminally."""
+    from cgx.session.router import _REPAIR_REGENERATE_BUDGET
     session, _scaffold, tasks, rep = _build_regenerate_chain(
-        prior_regens=_REGENERATE_BUDGET)
+        prior_repair_regens=_REPAIR_REGENERATE_BUDGET)
     plan = Router().on_task_completed(
         session=session, completed=rep, tasks=tasks)
     creates = [a for a in plan.actions if isinstance(a, CreateTask)]
@@ -8107,6 +8112,30 @@ def test_router_repair_regenerate_budget_exhausted_fails_session():
     status = [a for a in plan.actions if isinstance(a, UpdateSessionStatus)]
     assert len(status) == 1
     assert status[0].status is SessionStatus.FAILED
+
+
+def test_router_repair_regenerate_allowed_after_syntax_budget_spent():
+    """The ses_7c8b181873844f06 shape: a scaffold that spent its whole
+    syntax-churn budget converging to a clean tree must still afford the
+    FIRST semantic (api_check-driven) regenerate.
+    """
+    from cgx.session.router import (_REGENERATE_BUDGET,
+                                    _REPAIR_REGENERATE_BUDGET)
+    assert _REPAIR_REGENERATE_BUDGET >= 1
+    session, scaffold, tasks, rep = _build_regenerate_chain(
+        prior_regens=_REGENERATE_BUDGET, prior_repair_regens=0)
+    plan = Router().on_task_completed(
+        session=session, completed=rep, tasks=tasks)
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    # The syntax budget being spent must NOT block the semantic repair.
+    assert len(creates) == 1
+    new_scaffold = creates[0].task
+    assert new_scaffold.kind is TaskKind.SCAFFOLD
+    assert new_scaffold.inputs["repair_regenerate_attempt"] == 1
+    # No terminal FAILED -- the run gets its correctness rewrite.
+    assert not [a for a in plan.actions
+                if isinstance(a, UpdateSessionStatus)
+                and a.status is SessionStatus.FAILED]
 
 
 def test_router_repair_regenerate_without_scaffold_ancestor_fails_session():
