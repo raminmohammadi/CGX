@@ -1870,6 +1870,49 @@ def test_router_verify_stall_when_failing_flat_and_passing_flat():
     assert status[0].status is SessionStatus.FAILED
 
 
+def test_router_collection_error_progress_drop_allows_repair():
+    """P2/#5: a collection error whose erroring-module count drops repairs.
+
+    ``failing_count`` on a ``collection_error`` is the number of modules
+    erroring during collection (import fixes landing one at a time). A
+    strictly-dropping count (2 -> 1) is real forward progress, so the loop
+    continues and threads the new count onto the trend.
+    """
+    from cgx.session.models import SessionMode
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    ver = _greenfield_failed_verify(
+        signature="cerr2", outcome="collection_error", repair_attempt=1,
+        prior=["cerr1"], failing_count=1, prior_counts=[2], session=session)
+    plan = Router().on_task_completed(
+        session=session, completed=ver, tasks=[ver])
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    assert len(creates) == 1
+    rep = creates[0].task
+    assert rep.kind is TaskKind.REPAIR
+    assert rep.inputs["prior_failing_counts"] == [2, 1]
+
+
+def test_router_collection_error_progress_stall_refuses_repair():
+    """P2/#5: a collection error whose count stops dropping ends the loop.
+
+    Before this fix a ``collection_error`` ignored ``failing_count`` and a
+    fresh signature always slipped past the flap guard. Now a flat count
+    (2 -> 2) is a stall even with a brand-new signature, so the session
+    fails terminally instead of burning another round.
+    """
+    from cgx.session.models import SessionMode
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    ver = _greenfield_failed_verify(
+        signature="cfresh", outcome="collection_error", repair_attempt=1,
+        prior=["cerr1"], failing_count=2, prior_counts=[2], session=session)
+    plan = Router().on_task_completed(
+        session=session, completed=ver, tasks=[ver])
+    assert [a for a in plan.actions if isinstance(a, CreateTask)] == []
+    status = [a for a in plan.actions if isinstance(a, UpdateSessionStatus)]
+    assert len(status) == 1
+    assert status[0].status is SessionStatus.FAILED
+
+
 def test_router_repair_apply_verify_chain_carries_failing_counts():
     """P2/#5: the failing + passing ledgers survive REPAIR -> APPLY -> VERIFY."""
     from cgx.session.models import SessionMode

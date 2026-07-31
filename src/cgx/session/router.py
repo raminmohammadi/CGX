@@ -635,11 +635,17 @@ def _verify_to_repair_or_terminal(parent: TaskNode) -> List[TaskNode]:
     # passing count strictly rises (a round that fixed one test while
     # another newly began failing held the failing count flat but still
     # made forward progress). A stall (neither lever moved forward) ends
-    # the loop. The counts are trusted only for ``assertions_failed``
-    # (where "N tests failing / M passing" is meaningful); every other
-    # outcome falls back to the signature-flap backstop below.
+    # the loop. The failing-count trend is trusted for ``assertions_failed``
+    # *and* ``collection_error``: for a collection error ``failing_count`` is
+    # the number of modules erroring during collection (e.g. import fixes
+    # landing one module at a time), so a strictly-dropping count is genuine
+    # forward progress that should buy another round under the budget. The
+    # ``passing_count`` lever stays ``assertions_failed``-only ("M passing"
+    # is meaningless when nothing collected); every other outcome falls back
+    # to the signature-flap backstop below.
     new_count = (_coerce_count(outputs.get("failing_count"))
-                 if outcome == "assertions_failed" else None)
+                 if outcome in ("assertions_failed", "collection_error")
+                 else None)
     prior_counts = [c for c in (
         _coerce_count(x)
         for x in (parent.inputs.get("prior_failing_counts") or []))
