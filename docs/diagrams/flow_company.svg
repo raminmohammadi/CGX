@@ -59,9 +59,9 @@
     <!-- Agent loop -->
     <g>
       <rect x="60" y="280" width="620" height="100" rx="10" fill="#0b1220" stroke="#10b981" stroke-opacity="0.7"/>
-      <text x="78" y="305" font-size="12" font-weight="700" fill="#a7f3d0">🤖 Agent loop  ·  Planner → Tracker → Judge</text>
-      <text x="78" y="326" font-size="10.5" fill="#cbd5e1">Decomposes a goal into atomic tasks: ask / plan / scaffold_manifest / scaffold_file / search /</text>
-      <text x="78" y="342" font-size="10.5" fill="#cbd5e1">summarize / apply / verify / fill_logic.  Self-tests diffs (AST + scoped pytest) before surfacing.</text>
+      <text x="78" y="305" font-size="12" font-weight="700" fill="#a7f3d0">🤖 Agent loop  ·  session-shaped (Runner → Executor → Router → Store)</text>
+      <text x="78" y="326" font-size="10.5" fill="#cbd5e1">Progresses a task DAG one step at a time: explore / plan_change / clarify / decompose / scaffold /</text>
+      <text x="78" y="342" font-size="10.5" fill="#cbd5e1">apply / verify / repair.  Self-tests diffs (AST + scoped pytest) before surfacing.</text>
       <text x="78" y="362" font-size="10.5" fill="#94a3b8">SSE stays inside the local process; apply writes a backup dir for one-click rollback.</text>
     </g>
 

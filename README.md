@@ -109,10 +109,6 @@ backend that streams progress over Server-Sent Events.
   being surfaced. The sandbox now auto-installs missing Python packages
   before running pytest (`cgx.codegen.env_manager`) so a model choosing
   a new library doesn't mask real failures.
-- **Symbol table context.** Before generating a change plan, CGX
-  injects a compressed `# AVAILABLE CONTEXT` map of every symbol already
-  defined in the indexed codebase (`cgx.codegen.symbol_map`), preventing
-  local models from re-implementing helpers that already exist.
 - **Granular error slicing.** Retry prompts include ±5 lines of source
   context around the first traceback line number rather than a raw
   1 200-character pytest dump, keeping small models focused on the precise
