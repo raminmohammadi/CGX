@@ -6,11 +6,9 @@ import {
   ChevronRight,
   CircleCheck,
   Database,
-  History,
   LayoutDashboard,
   Loader2,
   MessageSquareDot,
-  Microchip,
   Plus,
   Settings,
   Trash2,
@@ -26,7 +24,6 @@ type NavTab = {
   label: string;
   icon: typeof Bot;
   pageKey: "agent" | "ask" | "plan" | "index" | null;
-  muted?: boolean;
 };
 
 const overviewTab: NavTab = { to: "/", label: "Overview", icon: LayoutDashboard, pageKey: null };
@@ -41,15 +38,11 @@ const navGroups: { eyebrow: string; tabs: NavTab[] }[] = [
     tabs: [
       { to: "/plan", label: "Self-Testing Plan", icon: Wand2, pageKey: "plan" },
       { to: "/agent", label: "Agent Loop", icon: Bot, pageKey: null },
-      { to: "/agent-legacy", label: "Agent (legacy)", icon: History, pageKey: "agent", muted: true },
     ],
   },
   {
     eyebrow: "Retrieval",
-    tabs: [
-      { to: "/index", label: "Incremental Index", icon: Database, pageKey: "index" },
-      { to: "/hardware", label: "Hardware Pick", icon: Microchip, pageKey: null },
-    ],
+    tabs: [{ to: "/index", label: "Incremental Index", icon: Database, pageKey: "index" }],
   },
   {
     eyebrow: "System",
@@ -151,26 +144,21 @@ export default function Sidebar() {
                     {group.eyebrow}
                   </span>
                   <nav className="space-y-0.5">
-                    {group.tabs.map(({ to, label, icon: Icon, pageKey, muted }) => {
+                    {group.tabs.map(({ to, label, icon: Icon, pageKey }) => {
                       const isRunning = pageKey ? running[pageKey] : false;
                       return (
                         <NavLink
                           key={to}
                           to={to}
                           className={({ isActive }) =>
-                            cn(
-                              "av-nav-item",
-                              isActive && "is-active font-medium",
-                              muted && "opacity-60 text-[11px]",
-                            )
+                            cn("av-nav-item", isActive && "is-active font-medium")
                           }
                         >
                           {({ isActive }) => (
                             <>
                               <Icon
                                 className={cn(
-                                  muted ? "h-3 w-3" : "h-3.5 w-3.5",
-                                  "shrink-0",
+                                  "h-3.5 w-3.5 shrink-0",
                                   isActive ? "text-emerald-400" : "text-slate-500",
                                 )}
                               />

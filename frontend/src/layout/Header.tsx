@@ -27,7 +27,6 @@ const PAGE_TITLES: Record<string, string> = {
   "/agent": "Agent",
   "/agent-legacy": "Agent (legacy)",
   "/index": "Index",
-  "/hardware": "Hardware",
   "/settings": "Settings",
 };
 
