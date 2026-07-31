@@ -295,8 +295,7 @@ def emit_llm_call(
 ) -> None:
     """Emit a bounded, redacted ``llm_call`` trace record.
 
-    Shared by the build-loop wrapper (:class:`cgx.agents.llm_trace.
-    LLMTraceProvider`) and the session-store wrapper
+    Used by the session-store wrapper
     (:class:`cgx.session.llm_trace.TracingProvider`). Only prompt/response
     *previews* and byte counts land in the trace; the full payload (when
     persisted) lives in the session store, correlated via ``fact_id`` +

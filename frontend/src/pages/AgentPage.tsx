@@ -22,8 +22,7 @@ const CATEGORIES: { key: AgentTab; label: string; icon: typeof Play }[] = [
 // category shell (matching Settings' split-pane pattern): Run (the
 // original single view), Agent Profiles (save + launch a {task, skills}
 // bundle), Skills (library of built-in + custom skills), and New Skill
-// (create/edit a custom skill). The legacy batch view still lives at
-// ``/agent-legacy``.
+// (create/edit a custom skill).
 export default function AgentPage() {
   const [tab, setTab] = useState<AgentTab>("run");
   const [pendingLaunch, setPendingLaunch] = useState<AgentProfileLaunch | null>(null);

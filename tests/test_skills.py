@@ -185,38 +185,6 @@ def test_warnings_are_not_returned_by_validate_scaffold():
     assert skills.collect_scaffold_warnings(react, diffs)
 
 
-def test_judge_surfaces_scaffold_warning_in_rationale_without_failing():
-    # End-to-end: a React scaffold with no tests passes but the verdict
-    # rationale tells the operator a test file is missing.
-    from cgx.agents.judge import Judge
-    from cgx.agents.types import Task, TaskKind
-    task = Task(
-        description="Generate a React calculator",
-        kind=TaskKind.SCAFFOLD,
-        criteria=["renders a calculator"],
-        inputs={"skills": ["react"], "goal": "create a React calculator"},
-        output={"plan_md": "react calc",
-                "diffs": [_diff("src/App.jsx", "import React from 'react';"),
-                          _diff("package.json", "{}")]},
-    )
-    v = Judge(provider=None).judge(task)
-    assert v.verdict == "pass"
-    assert "warning" in v.rationale.lower() and "test" in v.rationale.lower()
-
-
-# ---------------------------------------------------------------------------
-# Planner integration
-# ---------------------------------------------------------------------------
-def test_planner_attaches_detected_skill_names_to_scaffold_inputs():
-    from cgx.agents.planner import Planner
-    plan = Planner(provider=None).plan(
-        "create a React calculator with FastAPI backend")
-    manifest_tasks = [t for t in plan.tasks if t.kind.value == "scaffold_manifest"]
-    assert manifest_tasks, "expected a scaffold_manifest task"
-    attached = manifest_tasks[0].inputs.get("skills") or []
-    assert "react" in attached and "fastapi" in attached
-
-
 # ---------------------------------------------------------------------------
 # Custom skills (user-authored, loaded from disk)
 # ---------------------------------------------------------------------------

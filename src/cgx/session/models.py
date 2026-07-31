@@ -4,8 +4,8 @@
 
 Plain :mod:`dataclasses` (no Pydantic) to keep the package
 dependency-light and JSON-serialise cleanly via ``to_dict()`` --
-matching the convention already used by :mod:`cgx.agents.types` and
-:mod:`cgx.sessions`. Pydantic stays at the webui wire boundary.
+matching the convention already used by :mod:`cgx.sessions`. Pydantic
+stays at the webui wire boundary.
 """
 
 from __future__ import annotations
