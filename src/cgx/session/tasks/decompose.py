@@ -69,7 +69,8 @@ def run_decompose(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     contracts = _coerce_contracts((result or {}).get("contracts"))
     if not _layer_file_count(layers):
         return ExecutorResult(
-            failure="DECOMPOSE: planner returned an empty manifest")
+            failure="DECOMPOSE: planner returned an empty manifest",
+            retryable=True)
 
     # Deterministic coherence gate: repair what can be repaired in place
     # (dangling depends_on, dependency cycles -- both only ordering
@@ -78,7 +79,7 @@ def run_decompose(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     # generates dependencies before their consumers.
     coherence_error = _validate_manifest_coherence(layers)
     if coherence_error:
-        return ExecutorResult(failure=coherence_error)
+        return ExecutorResult(failure=coherence_error, retryable=True)
     layers = _order_manifest_layers(layers)
 
     artifact = Artifact.new(

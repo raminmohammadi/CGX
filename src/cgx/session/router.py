@@ -1142,8 +1142,8 @@ class Router:
     def on_task_failed(self, *, session: Session,
                        failed: TaskNode,
                        tasks: List[TaskNode],
-                       resume_scaffold_artifact_id: Optional[str] = None
-                       ) -> RouterPlan:
+                       resume_scaffold_artifact_id: Optional[str] = None,
+                       retryable: bool = False) -> RouterPlan:
         """Transition a session to terminal ``FAILED`` on a hard failure.
 
         A *hard* failure is an executor that returned
@@ -1157,19 +1157,26 @@ class Router:
         hard failure ends the session ``FAILED`` -- asking the user to
         hand-fix AI-generated code is never a valid recovery.
 
-        One recoverable case (B4): a SCAFFOLD that crashed or timed out
-        *mid-run* after checkpointing some files. When the runner resolves
-        the crashed task's incomplete SCAFFOLD_PATCHES checkpoint and
-        threads its id via ``resume_scaffold_artifact_id``, and the shared
-        regenerate budget is not spent, re-queue a fresh SCAFFOLD that
-        resumes from that checkpoint (regenerating only the remainder)
-        instead of discarding every completed file. Budget-exhausted or
-        checkpoint-less crashes fall through to the terminal ``FAILED``.
+        Two recoverable cases:
 
-        Explore-mode sessions keep their user-driven lifecycle (the
-        caller may post a follow-up objective), so this returns an empty
-        plan for them, and it is a no-op if the session is already in a
-        terminal status.
+        * (B4) a SCAFFOLD that crashed or timed out *mid-run* after
+          checkpointing some files. When the runner resolves the crashed
+          task's incomplete SCAFFOLD_PATCHES checkpoint and threads its
+          id via ``resume_scaffold_artifact_id``, and the shared
+          regenerate budget is not spent, re-queue a fresh SCAFFOLD that
+          resumes from that checkpoint (regenerating only the remainder)
+          instead of discarding every completed file.
+        * a DECOMPOSE whose executor marked the failure ``retryable``
+          (a plan-quality problem such as an empty or unbuildable
+          manifest). Bounded by :data:`_DECOMPOSE_RETRY_BUDGET`, re-queue
+          a fresh DECOMPOSE with the failure message folded into its
+          goal so the planner LLM sees the constraint it must satisfy.
+
+        Budget-exhausted or non-recoverable failures fall through to the
+        terminal ``FAILED``. Explore-mode sessions keep their user-driven
+        lifecycle (the caller may post a follow-up objective), so this
+        returns an empty plan for them, and it is a no-op if the session
+        is already in a terminal status.
         """
         plan = RouterPlan()
         if session.mode is not SessionMode.GREENFIELD:
@@ -1183,6 +1190,11 @@ class Router:
         if resume_actions:
             plan.actions.extend(resume_actions)
             return plan
+        if retryable:
+            retry_actions = _decompose_retry_actions(failed)
+            if retry_actions:
+                plan.actions.extend(retry_actions)
+                return plan
         plan.actions.append(UpdateSessionStatus(
             session_id=session.session_id,
             status=SessionStatus.FAILED))
@@ -1454,6 +1466,54 @@ def _fold_failure_into_goal(prior_goal: str, failure_note: str) -> str:
     banner = ("The previous plan could not be scaffolded. Revise the file "
               "manifest to avoid this failure: " + note)
     return f"{goal}\n\n{banner}" if goal else banner
+
+
+# Maximum number of constraint-folded DECOMPOSE retries after a failure
+# the executor marked retryable (a plan-quality problem: an empty or
+# unbuildable manifest). One retry with the concrete failure folded into
+# the goal is enough to move a deterministic (temperature 0) planner off
+# the broken output; a second identical failure means the model cannot
+# satisfy the constraint and the session fails terminally.
+_DECOMPOSE_RETRY_BUDGET = 1
+
+
+def _decompose_retry_actions(failed: TaskNode) -> List[RouterAction]:
+    """Re-queue a DECOMPOSE whose executor marked the failure retryable.
+
+    The retry copies the failed task's requirements/answers wiring and
+    folds ``failed.error`` into ``prior_goal`` via
+    :func:`_fold_failure_into_goal` so the planner LLM sees exactly what
+    invalidated the prior manifest. Bounded by
+    :data:`_DECOMPOSE_RETRY_BUDGET` (counter carried in
+    ``inputs["decompose_retry"]``); returns an empty list for any other
+    task kind or a spent budget so :meth:`Router.on_task_failed` falls
+    through to the terminal ``FAILED``.
+    """
+    if failed.kind is not TaskKind.DECOMPOSE:
+        return []
+    prior_retries = int(failed.inputs.get("decompose_retry") or 0)
+    if prior_retries >= _DECOMPOSE_RETRY_BUDGET:
+        return []
+    prior_goal = str(failed.inputs.get("prior_goal") or "").strip()
+    answers = failed.inputs.get("answers")
+    retry = TaskNode.new(
+        session_id=failed.session_id,
+        kind=TaskKind.DECOMPOSE,
+        name="Revise the work plan",
+        description=("Re-plan the file manifest after the prior plan "
+                     "failed validation."),
+        parent_task_id=failed.task_id,
+        inputs={
+            "prior_goal": _fold_failure_into_goal(
+                prior_goal, str(failed.error or "")),
+            "requirements_artifact_id":
+                failed.inputs.get("requirements_artifact_id"),
+            "answers": dict(answers) if isinstance(answers, dict) else {},
+            "decompose_retry": prior_retries + 1,
+            "replan_attempt": int(failed.inputs.get("replan_attempt") or 0),
+        },
+    )
+    return [CreateTask(retry)]
 
 
 def _replan_or_fail(completed: TaskNode, tasks: List[TaskNode], *,

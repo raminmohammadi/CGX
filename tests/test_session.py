@@ -1745,6 +1745,82 @@ def test_router_on_task_failed_noop_when_already_terminal():
     assert list(plan.actions) == []
 
 
+def _failed_decompose(session, *, retries=0, error="DECOMPOSE: bad plan"):
+    task = TaskNode.new(
+        session.session_id, TaskKind.DECOMPOSE, "decompose",
+        inputs={"prior_goal": "build a todo app",
+                "requirements_artifact_id": "art_req",
+                "answers": {"q1": "a1"},
+                "decompose_retry": retries})
+    task.status = TaskNodeStatus.FAILED
+    task.error = error
+    return task
+
+
+def test_router_on_task_failed_retryable_decompose_requeues_with_constraint():
+    """A retryable DECOMPOSE failure re-queues with the failure folded in."""
+    from cgx.session.models import SessionMode
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    task = _failed_decompose(session)
+    plan = Router().on_task_failed(
+        session=session, failed=task, tasks=[task], retryable=True)
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    assert len(creates) == 1
+    retry = creates[0].task
+    assert retry.kind is TaskKind.DECOMPOSE
+    assert retry.parent_task_id == task.task_id
+    assert retry.inputs["decompose_retry"] == 1
+    assert retry.inputs["requirements_artifact_id"] == "art_req"
+    assert retry.inputs["answers"] == {"q1": "a1"}
+    # Original objective survives verbatim; failure is folded as constraint.
+    assert retry.inputs["prior_goal"].startswith("build a todo app")
+    assert "DECOMPOSE: bad plan" in retry.inputs["prior_goal"]
+    # Session stays active -- no terminal transition alongside the retry.
+    assert not any(isinstance(a, UpdateSessionStatus) for a in plan.actions)
+
+
+def test_router_on_task_failed_retryable_decompose_budget_exhausted():
+    """A second retryable DECOMPOSE failure ends the session terminally."""
+    from cgx.session.models import SessionMode
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    task = _failed_decompose(session, retries=1)
+    plan = Router().on_task_failed(
+        session=session, failed=task, tasks=[task], retryable=True)
+    assert not any(isinstance(a, CreateTask) for a in plan.actions)
+    status = [a for a in plan.actions if isinstance(a, UpdateSessionStatus)]
+    assert len(status) == 1
+    assert status[0].status is SessionStatus.FAILED
+
+
+def test_router_on_task_failed_retryable_non_decompose_stays_terminal():
+    """retryable only re-queues DECOMPOSE; other kinds fail terminally."""
+    from cgx.session.models import SessionMode
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    task = TaskNode.new(
+        session.session_id, TaskKind.BOOTSTRAP_ENV, "bootstrap",
+        inputs={"mode": SessionMode.GREENFIELD.value})
+    task.status = TaskNodeStatus.FAILED
+    plan = Router().on_task_failed(
+        session=session, failed=task, tasks=[task], retryable=True)
+    assert not any(isinstance(a, CreateTask) for a in plan.actions)
+    status = [a for a in plan.actions if isinstance(a, UpdateSessionStatus)]
+    assert len(status) == 1
+    assert status[0].status is SessionStatus.FAILED
+
+
+def test_router_on_task_failed_non_retryable_decompose_stays_terminal():
+    """Without the retryable flag a DECOMPOSE failure stays terminal."""
+    from cgx.session.models import SessionMode
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    task = _failed_decompose(session)
+    plan = Router().on_task_failed(
+        session=session, failed=task, tasks=[task])
+    assert not any(isinstance(a, CreateTask) for a in plan.actions)
+    status = [a for a in plan.actions if isinstance(a, UpdateSessionStatus)]
+    assert len(status) == 1
+    assert status[0].status is SessionStatus.FAILED
+
+
 def test_router_verify_repeat_signature_refuses_repair():
     """Progress detector: same signature twice -> no REPAIR (loop guard)."""
     from cgx.session.models import SessionMode
