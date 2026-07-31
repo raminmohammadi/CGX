@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Union
+from typing import Any, Dict, Iterable, List, Optional, Union
 
 from cgx.session.models import (
     Decision,
@@ -264,6 +264,10 @@ def _apply_to_verify(parent: TaskNode) -> List[TaskNode]:
             "repair_attempt": repair_attempt,
             "prior_failure_signatures":
                 list(parent.inputs.get("prior_failure_signatures") or []),
+            "prior_failing_counts":
+                list(parent.inputs.get("prior_failing_counts") or []),
+            "prior_passing_counts":
+                list(parent.inputs.get("prior_passing_counts") or []),
         },
     )]
 
@@ -483,22 +487,77 @@ def _decompose_to_ask(parent: TaskNode) -> List[TaskNode]:
     )]
 
 
-_REPAIR_BUDGET = 2
+# Absolute ceiling on repair rounds for a single greenfield write loop.
+# The progress-aware gate (see :func:`_repair_progress_stalled`) ends a
+# loop as soon as the failing-test count stops strictly dropping, so most
+# loops terminate well before this cap; the cap only bounds a loop whose
+# failure signature keeps mutating with no usable count trend. Raised from
+# the original 2-shot limit so a genuinely-progressing hard task can
+# iterate further without ever running unbounded.
+_REPAIR_BUDGET = 4
 
-# Maximum number of regenerate attempts per SCAFFOLD ancestor chain.
-# One full re-scaffold is enough to incorporate the failure-derived
-# constraints; two would risk a regenerate loop and waste tokens. When
-# the budget is exhausted the regenerate branch falls back to the
-# patch branch's ASK_USER escalation.
-_REGENERATE_BUDGET = 1
+
+def _coerce_count(value: Any) -> Optional[int]:
+    """Best-effort ``int`` coercion; returns ``None`` for missing/garbage."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _repair_progress_stalled(
+        new_count: Optional[int],
+        prior_counts: List[int],
+        new_passing: Optional[int] = None,
+        prior_passing: Optional[List[int]] = None) -> bool:
+    """True when the coverage-aware progress ledger shows no forward step.
+
+    ``new_count`` is the number of tests failing in the just-finished
+    VERIFY; ``prior_counts`` is the ordered history of failing counts from
+    earlier rounds of the *same* repair loop. The primary progress signal
+    is the failing count strictly dropping round over round.
+
+    ``new_passing`` / ``prior_passing`` extend that with the passing-test
+    trend (#5): a round that did not lower the failing count can still be
+    real forward progress if it made *more* tests pass than the previous
+    round -- e.g. it fixed one assertion while a newly-unskipped test began
+    failing, holding the failing count flat. Such a round is NOT a stall.
+    So the loop is stalled only when neither lever moved forward: the
+    failing count did not drop AND the passing count did not rise.
+
+    A missing failing count (``None`` -- e.g. a non-assertion outcome
+    where a test count is not a meaningful progress signal) is
+    inconclusive and never on its own declares a stall: the caller still
+    applies the signature-flap backstop and the absolute
+    :data:`_REPAIR_BUDGET` cap.
+    """
+    if new_count is None or not prior_counts:
+        return False
+    failing_dropped = new_count < prior_counts[-1]
+    passing_rose = (new_passing is not None
+                    and bool(prior_passing)
+                    and new_passing > prior_passing[-1])
+    return not (failing_dropped or passing_rose)
+
+# Maximum number of targeted regenerate attempts per SCAFFOLD ancestor
+# chain. Each attempt re-generates only the files that dropped, seeding
+# the survivors from the prior checkpoint, so a retry is fast and does
+# not disturb good work. A local/flaky model routinely drops a single
+# file to a read timeout or an empty patch, so a shallow budget escalated
+# straight to a disruptive re-plan (and re-approval); a few in-place
+# retries clear the common case before the manifest is ever blamed.
+_REGENERATE_BUDGET = 3
 
 # Maximum number of *re-plan* escalations per session. When a SCAFFOLD or
 # APPLY spends its per-manifest regenerate budget the manifest itself is
-# the suspect (not the generation of any single file), so before failing
-# terminally the router escalates once to a fresh DECOMPOSE that revises
-# the plan with the accumulated failure folded into its goal. A single
-# revision is enough; a second exhaustion on the revised manifest is a
-# genuine dead end and terminates the session.
+# the suspect (not the generation of any single file), so the router
+# escalates once to a fresh DECOMPOSE that revises the plan with the
+# accumulated failure folded into its goal. When the re-plan budget is
+# also spent the router does NOT discard the run: as long as the partial
+# scaffold produced survivors it proceeds along the normal edge (APPLY
+# writes them, VERIFY judges them) rather than failing terminally and
+# throwing away every successfully generated file. Only a scaffold that
+# produced nothing usable is a genuine dead end.
 _REPLAN_BUDGET = 1
 
 
@@ -533,12 +592,20 @@ def _verify_to_repair_or_terminal(parent: TaskNode) -> List[TaskNode]:
 
     Triggers only in greenfield mode (auto-apply is part of the
     greenfield contract; explore-mode write loops keep their existing
-    approval gates). The progress detector reads
-    ``prior_failure_signatures`` off the parent: if the just-finished
-    VERIFY's signature already appears in the list, the loop is
-    flapping and we refuse to spawn another REPAIR.
+    approval gates). Progress is judged two ways, both read off the
+    parent's inputs so the router stays IO-free:
 
-    The retry budget is :data:`_REPAIR_BUDGET` attempts. The attempt
+    * a failing-test-count *trend* (``prior_failing_counts``): for a real
+      ``assertions_failed`` outcome the loop keeps going only while the
+      count strictly drops round over round (see
+      :func:`_repair_progress_stalled`) -- the primary, progress-aware
+      guard that lets a genuinely-improving hard task iterate further;
+    * a failure-*signature* flap backstop (``prior_failure_signatures``):
+      if the just-finished VERIFY's signature already appears in the
+      list the loop is churning and we refuse another REPAIR. This still
+      covers non-assertion outcomes where a test count is meaningless.
+
+    Both sit under the absolute :data:`_REPAIR_BUDGET` cap. The attempt
     counter lives in ``parent.inputs["repair_attempt"]`` (incremented by
     the REPAIR -> APPLY -> VERIFY chain), so the router can read it
     without walking the task tree.
@@ -561,6 +628,37 @@ def _verify_to_repair_or_terminal(parent: TaskNode) -> List[TaskNode]:
     repair_attempt = int(parent.inputs.get("repair_attempt") or 0)
     if repair_attempt >= _REPAIR_BUDGET:
         return []
+    # Coverage-aware progress gate (#5): for a real test failure the
+    # failing-test count is a truer progress signal than failure-signature
+    # identity -- a loop can keep churning fresh signatures while fixing
+    # nothing. Keep repairing while the failing count strictly drops OR the
+    # passing count strictly rises (a round that fixed one test while
+    # another newly began failing held the failing count flat but still
+    # made forward progress). A stall (neither lever moved forward) ends
+    # the loop. The failing-count trend is trusted for ``assertions_failed``
+    # *and* ``collection_error``: for a collection error ``failing_count`` is
+    # the number of modules erroring during collection (e.g. import fixes
+    # landing one module at a time), so a strictly-dropping count is genuine
+    # forward progress that should buy another round under the budget. The
+    # ``passing_count`` lever stays ``assertions_failed``-only ("M passing"
+    # is meaningless when nothing collected); every other outcome falls back
+    # to the signature-flap backstop below.
+    new_count = (_coerce_count(outputs.get("failing_count"))
+                 if outcome in ("assertions_failed", "collection_error")
+                 else None)
+    prior_counts = [c for c in (
+        _coerce_count(x)
+        for x in (parent.inputs.get("prior_failing_counts") or []))
+        if c is not None]
+    new_passing = (_coerce_count(outputs.get("passing_count"))
+                   if outcome == "assertions_failed" else None)
+    prior_passing = [c for c in (
+        _coerce_count(x)
+        for x in (parent.inputs.get("prior_passing_counts") or []))
+        if c is not None]
+    if _repair_progress_stalled(
+            new_count, prior_counts, new_passing, prior_passing):
+        return []
     # Read the VERIFY_REPORT's failure_signature lazily by deferring to
     # the classifier; the router stays free of I/O by using a precomputed
     # signature stashed by the runner-style ``outputs``. Falls back to a
@@ -572,6 +670,10 @@ def _verify_to_repair_or_terminal(parent: TaskNode) -> List[TaskNode]:
     prior = list(parent.inputs.get("prior_failure_signatures") or [])
     if new_signature in prior:
         return []
+    next_counts = (prior_counts + [new_count] if new_count is not None
+                   else prior_counts)
+    next_passing = (prior_passing + [new_passing] if new_passing is not None
+                    else prior_passing)
     verify_artifact_id = parent.produced_artifact_id
     return [TaskNode.new(
         session_id=parent.session_id,
@@ -588,6 +690,118 @@ def _verify_to_repair_or_terminal(parent: TaskNode) -> List[TaskNode]:
             "mode": mode,
             "repair_attempt": repair_attempt + 1,
             "prior_failure_signatures": prior + [new_signature],
+            "prior_failing_counts": next_counts,
+            "prior_passing_counts": next_passing,
+        },
+    )]
+
+
+def _verify_successors(parent: TaskNode) -> List[TaskNode]:
+    """Route a finished VERIFY to RUNTIME_VERIFY, REPAIR, or a terminal.
+
+    Greenfield + a *passing* unit suite hands off to RUNTIME_VERIFY: the
+    tests the model wrote are green, but the app itself may still fail to
+    boot (an import-time error, a bad ``create_app`` wiring), so a
+    runtime gate runs before the session is declared COMPLETED. Every
+    other case -- a fixable failure, a skipped/test-free suite, or an
+    explore-mode VERIFY -- keeps the existing repair-or-terminal path.
+    """
+    mode = str(parent.inputs.get("mode") or "").strip()
+    outputs = parent.outputs or {}
+    outcome = str(outputs.get("outcome") or "").strip()
+    if mode == SessionMode.GREENFIELD.value and outcome == "passed":
+        return _runtime_verify_node(parent)
+    return _verify_to_repair_or_terminal(parent)
+
+
+def _runtime_verify_node(parent: TaskNode) -> List[TaskNode]:
+    """Spawn the RUNTIME_VERIFY gate carrying the upstream artifact ids."""
+    return [TaskNode.new(
+        session_id=parent.session_id,
+        kind=TaskKind.RUNTIME_VERIFY,
+        name="Boot the scaffolded app",
+        description=("Import-and-call smoke each entry module under the "
+                     "bootstrapped venv to confirm the app actually runs, "
+                     "not just that its unit tests pass."),
+        parent_task_id=parent.task_id,
+        inputs={
+            "verify_artifact_id": parent.produced_artifact_id,
+            "build_artifact_id": parent.inputs.get("build_artifact_id"),
+            "apply_artifact_id": parent.inputs.get("apply_artifact_id"),
+            "scaffold_artifact_id": parent.inputs.get("scaffold_artifact_id"),
+            "plan_artifact_id": parent.inputs.get("plan_artifact_id"),
+            "prior_goal": parent.inputs.get("prior_goal"),
+            "mode": SessionMode.GREENFIELD.value,
+            # Thread the shared repair budget through the runtime gate so a
+            # boot failure can route to REPAIR under the same attempt cap +
+            # flap detector as the pre-VERIFY gates (#3).
+            "repair_attempt": int(parent.inputs.get("repair_attempt") or 0),
+            "prior_failure_signatures":
+                list(parent.inputs.get("prior_failure_signatures") or []),
+            "prior_failing_counts":
+                list(parent.inputs.get("prior_failing_counts") or []),
+            "prior_passing_counts":
+                list(parent.inputs.get("prior_passing_counts") or []),
+        },
+    )]
+
+
+# RUNTIME_REPORT outcomes REPAIR knows how to attempt a fix for: a hard
+# boot failure. ``passed`` / ``skipped`` complete the session and never
+# reach this edge.
+_REPAIRABLE_RUNTIME_OUTCOMES = frozenset({"failed", "timeout", "error"})
+
+
+def _runtime_verify_to_repair_or_terminal(parent: TaskNode) -> List[TaskNode]:
+    """Spawn REPAIR on a boot failure; otherwise terminal (#3).
+
+    A ``passed`` / ``skipped`` RUNTIME_VERIFY spawns no successor and the
+    session COMPLETES via :func:`_runtime_verify_terminal_session_actions`.
+    A hard boot outcome (``failed`` / ``timeout`` / ``error``) routes to
+    REPAIR with the RUNTIME_REPORT as the source artifact, gated by the
+    same shared retry budget and failure-signature flap detector used by
+    the SMOKE/API_CHECK gates. When the budget is spent or the signature
+    flaps the helper declines to spawn REPAIR and the terminal action
+    marks the session FAILED. Explore mode never reaches RUNTIME_VERIFY.
+    """
+    outputs = parent.outputs or {}
+    outcome = str(outputs.get("outcome") or "").strip()
+    mode = str(parent.inputs.get("mode") or "").strip()
+    if mode != SessionMode.GREENFIELD.value:
+        return []
+    if outcome not in _REPAIRABLE_RUNTIME_OUTCOMES:
+        return []
+    repair_attempt = int(parent.inputs.get("repair_attempt") or 0)
+    if repair_attempt >= _REPAIR_BUDGET:
+        return []
+    new_signature = str(outputs.get("failure_signature") or "").strip()
+    if not new_signature:
+        failed = outputs.get("failed_count")
+        new_signature = f"runtime_failed|count={failed}"
+    prior = list(parent.inputs.get("prior_failure_signatures") or [])
+    if new_signature in prior:
+        return []
+    return [TaskNode.new(
+        session_id=parent.session_id,
+        kind=TaskKind.REPAIR,
+        name="Repair failed app boot",
+        description=("Classify the upstream RUNTIME_VERIFY boot failure and "
+                     "re-author the failing entry module(s) so the app "
+                     "imports and starts, not just passes its unit tests."),
+        parent_task_id=parent.task_id,
+        inputs={
+            "runtime_artifact_id": parent.produced_artifact_id,
+            "build_artifact_id": parent.inputs.get("build_artifact_id"),
+            "apply_artifact_id": parent.inputs.get("apply_artifact_id"),
+            "scaffold_artifact_id": parent.inputs.get("scaffold_artifact_id"),
+            "prior_goal": parent.inputs.get("prior_goal"),
+            "mode": mode,
+            "repair_attempt": repair_attempt + 1,
+            "prior_failure_signatures": prior + [new_signature],
+            "prior_failing_counts":
+                list(parent.inputs.get("prior_failing_counts") or []),
+            "prior_passing_counts":
+                list(parent.inputs.get("prior_passing_counts") or []),
         },
     )]
 
@@ -626,6 +840,10 @@ def _repair_to_apply_or_ask(parent: TaskNode) -> List[TaskNode]:
             "repair_attempt": attempt,
             "prior_failure_signatures": (
                 prior if signature in prior else prior + [signature]),
+            "prior_failing_counts":
+                list(parent.inputs.get("prior_failing_counts") or []),
+            "prior_passing_counts":
+                list(parent.inputs.get("prior_passing_counts") or []),
         },
     )]
 
@@ -684,6 +902,66 @@ def _verify_terminal_session_actions(
                                 status=status)]
 
 
+# Terminal RUNTIME_VERIFY outcomes that mean the greenfield write loop
+# delivered an app that actually boots. ``skipped`` (no detectable entry
+# module to boot) counts as success -- it is an explicit no-op, not a
+# broken app. Everything else (``failed`` / ``timeout`` / ``error``) is a
+# definitive failure.
+_RUNTIME_VERIFY_SUCCESS_OUTCOMES = frozenset({"passed", "skipped"})
+
+
+def _runtime_verify_terminal_session_actions(
+        completed: TaskNode) -> List[RouterAction]:
+    """Set the greenfield session's terminal status after RUNTIME_VERIFY.
+
+    A booting app (``passed``) -- or a run with no detectable entry to
+    boot (``skipped``) -- COMPLETES the session; any hard boot outcome
+    (``failed`` / ``timeout`` / ``error``) is a definitive ``FAILED``.
+    Mirrors :func:`_verify_terminal_session_actions`; explore mode never
+    reaches RUNTIME_VERIFY, so this is a no-op there.
+    """
+    mode = str(completed.inputs.get("mode") or "").strip()
+    if mode != SessionMode.GREENFIELD.value:
+        return []
+    outputs = completed.outputs or {}
+    outcome = str(outputs.get("outcome") or "").strip()
+    status = (SessionStatus.COMPLETED
+              if outcome in _RUNTIME_VERIFY_SUCCESS_OUTCOMES
+              else SessionStatus.FAILED)
+    return [UpdateSessionStatus(session_id=completed.session_id,
+                                status=status)]
+
+
+def _preverify_gate_terminal_actions(
+        completed: TaskNode) -> List[RouterAction]:
+    """Terminate a greenfield run when a pre-VERIFY gate stalls.
+
+    API_CHECK / SMOKE hand off to their successor on ``passed`` /
+    ``skipped`` (SMOKE, then VERIFY) and to REPAIR on ``failed`` -- but
+    only while the shared repair budget holds and the failure signature
+    keeps changing. Once the budget is spent or the signature flaps, the
+    gate helper declines to spawn REPAIR and returns no successor. A
+    ``failed`` gate with no successor is a genuine dead end (the applied
+    files reference symbols that cannot resolve, and repairing them is no
+    longer making progress); without an explicit transition the drain
+    loop would exit with the session still ``active`` -- idle, with no
+    terminal status the UI can settle on. Mirroring
+    :func:`_verify_terminal_session_actions`, end the session ``FAILED``
+    so the run resolves instead of hanging. A non-``failed`` gate that
+    somehow produced no successor is left untouched (empty list) so the
+    normal edge is not overridden. Explore-mode keeps its own lifecycle.
+    """
+    mode = str(completed.inputs.get("mode") or "").strip()
+    if mode != SessionMode.GREENFIELD.value:
+        return []
+    outputs = completed.outputs or {}
+    outcome = str(outputs.get("outcome") or "").strip()
+    if outcome != "failed":
+        return []
+    return [UpdateSessionStatus(session_id=completed.session_id,
+                                status=SessionStatus.FAILED)]
+
+
 def _scaffold_to_apply(parent: TaskNode) -> List[TaskNode]:
     """Spawn the APPLY follow-up for a finished SCAFFOLD."""
     return [TaskNode.new(
@@ -704,8 +982,10 @@ def _scaffold_to_apply(parent: TaskNode) -> List[TaskNode]:
 
 # Maps the parent's kind to a function that produces the successor
 # tasks. Greenfield kinds (CLARIFY_REQUIREMENTS, DECOMPOSE, SCAFFOLD,
-# BOOTSTRAP_ENV) chain to ASK_USER / APPLY / VERIFY respectively.
-# VERIFY is terminal.
+# BOOTSTRAP_ENV) chain to ASK_USER / APPLY / VERIFY respectively. A
+# passing greenfield VERIFY hands off to RUNTIME_VERIFY (the app-boot
+# gate); a booting RUNTIME_VERIFY is terminal while a boot failure routes
+# to REPAIR under the shared budget (#3).
 TASK_SUCCESSOR = {
     TaskKind.EXPLORE: _explore_to_ask,
     TaskKind.INVESTIGATE: _investigate_to_recommend,
@@ -718,7 +998,8 @@ TASK_SUCCESSOR = {
     TaskKind.BOOTSTRAP_ENV: _bootstrap_to_api_check,
     TaskKind.API_CHECK: _api_check_to_smoke_or_repair,
     TaskKind.SMOKE: _smoke_to_verify_or_repair,
-    TaskKind.VERIFY: _verify_to_repair_or_terminal,
+    TaskKind.VERIFY: _verify_successors,
+    TaskKind.RUNTIME_VERIFY: _runtime_verify_to_repair_or_terminal,
     TaskKind.REPAIR: _repair_to_apply_or_ask,
 }
 
@@ -811,6 +1092,11 @@ class Router:
             if dropped_actions:
                 plan.actions.extend(dropped_actions)
                 return plan
+            contract_actions = _scaffold_contract_regenerate_actions(
+                completed, tasks)
+            if contract_actions:
+                plan.actions.extend(contract_actions)
+                return plan
         if completed.kind is TaskKind.APPLY:
             dropped_actions = _apply_failed_files_actions(completed, tasks)
             if dropped_actions:
@@ -827,6 +1113,13 @@ class Router:
         if completed.kind is TaskKind.VERIFY and not children:
             plan.actions.extend(
                 _verify_terminal_session_actions(completed))
+        if completed.kind is TaskKind.RUNTIME_VERIFY and not children:
+            plan.actions.extend(
+                _runtime_verify_terminal_session_actions(completed))
+        if (completed.kind in (TaskKind.API_CHECK, TaskKind.SMOKE)
+                and not children):
+            plan.actions.extend(
+                _preverify_gate_terminal_actions(completed))
         return plan
 
     @traced("router")
@@ -1068,12 +1361,13 @@ def _apply_failed_files_actions(completed: TaskNode,
     APPLY that dropped a file re-scaffolds within
     :data:`_REGENERATE_BUDGET` instead of limping forward. When the
     regenerate budget is spent the router escalates once to a revised
-    manifest via :func:`_replan_or_fail` (a fresh DECOMPOSE) before ending
-    the session terminally ``FAILED``. When no SCAFFOLD ancestor exists the
-    session fails terminally -- it never proceeds on a known-broken tree,
-    and never asks the user to hand-fix generated code. Returns an empty
-    list for explore mode or a clean apply so the dispatcher takes the
-    normal APPLY -> VERIFY edge.
+    manifest via :func:`_replan_or_fail` (a fresh DECOMPOSE); when the
+    re-plan budget is also spent that helper proceeds with the survivors
+    rather than discarding the run, and only fails terminally when nothing
+    usable was generated. When no SCAFFOLD ancestor exists the session
+    fails terminally -- it cannot re-scaffold a tree it cannot find.
+    Returns an empty list for explore mode or a clean apply so the
+    dispatcher takes the normal APPLY -> VERIFY edge.
     """
     from cgx.session.repair.propose import propose_regenerate  # dep direction
 
@@ -1160,7 +1454,15 @@ def _replan_or_fail(completed: TaskNode, tasks: List[TaskNode], *,
         return fail
     prior_replans = int(scaffold.inputs.get("replan_attempt") or 0)
     if prior_replans >= _REPLAN_BUDGET:
-        return fail
+        # Budgets spent. Rather than discard every file that generated
+        # cleanly, proceed with the survivors on the normal edge (the
+        # empty return lets the dispatcher take SCAFFOLD -> APPLY /
+        # APPLY -> VERIFY) whenever the partial scaffold produced output;
+        # the dropped files are already surfaced to the UI via the
+        # scaffold ``failed_count`` progress beats. Only a scaffold that
+        # produced nothing usable is a terminal dead end.
+        survivors = int((scaffold.outputs or {}).get("generated_count") or 0)
+        return [] if survivors > 0 else fail
     prior_goal = str(scaffold.inputs.get("prior_goal") or "").strip()
     decompose = _find_ancestor_by_kind(scaffold, tasks, TaskKind.DECOMPOSE)
     answers: Dict[str, object] = {}
@@ -1211,10 +1513,11 @@ def _scaffold_failed_files_actions(completed: TaskNode,
     per-file errors into the regenerate constraint so the retry has
     actionable feedback. When that budget is spent the router escalates
     once to a revised manifest via :func:`_replan_or_fail` (a fresh
-    DECOMPOSE) before ending the session terminally ``FAILED`` -- it never
-    limps forward on a known-incomplete tree. Returns an empty list for a
-    clean scaffold so the dispatcher takes the normal SCAFFOLD -> APPLY
-    edge.
+    DECOMPOSE); when the re-plan budget is also spent that helper proceeds
+    with the survivors on the normal SCAFFOLD -> APPLY edge rather than
+    discarding them, failing terminally only when nothing usable was
+    generated. Returns an empty list for a clean scaffold so the
+    dispatcher takes the normal SCAFFOLD -> APPLY edge.
     """
     from cgx.session.repair.propose import propose_regenerate  # dep direction
 
@@ -1244,6 +1547,87 @@ def _scaffold_failed_files_actions(completed: TaskNode,
         completed, constraint,
         regenerate_files=regen_files,
         prior_scaffold_artifact_id=prior_id)))
+    return actions
+
+
+# Contract-warning kinds a regenerate can actually satisfy: a declared
+# function/constant/schema names the module that must provide it, so the
+# retry has a concrete, satisfiable target. Endpoints are omitted -- a
+# planner placeholder path (e.g. ``/api/x``) is frequently unsatisfiable
+# and would only spin the budget.
+_CONTRACT_REGENERATE_KINDS = {"function", "constant", "schema"}
+
+
+def _actionable_contract_warnings(
+        outputs: Dict[str, object]) -> List[Dict[str, object]]:
+    """Return the contract warnings a regenerate can act on.
+
+    Keeps only a declared function/constant/schema that names a concrete
+    ``module`` -- the offending module is known and the goal is
+    satisfiable. Endpoint warnings and any warning without a module are
+    dropped so an unsatisfiable planner contract never forces a retry.
+    """
+    out: List[Dict[str, object]] = []
+    for w in outputs.get("contract_warnings") or []:
+        if not isinstance(w, dict):
+            continue
+        if (w.get("kind") in _CONTRACT_REGENERATE_KINDS
+                and str(w.get("module") or "").strip()):
+            out.append(w)
+    return out
+
+
+def _contract_regenerate_constraint(
+        warnings: List[Dict[str, object]]) -> Dict[str, object]:
+    """Fold unmet contract items into a SCAFFOLD regenerate constraint."""
+    items = [f"{w.get('kind')} {w.get('name')!r} in module "
+             f"{str(w.get('module'))!r}" for w in warnings[:6]]
+    rationale = ("the generated files do not satisfy declared contract(s): "
+                 + "; ".join(items)
+                 + ". Implement each named symbol in its module.")
+    return {"kind": "unmet_contract", "rationale": rationale,
+            "unmet_contracts": items}
+
+
+def _scaffold_contract_regenerate_actions(
+        completed: TaskNode,
+        tasks: List[TaskNode]) -> List[RouterAction]:
+    """Regenerate a clean-but-noncompliant SCAFFOLD once per budget step.
+
+    Complements :func:`_scaffold_failed_files_actions`: that path owns a
+    scaffold that *dropped* files (``failed_count > 0``); this one handles
+    a scaffold where every file generated but a file-attributable contract
+    (a declared function/constant/schema whose named module never provides
+    it) is unmet, folding the unmet contracts in as a whole-tree
+    regenerate constraint. Bounded by :data:`_REGENERATE_BUDGET` and
+    deliberately **non-terminal**: once the budget is spent the empty
+    return lets the dispatcher take SCAFFOLD -> APPLY so VERIFY -- which
+    exercises the contract against a real suite -- makes the final call
+    rather than failing the session on a static gate. Returns an empty
+    list (normal edge) for a compliant scaffold, one that dropped files,
+    or a spent budget.
+    """
+    from cgx.session.repair.propose import propose_regenerate  # dep direction
+
+    outputs = completed.outputs or {}
+    if int(outputs.get("failed_count") or 0) > 0:
+        return []
+    actionable = _actionable_contract_warnings(outputs)
+    if not actionable:
+        return []
+    prior_regens = int(completed.inputs.get("regenerate_attempt") or 0)
+    if prior_regens >= _REGENERATE_BUDGET:
+        return []
+    constraint = _contract_regenerate_constraint(actionable)
+    actions: List[RouterAction] = []
+    skip_states = {TaskNodeStatus.DONE, TaskNodeStatus.FAILED,
+                   TaskNodeStatus.ABANDONED}
+    for t in _collect_descendants(completed.task_id, tasks):
+        if t.status in skip_states:
+            continue
+        actions.append(UpdateTaskStatus(
+            task_id=t.task_id, status=TaskNodeStatus.ABANDONED))
+    actions.append(CreateTask(propose_regenerate(completed, constraint)))
     return actions
 
 

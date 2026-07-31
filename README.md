@@ -357,12 +357,38 @@ Tabs (left → right):
 
 ### CLI
 
+The `cgx` command exposes every capability as a scriptable subcommand
+(`cgx <command> --help` for the full flag list):
+
 ```bash
-cgx index --project-root /path/to/repo --out-dir /tmp/cgx_index
-cgx query --index-dir /tmp/cgx_index/indices \
-          --records  /tmp/cgx_index/records.jsonl \
+# 1. Build an index into the auto-discovered .cgx/index location
+cgx index --project-root . --out-dir .cgx/index
+
+# 2. Raw hybrid retrieval as JSON (no LLM)
+cgx query --index-dir .cgx/index/indices \
+          --records  .cgx/index/records.jsonl \
           --query "What does parse_codebase do?"
+
+# 3. Grounded, streamed LLM answer over the index
+cgx ask "What does parse_codebase do?" --think
+
+# 4. Generate a self-tested code-change plan
+cgx plan "Add a --json flag to the query command" --self-test --run-tests
+
+# 5. Run the Planner -> Tracker -> Judge agent loop
+cgx agent "Add docstrings to every public function in cgx.parser"
+
+# Provider + hardware + index status
+cgx status
 ```
+
+`ask`, `plan`, `agent`, and `status` share provider flags
+(`--provider`, `--model`, `--base-url`, `--profile`) and auto-discover the
+index at `<project-root>/.cgx/index` (override with
+`--index-dir` / `--records`). They stream tokens live and cancel cleanly
+on **Ctrl-C**. See [docs/usage.md](docs/usage.md#the-cli-non-interactive-subcommands)
+for the full reference. `cgx serve` launches the web UI; bare `cgx` (or
+`cgx dash`) opens the interactive dashboard.
 
 ### Python
 

@@ -8,10 +8,18 @@ import { streamSSE } from "../lib/sse";
 import { abortConnection, getConnection, setConnection } from "../lib/connections";
 import { useTasks, type ChatMsg } from "../store/tasks";
 import { useWorkspace } from "../store/workspace";
+import { useConnection } from "../store/connection";
 import { Markdown } from "../components/Markdown";
-import { Pill } from "../components/Pill";
+import { Pill, StatusDot } from "../components/Pill";
 
 const PAGE_KEY = "ask";
+
+const SUGGESTED_PROMPTS = [
+  "What does this module do?",
+  "Where is X defined?",
+  "Summarize recent changes",
+  "How do I add a new provider?",
+];
 
 // Model families that expose a native reasoning / "thinking" phase. Mirrors
 // the backend registry in cgx.answer.model_caps.model_supports_thinking so
@@ -32,6 +40,7 @@ export default function AskPage() {
   const { provider, index, selectedSessionId, setSelectedSession, setProvider } = useWorkspace();
   const { ask, setAsk, appendAskMessage, resetAsk } = useTasks();
   const { busy, messages, error } = ask;
+  const offline = useConnection((s) => s.offline);
 
   const threadRef = useRef<HTMLDivElement | null>(null);
   const draftRef = useRef<HTMLTextAreaElement | null>(null);
@@ -211,6 +220,11 @@ export default function AskPage() {
     patchLast({ streaming: false, content: "_Cancelled._" });
   };
 
+  const sendPrompt = (text: string) => {
+    if (draftRef.current) draftRef.current.value = text;
+    send();
+  };
+
   const handleKey = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
@@ -243,7 +257,7 @@ export default function AskPage() {
         />
 
         <div ref={threadRef} className="flex-1 px-6 py-5 overflow-y-auto space-y-6">
-          {messages.length === 0 && <AskEmptyState />}
+          {messages.length === 0 && <AskEmptyState offline={offline} onPrompt={sendPrompt} />}
           {messages.map((m, i) => (
             <ChatBubble key={i} msg={m} />
           ))}
@@ -436,8 +450,8 @@ function ChatBubble({ msg }: { msg: ChatMsg }) {
   }
   return (
     <div className="flex gap-3">
-      <div className="bg-purple-500/10 text-purple-400 h-5 w-5 rounded flex items-center justify-center border border-purple-500/20 text-[10px]">
-        <Bot className="h-3 w-3" />
+      <div className="bg-purple-500/10 text-purple-400 h-6 w-6 rounded-full flex items-center justify-center border border-purple-500/20 text-[10px] shrink-0">
+        <Bot className="h-3.5 w-3.5" />
       </div>
       <div className="space-y-3 w-full min-w-0">
         <div className="flex items-center gap-2">
@@ -610,10 +624,36 @@ function SourceRow({ src, rank }: { src: any; rank: number }) {
   );
 }
 
-function AskEmptyState() {
+function AskEmptyState({
+  offline,
+  onPrompt,
+}: {
+  offline: boolean;
+  onPrompt: (text: string) => void;
+}) {
   return (
-    <div className="text-center text-slate-500 text-xs font-mono py-10">
-      Drop a question below. CGX will fuse semantic + symbolic + graph retrieval before answering.
+    <div className="h-full flex flex-col items-center justify-center text-center gap-3 py-10">
+      <div className="h-12 w-12 rounded-full bg-purple-500/10 border border-purple-500/20 flex items-center justify-center">
+        <Bot className="h-6 w-6 text-purple-400" />
+      </div>
+      <h2 className="text-white font-bold text-base font-mono">CGX</h2>
+      <Pill tone={offline ? "red" : "neon"}>
+        <StatusDot tone={offline ? "red" : "neon"} /> {offline ? "Offline" : "Ready to chat"}
+      </Pill>
+      <p className="text-slate-500 text-xs font-mono max-w-sm">
+        Ask anything about this codebase — signatures, modules, behavior, change ideas…
+      </p>
+      <div className="flex flex-wrap justify-center gap-2 mt-2 max-w-md">
+        {SUGGESTED_PROMPTS.map((q) => (
+          <button
+            key={q}
+            onClick={() => onPrompt(q)}
+            className="av-btn-ghost text-[11px]"
+          >
+            {q}
+          </button>
+        ))}
+      </div>
     </div>
   );
 }

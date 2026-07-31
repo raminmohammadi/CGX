@@ -29,6 +29,7 @@ from cgx.trace import traced
 
 REPAIR_CLASSIFICATIONS: Tuple[str, ...] = (
     "third_party_import_break",
+    "relative_import_error",
     "unittest_pytest_mix",
     "missing_module_pythonpath",
     "missing_fixture",
@@ -71,6 +72,18 @@ _FIXTURE_NOT_FOUND_RE = re.compile(
     r"fixture\s+'([A-Za-z_][A-Za-z0-9_]*)'\s+not found"
 )
 
+# Traceback frame shapes that name a source file + line. Pytest renders
+# its own frames as ``path/to/file.py:123: in func`` (and a trailing
+# ``path/to/file.py:123: SomeError`` summary), while a captured Python
+# traceback uses ``File "path/to/file.py", line 123``. Both let us
+# localize the repair to the files the failure actually flowed through
+# instead of only the files APPLY happened to write. Character classes
+# are spelled out (no ``\d``/``\w``) for cross-engine portability.
+_TB_PYTEST_FRAME_RE = re.compile(
+    r"([A-Za-z0-9_./\\-]+\.py):[0-9]+")
+_TB_FILE_LINE_RE = re.compile(
+    r'File "([A-Za-z0-9_./\\-]+\.py)", line [0-9]+')
+
 # Third-party API break: ``ImportError: cannot import name '<sym>' from
 # '<pkg>'`` is emitted when the named module exists (the install
 # succeeded) but the requested attribute is missing -- the canonical
@@ -80,6 +93,18 @@ _FIXTURE_NOT_FOUND_RE = re.compile(
 _CANNOT_IMPORT_NAME_RE = re.compile(
     r"ImportError:\s+cannot import name\s+'([A-Za-z_][A-Za-z0-9_]*)'\s+"
     r"from\s+'([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)'"
+)
+
+# A relative import that resolves above the package root -- ``from ..x
+# import y`` in a module that is not deep enough, or a first-party module
+# run without its package context. Python renders this as
+# ``ImportError: attempted relative import beyond top-level package`` (or
+# ``with no known parent package``). There is no mechanical patch: the
+# scaffold authored an import that cannot resolve, so REPAIR re-authors the
+# offending module(s) with the failure folded in as a regenerate constraint.
+_RELATIVE_IMPORT_RE = re.compile(
+    r"attempted relative import (?:beyond top-level package|"
+    r"with no known parent package)"
 )
 
 
@@ -95,6 +120,8 @@ _ClassifierFn = Callable[[Dict[str, Any]], bool]
 _CLASSIFIER_REGISTRY: Tuple[Tuple[RepairClassification, _ClassifierFn], ...] = (
     ("third_party_import_break",
      lambda c: bool(_CANNOT_IMPORT_NAME_RE.search(_failure_text(c)))),
+    ("relative_import_error",
+     lambda c: bool(_RELATIVE_IMPORT_RE.search(_failure_text(c)))),
     ("unittest_pytest_mix",
      lambda c: bool(_UNITTEST_HELPER_RE.search(_failure_text(c)))),
     ("missing_module_pythonpath",
@@ -190,6 +217,27 @@ def missing_fixture_names(content: Dict[str, Any]) -> Tuple[str, ...]:
     return tuple(out)
 
 
+def traceback_source_files(content: Dict[str, Any]) -> Tuple[str, ...]:
+    """Return the ``.py`` paths named in the failure traceback(s).
+
+    Scans the concatenated failure text for both pytest (``file.py:12:
+    in func``) and standard (``File "file.py", line 12``) frame shapes so
+    the REPAIR executor can localize the fix to the files the failure
+    actually flowed through -- not just the files APPLY wrote. The paths
+    are returned verbatim (still runner-relative or absolute), order-
+    preserving and de-duplicated; the caller resolves them against the
+    project root and drops anything not on disk.
+    """
+    blob = _failure_text(content)
+    out: List[str] = []
+    for regex in (_TB_FILE_LINE_RE, _TB_PYTEST_FRAME_RE):
+        for m in regex.finditer(blob):
+            path = m.group(1).replace("\\", "/").strip()
+            if path and path not in out:
+                out.append(path)
+    return tuple(out)
+
+
 def failure_signature(content: Dict[str, Any]) -> str:
     """Return a short hash that identifies "the same failure" across runs.
 
@@ -214,6 +262,54 @@ def failure_text(content: Dict[str, Any]) -> str:
     private name or re-deriving the concatenation order.
     """
     return _failure_text(content)
+
+
+# Classification token for a RUNTIME_REPORT whose app failed to boot
+# (import-time error, ``create_app`` wiring, or a boot that hangs). Unlike
+# the VERIFY tokens in :data:`REPAIR_CLASSIFICATIONS` this never has a
+# mechanical locator -- the fix is to re-author the failing entry module
+# and what it imports -- so REPAIR routes it straight to a regenerate with
+# the captured boot error folded in as a constraint.
+RUNTIME_REPAIR_CLASSIFICATION = "runtime_failure"
+
+# RUNTIME_REPORT outcomes that mean the app did not boot cleanly. A
+# ``passed`` / ``skipped`` report never reaches classification (the router
+# completes the session on those), so this covers the hard boot failures.
+_RUNTIME_FAILED_OUTCOMES = frozenset({"failed", "timeout", "error"})
+
+
+def classify_runtime_report(content: Dict[str, Any]) -> RepairClassification:
+    """Map a RUNTIME_REPORT content dict to a classification token.
+
+    Returns :data:`RUNTIME_REPAIR_CLASSIFICATION` for any hard boot
+    outcome (``failed`` / ``timeout`` / ``error``) and ``unknown``
+    otherwise, mirroring the conservative contract of
+    :func:`classify_verify_report`.
+    """
+    outcome = str(content.get("outcome") or "").strip()
+    if outcome in _RUNTIME_FAILED_OUTCOMES:
+        return RUNTIME_REPAIR_CLASSIFICATION
+    return "unknown"
+
+
+def runtime_failure_text(content: Dict[str, Any]) -> str:
+    """Concatenate the captured boot error of every failing entry probe.
+
+    Each failing ``probes`` entry contributes a ``<file> (<kind>):`` header
+    followed by its ``stderr_tail`` so the regenerate constraint carries
+    the concrete traceback the model must fix, not just the entry name.
+    Order-stable; returns an empty string when nothing failed.
+    """
+    parts: List[str] = []
+    for probe in content.get("probes") or []:
+        if not isinstance(probe, dict) or probe.get("ok"):
+            continue
+        rel = str(probe.get("file") or "").strip()
+        kind = str(probe.get("kind") or "").strip()
+        tail = str(probe.get("stderr_tail") or "").strip()
+        header = f"{rel} ({kind}):" if kind else f"{rel}:"
+        parts.append(f"{header}\n{tail}".rstrip())
+    return "\n\n".join(parts)
 
 
 # --------------------- helpers ---------------------

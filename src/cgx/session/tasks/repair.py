@@ -35,9 +35,12 @@ from cgx.session.models import (
     TaskNode,
 )
 from cgx.session.repair.classify import (
+    classify_runtime_report,
     classify_verify_report,
     failure_signature,
+    runtime_failure_text,
     third_party_import_breaks,
+    traceback_source_files,
 )
 from cgx.session.repair.locate import (
     MissingFixtureLocation,
@@ -70,14 +73,26 @@ logger = logging.getLogger(__name__)
 _PATCH_DIFF_LIMIT = 5
 
 # Bounded LLM logic-repair caps. The router already gates the overall
-# loop via ``_REPAIR_BUDGET`` + flap detection on ``failure_signature``;
-# these caps keep a single REPAIR call's LLM cost and blast radius
-# proportional to the failure. LLM repair is only attempted on the first
-# ``_LLM_REPAIR_MAX_ATTEMPT`` repair attempts (later attempts fall back to
-# regenerate), and at most ``_LLM_REPAIR_MAX_FILES`` files are shown to
-# the provider.
-_LLM_REPAIR_MAX_ATTEMPT = 2
+# loop via ``_REPAIR_BUDGET`` + the progress-aware failing-test-count
+# trend (P2) + flap detection on ``failure_signature``; these caps keep a
+# single REPAIR call's LLM cost and blast radius proportional to the
+# failure. LLM repair is attempted on every repair attempt the router
+# still funds (#4: it used to give up after 2 shots even while the router
+# was willing to keep going on a genuinely-shrinking failure) -- the
+# progress gate, not this executor, decides when to stop iterating. At
+# most ``_LLM_REPAIR_MAX_FILES`` files are shown to the provider.
+_LLM_REPAIR_MAX_ATTEMPT = 4
 _LLM_REPAIR_MAX_FILES = 8
+
+# Retrieval-fed repair (#6). When an index is wired into ``deps``
+# (existing-repo / explore mode -- greenfield sessions have none), any
+# file-slot the failure-localized candidates leave unused is filled with
+# the source files hybrid retrieval judges most relevant to the failure,
+# so a fix that must touch a symbol APPLY never wrote this attempt is not
+# invisible to the provider. Retrieval widens ``top_k_per_view`` by this
+# slack so path-resolution / de-dup drops still leave enough hits to fill
+# the remaining budget.
+_LLM_REPAIR_RETRIEVAL_SLACK = 4
 
 # Classifications whose only realistic fix is to re-author the offending
 # scaffold layer rather than mechanically patch what was already
@@ -85,8 +100,10 @@ _LLM_REPAIR_MAX_FILES = 8
 # produced.
 _REGENERATE_CLASSES = frozenset({
     "third_party_import_break",
+    "relative_import_error",
     "smoke_import_failure",
     "api_check_failure",
+    "runtime_failure",
     "empty_test_suite",
     "missing_fixture",
     "missing_module_pythonpath",
@@ -112,11 +129,22 @@ def run_repair(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
       caught before SMOKE/VERIFY. Same v1 contract as SMOKE: structured
       rationale + ``can_apply=False`` so the router escalates to
       ASK_USER until Phase 3.2's dependency-aware proposer lands.
+    * ``RUNTIME_REPORT`` -- the unit suite passed but the app failed to
+      boot under RUNTIME_VERIFY (bottleneck #3). There is no mechanical
+      locator for a boot failure, so REPAIR records the captured
+      import/create_app traceback with classification ``runtime_failure``
+      and ``strategy='regenerate'`` so the router re-authors the failing
+      entry module(s) via the nearest SCAFFOLD ancestor.
     """
     if not deps.project_root:
         return ExecutorResult(failure="REPAIR requires project_root in deps")
     if deps.store is None:
         return ExecutorResult(failure="REPAIR requires a session store in deps")
+
+    runtime_artifact_id = str(
+        task.inputs.get("runtime_artifact_id") or "").strip()
+    if runtime_artifact_id:
+        return _run_runtime_repair(task, deps, runtime_artifact_id)
 
     api_check_artifact_id = str(
         task.inputs.get("api_check_artifact_id") or "").strip()
@@ -199,6 +227,20 @@ def run_repair(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             "inside a @pytest.fixture or any other function -- and "
             "fixtures must not be named 'test_*'. Rewrite the test "
             "module(s) so every test is a top-level 'def test_*'.")
+    elif classification == "relative_import_error":
+        # An "attempted relative import beyond top-level package" (or with no
+        # known parent package): the scaffold authored a relative import that
+        # cannot resolve -- a phantom sibling module or a level that walks
+        # above the package root. There is no mechanical patch; re-scaffold
+        # with an explicit constraint so the regenerated module imports only
+        # real first-party modules (preferring absolute imports).
+        rationale = (
+            "A relative import could not be resolved (Python raised "
+            "'attempted relative import beyond top-level package' / 'with no "
+            "known parent package'). Re-author the offending module(s) so "
+            "every first-party import targets a module that actually exists "
+            "in the project -- prefer absolute imports rooted at the top-level "
+            "package, and never import a module that was not generated.")
     else:
         diffs = _propose_llm_logic_repair(task, deps, content)
         if diffs:
@@ -343,6 +385,89 @@ def _run_smoke_repair(task: TaskNode, deps: ExecutorDeps,
             "extra_constraints": extra_constraints,
         },
         artifact=artifact,
+    )
+
+
+def _run_runtime_repair(task: TaskNode, deps: ExecutorDeps,
+                        runtime_artifact_id: str) -> ExecutorResult:
+    """Emit a REPAIR_PLAN from a RUNTIME_REPORT boot failure (#3).
+
+    The unit suite is green but the app did not boot, so there is no
+    failing test to patch and no mechanical locator to run. The plan
+    therefore carries ``strategy='regenerate'`` with the captured
+    import/``create_app`` traceback folded into ``extra_constraints`` so
+    the router re-authors the failing entry module(s) -- and whatever they
+    import -- via the nearest SCAFFOLD ancestor. ``can_apply=False`` keeps
+    the empty-diff plan off the patch path.
+    """
+    artifact = deps.store.get_artifact(runtime_artifact_id)
+    if (artifact is None
+            or artifact.kind is not ArtifactKind.RUNTIME_REPORT):
+        return ExecutorResult(
+            failure=f"REPAIR: artifact {runtime_artifact_id!r} missing or "
+                    "wrong kind (need RUNTIME_REPORT)")
+    content = dict(artifact.content or {})
+    classification = classify_runtime_report(content)
+    failed = [str(f).strip() for f in content.get("failed_entries") or []
+              if str(f).strip()]
+    outcome = str(content.get("outcome") or "").strip()
+    signature = str(content.get("failure_signature") or "").strip()
+    if not signature:
+        signature = "runtime_boot|" + ",".join(sorted(failed))
+    attempt = int(task.inputs.get("repair_attempt") or 1)
+    error_text = runtime_failure_text(content)
+    if failed:
+        rationale = (
+            f"The application failed to boot ({outcome}): entry module(s) "
+            f"{', '.join(failed)} raised at import or create_app() time. The "
+            "unit tests pass but the app itself does not run. Re-author the "
+            "failing entry module(s) and any first-party module they import "
+            "so the module imports cleanly and, when a create_app() factory "
+            "is present, it returns without raising. Boot error:\n"
+            + (error_text or "(no captured output)"))
+    else:
+        rationale = (
+            "RUNTIME_VERIFY reported a boot failure but no failing entry "
+            "files were recorded; escalating to ASK_USER.")
+    extra_constraints: Dict[str, Any] = {
+        "kind": "runtime_failure",
+        "failed_entries": failed,
+        "outcome": outcome,
+        "runtime_error": error_text,
+        "rationale": rationale,
+    }
+    plan = Artifact.new(
+        session_id=task.session_id,
+        produced_by_task_id=task.task_id,
+        kind=ArtifactKind.REPAIR_PLAN,
+        content={
+            "runtime_artifact_id": runtime_artifact_id,
+            "build_artifact_id": content.get("build_artifact_id"),
+            "apply_artifact_id": content.get("apply_artifact_id"),
+            "scaffold_artifact_id": content.get("scaffold_artifact_id"),
+            "classification": classification,
+            "failure_signature": signature,
+            "repair_attempt": attempt,
+            "rationale": rationale,
+            "failed_entries": failed,
+            "diffs": [],
+            "strategy": "regenerate",
+            "extra_constraints": extra_constraints,
+            "mode": task.inputs.get("mode"),
+        },
+    )
+    return ExecutorResult(
+        outputs={
+            "repair_artifact_id": plan.artifact_id,
+            "classification": classification,
+            "failure_signature": signature,
+            "repair_attempt": attempt,
+            "diff_count": 0,
+            "can_apply": False,
+            "strategy": "regenerate",
+            "extra_constraints": extra_constraints,
+        },
+        artifact=plan,
     )
 
 
@@ -566,43 +691,70 @@ def _propose_llm_logic_repair(
         content: Dict[str, Any]) -> List[Dict[str, str]]:
     """Bounded LLM repair for an ``unknown`` logic/assertion failure.
 
-    Reads the failing-test output plus the on-disk files APPLY wrote
-    (``changed_files`` / ``tests_selected`` from the VERIFY_REPORT),
-    asks the provider for corrected complete file contents, and turns
-    each accepted rewrite into a unified diff shaped like every other
-    ``propose_*`` result. Returns an empty list -- so the caller falls
-    back to the regenerate path -- when there is no provider, the repair
-    attempt budget is spent, no candidate file is readable, or the model
-    declined / produced nothing that parses.
+    Reads the failing-test output plus the on-disk files most relevant to
+    the failure and asks the provider for corrected complete file
+    contents, turning each accepted rewrite into a unified diff shaped
+    like every other ``propose_*`` result.
+
+    Candidate files are localized from the failure itself (#4): the source
+    files named in the traceback frames come *first* (that is where the
+    error actually flowed, and it may be a source file APPLY never touched
+    this attempt), followed by the files APPLY wrote / selected
+    (``changed_files`` / ``tests_selected``). Any file-slot those leave
+    unused is then filled by hybrid retrieval over the project index (#6)
+    so a fix that must reach a symbol in an existing file neither the
+    traceback nor APPLY named is still in scope -- a no-op in greenfield
+    (no index). The traceback-referenced subset is passed to the generator
+    so the prompt can point the model at the failing frames instead of
+    asking it to re-derive the culprit.
+
+    Returns an empty list -- so the caller falls back to the regenerate
+    path -- when there is no provider, the repair attempt budget is spent,
+    no candidate file is readable, or the model declined / produced
+    nothing that parses.
     """
     if deps.provider is None or not deps.project_root:
         return []
     attempt = int(task.inputs.get("repair_attempt") or 1)
     if attempt > _LLM_REPAIR_MAX_ATTEMPT:
         return []
+    from cgx.answer.engine import generate_repair_files
+    from cgx.session.repair.classify import failure_text
+    from cgx.session.repair.propose import _unified_diff
     root = Path(deps.project_root)
+    localized = _localized_source_files(content, root)
+    localized_set = set(localized)
+    goal = str(task.inputs.get("prior_goal") or content.get("goal") or "").strip()
+    blob = failure_text(content)
+    candidates = _repair_candidate_files(content, root)
+    if len(candidates) < _LLM_REPAIR_MAX_FILES:
+        query = _repair_retrieval_query(goal, blob)
+        limit = _LLM_REPAIR_MAX_FILES - len(candidates)
+        for rel in _retrieval_relevant_files(deps, query, root, limit):
+            if rel not in candidates:
+                candidates.append(rel)
     files: List[Dict[str, str]] = []
     originals: Dict[str, str] = {}
-    for rel in _candidate_test_files(content)[:_LLM_REPAIR_MAX_FILES]:
+    shown_localized: List[str] = []
+    for rel in candidates[:_LLM_REPAIR_MAX_FILES]:
         try:
             text = (root / rel).resolve().read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             continue
         originals[rel] = text
         files.append({"path": rel, "content": text})
+        if rel in localized_set:
+            shown_localized.append(rel)
     if not files:
         return []
-    from cgx.answer.engine import generate_repair_files
-    from cgx.session.repair.classify import failure_text
-    from cgx.session.repair.propose import _unified_diff
-    goal = str(task.inputs.get("prior_goal") or content.get("goal") or "").strip()
     try:
         fixed = generate_repair_files(
             deps.provider,
             goal=goal,
-            failure_text=failure_text(content),
+            failure_text=blob,
             files=files,
             max_files=_LLM_REPAIR_MAX_FILES,
+            localized_files=shown_localized,
         )
     except Exception:  # pragma: no cover - defensive: provider hiccup
         logger.exception("REPAIR: bounded LLM logic repair crashed")
@@ -635,6 +787,115 @@ def _candidate_test_files(content: Dict[str, Any]) -> List[str]:
                 if s and s not in out:
                     out.append(s)
     return out
+
+
+def _localized_source_files(content: Dict[str, Any], root: Path) -> List[str]:
+    """Resolve the traceback-named ``.py`` frames to on-disk repo paths.
+
+    Each raw frame path (which may be runner-relative or absolute) is
+    resolved against ``root``; only paths that resolve to an existing file
+    inside the project are kept, order-preserving and de-duplicated.
+    Anything outside the tree (stdlib / site-packages frames) is dropped
+    so the repair context stays scoped to first-party code.
+    """
+    out: List[str] = []
+    for raw in traceback_source_files(content):
+        rel = _resolve_repo_relative(root, raw)
+        if rel and rel not in out:
+            out.append(rel)
+    return out
+
+
+def _resolve_repo_relative(root: Path, raw: str) -> Optional[str]:
+    """Return ``raw`` as a repo-relative path when it names a project file.
+
+    Handles both an absolute frame path under ``root`` and an already-
+    relative one (optionally ``./``-prefixed). Returns ``None`` when the
+    path escapes the tree or does not exist on disk.
+    """
+    candidate = raw[2:] if raw.startswith("./") else raw
+    p = Path(candidate)
+    if p.is_absolute():
+        try:
+            candidate = str(p.resolve().relative_to(root.resolve()))
+        except (ValueError, OSError):
+            return None
+    if ".." in Path(candidate).parts:
+        return None
+    return candidate if (root / candidate).is_file() else None
+
+
+def _repair_candidate_files(content: Dict[str, Any], root: Path) -> List[str]:
+    """Order the files shown to the LLM repair, traceback frames first.
+
+    The traceback-localized source files lead (that is where the failure
+    actually flowed, and the culprit is often a source file APPLY did not
+    touch this attempt), followed by the APPLY-written / selected files
+    from :func:`_candidate_test_files`. De-duplicated, order-preserving.
+    """
+    out: List[str] = list(_localized_source_files(content, root))
+    for rel in _candidate_test_files(content):
+        if rel not in out:
+            out.append(rel)
+    return out
+
+
+def _repair_retrieval_query(goal: str, failure_blob: str) -> str:
+    """Compose the retrieval query for the #6 candidate-fill step.
+
+    Pairs the original goal (what the code is supposed to do) with the
+    first exception / pytest error line from the failure blob (what broke),
+    which together steer hybrid retrieval at the symbols the fix is most
+    likely to touch. Falls back to whichever half is present.
+    """
+    first = ""
+    for raw in failure_blob.splitlines():
+        line = raw.strip()
+        if (line.startswith("E ") or line.startswith("E\t")
+                or "Error:" in line or "Exception:" in line):
+            first = line
+            break
+    return " ".join(p for p in (goal, first) if p).strip()
+
+
+def _retrieval_relevant_files(
+        deps: ExecutorDeps, query: str, root: Path, limit: int) -> List[str]:
+    """Return up to ``limit`` repo-relative source files hybrid retrieval
+    judges most relevant to ``query`` (#6).
+
+    Best-effort and self-disabling: returns ``[]`` when no index is wired
+    into ``deps`` (every greenfield session), when the query is empty, or
+    when retrieval raises -- the caller then keeps its failure-localized
+    candidates unchanged. Retrieval ``top_files`` are resolved against the
+    project root and de-duplicated the same way traceback frames are, so
+    only existing first-party files are ever handed to the provider.
+    """
+    if limit <= 0 or not query or not deps.index_dir or not deps.records_path:
+        return []
+    try:
+        from cgx.pipeline.auto import run_query_auto
+        out = run_query_auto(
+            index_dir=deps.index_dir,
+            records_path=deps.records_path,
+            query=query,
+            embedder=(deps.extra.get("embedder") if deps.extra else None),
+            top_k_per_view=limit + _LLM_REPAIR_RETRIEVAL_SLACK,
+        )
+    except Exception:  # pragma: no cover - defensive: retrieval hiccup
+        logger.exception("REPAIR: retrieval-fed candidate lookup crashed")
+        return []
+    files: List[str] = []
+    for entry in (out or {}).get("top_files") or []:
+        raw = (str((entry or {}).get("file") or "").strip()
+               if isinstance(entry, dict) else str(entry).strip())
+        if not raw:
+            continue
+        rel = _resolve_repo_relative(root, raw)
+        if rel and rel not in files:
+            files.append(rel)
+        if len(files) >= limit:
+            break
+    return files
 
 
 def _unittest_rationale(locations: List[StyleMixLocation]) -> str:

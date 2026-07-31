@@ -666,6 +666,181 @@ def test_scaffold_py_syntax_error_flags_when_retry_still_broken():
     assert out.get("syntax_error")
 
 
+def test_unwrap_wrapping_code_fence_variants():
+    from cgx.answer.engine import _unwrap_wrapping_code_fence as unwrap
+    # Whole-wrap with trailing prose after the closing fence.
+    assert unwrap("```python\ndef f():\n    return 1\n```\n\nDone.") == (
+        "def f():\n    return 1")
+    # Unclosed fence (model forgot the closing ```).
+    assert unwrap("```python\ndef f():\n    return 1") == (
+        "def f():\n    return 1")
+    # Short natural-language preamble before the opening fence.
+    assert unwrap("Here is the file:\n```py\nx = 1\n```") == "x = 1"
+    # No fence at all -> content is returned untouched.
+    assert unwrap("x = 1\n") == "x = 1\n"
+    # A docstring-embedded fence must NOT be stripped (guard on triple
+    # quotes in the preamble) so real Python survives verbatim.
+    doc = '"""Doc.\n\n```python\nnope\n```\n"""\nx = 1\n'
+    assert unwrap(doc) == doc
+
+
+def test_format_syntax_error_surfaces_offending_line():
+    from cgx.answer.engine import _format_syntax_error
+    e = SyntaxError("invalid syntax")
+    e.lineno = 1
+    e.text = "```python\n"
+    msg = _format_syntax_error(e)
+    assert "line 1" in msg
+    assert "```python" in msg
+
+
+def test_format_syntax_error_without_text_is_base():
+    from cgx.answer.engine import _format_syntax_error
+    assert _format_syntax_error(SyntaxError("invalid syntax")) == (
+        str(SyntaxError("invalid syntax")))
+
+
+def test_scaffold_fence_wrapped_python_parses_without_retry():
+    """A fence-wrapped body is unwrapped before the syntax gate, so a
+    valid file no longer burns a retry on a bogus line-1 error."""
+    from cgx.answer.engine import generate_single_scaffold_file
+    wrapped = "```python\n" + _VALID_PY + "```\n\nLet me know if you need more."
+    provider = _QueueProvider([wrapped])
+    out = generate_single_scaffold_file(
+        "src/calculator.py", "calculator core", provider,
+        layer="core", goal="build a calculator",
+    )
+    assert provider.calls == 1, "unwrap must avoid a line-1 syntax retry"
+    assert out["syntax_ok"] is True
+    assert out["content"] == _VALID_PY.rstrip("\n")
+    assert out["patch"]
+
+
+class _RecordingQueueProvider(_QueueProvider):
+    """Queue provider that also records each call's ``messages`` list."""
+
+    def __init__(self, payloads: List[str]):
+        super().__init__(payloads)
+        self.messages: List[Any] = []
+
+    def chat(self, *args: Any, **kwargs: Any) -> Dict[str, str]:
+        msgs = kwargs.get("messages")
+        if msgs is None and args:
+            msgs = args[0]
+        self.messages.append(msgs)
+        return super().chat(*args, **kwargs)
+
+
+def test_scaffold_py_syntax_retry_prompt_is_minimal():
+    """The targeted retry drops the prior-file digest, ships the broken file.
+
+    The first attempt carries the ``ALREADY GENERATED FILES`` context so
+    imports resolve; the syntax retry must instead send only the offending
+    file plus the parser error (P1.1), reclaiming the O(files) digest tax.
+    """
+    from cgx.answer.engine import generate_single_scaffold_file
+    prior = {"path": "src/db.py",
+             "content": "def unique_prior_marker():\n    return 42\n"}
+    provider = _RecordingQueueProvider([_BROKEN_PY, _VALID_PY])
+    out = generate_single_scaffold_file(
+        "src/calculator.py", "calculator core", provider,
+        layer="core", goal="build a calculator",
+        existing_files_with_content=[prior],
+    )
+    assert provider.calls == 2
+    assert out["syntax_ok"] is True and out["content"] == _VALID_PY
+    first_user = provider.messages[0][1]["content"]
+    retry_user = provider.messages[1][1]["content"]
+    # First attempt: full context (digest of the prior file present).
+    assert "ALREADY GENERATED FILES" in first_user
+    assert "unique_prior_marker" in first_user
+    # Retry: minimal -- no digest block, just the broken bytes + error.
+    assert "ALREADY GENERATED FILES" not in retry_user
+    assert "unique_prior_marker" not in retry_user
+    assert "BROKEN FILE:" in retry_user
+    assert _BROKEN_PY.strip() in retry_user
+
+
+def _chunk(text: str, n: int = 5) -> List[str]:
+    """Split ``text`` into ``n`` roughly-equal pieces (fake stream deltas)."""
+    step = max(1, len(text) // n)
+    return [text[i:i + step] for i in range(0, len(text), step)]
+
+
+class _StreamProvider:
+    """Provider whose ``chat_stream`` yields queued JSON deltas.
+
+    Advertises ``stream_json_capable`` so the scaffold generator takes the
+    streaming path when handed an ``on_token``; ``chat`` is the blocking
+    fallback and records its own call count.
+    """
+
+    model = "gpt-4o"  # cloud-tier so the summary budget stays generous
+    stream_json_capable = True
+
+    def __init__(self, stream_chunks: List[str], chat_body: str = ""):
+        self._chunks = list(stream_chunks)
+        self._chat_body = chat_body
+        self.stream_calls = 0
+        self.chat_calls = 0
+
+    def chat_stream(self, messages: Any, temperature: float = 0.2,
+                    max_tokens: Any = None, force_json: bool = False,
+                    **kwargs: Any):
+        self.stream_calls += 1
+        assert force_json is True, "scaffold stream must request JSON mode"
+        for chunk in self._chunks:
+            yield chunk
+
+    def chat(self, *args: Any, **kwargs: Any) -> Dict[str, str]:
+        self.chat_calls += 1
+        return {"content": json.dumps({"content": self._chat_body})}
+
+
+def test_scaffold_streams_tokens_and_parses_result():
+    """With ``on_token`` the file is streamed; deltas reach the callback."""
+    from cgx.answer.engine import generate_single_scaffold_file
+    body = json.dumps({"content": _VALID_PY})
+    provider = _StreamProvider(_chunk(body))
+    seen: List[str] = []
+    out = generate_single_scaffold_file(
+        "src/calculator.py", "calculator core", provider,
+        layer="core", goal="build a calculator",
+        on_token=seen.append,
+    )
+    assert provider.stream_calls == 1
+    assert provider.chat_calls == 0, "streaming must not also block-call chat"
+    assert out["syntax_ok"] is True and out["content"] == _VALID_PY
+    assert "".join(seen) == body, "every delta must reach on_token in order"
+
+
+def test_scaffold_stream_falls_back_to_chat_when_unparseable():
+    """A stream that yields non-JSON degrades to the reliable chat call."""
+    from cgx.answer.engine import generate_single_scaffold_file
+    provider = _StreamProvider(["not json ", "at all"], chat_body=_VALID_PY)
+    out = generate_single_scaffold_file(
+        "src/calculator.py", "calculator core", provider,
+        layer="core", goal="build a calculator",
+        on_token=lambda _d: None,
+    )
+    assert provider.stream_calls == 1
+    assert provider.chat_calls == 1, "unparseable stream must fall back"
+    assert out["syntax_ok"] is True and out["content"] == _VALID_PY
+
+
+def test_scaffold_without_on_token_never_streams():
+    """No callback -> the legacy blocking path, even on a stream provider."""
+    from cgx.answer.engine import generate_single_scaffold_file
+    provider = _StreamProvider([], chat_body=_VALID_PY)
+    out = generate_single_scaffold_file(
+        "src/calculator.py", "calculator core", provider,
+        layer="core", goal="build a calculator",
+    )
+    assert provider.stream_calls == 0
+    assert provider.chat_calls == 1
+    assert out["content"] == _VALID_PY
+
+
 # Unbalanced JSX: the return expression is never closed. Parsed with the
 # tree-sitter ``javascript`` grammar this reports has_error, which the
 # inline gate turns into one hardened retry.
@@ -761,6 +936,139 @@ def test_generate_single_scaffold_file_short_circuits_conftest():
     body = out["content"]
     assert "sys.path.insert" in body
     assert '"src"' in body or "'src'" in body
+
+
+# ---------------------------------------------------------------------------
+# generate_single_scaffold_file: pure-boilerplate files (.gitignore, ...)
+# short-circuit the LLM with a deterministic template (P1.3).
+# ---------------------------------------------------------------------------
+def test_generate_single_scaffold_file_short_circuits_trivial_boilerplate():
+    from cgx.answer.engine import generate_single_scaffold_file
+
+    class _Boom:
+        def chat(self, *a, **kw):
+            raise AssertionError("provider must not be called for boilerplate")
+
+    cases = {
+        ".gitignore": "__pycache__/",
+        ".dockerignore": ".git",
+        ".gitattributes": "text=auto",
+        ".editorconfig": "root = true",
+    }
+    for path, marker in cases.items():
+        out = generate_single_scaffold_file(path, "boilerplate", _Boom())
+        assert out["file"].rsplit("/", 1)[-1] == path
+        assert out["syntax_ok"] is True
+        assert out["patch"], "patch must be non-empty"
+        assert marker in out["content"]
+
+
+def test_generate_single_scaffold_file_depends_on_scopes_digest():
+    """With ``depends_on`` the digest carries only the declared deps."""
+    from cgx.answer.engine import generate_single_scaffold_file
+
+    dep = {"path": "src/dep.py",
+           "content": "def dep_marker_fn():\n    return 1\n"}
+    other = {"path": "src/other.py",
+             "content": "def other_marker_fn():\n    return 2\n"}
+
+    scoped = _RecordingQueueProvider([_VALID_PY])
+    generate_single_scaffold_file(
+        "src/calculator.py", "calculator core", scoped,
+        layer="core", goal="build a calculator",
+        existing_files_with_content=[dep, other],
+        depends_on=["src/dep.py"],
+    )
+    scoped_user = scoped.messages[0][1]["content"]
+    assert "dep_marker_fn" in scoped_user
+    assert "other_marker_fn" not in scoped_user
+
+    # No depends_on -> legacy full-context digest (both siblings present).
+    full = _RecordingQueueProvider([_VALID_PY])
+    generate_single_scaffold_file(
+        "src/calculator.py", "calculator core", full,
+        layer="core", goal="build a calculator",
+        existing_files_with_content=[dep, other],
+    )
+    full_user = full.messages[0][1]["content"]
+    assert "dep_marker_fn" in full_user
+    assert "other_marker_fn" in full_user
+
+
+def test_trivial_boilerplate_content_returns_none_for_normal_files():
+    from cgx.answer.engine import _trivial_boilerplate_content
+
+    assert _trivial_boilerplate_content("src/app.py") is None
+    assert _trivial_boilerplate_content("README.md") is None
+    assert _trivial_boilerplate_content(".gitignore") is not None
+    assert _trivial_boilerplate_content("nested/dir/.gitignore") is not None
+
+
+# ---------------------------------------------------------------------------
+# P0 contract-first planning: plan_scaffold_manifest emits a normalized
+# ``contracts`` block and generate_single_scaffold_file threads it into the
+# per-file prompt so cross-file interfaces are declared, not re-derived.
+# ---------------------------------------------------------------------------
+def test_plan_scaffold_manifest_normalizes_and_returns_contracts():
+    from cgx.answer.engine import plan_scaffold_manifest
+
+    reply = json.dumps({
+        "plan_md": "flask + react calculator",
+        "contracts": {
+            "endpoints": [
+                {"method": "post", "path": "/api/calc",
+                 "request": {"expr": "str"},
+                 "response": {"result": "number"},
+                 "description": "evaluate an expression"},
+                {},  # malformed (empty) -> dropped by the normalizer
+            ],
+            "schemas": [{"name": "CalcRequest", "fields": {"expr": "str"}}],
+            "functions": [{"name": "evaluate",
+                           "signature": "evaluate(expr: str) -> float",
+                           "module": "backend/calc.py"}],
+            "constants": [{"name": "API_BASE", "value": "/api"}],
+            "junk": "unknown category ignored",
+        },
+        "layers": [{"name": "core", "files": [
+            {"path": "backend/calc.py", "description": "core"}]}],
+    })
+    out = plan_scaffold_manifest(
+        "build a calculator", _OneShotProvider(reply), goal="build a calculator")
+    contracts = out["contracts"]
+    assert set(contracts.keys()) == {
+        "endpoints", "schemas", "functions", "constants"}
+    # The empty endpoint dict is dropped; the well-formed one survives.
+    assert len(contracts["endpoints"]) == 1
+    assert contracts["endpoints"][0]["path"] == "/api/calc"
+    # Unknown top-level categories never make it into the stored block.
+    assert "junk" not in contracts
+
+
+def test_generate_single_scaffold_file_threads_contracts_into_prompt():
+    from cgx.answer.engine import generate_single_scaffold_file
+
+    contracts = {
+        "endpoints": [{"method": "GET", "path": "/api/ping",
+                       "response": {"ok": "bool"}}],
+        "functions": [{"signature": "ping() -> dict", "module": "app.py"}],
+    }
+    provider = _RecordingQueueProvider([_VALID_PY])
+    generate_single_scaffold_file(
+        "app.py", "flask app", provider,
+        layer="core", goal="build an api", contracts=contracts,
+    )
+    user = provider.messages[0][1]["content"]
+    assert "PROJECT CONTRACTS" in user
+    assert "GET /api/ping" in user
+    assert "ping() -> dict" in user
+
+    # No contracts -> the section is absent (prompt unchanged).
+    plain = _RecordingQueueProvider([_VALID_PY])
+    generate_single_scaffold_file(
+        "app.py", "flask app", plain,
+        layer="core", goal="build an api",
+    )
+    assert "PROJECT CONTRACTS" not in plain.messages[0][1]["content"]
 
 
 # ---------------------------------------------------------------------

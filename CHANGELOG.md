@@ -2,6 +2,36 @@
 
 All notable changes are documented here. Versions follow semver-ish.
 
+## Unreleased -- CLI parity (ask / plan / agent / status)
+
+The `cgx` command now exposes every runtime capability that the
+dashboard and web UI already offered, closing the gap where `cgx ask`
+and `cgx agent` were documented but unimplemented.
+
+* **New subcommands**: `cgx ask` (grounded, streamed LLM answers),
+  `cgx plan` (self-testing code-change plans with `--self-test` /
+  `--run-tests`), `cgx agent` (the batch Planner → Tracker → Judge loop
+  with `--stop-on-fail`), and `cgx status` (provider + hardware + index
+  summary). `cgx query` remains the raw, LLM-free retrieval dump.
+* **Shared provider/index flags** across the new commands:
+  `--provider {ollama,openai,openai-compat,gemini,custom}`, `--model`,
+  `--base-url`, `--profile`, `--project-root`, and `--index-dir` /
+  `--records` overrides. A `--profile` takes precedence and API keys are
+  resolved from the environment / keyring — never passed on the command
+  line.
+* **Same streaming engine as the UI**: the commands reuse
+  `cgx.webui.handlers` (`stream_ask` / `stream_plan` / `stream_agent`)
+  driven through the terminal `Printer` / `run_stream`, so tokens stream
+  live under a spinner and **Ctrl-C** cancels via the shared
+  `cancel_event` (exit `130`; other failures exit `1`).
+* **Index auto-discovery**: `ask` / `plan` / `status` read a completed
+  index at `<project-root>/.cgx/index` by default; `agent` runs with or
+  without one (greenfield generation).
+* Implementation: new `plan_events` plus `index_dir` / `records` /
+  `think` / `stop_on_fail` support in `cgx.cli.tui.ops`, a `plan`-payload
+  branch in `map_event`, and the subcommand wiring in `cgx.cli.main`.
+  Covered by new tests in `tests/test_cli_dashboard.py`.
+
 ## Unreleased -- Greenfield agentic-loop hardening (Phases A-E)
 
 A reliability pass over the greenfield loop (Plan -> Scaffold -> Apply ->

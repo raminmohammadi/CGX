@@ -6,10 +6,9 @@ import {
   ChevronRight,
   CircleCheck,
   Database,
-  History,
+  LayoutDashboard,
   Loader2,
   MessageSquareDot,
-  Microchip,
   Plus,
   Settings,
   Trash2,
@@ -20,14 +19,35 @@ import { useWorkspace } from "../store/workspace";
 import { useTasks } from "../store/tasks";
 import { cn, formatRelative } from "../lib/utils";
 
-const tabs = [
-  { to: "/settings", label: "Profiles & Setup", icon: Settings, pageKey: null },
-  { to: "/index", label: "Incremental Index", icon: Database, pageKey: "index" as const },
-  { to: "/ask", label: "Contextual Ask", icon: MessageSquareDot, pageKey: "ask" as const },
-  { to: "/plan", label: "Self-Testing Plan", icon: Wand2, pageKey: "plan" as const },
-  { to: "/agent", label: "Agent Loop", icon: Bot, pageKey: null },
-  { to: "/agent-legacy", label: "Agent (legacy)", icon: History, pageKey: "agent" as const },
-  { to: "/hardware", label: "Hardware Pick", icon: Microchip, pageKey: null },
+type NavTab = {
+  to: string;
+  label: string;
+  icon: typeof Bot;
+  pageKey: "agent" | "ask" | "plan" | "index" | null;
+};
+
+const overviewTab: NavTab = { to: "/", label: "Overview", icon: LayoutDashboard, pageKey: null };
+
+const navGroups: { eyebrow: string; tabs: NavTab[] }[] = [
+  {
+    eyebrow: "Converse",
+    tabs: [{ to: "/ask", label: "Contextual Ask", icon: MessageSquareDot, pageKey: "ask" }],
+  },
+  {
+    eyebrow: "Build",
+    tabs: [
+      { to: "/plan", label: "Self-Testing Plan", icon: Wand2, pageKey: "plan" },
+      { to: "/agent", label: "Agent Loop", icon: Bot, pageKey: null },
+    ],
+  },
+  {
+    eyebrow: "Retrieval",
+    tabs: [{ to: "/index", label: "Incremental Index", icon: Database, pageKey: "index" }],
+  },
+  {
+    eyebrow: "System",
+    tabs: [{ to: "/settings", label: "Profiles & Setup", icon: Settings, pageKey: null }],
+  },
 ];
 
 function useRunningPages() {
@@ -91,6 +111,21 @@ export default function Sidebar() {
     >
       <div className="p-3 space-y-5 overflow-y-auto">
         <div>
+          <NavLink
+            to={overviewTab.to}
+            end
+            className={({ isActive }) => cn("av-nav-item mb-2", isActive && "is-active font-medium")}
+          >
+            {({ isActive }) => (
+              <>
+                <overviewTab.icon
+                  className={cn("h-3.5 w-3.5 shrink-0", isActive ? "text-emerald-400" : "text-slate-500")}
+                />
+                <span className="truncate flex-1">{overviewTab.label}</span>
+              </>
+            )}
+          </NavLink>
+
           <button
             onClick={() => setNavCollapsed((c) => !c)}
             className="flex items-center justify-between w-full px-2 mb-2 group"
@@ -102,37 +137,46 @@ export default function Sidebar() {
             }
           </button>
           {!navCollapsed && (
-            <nav className="space-y-0.5">
-              {tabs.map(({ to, label, icon: Icon, pageKey }) => {
-                const isRunning = pageKey ? running[pageKey as keyof typeof running] : false;
-                return (
-                  <NavLink
-                    key={to}
-                    to={to}
-                    className={({ isActive }) =>
-                      cn("av-nav-item", isActive && "is-active font-medium")
-                    }
-                  >
-                    {({ isActive }) => (
-                      <>
-                        <Icon
-                          className={cn(
-                            "h-3.5 w-3.5 shrink-0",
-                            isActive ? "text-emerald-400" : "text-slate-500",
+            <div className="space-y-3">
+              {navGroups.map((group) => (
+                <div key={group.eyebrow}>
+                  <span className="av-section-eyebrow block px-2 mb-1 text-[9px]">
+                    {group.eyebrow}
+                  </span>
+                  <nav className="space-y-0.5">
+                    {group.tabs.map(({ to, label, icon: Icon, pageKey }) => {
+                      const isRunning = pageKey ? running[pageKey] : false;
+                      return (
+                        <NavLink
+                          key={to}
+                          to={to}
+                          className={({ isActive }) =>
+                            cn("av-nav-item", isActive && "is-active font-medium")
+                          }
+                        >
+                          {({ isActive }) => (
+                            <>
+                              <Icon
+                                className={cn(
+                                  "h-3.5 w-3.5 shrink-0",
+                                  isActive ? "text-emerald-400" : "text-slate-500",
+                                )}
+                              />
+                              <span className="truncate flex-1">{label}</span>
+                              {isRunning && (
+                                <span title="Task running">
+                                  <Loader2 className="h-3 w-3 text-emerald-400 animate-spin shrink-0" />
+                                </span>
+                              )}
+                            </>
                           )}
-                        />
-                        <span className="truncate flex-1">{label}</span>
-                        {isRunning && (
-                          <span title="Task running">
-                            <Loader2 className="h-3 w-3 text-emerald-400 animate-spin shrink-0" />
-                          </span>
-                        )}
-                      </>
-                    )}
-                  </NavLink>
-                );
-              })}
-            </nav>
+                        </NavLink>
+                      );
+                    })}
+                  </nav>
+                </div>
+              ))}
+            </div>
           )}
         </div>
 

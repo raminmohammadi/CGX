@@ -69,6 +69,11 @@ class TaskKind(str, enum.Enum):
     failed with a classifiable cause (e.g. unittest/pytest helper
     mismatch). It emits a typed plan; the existing APPLY executor
     consumes it like any other diff source.
+
+    RUNTIME_VERIFY is the post-VERIFY runtime gate (greenfield only):
+    once the unit suite the model wrote passes, it boots the scaffolded
+    app / import-and-call smokes the entry modules so "the tests pass"
+    becomes "the app actually runs".
     """
     EXPLORE = "explore"
     INVESTIGATE = "investigate"
@@ -76,6 +81,7 @@ class TaskKind(str, enum.Enum):
     PLAN_CHANGE = "plan_change"
     APPLY = "apply"
     VERIFY = "verify"
+    RUNTIME_VERIFY = "runtime_verify"
     ASK_USER = "ask_user"
     SEARCH = "search"
     SUMMARIZE = "summarize"
@@ -103,6 +109,7 @@ class ArtifactKind(str, enum.Enum):
     CODE_CHANGE_PLAN = "code_change_plan"
     APPLIED_CHANGES = "applied_changes"
     VERIFY_REPORT = "verify_report"
+    RUNTIME_REPORT = "runtime_report"
     SESSION_DIGEST = "session_digest"
     REQUIREMENTS_SHEET = "requirements_sheet"
     WORK_PLAN = "work_plan"

@@ -20,6 +20,7 @@ from Phase 3.2.
 
 from __future__ import annotations
 
+import ast
 import logging
 import re
 from pathlib import Path
@@ -345,3 +346,314 @@ def validate_scaffold_diffs(
             adj["file"] = path
             all_adjustments.append(adj)
     return new_diffs, new_contents, all_adjustments
+
+
+# --------------------- first-party import cross-check ---------------------
+
+def _module_name_for_path(path: str) -> Optional[str]:
+    """Dotted module name for a generated ``.py`` path, or ``None``.
+
+    ``pkg/sub/mod.py`` -> ``pkg.sub.mod``; ``pkg/__init__.py`` -> ``pkg``.
+    Non-Python paths return ``None``.
+    """
+    s = (path or "").strip().replace("\\", "/")
+    if not s.endswith(".py"):
+        return None
+    parts = [x for x in s.split("/") if x and x != "."]
+    if not parts:
+        return None
+    if parts[-1] == "__init__.py":
+        parts = parts[:-1]
+    else:
+        parts[-1] = parts[-1][:-3]
+    return ".".join(parts) if parts else None
+
+
+def _top_level_symbols(content: str,
+                       include_imports: bool = True) -> Optional[Set[str]]:
+    """Top-level names a ``from mod import name`` could bind, or ``None``.
+
+    ``None`` signals the module could not be parsed, so the caller must
+    abstain rather than flag a false positive. When ``include_imports`` is
+    ``False`` the names merely *bound* by an ``import`` / ``from ... import``
+    are omitted, leaving only the names the module actually *defines*
+    (functions, classes, assignments). Contract checks that require a name
+    to be authored -- not just re-exported -- use that stricter view.
+    """
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        return None
+    names: Set[str] = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                             ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.Assign):
+            for tgt in node.targets:
+                for nm in _assign_names(tgt):
+                    names.add(nm)
+        elif isinstance(node, ast.AnnAssign):
+            if isinstance(node.target, ast.Name):
+                names.add(node.target.id)
+        elif isinstance(node, ast.Import):
+            if include_imports:
+                for a in node.names:
+                    names.add((a.asname or a.name).split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            if include_imports:
+                for a in node.names:
+                    if a.name != "*":
+                        names.add(a.asname or a.name)
+    return names
+
+
+def _assign_names(target: ast.AST) -> List[str]:
+    if isinstance(target, ast.Name):
+        return [target.id]
+    if isinstance(target, (ast.Tuple, ast.List)):
+        out: List[str] = []
+        for e in target.elts:
+            out.extend(_assign_names(e))
+        return out
+    return []
+
+
+def _resolve_from_target(node: ast.ImportFrom, importer: str,
+                         is_pkg_init: bool) -> Optional[str]:
+    """Dotted target module of a ``from ... import`` (absolute or relative)."""
+    if node.level:
+        parts = importer.split(".") if importer else []
+        base = parts if is_pkg_init else parts[:-1]
+        up = node.level - 1  # level 1 == current package
+        if up > len(base):
+            return None
+        base = base[:len(base) - up]
+        target = base + (node.module.split(".") if node.module else [])
+        return ".".join(target) if target else None
+    return node.module or None
+
+
+def cross_check_first_party_imports(
+        file_contents: Dict[str, str]) -> List[Dict[str, Any]]:
+    """Flag ``from <first-party> import <name>`` where ``name`` is absent.
+
+    Best-effort, Python-only static check run after SCAFFOLD: for every
+    generated ``.py`` file, resolve each ``from ... import`` whose target
+    module is itself a generated file and verify the imported names are
+    defined there (or are generated submodules). Third-party and
+    unresolved imports are ignored, and any parse failure abstains, so
+    the check never fails the scaffold -- it only surfaces
+    ``{file, module, name, reason}`` warnings the router can act on.
+    """
+    modules: Dict[str, str] = {}
+    packages: Set[str] = set()
+    for path in file_contents:
+        mod = _module_name_for_path(path)
+        if mod is None:
+            continue
+        modules[mod] = path
+        parts = mod.split(".")
+        for i in range(1, len(parts)):
+            packages.add(".".join(parts[:i]))
+        if path.replace("\\", "/").endswith("__init__.py"):
+            packages.add(mod)
+
+    warnings: List[Dict[str, Any]] = []
+    symbol_cache: Dict[str, Optional[Set[str]]] = {}
+    for path, content in file_contents.items():
+        importer = _module_name_for_path(path)
+        if importer is None or not isinstance(content, str):
+            continue
+        try:
+            tree = ast.parse(content)
+        except SyntaxError:
+            continue
+        is_pkg_init = path.replace("\\", "/").endswith("__init__.py")
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom):
+                continue
+            target = _resolve_from_target(node, importer, is_pkg_init)
+            if node.level:
+                # Relative imports can only reference first-party siblings in
+                # the same package tree, so -- unlike absolute/third-party
+                # targets -- an unresolved one is never something to abstain
+                # on. Flag it when resolution fell off the top of the tree
+                # (``_resolve_from_target`` -> ``None``: "attempted relative
+                # import beyond top-level package") or the resolved module was
+                # never generated (a phantom sibling), so the router
+                # regenerates instead of shipping a scaffold that cannot
+                # import. A target that resolves to a generated package with
+                # no ``__init__`` still abstains via the fall-through below.
+                if target is None or (
+                        target not in modules and target not in packages):
+                    spec = "." * node.level + (node.module or "")
+                    for alias in node.names:
+                        warnings.append({
+                            "file": path,
+                            "module": spec,
+                            "name": alias.name,
+                            "reason": (f"relative import {spec!r} does not "
+                                       "resolve to a generated module"),
+                        })
+                    continue
+            if target is None:
+                continue
+            target_path = modules.get(target)
+            if target_path is None:
+                # A first-party package with no generated ``__init__`` (or a
+                # third-party module): no source to verify against -> abstain.
+                continue
+            if target_path not in symbol_cache:
+                symbol_cache[target_path] = _top_level_symbols(
+                    file_contents.get(target_path) or "")
+            defined = symbol_cache[target_path]
+            if defined is None:
+                continue
+            for alias in node.names:
+                name = alias.name
+                if name == "*":
+                    continue
+                sub = f"{target}.{name}"
+                if sub in modules or sub in packages:
+                    continue  # importing a generated submodule/subpackage
+                if name not in defined:
+                    warnings.append({
+                        "file": path,
+                        "module": target,
+                        "name": name,
+                        "reason": f"{name!r} not defined in {target_path}",
+                    })
+    return warnings
+
+
+# --------------------- work-plan contract enforcement ---------------------
+
+def check_contract_compliance(
+        file_contents: Dict[str, str],
+        contracts: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Flag WORK_PLAN contract items no generated file satisfies.
+
+    Best-effort static gate run after SCAFFOLD (companion to
+    :func:`cross_check_first_party_imports`): checks each declared shared
+    interface against the generated file set so a mismatch is caught here,
+    not only when VERIFY runs the suite. Four categories are checked:
+
+    * ``endpoints`` -- the declared ``path`` string must appear verbatim
+      in some generated file (route decorators embed the path literally,
+      so this scan is language-agnostic);
+    * ``schemas`` -- a class/name ``name`` must be defined in some
+      generated Python module;
+    * ``functions`` -- a function named ``name`` must be defined, in the
+      declared ``module`` when it is a generated Python file, otherwise in
+      any generated module;
+    * ``constants`` -- a module-level name ``name`` must be assigned in
+      some generated Python module.
+
+    The symbol checks only run when at least one Python module parsed (a
+    pure JS/TS scaffold has no AST here, so they abstain); the endpoint
+    substring scan always runs. Any item that cannot be evaluated is
+    skipped, so the gate never fails a scaffold on its own -- it returns
+    ``{kind, name, reason, ...}`` warnings the router can turn into a
+    targeted regenerate constraint.
+    """
+    if not isinstance(contracts, dict) or not contracts:
+        return []
+
+    per_module: Dict[str, Set[str]] = {}
+    all_symbols: Set[str] = set()
+    # Names actually *defined* (assigned / functions / classes) across every
+    # module, excluding names merely re-exported via an import. Constants must
+    # be assigned, not just imported, to satisfy their contract.
+    assigned_symbols: Set[str] = set()
+    for path, content in file_contents.items():
+        if not isinstance(content, str):
+            continue
+        if _module_name_for_path(path) is None:
+            continue
+        syms = _top_level_symbols(content)
+        if syms is None:
+            continue
+        per_module[path.replace("\\", "/")] = syms
+        all_symbols |= syms
+        defined = _top_level_symbols(content, include_imports=False)
+        if defined is not None:
+            assigned_symbols |= defined
+
+    have_python = bool(per_module)
+    haystack = "\n".join(
+        c for c in file_contents.values() if isinstance(c, str))
+
+    warnings: List[Dict[str, Any]] = []
+
+    for ep in contracts.get("endpoints") or []:
+        if not isinstance(ep, dict):
+            continue
+        path = str(ep.get("path") or "").strip()
+        if not path:
+            continue
+        if path not in haystack:
+            warnings.append({
+                "kind": "endpoint",
+                "name": path,
+                "method": str(ep.get("method") or "").strip().upper(),
+                "reason": (f"declared endpoint {path!r} not found in any "
+                           "generated file"),
+            })
+
+    if have_python:
+        for sc in contracts.get("schemas") or []:
+            if not isinstance(sc, dict):
+                continue
+            name = str(sc.get("name") or "").strip()
+            if not name:
+                continue
+            if name not in all_symbols:
+                warnings.append({
+                    "kind": "schema",
+                    "name": name,
+                    "reason": (f"declared schema {name!r} has no definition "
+                               "in any generated module"),
+                })
+
+        for fn in contracts.get("functions") or []:
+            if not isinstance(fn, dict):
+                continue
+            name = str(fn.get("name") or "").strip()
+            if not name:
+                continue
+            module = str(fn.get("module") or "").strip().replace("\\", "/")
+            scope = per_module.get(module)
+            if scope is not None:
+                if name not in scope:
+                    warnings.append({
+                        "kind": "function",
+                        "name": name,
+                        "module": module,
+                        "reason": (f"declared function {name!r} not defined "
+                                   f"in {module}"),
+                    })
+            elif name not in all_symbols:
+                warnings.append({
+                    "kind": "function",
+                    "name": name,
+                    "module": module or None,
+                    "reason": (f"declared function {name!r} not defined in "
+                               "any generated module"),
+                })
+
+        for c in contracts.get("constants") or []:
+            if not isinstance(c, dict):
+                continue
+            name = str(c.get("name") or "").strip()
+            if not name:
+                continue
+            if name not in assigned_symbols:
+                warnings.append({
+                    "kind": "constant",
+                    "name": name,
+                    "reason": (f"declared constant {name!r} not assigned in "
+                               "any generated module"),
+                })
+
+    return warnings

@@ -128,33 +128,69 @@ def index_events(state: Any, *, cancel_event=None) -> Iterator[Event]:
     )
 
 
-def ask_events(state: Any, question: str, *, cancel_event=None) -> Iterator[Event]:
+def resolve_index(state: Any, *, index_dir: Optional[str] = None,
+                  records: Optional[str] = None) -> Optional[Tuple[str, str]]:
+    """Resolve an ``(index_dir, records)`` pair for the active project.
+
+    An explicit ``index_dir`` + ``records`` override wins (so a CLI user can
+    point at an index built with ``cgx index --out-dir``); otherwise fall
+    back to the auto-discovered ``<project>/.cgx/index`` layout.
+    """
+    if index_dir and records:
+        return index_dir, records
+    return find_existing_index(state.project_root)
+
+
+def ask_events(state: Any, question: str, *, index_dir: Optional[str] = None,
+               records: Optional[str] = None, think: bool = False,
+               cancel_event=None) -> Iterator[Event]:
     """Stream a fast, read-only grounded answer (thought + answer tokens)."""
     from cgx.webui import handlers
 
-    idx = find_existing_index(state.project_root)
+    idx = resolve_index(state, index_dir=index_dir, records=records)
     if not idx:
         yield "error", {"message": "no index -- run /index first"}
         return
-    index_dir, records = idx
+    resolved_index, resolved_records = idx
     yield from handlers.stream_ask(
-        index_dir=index_dir, records=records, question=question,
-        embed_model=DEFAULT_EMBED_MODEL, cancel_event=cancel_event,
+        index_dir=resolved_index, records=resolved_records, question=question,
+        embed_model=DEFAULT_EMBED_MODEL, think=think, cancel_event=cancel_event,
         **provider_kwargs(state),
     )
 
 
-def agent_events(state: Any, goal: str, *, cancel_event=None) -> Iterator[Event]:
+def plan_events(state: Any, task: str, *, index_dir: Optional[str] = None,
+                records: Optional[str] = None, self_test: bool = False,
+                run_tests: bool = False, cancel_event=None) -> Iterator[Event]:
+    """Stream a code-change plan (sketch → plan_md + structured diffs)."""
+    from cgx.webui import handlers
+
+    idx = resolve_index(state, index_dir=index_dir, records=records)
+    if not idx:
+        yield "error", {"message": "no index -- run /index first"}
+        return
+    resolved_index, resolved_records = idx
+    yield from handlers.stream_plan(
+        index_dir=resolved_index, records=resolved_records, task=task,
+        embed_model=DEFAULT_EMBED_MODEL, self_test=self_test,
+        run_tests=run_tests, project_root=state.project_root,
+        cancel_event=cancel_event, **provider_kwargs(state),
+    )
+
+
+def agent_events(state: Any, goal: str, *, index_dir: Optional[str] = None,
+                 records: Optional[str] = None, stop_on_fail: bool = False,
+                 cancel_event=None) -> Iterator[Event]:
     """Stream the full Planner → Tracker → Judge agent loop."""
     from cgx.webui import handlers
 
-    idx = find_existing_index(state.project_root)
-    index_dir = idx[0] if idx else None
-    records = idx[1] if idx else None
+    idx = resolve_index(state, index_dir=index_dir, records=records)
+    resolved_index = idx[0] if idx else None
+    resolved_records = idx[1] if idx else None
     yield from handlers.stream_agent(
-        index_dir=index_dir, records=records, goal=goal,
+        index_dir=resolved_index, records=resolved_records, goal=goal,
         embed_model=DEFAULT_EMBED_MODEL, project_root=state.project_root,
-        stop_on_fail=False, cancel_event=cancel_event,
+        stop_on_fail=stop_on_fail, cancel_event=cancel_event,
         **provider_kwargs(state),
     )
 
@@ -226,6 +262,17 @@ def map_event(etype: str, payload: Optional[Dict[str, Any]], *,
         bits = [b for b in (str(model) if model else "", str(when) if when else "") if b]
         tail = ansi.dim("  " + " · ".join(bits), enabled=enabled) if bits else ""
         return Render("line", c("✔ ", "green") + f"index ready: {counts}" + tail)
+
+    # --- plan (code-change plan handler) ------------------------------
+    # The plan *handler* emits a terminal ``plan`` event carrying ``plan_md``
+    # + structured ``diffs``; the *agent* loop emits ``plan`` with a nested
+    # ``plan.tasks`` list. Disambiguate on the presence of ``plan_md``.
+    if etype == "plan" and "plan_md" in payload:
+        plan_md = str(payload.get("plan_md") or "").strip()
+        diffs = payload.get("diffs") or []
+        files = ", ".join(str(d.get("file", "")) for d in diffs if isinstance(d, dict))
+        tail = c(f"\n\n{len(diffs)} diff(s)", "cyan") + (f": {files}" if files else "")
+        return Render("line", "\n" + (plan_md or "(no plan text)") + tail)
 
     # --- agent --------------------------------------------------------
     if etype == "status":

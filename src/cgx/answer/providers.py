@@ -70,6 +70,19 @@ class LLMProvider:
     schema the call degrades gracefully to plain JSON mode, so callers keep
     their existing balanced-brace extraction as the final safety net.
     """
+
+    # Whether ``chat_stream(force_json=True)`` yields deltas that, once
+    # concatenated, form a single parseable JSON object. Only such providers
+    # are worth streaming for per-file scaffold generation: otherwise the
+    # accumulated text fails to parse and the caller pays for a second,
+    # blocking call. Concrete providers with native JSON streaming opt in.
+    stream_json_capable: bool = False
+
+    # Whether the backend can service several concurrent generation requests
+    # without thrashing. Remote/cloud endpoints (Gemini, OpenAI-compatible)
+    # fan out safely; a single local GPU (Ollama) does not, so intra-layer
+    # scaffold parallelism defaults off here and only opts in per provider.
+    parallel_scaffold_capable: bool = False
     def chat(
         self,
         messages: List[Dict[str, str]],
@@ -86,14 +99,19 @@ class LLMProvider:
         messages: List[Dict[str, str]],
         temperature: float = 0.2,
         max_tokens: Optional[int] = None,
+        force_json: bool = False,
         **kwargs: Any,
     ) -> Iterator[str]:
         """Yield incremental text deltas. Default fallback: call :meth:`chat`
         once and yield the whole content. Concrete providers override for
-        real token streaming (used by the UI 'thought process' panel)."""
+        real token streaming (used by the UI 'thought process' panel).
+
+        ``force_json`` is forwarded to :meth:`chat` so a streaming caller
+        that needs a JSON object (e.g. per-file scaffold generation) keeps
+        the same constrained-decoding contract as the blocking path."""
         out = self.chat(
             messages, temperature=temperature, max_tokens=max_tokens,
-            force_json=False, **kwargs,
+            force_json=force_json, **kwargs,
         )
         text = out.get("content", "") if isinstance(out, dict) else ""
         if text:
@@ -110,6 +128,12 @@ class OllamaProvider(LLMProvider):
     - We disable streaming to get a single response payload.
     - We pass through `system`, `user`, `assistant` roles as-is.
     """
+
+    # Ollama streams a JSON object incrementally when ``format="json"`` is
+    # set, so concatenated deltas parse cleanly -- safe to stream scaffold
+    # generation for live progress.
+    stream_json_capable: bool = True
+
     def __init__(
         self,
         model: str = "qwen2.5-coder:3b",
@@ -206,9 +230,14 @@ class OllamaProvider(LLMProvider):
         messages: List[Dict[str, str]],
         temperature: float = 0.2,
         max_tokens: Optional[int] = None,
+        force_json: bool = False,
         **kwargs: Any,
     ) -> Iterator[str]:
-        """Stream deltas from Ollama via NDJSON lines on /api/chat."""
+        """Stream deltas from Ollama via NDJSON lines on /api/chat.
+
+        With ``force_json`` the server is asked for ``format="json"`` just
+        like :meth:`chat`, so the concatenated deltas form a single JSON
+        object the caller can parse once the stream completes."""
         url = f"{self.base_url}/api/chat"
         options = {"temperature": float(temperature)}
         options.update(self.extra_options)
@@ -220,6 +249,8 @@ class OllamaProvider(LLMProvider):
             "stream": True,
             "options": options,
         }
+        if force_json:
+            payload["format"] = "json"
         if self.keep_alive is not None:
             payload["keep_alive"] = self.keep_alive
         try:
@@ -254,6 +285,9 @@ class GeminiProvider(LLMProvider):
     Maps CGX's internal ``messages`` format to Gemini's ``contents`` +
     ``systemInstruction`` format so the orchestration layer stays provider-agnostic.
     """
+
+    # Remote endpoint: safe to fan out concurrent scaffold generations.
+    parallel_scaffold_capable: bool = True
 
     _BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 
@@ -503,6 +537,12 @@ class OpenAICompatProvider(LLMProvider):
     We request JSON via response_format={'type': 'json_object'} when the server supports it.
     If the server rejects that field, we fall back to plain text and let the caller parse.
     """
+
+    # Typically a remote endpoint that services concurrent requests; opt in
+    # to intra-layer scaffold fan-out. Users pointing this at a single local
+    # GPU server can pin ``CGX_SCAFFOLD_CONCURRENCY=1`` to force serial.
+    parallel_scaffold_capable: bool = True
+
     def __init__(
         self,
         model: str,

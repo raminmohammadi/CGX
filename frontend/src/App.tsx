@@ -4,12 +4,12 @@ import AppShell from "./layout/AppShell";
 
 // Each route is code-split so the initial bundle only includes the shell.
 // Markdown/highlight.js live in AskPage + PlanPage and are pulled lazily.
+const OverviewPage = lazy(() => import("./pages/OverviewPage"));
 const AskPage = lazy(() => import("./pages/AskPage"));
 const PlanPage = lazy(() => import("./pages/PlanPage"));
 const AgentPage = lazy(() => import("./pages/AgentPage"));
 const AgentLegacyPage = lazy(() => import("./pages/AgentLegacyPage"));
 const IndexPage = lazy(() => import("./pages/IndexPage"));
-const HardwarePage = lazy(() => import("./pages/HardwarePage"));
 const SettingsPage = lazy(() => import("./pages/SettingsPage"));
 
 function RouteFallback() {
@@ -25,7 +25,14 @@ export default function App() {
   return (
     <Routes>
       <Route element={<AppShell />}>
-        <Route path="/" element={<Navigate to="/ask" replace />} />
+        <Route
+          path="/"
+          element={
+            <Suspense fallback={<RouteFallback />}>
+              <OverviewPage />
+            </Suspense>
+          }
+        />
         <Route
           path="/ask"
           element={
@@ -67,14 +74,6 @@ export default function App() {
           }
         />
         <Route
-          path="/hardware"
-          element={
-            <Suspense fallback={<RouteFallback />}>
-              <HardwarePage />
-            </Suspense>
-          }
-        />
-        <Route
           path="/settings"
           element={
             <Suspense fallback={<RouteFallback />}>
@@ -82,7 +81,7 @@ export default function App() {
             </Suspense>
           }
         />
-        <Route path="*" element={<Navigate to="/ask" replace />} />
+        <Route path="*" element={<Navigate to="/" replace />} />
       </Route>
     </Routes>
   );

@@ -64,6 +64,7 @@ def run_decompose(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
 
     plan_md = str((result or {}).get("plan_md") or "")
     layers = _coerce_layers((result or {}).get("layers"))
+    contracts = _coerce_contracts((result or {}).get("contracts"))
     if not _layer_file_count(layers):
         return ExecutorResult(
             failure="DECOMPOSE: planner returned an empty manifest")
@@ -87,6 +88,7 @@ def run_decompose(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             "answers": dict(answers),
             "plan_md": plan_md,
             "layers": layers,
+            "contracts": contracts,
         },
     )
     return ExecutorResult(
@@ -94,6 +96,7 @@ def run_decompose(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             "work_plan_artifact_id": artifact.artifact_id,
             "file_count": _layer_file_count(layers),
             "layer_count": len(layers),
+            "contract_count": _contract_entry_count(contracts),
         },
         artifact=artifact,
     )
@@ -169,6 +172,47 @@ def _coerce_layers(raw: Any) -> List[Dict[str, Any]]:
             files.append(entry)
         out.append({"name": name, "files": files})
     return out
+
+
+_CONTRACT_KEYS = ("endpoints", "schemas", "functions", "constants")
+
+
+def _coerce_contracts(raw: Any) -> Dict[str, Any]:
+    """Normalize the planner ``contracts`` block for storage on the WORK_PLAN.
+
+    Mirrors :func:`cgx.answer.engine._normalize_contracts` defensively so a
+    monkeypatched/legacy planner that returns a raw (or absent) contracts
+    block still yields a clean, bounded dict: only the four recognised
+    interface categories survive, each a list of small string-keyed dicts
+    with empty/malformed entries dropped. Absent categories are omitted so
+    an empty or missing block stores as ``{}``.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    out: Dict[str, Any] = {}
+    for key in _CONTRACT_KEYS:
+        items = raw.get(key)
+        if not isinstance(items, list):
+            continue
+        cleaned: List[Dict[str, Any]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            entry = {
+                str(k): v for k, v in item.items()
+                if isinstance(k, str) and str(k).strip()
+                and isinstance(v, (str, int, float, bool, list, dict))
+            }
+            if entry:
+                cleaned.append(entry)
+        if cleaned:
+            out[key] = cleaned
+    return out
+
+
+def _contract_entry_count(contracts: Dict[str, Any]) -> int:
+    """Total number of declared contract entries across all categories."""
+    return sum(len(v) for v in contracts.values() if isinstance(v, list))
 
 
 def _coerce_depends_on(raw: Any) -> List[str]:
@@ -268,23 +312,29 @@ def _validate_manifest_coherence(
     """Deterministic manifest sanity check.
 
     Fails DECOMPOSE early (with an actionable message the router folds
-    into a retry constraint) when the plan is logically broken:
-    ``depends_on`` naming a file absent from the manifest, a dependency
-    cycle, or a manifest carrying no runnable source file (only
-    docs/config/tests -- nothing to build or to test against).
+    into a retry constraint) when the plan is logically broken: a
+    dependency cycle, or a manifest carrying no runnable source file
+    (only docs/config/tests -- nothing to build or to test against).
+
+    A dangling ``depends_on`` entry (a phantom path or a glob like
+    ``src/components/*.jsx``) is *not* fatal: ``depends_on`` is only a
+    topological / context-scoping hint, so a stray reference -- a common
+    planner slip, especially on the last-resort re-plan -- is pruned in
+    place with a warning rather than sinking an otherwise-buildable
+    manifest and terminally failing the whole session.
     """
     files = _manifest_files(layers)
     path_set = {f["path"] for f in files}
 
-    dangling: List[str] = []
     for f in files:
-        for dep in f.get("depends_on") or []:
-            if dep not in path_set:
-                dangling.append(f"{dep!r} (needed by {f['path']!r})")
-    if dangling:
-        return ("DECOMPOSE: manifest has dangling dependency reference(s): "
-                + ", ".join(dangling[:6])
-                + ". Every depends_on must name a file in the manifest.")
+        deps = f.get("depends_on") or []
+        kept = [d for d in deps if d in path_set]
+        if len(kept) != len(deps):
+            dropped = [d for d in deps if d not in path_set]
+            logger.warning(
+                "DECOMPOSE: pruning dangling depends_on %s from %r",
+                dropped, f["path"])
+            f["depends_on"] = kept
 
     cycle = _find_dependency_cycle(files)
     if cycle:

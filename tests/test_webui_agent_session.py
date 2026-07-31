@@ -17,6 +17,7 @@ so the route layer never tries to construct a provider.
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from typing import Any, Awaitable, Iterator, TypeVar
 
@@ -32,6 +33,11 @@ from cgx.session.tasks.base import (
 )
 from cgx.webui import models as wm
 from cgx.webui.routes import agent_session as routes
+
+# Captured at import time -- before the autouse ``_stub_build_deps`` fixture
+# monkeypatches ``routes._build_deps`` -- so the profile-not-found test can
+# drive the real dependency builder.
+_REAL_BUILD_DEPS = routes._build_deps
 
 T = TypeVar("T")
 
@@ -76,6 +82,17 @@ def _restore_registry() -> Iterator[None]:
     yield
     _REGISTRY.clear()
     _REGISTRY.update(snapshot)
+
+
+@pytest.fixture(autouse=True)
+def _drain_inline(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run the drain synchronously in tests.
+
+    The direct-call shim drives each handler to completion on a throwaway
+    event loop, so a backgrounded drain would never run. Forcing the
+    inline path keeps snapshots reflecting a fully-drained pipeline.
+    """
+    monkeypatch.setattr(routes, "_RUN_DRAIN_IN_BACKGROUND", False)
 
 
 @pytest.fixture()
@@ -130,6 +147,9 @@ class _HandlerClient:
     def delete(self, sid: str, project_root: str | None = None) -> dict | None:
         return self._call(routes.delete_session(
             sid, project_root=project_root))
+
+    def cancel(self, sid: str) -> dict | None:
+        return self._call(routes.post_cancel(sid))
 
 
 # ----------------------------- stubs -----------------------------
@@ -234,6 +254,41 @@ def test_delete_session_removes_aggregate_and_404s_on_followups(
     # Re-deleting yields 404 as well.
     client.delete(sid, project_root=str(project_root))
     assert client.last_status == 404
+
+
+def test_delete_session_cancels_inflight_background_drain(
+        client: _HandlerClient, project_root: Path) -> None:
+    """DELETE stops a running drain so it can't outlive the session.
+
+    A background drain whose task is still in flight when the session is
+    deleted would otherwise write a child row against the now-gone parent
+    and trip a FK error. Deletion must cancel the drain task, drop it from
+    ``_SESSION_DRAINS``, and clear any pending cancel flag.
+    """
+    _install_stubs()
+    routes._SESSION_DRAINS.clear()
+    routes._CANCEL_REQUESTS.clear()
+    state = client.create(objective="g", project_root=str(project_root),
+                          run_initial_task=False)
+    sid = state["session"]["session_id"]
+
+    async def _never() -> None:
+        await asyncio.sleep(60)
+
+    async def _scenario() -> None:
+        task = asyncio.create_task(_never())
+        routes._SESSION_DRAINS[sid] = task
+        resp = await routes.delete_session(sid, project_root=str(project_root))
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        assert resp == {"deleted": sid}
+        assert task.cancelled()
+        assert sid not in routes._SESSION_DRAINS
+        assert sid not in routes._CANCEL_REQUESTS
+
+    asyncio.new_event_loop().run_until_complete(_scenario())
 
 
 def test_create_session_runs_initial_explore_and_spawns_ask(
@@ -774,3 +829,309 @@ def test_create_session_rejects_invalid_mode(
     assert state is None
     assert client.last_status == 400
     assert "bogus" in str(client.last_detail)
+
+
+# --------------------- P0: background drain + SSE ---------------------
+
+def test_schedule_drain_backgrounds_and_coalesces(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """A scheduled drain runs detached and a concurrent schedule coalesces.
+
+    The POST handler must return without waiting for the drain, so
+    ``_schedule_drain`` returns before the (stubbed) drain body runs, keeps
+    exactly one task per session in ``_SESSION_DRAINS``, and clears the
+    registry once the drain finishes.
+    """
+    monkeypatch.setattr(routes, "_RUN_DRAIN_IN_BACKGROUND", True)
+    routes._SESSION_DRAINS.clear()
+    order: list[str] = []
+
+    async def _fake_drain(runner, session_id, deps, *, max_steps=64):
+        order.append("start")
+        await asyncio.sleep(0.02)
+        order.append("end")
+
+    monkeypatch.setattr(routes, "_drain_ready", _fake_drain)
+
+    async def _scenario() -> None:
+        await routes._schedule_drain(None, "sX", None)  # type: ignore[arg-type]
+        # Returned before the drain body executed -> non-blocking.
+        assert order == []
+        first = routes._SESSION_DRAINS.get("sX")
+        assert first is not None and not first.done()
+        # A second schedule while the first runs must not spawn a duplicate.
+        await routes._schedule_drain(None, "sX", None)  # type: ignore[arg-type]
+        assert routes._SESSION_DRAINS.get("sX") is first
+        await first
+        await asyncio.sleep(0)  # let the done-callback fire
+        assert order == ["start", "end"]
+        assert "sX" not in routes._SESSION_DRAINS
+
+    asyncio.new_event_loop().run_until_complete(_scenario())
+
+
+def test_drain_ready_honours_cooperative_cancel(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """A cancel requested mid-drive stops the loop before the next task.
+
+    The flag is checked at the top of each iteration, so a cancel set
+    while task N runs is honoured before task N+1 dispatches, and the
+    flag is consumed (a later message can resume).
+    """
+    routes._CANCEL_REQUESTS.clear()
+    calls: list[int] = []
+
+    class _LiveStore:
+        def get_session(self, sid: str) -> object:
+            return object()  # session always present
+
+    class _FakeRunner:
+        store = _LiveStore()
+
+        def run_next(self, *, session_id: str, deps: Any) -> object:
+            calls.append(1)
+            if len(calls) == 2:
+                routes.request_cancel(session_id)
+            return object()  # non-None -> the drain keeps looping
+
+    async def _scenario() -> None:
+        await routes._drain_ready(
+            _FakeRunner(), "sC", None, max_steps=64)  # type: ignore[arg-type]
+
+    asyncio.new_event_loop().run_until_complete(_scenario())
+    # Tasks 1 and 2 ran; cancel set during task 2 -> checked at the top of
+    # iteration 3 -> stop. Exactly two run_next calls, flag consumed.
+    assert len(calls) == 2
+    assert "sC" not in routes._CANCEL_REQUESTS
+
+
+class _ToggleStore:
+    """Store whose session presence flips off on demand (delete race)."""
+
+    def __init__(self) -> None:
+        self.exists = True
+
+    def get_session(self, sid: str) -> object | None:
+        return object() if self.exists else None
+
+
+def test_drain_ready_stops_when_session_deleted_between_tasks() -> None:
+    """A session deleted after task N halts the drive before task N+1."""
+    routes._CANCEL_REQUESTS.clear()
+    store = _ToggleStore()
+    calls: list[int] = []
+
+    class _FakeRunner:
+        def __init__(self, s: _ToggleStore) -> None:
+            self.store = s
+
+        def run_next(self, *, session_id: str, deps: Any) -> object:
+            calls.append(1)
+            store.exists = False  # session removed out from under us
+            return object()  # non-None -> would loop again but for the guard
+
+    async def _scenario() -> None:
+        await routes._drain_ready(
+            _FakeRunner(store), "sD", None, max_steps=64)  # type: ignore[arg-type]
+
+    asyncio.new_event_loop().run_until_complete(_scenario())
+    # Iteration 2's vanished-session guard stops before dispatching again.
+    assert len(calls) == 1
+
+
+def test_drain_ready_swallows_error_when_session_deleted_mid_task() -> None:
+    """A result-write error for a vanished session is a benign stop."""
+    routes._CANCEL_REQUESTS.clear()
+    store = _ToggleStore()
+
+    class _FakeRunner:
+        def __init__(self, s: _ToggleStore) -> None:
+            self.store = s
+
+        def run_next(self, *, session_id: str, deps: Any) -> object:
+            store.exists = False  # deleted while this task ran
+            raise RuntimeError("FOREIGN KEY constraint failed")
+
+    async def _scenario() -> None:
+        await routes._drain_ready(
+            _FakeRunner(store), "sE", None, max_steps=64)  # type: ignore[arg-type]
+
+    # Must not propagate -- the deleted session makes the FK error benign.
+    asyncio.new_event_loop().run_until_complete(_scenario())
+
+
+def test_drain_ready_reraises_error_when_session_still_exists() -> None:
+    """A genuine error (session intact) still propagates out of the drain."""
+    routes._CANCEL_REQUESTS.clear()
+
+    class _LiveStore:
+        def get_session(self, sid: str) -> object:
+            return object()
+
+    class _FakeRunner:
+        store = _LiveStore()
+
+        def run_next(self, *, session_id: str, deps: Any) -> object:
+            raise RuntimeError("boom")
+
+    async def _scenario() -> None:
+        await routes._drain_ready(
+            _FakeRunner(), "sF", None, max_steps=64)  # type: ignore[arg-type]
+
+    with pytest.raises(RuntimeError, match="boom"):
+        asyncio.new_event_loop().run_until_complete(_scenario())
+
+
+def test_post_cancel_flags_session_and_404s_on_unknown(
+        client: _HandlerClient, project_root: Path) -> None:
+    """POST /cancel flags a known session and 404s an unknown id."""
+    _install_stubs()
+    routes._CANCEL_REQUESTS.clear()
+    state = client.create(objective="cancel me",
+                          project_root=str(project_root),
+                          run_initial_task=False)
+    sid = state["session"]["session_id"]
+
+    snap = client.cancel(sid)
+    assert client.last_status == 200
+    assert snap is not None and snap["session"]["session_id"] == sid
+    assert sid in routes._CANCEL_REQUESTS
+
+    assert client.cancel("nope-not-a-session") is None
+    assert client.last_status == 404
+
+
+def test_build_deps_missing_profile_is_400_not_500(
+        project_root: Path) -> None:
+    """P3.2: an unknown profile name surfaces as a clean 400, not a 500.
+
+    ``provider_from_profile_name`` raises ``ValueError`` for a missing
+    profile; ``_build_deps`` must translate that into an HTTP 400 with the
+    underlying message so the UI can show a helpful error instead of a
+    generic server fault.
+    """
+    provider = wm.ProviderConfig(use_profile=True,
+                                 profile_name="does-not-exist-xyz")
+    index = wm.IndexLocation()
+    with pytest.raises(HTTPException) as exc:
+        _REAL_BUILD_DEPS(provider, index, str(project_root), store=None)
+    assert exc.value.status_code == 400
+    assert "profile not found" in str(exc.value.detail).lower()
+
+
+def test_session_events_streams_snapshot_then_partial(
+        client: _HandlerClient, project_root: Path) -> None:
+    """The SSE endpoint emits a snapshot first, then live bus events."""
+    _install_stubs()
+    state = client.create(objective="g", project_root=str(project_root),
+                          run_initial_task=True)
+    sid = state["session"]["session_id"]
+    runner = routes._resolve_runner_for(sid)
+
+    calls = {"n": 0}
+
+    class _FakeRequest:
+        async def is_disconnected(self) -> bool:
+            calls["n"] += 1
+            return calls["n"] > 1
+
+    async def _scenario() -> None:
+        resp = await routes.session_events(sid, _FakeRequest())  # type: ignore[arg-type]
+        it = resp.body_iterator
+        first = await it.__anext__()
+        assert first["event"] == "snapshot"
+        # Publish a progress beat for this session on the shared bus.
+        runner.store.emit_task_progress(
+            sid, "tX", {"index": 1, "total": 3, "path": "a.py"})
+        second = await it.__anext__()
+        assert second["event"] == "task.output_partial"
+        payload = json.loads(second["data"])
+        assert payload["payload"]["progress"]["path"] == "a.py"
+        # Next disconnect check trips -> generator completes.
+        with pytest.raises(StopAsyncIteration):
+            await it.__anext__()
+
+    asyncio.new_event_loop().run_until_complete(_scenario())
+
+
+def test_emit_scaffold_progress_publishes_partial_with_eta(
+        tmp_path: Path) -> None:
+    """The scaffold helper publishes TASK_OUTPUT_PARTIAL and derives an ETA."""
+    from cgx.session import SessionStore
+    from cgx.session.events import EventType, get_default_bus
+    from cgx.session.tasks.scaffold import _emit_scaffold_progress
+
+    store = SessionStore(project_root=str(tmp_path / "sp"))
+    seen: list[Any] = []
+    unsub = get_default_bus().subscribe(
+        EventType.TASK_OUTPUT_PARTIAL, lambda e: seen.append(e))
+
+    class _Task:
+        session_id = "s1"
+        task_id = "t1"
+
+    class _Deps:
+        pass
+
+    deps = _Deps()
+    deps.store = store  # type: ignore[attr-defined]
+    try:
+        _emit_scaffold_progress(
+            deps, _Task(), file="app/main.py", layer="api",  # type: ignore[arg-type]
+            index=1, total=4, status="done", bytes=120, elapsed_ms=2000)
+    finally:
+        unsub()
+        store.close()
+
+    assert len(seen) == 1
+    prog = seen[0].payload["progress"]
+    assert prog["path"] == "app/main.py" and prog["index"] == 1
+    # 2.0s/file * 3 remaining files.
+    assert prog["eta_seconds"] == 6.0
+
+
+def test_make_stream_beat_throttles_and_emits_stream_status(
+        tmp_path: Path) -> None:
+    """The on_token beat coalesces deltas into throttled ``stream`` frames."""
+    from cgx.session import SessionStore
+    from cgx.session.events import EventType, get_default_bus
+    from cgx.session.tasks import scaffold as _scaffold
+
+    store = SessionStore(project_root=str(tmp_path / "sb"))
+    seen: list[Any] = []
+    unsub = get_default_bus().subscribe(
+        EventType.TASK_OUTPUT_PARTIAL, lambda e: seen.append(e))
+
+    class _Task:
+        session_id = "s1"
+        task_id = "t1"
+
+    class _Deps:
+        pass
+
+    deps = _Deps()
+    deps.store = store  # type: ignore[attr-defined]
+    try:
+        beat = _scaffold._make_stream_beat(
+            deps, _Task(), file="app/main.py", layer="api",  # type: ignore[arg-type]
+            index=2, total=4)
+        # First delta is throttled out (last==0 -> now-last < interval only
+        # if clock is fresh); force determinism by pinning the interval to 0.
+        orig = _scaffold._STREAM_BEAT_MIN_INTERVAL_S
+        _scaffold._STREAM_BEAT_MIN_INTERVAL_S = 0.0
+        try:
+            beat("import os\n")
+            beat("def main():\n")
+        finally:
+            _scaffold._STREAM_BEAT_MIN_INTERVAL_S = orig
+    finally:
+        unsub()
+        store.close()
+
+    assert seen, "at least one stream beat should be published"
+    prog = seen[-1].payload["progress"]
+    assert prog["status"] == "stream"
+    assert prog["index"] == 2 and prog["total"] == 4
+    assert prog["path"] == "app/main.py"
+    # Cumulative streamed character count grows across deltas.
+    assert prog["bytes"] == len("import os\n") + len("def main():\n")

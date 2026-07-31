@@ -36,6 +36,8 @@ from typing import Any, Callable, Dict, Iterator, List, Optional
 
 from cgx.agents.judge import Judge
 from cgx.agents.types import AgentEvent, Plan, Task, TaskKind, TaskStatus
+from cgx.redact import preview_mapping
+from cgx.trace import emit_trace, is_trace_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -533,6 +535,9 @@ class Tracker:
     def stream(self, plan: Plan) -> Iterator[AgentEvent]:
         logger.info("Tracker.stream: starting plan id=%s goal=%r tasks=%d",
                     plan.id, plan.goal[:80], len(plan.tasks))
+        emit_trace("agent_plan_stream_start", plan_id=plan.id,
+                   n_tasks=len(plan.tasks),
+                   kinds=[t.kind.value for t in plan.tasks])
         yield AgentEvent(type="plan", payload={"plan": plan.to_dict()})
         prior_outputs: List[Dict[str, Any]] = []
         halted = False
@@ -544,6 +549,8 @@ class Tracker:
 
             if halted:
                 logger.info("Tracker: skipping task id=%s (plan halted)", task.id)
+                emit_trace("agent_task_skipped", task_id=task.id,
+                           kind=task.kind.value, reason="plan halted")
                 task.status = TaskStatus.SKIPPED
                 yield AgentEvent(type="task_skipped",
                                  payload={"task_id": task.id})
@@ -570,6 +577,8 @@ class Tracker:
                     "Tracker: skipping SCAFFOLD_FILE id=%s (%s)",
                     task.id, reason,
                 )
+                emit_trace("agent_task_skipped", task_id=task.id,
+                           kind=task.kind.value, reason=reason)
                 yield AgentEvent(type="task_skipped",
                                  payload={"task_id": task.id,
                                           "kind": task.kind.value,
@@ -581,6 +590,12 @@ class Tracker:
             task.started_at = time.time()
             logger.info("Tracker: starting task id=%s kind=%s name=%r",
                         task.id, task.kind.value, (task.name or task.description)[:60])
+            start_fields: Dict[str, Any] = {
+                "task_id": task.id, "kind": task.kind.value,
+                "name": (task.name or task.description or "")[:120]}
+            if is_trace_enabled() and task.inputs:
+                start_fields["inputs_preview"] = preview_mapping(task.inputs)
+            emit_trace("agent_task_start", **start_fields)
             yield AgentEvent(type="task_start",
                              payload={"task_id": task.id,
                                       "name": task.name or task.description,
@@ -590,6 +605,9 @@ class Tracker:
             if cap is None:
                 task.status = TaskStatus.SKIPPED
                 task.ended_at = time.time()
+                emit_trace("agent_task_skipped", task_id=task.id,
+                           kind=task.kind.value,
+                           reason=f"no capability for kind={task.kind.value}")
                 yield AgentEvent(type="task_skipped",
                                  payload={"task_id": task.id,
                                           "reason": f"no capability for kind={task.kind.value}"})
@@ -634,6 +652,9 @@ class Tracker:
                 task.status = TaskStatus.FAILED
                 task.ended_at = time.time()
                 logger.warning("Tracker: task FAILED id=%s error=%s", task.id, task.error)
+                emit_trace("agent_task_failed", task_id=task.id,
+                           kind=task.kind.value, source="capability",
+                           error=task.error[:300])
                 yield AgentEvent(type="task_failed",
                                  payload={"task_id": task.id, "error": task.error})
                 if self.stop_on_fail and task.kind not in _SOFT_FAIL_KINDS:
@@ -646,6 +667,10 @@ class Tracker:
                 task.judge = verdict.to_dict()
                 logger.info("Tracker: judge task id=%s verdict=%s confidence=%.2f",
                             task.id, verdict.verdict, verdict.confidence)
+                emit_trace("agent_judge_verdict", task_id=task.id,
+                           kind=task.kind.value, verdict=verdict.verdict,
+                           confidence=round(float(verdict.confidence), 3),
+                           rationale=(verdict.rationale or "")[:300])
                 yield AgentEvent(type="judge", payload={"task_id": task.id,
                                                         **task.judge})
                 if not verdict.passed:
@@ -653,6 +678,9 @@ class Tracker:
                     task.ended_at = time.time()
                     logger.warning("Tracker: judge FAILED task id=%s rationale=%r",
                                    task.id, verdict.rationale[:100])
+                    emit_trace("agent_task_failed", task_id=task.id,
+                               kind=task.kind.value, source="judge",
+                               error=(verdict.rationale or "")[:300])
                     # Pass the capability's output through so the UI can
                     # still render the rejected diff + codegen_report
                     # rather than leaving the user with just an error.
@@ -700,6 +728,8 @@ class Tracker:
                     logger.info(
                         "Tracker: injecting REINDEX task id=%s after APPLY id=%s",
                         reindex_task.id, task.id)
+                    emit_trace("agent_task_injected", task_id=reindex_task.id,
+                               kind="reindex", after_task_id=task.id)
                     plan.tasks.insert(i, reindex_task)
                     yield AgentEvent(type="plan",
                                      payload={"plan": plan.to_dict()})
@@ -712,6 +742,10 @@ class Tracker:
                 logger.info(
                     "Tracker: injecting %d task(s) after task id=%s",
                     len(inject), task.id)
+                emit_trace("agent_tasks_injected", after_task_id=task.id,
+                           count=len(inject),
+                           kinds=[getattr(t.kind, "value", str(t.kind))
+                                  for t in inject if hasattr(t, "kind")])
                 for j, new_task in enumerate(inject):
                     plan.tasks.insert(i + j, new_task)
                 # Re-emit the updated plan so the UI can render new rows.
@@ -719,6 +753,13 @@ class Tracker:
 
             elapsed = (task.ended_at - task.started_at) if task.started_at else None
             logger.info("Tracker: task completed id=%s elapsed=%.1fs", task.id, elapsed or 0)
+            done_fields: Dict[str, Any] = {
+                "task_id": task.id, "kind": task.kind.value,
+                "elapsed_ms": int((elapsed or 0) * 1000),
+                "output_keys": list((task.output or {}).keys())}
+            if is_trace_enabled() and task.output:
+                done_fields["outputs_preview"] = preview_mapping(task.output)
+            emit_trace("agent_task_done", **done_fields)
             yield AgentEvent(type="task_done",
                              payload={"task_id": task.id,
                                       "kind": task.kind.value,
@@ -734,6 +775,8 @@ class Tracker:
         skipped = sum(1 for t in plan.tasks if t.status == TaskStatus.SKIPPED)
         logger.info("Tracker.stream: plan complete completed=%d failed=%d skipped=%d",
                     completed, failed, skipped)
+        emit_trace("agent_plan_complete", plan_id=plan.id, completed=completed,
+                   failed=failed, skipped=skipped)
         yield AgentEvent(type="summary",
                          payload={"plan": plan.to_dict(),
                                   "completed": completed,

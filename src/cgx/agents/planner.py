@@ -18,6 +18,7 @@ import logging
 
 from cgx.agents.types import Plan, Task, TaskKind
 from cgx.answer.intent import detect_intent
+from cgx.trace import emit_trace
 
 # The ``skills`` package lives at the repo root alongside ``src/``. It is
 # wired into sys.path by ``tests/conftest.py`` for tests and by
@@ -597,10 +598,14 @@ class Planner:
                                    rationale_box=rationale_box,
                                    prior_goal=carried_prior or None)
             logger.info("Planner: LLM returned %d tasks", len(tasks))
+            emit_trace("planner_decomposition", source="llm",
+                       n_tasks=len(tasks), continuation=bool(continuation))
         else:
             tasks = []
         if not tasks:
             logger.info("Planner: using deterministic fallback plan")
+            emit_trace("planner_decomposition", source="fallback",
+                       continuation=bool(continuation))
             tasks = self._fallback_plan(goal, continuation=continuation)
         tasks = self._enforce_kind_policy(goal, tasks, continuation=continuation)
         if not continuation:
@@ -621,6 +626,10 @@ class Planner:
             plan.tasks[i].dependencies = [plan.tasks[i - 1].id]
         logger.info("Planner: plan ready id=%s tasks=%d kinds=%s",
                     plan.id, len(plan.tasks), [t.kind.value for t in plan.tasks])
+        emit_trace("planner_plan_ready", plan_id=plan.id,
+                   n_tasks=len(plan.tasks),
+                   kinds=[t.kind.value for t in plan.tasks],
+                   rationale=(rationale or "")[:200])
         return plan
 
     def plan_fix(

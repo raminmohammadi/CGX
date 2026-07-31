@@ -18,8 +18,9 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from cgx.session.models import (
     Artifact,
@@ -28,7 +29,11 @@ from cgx.session.models import (
     TaskNode,
 )
 from cgx.session.repair.pypi_client import PyPIClient
-from cgx.session.scaffold_validate import validate_scaffold_diffs
+from cgx.session.scaffold_validate import (
+    check_contract_compliance,
+    cross_check_first_party_imports,
+    validate_scaffold_diffs,
+)
 from cgx.session.tasks.base import (
     ExecutorDeps,
     ExecutorResult,
@@ -36,6 +41,19 @@ from cgx.session.tasks.base import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Default intra-layer worker count for providers that advertise
+# ``parallel_scaffold_capable`` (remote/cloud endpoints) when
+# ``CGX_SCAFFOLD_CONCURRENCY`` is unset. Bounded so a burst of sibling
+# files never opens an unreasonable number of concurrent HTTP requests.
+_CLOUD_SCAFFOLD_CONCURRENCY = 4
+
+# Number of global coherence passes run after the main scaffold loop
+# (#2). Each pass re-checks first-party imports across the finished tree
+# and regenerates only the importer files that reference a symbol no
+# sibling defines. One pass clears the common single-hop mismatch; a hard
+# cap stops a stubborn model from looping and keeps the retry bounded.
+_COHERENCE_PASS_BUDGET = 1
 
 
 @register_executor(TaskKind.SCAFFOLD)
@@ -64,6 +82,15 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         return ExecutorResult(
             failure="SCAFFOLD: work plan carries no layers")
 
+    # Contract-first (P0): the WORK_PLAN carries a ``contracts`` block --
+    # the shared interfaces (endpoints, schemas, function signatures,
+    # constants) DECOMPOSE declared. Thread it into every per-file
+    # generation so cross-file assumptions are honoured, not re-derived.
+    # Absent/malformed -> ``None`` so the generator prompt is unchanged.
+    contracts = content.get("contracts")
+    if not isinstance(contracts, dict) or not contracts:
+        contracts = None
+
     # Phase 6.1: when REPAIR routed a regenerate verdict here, fold the
     # accumulated constraint payloads into the goal so the per-file
     # generator sees the prior-failure context. Each entry is a small
@@ -87,7 +114,7 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     existing_with_content: List[Dict[str, str]] = []
     generated: List[Dict[str, Any]] = []
     failed: List[Dict[str, str]] = []
-    concurrency = _scaffold_concurrency()
+    concurrency = _scaffold_concurrency(deps.provider)
 
     # Targeted regeneration (router failed-files splices): when a prior
     # SCAFFOLD/APPLY dropped specific files, only those paths are
@@ -148,13 +175,29 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         },
     )
 
+    # Progress denominator: every planned manifest file. ``progress_done``
+    # counts files whose content is settled (reused/resumed already, then
+    # each freshly generated file) so the UI can render "i / total" and an
+    # ETA while a long serial SCAFFOLD grinds through the manifest.
+    total_files = sum(
+        1 for lay in layers if isinstance(lay, dict)
+        for e in (lay.get("files") or [])
+        if isinstance(e, dict) and str(e.get("path") or "").strip())
+    progress_done = len(generated)
+    # Running count of files whose generation failed. Threaded into every
+    # beat so the UI can distinguish a genuine failure from a counter that
+    # simply hasn't advanced: on failure ``progress_done`` stays put, so
+    # without this the next file's ``start`` reuses the same index and looks
+    # like a silent restart.
+    progress_failed = 0
+
     for layer in layers:
         if not isinstance(layer, dict):
             continue
         layer_name = str(layer.get("name") or "project").strip()
         # Collect this layer's files (manifest order) after the targeted-
         # regenerate skip, so the parallel and serial paths share one plan.
-        pending: List[Tuple[str, str]] = []
+        pending: List[Tuple[str, str, List[str]]] = []
         for entry in (layer.get("files") or []):
             if not isinstance(entry, dict):
                 continue
@@ -162,6 +205,13 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             description = str(entry.get("description") or path).strip()
             if not path:
                 continue
+            # Manifest-declared dependency paths for this file, used to
+            # scope the generator's context digest (P1.3). Absent/malformed
+            # entries degrade to an empty list -> full-context fallback.
+            raw_deps = entry.get("depends_on")
+            depends_on = [str(d).strip() for d in raw_deps
+                          if isinstance(d, str) and str(d).strip()] \
+                if isinstance(raw_deps, list) else []
             # Targeted regenerate: skip every file not slated for
             # regeneration -- it was reused above (or was never at fault).
             if regen_set is not None and path not in regen_set:
@@ -169,7 +219,7 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             # Resume: skip files already generated by the crashed attempt.
             if path in resume_done:
                 continue
-            pending.append((path, description))
+            pending.append((path, description, depends_on))
         if not pending:
             continue
 
@@ -189,24 +239,52 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
                 fut_to_idx = {
                     pool.submit(
                         _generate_one, p, d, layer_name,
-                        list(context_snapshot), deps.provider, goal): i
-                    for i, (p, d) in enumerate(pending)
+                        list(context_snapshot), deps.provider, goal,
+                        depends_on=dep, contracts=contracts): i
+                    for i, (p, d, dep) in enumerate(pending)
                 }
                 for fut in as_completed(fut_to_idx):
                     layer_results[fut_to_idx[fut]] = fut.result()
         else:
             # Serial: each file additionally sees its already-generated
             # siblings, maximising intra-layer import resolution (the legacy
-            # behaviour, preserved as the default).
+            # behaviour, preserved as the default). A start/done progress
+            # pair is emitted per file so the UI shows the active file and
+            # advancing count instead of a frozen IN_PROGRESS.
             layer_results = []
-            for (p, d) in pending:
+            for (p, d, dep) in pending:
+                _emit_scaffold_progress(
+                    deps, task, file=p, layer=layer_name,
+                    index=progress_done + 1, total=total_files,
+                    status="start", failed_count=progress_failed)
+                started = time.time()
+                on_token = _make_stream_beat(
+                    deps, task, file=p, layer=layer_name,
+                    index=progress_done + 1, total=total_files,
+                    failed_count=progress_failed)
                 ok, fail = _generate_one(
                     p, d, layer_name, list(existing_with_content),
-                    deps.provider, goal)
+                    deps.provider, goal, on_token=on_token,
+                    depends_on=dep, contracts=contracts)
+                elapsed_ms = int((time.time() - started) * 1000)
                 layer_results.append((ok, fail))
                 if ok is not None:
                     existing_with_content.append(
                         {"path": ok["file"], "content": ok["content"]})
+                    progress_done += 1
+                    _emit_scaffold_progress(
+                        deps, task, file=p, layer=layer_name,
+                        index=progress_done, total=total_files,
+                        status="done", bytes=len(ok["content"]),
+                        elapsed_ms=elapsed_ms,
+                        failed_count=progress_failed)
+                else:
+                    progress_failed += 1
+                    _emit_scaffold_progress(
+                        deps, task, file=p, layer=layer_name,
+                        index=progress_done, total=total_files,
+                        status="failed", elapsed_ms=elapsed_ms,
+                        failed_count=progress_failed)
 
         # Fold the layer's outcomes into the running state in manifest
         # order. In the parallel path the context snapshot was frozen, so
@@ -214,6 +292,13 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         for ok, fail in layer_results:
             if fail is not None:
                 failed.append(fail)
+                if parallel:
+                    progress_failed += 1
+                    _emit_scaffold_progress(
+                        deps, task, file=str(fail.get("file") or ""),
+                        layer=layer_name, index=progress_done,
+                        total=total_files, status="failed",
+                        failed_count=progress_failed)
                 continue
             diffs.append({"file": ok["file"], "patch": ok["patch"]})
             generated.append({
@@ -226,6 +311,12 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             if parallel:
                 existing_with_content.append(
                     {"path": ok["file"], "content": ok["content"]})
+                progress_done += 1
+                _emit_scaffold_progress(
+                    deps, task, file=ok["file"], layer=layer_name,
+                    index=progress_done, total=total_files,
+                    status="done", bytes=len(ok["content"]),
+                    failed_count=progress_failed)
 
         # Checkpoint after each layer so a crash mid-run is resumable.
         _checkpoint_progress(deps, artifact)
@@ -233,6 +324,29 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     if not diffs:
         return ExecutorResult(
             failure="SCAFFOLD: every file generation failed")
+
+    # Global coherence pass (#2): the per-file loop resolves imports
+    # against whichever siblings existed when each file was generated (and
+    # the parallel path freezes a per-layer snapshot), so a file can still
+    # reference a symbol another sibling never defined. Before APPLY writes
+    # anything, re-check first-party imports across the whole tree and
+    # regenerate just the importer files that don't resolve, folding the
+    # unresolved symbols in as a constraint so cross-file mismatches
+    # self-heal. Best-effort and bounded -- a failure leaves the bundle
+    # untouched.
+    reconciled_count = 0
+    try:
+        reconciled_count = _reconcile_import_warnings(
+            diffs=diffs, generated=generated,
+            existing_with_content=existing_with_content,
+            layers=layers, goal=goal, provider=deps.provider,
+            contracts=contracts)
+    except Exception:  # pragma: no cover - defensive: pass is best-effort
+        logger.exception(
+            "SCAFFOLD: coherence reconciliation raised; skipping")
+        reconciled_count = 0
+    if reconciled_count:
+        _checkpoint_progress(deps, artifact)
 
     # Phase 4.1: tighten upper bounds on known-fragile peers using the
     # consumer's PyPI ``requires_dist`` *before* APPLY writes the file.
@@ -251,6 +365,38 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             "SCAFFOLD: pin validator raised; emitting unmodified diffs")
         pin_adjustments = []
 
+    # Phase 3.3: static first-party import cross-check. Parse every
+    # generated Python file and flag ``from <local> import <name>`` where
+    # ``name`` is absent from the referenced module. Best-effort and
+    # non-fatal -- any failure degrades to an empty warning list so the
+    # scaffold is never blocked by the checker itself.
+    import_warnings: List[Dict[str, Any]] = []
+    try:
+        xcheck_contents = {
+            e["path"]: e["content"] for e in existing_with_content
+            if e.get("path") and isinstance(e.get("content"), str)}
+        import_warnings = cross_check_first_party_imports(xcheck_contents)
+    except Exception:  # pragma: no cover - defensive: checker is best-effort
+        logger.exception(
+            "SCAFFOLD: import cross-check raised; skipping")
+        import_warnings = []
+
+    # Contract enforcement gate (#1, deepens P0): statically verify the
+    # generated files honour the WORK_PLAN ``contracts`` block (declared
+    # endpoints/schemas/functions/constants) so a mismatch surfaces here
+    # rather than only when VERIFY runs the suite. Best-effort and
+    # non-fatal -- like the import cross-check it only records
+    # ``contract_warnings`` the router can turn into a regenerate
+    # constraint; a raised checker degrades to an empty list.
+    contract_warnings: List[Dict[str, Any]] = []
+    try:
+        contract_warnings = check_contract_compliance(
+            xcheck_contents, contracts)
+    except Exception:  # pragma: no cover - defensive: checker is best-effort
+        logger.exception(
+            "SCAFFOLD: contract compliance check raised; skipping")
+        contract_warnings = []
+
     # Finalise the checkpoint artifact in place: pin validation reassigns
     # ``diffs`` to a new list, so re-point the content at it, attach the
     # adjustment log, and flip ``complete``. Same artifact_id, so the
@@ -259,6 +405,9 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     artifact.content["generated"] = generated
     artifact.content["failed"] = failed
     artifact.content["pin_adjustments"] = pin_adjustments
+    artifact.content["import_warnings"] = import_warnings
+    artifact.content["contract_warnings"] = contract_warnings
+    artifact.content["reconciled_count"] = reconciled_count
     artifact.content["complete"] = True
     return ExecutorResult(
         outputs={
@@ -267,6 +416,10 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             "failed_count": len(failed),
             "failed": failed,
             "pin_adjustments_count": len(pin_adjustments),
+            "import_warnings_count": len(import_warnings),
+            "contract_warnings_count": len(contract_warnings),
+            "contract_warnings": contract_warnings,
+            "reconciled_count": reconciled_count,
         },
         artifact=artifact,
     )
@@ -275,6 +428,9 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
 def _generate_one(
         path: str, description: str, layer_name: str,
         context: List[Dict[str, str]], provider: Any, goal: str,
+        on_token: Optional[Callable[[str], None]] = None,
+        depends_on: Optional[List[str]] = None,
+        contracts: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, str]]]:
     """Generate one scaffold file. Returns ``(ok_entry, fail_entry)``.
 
@@ -284,7 +440,11 @@ def _generate_one(
     constraint. It reads no shared state, so it is safe to run inside the
     bounded per-layer worker pool. The generator import is resolved on each
     call so monkeypatched stubs (and any hot-swapped prompt templates) take
-    effect.
+    effect. ``on_token`` (serial path only) forwards streamed generation
+    deltas for live progress. ``depends_on`` scopes the context digest to
+    the manifest-declared dependency paths. ``contracts`` is the WORK_PLAN
+    shared-interface block, threaded verbatim so every file honours the
+    same declared endpoints/schemas/signatures.
     """
     from cgx.answer.engine import generate_single_scaffold_file
     try:
@@ -293,6 +453,9 @@ def _generate_one(
             layer=layer_name,
             existing_files_with_content=context,
             goal=goal,
+            on_token=on_token,
+            depends_on=depends_on,
+            contracts=contracts,
         )
     except Exception as exc:
         logger.exception(
@@ -302,8 +465,25 @@ def _generate_one(
     file_path = str(result.get("file") or path).strip()
     patch = str(result.get("patch") or "")
     file_content = str(result.get("content") or "")
+    syntax_error = str(result.get("syntax_error") or "").strip()
     if not file_path or not patch:
-        return None, {"file": path, "error": "generator returned empty patch"}
+        # A cleared/empty patch means a single-file gate (duplicate content,
+        # undefined first-party symbol, ...) already rejected the body.
+        # Surface its concrete reason when present so the router's
+        # regenerate constraint is specific rather than a generic empty-patch.
+        return None, {"file": file_path or path,
+                      "error": syntax_error or "generator returned empty patch"}
+    if not bool(result.get("syntax_ok")):
+        # Explicit file-level failure (P2.1): a file that failed the inline
+        # syntax gate (Python/TOML/JS/TS/JSX/Vue) or the extension/content
+        # mismatch check still carries a non-empty patch here. Shipping it
+        # to APPLY only to have APPLY's own syntax gate silently drop it can
+        # leave the project without an entry point or its only test (VERIFY
+        # then reports a false success). Fail it explicitly instead so the
+        # router turns it into a targeted regenerate with the exact error.
+        return None, {"file": file_path,
+                      "error": syntax_error
+                      or "generated file failed syntax validation"}
     return {
         "file": file_path,
         "patch": patch,
@@ -314,23 +494,102 @@ def _generate_one(
     }, None
 
 
-def _scaffold_concurrency() -> int:
+def _emit_scaffold_progress(
+        deps: ExecutorDeps, task: TaskNode, *, file: str, layer: str,
+        index: int, total: int, status: str,
+        bytes: Optional[int] = None,
+        elapsed_ms: Optional[int] = None,
+        failed_count: int = 0) -> None:
+    """Publish one intra-SCAFFOLD progress beat (best-effort).
+
+    ``status`` is one of ``start`` / ``done`` / ``failed``. A rough ETA is
+    derived from the just-finished file's wall time projected over the
+    remaining manifest entries -- coarse, but enough for the UI to show a
+    shrinking countdown instead of a frozen spinner. ``failed_count`` carries
+    the running number of files that failed so far; on failure ``index`` does
+    not advance, so this lets the UI show the failure instead of rendering an
+    apparent counter reset. Never raises: progress telemetry must not be able
+    to fail a generation run.
+    """
+    store = getattr(deps, "store", None)
+    if store is None:
+        return
+    progress: Dict[str, Any] = {
+        "index": index, "total": total, "path": file,
+        "layer": layer, "status": status, "failed_count": failed_count,
+    }
+    if bytes is not None:
+        progress["bytes"] = bytes
+    if elapsed_ms is not None:
+        progress["elapsed_ms"] = elapsed_ms
+        remaining = max(total - index, 0)
+        progress["eta_seconds"] = round((elapsed_ms / 1000.0) * remaining, 1)
+    else:
+        progress["eta_seconds"] = None
+    try:
+        store.emit_task_progress(task.session_id, task.task_id, progress)
+    except Exception:  # pragma: no cover - telemetry must never break a run
+        logger.debug("SCAFFOLD: progress emit failed", exc_info=True)
+
+
+# Minimum wall gap between streamed ``stream`` beats. Token deltas arrive
+# far faster than the UI needs; coalescing to a few per second keeps the
+# progress bar moving without flooding the SSE bridge.
+_STREAM_BEAT_MIN_INTERVAL_S = 0.25
+
+
+def _make_stream_beat(
+        deps: ExecutorDeps, task: TaskNode, *, file: str, layer: str,
+        index: int, total: int,
+        failed_count: int = 0) -> Callable[[str], None]:
+    """Return an ``on_token`` callback that emits throttled ``stream`` beats.
+
+    Accumulates the streamed character count for the file being generated
+    and publishes a ``status="stream"`` progress beat at most every
+    :data:`_STREAM_BEAT_MIN_INTERVAL_S` seconds, so the UI shows the active
+    file growing in real time instead of a frozen ``start``. ``failed_count``
+    is the running failure tally carried into each beat. Best-effort:
+    delegates to :func:`_emit_scaffold_progress`, which never raises.
+    """
+    state = {"chars": 0, "last": 0.0}
+
+    def _beat(delta: str) -> None:
+        state["chars"] += len(delta)
+        now = time.time()
+        if now - state["last"] < _STREAM_BEAT_MIN_INTERVAL_S:
+            return
+        state["last"] = now
+        _emit_scaffold_progress(
+            deps, task, file=file, layer=layer,
+            index=index, total=total, status="stream",
+            bytes=state["chars"], failed_count=failed_count)
+
+    return _beat
+
+
+def _scaffold_concurrency(provider: Any = None) -> int:
     """Return the bounded per-layer generation worker count (>= 1).
 
-    Defaults to 1 (serial) so a single local GPU is never over-subscribed:
-    the runner's ``_GPU_INFERENCE_SEMAPHORE`` already serialises whole LLM
-    tasks, and intra-layer fan-out only pays off when the provider can
-    service concurrent requests (cloud endpoints, or a host with GPU
-    headroom). Opt in via ``CGX_SCAFFOLD_CONCURRENCY``; malformed or sub-1
-    values clamp to 1.
+    Provider-gated: a provider that advertises ``parallel_scaffold_capable``
+    (remote/cloud endpoints) fans out to :data:`_CLOUD_SCAFFOLD_CONCURRENCY`
+    by default, while a single local GPU (Ollama) stays serial so it is never
+    over-subscribed -- the runner's ``_GPU_INFERENCE_SEMAPHORE`` already
+    serialises whole LLM tasks, so intra-layer fan-out only pays off when the
+    backend can service concurrent requests.
+
+    ``CGX_SCAFFOLD_CONCURRENCY`` overrides the gate in both directions (pin a
+    cloud run serial, or opt a local host with GPU headroom into fan-out);
+    malformed or sub-1 values clamp to 1.
     """
     raw = os.environ.get("CGX_SCAFFOLD_CONCURRENCY")
-    if not raw:
-        return 1
-    try:
-        return max(1, int(raw))
-    except (TypeError, ValueError):
-        return 1
+    if raw:
+        try:
+            return max(1, int(raw))
+        except (TypeError, ValueError):
+            return 1
+    if getattr(provider, "parallel_scaffold_capable", False):
+        return _CLOUD_SCAFFOLD_CONCURRENCY
+    return 1
 
 
 def _resolve_pypi_client(deps: ExecutorDeps) -> PyPIClient:
@@ -501,6 +760,108 @@ def _augment_goal_with_constraints(
     if len(lines) == 2:
         return goal
     return f"{goal}\n" + "\n".join(lines) if goal else "\n".join(lines[1:])
+
+
+def _reconcile_import_warnings(
+        *,
+        diffs: List[Dict[str, str]],
+        generated: List[Dict[str, Any]],
+        existing_with_content: List[Dict[str, str]],
+        layers: List[Any],
+        goal: str,
+        provider: Any,
+        contracts: Optional[Dict[str, Any]],
+) -> int:
+    """Regenerate importer files whose first-party imports don't resolve.
+
+    Re-checks first-party imports across the finished scaffold tree and
+    regenerates only the importer files carrying an unresolved symbol,
+    folding the missing ``module.name`` list in as a constraint so the
+    model aligns each file to what its siblings actually define. Mutates
+    ``diffs``/``generated``/``existing_with_content`` in place and returns
+    the number of files rewritten. Bounded by
+    :data:`_COHERENCE_PASS_BUDGET`; a regeneration that fails or raises
+    leaves the original file untouched, so the pass can only improve (or
+    no-op) the bundle.
+    """
+    if provider is None:
+        return 0
+    # Manifest lookup: path -> (description, layer_name, depends_on).
+    meta: Dict[str, Tuple[str, str, List[str]]] = {}
+    for layer in layers:
+        if not isinstance(layer, dict):
+            continue
+        layer_name = str(layer.get("name") or "project").strip()
+        for entry in (layer.get("files") or []):
+            if not isinstance(entry, dict):
+                continue
+            path = str(entry.get("path") or "").strip()
+            if not path:
+                continue
+            raw_deps = entry.get("depends_on")
+            dep = [str(d).strip() for d in raw_deps
+                   if isinstance(d, str) and str(d).strip()] \
+                if isinstance(raw_deps, list) else []
+            desc = str(entry.get("description") or path).strip()
+            meta[path] = (desc, layer_name, dep)
+
+    def _find(seq: List[Dict[str, Any]], key: str, value: str) -> int:
+        for i, e in enumerate(seq):
+            if str(e.get(key) or "") == value:
+                return i
+        return -1
+
+    reconciled = 0
+    for _ in range(_COHERENCE_PASS_BUDGET):
+        contents = {e["path"]: e["content"] for e in existing_with_content
+                    if e.get("path") and isinstance(e.get("content"), str)}
+        by_file: Dict[str, List[Dict[str, Any]]] = {}
+        for w in cross_check_first_party_imports(contents):
+            f = str(w.get("file") or "").strip()
+            if f and f in meta:
+                by_file.setdefault(f, []).append(w)
+        if not by_file:
+            break
+        rewritten = 0
+        for path, file_warnings in by_file.items():
+            desc, layer_name, dep = meta[path]
+            constraints = [{
+                "kind": "unresolved import",
+                "rationale": (
+                    f"`{w.get('name')}` imported from `{w.get('module')}` "
+                    "is not defined there; import only names that exist in "
+                    "the referenced sibling modules, or define what you use"),
+            } for w in file_warnings]
+            aug_goal = _augment_goal_with_constraints(
+                goal, constraints,
+                header="Cross-file import mismatches to fix this pass:")
+            context = [e for e in existing_with_content
+                       if e.get("path") != path]
+            ok, _fail = _generate_one(
+                path, desc, layer_name, context, provider, aug_goal,
+                depends_on=dep, contracts=contracts)
+            if ok is None:
+                continue
+            di = _find(diffs, "file", path)
+            if di >= 0:
+                diffs[di] = {"file": ok["file"], "patch": ok["patch"]}
+            gi = _find(generated, "file", path)
+            if gi >= 0:
+                generated[gi] = {
+                    "file": ok["file"], "layer": ok["layer"],
+                    "syntax_ok": ok["syntax_ok"],
+                    "confidence": ok["confidence"],
+                    "bytes": len(ok["content"]), "reconciled": True,
+                }
+            ei = _find(existing_with_content, "path", path)
+            if ei >= 0:
+                existing_with_content[ei] = {
+                    "path": ok["file"], "content": ok["content"]}
+            rewritten += 1
+        reconciled += rewritten
+        if rewritten == 0:
+            break
+    return reconciled
 
 
 def _lessons_as_constraints(

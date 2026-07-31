@@ -188,6 +188,9 @@ def apply_diffs_to_disk(
             sum(1 for p in patches if p.ok and p.new_content is not None
                 and p.path not in {f["file"] for f in failed_files}),
         )
+        for f in failed_files:
+            logger.warning("apply_diffs_to_disk: dropped %s: %s",
+                           f["file"], f["error"])
 
     # Step 2: prepare a backup mirror (always, so passing files are safely backed up).
     run_id = time.strftime("%Y%m%d-%H%M%S")

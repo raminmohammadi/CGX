@@ -76,6 +76,127 @@ Colour is auto-disabled when stdout is not a TTY or when `NO_COLOR` /
 explicit subcommands below (`cgx index`, `cgx ask`, `cgx serve`, ...)
 remain available for scripted, non-interactive use.
 
+## The CLI (non-interactive subcommands)
+
+Every capability the dashboard and web UI expose is also available as a
+plain, scriptable subcommand. Run `cgx <command> --help` for the full,
+authoritative flag list; this section is the reference.
+
+| Command       | What it does                                                        |
+| ------------- | ------------------------------------------------------------------- |
+| `cgx`         | Open the interactive dashboard (same as `cgx dash`).                |
+| `cgx index`   | Parse → embed (two views) → FAISS → persist an index on disk.       |
+| `cgx query`   | Raw hybrid retrieval; prints the ranked chunks as JSON (no LLM).    |
+| `cgx ask`     | Grounded, read-only LLM answer streamed to the terminal.            |
+| `cgx plan`    | Generate a code-change plan (`plan_md` + structured diffs).         |
+| `cgx agent`   | Run the full Planner → Tracker → Judge loop toward a goal.          |
+| `cgx status`  | Print provider, hardware, and index status for a project.           |
+| `cgx serve`   | Launch the FastAPI + React web UI (`--host` / `--port`).            |
+| `cgx dash`    | Launch the interactive terminal dashboard.                          |
+
+`ask`, `plan`, `agent`, and `status` share the same **streaming engine**
+as the dashboard and web UI (`cgx.webui.handlers`): tokens stream as they
+arrive under a Braille spinner, and **Ctrl-C** cancels the running task
+(exit code `130`) by flipping the same `cancel_event` the UI's Stop
+button uses. Any other failure exits non-zero (`1`). Colour follows the
+same TTY / `NO_COLOR` / `CGX_FORCE_COLOR` rules as the dashboard, so
+piping to a file yields clean, escape-free text.
+
+### Shared provider & index flags
+
+`ask`, `plan`, `agent`, and `status` accept a common set of flags:
+
+| Flag             | Default                    | Purpose                                                     |
+| ---------------- | -------------------------- | ---------------------------------------------------------- |
+| `--project-root` | current directory          | Project whose index is queried / written.                  |
+| `--provider`     | `ollama`                   | One of `ollama`, `openai`, `openai-compat`, `gemini`, `custom`. |
+| `--model`        | provider default           | LLM name; always overrides a profile's model when given.   |
+| `--base-url`     | `http://localhost:11434`   | Provider endpoint (Ollama / OpenAI-compatible).            |
+| `--profile`      | none                       | A saved provider profile (see §1) — takes precedence over `--provider`/`--base-url`. |
+| `--index-dir`    | auto-discovered            | Override the FAISS `indices/` directory to read.           |
+| `--records`      | auto-discovered            | Override the `records.jsonl` path to read.                 |
+
+**Provider resolution.** `--profile` wins: its `kind`, `model`, and
+`base_url` are loaded from `~/.cgx/profiles.json`, with `--model` still
+able to override the model. Otherwise the explicit `--provider` /
+`--model` / `--base-url` values are used. When the provider is `ollama`
+and no model is given, CGX picks a hardware-appropriate default via
+`ollama_discovery.recommend_default_model()`. **API keys are never passed
+on the command line** — cloud providers read them from the environment
+(`OPENAI_API_KEY`, `GEMINI_API_KEY`) or the keyring-backed profile store,
+so nothing secret lands in your shell history.
+
+**Index discovery.** `ask`, `plan`, and `status` look for a *completed*
+index at `<project-root>/.cgx/index` (the same layout the dashboard's
+`/index` builds); `agent` uses it when present and can also run without
+one for greenfield generation. To make an index discoverable, build it
+into that path:
+
+```bash
+cgx index --project-root . --out-dir .cgx/index
+cgx ask "How does parse_codebase work?"
+```
+
+Or build it anywhere and point the reader at it explicitly:
+
+```bash
+cgx index --project-root . --out-dir /tmp/cgx_index
+cgx ask "How does parse_codebase work?" \
+        --index-dir /tmp/cgx_index/indices \
+        --records  /tmp/cgx_index/records.jsonl
+```
+
+> The index is read back with the **default Jina code-embedding model**,
+> so an index passed via `--index-dir` / `--records` must have been built
+> with that model (a mismatched embedding dimension is rejected at load).
+
+### `cgx ask` — grounded question answering
+
+```bash
+cgx ask "What does the retrieval orchestrator fuse?" \
+        --provider openai --model gpt-4o-mini --think
+```
+
+Streams a read-only, citation-grounded answer over the project's index.
+Add `--think` to also stream the model's reasoning sketch before the
+answer. The multi-word question is a positional argument (no quoting
+required, though quoting is fine).
+
+### `cgx plan` — self-testing change plans
+
+```bash
+cgx plan "Add a --json flag to the query command" \
+         --self-test --run-tests --profile my-ollama
+```
+
+Emits a markdown plan plus structured diffs. `--self-test` has the
+planner validate and repair its own diffs (parse + dry-apply +
+`ast.parse`); `--run-tests` executes the project's impacted tests in a
+sandbox. See §4 for the UI equivalent and the report shape.
+
+### `cgx agent` — multi-step agent loop
+
+```bash
+cgx agent "Add docstrings to every public function in cgx.parser" \
+          --stop-on-fail
+```
+
+Runs the batch Planner → Tracker → Judge loop (§7) and streams each
+task's start / progress / done / retry events. `--stop-on-fail` halts on
+the first failed task instead of continuing. With no discoverable index
+the loop can still scaffold a brand-new project into `--project-root`.
+
+### `cgx status` — environment & index summary
+
+```bash
+cgx status --provider ollama
+```
+
+Prints the resolved provider and model, a live Ollama reachability check
+(when applicable), detected RAM / VRAM, and whether the project's index
+is built (with its build timestamp and embedding model). This is the
+non-interactive form of the dashboard's `/status` command.
+
 ## 1. Pick a provider
 
 CGX supports four provider kinds, all configurable from the **⚙️ Setup**
@@ -247,10 +368,22 @@ Implementation lives in `src/cgx/embeddings/cache.py`.
 
 ## 3. Ask a question
 
+There are two CLI entry points here. `cgx query` runs **raw hybrid
+retrieval** and prints the ranked chunks as JSON — no LLM is involved,
+which is ideal for debugging retrieval or piping into other tooling:
+
 ```bash
 cgx query --index-dir /tmp/cgx_index/indices \
           --records  /tmp/cgx_index/records.jsonl \
           --query    "What does parse_codebase do?"
+```
+
+`cgx ask` runs the full **grounded-answer** path — retrieval plus an LLM
+that streams a cited answer to the terminal (see the CLI reference above
+for provider flags and index discovery):
+
+```bash
+cgx ask "What does parse_codebase do?" --think
 ```
 
 Or open the **Ask** tab. The streaming panel shows the model's
@@ -264,6 +397,16 @@ keeps streaming in the background and the accumulated messages are
 restored when you return to the Ask tab.
 
 ## 4. Generate a change plan
+
+From the CLI:
+
+```bash
+cgx plan "Add a --json flag to the query command" --self-test --run-tests
+```
+
+`--self-test` maps to **Validate diffs** and `--run-tests` to **Run
+impacted tests** (both described below); the plan and its report stream
+to the terminal.
 
 The **Plan** tab accepts a free-form task description. Recommended
 options:
@@ -435,11 +578,12 @@ CLARIFY_REQUIREMENTS -> ASK_USER(clarify_answers)
                                   |
                                   v
                             DECOMPOSE -> ASK_USER(approve_plan)
-                                                  |
+                            (contracts + layers)   |
                                           approved=true | approved=false
                                                   v        |
                                               SCAFFOLD     (loop halts;
-                                                  |         no files written)
+                          (contract gate + coherence pass)  no files written)
+                                                  |
                                                   v
                                               APPLY
                                                   |
@@ -455,11 +599,16 @@ CLARIFY_REQUIREMENTS -> ASK_USER(clarify_answers)
                                                   v
                                               VERIFY <-----+
                                                   |        |
-                                                  v        |
-                                              REPAIR ------+ (fixable failure,
-                                                  |          attempt < 2,
-                                          patch | regenerate new signature)
-                                          (<=5 diffs) | (Phase 6.1)
+                          passed (greenfield) |   | fixable failure
+                                              v   |
+                                      RUNTIME_VERIFY (boot the app; P1)
+                                          |       |
+                          passed/skipped  |       | failed/timeout/error
+                                          v       v
+                                     COMPLETED   REPAIR ------+ (progress-aware
+                                                  |            budget: keep going
+                                          patch | regenerate  while failing count
+                                          (<=5 diffs) | (6.1)  strictly drops, #5)
                                               v        v
                                             APPLY    SCAFFOLD (re-enters loop)
 ```
@@ -476,7 +625,16 @@ manifest). `SCAFFOLD` walks the approved manifest layer-by-layer,
 calls `generate_single_scaffold_file` for each entry while
 accumulating sibling-file context (so cross-file imports resolve
 correctly), captures per-file failures into a `failed` list, and
-emits a `SCAFFOLD_PATCHES` artifact. The shared `APPLY` executor
+emits a `SCAFFOLD_PATCHES` artifact. As of the contract-first work,
+the `WORK_PLAN` also carries a `contracts` block (the declared
+endpoints / schemas / functions / constants every file must share);
+it is threaded into each `generate_single_scaffold_file` call, and
+after the per-file loop two best-effort gates run before `APPLY`: a
+**coherence pass** that regenerates only importer files referencing a
+first-party symbol no sibling defines, and a **contract enforcement
+gate** that flags declared interfaces no generated file satisfies.
+Both attach `import_warnings` / `contract_warnings` to
+`SCAFFOLD_PATCHES` rather than failing the scaffold. The shared `APPLY` executor
 accepts either a `CODE_CHANGE_PLAN` (explore) or `SCAFFOLD_PATCHES`
 (greenfield). In greenfield mode a `BOOTSTRAP_ENV` step then
 provisions a project-local `.venv` (via
@@ -550,14 +708,34 @@ v1 recognises three classifications:
   `ASK_USER` -- a fixture nobody wrote isn't something the loop can
   invent without an LLM.
 
+When no deterministic classifier matches, `REPAIR` falls back to a
+bounded LLM repair that is **traceback-localized** (candidate files
+come from the crash frames first, then the files `APPLY` wrote) and
+**retrieval-fed** (any remaining candidate slot is filled by hybrid
+retrieval over the project index -- a no-op in greenfield, where there
+is no index).
+
 The executor emits a `REPAIR_PLAN` artifact shaped exactly like a
 `CODE_CHANGE_PLAN`. The shared `APPLY` executor consumes it,
 carries the `build_artifact_id` forward (so `BOOTSTRAP_ENV` is
-skipped on the repair pass), and re-runs `VERIFY`. The cycle is
-capped at two attempts and refuses to retry when the new
-`failure_signature` matches one already seen on the chain, so a
-fix that "succeeds" without actually resolving the failure
-escalates to a freeform `ASK_USER` instead of looping.
+skipped on the repair pass), and re-runs `VERIFY`. The cycle is no
+longer a flat two-shot cap: a **progress-aware budget** keeps the loop
+running while the failing-test count strictly drops round over round
+(backed by a passing-count trend so a repair that trades a failure for
+a new pass still counts as progress), under an absolute ceiling of four
+rounds and a `failure_signature` flap backstop. A fix that "succeeds"
+without actually shrinking the failure -- or that churns the same
+signature -- escalates to a freeform `ASK_USER` instead of looping.
+
+Once `VERIFY` is green in greenfield mode, the router runs a
+`RUNTIME_VERIFY` gate before declaring the session complete: it boots
+each detected entry module (`app.py` / `main.py` / any file that
+constructs a Flask / FastAPI app or defines `create_app`) under the
+bootstrapped venv and emits a `RUNTIME_REPORT`. A clean boot
+(`passed`) -- or a run with no detectable entry to boot (`skipped`) --
+COMPLETES the session; a hard boot failure routes back to `REPAIR`
+under the same budget. This is what turns "the tests the model wrote
+pass" into "the app actually runs".
 
 Every greenfield failure path is terminal. A *hard* executor
 failure -- one that returns no `outputs`, such as a `BOOTSTRAP_ENV`
@@ -577,6 +755,65 @@ list to the `BUILD_REPORT` artifact. The lint is informational --
 it does not change the bootstrap outcome -- but the UI renders the
 list under the manifests block so the user sees a named issue
 before `VERIFY` runs, even though `REPAIR` will still auto-fix it.
+
+#### Two maps of the greenfield loop
+
+To make the write loop legible at a glance, here it is as **flow** and
+as **components** -- the same picture the architecture doc uses, kept
+here so a first-time user can follow along without switching files.
+
+**The interstate highway system (data flow).** Each task is a highway,
+the router is the interchange choosing the next on-ramp, and artifacts
+are the freight.
+
+```mermaid
+flowchart LR
+    G([your goal]) --> C(["CLARIFY_REQUIREMENTS"]) --> D(["DECOMPOSE<br/>contracts + layers"])
+    D --> S(["SCAFFOLD<br/>+ coherence & contract gates"]) --> A(["APPLY"])
+    A --> B(["BOOTSTRAP_ENV"]) --> AC(["API_CHECK"]) --> SM(["SMOKE"]) --> V(["VERIFY"])
+    V --> I{"router"}
+    I -- "passed" --> R(["RUNTIME_VERIFY<br/>boot the app"])
+    I -- "fixable failure" --> RE(["REPAIR"])
+    R --> I2{"router"}
+    I2 -- "boots" --> OK((COMPLETED))
+    I2 -- "boot fails" --> RE
+    RE --> A
+    I -- "budget spent" --> NO((FAILED))
+
+    classDef road fill:#3b6ea5,stroke:#274c73,color:#fff;
+    classDef gate fill:#7d5ba6,stroke:#4c3575,color:#fff;
+    classDef term fill:#4c956c,stroke:#2c6e49,color:#fff;
+    class C,D,S,A,B,AC,SM,V,R,RE road;
+    class I,I2 gate;
+    class OK,NO term;
+```
+
+**The chocolate box map (components).** Each module is a chocolate; a
+connector is a flavour pairing (a typed value handed between modules).
+
+```mermaid
+flowchart TB
+    subgraph BOX["Greenfield agent chocolate box"]
+      direction TB
+      DEC["decompose.py"]
+      SCA["scaffold.py"]
+      SVAL["scaffold_validate.py"]
+      RTV["runtime_verify.py"]
+      VER["verify.py"]
+      REP["repair.py"]
+      ROU["router.py"]
+    end
+    DEC -->|contracts| SCA
+    SCA -->|generated tree| SVAL
+    SVAL -->|warnings| SCA
+    VER -->|pass/fail counts| ROU
+    RTV -->|boot outcome| ROU
+    ROU -->|funds a round?| REP
+    REP -->|REPAIR_PLAN| SCA
+
+    classDef choc fill:#6f4e37,stroke:#3e2723,color:#fff;
+    class DEC,SCA,SVAL,RTV,VER,REP,ROU choc;
+```
 
 ### UI controls
 
@@ -766,6 +1003,18 @@ The legacy Agent view at `/agent-legacy` runs a Planner → Tracker →
 Judge loop in batch mode. This is the original `cgx.agents` shape,
 preserved for fire-and-forget goals and for the `cgx agent` CLI; the
 new session-based view at `/agent` (§6) is the default.
+
+From the CLI:
+
+```bash
+cgx agent "Add docstrings to every public function in cgx.parser" \
+          --stop-on-fail
+```
+
+`--stop-on-fail` halts on the first failed task; omit it to let the loop
+continue and report per-task outcomes at the end (see the CLI reference
+for provider flags). This is the exact same loop as the programmatic
+`run_agent` shown below.
 
 A picture-first overview lives in [flowcharts.md](flowcharts.md) -- the
 "general user" SVG matches the UI flow described below.
