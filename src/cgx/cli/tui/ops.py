@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, Iterator, Optional, Tuple
 
@@ -178,21 +179,422 @@ def plan_events(state: Any, task: str, *, index_dir: Optional[str] = None,
     )
 
 
-def agent_events(state: Any, goal: str, *, index_dir: Optional[str] = None,
-                 records: Optional[str] = None, stop_on_fail: bool = False,
-                 cancel_event=None) -> Iterator[Event]:
-    """Stream the full Planner → Tracker → Judge agent loop."""
-    from cgx.webui import handlers
+# ----------------------------------------------------------------------
+# Session agent loop -- the TUI front-end for :mod:`cgx.session`.
+# ----------------------------------------------------------------------
 
+# One SessionRunner (and its SQLite store) per project root, mirroring
+# the webui's per-root runner cache so both surfaces share sessions.
+_SESSION_RUNNERS: Dict[str, Any] = {}
+
+
+def _session_runner(project_root: str) -> Any:
+    import cgx.session.tasks  # noqa: F401 -- registers executors
+    from cgx.session import SessionRunner, SessionStore
+
+    key = os.path.abspath(project_root or ".")
+    runner = _SESSION_RUNNERS.get(key)
+    if runner is None:
+        runner = SessionRunner(SessionStore(project_root=key))
+        _SESSION_RUNNERS[key] = runner
+    return runner
+
+
+def _session_deps(state: Any, *, index_dir: Optional[str],
+                  records: Optional[str], store: Any) -> Any:
+    """Build ExecutorDeps from dashboard state (provider + index)."""
+    from cgx.session.llm_trace import TracingProvider
+    from cgx.session.tasks.base import ExecutorDeps
+    from cgx.webui.handlers import _resolve_provider
+
+    provider = _resolve_provider(**provider_kwargs(state))
+    if provider is not None and not isinstance(provider, TracingProvider):
+        provider = TracingProvider(provider)
     idx = resolve_index(state, index_dir=index_dir, records=records)
-    resolved_index = idx[0] if idx else None
-    resolved_records = idx[1] if idx else None
-    yield from handlers.stream_agent(
-        index_dir=resolved_index, records=resolved_records, goal=goal,
-        embed_model=DEFAULT_EMBED_MODEL, project_root=state.project_root,
-        stop_on_fail=stop_on_fail, cancel_event=cancel_event,
-        **provider_kwargs(state),
+    return ExecutorDeps(
+        project_root=state.project_root,
+        index_dir=idx[0] if idx else None,
+        records_path=idx[1] if idx else None,
+        embed_model=DEFAULT_EMBED_MODEL,
+        provider=provider,
+        store=store,
     )
+
+
+def agent_events(state: Any, text: str, *, index_dir: Optional[str] = None,
+                 records: Optional[str] = None, auto: bool = False,
+                 cancel_event=None) -> Iterator[Event]:
+    """Drive one turn of the session agent loop and stream its events.
+
+    The plain-message surface for :mod:`cgx.session`: the first message
+    starts a session (mode auto-detected -- greenfield for an empty
+    directory, explore otherwise), a message while an ASK_USER is open
+    answers it, and any other message is posted as a follow-up
+    objective. Each turn drains READY tasks until the session pauses on
+    a question, quiesces, or reaches a terminal status. With ``auto``
+    (the one-shot ``cgx agent`` command) clarify/approval questions are
+    answered with defaults so the run is unattended.
+    """
+    from cgx.session.mode import detect_mode
+    from cgx.session.models import SessionStatus
+
+    runner = _session_runner(state.project_root)
+    store = runner.store
+    try:
+        deps = _session_deps(state, index_dir=index_dir, records=records,
+                             store=store)
+    except ValueError as exc:
+        yield "error", {"message": str(exc)}
+        return
+
+    sid = getattr(state, "agent_session_id", None)
+    session = store.get_session(sid) if sid else None
+    if session is not None and session.status in (SessionStatus.COMPLETED,
+                                                  SessionStatus.FAILED,
+                                                  SessionStatus.ABANDONED):
+        session = None
+
+    if session is None:
+        state.pending_ask = None
+        mode = detect_mode(project_root=state.project_root,
+                           index_dir=deps.index_dir,
+                           records_path=deps.records_path)
+        session = runner.start_session(
+            objective=text, project_root=state.project_root, mode=mode)
+        state.agent_session_id = session.session_id
+        yield "status", {"message": f"session started ({mode.value})"}
+    else:
+        pending = getattr(state, "pending_ask", None)
+        if pending:
+            ok = yield from _answer_pending_ask(
+                state, runner, session, pending, text)
+            if not ok:
+                return
+        else:
+            runner.post_message(session_id=session.session_id, message=text)
+
+    yield from _drive_session(state, runner, session.session_id, deps,
+                              auto=auto, cancel_event=cancel_event)
+
+
+def _answer_pending_ask(state: Any, runner: Any, session: Any,
+                        pending: Dict[str, Any], text: str):
+    """Resolve the open ASK_USER from a freeform reply. Returns True on
+    success; on a validation error re-renders the question and returns
+    False so the user can answer again (the pending ask is kept)."""
+    from cgx.session.tasks.ask import build_decision
+
+    task = runner.store.get_task(str(pending.get("task_id") or ""))
+    if task is None:  # stale pending state -- treat as a follow-up
+        state.pending_ask = None
+        runner.post_message(session_id=session.session_id, message=text)
+        return True
+    chosen, rationale = _chosen_from_text(pending, text)
+    try:
+        decision = build_decision(session_id=session.session_id, task=task,
+                                  chosen=chosen, rationale=rationale)
+    except ValueError as exc:
+        yield "error", {"message": str(exc)}
+        yield "ask_user", pending
+        return False
+    runner.post_decision(session_id=session.session_id, decision=decision)
+    state.pending_ask = None
+    return True
+
+
+def _drive_session(state: Any, runner: Any, sid: str, deps: Any, *,
+                   auto: bool, cancel_event=None) -> Iterator[Event]:
+    """Drain READY tasks, relaying live bus events as TUI events.
+
+    ``run_next`` blocks for the duration of a task, so it runs on an
+    inner thread while this generator forwards the session's bus
+    events (task lifecycle, scaffold file progress) as they happen.
+    The 64-step ceiling mirrors the webui drain's safety valve.
+    """
+    import queue as queue_mod
+    import threading
+
+    from cgx.session.events import get_default_bus
+    from cgx.session.tasks.ask import build_decision
+
+    store = runner.store
+    bus_q: "queue_mod.Queue[Any]" = queue_mod.Queue()
+    unsubscribe = get_default_bus().subscribe(
+        "*", lambda ev: bus_q.put(ev) if ev.session_id == sid else None)
+    try:
+        for _ in range(64):
+            if cancel_event is not None and cancel_event.is_set():
+                yield "cancelled", {}
+                return
+            holder: Dict[str, Any] = {}
+
+            def _step() -> None:
+                try:
+                    holder["task"] = runner.run_next(session_id=sid,
+                                                     deps=deps)
+                except Exception as exc:  # surfaced below on this thread
+                    holder["error"] = exc
+
+            worker = threading.Thread(target=_step, name="cgx-session-step",
+                                      daemon=True)
+            worker.start()
+            while worker.is_alive():
+                try:
+                    ev = bus_q.get(timeout=0.2)
+                except queue_mod.Empty:
+                    continue
+                yield from _bus_to_tui(ev)
+            worker.join()
+            while True:
+                try:
+                    ev = bus_q.get_nowait()
+                except queue_mod.Empty:
+                    break
+                yield from _bus_to_tui(ev)
+            if "error" in holder:
+                exc = holder["error"]
+                yield "error", {"message": f"{type(exc).__name__}: {exc}"}
+                return
+
+            ask = _pending_ask_task(store, sid)
+            if ask is not None:
+                payload = _ask_payload(store, ask)
+                if auto:
+                    chosen = _auto_chosen(payload)
+                    if chosen is not None:
+                        yield "status", {"message": "auto-answering: "
+                                         + str(payload.get("question") or "")}
+                        decision = build_decision(
+                            session_id=sid, task=ask, chosen=chosen)
+                        runner.post_decision(session_id=sid,
+                                             decision=decision)
+                        continue
+                state.pending_ask = payload
+                yield "ask_user", payload
+                return
+            if holder.get("task") is None:  # quiesced, no open question
+                break
+        yield from _session_epilogue(store, sid)
+    finally:
+        unsubscribe()
+
+
+def _bus_to_tui(ev: Any) -> Iterator[Event]:
+    """Translate a session bus event into the dashboard's vocabulary."""
+    from cgx.session.events import EventType
+
+    p = ev.payload or {}
+    kind = str(p.get("kind") or "")
+    if kind == "ask_user":  # rendered separately as an ``ask_user`` event
+        return
+    if ev.type is EventType.TASK_STATUS_CHANGED:
+        if str(p.get("status") or "") == "in_progress":
+            yield "task_start", {"name": p.get("name"), "kind": kind}
+    elif ev.type is EventType.TASK_COMPLETED:
+        yield "task_done", {"kind": kind}
+    elif ev.type is EventType.TASK_FAILED:
+        yield "task_failed", {"kind": kind, "error": p.get("error")}
+    elif ev.type is EventType.TASK_OUTPUT_PARTIAL:
+        prog = p.get("progress") or {}
+        path, idx, total = (prog.get("path"), prog.get("index"),
+                            prog.get("total"))
+        msg = "working…"
+        if path:
+            msg = f"generating {path}"
+            if idx and total:
+                msg += f" ({idx}/{total})"
+        yield "status", {"message": msg}
+
+
+def _pending_ask_task(store: Any, sid: str) -> Optional[Any]:
+    from cgx.session.models import TaskKind, TaskNodeStatus
+
+    for t in store.list_tasks(sid):
+        if (t.kind is TaskKind.ASK_USER
+                and t.status is TaskNodeStatus.IN_PROGRESS):
+            return t
+    return None
+
+
+def _ask_payload(store: Any, task: Any) -> Dict[str, Any]:
+    """Serialise an open ASK_USER (question + options) for rendering."""
+    from cgx.session.models import DecisionKind
+
+    expected = str(task.inputs.get("expected_kind")
+                   or DecisionKind.FREEFORM.value)
+    payload: Dict[str, Any] = {
+        "task_id": task.task_id,
+        "expected_kind": expected,
+        "question": task.description or task.name,
+        "questions": [],
+        "options": [],
+    }
+
+    def _artifact_content(key: str) -> Dict[str, Any]:
+        art = store.get_artifact(str(task.inputs.get(key) or ""))
+        content = getattr(art, "content", None)
+        return content if isinstance(content, dict) else {}
+
+    if expected == DecisionKind.CLARIFY_ANSWERS.value:
+        payload["questions"] = list(
+            _artifact_content("requirements_artifact_id")
+            .get("questions") or [])
+    elif expected == DecisionKind.APPROVE_PLAN.value:
+        payload["plan_md"] = str(
+            _artifact_content("work_plan_artifact_id").get("plan_md") or "")
+    elif expected == DecisionKind.CHOOSE_PATH.value:
+        payload["options"] = list(
+            _artifact_content("directions_artifact_id").get("options") or [])
+    elif expected == DecisionKind.CHOOSE_RECOMMENDATION.value:
+        content = _artifact_content("recommendations_artifact_id")
+        payload["options"] = list(content.get("options")
+                                  or content.get("recommendations") or [])
+    payload["text"] = _render_ask_text(payload)
+    return payload
+
+
+def _render_ask_text(payload: Dict[str, Any]) -> str:
+    """Plain-text block for an open question (rendered by map_event)."""
+    from cgx.session.models import DecisionKind
+
+    lines = [str(payload.get("question") or "").strip()]
+    for i, q in enumerate(payload.get("questions") or [], 1):
+        line = f"  {i}. " + str(q.get("prompt") or "").strip()
+        hint = str(q.get("hint") or "").strip()
+        if hint:
+            line += f"  ({hint})"
+        lines.append(line)
+        sug = [str(s) for s in (q.get("suggested") or []) if str(s).strip()]
+        if sug:
+            lines.append("     e.g. " + " | ".join(sug))
+    for i, o in enumerate(payload.get("options") or [], 1):
+        title = str(o.get("title") or o.get("kind") or "").strip()
+        why = str(o.get("rationale") or "").strip()
+        lines.append(f"  {i}. {title}" + (f" -- {why}" if why else ""))
+    plan_md = str(payload.get("plan_md") or "").strip()
+    if plan_md:
+        preview = plan_md.splitlines()
+        if len(preview) > 30:
+            preview = preview[:30] + ["…"]
+        lines.append("")
+        lines.extend(preview)
+    tips = {
+        DecisionKind.CLARIFY_ANSWERS.value:
+            "Reply with one line per question (or one line for all).",
+        DecisionKind.APPROVE_PLAN.value:
+            "Reply 'yes' to approve, or describe what to change.",
+        DecisionKind.APPROVE.value:
+            "Reply 'yes' to approve, or 'no' to reject.",
+        DecisionKind.CHOOSE_PATH.value: "Reply with an option number.",
+        DecisionKind.CHOOSE_RECOMMENDATION.value:
+            "Reply with an option number.",
+    }
+    lines.append("")
+    lines.append(tips.get(str(payload.get("expected_kind")),
+                          "Reply in the chat to answer."))
+    return "\n".join(lines)
+
+
+_YES_WORDS = {"y", "yes", "ok", "okay", "approve", "approved", "go",
+              "lgtm", "sure", "proceed"}
+_NO_WORDS = {"n", "no", "reject", "rejected", "stop", "cancel"}
+
+
+def _chosen_from_text(pending: Dict[str, Any],
+                      text: str) -> Tuple[Dict[str, Any], Optional[str]]:
+    """Map a freeform reply onto the ``chosen`` slots the decision needs.
+
+    Returns ``(chosen, rationale)``. Anything that fails
+    :func:`build_decision` validation re-renders the question, so this
+    only has to be a best-effort mapping, not a strict parser.
+    """
+    from cgx.session.models import DecisionKind
+
+    kind = str(pending.get("expected_kind") or "")
+    text = (text or "").strip()
+    if kind == DecisionKind.CLARIFY_ANSWERS.value:
+        qids = [str(q.get("id") or f"q{i + 1}") for i, q in
+                enumerate(pending.get("questions") or [])] or ["q1"]
+        lines = [re.sub(r"^\d+[.)]\s*", "", ln.strip())
+                 for ln in text.splitlines() if ln.strip()]
+        if len(lines) == len(qids):
+            return {"answers": dict(zip(qids, lines))}, None
+        return {"answers": {qid: text for qid in qids}}, None
+    if kind in (DecisionKind.APPROVE.value, DecisionKind.APPROVE_PLAN.value):
+        low = text.lower().rstrip(".!")
+        if low in _YES_WORDS:
+            return {"approved": True}, None
+        if low in _NO_WORDS:
+            return {"approved": False}, None
+        # Anything else is revision feedback -> not approved, with the
+        # reply as rationale so a re-plan can honour it.
+        return {"approved": False}, text
+    if kind == DecisionKind.CHOOSE_PATH.value:
+        opt = _pick_option(pending.get("options"), text)
+        anchor = str((opt or {}).get("chunk_id") or "") or text
+        return {"anchor_chunk_id": anchor}, None
+    if kind == DecisionKind.CHOOSE_RECOMMENDATION.value:
+        opt = _pick_option(pending.get("options"), text) or {}
+        chosen = {"kind": str(opt.get("kind") or text)}
+        anchor = str(opt.get("anchor_chunk_id") or "").strip()
+        if anchor:
+            chosen["anchor_chunk_id"] = anchor
+        return chosen, None
+    return {"text": text}, None
+
+
+def _pick_option(options: Any, text: str) -> Optional[Dict[str, Any]]:
+    """Resolve ``text`` as a 1-based index into ``options``."""
+    if not isinstance(options, list):
+        return None
+    m = re.match(r"^(\d+)\b", (text or "").strip())
+    if not m:
+        return None
+    i = int(m.group(1)) - 1
+    if 0 <= i < len(options) and isinstance(options[i], dict):
+        return options[i]
+    return None
+
+
+def _auto_chosen(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Default answer for unattended runs (``cgx agent``), or None.
+
+    Clarify questions take their first suggested option; plan/change
+    approvals are approved. Freeform and choose-* questions have no
+    safe default, so the turn ends with the question printed.
+    """
+    from cgx.session.models import DecisionKind
+
+    kind = str(payload.get("expected_kind") or "")
+    if kind == DecisionKind.CLARIFY_ANSWERS.value:
+        answers = {}
+        for i, q in enumerate(payload.get("questions") or []):
+            sug = [str(s) for s in (q.get("suggested") or [])
+                   if str(s).strip()]
+            answers[str(q.get("id") or f"q{i + 1}")] = (
+                sug[0] if sug else "Use your best judgment.")
+        return {"answers": answers or {"q1": "Use your best judgment."}}
+    if kind in (DecisionKind.APPROVE.value, DecisionKind.APPROVE_PLAN.value):
+        return {"approved": True}
+    return None
+
+
+def _session_epilogue(store: Any, sid: str) -> Iterator[Event]:
+    """Terminal render after the session quiesced with no open question."""
+    from cgx.session.models import SessionStatus, TaskNodeStatus
+
+    session = store.get_session(sid)
+    if session is None:
+        return
+    tasks = store.list_tasks(sid)
+    done = sum(1 for t in tasks if t.status is TaskNodeStatus.DONE)
+    failed = sum(1 for t in tasks if t.status is TaskNodeStatus.FAILED)
+    if session.status is SessionStatus.FAILED:
+        errors = [t.error for t in tasks if t.error]
+        yield "error", {"message": errors[-1] if errors
+                        else "session failed"}
+    yield "session_done", {"status": session.status.value,
+                           "done": done, "failed": failed}
 
 
 @dataclass
@@ -313,5 +715,21 @@ def map_event(etype: str, payload: Optional[Dict[str, Any]], *,
                   f"{payload.get('failed', 0)} failed, "
                   f"{payload.get('skipped', 0)} skipped")
         return Render("line", ansi.dim(counts, enabled=enabled))
+
+    # --- session agent loop --------------------------------------------
+    if etype == "ask_user":
+        return Render("line", "\n" + str(payload.get("text")
+                                         or payload.get("question") or ""))
+    if etype == "session_done":
+        status = str(payload.get("status") or "")
+        done, failed = payload.get("done"), payload.get("failed")
+        counts = (ansi.dim(f"  ({done} task(s) done, {failed} failed)",
+                           enabled=enabled) if done is not None else "")
+        if status == "completed":
+            return Render("line", c("✔ session complete", "green") + counts)
+        if status == "failed":
+            return Render("line", c("✖ session failed", "red") + counts)
+        return Render("line", ansi.dim(f"session {status or 'paused'}",
+                                       enabled=enabled))
 
     return Render("nothing")

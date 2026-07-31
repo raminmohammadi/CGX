@@ -361,19 +361,19 @@ def test_cli_plan_wires_task_and_flags(monkeypatch, tmp_path):
     assert seen["self_test"] is True and seen["run_tests"] is True
 
 
-def test_cli_agent_wires_goal_and_stop_on_fail(monkeypatch, tmp_path):
+def test_cli_agent_wires_goal_and_auto(monkeypatch, tmp_path):
     seen: dict = {}
 
     def fake_agent_events(state, goal, *, index_dir=None, records=None,
-                          stop_on_fail=False, cancel_event=None):
-        seen.update(goal=goal, stop_on_fail=stop_on_fail)
-        yield "summary", {"completed": 1, "failed": 0, "skipped": 0}
+                          auto=False, cancel_event=None):
+        seen.update(goal=goal, auto=auto)
+        yield "session_done", {"status": "completed", "done": 1, "failed": 0}
 
     monkeypatch.setattr(ops, "agent_events", fake_agent_events)
     cli_main.main(["agent", "build", "a", "CLI", "--project-root", str(tmp_path),
-                   "--model", "gpt-4o", "--provider", "openai", "--stop-on-fail"])
+                   "--model", "gpt-4o", "--provider", "openai"])
     assert seen["goal"] == "build a CLI"
-    assert seen["stop_on_fail"] is True
+    assert seen["auto"] is True
 
 
 def test_cli_status_prints_probe(monkeypatch, capsys, tmp_path):
