@@ -312,23 +312,29 @@ def _validate_manifest_coherence(
     """Deterministic manifest sanity check.
 
     Fails DECOMPOSE early (with an actionable message the router folds
-    into a retry constraint) when the plan is logically broken:
-    ``depends_on`` naming a file absent from the manifest, a dependency
-    cycle, or a manifest carrying no runnable source file (only
-    docs/config/tests -- nothing to build or to test against).
+    into a retry constraint) when the plan is logically broken: a
+    dependency cycle, or a manifest carrying no runnable source file
+    (only docs/config/tests -- nothing to build or to test against).
+
+    A dangling ``depends_on`` entry (a phantom path or a glob like
+    ``src/components/*.jsx``) is *not* fatal: ``depends_on`` is only a
+    topological / context-scoping hint, so a stray reference -- a common
+    planner slip, especially on the last-resort re-plan -- is pruned in
+    place with a warning rather than sinking an otherwise-buildable
+    manifest and terminally failing the whole session.
     """
     files = _manifest_files(layers)
     path_set = {f["path"] for f in files}
 
-    dangling: List[str] = []
     for f in files:
-        for dep in f.get("depends_on") or []:
-            if dep not in path_set:
-                dangling.append(f"{dep!r} (needed by {f['path']!r})")
-    if dangling:
-        return ("DECOMPOSE: manifest has dangling dependency reference(s): "
-                + ", ".join(dangling[:6])
-                + ". Every depends_on must name a file in the manifest.")
+        deps = f.get("depends_on") or []
+        kept = [d for d in deps if d in path_set]
+        if len(kept) != len(deps):
+            dropped = [d for d in deps if d not in path_set]
+            logger.warning(
+                "DECOMPOSE: pruning dangling depends_on %s from %r",
+                dropped, f["path"])
+            f["depends_on"] = kept
 
     cycle = _find_dependency_cycle(files)
     if cycle:

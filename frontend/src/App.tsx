@@ -10,7 +10,6 @@ const PlanPage = lazy(() => import("./pages/PlanPage"));
 const AgentPage = lazy(() => import("./pages/AgentPage"));
 const AgentLegacyPage = lazy(() => import("./pages/AgentLegacyPage"));
 const IndexPage = lazy(() => import("./pages/IndexPage"));
-const HardwarePage = lazy(() => import("./pages/HardwarePage"));
 const SettingsPage = lazy(() => import("./pages/SettingsPage"));
 
 function RouteFallback() {
@@ -71,14 +70,6 @@ export default function App() {
           element={
             <Suspense fallback={<RouteFallback />}>
               <IndexPage />
-            </Suspense>
-          }
-        />
-        <Route
-          path="/hardware"
-          element={
-            <Suspense fallback={<RouteFallback />}>
-              <HardwarePage />
             </Suspense>
           }
         />

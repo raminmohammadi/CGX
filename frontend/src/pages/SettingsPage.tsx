@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Cog, Plug, Radio, Plus, Search } from "lucide-react";
+import { Cog, Microchip, Plug, Radio, Plus, Search } from "lucide-react";
 import { api, type PingResult, type ProfileSummary } from "../lib/api";
 import { usePullState } from "../lib/pullManager";
 import { useWorkspace } from "../store/workspace";
@@ -9,16 +9,18 @@ import { Pill } from "../components/Pill";
 import { ActiveProviderCard } from "../components/settings/ActiveProviderCard";
 import { ProfilesTable } from "../components/settings/ProfilesTable";
 import { TracePanel } from "../components/settings/TracePanel";
+import { HardwarePanel } from "../components/settings/HardwarePanel";
 import { ProfileEditModal } from "../components/settings/ProfileEditModal";
 import { emptyEdit, type ProfileEditState, type ProviderKind } from "../components/settings/providerKinds";
 import { cn } from "../lib/utils";
 
-type Category = "provider" | "profiles" | "observability";
+type Category = "provider" | "profiles" | "observability" | "hardware";
 
 const CATEGORIES: { key: Category; label: string; icon: typeof Plug }[] = [
   { key: "provider", label: "Active Provider", icon: Plug },
   { key: "profiles", label: "Saved Profiles", icon: Cog },
   { key: "observability", label: "Observability", icon: Radio },
+  { key: "hardware", label: "Hardware", icon: Microchip },
 ];
 
 export default function SettingsPage() {
@@ -214,7 +216,7 @@ export default function SettingsPage() {
       </div>
 
       {/* ── Right: selected category ── */}
-      <div className="flex-1 overflow-y-auto p-6 space-y-6 max-w-4xl">
+      <div className={cn("flex-1 overflow-y-auto p-6 space-y-6", category === "hardware" ? "max-w-6xl" : "max-w-4xl")}>
         {category === "provider" && (
           <ActiveProviderCard
             provider={provider}
@@ -250,6 +252,8 @@ export default function SettingsPage() {
             onToggle={toggleTrace}
           />
         )}
+
+        {category === "hardware" && <HardwarePanel />}
 
         {error && (
           <Card padded className="border-red-500/40">

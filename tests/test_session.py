@@ -3404,16 +3404,34 @@ def test_decompose_preserves_order_without_dependency_hints(store, monkeypatch):
     assert paths == ["src/a.py", "src/b.py", "src/c.py"]
 
 
-def test_decompose_fails_on_dangling_dependency(store, monkeypatch):
+def test_decompose_prunes_dangling_dependency(store, monkeypatch):
+    # A phantom depends_on entry is pruned in place (not fatal): the
+    # manifest still builds and the offending hint is dropped.
     result = _run_decompose_with_manifest(store, monkeypatch, {
         "plan_md": "p",
         "layers": [{"name": "core", "files": [
             {"path": "src/app.py", "description": "entry",
-             "depends_on": ["src/missing.py"]}]}],
+             "depends_on": ["src/util.py", "src/missing.py"]},
+            {"path": "src/util.py", "description": "helpers"}]}],
     })
-    assert result.failure
-    assert "dangling dependency" in result.failure
-    assert "src/missing.py" in result.failure
+    assert result.failure is None
+    files = result.artifact.content["layers"][0]["files"]
+    app = next(f for f in files if f["path"] == "src/app.py")
+    assert app["depends_on"] == ["src/util.py"]
+
+
+def test_decompose_prunes_glob_dependency(store, monkeypatch):
+    # A wildcard depends_on (a legitimate intent expressed wrong) is
+    # pruned rather than sinking the whole re-plan.
+    result = _run_decompose_with_manifest(store, monkeypatch, {
+        "plan_md": "p",
+        "layers": [{"name": "core", "files": [
+            {"path": "src/App.jsx", "description": "entry",
+             "depends_on": ["src/components/*.jsx"]}]}],
+    })
+    assert result.failure is None
+    files = result.artifact.content["layers"][0]["files"]
+    assert files[0]["depends_on"] == []
 
 
 def test_decompose_fails_on_dependency_cycle(store, monkeypatch):
