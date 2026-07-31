@@ -3268,7 +3268,7 @@ def test_decompose_executor_happy_path_emits_work_plan(
             {"id": "q1", "prompt": "Framework?"}], "source": "llm"})
     store.save_artifact(req)
 
-    def fake_manifest(composed, provider, goal=None):
+    def fake_manifest(composed, provider, goal=None, skills=None):
         return {
             "plan_md": "## Plan\n- app.py\n- README.md",
             "layers": [{"name": "app", "files": [
@@ -3300,7 +3300,7 @@ def test_decompose_executor_stores_contracts_on_work_plan(store, monkeypatch):
     session = Session.new("g", mode=SessionMode.GREENFIELD)
     store.save_session(session)
 
-    def fake_manifest(composed, provider, goal=None):
+    def fake_manifest(composed, provider, goal=None, skills=None):
         return {
             "plan_md": "p",
             "contracts": {
@@ -3501,7 +3501,7 @@ def test_scaffold_executor_happy_path_accumulates_context(
     def fake_generate(path, description, provider, *,
                       layer=None, existing_files_with_content=None,
                       goal=None, on_token=None, depends_on=None,
-                      contracts=None):
+                      contracts=None, skills=None):
         seen_contexts.append(
             [c["path"] for c in (existing_files_with_content or [])])
         body = f"# {path}\nprint('{path}')\n"
@@ -3547,7 +3547,7 @@ def test_scaffold_threads_contracts_to_generator(store, monkeypatch):
     def fake_generate(path, description, provider, *,
                       layer=None, existing_files_with_content=None,
                       goal=None, on_token=None, depends_on=None,
-                      contracts=None):
+                      contracts=None, skills=None):
         seen.append(contracts)
         return {"file": path, "patch": f"+++ {path}\nx",
                 "content": "x", "syntax_ok": True}
@@ -3711,7 +3711,7 @@ def test_scaffold_targeted_regenerate_reuses_good_diffs(store, monkeypatch):
     def fake_generate(path, description, provider, *,
                       layer=None, existing_files_with_content=None,
                       goal=None, on_token=None, depends_on=None,
-                      contracts=None):
+                      contracts=None, skills=None):
         seen.append({"path": path,
                      "context": [c["path"]
                                  for c in (existing_files_with_content or [])]})
@@ -3971,7 +3971,8 @@ def test_scaffold_parallel_generation_preserves_order_and_cross_layer_context(
 
     def fake_generate(path, description, provider, *,
                       layer=None, existing_files_with_content=None, goal=None,
-                      on_token=None, depends_on=None, contracts=None):
+                      on_token=None, depends_on=None, contracts=None,
+                      skills=None):
         with lock:
             seen[path] = [c["path"] for c in (existing_files_with_content or [])]
         if path == "src/B.jsx":
@@ -5018,6 +5019,67 @@ def test_api_check_splits_missing_dependency_from_hallucination(
     assert cats[("cerberus", "Schema")] == "api_check_failure"
 
 
+def test_api_check_wrong_path_first_party_is_not_missing_dependency(
+        tmp_path, store, monkeypatch):
+    """A first-party module reached by the wrong import path is a
+    hallucination (regenerate), never a ``missing_dependency`` install."""
+    from cgx.session.tasks import api_check as api_mod
+    from cgx.session.tasks.api_check import run_api_check
+    (tmp_path / "backend").mkdir()
+    (tmp_path / "backend" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "backend" / "app.py").write_text(
+        "app = object()\n", encoding="utf-8")
+    (tmp_path / "tests").mkdir()
+    # The test imports the app by the wrong path (bare ``app``) and also
+    # references a genuinely-absent third-party package (``cerberus``).
+    (tmp_path / "tests" / "test_app.py").write_text(
+        "from app import app\n"
+        "from cerberus import Schema\n",
+        encoding="utf-8")
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    build_art = Artifact.new(
+        session_id=session.session_id, produced_by_task_id="t_build",
+        kind=ArtifactKind.BUILD_REPORT,
+        content={"python_exe": "/fake/.venv/bin/python"})
+    store.save_artifact(build_art)
+
+    def fake_probe(python_exe, specs, timeout):
+        rows = []
+        for module, name in specs:
+            if module == "app":
+                rows.append({
+                    "module": module, "name": name, "ok": False,
+                    "error": "ModuleNotFoundError: No module named 'app'"})
+            elif module == "cerberus":
+                rows.append({
+                    "module": module, "name": name, "ok": False,
+                    "error": ("ModuleNotFoundError: No module named "
+                              "'cerberus'")})
+            else:
+                rows.append({"module": module, "name": name, "ok": True,
+                             "error": ""})
+        return rows, None
+
+    monkeypatch.setattr(api_mod, "_probe_references", fake_probe)
+    t = TaskNode.new(
+        session.session_id, TaskKind.API_CHECK, "api",
+        inputs={"applied_files": ["backend/__init__.py", "backend/app.py",
+                                  "tests/test_app.py"],
+                "build_artifact_id": build_art.artifact_id})
+    result = run_api_check(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    assert result.outputs["outcome"] == "failed"
+    content = result.artifact.content
+    # ``app`` exists on disk (backend/app.py) -> wrong-path hallucination,
+    # not a package to install. Only ``cerberus`` is a genuine missing dep.
+    assert content["missing_modules"] == ["cerberus"]
+    cats = {(r["module"], r["name"]): r.get("category")
+            for r in content["references"] if not r["ok"]}
+    assert cats[("app", "app")] == "api_check_failure"
+    assert cats[("cerberus", "Schema")] == "missing_dependency"
+
+
 def test_api_check_probe_error_skips_outcome(tmp_path, store, monkeypatch):
     """A probe-level failure (e.g. missing python_exe) -> outcome=skipped."""
     from cgx.session.tasks import api_check as api_mod
@@ -5168,6 +5230,44 @@ def test_repair_api_check_missing_dependency_installs(tmp_path, store):
     assert plan.content["missing_modules"] == ["flask", "flask_cors"]
     assert "flask" in plan.content["rationale"]
     assert plan.content["diffs"] == []
+
+
+def test_repair_api_check_unresolved_module_regenerates(tmp_path, store):
+    """An unresolved (wrong-path) module -> regenerate with path-fix guidance,
+    not the 'remove the symbol' rationale used for absent attributes."""
+    from cgx.session.tasks.repair import run_repair
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    report = Artifact.new(
+        session_id=session.session_id, produced_by_task_id="t_api",
+        kind=ArtifactKind.API_CHECK_REPORT,
+        content={
+            "outcome": "failed",
+            "failed_references": [
+                {"module": "app", "name": "app",
+                 "error": "ModuleNotFoundError: No module named 'app'",
+                 "category": "api_check_failure"},
+            ],
+            "missing_modules": [],
+            "hallucinated_references": [{"module": "app", "name": "app"}],
+            "failure_signature": "api_check|app.app",
+        })
+    store.save_artifact(report)
+    t = TaskNode.new(
+        session.session_id, TaskKind.REPAIR, "repair",
+        inputs={"api_check_artifact_id": report.artifact_id,
+                "repair_attempt": 1,
+                "mode": SessionMode.GREENFIELD.value})
+    result = run_repair(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    assert result.failure is None
+    assert result.outputs["classification"] == "api_check_failure"
+    assert result.outputs["strategy"] == "regenerate"
+    assert result.outputs["can_apply"] is False
+    rationale = result.artifact.content["rationale"]
+    assert "could NOT be imported" in rationale
+    assert "correct in-project path" in rationale
+    assert "ASK_USER" not in rationale
 
 
 # --------------------- runner integration (stub executors) ---------------------
@@ -8689,7 +8789,7 @@ def test_scaffold_augments_goal_with_regenerate_constraints(
     def fake_generate(path, description, provider, *,
                       layer=None, existing_files_with_content=None,
                       goal=None, on_token=None, depends_on=None,
-                      contracts=None):
+                      contracts=None, skills=None):
         seen_goals.append(goal)
         body = "x = 1\n"
         return {"file": path, "patch": f"+++ {path}\n{body}",
@@ -8948,7 +9048,7 @@ def test_scaffold_injects_relevant_lessons_into_goal(
     def fake_generate(path, description, provider, *,
                       layer=None, existing_files_with_content=None,
                       goal=None, on_token=None, depends_on=None,
-                      contracts=None):
+                      contracts=None, skills=None):
         seen_goals.append(goal)
         body = "x = 1\n"
         return {"file": path, "patch": f"+++ {path}\n{body}",

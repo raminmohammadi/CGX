@@ -81,10 +81,11 @@ def run_api_check(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         else:
             outcome = "passed" if all(r["ok"] for r in rows) else "failed"
 
+    first_party_mods = _applied_first_party_modules(applied_files)
     rows = _attach_references(rows, references)
     for r in rows:
         if not r.get("ok"):
-            r["category"] = _row_category(r)
+            r["category"] = _row_category(r, first_party_mods)
     failed = [r for r in rows if not r["ok"]]
     # A top-level package that is simply absent from the venv is a
     # bootstrap/install problem, not a hallucinated API. Split those out
@@ -106,7 +107,9 @@ def run_api_check(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         "applied_files": list(applied_files),
         "references": rows,
         "outcome": outcome,
-        "failed_references": [{"module": r["module"], "name": r["name"]}
+        "failed_references": [{"module": r["module"], "name": r["name"],
+                               "error": r.get("error", ""),
+                               "category": r.get("category", "")}
                               for r in failed],
         "missing_modules": missing_modules,
         "hallucinated_references": [{"module": r["module"], "name": r["name"]}
@@ -301,20 +304,54 @@ def _attach_references(rows: List[Dict[str, Any]],
 _NO_MODULE_RE = re.compile(r"No module named '([^']+)'")
 
 
-def _row_category(row: Dict[str, Any]) -> str:
+def _applied_first_party_modules(applied_files: List[str]) -> frozenset:
+    """Top-level module names that resolve to a first-party file on disk.
+
+    Covers a module referenced by the *wrong import path* -- e.g. a test
+    that does ``from app import x`` while the app actually lives at
+    ``backend/app.py``. The probe imports bare ``app``, which raises
+    ``ModuleNotFoundError: No module named 'app'`` even though ``app`` is
+    a perfectly real first-party module. Such a name must never be treated
+    as a third-party package to install (pip cannot satisfy it); the fix is
+    to regenerate the offending import. Each applied ``.py`` file
+    contributes its module stem, and a package ``__init__.py`` contributes
+    its directory name.
+    """
+    mods: set = set()
+    for rel in applied_files:
+        p = Path(rel)
+        if p.suffix != ".py":
+            continue
+        if p.stem == "__init__":
+            if p.parent.name:
+                mods.add(p.parent.name)
+        elif p.stem:
+            mods.add(p.stem)
+    return frozenset(mods)
+
+
+def _row_category(row: Dict[str, Any],
+                  first_party_mods: frozenset) -> str:
     """Classify a failed probe row as missing-dependency vs hallucination.
 
     ``missing_dependency`` when a whole top-level package is absent from
     the venv -- i.e. a ``ModuleNotFoundError`` for a *dotless* module
-    name (``No module named 'flask'``). That is a bootstrap/install
-    problem: the referenced symbol may be perfectly valid. Everything
-    else -- an ``AttributeError`` on an installed module, or a missing
-    *submodule* of an installed package (``No module named 'flask.foo'``)
-    -- is a genuine ``api_check_failure`` (hallucinated API).
+    name (``No module named 'flask'``) that is **not** a first-party
+    module present on disk. That is a bootstrap/install problem: the
+    referenced symbol may be perfectly valid. Everything else -- an
+    ``AttributeError`` on an installed module, a missing *submodule* of an
+    installed package (``No module named 'flask.foo'``), or a dotless name
+    that matches a first-party module reached by the wrong import path
+    (``app`` when the file is ``backend/app.py``) -- is a genuine
+    ``api_check_failure`` (hallucinated / mis-routed import) that pip
+    cannot fix, so it routes to a regenerate instead of a no-op
+    ``install_deps`` loop.
     """
     err = str(row.get("error") or "")
     m = _NO_MODULE_RE.search(err)
     if m and "." not in m.group(1):
+        if m.group(1) in first_party_mods:
+            return "api_check_failure"
         return "missing_dependency"
     return "api_check_failure"
 

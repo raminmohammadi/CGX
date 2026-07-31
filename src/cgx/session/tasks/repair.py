@@ -512,19 +512,42 @@ def _run_api_check_repair(task: TaskNode, deps: ExecutorDeps,
     attempt = int(task.inputs.get("repair_attempt") or 1)
     classification = "api_check_failure"
     if failed:
-        names = ", ".join(
-            f"{r.get('module')}.{r.get('name')}" for r in failed[:5])
-        if len(failed) > 5:
-            names += f", ... (+{len(failed) - 5} more)"
-        rationale = (
-            f"The symbol(s) {names} do NOT exist in the installed "
-            "package version (API_CHECK resolved the module but the "
-            "attribute is absent -- a hallucinated or outdated import). "
-            "When regenerating, REMOVE every reference to those exact "
-            "symbols and use the correct, currently-supported API for the "
-            "installed version instead. In particular, do not import a "
-            "test client from werkzeug -- a Flask test uses "
-            "`app.test_client()` obtained from the app object.")
+        # Split "module could not be imported at all" (a wrong-path or
+        # invented first-party import -- ``from app import x`` when the
+        # module lives at ``backend/app.py``) from "module resolved but the
+        # attribute is absent" (a hallucinated/outdated third-party symbol).
+        # The two need opposite fixes -- correct the import path vs remove
+        # the symbol -- so the regenerate constraint must not conflate them.
+        unresolved = [r for r in failed
+                      if "No module named" in str(r.get("error") or "")]
+        absent = [r for r in failed if r not in unresolved]
+        parts: List[str] = []
+        if unresolved:
+            mods = ", ".join(sorted({str(r.get("module"))
+                                     for r in unresolved}))
+            parts.append(
+                f"The module(s) {mods} could NOT be imported (No module "
+                "named ...). They are not installable third-party packages. "
+                "If a module is defined elsewhere in this project, import it "
+                "by its correct in-project path (e.g. `from backend.app "
+                "import app`), matching the actual file layout; do not "
+                "invent module names. If a module is not real, REMOVE every "
+                "reference to it.")
+        if absent:
+            names = ", ".join(
+                f"{r.get('module')}.{r.get('name')}" for r in absent[:5])
+            if len(absent) > 5:
+                names += f", ... (+{len(absent) - 5} more)"
+            parts.append(
+                f"The symbol(s) {names} do NOT exist in the installed "
+                "package version (API_CHECK resolved the module but the "
+                "attribute is absent -- a hallucinated or outdated import). "
+                "When regenerating, REMOVE every reference to those exact "
+                "symbols and use the correct, currently-supported API for "
+                "the installed version instead. In particular, do not import "
+                "a test client from werkzeug -- a Flask test uses "
+                "`app.test_client()` obtained from the app object.")
+        rationale = " ".join(parts)
     else:
         rationale = (
             "API_CHECK reported a failure but no failed references were "
