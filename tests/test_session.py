@@ -3434,15 +3434,42 @@ def test_decompose_prunes_glob_dependency(store, monkeypatch):
     assert files[0]["depends_on"] == []
 
 
-def test_decompose_fails_on_dependency_cycle(store, monkeypatch):
+def test_decompose_breaks_dependency_cycle(store, monkeypatch):
+    # depends_on is only an ordering hint, so a cycle (a routine slip
+    # for small local models) is repaired in place -- the back-edge is
+    # dropped -- instead of terminally failing the session.
     result = _run_decompose_with_manifest(store, monkeypatch, {
         "plan_md": "p",
         "layers": [{"name": "core", "files": [
             {"path": "a.py", "description": "a", "depends_on": ["b.py"]},
             {"path": "b.py", "description": "b", "depends_on": ["a.py"]}]}],
     })
-    assert result.failure
-    assert "circular dependency" in result.failure
+    assert result.failure is None
+    files = result.artifact.content["layers"][0]["files"]
+    deps = {f["path"]: f.get("depends_on") or [] for f in files}
+    # Exactly one edge survives; the surviving edge still orders the pair.
+    assert sorted(len(d) for d in deps.values()) == [0, 1]
+    paths = [f["path"] for f in files]
+    kept_src = next(p for p, d in deps.items() if d)
+    assert paths.index(deps[kept_src][0]) < paths.index(kept_src)
+
+
+def test_decompose_breaks_self_and_three_node_cycle(store, monkeypatch):
+    # A longer cycle (a -> b -> c -> a) is also broken deterministically
+    # and the manifest proceeds to a valid topological order.
+    result = _run_decompose_with_manifest(store, monkeypatch, {
+        "plan_md": "p",
+        "layers": [{"name": "core", "files": [
+            {"path": "a.py", "description": "a", "depends_on": ["b.py"]},
+            {"path": "b.py", "description": "b", "depends_on": ["c.py"]},
+            {"path": "c.py", "description": "c", "depends_on": ["a.py"]}]}],
+    })
+    assert result.failure is None
+    files = result.artifact.content["layers"][0]["files"]
+    paths = [f["path"] for f in files]
+    for f in files:
+        for dep in f.get("depends_on") or []:
+            assert paths.index(dep) < paths.index(f["path"])
 
 
 def test_decompose_fails_when_no_source_entry_point(store, monkeypatch):
