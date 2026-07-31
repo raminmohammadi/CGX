@@ -6126,6 +6126,48 @@ def test_classify_missing_module_pythonpath_from_collection_error():
     assert classify_verify_report(content) == "missing_module_pythonpath"
 
 
+def test_classify_relative_import_beyond_top_level():
+    """`attempted relative import beyond top-level package` -> its own token."""
+    from cgx.session.repair.classify import classify_verify_report
+    content = {
+        "outcome": "collection_error",
+        "returncode": 2,
+        "stdout": (
+            "ImportError while importing test module 'tests/test_app.py'.\n"
+            "src/app.py:1: in <module>\n"
+            "    from ..config import API_BASE\n"
+            "E   ImportError: attempted relative import beyond top-level "
+            "package\n"),
+        "stderr": "",
+    }
+    assert classify_verify_report(content) == "relative_import_error"
+
+
+def test_classify_relative_import_no_known_parent():
+    """The `with no known parent package` phrasing maps to the same token."""
+    from cgx.session.repair.classify import classify_verify_report
+    content = {
+        "outcome": "collection_error",
+        "returncode": 2,
+        "stdout": (
+            "E   ImportError: attempted relative import with no known parent "
+            "package\n"),
+        "stderr": "",
+    }
+    assert classify_verify_report(content) == "relative_import_error"
+
+
+def test_relative_import_error_routes_to_regenerate():
+    """The classifier token forces a regenerate strategy, not an LLM patch."""
+    from cgx.session.tasks.repair import _select_repair_strategy
+    strategy, constraints = _select_repair_strategy(
+        classification="relative_import_error", diffs=[],
+        rationale="re-author the failing module", extra_plan_fields={},
+        locations_payload=[])
+    assert strategy == "regenerate"
+    assert constraints["kind"] == "relative_import_error"
+
+
 def test_missing_module_names_extracts_dotted_targets():
     """Dotted module paths from pytest output are deduped + order-preserved."""
     from cgx.session.repair.classify import missing_module_names

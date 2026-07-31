@@ -29,6 +29,7 @@ from cgx.trace import traced
 
 REPAIR_CLASSIFICATIONS: Tuple[str, ...] = (
     "third_party_import_break",
+    "relative_import_error",
     "unittest_pytest_mix",
     "missing_module_pythonpath",
     "missing_fixture",
@@ -94,6 +95,18 @@ _CANNOT_IMPORT_NAME_RE = re.compile(
     r"from\s+'([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)'"
 )
 
+# A relative import that resolves above the package root -- ``from ..x
+# import y`` in a module that is not deep enough, or a first-party module
+# run without its package context. Python renders this as
+# ``ImportError: attempted relative import beyond top-level package`` (or
+# ``with no known parent package``). There is no mechanical patch: the
+# scaffold authored an import that cannot resolve, so REPAIR re-authors the
+# offending module(s) with the failure folded in as a regenerate constraint.
+_RELATIVE_IMPORT_RE = re.compile(
+    r"attempted relative import (?:beyond top-level package|"
+    r"with no known parent package)"
+)
+
 
 # --------------------- registry ---------------------
 
@@ -107,6 +120,8 @@ _ClassifierFn = Callable[[Dict[str, Any]], bool]
 _CLASSIFIER_REGISTRY: Tuple[Tuple[RepairClassification, _ClassifierFn], ...] = (
     ("third_party_import_break",
      lambda c: bool(_CANNOT_IMPORT_NAME_RE.search(_failure_text(c)))),
+    ("relative_import_error",
+     lambda c: bool(_RELATIVE_IMPORT_RE.search(_failure_text(c)))),
     ("unittest_pytest_mix",
      lambda c: bool(_UNITTEST_HELPER_RE.search(_failure_text(c)))),
     ("missing_module_pythonpath",

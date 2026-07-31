@@ -100,6 +100,7 @@ _LLM_REPAIR_RETRIEVAL_SLACK = 4
 # produced.
 _REGENERATE_CLASSES = frozenset({
     "third_party_import_break",
+    "relative_import_error",
     "smoke_import_failure",
     "api_check_failure",
     "runtime_failure",
@@ -226,6 +227,20 @@ def run_repair(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             "inside a @pytest.fixture or any other function -- and "
             "fixtures must not be named 'test_*'. Rewrite the test "
             "module(s) so every test is a top-level 'def test_*'.")
+    elif classification == "relative_import_error":
+        # An "attempted relative import beyond top-level package" (or with no
+        # known parent package): the scaffold authored a relative import that
+        # cannot resolve -- a phantom sibling module or a level that walks
+        # above the package root. There is no mechanical patch; re-scaffold
+        # with an explicit constraint so the regenerated module imports only
+        # real first-party modules (preferring absolute imports).
+        rationale = (
+            "A relative import could not be resolved (Python raised "
+            "'attempted relative import beyond top-level package' / 'with no "
+            "known parent package'). Re-author the offending module(s) so "
+            "every first-party import targets a module that actually exists "
+            "in the project -- prefer absolute imports rooted at the top-level "
+            "package, and never import a module that was not generated.")
     else:
         diffs = _propose_llm_logic_repair(task, deps, content)
         if diffs:
