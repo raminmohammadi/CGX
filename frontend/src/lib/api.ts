@@ -42,6 +42,29 @@ export type ProfileSummary = {
   allow_no_auth?: boolean;
 };
 
+// Distinct from ProfileSummary (an LLM connection preset) -- an Agent
+// Profile is a saved {task, skills} bundle a session can be launched from.
+export type AgentProfileSummary = {
+  name: string;
+  objective: string;
+  project_root: string;
+  mode: string; // "" (auto) | "explore" | "greenfield"
+  skills: string[];
+};
+
+export type SkillSummary = {
+  name: string;
+  role: string;
+  aliases: string[];
+  description: string;
+  is_custom: boolean;
+};
+
+export type SkillValidationError = {
+  error_kind: string;
+  error_detail: string;
+};
+
 export type RunningModel = {
   name: string;
   model?: string;
@@ -403,6 +426,32 @@ export const api = {
       `/api/profiles/${encodeURIComponent(name)}`,
       "DELETE",
     ),
+
+  listAgentProfiles: () => jsonReq<AgentProfileSummary[]>("/api/agent-profiles"),
+  upsertAgentProfile: (name: string, body: Omit<AgentProfileSummary, "name">) =>
+    jsonReq<AgentProfileSummary>(
+      `/api/agent-profiles/${encodeURIComponent(name)}`,
+      "PUT",
+      { name, ...body },
+    ),
+  deleteAgentProfile: (name: string) =>
+    jsonReq<{ deleted: string }>(
+      `/api/agent-profiles/${encodeURIComponent(name)}`,
+      "DELETE",
+    ),
+
+  listSkills: () => jsonReq<SkillSummary[]>("/api/skills"),
+  getSkillSource: (name: string) =>
+    jsonReq<{ name: string; source: string }>(
+      `/api/skills/${encodeURIComponent(name)}/source`,
+    ),
+  createSkill: (source: string) =>
+    jsonReq<SkillSummary>("/api/skills", "POST", { source }),
+  updateSkill: (name: string, source: string) =>
+    jsonReq<SkillSummary>(`/api/skills/${encodeURIComponent(name)}`, "PUT", { source }),
+  deleteSkill: (name: string) =>
+    jsonReq<{ deleted: string }>(`/api/skills/${encodeURIComponent(name)}`, "DELETE"),
+
   pingProvider: (body: {
     kind: string;
     base_url: string;
@@ -448,6 +497,7 @@ export const api = {
     index: IndexLocation;
     provider: ProviderConfig;
     run_initial_task?: boolean;
+    skills?: string[];
   }) => jsonReq<AgentSessionState>("/api/agent-session", "POST", body),
   agentSessionList: (projectRoot?: string | null) => {
     const q = projectRoot

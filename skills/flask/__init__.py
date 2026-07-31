@@ -19,6 +19,7 @@ class FlaskSkill(Skill):
     name = "flask"
     role = "backend"
     aliases = ("Flask",)
+    description = "Flask Python backend service (WSGI, Blueprints)."
 
     def detect(self, goal: str) -> float:
         if _FLASK_RE.search(goal or ""):

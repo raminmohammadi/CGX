@@ -38,6 +38,7 @@ from cgx.session.tasks.base import (
     ExecutorDeps,
     ExecutorResult,
     register_executor,
+    session_skills,
 )
 
 logger = logging.getLogger(__name__)
@@ -90,6 +91,11 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     contracts = content.get("contracts")
     if not isinstance(contracts, dict) or not contracts:
         contracts = None
+
+    # Explicit skill selection (e.g. from an Agent Profile) pinned on the
+    # session; ``None`` when unset so the generator falls back to
+    # auto-detecting from ``goal`` exactly as before.
+    skills = session_skills(task, deps)
 
     # Phase 6.1: when REPAIR routed a regenerate verdict here, fold the
     # accumulated constraint payloads into the goal so the per-file
@@ -240,7 +246,7 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
                     pool.submit(
                         _generate_one, p, d, layer_name,
                         list(context_snapshot), deps.provider, goal,
-                        depends_on=dep, contracts=contracts): i
+                        depends_on=dep, contracts=contracts, skills=skills): i
                     for i, (p, d, dep) in enumerate(pending)
                 }
                 for fut in as_completed(fut_to_idx):
@@ -265,7 +271,7 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
                 ok, fail = _generate_one(
                     p, d, layer_name, list(existing_with_content),
                     deps.provider, goal, on_token=on_token,
-                    depends_on=dep, contracts=contracts)
+                    depends_on=dep, contracts=contracts, skills=skills)
                 elapsed_ms = int((time.time() - started) * 1000)
                 layer_results.append((ok, fail))
                 if ok is not None:
@@ -340,7 +346,7 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             diffs=diffs, generated=generated,
             existing_with_content=existing_with_content,
             layers=layers, goal=goal, provider=deps.provider,
-            contracts=contracts)
+            contracts=contracts, skills=skills)
     except Exception:  # pragma: no cover - defensive: pass is best-effort
         logger.exception(
             "SCAFFOLD: coherence reconciliation raised; skipping")
@@ -431,6 +437,7 @@ def _generate_one(
         on_token: Optional[Callable[[str], None]] = None,
         depends_on: Optional[List[str]] = None,
         contracts: Optional[Dict[str, Any]] = None,
+        skills: Optional[List[str]] = None,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, str]]]:
     """Generate one scaffold file. Returns ``(ok_entry, fail_entry)``.
 
@@ -444,7 +451,9 @@ def _generate_one(
     deltas for live progress. ``depends_on`` scopes the context digest to
     the manifest-declared dependency paths. ``contracts`` is the WORK_PLAN
     shared-interface block, threaded verbatim so every file honours the
-    same declared endpoints/schemas/signatures.
+    same declared endpoints/schemas/signatures. ``skills`` pins the
+    generator to an explicit skill list instead of auto-detecting from
+    ``goal`` -- ``None`` preserves the existing auto-detect behavior.
     """
     from cgx.answer.engine import generate_single_scaffold_file
     try:
@@ -453,6 +462,7 @@ def _generate_one(
             layer=layer_name,
             existing_files_with_content=context,
             goal=goal,
+            skills=skills,
             on_token=on_token,
             depends_on=depends_on,
             contracts=contracts,
@@ -771,6 +781,7 @@ def _reconcile_import_warnings(
         goal: str,
         provider: Any,
         contracts: Optional[Dict[str, Any]],
+        skills: Optional[List[str]] = None,
 ) -> int:
     """Regenerate importer files whose first-party imports don't resolve.
 
@@ -839,7 +850,7 @@ def _reconcile_import_warnings(
                        if e.get("path") != path]
             ok, _fail = _generate_one(
                 path, desc, layer_name, context, provider, aug_goal,
-                depends_on=dep, contracts=contracts)
+                depends_on=dep, contracts=contracts, skills=skills)
             if ok is None:
                 continue
             di = _find(diffs, "file", path)

@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from cgx.session.models import (
     ArtifactKind,
@@ -101,7 +101,8 @@ class SessionRunner:
                       mode: SessionMode = SessionMode.EXPLORE,
                       max_task_runs: Optional[int] = None,
                       max_wall_seconds: Optional[float] = None,
-                      headless: bool = False) -> Session:
+                      headless: bool = False,
+                      skills: Optional[List[str]] = None) -> Session:
         """Create a session + its root task and persist both.
 
         ``mode`` decides whether the router seeds an EXPLORE root (default,
@@ -109,12 +110,14 @@ class SessionRunner:
         ``max_task_runs`` / ``max_wall_seconds`` cap the session's
         autonomous work (``None`` = unlimited); ``headless`` makes budget
         exhaustion terminal ``FAILED`` instead of pausing on an ASK_USER.
+        ``skills`` pins the plan/scaffold executors to an explicit skill
+        list instead of auto-detecting from the objective text.
         """
         session = Session.new(original_objective=objective,
                               project_root=project_root, title=title,
                               mode=mode, max_task_runs=max_task_runs,
                               max_wall_seconds=max_wall_seconds,
-                              headless=headless)
+                              headless=headless, skills=skills)
         self._store.save_session(session)
         # Trace the seed-router call inside the session's context so the
         # on_user_message records land in the project agent.log.

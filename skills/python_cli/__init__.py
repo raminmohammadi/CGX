@@ -31,6 +31,7 @@ class PythonCliSkill(Skill):
     name = "python_cli"
     role = "cli"
     aliases = ("Python CLI", "python script", "argparse")
+    description = "Python command-line tool (argparse/click-style entry point)."
 
     def detect(self, goal: str) -> float:
         g = goal or ""

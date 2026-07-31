@@ -27,6 +27,7 @@ from cgx.session.tasks.base import (
     ExecutorDeps,
     ExecutorResult,
     register_executor,
+    session_skills,
 )
 
 logger = logging.getLogger(__name__)
@@ -56,7 +57,8 @@ def run_decompose(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
 
     try:
         result = plan_scaffold_manifest(
-            composed_goal, deps.provider, goal=composed_goal)
+            composed_goal, deps.provider, goal=composed_goal,
+            skills=session_skills(task, deps))
     except Exception as exc:
         logger.exception("DECOMPOSE: plan_scaffold_manifest crashed")
         return ExecutorResult(

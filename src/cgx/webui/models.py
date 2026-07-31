@@ -109,6 +109,29 @@ class ProfileUpsertRequest(BaseModel):
     allow_no_auth: bool = False
 
 
+class AgentProfileUpsertRequest(BaseModel):
+    """Save a reusable {objective, project root, mode, skills} bundle.
+
+    Distinct from :class:`ProfileUpsertRequest` (an LLM connection
+    preset) -- this is a task template an agent session can be launched
+    from.
+    """
+    name: str
+    objective: str
+    project_root: str = ""
+    mode: str = ""  # "" (auto) | "explore" | "greenfield"
+    skills: List[str] = Field(default_factory=list)
+
+
+class SkillCreateRequest(BaseModel):
+    """Full Python source for a new custom skill (one ``Skill`` subclass)."""
+    source: str
+
+
+class SkillUpdateRequest(BaseModel):
+    source: str
+
+
 class SessionCreateRequest(BaseModel):
     title: Optional[str] = None
 
@@ -137,6 +160,9 @@ class AgentSessionCreateRequest(BaseModel):
     index: IndexLocation = Field(default_factory=IndexLocation)
     provider: ProviderConfig = Field(default_factory=ProviderConfig)
     run_initial_task: bool = True
+    # Explicit skill names to use instead of auto-detecting from the
+    # objective text. Empty (the default) preserves today's behavior.
+    skills: List[str] = Field(default_factory=list)
 
 
 class AgentSessionMessageRequest(BaseModel):
@@ -183,6 +209,22 @@ class ProfileSummary(BaseModel):
     num_ctx: Optional[int] = None
     endpoint_path: str = "/v1/chat/completions"
     allow_no_auth: bool = False
+
+
+class AgentProfileSummary(BaseModel):
+    name: str
+    objective: str
+    project_root: str = ""
+    mode: str = ""
+    skills: List[str] = Field(default_factory=list)
+
+
+class SkillSummary(BaseModel):
+    name: str
+    role: str
+    aliases: List[str] = Field(default_factory=list)
+    description: str = ""
+    is_custom: bool = False
 
 
 class SessionSummary(BaseModel):

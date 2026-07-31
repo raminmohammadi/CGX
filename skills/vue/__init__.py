@@ -20,6 +20,7 @@ class VueSkill(Skill):
     name = "vue"
     role = "frontend"
     aliases = ("Vue", "Vue.js", "VueJS", "Nuxt")
+    description = "Vue 3 (Composition API) frontend, with Nuxt co-detection."
 
     def detect(self, goal: str) -> float:
         g = goal or ""

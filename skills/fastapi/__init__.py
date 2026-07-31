@@ -19,6 +19,7 @@ class FastAPISkill(Skill):
     name = "fastapi"
     role = "backend"
     aliases = ("FastAPI", "Fast API")
+    description = "FastAPI Python backend service with pydantic models and uvicorn."
 
     def detect(self, goal: str) -> float:
         g = goal or ""

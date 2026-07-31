@@ -8,9 +8,13 @@ beyond what the Judge integration tests already do.
 
 from __future__ import annotations
 
+import time
 from typing import Any, Dict, List
 
+import pytest
+
 import skills
+from skills import loader as skill_loader
 from skills.base import SKILL_DETECT_THRESHOLD, Skill, SkillVerdict
 
 
@@ -211,3 +215,139 @@ def test_planner_attaches_detected_skill_names_to_scaffold_inputs():
     assert manifest_tasks, "expected a scaffold_manifest task"
     attached = manifest_tasks[0].inputs.get("skills") or []
     assert "react" in attached and "fastapi" in attached
+
+
+# ---------------------------------------------------------------------------
+# Custom skills (user-authored, loaded from disk)
+# ---------------------------------------------------------------------------
+
+_VALID_SKILL_SOURCE = '''
+from skills.base import Skill
+
+class GraphQLSkill(Skill):
+    name = "graphql"
+    role = "backend"
+    aliases = ("GraphQL",)
+    description = "GraphQL API layer."
+
+    def detect(self, goal: str) -> float:
+        return 0.9 if "graphql" in (goal or "").lower() else 0.0
+
+    def scaffold_system_prompt(self) -> str:
+        return "BACKEND -- expose a GraphQL endpoint"
+'''
+
+_HANGING_SKILL_SOURCE = '''
+from skills.base import Skill
+
+class HangSkill(Skill):
+    name = "hangs_forever"
+
+    def detect(self, goal: str) -> float:
+        while True:
+            pass
+'''
+
+
+@pytest.fixture()
+def custom_skills_dir(tmp_path, monkeypatch):
+    d = tmp_path / "skills"
+    d.mkdir()
+    monkeypatch.setattr(skill_loader, "CUSTOM_SKILLS_DIR", d)
+    monkeypatch.setattr(skill_loader, "_cache_signature", None)
+    monkeypatch.setattr(skill_loader, "_cache", [])
+    return d
+
+
+def test_custom_skill_loads_and_participates_in_registry(custom_skills_dir):
+    (custom_skills_dir / "graphql.py").write_text(_VALID_SKILL_SOURCE)
+
+    described = {d["name"]: d for d in skills.describe_skills()}
+    assert described["graphql"]["is_custom"] is True
+    assert described["graphql"]["description"] == "GraphQL API layer."
+
+    detected = [s.name for s in skills.detect_skills("Build a GraphQL API for todos")]
+    assert "graphql" in detected
+
+    resolved = skills.skills_by_names(["graphql", "fastapi"])
+    assert [s.name for s in resolved] == ["graphql", "fastapi"]
+
+    assert "graphql" in skills.known_skill_names()
+
+
+def test_load_custom_skills_skips_bad_file_without_crashing_registry(custom_skills_dir):
+    (custom_skills_dir / "good.py").write_text(_VALID_SKILL_SOURCE)
+    (custom_skills_dir / "broken.py").write_text("def not a valid python(:")
+
+    loaded = skill_loader.load_custom_skills(force=True)
+    assert [s.name for s in loaded] == ["graphql"]
+    # The whole registry keeps working despite the broken file.
+    assert skills.detect_skills("graphql please") != []
+
+
+def test_validate_skill_source_accepts_valid_skill():
+    result = skill_loader.validate_skill_source(
+        _VALID_SKILL_SOURCE, known_names=skills.known_skill_names())
+    assert result.ok is True
+    assert result.meta["name"] == "graphql"
+    assert result.meta["role"] == "backend"
+
+
+def test_validate_skill_source_rejects_syntax_error():
+    result = skill_loader.validate_skill_source(
+        "def broken(:", known_names=set())
+    assert result.ok is False
+    assert result.error_kind == "syntax_error"
+
+
+def test_validate_skill_source_rejects_missing_skill_class():
+    result = skill_loader.validate_skill_source(
+        "x = 1\n", known_names=set())
+    assert result.ok is False
+    assert result.error_kind == "no_skill_class"
+
+
+def test_validate_skill_source_rejects_multiple_skill_classes():
+    source = _VALID_SKILL_SOURCE + '''
+class AnotherSkill(Skill):
+    name = "another"
+    def detect(self, goal: str) -> float:
+        return 0.0
+'''
+    result = skill_loader.validate_skill_source(source, known_names=set())
+    assert result.ok is False
+    assert result.error_kind == "multiple_skill_classes"
+
+
+def test_validate_skill_source_rejects_name_collision_with_builtin():
+    source = _VALID_SKILL_SOURCE.replace('name = "graphql"', 'name = "react"')
+    result = skill_loader.validate_skill_source(
+        source, known_names=skills.known_skill_names())
+    assert result.ok is False
+    assert result.error_kind == "name_collision"
+
+
+def test_validate_skill_source_rejects_hanging_detect():
+    started = time.time()
+    result = skill_loader.validate_skill_source(
+        _HANGING_SKILL_SOURCE, known_names=set())
+    elapsed = time.time() - started
+    assert result.ok is False
+    assert result.error_kind == "timeout"
+    # Bounded by the probe's own timeout, not left to hang indefinitely.
+    assert elapsed < 15
+
+
+def test_read_skill_source_returns_builtin_file_contents():
+    src = skills.read_skill_source("react")
+    assert src is not None
+    assert "class ReactSkill" in src
+
+
+def test_read_skill_source_returns_custom_file_contents(custom_skills_dir):
+    (custom_skills_dir / "graphql.py").write_text(_VALID_SKILL_SOURCE)
+    assert skills.read_skill_source("graphql") == _VALID_SKILL_SOURCE
+
+
+def test_read_skill_source_returns_none_for_unknown():
+    assert skills.read_skill_source("does-not-exist") is None

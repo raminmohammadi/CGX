@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { Rocket } from "lucide-react";
 import { Field, TextArea, TextInput } from "../Input";
+import { SkillPicker } from "./SkillPicker";
 import { cn } from "../../lib/utils";
 import type { SessionModeValue } from "../../lib/api";
 
@@ -19,6 +20,7 @@ export function SessionLauncher({
   onCreate: (opts: {
     objective: string; projectRoot: string;
     mode: SessionModeValue | null;
+    skills: string[];
   }) => Promise<void> | void;
   pending: boolean;
   error: string | null;
@@ -26,6 +28,7 @@ export function SessionLauncher({
   const [objective, setObjective] = useState("");
   const [projectRoot, setProjectRoot] = useState(defaultProjectRoot);
   const [mode, setMode] = useState<ModeChoice>("auto");
+  const [skills, setSkills] = useState<string[]>([]);
   const canSubmit = objective.trim().length > 0 && !pending;
   return (
     <div className="max-w-2xl mx-auto w-full mt-8 px-6 space-y-5">
@@ -71,6 +74,9 @@ export function SessionLauncher({
           ))}
         </div>
       </Field>
+      <Field label="Skills" hint="Optional; leave empty to auto-detect from the objective.">
+        <SkillPicker selected={skills} onChange={setSkills} />
+      </Field>
       {error && (
         <p className="text-[12px] font-mono text-red-300 bg-red-950/30 border border-red-500/20 rounded px-3 py-2">
           {error}
@@ -84,6 +90,7 @@ export function SessionLauncher({
             objective: objective.trim(),
             projectRoot: projectRoot.trim(),
             mode: mode === "auto" ? null : mode,
+            skills,
           })}
           className="av-btn-primary"
         >

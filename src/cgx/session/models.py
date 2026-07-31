@@ -330,6 +330,11 @@ class Session:
     # (everything except the ASK_USER pause primitive).
     task_runs: int = 0
     first_task_started_at: Optional[float] = None
+    # Explicit skill names chosen at session creation (e.g. via an Agent
+    # Profile), used by the plan/scaffold executors in place of
+    # auto-detecting from goal text. Empty means "auto-detect" -- see
+    # ``cgx.answer.engine._resolve_skills``.
+    skills: List[str] = field(default_factory=list)
 
     @classmethod
     def new(cls, original_objective: str, *, title: Optional[str] = None,
@@ -337,7 +342,8 @@ class Session:
             mode: SessionMode = SessionMode.EXPLORE,
             max_task_runs: Optional[int] = None,
             max_wall_seconds: Optional[float] = None,
-            headless: bool = False) -> "Session":
+            headless: bool = False,
+            skills: Optional[List[str]] = None) -> "Session":
         t = (title or original_objective).strip()
         if len(t) > 80:
             t = t[:77] + "..."
@@ -350,6 +356,7 @@ class Session:
             max_task_runs=max_task_runs,
             max_wall_seconds=max_wall_seconds,
             headless=headless,
+            skills=list(skills or []),
         )
 
     def to_dict(self) -> Dict[str, Any]:

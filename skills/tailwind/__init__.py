@@ -22,6 +22,7 @@ class TailwindSkill(Skill):
     name = "tailwind"
     role = "style"
     aliases = ("Tailwind", "TailwindCSS", "Tailwind CSS")
+    description = "Tailwind CSS utility-first styling addon."
 
     def detect(self, goal: str) -> float:
         if _TAILWIND_RE.search(goal or ""):

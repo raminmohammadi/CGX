@@ -438,6 +438,7 @@ def _session_from_json(blob: str) -> Session:
         first_task_started_at=(float(d["first_task_started_at"])
                                if d.get("first_task_started_at") is not None
                                else None),
+        skills=list(d.get("skills") or []),
     )
 
 

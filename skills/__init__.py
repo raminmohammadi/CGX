@@ -13,13 +13,23 @@ consulted by:
   checks on produced diffs.
 
 Skills are listed explicitly in :data:`SKILLS` so the surface is
-auditable and import order is deterministic. To add a new skill: write
-``skills/<name>.py`` exposing a single ``Skill`` subclass, import it
-here, and append an instance to :data:`SKILLS`.
+auditable and import order is deterministic. To add a new built-in
+skill: write ``skills/<name>.py`` exposing a single ``Skill`` subclass,
+import it here, and append an instance to :data:`SKILLS`.
+
+Users can also add **custom skills** at runtime without touching this
+package: a single ``Skill`` subclass per ``.py`` file under
+``~/.cgx/skills/`` (see :mod:`skills.loader`). Custom skills are loaded
+lazily and merged with :data:`SKILLS` by every public function below
+(:func:`detect_skills`, :func:`skills_by_names`, :func:`describe_skills`)
+via the internal ``_all_skills()`` helper, so they participate in
+detection/prompt-composition/validation identically to built-ins.
 """
 
 from __future__ import annotations
 
+import inspect
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from skills.base import (
@@ -34,6 +44,7 @@ from skills.django import DjangoSkill
 from skills.express import ExpressSkill
 from skills.fastapi import FastAPISkill
 from skills.flask import FlaskSkill
+from skills.loader import load_custom_skills
 from skills.nextjs import NextJsSkill
 from skills.python_cli import PythonCliSkill
 from skills.react import ReactSkill
@@ -66,6 +77,68 @@ SKILLS: List[Skill] = [
 ]
 
 
+def _all_skills() -> List[Skill]:
+    """Built-in skills plus any user-authored custom skills.
+
+    Custom-skill loading fails soft to just the built-ins on any error
+    so a broken loader/directory never breaks detection or resolution.
+    """
+    try:
+        return list(SKILLS) + load_custom_skills()
+    except Exception:
+        return list(SKILLS)
+
+
+def describe_skills() -> List[Dict[str, Any]]:
+    """UI-facing listing: name/role/aliases/description/is_custom per skill."""
+    builtin_names = {s.name for s in SKILLS}
+    return [
+        {
+            "name": s.name,
+            "role": s.role,
+            "aliases": list(s.aliases),
+            "description": getattr(s, "description", ""),
+            "is_custom": s.name not in builtin_names,
+        }
+        for s in _all_skills()
+    ]
+
+
+def known_skill_names(exclude: Optional[str] = None) -> set:
+    """Lower-cased set of every skill's name + aliases, for collision checks."""
+    out: set = set()
+    for s in _all_skills():
+        if s.name == exclude:
+            continue
+        out.add(s.name.lower())
+        out.update(a.lower() for a in s.aliases)
+    return out
+
+
+def read_skill_source(name: str) -> Optional[str]:
+    """Return the Python source for any skill, built-in or custom.
+
+    Custom skills are read straight from their file under
+    ``~/.cgx/skills/``; built-ins are located via :func:`inspect` (their
+    source lives in this package's own tree) so the Skills tab can show
+    "how does this skill work?" for every entry, not just user-authored
+    ones. Read-only either way -- editing/deleting is still restricted
+    to custom skills at the route layer.
+    """
+    from skills.loader import read_custom_skill_source
+    custom = read_custom_skill_source(name)
+    if custom is not None:
+        return custom
+    for s in SKILLS:
+        if s.name == name:
+            try:
+                path = inspect.getsourcefile(type(s))
+                return Path(path).read_text(encoding="utf-8") if path else None
+            except Exception:
+                return None
+    return None
+
+
 def detect_skills(goal: str,
                   threshold: float = SKILL_DETECT_THRESHOLD) -> List[Skill]:
     """Return skills whose ``detect(goal)`` score meets ``threshold``.
@@ -76,7 +149,7 @@ def detect_skills(goal: str,
     if not goal or not goal.strip():
         return []
     scored: List[Tuple[Skill, float]] = []
-    for s in SKILLS:
+    for s in _all_skills():
         try:
             score = float(s.detect(goal))
         except Exception:
@@ -101,7 +174,7 @@ def skills_by_names(names: List[str]) -> List[Skill]:
     """
     if not names:
         return []
-    lookup: Dict[str, Skill] = {s.name: s for s in SKILLS}
+    lookup: Dict[str, Skill] = {s.name: s for s in _all_skills()}
     out: List[Skill] = []
     for n in names:
         s = lookup.get(str(n).strip())
@@ -189,10 +262,13 @@ __all__ = [
     "collect_scaffold_warnings",
     "compose_plan_prompt",
     "compose_scaffold_prompt",
+    "describe_skills",
     "detect_skills",
     "file_paths",
     "file_with_content",
     "has_any_ext",
+    "known_skill_names",
+    "read_skill_source",
     "skill_names",
     "skills_by_names",
     "validate_plan",
