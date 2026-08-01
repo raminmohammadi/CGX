@@ -8,6 +8,11 @@ from pathlib import Path
 
 from cgx.io.persist import load_indices, load_jsonl
 from cgx.answer.providers import LLMProvider
+from cgx.answer.schemas import (
+    MANIFEST_SCHEMA,
+    REPAIR_FILES_SCHEMA,
+    validate_json_schema,
+)
 from cgx.answer.intent import detect_intent  # <-- NEW central intent detection
 from cgx.retrieval.orchestrator import (
     SYMBOL_STOPWORDS as _SYMBOL_STOPWORDS,
@@ -2353,26 +2358,54 @@ def plan_scaffold_manifest(
         listed = "\n".join(f"- {p}" for p in list(existing_files)[:60])
         parts.append("EXISTING FILES (already planned -- do NOT repeat):\n" + listed)
 
-    def _call(user_msg: str) -> Dict[str, Any]:
+    # One schema re-ask for the whole planning call: constrained decoding
+    # makes violations rare, and a model that misses the shape twice on the
+    # same conversation is not going to converge on a third attempt.
+    reask_left = [1]
+
+    def _chat(messages: List[Dict[str, str]]) -> str:
         # Manifest generation is a structural step validated by a
         # deterministic Judge (required files, layer shape). Sampling
         # variance here turns the same prompt into different file trees
         # across retries and makes pass/fail outcomes flaky, so we pin
         # the temperature to 0.
         resp = provider.chat(
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user_msg},
-            ],
+            messages=messages,
             temperature=0.0,
             max_tokens=6000,
             force_json=True,
+            json_schema=MANIFEST_SCHEMA,
         )
         if isinstance(resp, dict) and resp.get("error"):
             logger.warning("plan_scaffold_manifest: provider returned error -- %s",
                            resp.get("error"))
-        raw = (resp or {}).get("content", "") if isinstance(resp, dict) else ""
-        return _extract_json_object(raw) or {}
+        return (resp or {}).get("content", "") if isinstance(resp, dict) else ""
+
+    def _call(user_msg: str) -> Dict[str, Any]:
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user_msg},
+        ]
+        raw = _chat(messages)
+        parsed = _extract_json_object(raw) or {}
+        violations = validate_json_schema(parsed, MANIFEST_SCHEMA)
+        if violations and reask_left[0]:
+            reask_left[0] = 0
+            logger.warning("plan_scaffold_manifest: schema violation, "
+                           "re-asking -- %s", "; ".join(violations[:4]))
+            messages.append({"role": "assistant", "content": raw})
+            messages.append({"role": "user", "content": (
+                "Your reply did not match the required schema. Violations:\n- "
+                + "\n- ".join(violations[:8])
+                + "\n\nReply again with STRICT JSON only, exactly matching the "
+                  'schema in the system message: top-level "plan_md" (string), '
+                  'optional "contracts" (object), and a non-empty "layers" '
+                  'array of {"name", "files": [{"path", "description"}]}. '
+                  "No prose outside JSON.")})
+            reparsed = _extract_json_object(_chat(messages)) or {}
+            if not validate_json_schema(reparsed, MANIFEST_SCHEMA):
+                return reparsed
+        return parsed
 
     def _layers_have_files(p: Dict[str, Any]) -> bool:
         ls = p.get("layers")
@@ -4214,19 +4247,47 @@ def generate_repair_files(
         + localized_note
         + "CURRENT FILES:\n\n" + "\n\n".join(blocks)
     )
+    messages = [
+        {"role": "system", "content": _LOGIC_REPAIR_SYSTEM},
+        {"role": "user", "content": context},
+    ]
     try:
         raw = provider.chat(
-            messages=[
-                {"role": "system", "content": _LOGIC_REPAIR_SYSTEM},
-                {"role": "user", "content": context},
-            ],
+            messages=messages,
             temperature=0.1,
             max_tokens=budget["output_tokens"],
             force_json=True,
+            json_schema=REPAIR_FILES_SCHEMA,
         ).get("content", "")
     except Exception:  # pragma: no cover - defensive: provider hiccup
         return {}
     parsed = _extract_json_object(raw)
+    violations = validate_json_schema(parsed or {}, REPAIR_FILES_SCHEMA)
+    if violations:
+        # One bounded re-ask: fold the concrete violations back so the model
+        # fixes the shape; a second miss falls through to the empty mapping
+        # and the caller's regenerate path.
+        logger.warning("generate_repair_files: schema violation, "
+                       "re-asking -- %s", "; ".join(violations[:4]))
+        messages.append({"role": "assistant", "content": raw})
+        messages.append({"role": "user", "content": (
+            "Your reply did not match the required schema. Violations:\n- "
+            + "\n- ".join(violations[:8])
+            + "\n\nReply again with STRICT JSON only: "
+              '{"files": [{"path": "<known path>", "content": "<complete '
+              'corrected file>"}]}. Use {"files": []} to decline. '
+              "No prose outside JSON.")})
+        try:
+            raw = provider.chat(
+                messages=messages,
+                temperature=0.0,
+                max_tokens=budget["output_tokens"],
+                force_json=True,
+                json_schema=REPAIR_FILES_SCHEMA,
+            ).get("content", "")
+        except Exception:  # pragma: no cover - defensive: provider hiccup
+            return {}
+        parsed = _extract_json_object(raw)
     entries = parsed.get("files") if parsed else None
     if not isinstance(entries, list):
         return {}
