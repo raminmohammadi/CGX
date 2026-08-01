@@ -388,7 +388,25 @@ def _clarify_requirements_to_ask(parent: TaskNode) -> List[TaskNode]:
 
 
 def _decompose_to_ask(parent: TaskNode) -> List[TaskNode]:
-    """Spawn the ASK_USER(APPROVE_PLAN) gate for a finished DECOMPOSE."""
+    """Spawn the ASK_USER(APPROVE_PLAN) gate for a finished DECOMPOSE.
+
+    A re-planned DECOMPOSE carries the failed chain's flap ledger
+    (``prior_failure_signatures``); it rides the approval gate down to
+    the new SCAFFOLD so the revised manifest's chain is not amnesiac
+    about failures the previous manifest already produced.
+    """
+    inputs: Dict[str, Any] = {
+        "expected_kind": DecisionKind.APPROVE_PLAN.value,
+        "work_plan_artifact_id": parent.produced_artifact_id,
+        "prior_goal": parent.inputs.get("prior_goal"),
+        "requirements_artifact_id":
+            parent.inputs.get("requirements_artifact_id"),
+        "replan_attempt": parent.inputs.get("replan_attempt"),
+    }
+    signatures = list(LoopBudget.from_inputs(
+        parent.inputs).prior_failure_signatures)
+    if signatures:
+        inputs["prior_failure_signatures"] = signatures
     return [TaskNode.new(
         session_id=parent.session_id,
         kind=TaskKind.ASK_USER,
@@ -396,14 +414,7 @@ def _decompose_to_ask(parent: TaskNode) -> List[TaskNode]:
         description=("Review the proposed file manifest and approve to "
                      "begin scaffolding."),
         parent_task_id=parent.task_id,
-        inputs={
-            "expected_kind": DecisionKind.APPROVE_PLAN.value,
-            "work_plan_artifact_id": parent.produced_artifact_id,
-            "prior_goal": parent.inputs.get("prior_goal"),
-            "requirements_artifact_id":
-                parent.inputs.get("requirements_artifact_id"),
-            "replan_attempt": parent.inputs.get("replan_attempt"),
-        },
+        inputs=inputs,
     )]
 
 
@@ -1292,13 +1303,31 @@ def _from_clarify_answers(ask: TaskNode,
 
 def _from_approve_plan(ask: TaskNode,
                        decision: Decision) -> Optional[TaskNode]:
-    """Spawn SCAFFOLD when the user approves the work plan."""
+    """Spawn SCAFFOLD when the user approves the work plan.
+
+    Carries the flap ledger a re-plan folded into the approval gate, so
+    :func:`_scaffold_to_apply` threads it down the new chain and a
+    revised manifest that reproduces an already-seen failure is stopped
+    by ``budget.seen()`` instead of spending a fresh repair budget.
+    """
     if not bool(decision.chosen.get("approved")):
         return None
     work_plan_artifact_id = str(
         ask.inputs.get("work_plan_artifact_id") or "").strip()
     if not work_plan_artifact_id:
         return None
+    inputs: Dict[str, Any] = {
+        "work_plan_artifact_id": work_plan_artifact_id,
+        "requirements_artifact_id":
+            ask.inputs.get("requirements_artifact_id"),
+        "prior_goal": ask.inputs.get("prior_goal"),
+        "replan_attempt": ask.inputs.get("replan_attempt"),
+        "decision_id": decision.decision_id,
+    }
+    signatures = list(LoopBudget.from_inputs(
+        ask.inputs).prior_failure_signatures)
+    if signatures:
+        inputs["prior_failure_signatures"] = signatures
     return TaskNode.new(
         session_id=ask.session_id,
         kind=TaskKind.SCAFFOLD,
@@ -1306,12 +1335,5 @@ def _from_approve_plan(ask: TaskNode,
         description=("Generate the content for each file in the work "
                      "plan, layer by layer."),
         parent_task_id=ask.task_id,
-        inputs={
-            "work_plan_artifact_id": work_plan_artifact_id,
-            "requirements_artifact_id":
-                ask.inputs.get("requirements_artifact_id"),
-            "prior_goal": ask.inputs.get("prior_goal"),
-            "replan_attempt": ask.inputs.get("replan_attempt"),
-            "decision_id": decision.decision_id,
-        },
+        inputs=inputs,
     )

@@ -9689,6 +9689,75 @@ def test_router_replan_attempt_threads_decompose_to_scaffold():
     assert sc.inputs["replan_attempt"] == 1
 
 
+def test_router_replan_carries_flap_ledger_into_new_decompose():
+    """A re-plan must not restart the failure ledger from empty.
+
+    Observed live: a re-planned manifest reproduced the identical
+    ``smoke_import|npm run build --silent`` failure and, because the new
+    chain had never seen the signature, spent a second full repair
+    budget on it before the session finally failed.
+    """
+    from cgx.session.budget import REGENERATE_BUDGET
+    session, _parent, scaffold, tasks = _build_scaffold_failed_chain(
+        prior_regens=REGENERATE_BUDGET)
+    scaffold.inputs["prior_failure_signatures"] = [
+        "smoke_import|npm run build --silent"]
+    plan = Router().on_task_completed(
+        session=session, completed=scaffold, tasks=tasks)
+    dec = [a.task for a in plan.actions if isinstance(a, CreateTask)][0]
+    assert dec.kind is TaskKind.DECOMPOSE
+    assert dec.inputs["prior_failure_signatures"] == [
+        "smoke_import|npm run build --silent"]
+
+
+def test_router_flap_ledger_threads_replan_decompose_to_scaffold():
+    """The ledger rides DECOMPOSE -> ASK(APPROVE_PLAN) -> SCAFFOLD."""
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    dec = TaskNode.new(
+        session.session_id, TaskKind.DECOMPOSE, "revise",
+        inputs={"prior_goal": "g", "requirements_artifact_id": "art_req",
+                "replan_attempt": 1,
+                "prior_failure_signatures": ["sig-old"]})
+    dec.produced_artifact_id = "art_plan2"
+    dec.status = TaskNodeStatus.DONE
+    plan = Router().on_task_completed(
+        session=session, completed=dec, tasks=[dec])
+    ask = [a.task for a in plan.actions if isinstance(a, CreateTask)][0]
+    assert ask.inputs["prior_failure_signatures"] == ["sig-old"]
+    decision = Decision.new(
+        session.session_id, ask.task_id, DecisionKind.APPROVE_PLAN,
+        "approve plan", {"approved": True})
+    plan2 = Router().on_decision_recorded(
+        session=session, decision=decision, tasks=[ask])
+    sc = [a.task for a in plan2.actions if isinstance(a, CreateTask)][0]
+    assert sc.kind is TaskKind.SCAFFOLD
+    assert sc.inputs["prior_failure_signatures"] == ["sig-old"]
+    # And on down the regenerated write chain.
+    sc.produced_artifact_id = "art_scaffold2"
+    sc.status = TaskNodeStatus.DONE
+    plan3 = Router().on_task_completed(
+        session=session, completed=sc, tasks=[sc])
+    ap = [a.task for a in plan3.actions if isinstance(a, CreateTask)][0]
+    assert ap.kind is TaskKind.APPLY
+    assert ap.inputs["prior_failure_signatures"] == ["sig-old"]
+
+
+def test_router_first_run_scaffold_has_no_flap_ledger_key():
+    """A non-re-planned approval leaves the ledger key off entirely."""
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    ask = TaskNode.new(
+        session.session_id, TaskKind.ASK_USER, "approve",
+        inputs={"expected_kind": "approve_plan",
+                "work_plan_artifact_id": "art_plan"})
+    decision = Decision.new(
+        session.session_id, ask.task_id, DecisionKind.APPROVE_PLAN,
+        "approve plan", {"approved": True})
+    plan = Router().on_decision_recorded(
+        session=session, decision=decision, tasks=[ask])
+    sc = [a.task for a in plan.actions if isinstance(a, CreateTask)][0]
+    assert "prior_failure_signatures" not in sc.inputs
+
+
 def test_router_scaffold_clean_still_spawns_apply():
     """A SCAFFOLD with no dropped files keeps its SCAFFOLD -> APPLY edge."""
     session, _parent, scaffold, tasks = _build_scaffold_failed_chain(
