@@ -7487,6 +7487,36 @@ def test_missing_fixture_names_extracts_targets_in_order():
     assert missing_fixture_names(content) == ("client", "db")
 
 
+def test_missing_fixture_names_rejects_non_fixture_names():
+    """``self``/``cls``/``request`` are never fixtures a repair can add."""
+    from cgx.session.repair.classify import missing_fixture_names
+    content = {"stdout": (
+        "E       fixture 'self' not found\n"
+        "E       fixture 'cls' not found\n"
+        "E       fixture 'request' not found\n")}
+    assert missing_fixture_names(content) == ()
+    # A real fixture alongside them still comes through.
+    content = {"stdout": ("E       fixture 'self' not found\n"
+                          "E       fixture 'client' not found\n")}
+    assert missing_fixture_names(content) == ("client",)
+
+
+def test_classify_does_not_call_self_a_missing_fixture():
+    """A collected method reported as ``fixture 'self' not found`` is not
+    a missing fixture: classifying it as one ordered a whole-tree
+    regenerate to define a fixture that cannot exist."""
+    from cgx.session.repair.classify import classify_verify_report
+    content = {
+        "outcome": "collection_error",
+        "returncode": 2,
+        "stdout": (
+            "tests/test_widget.py:7: in test_widget\n"
+            "E       fixture 'self' not found\n"),
+        "stderr": "",
+    }
+    assert classify_verify_report(content) != "missing_fixture"
+
+
 def test_locate_missing_fixture_finds_hoist_candidate(tmp_path: Path):
     """Locator picks up @pytest.fixture defs in test files."""
     from cgx.session.repair.locate import locate_missing_fixture

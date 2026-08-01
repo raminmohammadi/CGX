@@ -87,6 +87,16 @@ _FIXTURE_NOT_FOUND_RE = re.compile(
     r"fixture\s+'([A-Za-z_][A-Za-z0-9_]*)'\s+not found"
 )
 
+# Names pytest reports as a "missing fixture" that no fixture can ever
+# supply. ``self``/``cls`` mean a test method was collected outside a
+# collected class (a helper class pytest picked up, or a ``Test`` class
+# with an ``__init__``); ``request`` is a pytest builtin, so its absence
+# means the plugin machinery is broken, not the tree. Treating any of
+# them as a fixture sends the loop hunting a definition that cannot
+# exist -- observed live, where a whole-tree regenerate was ordered to
+# create a fixture named ``self``.
+_NON_FIXTURE_NAMES = frozenset({"self", "cls", "request"})
+
 # Traceback frame shapes that name a source file + line. Pytest renders
 # its own frames as ``path/to/file.py:123: in func`` (and a trailing
 # ``path/to/file.py:123: SomeError`` summary), while a captured Python
@@ -177,7 +187,7 @@ _CLASSIFIER_REGISTRY: Tuple[Tuple[RepairClassification, _ClassifierFn], ...] = (
     ("missing_module_pythonpath",
      lambda c: bool(_MODULE_NOT_FOUND_RE.search(_failure_text(c)))),
     ("missing_fixture",
-     lambda c: bool(_FIXTURE_NOT_FOUND_RE.search(_failure_text(c)))),
+     lambda c: bool(missing_fixture_names(c))),
 )
 
 
@@ -291,12 +301,19 @@ def missing_fixture_names(content: Dict[str, Any]) -> Tuple[str, ...]:
     ``@pytest.fixture`` definition; if every name resolves to an
     on-disk fixture, the proposer hoists the bodies into a conftest.
     Order-preserving and de-duplicated.
+
+    :data:`_NON_FIXTURE_NAMES` are dropped: pytest words the "collected
+    a method outside a collected class" failure as a missing fixture
+    named ``self``, and no repair can conjure that fixture. Filtering
+    here also demotes the classification (the registry predicate reads
+    this function), so such a report falls through to the classifiers
+    that can actually act on it.
     """
     blob = _failure_text(content)
     out: List[str] = []
     for m in _FIXTURE_NOT_FOUND_RE.finditer(blob):
         name = m.group(1)
-        if name and name not in out:
+        if name and name not in out and name not in _NON_FIXTURE_NAMES:
             out.append(name)
     return tuple(out)
 
