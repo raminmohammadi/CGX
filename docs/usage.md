@@ -643,7 +643,11 @@ provisions a project-local `.venv` (via
 `cgx.codegen.test_runner.ensure_project_venv`), installs declared
 requirements, and preflight-installs any undeclared top-level
 imports found in the applied files (successful adds are appended
-back to `requirements.txt`); the resulting `BUILD_REPORT` artifact
+back to `requirements.txt`); it also pre-installs `httpx` when the
+applied files use the fastapi/starlette `TestClient` (an optional
+extra needed only at test-import time) and installs any
+`missing_modules` requested by an `install_deps` repair verdict;
+the resulting `BUILD_REPORT` artifact
 carries the venv path, the manifests installed from, the list of
 installed/failed packages, and an `outcome` token
 (`succeeded` / `failed` / `no_venv` / `skipped` / `partial`).
@@ -668,7 +672,7 @@ If `VERIFY` ends with `outcome=assertions_failed` or
 `collection_error` in greenfield mode, the router spawns a `REPAIR`
 task that runs a deterministic, LLM-free classifier
 (`cgx.session.repair.classify`) against the captured pytest output.
-v1 recognises three classifications:
+The deterministic registry recognises, among others:
 
 * `unittest_pytest_mix` -- scaffolded tests call `self.assertLogs` /
   `self.assertEqual` / etc. on a class that does not inherit from
@@ -709,6 +713,24 @@ v1 recognises three classifications:
   definition exists the diffs are empty and the router escalates to
   `ASK_USER` -- a fixture nobody wrote isn't something the loop can
   invent without an LLM.
+* `missing_dependency` -- a `RuntimeError: ... requires the <pkg>
+  package to be installed` guard (e.g. the fastapi/starlette
+  TestClient's `httpx`, a transitive extra no first-party file
+  imports directly) names the exact distribution, or a
+  `ModuleNotFoundError` names a top-level module that no file or
+  directory under the project root claims. Regenerating source can
+  never install a package, so the plan carries
+  `strategy=install_deps`: the router re-runs `BOOTSTRAP_ENV`,
+  which installs the package(s), syncs `requirements.txt`, and
+  flows back through `API_CHECK` / `SMOKE` / `VERIFY`.
+* `circular_import` -- pytest collection dies with `ImportError:
+  cannot import name ... from partially initialized module ...
+  (most likely due to a circular import)`. No single-file patch can
+  decide which import to break, so the cycle members are folded
+  into a regenerate constraint and the offending module(s) are
+  re-authored. (`SCAFFOLD` also runs a static circular-import gate
+  -- Tarjan SCC over the generated batch's first-party import graph
+  -- so most cycles are broken before the tree is ever applied.)
 
 When no deterministic classifier matches, `REPAIR` falls back to a
 bounded LLM repair that is **traceback-localized** (candidate files
@@ -728,6 +750,11 @@ a new pass still counts as progress), under an absolute ceiling of four
 rounds and a `failure_signature` flap backstop. A fix that "succeeds"
 without actually shrinking the failure -- or that churns the same
 signature -- escalates to a freeform `ASK_USER` instead of looping.
+The flap ledger survives a repair-driven regenerate too:
+`prior_failure_signatures` are folded into the fresh `SCAFFOLD` and
+threaded down its new `APPLY` → … → `VERIFY` chain, so a regenerated
+tree that reproduces the identical failure escalates instead of
+burning the regenerate budget.
 
 Once `VERIFY` is green in greenfield mode, the router runs a
 `RUNTIME_VERIFY` gate before declaring the session complete: it boots

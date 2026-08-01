@@ -410,11 +410,18 @@ semantic rewrites of an already-applied tree per ancestor chain.
 
 The deterministic classifier registry (`cgx.session.repair.classify`,
 **Phase 3.2**) ships `unittest_pytest_mix`, `missing_module_pythonpath`,
-`missing_fixture`, `hallucinated_api`, and `third_party_import_break`
+`missing_fixture`, `hallucinated_api`, `third_party_import_break`
 (`propose_third_party_pin` reads `BUILD_REPORT.installed_packages`,
 queries `pypi.org/pypi/<pkg>/<ver>/json` via `pypi_client` with an
 on-disk cache under `~/.cgx/pypi-cache/`, and emits a
-`requirements.txt` diff against the peer-dependency table). When no
+`requirements.txt` diff against the peer-dependency table),
+`missing_dependency` (a `requires the <pkg> package to be installed`
+guard or a `ModuleNotFoundError` no project file claims →
+`strategy=install_deps`, a BOOTSTRAP_ENV re-run instead of a source
+rewrite), `circular_import` / `relative_import_error`
+(regenerate-only: the offending modules are re-authored with the
+cycle folded into the constraint), and `empty_test_suite` (pytest
+exit 5 with test files selected → re-scaffold). When no
 classifier matches, the bounded LLM repair is **traceback-localized**
 (crash-frame files first), **retrieval-fed** (remaining candidate
 slots filled from the project index; a no-op in greenfield), and
@@ -441,11 +448,14 @@ flowchart TB
     VER2 -- "still failing" --> GUARD
 
     STRAT -- "regenerate<br/>(no diffs / >5 diffs; always for<br/>SMOKE & API_CHECK breaks)" --> RGUARD{"spend_regenerate — 3, syntax churn /<br/>spend_repair_regenerate — 2, semantic"}
-    RGUARD -- funded --> SCA["fresh SCAFFOLD via propose_regenerate:<br/>nearest ancestor, live descendants<br/>ABANDONED, regenerate_constraints in inputs"]
+    RGUARD -- funded --> SCA["fresh SCAFFOLD via propose_regenerate:<br/>nearest ancestor, live descendants<br/>ABANDONED, regenerate_constraints +<br/>prior_failure_signatures in inputs"]
     SCA --> LOOP(["re-enters greenfield loop:<br/>SCAFFOLD → APPLY → BOOTSTRAP_ENV →<br/>API_CHECK → SMOKE → VERIFY"])
     RGUARD -- exhausted --> RPL{"spend_replan<br/>REPLAN_BUDGET=1"}
     RPL -- funded --> DEC["fresh DECOMPOSE with the failure<br/>folded into its goal"]
     RPL -- exhausted --> SURV(["proceed with surviving files"])
+
+    STRAT -- "install_deps<br/>(missing_dependency)" --> BOOT["BOOTSTRAP_ENV re-run:<br/>install missing_modules +<br/>sync requirements.txt"]
+    BOOT --> LOOP2(["re-probes via API_CHECK →<br/>SMOKE → VERIFY"])
 
     STRAT -- "empty diffs<br/>(unknown / marker present)" --> ASK["ASK_USER(freeform)<br/>classification + rationale"]
 
@@ -453,9 +463,9 @@ flowchart TB
     classDef gate fill:#7d5ba6,stroke:#4c3575,color:#fff;
     classDef term fill:#4c956c,stroke:#2c6e49,color:#fff;
     classDef bad fill:#bc4749,stroke:#7f2d2f,color:#fff;
-    class AC,SM,VF,RV,SRC,REP,APP,VER2,SCA,DEC,ASK road;
+    class AC,SM,VF,RV,SRC,REP,APP,VER2,SCA,DEC,ASK,BOOT road;
     class GUARD,STRAT,RGUARD,RPL gate;
-    class LES,LOOP,SURV term;
+    class LES,LOOP,LOOP2,SURV term;
     class FAIL bad;
 ```
 
