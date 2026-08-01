@@ -20,6 +20,7 @@ class DjangoSkill(Skill):
     name = "django"
     role = "backend"
     aliases = ("Django", "DRF", "Django REST Framework")
+    description = "Django / Django REST Framework Python backend."
 
     def detect(self, goal: str) -> float:
         g = goal or ""

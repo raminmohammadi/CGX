@@ -24,6 +24,7 @@ class NextJsSkill(Skill):
     name = "nextjs"
     role = "fullstack"
     aliases = ("Next.js", "NextJS", "next")
+    description = "Next.js App Router fullstack framework (React + server routes)."
 
     def detect(self, goal: str) -> float:
         if _NEXT_RE.search(goal or ""):

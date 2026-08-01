@@ -33,6 +33,7 @@ class ReactSkill(Skill):
     name = "react"
     role = "frontend"
     aliases = ("React", "react.js", "ReactJS")
+    description = "Vite + React frontend: functional components, hooks, JSX/TSX."
 
     def detect(self, goal: str) -> float:
         g = goal or ""

@@ -548,6 +548,22 @@ def _repair_progress_stalled(
 # retries clear the common case before the manifest is ever blamed.
 _REGENERATE_BUDGET = 3
 
+# Maximum number of *semantic-repair* regenerations per SCAFFOLD ancestor
+# chain -- deliberately separate from :data:`_REGENERATE_BUDGET`. That
+# budget bounds *syntax churn* (SCAFFOLD/APPLY dropping files that do not
+# parse, ``failed_count > 0``) *before* the tree is applied; this one
+# bounds a whole-tree rewrite of a tree that already generated and applied
+# cleanly but references a symbol a downstream gate (API_CHECK / VERIFY /
+# RUNTIME_VERIFY) proved wrong. Conflating the two on one counter let a
+# scaffold that spent its whole syntax budget converging to a clean tree
+# arrive at the *first* semantic repair with nothing left, failing a run
+# that was one rewrite from green. ``repair_attempt`` cannot bound this
+# loop -- it does not survive a scaffold regeneration (``propose_regenerate``
+# copies the SCAFFOLD's inputs, not the REPAIR's) -- so this dedicated,
+# scaffold-carried counter is what keeps the semantic repair <-> regenerate
+# loop finite and loop-safe.
+_REPAIR_REGENERATE_BUDGET = 2
+
 # Maximum number of *re-plan* escalations per session. When a SCAFFOLD or
 # APPLY spends its per-manifest regenerate budget the manifest itself is
 # the suspect (not the generation of any single file), so the router
@@ -1319,6 +1335,15 @@ def _repair_regenerate_actions(completed: TaskNode,
     this function returns an empty list, so the four early-exit cases
     below (wrong strategy, no SCAFFOLD ancestor, budget exhausted, or
     nothing to abandon) degrade gracefully.
+
+    The budget gate reads a dedicated ``repair_regenerate_attempt``
+    counter -- **not** the syntax-churn ``regenerate_attempt`` spent by
+    :func:`_scaffold_failed_files_actions` / :func:`_apply_failed_files_actions`
+    making the tree parse. A scaffold that burned its whole syntax budget
+    converging to a clean, applied tree must still afford the correctness
+    loop its full :data:`_REPAIR_REGENERATE_BUDGET`; the regenerated
+    SCAFFOLD carries ``repair_regenerate_attempt + 1`` so this loop stays
+    finite even though ``repair_attempt`` does not survive the regenerate.
     """
     from cgx.session.repair.propose import propose_regenerate  # local import: dep direction
 
@@ -1332,8 +1357,9 @@ def _repair_regenerate_actions(completed: TaskNode,
     scaffold = _find_scaffold_ancestor(completed, tasks)
     if scaffold is None:
         return []
-    prior_regens = int(scaffold.inputs.get("regenerate_attempt") or 0)
-    if prior_regens >= _REGENERATE_BUDGET:
+    prior_repair_regens = int(
+        scaffold.inputs.get("repair_regenerate_attempt") or 0)
+    if prior_repair_regens >= _REPAIR_REGENERATE_BUDGET:
         return []
     abandon_targets = _collect_descendants(scaffold.task_id, tasks)
     actions: List[RouterAction] = []
@@ -1345,6 +1371,7 @@ def _repair_regenerate_actions(completed: TaskNode,
         actions.append(UpdateTaskStatus(
             task_id=t.task_id, status=TaskNodeStatus.ABANDONED))
     new_scaffold = propose_regenerate(scaffold, extra_constraints)
+    new_scaffold.inputs["repair_regenerate_attempt"] = prior_repair_regens + 1
     actions.append(CreateTask(new_scaffold))
     return actions
 

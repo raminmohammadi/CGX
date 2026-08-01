@@ -272,7 +272,8 @@ async def create_session(req: AgentSessionCreateRequest) -> AgentSessionState:
     mode = _resolve_mode(req)
     session = await asyncio.to_thread(
         runner.start_session, objective=req.objective,
-        project_root=req.project_root, title=req.title, mode=mode)
+        project_root=req.project_root, title=req.title, mode=mode,
+        skills=req.skills or None)
     with _RUNNERS_LOCK:
         _SESSION_TO_RUNNER[session.session_id] = runner
     if req.run_initial_task:

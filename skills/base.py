@@ -69,9 +69,10 @@ class SkillVerdict:
 class Skill(ABC):
     """Base class for a CGX skill.
 
-    Subclasses set the class attributes (``name``, ``role``, ``aliases``)
-    and override :meth:`detect`. Prompt fragments and validators are
-    optional -- override only the ones that make sense for the technology.
+    Subclasses set the class attributes (``name``, ``role``, ``aliases``,
+    ``description``) and override :meth:`detect`. Prompt fragments and
+    validators are optional -- override only the ones that make sense
+    for the technology.
     """
 
     #: Stable, lower-snake identifier used in logs / task inputs.
@@ -85,6 +86,9 @@ class Skill(ABC):
     #: Optional surface-form aliases (display name + common
     #: misspellings). Only used for diagnostics / docs.
     aliases: Tuple[str, ...] = ()
+
+    #: One-line, user-facing summary shown on the Skills-tab card.
+    description: str = ""
 
     # ---- Required ----------------------------------------------------
     @abstractmethod

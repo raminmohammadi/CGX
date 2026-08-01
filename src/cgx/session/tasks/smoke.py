@@ -47,6 +47,29 @@ logger = logging.getLogger(__name__)
 _DEFAULT_TIMEOUT_PER_MODULE = 5.0
 _DEFAULT_BUILD_SMOKE_TIMEOUT = 180.0
 _STDERR_TAIL_CHARS = 800
+# JS bundlers (Vite/rolldown, esbuild) print the actionable cause -- e.g.
+# ``[UNRESOLVED_ENTRY] Cannot resolve entry module index.html`` -- at the
+# HEAD of stderr, then a long, generic async stack trace. A tail-only clip
+# keeps only the useless stack, so REPAIR's ``build_error`` constraint is
+# non-actionable. Keep the head (the real diagnostic) and the tail (any
+# summary line) so both survive into the regenerate constraint.
+_STDERR_HEAD_CHARS = 1200
+
+
+def _clip_output(text: str) -> str:
+    """Clip build output to a head+tail window, preserving both ends.
+
+    The head carries the bundler's primary error; the tail carries any
+    trailing summary. When the text fits within the combined budget it is
+    returned verbatim; otherwise the elided middle is marked.
+    """
+    if not text:
+        return ""
+    if len(text) <= _STDERR_HEAD_CHARS + _STDERR_TAIL_CHARS:
+        return text
+    return (text[:_STDERR_HEAD_CHARS]
+            + "\n...[truncated]...\n"
+            + text[-_STDERR_TAIL_CHARS:])
 
 
 @register_executor(TaskKind.SMOKE)
@@ -308,12 +331,12 @@ def _npm_build_smoke(root: Path, task: TaskNode) -> Optional[Dict[str, Any]]:
             timeout=timeout,
         )
     except subprocess.TimeoutExpired as exc:
-        tail = ((exc.stderr or "") + "\n[timeout]")[-_STDERR_TAIL_CHARS:]
+        tail = _clip_output((exc.stderr or "") + "\n[timeout]")
         return {"label": label, "ok": False, "stderr_tail": tail}
     except Exception as exc:
         return {"label": label, "ok": False,
                 "stderr_tail": f"{type(exc).__name__}: {exc}"}
     ok = proc.returncode == 0
-    tail = "" if ok else (proc.stderr or proc.stdout or "")[-_STDERR_TAIL_CHARS:]
+    tail = "" if ok else _clip_output(proc.stderr or proc.stdout or "")
     return {"label": label, "ok": ok, "stderr_tail": tail}
 

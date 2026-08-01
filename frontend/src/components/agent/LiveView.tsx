@@ -1,5 +1,5 @@
 import {
-  History, PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen,
+  History, PanelLeftClose, PanelRightClose,
   Plus, RefreshCw, Send, Square, Trash2,
 } from "lucide-react";
 import type {
@@ -10,6 +10,7 @@ import { TaskTree } from "./TaskTree";
 import { ActiveTaskPanel } from "./ActiveTask";
 import { SidePanel } from "./SidePanel";
 import { ResizeHandle } from "./ResizeHandle";
+import { CollapsedRail } from "../CollapsedRail";
 import { TextArea } from "../Input";
 import { ErrorBoundary } from "../ErrorBoundary";
 import { cn, formatRelative } from "../../lib/utils";
@@ -201,33 +202,6 @@ export function LiveView({
         </>
       )}
     </div>
-  );
-}
-
-// Slim 28px rail rendered in place of a collapsed side panel. A single
-// icon button restores the panel; the rotated label hints at what lives
-// behind it.
-function CollapsedRail({
-  side, label, onExpand,
-}: { side: "left" | "right"; label: string; onExpand: () => void }) {
-  const Icon = side === "left" ? PanelLeftOpen : PanelRightOpen;
-  return (
-    <aside className={cn(
-      "w-7 shrink-0 bg-slate-950/40 flex flex-col items-center py-2 gap-2",
-      side === "left" ? "border-r" : "border-l",
-      "border-muted",
-    )}>
-      <button
-        type="button"
-        onClick={onExpand}
-        title={`Show ${label.toLowerCase()} panel`}
-        className="av-btn-icon h-5 w-5"
-      ><Icon className="h-3 w-3" /></button>
-      <span
-        className="text-[10px] font-mono uppercase tracking-widest text-slate-500 select-none"
-        style={{ writingMode: "vertical-rl", transform: "rotate(180deg)" }}
-      >{label}</span>
-    </aside>
   );
 }
 

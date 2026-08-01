@@ -99,3 +99,22 @@ def dispatch(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         raise LookupError(
             f"no executor registered for task kind {task.kind.value!r}")
     return fn(task, deps)
+
+
+def session_skills(task: TaskNode, deps: ExecutorDeps) -> Optional[List[str]]:
+    """Return the owning session's explicit skill list, or ``None``.
+
+    ``None`` (not ``[]``) is returned when the session has no skills set
+    so callers can pass it straight through to
+    ``cgx.answer.engine``'s ``skills=`` kwarg and get its existing
+    auto-detect-from-goal-text fallback for free.
+    """
+    if deps.store is None:
+        return None
+    try:
+        session = deps.store.get_session(task.session_id)
+    except Exception:
+        return None
+    if session is None or not session.skills:
+        return None
+    return list(session.skills)

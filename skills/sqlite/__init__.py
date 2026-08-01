@@ -23,6 +23,7 @@ class SQLiteSkill(Skill):
     name = "sqlite"
     role = "data"
     aliases = ("SQLite", "sqlite3")
+    description = "SQLite persistence layer / embedded database access."
 
     def detect(self, goal: str) -> float:
         if _SQLITE_RE.search(goal or ""):

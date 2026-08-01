@@ -666,6 +666,64 @@ def test_scaffold_py_syntax_error_flags_when_retry_still_broken():
     assert out.get("syntax_error")
 
 
+def test_new_file_body_from_patch_roundtrips_and_rejects_modifications():
+    from cgx.answer.engine import (
+        _content_to_new_file_patch, _new_file_body_from_patch)
+    body = "line 1\nline 2\n\nline 4"
+    assert _new_file_body_from_patch(
+        _content_to_new_file_patch("a/b.txt", body)) == body
+    # An empty new file round-trips to an empty body.
+    assert _new_file_body_from_patch(
+        _content_to_new_file_patch("e.txt", "")) == ""
+    # A modification diff (context/removal lines) is not losslessly
+    # reversible into a whole-file body -> None.
+    mod = ("--- a/x.py\n+++ b/x.py\n@@ -1,2 +1,2 @@\n"
+           " keep\n-old\n+new\n")
+    assert _new_file_body_from_patch(mod) is None
+    # Not a diff at all, or empty -> None.
+    assert _new_file_body_from_patch("just some text") is None
+    assert _new_file_body_from_patch("") is None
+
+
+class _FreeformFallbackProvider:
+    """Empty primary JSON content -> forces the freeform fallback path."""
+
+    stream_json_capable = False
+
+    def __init__(self, freeform_body: str):
+        self._freeform = freeform_body
+        self.calls = 0
+
+    def chat(self, *args: Any, **kwargs: Any) -> Dict[str, str]:
+        self.calls += 1
+        # Primary JSON-mode call yields no usable ``content`` -> fallback.
+        if kwargs.get("force_json"):
+            return {"content": "{}"}
+        return {"content": self._freeform}
+
+
+def test_scaffold_freeform_fallback_recovers_body_not_diff_header():
+    """The freeform fallback must hand back the file body, not the wrapped
+    unified diff -- otherwise the diff header leaks in as content and trips
+    the 'content is a unified-diff header' guard (the public/index.html
+    regen failure)."""
+    from cgx.answer.engine import generate_single_scaffold_file
+    html = ('<!doctype html>\n<html>\n  <head><title>Calc</title></head>\n'
+            '  <body><div id="root"></div></body>\n</html>')
+    freeform = "```html path=public/index.html\n" + html + "\n```"
+    provider = _FreeformFallbackProvider(freeform)
+    out = generate_single_scaffold_file(
+        "public/index.html", "app entry html", provider,
+        layer="frontend", goal="build a react app",
+    )
+    assert provider.calls == 2, "primary (empty) then freeform fallback"
+    assert out["syntax_ok"] is True
+    assert "unified-diff header" not in (out.get("syntax_error") or "")
+    assert out["content"].startswith("<!doctype html>")
+    assert "--- /dev/null" not in out["content"]
+    assert 'id="root"' in out["content"]
+
+
 def test_unwrap_wrapping_code_fence_variants():
     from cgx.answer.engine import _unwrap_wrapping_code_fence as unwrap
     # Whole-wrap with trailing prose after the closing fence.

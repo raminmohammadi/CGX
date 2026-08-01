@@ -24,6 +24,7 @@ from cgx.session.tasks.base import (
     ExecutorDeps,
     ExecutorResult,
     register_executor,
+    session_skills,
 )
 
 logger = logging.getLogger(__name__)
@@ -53,6 +54,7 @@ def run_plan_change(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             provider=deps.provider,
             project_root=deps.project_root,
             embedder=deps.extra.get("embedder") if deps.extra else None,
+            skills=session_skills(task, deps),
         )
     except Exception as exc:
         logger.exception("PLAN_CHANGE: generate_code_plan crashed")

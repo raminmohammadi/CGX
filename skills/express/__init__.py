@@ -19,6 +19,7 @@ class ExpressSkill(Skill):
     name = "express"
     role = "backend"
     aliases = ("Express", "Express.js", "ExpressJS")
+    description = "Express.js Node backend service."
 
     def detect(self, goal: str) -> float:
         if _EXPRESS_RE.search(goal or ""):

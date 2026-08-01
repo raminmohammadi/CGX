@@ -1778,6 +1778,39 @@ def _content_to_new_file_patch(path: str, content: str) -> str:
     return header + (body if body else "+")
 
 
+def _new_file_body_from_patch(patch: str) -> Optional[str]:
+    """Reverse :func:`_content_to_new_file_patch`: recover a new file's body.
+
+    The freeform scaffold parser wraps a raw file body into a ``--- /dev/null``
+    new-file diff, but the single-file path needs the plain body back --
+    otherwise the diff text leaks in as file content and trips the
+    unified-diff-header guard. Returns ``None`` when the patch is not a pure
+    new-file addition (context/removal lines, or content before the hunk),
+    since such a modification diff cannot be losslessly turned into a body.
+    """
+    if not patch:
+        return None
+    seen_hunk = False
+    body_lines: List[str] = []
+    for ln in patch.splitlines():
+        if ln.startswith(("--- ", "+++ ")):
+            continue
+        if ln.startswith("@@"):
+            seen_hunk = True
+            continue
+        if not seen_hunk:
+            return None
+        if ln.startswith("+"):
+            body_lines.append(ln[1:])
+        elif ln.startswith(("-", " ")):
+            return None
+        else:
+            body_lines.append(ln)
+    if not seen_hunk:
+        return None
+    return "\n".join(body_lines)
+
+
 def _parse_scaffold_freeform(text: str) -> Dict[str, Any]:
     """Parse free-form scaffold response with fenced ``code path=...`` blocks.
 
@@ -3455,13 +3488,21 @@ def generate_single_scaffold_file(
             force_json=False,
         ).get("content", "")
         parsed_ff = _parse_scaffold_freeform(ff_raw)
+
+        def _patch_to_body(entry: Dict[str, Any]) -> str:
+            # The freeform parser hands back a unified diff; recover the plain
+            # body so it doesn't leak in as a diff-header "file". A modification
+            # diff we can't reverse falls through to the header guard.
+            p = str(entry.get("patch") or "")
+            body = _new_file_body_from_patch(p)
+            return body if body is not None else p
+
         for d in (parsed_ff.get("diffs") or []):
             if isinstance(d, dict) and d.get("file") == path:
-                content = str(d.get("patch") or "")
+                content = _patch_to_body(d)
                 break
         if not content and parsed_ff.get("diffs"):
-            first = parsed_ff["diffs"][0]
-            content = str(first.get("patch") or "")
+            content = _patch_to_body(parsed_ff["diffs"][0])
 
     # Inline syntax validation.
     syntax_ok = True

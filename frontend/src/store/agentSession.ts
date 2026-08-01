@@ -33,6 +33,10 @@ export interface AgentSessionUIState {
   taskTreeWidth: number;
   sidePanelWidth: number;
   sidePanelCollapsed: boolean;
+  // Collapse state for the Agent page's own left category nav
+  // (Run / Agent Profiles / Skills / New Skill) -- distinct from the
+  // main app Sidebar and from the Sessions/Artifacts panels above.
+  agentNavCollapsed: boolean;
   setActiveId: (id: string | null) => void;
   setSelectedTaskId: (id: string | null) => void;
   setRunModel: (sid: string, model: string) => void;
@@ -41,6 +45,7 @@ export interface AgentSessionUIState {
   setTaskTreeWidth: (w: number) => void;
   setSidePanelWidth: (w: number) => void;
   setSidePanelCollapsed: (v: boolean) => void;
+  setAgentNavCollapsed: (v: boolean) => void;
 }
 
 const clamp = (v: number, lo: number, hi: number) =>
@@ -57,6 +62,7 @@ export const useAgentSession = create<AgentSessionUIState>()(
       taskTreeWidth: TASK_TREE_DEFAULT,
       sidePanelWidth: SIDE_PANEL_DEFAULT,
       sidePanelCollapsed: false,
+      agentNavCollapsed: false,
       setActiveId: (id) => set({ activeId: id }),
       setSelectedTaskId: (id) => set({ selectedTaskId: id }),
       setRunModel: (sid, model) =>
@@ -69,6 +75,7 @@ export const useAgentSession = create<AgentSessionUIState>()(
       setSidePanelWidth: (w) =>
         set({ sidePanelWidth: clamp(w, SIDE_PANEL_MIN, SIDE_PANEL_MAX) }),
       setSidePanelCollapsed: (v) => set({ sidePanelCollapsed: v }),
+      setAgentNavCollapsed: (v) => set({ agentNavCollapsed: v }),
     }),
     { name: "cgx-agent-session" },
   ),
