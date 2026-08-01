@@ -23,6 +23,7 @@ from cgx.session.models import (
     TaskKind,
     TaskNode,
 )
+from cgx.session.scaffold_validate import missing_stack_entry_files
 from cgx.session.tasks.base import (
     ExecutorDeps,
     ExecutorResult,
@@ -73,10 +74,12 @@ def run_decompose(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             retryable=True)
 
     # Deterministic coherence gate: repair what can be repaired in place
-    # (dangling depends_on, dependency cycles -- both only ordering
-    # hints), fail early only when the manifest is logically unbuildable,
-    # then topologically order files by dependency hints so SCAFFOLD
-    # generates dependencies before their consumers.
+    # (missing stack entry points, dangling depends_on, dependency cycles
+    # -- the latter two only ordering hints), fail early only when the
+    # manifest is logically unbuildable, then topologically order files by
+    # dependency hints so SCAFFOLD generates dependencies before their
+    # consumers.
+    _inject_stack_entry_files(layers)
     coherence_error = _validate_manifest_coherence(layers)
     if coherence_error:
         return ExecutorResult(failure=coherence_error, retryable=True)
@@ -309,6 +312,49 @@ def _find_dependency_cycle(
             if found:
                 return found
     return None
+
+
+def _inject_stack_entry_files(layers: List[Dict[str, Any]]) -> List[str]:
+    """Add toolchain-mandated entry files the planner left out.
+
+    A manifest that declares ``vite.config.js`` but no root
+    ``index.html`` is unbuildable, and the regenerate loop cannot recover
+    from it: SCAFFOLD only ever generates the paths the manifest names,
+    so the missing entry point stays missing however many times the tree
+    is re-authored. Appending the entry to the layer that carries its
+    trigger turns a guaranteed dead end into a normally-generated file.
+    Mutates ``layers`` in place and returns the paths that were added.
+    """
+    files = _manifest_files(layers)
+    paths = [f["path"] for f in files]
+    missing = missing_stack_entry_files(paths)
+    if not missing:
+        return []
+    # Append to the last layer that has files so the generator sees the
+    # whole tree (notably the script entry point the HTML must reference)
+    # as context, and declare the dependency so the toposort keeps that
+    # ordering within the layer.
+    target = next((lay for lay in reversed(layers)
+                   if isinstance(lay, dict) and lay.get("files")), None)
+    if target is None:
+        return []
+    script = next((p for p in paths
+                   if p.rsplit("/", 1)[-1].split(".")[0] in ("main", "index")
+                   and p.rsplit(".", 1)[-1] in ("jsx", "tsx", "js", "ts")),
+                  None)
+    added: List[str] = []
+    for entry in missing:
+        node: Dict[str, Any] = {"path": entry["path"],
+                                "description": entry["description"]}
+        if script:
+            node["depends_on"] = [script]
+        target["files"].append(node)
+        added.append(entry["path"])
+    if added:
+        logger.warning(
+            "DECOMPOSE: manifest omitted required entry file(s) %s; "
+            "injecting them so the project can build", added)
+    return added
 
 
 def _validate_manifest_coherence(

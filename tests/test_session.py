@@ -3632,6 +3632,48 @@ def test_decompose_fails_when_only_test_files(store, monkeypatch):
     assert "no runnable source" in result.failure
 
 
+def test_decompose_injects_missing_vite_entry_html(store, monkeypatch):
+    # A Vite manifest without a root index.html cannot build at all, and
+    # the regenerate loop can never add the file -- DECOMPOSE folds it in.
+    result = _run_decompose_with_manifest(store, monkeypatch, {
+        "plan_md": "p",
+        "layers": [
+            {"name": "ui", "files": [
+                {"path": "src/main.jsx", "description": "entry"},
+                {"path": "src/App.jsx", "description": "root component"}]},
+            {"name": "config", "files": [
+                {"path": "vite.config.js", "description": "vite config"},
+                {"path": "package.json", "description": "manifest"}]},
+        ],
+    })
+    assert result.failure is None
+    layers = result.artifact.content["layers"]
+    paths = [f["path"] for lay in layers for f in lay["files"]]
+    assert "index.html" in paths
+    assert result.outputs["file_count"] == 5
+
+
+def test_decompose_keeps_existing_vite_entry_html(store, monkeypatch):
+    # Already coherent -> no injection, no duplicate entry.
+    result = _run_decompose_with_manifest(store, monkeypatch, {
+        "plan_md": "p",
+        "layers": [{"name": "ui", "files": [
+            {"path": "index.html", "description": "entry html"},
+            {"path": "src/main.jsx", "description": "entry"},
+            {"path": "vite.config.js", "description": "vite config"}]}],
+    })
+    assert result.failure is None
+    paths = [f["path"] for f in result.artifact.content["layers"][0]["files"]]
+    assert paths.count("index.html") == 1
+
+
+def test_missing_stack_entry_files_ignores_non_vite_manifests():
+    from cgx.session.scaffold_validate import missing_stack_entry_files
+    assert missing_stack_entry_files(
+        ["src/index.js", "package.json", "public/index.html"]) == []
+    assert missing_stack_entry_files(["backend/main.py"]) == []
+
+
 def test_scaffold_executor_missing_work_plan_fails(store):
     from cgx.session.tasks.scaffold import run_scaffold
     session = Session.new("g", mode=SessionMode.GREENFIELD)

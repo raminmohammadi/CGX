@@ -24,7 +24,7 @@ import ast
 import logging
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from cgx.session.repair.pypi_client import PyPIClient
 
@@ -657,3 +657,54 @@ def check_contract_compliance(
                 })
 
     return warnings
+
+
+# --------------------- manifest stack requirements ---------------------
+
+# Entry files a toolchain requires but a planner routinely forgets, keyed
+# by the manifest path that proves the toolchain is in play. Each rule is
+# ``(trigger basenames, required path, alternatives, description)``: when
+# any trigger appears in the manifest and neither the required path nor
+# any alternative does, the required path is missing and the build cannot
+# resolve its entry module. Kept to cases where the omission is *fatal*
+# and the fix is a single well-known file -- a rule that merely encodes a
+# style preference would add files nobody asked for.
+_STACK_ENTRY_RULES: Tuple[Tuple[Tuple[str, ...], str,
+                                Tuple[str, ...], str], ...] = (
+    (
+        ("vite.config.js", "vite.config.ts", "vite.config.mjs",
+         "vite.config.cjs"),
+        "index.html",
+        (),
+        ("Vite entry HTML at the project root: loads the app's script "
+         "entry point (e.g. <script type=\"module\" src=\"/src/main.jsx\">) "
+         "and provides the mount element the entry point renders into."),
+    ),
+)
+
+
+def missing_stack_entry_files(paths: Sequence[str]) -> List[Dict[str, str]]:
+    """Return the entry files ``paths`` implies but does not contain.
+
+    Deterministic manifest gate: a Vite manifest without a root
+    ``index.html`` cannot build at all (``[UNRESOLVED_ENTRY] Cannot
+    resolve entry module index.html``), and no amount of re-authoring the
+    files that *are* planned can fix it -- the fix is a file that must
+    exist. Rather than let SCAFFOLD generate an unbuildable tree and burn
+    the repair budget discovering it, DECOMPOSE folds the missing entries
+    straight into the manifest.
+
+    Returns one ``{path, description}`` dict per missing entry, in rule
+    order; an empty list when the manifest is already coherent.
+    """
+    have = {str(p or "").strip().replace("\\", "/").lstrip("./")
+            for p in paths}
+    basenames = {p.rsplit("/", 1)[-1] for p in have}
+    out: List[Dict[str, str]] = []
+    for triggers, required, alternatives, description in _STACK_ENTRY_RULES:
+        if not basenames & set(triggers):
+            continue
+        if required in have or any(a in have for a in alternatives):
+            continue
+        out.append({"path": required, "description": description})
+    return out
