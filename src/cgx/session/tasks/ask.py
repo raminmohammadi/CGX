@@ -27,7 +27,8 @@ from cgx.session.models import (
     TaskKind,
     TaskNode,
 )
-from cgx.session.router import Router, RouterPlan
+from cgx.session.actions import RouterPlan
+from cgx.session.router import Router
 from cgx.session.tasks.base import (
     ExecutorDeps,
     ExecutorResult,

@@ -32,7 +32,7 @@ from cgx.session import (
     TaskNode,
     TaskNodeStatus,
 )
-from cgx.session.router import (
+from cgx.session.actions import (
     AttachDecisionToTask,
     CreateTask,
     RecordDecision,
@@ -8283,7 +8283,7 @@ def test_router_repair_regenerate_abandons_subtree_and_requeues_scaffold():
 
 
 def test_actionable_contract_warnings_filters_endpoints_and_unattributed():
-    from cgx.session.router import _actionable_contract_warnings
+    from cgx.session.greenfield_edges import _actionable_contract_warnings
     got = _actionable_contract_warnings({"contract_warnings": [
         {"kind": "endpoint", "name": "/api/x", "method": "POST"},
         {"kind": "constant", "name": "API_BASE"},  # no module -> skip
@@ -8330,7 +8330,9 @@ def test_router_scaffold_unmet_contract_regenerates_within_budget():
 def test_router_scaffold_placeholder_endpoint_does_not_regenerate():
     # The exact shape from ses_fc44ba67d1cc4835: placeholder endpoints and
     # unattributed constants must NOT force a regenerate.
-    from cgx.session.router import _scaffold_contract_regenerate_actions
+    from cgx.session.greenfield_edges import (
+        _scaffold_contract_regenerate_actions,
+    )
     _session, scaffold = _make_clean_scaffold_with_contracts([
         {"kind": "endpoint", "name": "/api/x", "method": "POST"},
         {"kind": "endpoint", "name": "/api/protected", "method": "GET"},
@@ -8344,7 +8346,9 @@ def test_router_scaffold_unmet_contract_non_terminal_when_budget_spent():
     # Budget spent -> helper returns nothing (non-terminal): the caller
     # then takes the normal SCAFFOLD -> APPLY edge instead of failing.
     from cgx.session.budget import REGENERATE_BUDGET
-    from cgx.session.router import _scaffold_contract_regenerate_actions
+    from cgx.session.greenfield_edges import (
+        _scaffold_contract_regenerate_actions,
+    )
     _session, scaffold = _make_clean_scaffold_with_contracts(
         [{"kind": "function", "name": "compute", "module": "src/core.py"}],
         prior_regens=REGENERATE_BUDGET)
@@ -8354,7 +8358,9 @@ def test_router_scaffold_unmet_contract_non_terminal_when_budget_spent():
 def test_router_scaffold_contract_skipped_when_files_dropped():
     # failed_count > 0 belongs to the dropped-files path; the contract
     # path must defer even if contract warnings are also present.
-    from cgx.session.router import _scaffold_contract_regenerate_actions
+    from cgx.session.greenfield_edges import (
+        _scaffold_contract_regenerate_actions,
+    )
     _session, scaffold = _make_clean_scaffold_with_contracts(
         [{"kind": "function", "name": "compute", "module": "src/core.py"}],
         failed_count=1)
@@ -9034,8 +9040,8 @@ def test_relevant_lessons_empty_when_store_missing(tmp_path: Path):
 
 def test_router_verify_pass_with_repair_ancestor_emits_record_lesson():
     """A VERIFY-pass downstream of REPAIR -> RecordLesson action."""
+    from cgx.session.actions import RecordLesson
     from cgx.session.models import SessionMode
-    from cgx.session.router import RecordLesson
     session = Session.new("g", mode=SessionMode.GREENFIELD)
     scaffold = TaskNode.new(
         session.session_id, TaskKind.SCAFFOLD, "scaffold", inputs={})
@@ -9077,8 +9083,8 @@ def test_router_verify_pass_with_repair_ancestor_emits_record_lesson():
 
 def test_router_verify_pass_without_repair_emits_no_lesson():
     """A fresh VERIFY-pass with no REPAIR upstream -> zero RecordLesson actions."""
+    from cgx.session.actions import RecordLesson
     from cgx.session.models import SessionMode
-    from cgx.session.router import RecordLesson
     session = Session.new("g", mode=SessionMode.GREENFIELD)
     scaffold = TaskNode.new(
         session.session_id, TaskKind.SCAFFOLD, "scaffold", inputs={})
@@ -9102,8 +9108,8 @@ def test_router_verify_pass_without_repair_emits_no_lesson():
 def test_runner_writes_lesson_on_successful_repair_cycle(
         store, tmp_path: Path, monkeypatch):
     """End-to-end: SessionRunner._record_lesson lands a row in lessons.jsonl."""
+    from cgx.session.actions import RecordLesson
     from cgx.session.lessons import load_lessons
-    from cgx.session.router import RecordLesson
     lessons_file = tmp_path / "lessons.jsonl"
     monkeypatch.setenv("CGX_LESSONS_PATH", str(lessons_file))
 

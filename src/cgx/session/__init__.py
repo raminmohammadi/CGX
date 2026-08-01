@@ -30,7 +30,8 @@ from cgx.session.models import (
 )
 from cgx.session.events import Event, EventBus, EventType, get_default_bus
 from cgx.session.mode import detect_mode
-from cgx.session.router import Router, RouterPlan
+from cgx.session.actions import RouterPlan
+from cgx.session.router import Router
 from cgx.session.runner import SessionRunner
 from cgx.session.store import SessionStore
 
