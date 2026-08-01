@@ -41,8 +41,8 @@ cgx dash --project-root /path/to/repo
 The screen has four zones: an ASCII banner, a **status bar** (current
 directory, index state, active model and remaining context window), a
 **tips** panel, and a bordered input box. Type a plain message to route
-it through the Planner -> Tracker -> Judge agent loop -- it can answer a
-question, plan an edit, or scaffold new code. Lines starting with `/`
+it through the session agent loop -- it can answer a question, plan an
+edit, or scaffold new code. Lines starting with `/`
 are commands:
 
 | Command            | Action                                            |
@@ -58,9 +58,10 @@ are commands:
 | `/clear`           | Clear the screen and scrollback.                  |
 | `/quit`, `/exit`   | Leave the dashboard.                              |
 
-The dashboard shares the **exact streaming engine** the web UI uses:
-`/ask`, plain-text agent goals, and `/index` all run through
-`cgx.webui.handlers` (`stream_ask` / `stream_agent` / `stream_index`).
+The dashboard shares its engines with the web UI: `/ask` and `/index`
+run through `cgx.webui.handlers` (`stream_ask` / `stream_index`), and
+plain-text agent goals drive the same `SessionRunner` behind the web
+UI's `/agent` tab (sessions persist in the shared SQLite store).
 Heavy work runs on a background thread while a Braille spinner shows
 elapsed time, so the prompt never looks frozen and answer tokens stream
 into the terminal as they arrive. Press **Ctrl-C** to cancel the
@@ -89,14 +90,14 @@ authoritative flag list; this section is the reference.
 | `cgx query`   | Raw hybrid retrieval; prints the ranked chunks as JSON (no LLM).    |
 | `cgx ask`     | Grounded, read-only LLM answer streamed to the terminal.            |
 | `cgx plan`    | Generate a code-change plan (`plan_md` + structured diffs).         |
-| `cgx agent`   | Run the full Planner → Tracker → Judge loop toward a goal.          |
+| `cgx agent`   | Run the session agent loop toward a goal (unattended).              |
 | `cgx status`  | Print provider, hardware, and index status for a project.           |
 | `cgx serve`   | Launch the FastAPI + React web UI (`--host` / `--port`).            |
 | `cgx dash`    | Launch the interactive terminal dashboard.                          |
 
-`ask`, `plan`, `agent`, and `status` share the same **streaming engine**
-as the dashboard and web UI (`cgx.webui.handlers`): tokens stream as they
-arrive under a Braille spinner, and **Ctrl-C** cancels the running task
+`ask`, `plan`, `agent`, and `status` stream the same way the dashboard
+does: tokens and task events arrive live under a Braille spinner, and
+**Ctrl-C** cancels the running task
 (exit code `130`) by flipping the same `cancel_event` the UI's Stop
 button uses. Any other failure exits non-zero (`1`). Colour follows the
 same TTY / `NO_COLOR` / `CGX_FORCE_COLOR` rules as the dashboard, so
@@ -174,17 +175,22 @@ planner validate and repair its own diffs (parse + dry-apply +
 `ast.parse`); `--run-tests` executes the project's impacted tests in a
 sandbox. See §4 for the UI equivalent and the report shape.
 
-### `cgx agent` — multi-step agent loop
+### `cgx agent` — session agent loop
 
 ```bash
-cgx agent "Add docstrings to every public function in cgx.parser" \
-          --stop-on-fail
+cgx agent "Add docstrings to every public function in cgx.parser"
 ```
 
-Runs the batch Planner → Tracker → Judge loop (§7) and streams each
-task's start / progress / done / retry events. `--stop-on-fail` halts on
-the first failed task instead of continuing. With no discoverable index
-the loop can still scaffold a brand-new project into `--project-root`.
+Runs one unattended turn of the session agent loop (§6) and streams
+each task's start / done / failed events. The goal drives the same
+`SessionRunner` as the web UI and dashboard, in auto-answer mode:
+clarify questions take their first suggested option and plan/change
+approvals are approved, so the run never blocks on a checkpoint;
+questions with no safe default (freeform, choose-path) end the turn
+with the question printed. With no discoverable index the loop
+scaffolds a brand-new project into `--project-root`. The session
+persists in `<project_root>/.cgx/sessions.db`, so it can be resumed
+from the dashboard or web UI afterwards.
 
 ### `cgx status` — environment & index summary
 
@@ -277,7 +283,7 @@ indices/                   # FAISS files + per-view metadata (.npy + .json)
 records.jsonl              # canonical records (one per chunk)
 chunks.jsonl               # raw parser chunks
 graph.json                 # NetworkX node-link graph
-repo_map.json              # cached hierarchical repo map (Planner context)
+repo_map.json              # cached hierarchical repo map (planning context)
 parse_cache.json           # per-file parse cache (incremental re-parse)
 emb_cache_intent.npz       # content-addressed embedding cache (intent view)
 emb_cache_impl.npz         # content-addressed embedding cache (impl view)
@@ -525,10 +531,6 @@ creation and overridable from the launcher's mode picker
   the agent asks clarification questions, plans a layered file
   manifest, and only writes anything to disk after you approve the
   plan.
-
-Use the legacy batch view at `/agent-legacy` (§7 below) when you have
-a well-scoped goal and prefer fire-and-forget semantics with no
-checkpoints.
 
 ### The Explore Write Loop
 
@@ -802,17 +804,19 @@ flowchart TB
       VER["verify.py"]
       REP["repair.py"]
       ROU["router.py"]
+      BUD["budget.py<br/>LoopBudget"]
     end
     DEC -->|contracts| SCA
     SCA -->|generated tree| SVAL
     SVAL -->|warnings| SCA
     VER -->|pass/fail counts| ROU
     RTV -->|boot outcome| ROU
+    BUD -->|typed counters| ROU
     ROU -->|funds a round?| REP
     REP -->|REPAIR_PLAN| SCA
 
     classDef choc fill:#6f4e37,stroke:#3e2723,color:#fff;
-    class DEC,SCA,SVAL,RTV,VER,REP,ROU choc;
+    class DEC,SCA,SVAL,RTV,VER,REP,ROU,BUD choc;
 ```
 
 ### UI controls
@@ -977,135 +981,17 @@ The HTTP `POST /api/agent-session` route uses the unlimited defaults;
 drive budgeted / headless runs through the programmatic `SessionRunner`
 API above (or a thin wrapper of your own).
 
-### When to use the legacy view (`/agent-legacy`)
+### Skills (technology-aware scaffolding)
 
-The batch Planner → Tracker → Judge loop described in §7 is still
-the right tool when:
+CGX ships with a registry of per-technology *skills* (`skills/<name>/`)
+that activate automatically when the objective mentions them. Each
+active skill injects technology-specific instructions into the
+scaffold / plan prompts composed by `cgx.answer.engine`, and defines a
+structural validator (`skills.validate_scaffold` / `validate_plan`)
+callers can run against the produced diffs, so a goal asking for React
+never silently passes a Python-only output.
 
-* The goal is a single well-scoped instruction (*"add docstrings to
-  every public function in `cgx.parser`"*).
-* You want one streaming run with no checkpoints.
-* You want to scaffold a new project without intermediate
-  human-in-the-loop checkpoints. (The session-based agent's
-  greenfield mode is the default for new-project work and exposes
-  every step as a typed checkpoint; the legacy view runs the same
-  `scaffold_manifest → scaffold_file × N → apply → verify` chain
-  end-to-end without pauses.)
-
-The two views share retrieval, codegen, and providers; only the
-state and interaction models differ.
-
----
-
-## 7. Multi-agent orchestration (legacy `/agent-legacy` tab)
-
-The legacy Agent view at `/agent-legacy` runs a Planner → Tracker →
-Judge loop in batch mode. This is the original `cgx.agents` shape,
-preserved for fire-and-forget goals and for the `cgx agent` CLI; the
-new session-based view at `/agent` (§6) is the default.
-
-From the CLI:
-
-```bash
-cgx agent "Add docstrings to every public function in cgx.parser" \
-          --stop-on-fail
-```
-
-`--stop-on-fail` halts on the first failed task; omit it to let the loop
-continue and report per-task outcomes at the end (see the CLI reference
-for provider flags). This is the exact same loop as the programmatic
-`run_agent` shown below.
-
-A picture-first overview lives in [flowcharts.md](flowcharts.md) -- the
-"general user" SVG matches the UI flow described below.
-
-1. **Planner** decomposes the goal into 1–6 ordered `Task`s with a short
-   `name`, a `description`, a `kind` (see table below), and plain-English
-   `criteria`. The LLM is asked for a strict JSON plan; on failure the
-   planner falls back to a deterministic single-task plan. A kind-policy
-   pass applies routing rules in order:
-   - *New-project goals* → `[scaffold_manifest, apply, verify]` (no
-     index needed). A goal is recognised as a new-project request when
-     any of three signals fires: a scaffold verb + project noun
-     (`create a FastAPI app`, `build a calculator`, `bootstrap a
-     CLI`), a scaffold verb paired with a framework / language name
-     from a curated list (`create a calculator using React`, `build a
-     todo app with FastAPI`), or the planner LLM emitted `scaffold`
-     task(s) and the goal has no existing-codebase hint. Phrases like
-     *"add a React component to our existing app"* are kept on the
-     change-goal path. The manifest call returns a layered file plan
-     (core logic, UI, tests, config); the Tracker then injects one
-     `scaffold_file` task per planned file before `apply` runs, so
-     each generation call stays focused on a single output and the UI
-     shows per-file progress.
-   - *Verify-only goals* ("do tests pass?") → `[verify]`.
-   - *Read-only goals* → any `plan` downgraded to `ask`.
-   - *Code-change goals* → `apply` + `verify` appended after `plan`;
-     any stray `scaffold` tasks are dropped so we modify rather than
-     recreate the existing codebase.
-
-2. **Tracker** walks the plan task by task, dispatching each `kind`
-   to a capability on a worker thread and streaming `AgentEvent`s:
-   `plan`, `task_start`, `task_progress`, `task_done`, `task_failed`,
-   `task_skipped`, `judge`, `summary`. `task_progress` fires every 2 s
-   with `{task_id, name, kind, elapsed}`.
-
-3. **Judge** validates each completed task: structural short-circuits
-   first (per kind), then optionally an LLM verdict
-   `{verdict, confidence, rationale}`. For `scaffold` tasks the artifact
-   shown to the LLM judge includes the plan summary, the full list of
-   generated file paths, and a per-file content preview so verdicts are
-   grounded in the actual code rather than a truncated JSON keyset.
-
-| Kind | What it does | Index required? |
-|------|-------------|-----------------|
-| `ask` | Answer a question grounded in the indexed code | Yes |
-| `plan` | Produce a unified-diff change plan for an existing codebase | Yes |
-| `scaffold` | One-shot new-project generation (legacy, kept for tests / callers passing a custom capability map) | **No** |
-| `scaffold_manifest` | Plan the file layout of a new project; emits an `inject_tasks` list of `scaffold_file` tasks | **No** |
-| `scaffold_file` | Generate exactly one file given its path, layer, and the content of prior generated files | **No** |
-| `search` | Retrieve relevant code chunks | Yes |
-| `summarize` | Condense prior outputs | No |
-| `apply` | Write diffs from `plan` / `scaffold_file` outputs to `project_root` on disk (with backup mirror) | No |
-| `verify` | Detect the project's stack(s) and run each matching test runner via a pluggable registry (`cgx.codegen.test_runners`) -- pytest (with pre-flight dep install) for Python, `npm test`/`npm run build` for JS/TS -- merging their outcomes into one pass/fail signal | No |
-| `fill_logic` | Fill a single empty function body in an existing skeleton file | No |
-
-### Generating a new project from scratch
-
-Set **Project Root** to the target directory (it will be created if absent),
-then describe the project idea as the goal:
-
-> *"Create a FastAPI todo app with SQLite storage and a full pytest suite"*
-> *"Create a React calculator app with input fields and result display"*
-
-The planner emits `[scaffold_manifest, apply, verify]`. The
-`scaffold_manifest` task calls `plan_scaffold_manifest` (a cheap LLM
-call that returns just the layered file list, no contents) and the
-Tracker injects one `scaffold_file` task per planned file into the
-plan immediately after, ordered layer-by-layer so dependency-heavy
-files (core types, utilities) are generated before the files that
-import them. Before that, the manifest builder deterministically
-guarantees a well-formed layout: it injects required packaging files,
-a stack-appropriate test file when the manifest carried none
-(`_inject_required_test_file`, so `verify` always has a runnable
-pass/fail signal), Python package `__init__.py` markers, and a
-trailing `README.md`. The Judge's manifest check enforces the same
-required-test rule as a backstop. Each `scaffold_file` task calls
-`generate_single_scaffold_file` with the target path, its layer, and
-the full content of files already generated by earlier
-`scaffold_file` tasks. The `apply` task writes every generated file
-to `project_root` (creating a backup mirror under
-`<project_root>/.cgx-backups/<run_id>/` for any pre-existing file
-it overwrites). The `verify` task runs the generated tests.
-
-**Skills the system knows about.** CGX ships with a registry of
-per-technology *skills* (`skills/<name>/`) that activate automatically
-when the goal mentions them. Each active skill (a) injects technology-
-specific instructions into the scaffold / plan system prompt and
-(b) runs a structural validator on the produced diffs so a goal asking
-for React can never silently pass a Python-only output.
-
-| Skill        | Activates on (examples)                                  | Enforces in scaffold output |
+| Skill        | Activates on (examples)                                  | Structural check            |
 |--------------|----------------------------------------------------------|-----------------------------|
 | `react`      | "react app", "react component", "react ui"               | At least one `.jsx`/`.tsx`/`.js`/`.ts` file; `package.json` with `react` dep |
 | `nextjs`     | "next.js", "nextjs app", "app router"                    | `next.config.*` or `pages/` / `app/` directory |
@@ -1118,118 +1004,33 @@ for React can never silently pass a Python-only output.
 | `python_cli` | "python cli", "argparse cli", "command line tool"        | Entrypoint with `argparse` / `click` / `typer` |
 | `sqlite`     | "sqlite", "sqlite db", "sqlite storage"                  | `sqlite3` / `aiosqlite` import or `.db` reference |
 
-Multi-skill goals compose naturally -- *"Create a calculator project
-with a React UI and a FastAPI backend"* activates both `react` and
-`fastapi`, so the LLM sees both prompt fragments and the Judge runs
-both validators against the produced diffs. To extend the registry,
-add a folder under `skills/<name>/` with a single `Skill` subclass and
-append it to `SKILLS` in `skills/__init__.py`; no agent-layer changes
-are required. See [architecture.md](architecture.md#skills) for the
-full protocol.
+Multi-skill objectives compose naturally -- *"Create a calculator
+project with a React UI and a FastAPI backend"* activates both `react`
+and `fastapi`, so the LLM sees both prompt fragments. To extend the
+registry, add a folder under `skills/<name>/` with a single `Skill`
+subclass and append it to `SKILLS` in `skills/__init__.py`; no
+agent-layer changes are required. See
+[architecture.md](architecture.md#skills) for the full protocol.
 
-### UI controls
+---
 
-- **Goal** textbox -- free-form English.
-- **Project Root** -- destination directory for `apply` / `scaffold`.
-- **Stop on first failure** toggle -- halts the loop on `task_failed`.
-- **Cancel** button -- closes the SSE connection; partial event log preserved.
-- **Plan Tasks panel** -- vertical rail showing status circle, bold name,
-  elapsed-seconds badge, and Judge rationale per task.
-- **Live event log** -- collapsible JSON stream of every `AgentEvent`.
-- **Tab persistence** -- SSE stream continues in the background; state
-  restored from Zustand on return.
+## 7. SLM-grade execution engine
 
-### Programmatic use
-
-```python
-from cgx.agents import run_agent
-from cgx.answer.providers import OllamaProvider
-
-prov = OllamaProvider(model="qwen2.5-coder:3b")
-
-# Modify an existing codebase (stream=True yields AgentEvent objects).
-for event in run_agent(
-    goal="Add docstrings to every public function in cgx.parser",
-    provider=prov,
-    index_dir="/tmp/cgx_index/indices",
-    records_path="/tmp/cgx_index/records.jsonl",
-    project_root=".",
-    stop_on_fail=True,
-    stream=True,
-):
-    print(event.type, event.payload)
-
-# Generate a brand-new project -- no index required.
-for event in run_agent(
-    goal="Create a FastAPI todo app with SQLite and pytest tests",
-    provider=prov,
-    project_root="/tmp/my_todo_app",   # destination directory
-    stream=True,
-):
-    print(event.type, event.payload)
-
-# stream=False (default) blocks until done and returns the final Plan.
-plan = run_agent(
-    goal="Add docstrings to every public function in cgx.parser",
-    provider=prov,
-    index_dir="/tmp/cgx_index/indices",
-    records_path="/tmp/cgx_index/records.jsonl",
-)
-for task in plan.tasks:
-    print(task.kind, task.status, task.output)
-```
-
-For tests and custom flows, inject your own capability map:
-
-```python
-from cgx.agents import run_agent, Planner, Judge
-
-caps = {
-    "ask":      lambda q, **_: {"answer_md": "stubbed answer"},
-    "plan":     lambda q, **_: {"plan_md": "...", "diffs": []},
-    "scaffold": lambda q, **_: {"plan_md": "...", "diffs": []},
-    "search":   lambda q, **_: {"hits": []},
-    "summarize":lambda prior, **_: {"answer_md": "summary"},
-    "apply":    lambda prior, **_: {"applied_files": [], "failed_files": []},
-    "verify":   lambda prior, **_: {"ran": False, "skipped_reason": "stub"},
-}
-plan = run_agent(goal="...", capabilities=caps,
-                 planner=Planner(provider=None), judge=Judge(provider=None))
-```
-
-## 8. SLM-grade execution engine
-
-The following features are active by default whenever the Agent loop
+The following features are active by default whenever the session loop
 runs and require no extra configuration. They are particularly important
 when using a local 7B model that would otherwise hallucinate dependencies
 or degrade on large files.
 
-### Skeleton-and-Fill (`fill_logic` task kind)
-
-Instead of asking a small model to write a 300-line file in one shot, the
-planner can decompose generation into two phases:
-
-1. **Scaffold** -- write the file structure (imports, class/function
-   signatures, `pass` stubs).
-2. **Fill** -- one `fill_logic` task per empty function body, prompting
-   the model with *"Implement the body for `fn_name`. Return only the
-   logic."*
-
-The `fill_logic` capability finds each `pass` / `# TODO` stub in the
-skeleton file via a regex match on the function signature, stitches the
-returned body into the file at the correct indentation, and runs an
-inline `ast.parse` smoke test. The timeline row reports
-`fn_name() in file.py · stitched · syntax ok`.
-
 ### Dynamic Dependency Management (`cgx.codegen.env_manager`)
 
-Before running pytest in the verify step, the agent scans every
-generated `.py` file for `import` statements and cross-references them
-against `requirements.txt`. Any new package the model chose but did not
-declare is installed with `pip install --quiet` before tests run.
+Before VERIFY runs the project's tests, the `BOOTSTRAP_ENV` task scans
+every generated `.py` file for `import` statements and cross-references
+them against `requirements.txt`. Any new package the model chose but
+did not declare is installed (`preflight_install`) before tests run.
 
 If the tests pass, the newly installed packages are appended to
-`requirements.txt` so the dependency becomes permanent.
+`requirements.txt` (`update_requirements`) so the dependency becomes
+permanent.
 
 ```
 Generated src/auth.py imports: bcrypt
@@ -1241,49 +1042,21 @@ Failures (e.g. a misspelled package name) are logged but never abort
 the run -- pytest still executes and gives the retry loop a real
 `ModuleNotFoundError` to diagnose rather than a false pass.
 
-### Symbol Table Context (`cgx.codegen.symbol_map`)
+### Granular error context (repair loop)
 
-Before dispatching a `plan` task the agent injects a compressed map of
-every symbol already defined in the indexed codebase:
+Instead of dumping the full pytest log into a retry prompt, the
+session REPAIR loop (`cgx.session.repair`) works from the failure
+site: `classify` parses the pytest output into typed failure kinds
+and extracts the traceback, `locate` maps it to the offending symbol
+in the generated source, and `propose` builds a focused fix prompt
+containing only the relevant source snippet (plus the fixture source
+when a test fixture is implicated).
 
-```
-# AVAILABLE CONTEXT (Do not redefine these):
-File: src/db.py -> get_connection(), close_connection()
-File: src/utils.py -> hash_password(str), verify_token(str)
-```
+This keeps the repair prompt small and lets local models focus on the
+precise failure site rather than guessing from a wall of pytest
+output.
 
-This is built from the same `records.jsonl` file the retrieval layer
-uses (`build_symbol_map`) and formatted to stay well inside the context
-window of a 7B model (capped at 60 files × 20 symbols).
-
-When a retry is triggered by a wrong-arguments call, the retry loop uses
-`fetch_symbol_source(records_path, symbol_name)` to inject the exact
-source code of the failing function so the model sees the real signature.
-
-### Granular Error Slicing (10-line buffer)
-
-Instead of dumping the full 1 200-character pytest log into the retry
-prompt, `_build_fix_goal` extracts exactly ±5 lines around the first
-traceback line number:
-
-```
-Your code failed in `src/auth.py` at line 42 with `TypeError: expected str`.
-Here is the context around the failure:
-```python
-37.  def login(req):
-...
-42.     hash = hash_password(req.body)  # <-- ERROR HERE
-...
-47.
-```
-Fix this specific issue only.
-```
-
-This keeps the retry prompt under ~500 tokens and lets small models
-focus on the precise failure site rather than guessing from a wall of
-pytest output.
-
-## 9. Persistent chat sessions (Ask tab sidebar)
+## 8. Persistent chat sessions (Ask tab sidebar)
 
 The Ask tab's sidebar holds the local conversation store:
 
@@ -1321,7 +1094,7 @@ sessions.delete_session(m.id)
 Writes go through `os.replace` so a crash mid-write cannot corrupt
 either the index or a thread file.
 
-## 10. Hardware-aware model picker (Hardware tab)
+## 9. Hardware-aware model picker (Hardware tab)
 
 Click **🧠 Detect hardware** to populate the local-model fit table.
 The computation is pure-local -- it reads the RAM/VRAM detected by
@@ -1352,7 +1125,7 @@ behind each row.
 The same data is exported as `docs/hardware_matrix.json` for
 downstream tooling.
 
-## 11. Rate limiting and retries
+## 10. Rate limiting and retries
 
 Every HTTP-backed provider (Ollama and OpenAI-compatible) goes through
 `cgx.answer.ratelimit`, which provides:
@@ -1380,7 +1153,7 @@ When you load a profile from the UI, the provider is instantiated
 with the persisted `rate_limit` / `max_retries`, so the budget is
 applied transparently to every subsequent call.
 
-## 12. Anonymous telemetry (opt-in)
+## 11. Anonymous telemetry (opt-in)
 
 `cgx.telemetry` ships an ultra-light startup ping that exists solely
 to count active installs (MAU/DAU). It is **off by default** and emits
@@ -1397,7 +1170,7 @@ Disable: unset the variable, or set `CGX_TELEMETRY=0`. To rotate the
 install id, delete `~/.cgx/install_id` and restart. The full payload
 shape lives in `src/cgx/telemetry.py`; review it before opting in.
 
-## 13. VS Code extension
+## 12. VS Code extension
 
 [`extension/`](../extension/) hosts the CGX web UI inside a VS Code
 webview. The scaffold ships source-only; build it locally:
@@ -1423,7 +1196,7 @@ npm install -g @vscode/vsce
 vsce package        # → cgx-0.0.1.vsix
 ```
 
-## 14. Terminal logging
+## 13. Terminal logging
 
 All operations emit structured log lines to stdout from the moment the
 server starts. `setup_logging(INFO)` is called once in `launch.py` and
@@ -1433,21 +1206,15 @@ What each module logs:
 
 | Module                     | Log lines emitted                                            |
 |----------------------------|--------------------------------------------------------------|
-| Handlers (ask/plan/agent/index) | Request received; SSE stream opened / closed; errors.  |
+| Handlers (ask/plan/index)  | Request received; SSE stream opened / closed; errors.       |
 | `cgx.webui.task_store`     | Task created; status transitions (running → done/cancelled/error). |
-| `cgx.agents.tracker`       | `task_start`, `task_done`, `task_fail` for each planned task. |
-| `cgx.agents.planner`       | LLM call dispatched, task count returned, fallback activated, kind-policy routing branch (`SCAFFOLD` / `VERIFY-ONLY` / `READ-ONLY` / `CHANGE-GOAL`). |
-| `cgx.agents.judge`         | Structural verdict per task; LLM judge invocation outcome.   |
+| `cgx.session` (runner/router) | Recoverable loop issues as `[WARNING]` lines (unknown routing action, decision targeting a non-ask task, lesson-recording failures). |
 | SSE bridge (`cgx.webui.sse`) | Stream opened; each event forwarded; cancellation detected. |
 
-Example lines for a scaffold goal (*"create a calculator using React UI
-and python"*):
-
-```
-[INFO] cgx.agents.planner: Planner: kind-policy SCAFFOLD path (regex=True llm=False)
-[INFO] cgx.agents.planner: Planner: plan ready id=… tasks=4 kinds=['scaffold', 'scaffold', 'apply', 'verify']
-[INFO] cgx.agents.tracker: task_start kind=scaffold name='Generate React UI'
-```
+The session loop's full per-task lifecycle is captured separately as a
+JSONL trace in `<project_root>/.cgx/agent.log` (with a stable
+per-session mirror under `~/.cgx/agent-sessions/<session_id>/agent.log`);
+see "Function-call tracing" below for the verbose variant.
 
 Severity levels used are `[INFO]` for normal progress and `[WARNING]`
 for recoverable issues (e.g. LLM fallback, missing cancel token). To
@@ -1479,7 +1246,7 @@ decorator is a single `bool` check when disabled, but each `@traced`
 call still writes a JSONL row while it's on, so long-running sessions
 can produce thousands of lines.
 
-## 15. Task REST API
+## 14. Task REST API
 
 Every SSE operation creates a task record in `~/.cgx/tasks.db` (via
 `cgx.webui.task_store`). The REST API mounted at `/api/tasks` lets you
@@ -1529,7 +1296,7 @@ existed before the run are restored from the backup; files the
 the **Undo** button surfaced by the Agent tab after a successful
 apply.
 
-## 16. Safety defaults
+## 15. Safety defaults
 
 - **Plan tab** -- CGX never writes to your project directory during
   plan generation. The "Run impacted tests" sandbox uses a temporary

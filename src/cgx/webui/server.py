@@ -27,7 +27,6 @@ from fastapi.staticfiles import StaticFiles
 from cgx.trace import emit_trace as _trace_emit, is_trace_enabled
 
 from cgx.webui.routes import (
-    agent,
     agent_profiles,
     agent_session,
     ask,
@@ -107,7 +106,6 @@ def create_app() -> FastAPI:
     app.include_router(embed.router, prefix="/api")
     app.include_router(ask.router, prefix="/api")
     app.include_router(plan.router, prefix="/api")
-    app.include_router(agent.router, prefix="/api")
     app.include_router(agent_session.router, prefix="/api")
     app.include_router(agent_profiles.router, prefix="/api")
     app.include_router(skills_route.router, prefix="/api")

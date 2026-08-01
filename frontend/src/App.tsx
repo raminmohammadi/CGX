@@ -8,7 +8,6 @@ const OverviewPage = lazy(() => import("./pages/OverviewPage"));
 const AskPage = lazy(() => import("./pages/AskPage"));
 const PlanPage = lazy(() => import("./pages/PlanPage"));
 const AgentPage = lazy(() => import("./pages/AgentPage"));
-const AgentLegacyPage = lazy(() => import("./pages/AgentLegacyPage"));
 const IndexPage = lazy(() => import("./pages/IndexPage"));
 const SettingsPage = lazy(() => import("./pages/SettingsPage"));
 
@@ -54,14 +53,6 @@ export default function App() {
           element={
             <Suspense fallback={<RouteFallback />}>
               <AgentPage />
-            </Suspense>
-          }
-        />
-        <Route
-          path="/agent-legacy"
-          element={
-            <Suspense fallback={<RouteFallback />}>
-              <AgentLegacyPage />
             </Suspense>
           }
         />

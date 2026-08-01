@@ -34,16 +34,16 @@ from cgx.session.models import (
     TaskNode,
     TaskNodeStatus,
 )
-from cgx.session.router import (
+from cgx.session.actions import (
     AttachDecisionToTask,
     CreateTask,
     RecordDecision,
     RecordLesson,
-    Router,
     RouterPlan,
     UpdateSessionStatus,
     UpdateTaskStatus,
 )
+from cgx.session.router import Router
 from cgx.session.agent_log import log_event
 from cgx.session.store import SessionStore
 from cgx.session.tasks.base import ExecutorDeps, ExecutorResult, dispatch
@@ -344,7 +344,8 @@ class SessionRunner:
                 self._store.add_fact(fact)
 
             if result.failure:
-                return self._fail_and_route(session, task, result.failure)
+                return self._fail_and_route(session, task, result.failure,
+                                            retryable=result.retryable)
 
             if result.artifact is not None:
                 self._store.save_artifact(result.artifact)
@@ -392,7 +393,7 @@ class SessionRunner:
         return task
 
     def _fail_and_route(self, session: Session, task: TaskNode,
-                        message: str) -> TaskNode:
+                        message: str, *, retryable: bool = False) -> TaskNode:
         """Mark ``task`` FAILED and route the hard failure through the router.
 
         A hard failure (executor ``result.failure`` or a crash) produces
@@ -401,14 +402,17 @@ class SessionRunner:
         greenfield session reach its terminal ``FAILED`` status instead of
         hanging in ``active`` with a dead FAILED leaf. Explore-mode
         sessions get an empty plan, preserving their user-driven
-        lifecycle.
+        lifecycle. ``retryable`` forwards the executor's own verdict that
+        the failure is plan-quality (an LLM retry could fix it); crashes
+        and missing-executor failures are never retryable.
         """
         self._mark_failed(session, task, message)
         tasks_after = self._store.list_tasks(session.session_id)
         resume_id = self._resume_checkpoint_id(session, task)
         plan = self._router.on_task_failed(
             session=session, failed=task, tasks=tasks_after,
-            resume_scaffold_artifact_id=resume_id)
+            resume_scaffold_artifact_id=resume_id,
+            retryable=retryable)
         self._apply_plan(session, plan)
         return task
 

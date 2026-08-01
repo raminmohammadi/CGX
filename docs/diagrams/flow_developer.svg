@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 1040" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace">
-  <!-- CGX · Developer Architecture: Planner → Tracker → Judge + Skills + Retry loop -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 900" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace">
+  <!-- CGX · Developer Architecture: session loop (Runner → Executor → Router → Store) -->
   <defs>
     <linearGradient id="dbg" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0%" stop-color="#0f172a"/>
@@ -23,246 +23,125 @@
     <marker id="darrowPurple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
       <path d="M 0 0 L 10 5 L 0 10 z" fill="#a78bfa"/>
     </marker>
-    <marker id="darrowRed" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
-      <path d="M 0 0 L 10 5 L 0 10 z" fill="#f87171"/>
-    </marker>
     <marker id="darrowMuted" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
       <path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/>
     </marker>
   </defs>
-  <rect width="1280" height="1040" fill="url(#dbg)"/>
+  <rect width="1280" height="900" fill="url(#dbg)"/>
 
-  <text x="40" y="44" font-family="Inter, sans-serif" font-size="22" font-weight="700" fill="#f1f5f9">CGX Agent Loop -- Developer View</text>
-  <text x="40" y="66" font-family="Inter, sans-serif" font-size="12" fill="#94a3b8">cgx.agents.run_agent  ·  goal → Planner (4-branch routing, skills attach) → Tracker → (capability + Judge)*  → SSE stream → React UI · failure-driven retry</text>
+  <text x="40" y="44" font-family="Inter, sans-serif" font-size="22" font-weight="700" fill="#f1f5f9">CGX Session Loop -- Developer View</text>
+  <text x="40" y="66" font-family="Inter, sans-serif" font-size="12" fill="#94a3b8">cgx.session  ·  objective → Router seeds root task → Runner claims READY task → Executor → Router routes success / failure → SessionStore persists · events stream to every UI</text>
 
-  <!-- UI side -->
+  <!-- Row 1: surfaces -->
   <g>
-    <rect x="40" y="100" width="220" height="100" rx="12" fill="url(#moduleFill)" stroke="#38bdf8" stroke-width="2"/>
+    <rect x="40" y="100" width="230" height="104" rx="12" fill="url(#moduleFill)" stroke="#38bdf8" stroke-width="2"/>
     <text x="60" y="124" font-size="13" font-weight="700" fill="#38bdf8">AgentPage.tsx</text>
-    <text x="60" y="146" font-size="11" fill="#cbd5e1">POST /api/agent (goal, opts)</text>
-    <text x="60" y="164" font-size="11" fill="#cbd5e1">EventSource &lt;- SSE  ·  Cancel btn</text>
-    <text x="60" y="184" font-size="10" fill="#64748b">tasks store · sessionStorage replay</text>
-  </g>
-
-  <!-- API / SSE bridge -->
-  <g>
-    <rect x="300" y="100" width="220" height="100" rx="12" fill="url(#moduleFill)" stroke="#94a3b8" stroke-width="2"/>
-    <text x="320" y="124" font-size="13" font-weight="700" fill="#cbd5e1">cgx.webui  ·  SSE bridge</text>
-    <text x="320" y="146" font-size="11" fill="#cbd5e1">text/event-stream  ·  /api/tasks  ·  /api/rollback</text>
-    <text x="320" y="164" font-size="11" fill="#cbd5e1">task_store (SQLite) + cancel_event</text>
-    <text x="320" y="184" font-size="10" fill="#64748b">replay-on-remount · DELETE cancels</text>
-  </g>
-
-  <!-- run_agent -->
-  <g>
-    <rect x="560" y="100" width="220" height="100" rx="12" fill="url(#moduleFill)" stroke="#a78bfa" stroke-width="2"/>
-    <text x="580" y="124" font-size="13" font-weight="700" fill="#a78bfa">cgx.agents.loop</text>
-    <text x="580" y="146" font-size="11" fill="#cbd5e1">run_agent(goal, ..., stream=True)</text>
-    <text x="580" y="164" font-size="11" fill="#cbd5e1">progress_interval=2.0s · max_retries</text>
-    <text x="580" y="184" font-size="10" fill="#64748b">wires Planner + Tracker + Judge</text>
-  </g>
-
-  <!-- Provider summary (Phase 5) -->
-  <g>
-    <rect x="820" y="100" width="420" height="100" rx="12" fill="url(#moduleFill)" stroke="#f472b6" stroke-width="2"/>
-    <text x="840" y="124" font-size="13" font-weight="700" fill="#f472b6">cgx.answer.providers  ·  uniform chat() / chat_stream()</text>
-    <text x="840" y="146" font-size="11" fill="#cbd5e1">OllamaProvider  ·  OpenAICompatProvider  ·  GeminiProvider  ·  custom</text>
-    <text x="840" y="164" font-size="11" fill="#cbd5e1">endpoint_path · allow_no_auth · rate_limit · max_retries</text>
-    <text x="840" y="184" font-size="10" fill="#64748b">POST /api/provider/ping → {ok, latency_ms, error}</text>
-  </g>
-
-  <!-- arrows UI -->
-  <line x1="260" y1="150" x2="298" y2="150" stroke="#34d399" stroke-width="2" marker-end="url(#darrow)"/>
-  <line x1="520" y1="150" x2="558" y2="150" stroke="#34d399" stroke-width="2" marker-end="url(#darrow)"/>
-
-  <!-- Planner -->
-  <g>
-    <rect x="40" y="240" width="370" height="200" rx="12" fill="url(#moduleFill)" stroke="#38bdf8" stroke-width="2"/>
-    <text x="60" y="264" font-size="14" font-weight="700" fill="#38bdf8">Planner  ·  cgx.agents.planner</text>
-    <text x="60" y="284" font-size="11" fill="#cbd5e1">LLM (strict JSON) or deterministic fallback</text>
-    <text x="60" y="300" font-size="10.5" fill="#cbd5e1">Schema: {name, description, kind, criteria}</text>
-    <text x="60" y="316" font-size="10.5" fill="#cbd5e1">kind ∈ {ask, plan, scaffold, scaffold_manifest,</text>
-    <text x="60" y="330" font-size="10.5" fill="#cbd5e1">  scaffold_file, search, summarize, apply, verify, fill_logic}</text>
-    <text x="60" y="350" font-size="11" fill="#f59e0b">_enforce_kind_policy -- 4 routing branches:</text>
-    <text x="60" y="366" font-size="10.5" fill="#cbd5e1">  SCAFFOLD → [scaffold_manifest, apply, verify]</text>
-    <text x="60" y="380" font-size="10.5" fill="#cbd5e1">    (manifest injects N scaffold_file tasks at runtime)</text>
-    <text x="60" y="394" font-size="10.5" fill="#cbd5e1">  VERIFY-ONLY · READ-ONLY (plan→ask) · CHANGE-GOAL</text>
-    <text x="60" y="412" font-size="10.5" fill="#cbd5e1">attaches task.inputs[goal, skills] to SCAFFOLD/PLAN</text>
-    <text x="60" y="428" font-size="10" fill="#64748b">[INFO] kind-policy branch + skills=[...] log line</text>
-  </g>
-
-  <!-- Tracker -->
-  <g>
-    <rect x="450" y="240" width="370" height="200" rx="12" fill="url(#moduleFill)" stroke="#34d399" stroke-width="2"/>
-    <text x="470" y="264" font-size="14" font-weight="700" fill="#34d399">Tracker  ·  cgx.agents.tracker</text>
-    <text x="470" y="284" font-size="11" fill="#cbd5e1">stream(plan) → Iterator[AgentEvent]</text>
-    <text x="470" y="300" font-size="11" fill="#cbd5e1">capability runs in a worker thread</text>
-    <text x="470" y="320" font-size="11" fill="#f59e0b">every progress_interval (2s default):</text>
-    <text x="470" y="336" font-size="10.5" fill="#cbd5e1">  yield task_progress {task_id, elapsed}</text>
-    <text x="470" y="356" font-size="11" fill="#f59e0b">after each apply:</text>
-    <text x="470" y="372" font-size="10.5" fill="#cbd5e1">  updates plan.owned_files[path] = applied|failed</text>
-    <text x="470" y="392" font-size="10.5" fill="#cbd5e1">on done: judge → task_done | task_failed | task_skipped</text>
-    <text x="470" y="412" font-size="10.5" fill="#cbd5e1">stop_on_fail halts; otherwise skips downstream</text>
-    <text x="470" y="428" font-size="10" fill="#64748b">8 AgentEvent kinds streamed as SSE</text>
-  </g>
-
-  <!-- Judge -->
-  <g>
-    <rect x="860" y="240" width="380" height="200" rx="12" fill="url(#moduleFill)" stroke="#a78bfa" stroke-width="2"/>
-    <text x="880" y="264" font-size="14" font-weight="700" fill="#a78bfa">Judge  ·  cgx.agents.judge</text>
-    <text x="880" y="284" font-size="11" fill="#cbd5e1">Structural short-circuits per kind:</text>
-    <text x="880" y="300" font-size="10.5" fill="#cbd5e1">  ASK: fail when answer_md empty</text>
-    <text x="880" y="316" font-size="10.5" fill="#cbd5e1">  PLAN: needs plan_md or diffs · skills.validate_plan</text>
-    <text x="880" y="332" font-size="10.5" fill="#cbd5e1">  SCAFFOLD: skills.validate_scaffold → pass short-circuit</text>
-    <text x="880" y="348" font-size="10.5" fill="#cbd5e1">  SEARCH: pass when hits &gt; 0  (LLM skipped)</text>
-    <text x="880" y="364" font-size="10.5" fill="#cbd5e1">  APPLY: pass when failed_files empty (partial OK)</text>
-    <text x="880" y="380" font-size="10.5" fill="#cbd5e1">  VERIFY: trust pytest returncode</text>
-    <text x="880" y="400" font-size="11" fill="#f59e0b">LLM verdict (when needed):</text>
-    <text x="880" y="416" font-size="10.5" fill="#cbd5e1">  scaffold render: plan_md + files + preview (≤7.5k)</text>
-    <text x="880" y="430" font-size="10" fill="#64748b">{verdict, confidence, rationale} JSON  ·  [skill] prefix on fail</text>
-  </g>
-
-  <!-- Flow arrows between Planner -> Tracker -> Judge -->
-  <line x1="410" y1="330" x2="448" y2="330" stroke="#34d399" stroke-width="2" marker-end="url(#darrow)"/>
-  <line x1="820" y1="330" x2="858" y2="330" stroke="#a78bfa" stroke-width="2" marker-end="url(#darrowPurple)"/>
-  <!-- Judge → Tracker feedback (verdict feeds next task) -->
-  <path d="M 1050 440 L 1050 462 L 635 462 L 635 442" fill="none" stroke="#a78bfa" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#darrowPurple)"/>
-  <text x="780" y="458" font-size="10" fill="#a78bfa" font-family="Inter, sans-serif">verdict feeds next task</text>
-
-  <!-- Skills banner -->
-  <g>
-    <rect x="40" y="478" width="1200" height="46" rx="10" fill="#0b1220" stroke="#f472b6" stroke-opacity="0.6"/>
-    <text x="60" y="500" font-size="12" font-weight="700" fill="#f472b6" font-family="Inter, sans-serif">skills/ package</text>
-    <text x="170" y="500" font-size="11" fill="#cbd5e1">react · nextjs · vue · tailwind · fastapi · flask · django · express · python_cli · sqlite</text>
-    <text x="60" y="516" font-size="10.5" fill="#94a3b8">detect_skills(goal) → compose_scaffold_prompt / compose_plan_prompt · validate_scaffold / validate_plan (returns SkillVerdict)</text>
-  </g>
-
-  <!-- Capabilities (dispatched by task.kind) -->
-  <text x="40" y="554" font-size="13" font-weight="700" fill="#cbd5e1" font-family="Inter, sans-serif">Capabilities (dispatched by task.kind)</text>
-  <line x1="40" y1="562" x2="1240" y2="562" stroke="#1e293b"/>
-
-  <!-- Row 1: search · ask · plan · scaffold -->
-  <g>
-    <rect x="40"  y="572" width="290" height="86" rx="10" fill="#0b1220" stroke="#34d399" stroke-opacity="0.6"/>
-    <text x="58" y="596" font-size="12" font-weight="700" fill="#34d399">search</text>
-    <text x="58" y="616" font-size="10.5" fill="#cbd5e1">cgx.pipeline.auto.run_query_auto</text>
-    <text x="58" y="634" font-size="10" fill="#94a3b8">parallel intent + impl ANN  ·  RRF</text>
-    <text x="58" y="650" font-size="10" fill="#64748b">→ {hits, top_files, impact}</text>
+    <text x="60" y="146" font-size="11" fill="#cbd5e1">POST /api/agent-session</text>
+    <text x="60" y="164" font-size="11" fill="#cbd5e1">/message · /decision · DELETE</text>
+    <text x="60" y="188" font-size="10" fill="#64748b">EventSource /{sid}/events · snapshot replay</text>
   </g>
   <g>
-    <rect x="350" y="572" width="290" height="86" rx="10" fill="#0b1220" stroke="#38bdf8" stroke-opacity="0.6"/>
-    <text x="368" y="596" font-size="12" font-weight="700" fill="#38bdf8">ask</text>
-    <text x="368" y="616" font-size="10.5" fill="#cbd5e1">cgx.answer.engine.answer_with_llm</text>
-    <text x="368" y="634" font-size="10" fill="#94a3b8">intent-conditioned system prompts</text>
-    <text x="368" y="650" font-size="10" fill="#64748b">→ {answer_md, citations}</text>
+    <rect x="310" y="100" width="230" height="104" rx="12" fill="url(#moduleFill)" stroke="#94a3b8" stroke-width="2"/>
+    <text x="330" y="124" font-size="13" font-weight="700" fill="#cbd5e1">cgx.webui.routes.agent_session</text>
+    <text x="330" y="146" font-size="11" fill="#cbd5e1">REST + SSE (text/event-stream)</text>
+    <text x="330" y="164" font-size="11" fill="#cbd5e1">_schedule_drain · cancel_event</text>
+    <text x="330" y="188" font-size="10" fill="#64748b">one SessionRunner per project_root</text>
   </g>
   <g>
-    <rect x="660" y="572" width="290" height="86" rx="10" fill="#0b1220" stroke="#f59e0b" stroke-opacity="0.6"/>
-    <text x="678" y="596" font-size="12" font-weight="700" fill="#f59e0b">plan</text>
-    <text x="678" y="616" font-size="10.5" fill="#cbd5e1">cgx.answer.engine.generate_code_plan</text>
-    <text x="678" y="634" font-size="10" fill="#94a3b8">+ symbol_map context · skills= prompts</text>
-    <text x="678" y="650" font-size="10" fill="#64748b">→ {plan_md, diffs, codegen_report}</text>
+    <rect x="580" y="100" width="230" height="104" rx="12" fill="url(#moduleFill)" stroke="#38bdf8" stroke-width="2"/>
+    <text x="600" y="124" font-size="13" font-weight="700" fill="#38bdf8">cgx.cli  ·  terminal</text>
+    <text x="600" y="146" font-size="11" fill="#cbd5e1">cgx agent &lt;goal&gt; -- one auto turn</text>
+    <text x="600" y="164" font-size="11" fill="#cbd5e1">TUI dashboard · ops.agent_events()</text>
+    <text x="600" y="188" font-size="10" fill="#64748b">auto=True answers checkpoints itself</text>
   </g>
   <g>
-    <rect x="970" y="572" width="270" height="86" rx="10" fill="#0b1220" stroke="#f472b6" stroke-opacity="0.7"/>
-    <text x="988" y="596" font-size="12" font-weight="700" fill="#f472b6">scaffold_manifest → scaffold_file × N</text>
-    <text x="988" y="616" font-size="10.5" fill="#cbd5e1">manifest: plan_scaffold_manifest(idea)</text>
-    <text x="988" y="634" font-size="10" fill="#94a3b8">per file: generate_single_scaffold_file()</text>
-    <text x="988" y="650" font-size="10" fill="#64748b">tracker injects 1 SCAFFOLD_FILE per layer file</text>
+    <rect x="850" y="100" width="390" height="104" rx="12" fill="url(#moduleFill)" stroke="#94a3b8" stroke-width="2"/>
+    <text x="870" y="124" font-size="13" font-weight="700" fill="#cbd5e1">cgx.answer.providers  ·  uniform chat() / chat_stream()</text>
+    <text x="870" y="146" font-size="11" fill="#cbd5e1">OllamaProvider · OpenAICompatProvider · GeminiProvider</text>
+    <text x="870" y="164" font-size="11" fill="#cbd5e1">rate_limit + backoff · profile-resolved model/temperature</text>
+    <text x="870" y="188" font-size="10" fill="#64748b">every executor LLM call goes through here</text>
   </g>
 
-  <!-- Row 2: summarize · apply · verify · fill_logic -->
+  <!-- Row 2: runner / executors / router -->
   <g>
-    <rect x="40"  y="672" width="290" height="86" rx="10" fill="#0b1220" stroke="#a78bfa" stroke-opacity="0.6"/>
-    <text x="58" y="696" font-size="12" font-weight="700" fill="#a78bfa">summarize</text>
-    <text x="58" y="716" font-size="10.5" fill="#cbd5e1">LLM over prior task outputs</text>
-    <text x="58" y="734" font-size="10" fill="#94a3b8">composes a final report</text>
-    <text x="58" y="750" font-size="10" fill="#64748b">→ {answer_md}</text>
-  </g>
-  <g>
-    <rect x="350" y="672" width="290" height="86" rx="10" fill="#0b1220" stroke="#22d3ee" stroke-opacity="0.7"/>
-    <text x="368" y="696" font-size="12" font-weight="700" fill="#22d3ee">apply</text>
-    <text x="368" y="716" font-size="10.5" fill="#cbd5e1">cgx.codegen.disk_apply.apply_diffs_to_disk</text>
-    <text x="368" y="734" font-size="10" fill="#94a3b8">partial-apply + cross-file coherence · backup dir</text>
-    <text x="368" y="750" font-size="10" fill="#64748b">→ {applied_files, failed_files, smoke_ok, backup_dir}</text>
+    <rect x="40" y="270" width="340" height="150" rx="12" fill="url(#moduleFill)" stroke="#a78bfa" stroke-width="2"/>
+    <text x="60" y="294" font-size="13" font-weight="700" fill="#a78bfa">SessionRunner  ·  cgx.session.runner</text>
+    <text x="60" y="316" font-size="11" fill="#cbd5e1">start_session · post_message · post_decision</text>
+    <text x="60" y="334" font-size="11" fill="#cbd5e1">run_next: _pick_ready → _execute → _apply_plan</text>
+    <text x="60" y="352" font-size="11" fill="#cbd5e1">per-session lock · one task per call</text>
+    <text x="60" y="370" font-size="11" fill="#cbd5e1">budget guard → escalates to a budget ASK_USER</text>
+    <text x="60" y="394" font-size="10" fill="#64748b">no thread pool: caller drives the loop (UI drain / CLI)</text>
   </g>
   <g>
-    <rect x="660" y="672" width="290" height="86" rx="10" fill="#0b1220" stroke="#84cc16" stroke-opacity="0.7"/>
-    <text x="678" y="696" font-size="12" font-weight="700" fill="#84cc16">verify</text>
-    <text x="678" y="716" font-size="10.5" fill="#cbd5e1">env_manager.preflight_install → pytest</text>
-    <text x="678" y="734" font-size="10" fill="#94a3b8">missing pkgs auto-installed + req.txt</text>
-    <text x="678" y="750" font-size="10" fill="#64748b">→ {ran, tests_passed, returncode}</text>
+    <rect x="420" y="270" width="420" height="150" rx="12" fill="url(#moduleFill)" stroke="#34d399" stroke-width="2"/>
+    <text x="440" y="294" font-size="13" font-weight="700" fill="#34d399">Executors  ·  cgx.session.tasks.*  (@register_executor)</text>
+    <text x="440" y="316" font-size="11" fill="#cbd5e1">explore · investigate · recommend · plan_change · apply · verify</text>
+    <text x="440" y="334" font-size="11" fill="#cbd5e1">clarify_requirements · decompose · scaffold · bootstrap_env</text>
+    <text x="440" y="352" font-size="11" fill="#cbd5e1">api_check · smoke · runtime_verify · repair · ask</text>
+    <text x="440" y="376" font-size="11" fill="#f1f5f9">ExecutorResult {status, facts, artifacts, retryable}</text>
+    <text x="440" y="394" font-size="10" fill="#64748b">retryable=True marks failures the Router may re-run with folded feedback</text>
   </g>
   <g>
-    <rect x="970" y="672" width="270" height="86" rx="10" fill="#0b1220" stroke="#fb923c" stroke-opacity="0.7"/>
-    <text x="988" y="696" font-size="12" font-weight="700" fill="#fb923c">fill_logic</text>
-    <text x="988" y="716" font-size="10.5" fill="#cbd5e1">stitches one function body at a time</text>
-    <text x="988" y="734" font-size="10" fill="#94a3b8">regex matches pass / # TODO  ·  ast.parse</text>
-    <text x="988" y="750" font-size="10" fill="#64748b">→ {applied, syntax_ok}</text>
+    <rect x="880" y="270" width="360" height="150" rx="12" fill="url(#moduleFill)" stroke="#f59e0b" stroke-width="2"/>
+    <text x="900" y="294" font-size="13" font-weight="700" fill="#f59e0b">Router  ·  cgx.session.router</text>
+    <text x="900" y="316" font-size="11" fill="#cbd5e1">TASK_SUCCESSOR: 14 deterministic edges</text>
+    <text x="900" y="334" font-size="11" fill="#cbd5e1">on_task_done → spawn successors (RouterPlan)</text>
+    <text x="900" y="352" font-size="11" fill="#cbd5e1">on_task_failed → bounded retry when retryable,</text>
+    <text x="900" y="370" font-size="11" fill="#cbd5e1">checkpoint re-plan, else terminal FAILED</text>
+    <text x="900" y="394" font-size="10" fill="#64748b">RouterPlan = CreateTask · UpdateStatus · RecordDecision · RecordLesson</text>
   </g>
 
-  <!-- Retry loop section -->
+  <!-- Row 3: store / events / mode chains -->
   <g>
-    <rect x="40" y="780" width="1200" height="160" rx="12" fill="url(#retryFill)" stroke="#f87171" stroke-width="2"/>
-    <text x="60" y="804" font-size="13" font-weight="700" fill="#f87171" font-family="Inter, sans-serif">Failure-driven retry  ·  cgx.agents.loop._stream_with_retry  ·  recurses up to max_retries</text>
-
-    <!-- sub: verify -->
-    <g>
-      <rect x="60" y="820" width="370" height="100" rx="10" fill="#0b1220" stroke="#f87171" stroke-opacity="0.6"/>
-      <text x="78" y="842" font-size="11" font-weight="700" fill="#f87171">verify failure</text>
-      <text x="78" y="860" font-size="10.5" fill="#cbd5e1">_diagnose_failure → import / syntax / logic</text>
-      <text x="78" y="876" font-size="10.5" fill="#cbd5e1">_extract_error_snippet -- ±5 line window</text>
-      <text x="78" y="892" font-size="10.5" fill="#cbd5e1">  with `# &lt;-- ERROR HERE` (10-line buffer)</text>
-      <text x="78" y="908" font-size="10" fill="#94a3b8">_build_fix_goal names broken files only</text>
-    </g>
-
-    <!-- sub: apply -->
-    <g>
-      <rect x="450" y="820" width="370" height="100" rx="10" fill="#0b1220" stroke="#22d3ee" stroke-opacity="0.6"/>
-      <text x="468" y="842" font-size="11" font-weight="700" fill="#22d3ee">apply failure</text>
-      <text x="468" y="860" font-size="10.5" fill="#cbd5e1">smoke / cross-file coherence rejected</text>
-      <text x="468" y="876" font-size="10.5" fill="#cbd5e1">regenerate only failed_files</text>
-      <text x="468" y="892" font-size="10.5" fill="#cbd5e1">passing files already on disk (partial apply)</text>
-      <text x="468" y="908" font-size="10" fill="#94a3b8">plan.owned_files = "applied" | "failed"</text>
-    </g>
-
-    <!-- sub: codegen -->
-    <g>
-      <rect x="840" y="820" width="380" height="100" rx="10" fill="#0b1220" stroke="#f59e0b" stroke-opacity="0.6"/>
-      <text x="858" y="842" font-size="11" font-weight="700" fill="#f59e0b">scaffold / plan judge fail</text>
-      <text x="858" y="860" font-size="10.5" fill="#cbd5e1">_build_core_fix_goal re-asks LLM</text>
-      <text x="858" y="876" font-size="10.5" fill="#cbd5e1">SCAFFOLD: tech-mismatch hard-fail still applies</text>
-      <text x="858" y="892" font-size="10.5" fill="#cbd5e1">PLAN: skill.validate_plan can short-circuit</text>
-      <text x="858" y="908" font-size="10" fill="#94a3b8">re-routes through Planner → Tracker → Judge</text>
-    </g>
+    <rect x="40" y="486" width="340" height="140" rx="12" fill="url(#moduleFill)" stroke="#94a3b8" stroke-width="2"/>
+    <text x="60" y="510" font-size="13" font-weight="700" fill="#cbd5e1">SessionStore  ·  cgx.session.store</text>
+    <text x="60" y="532" font-size="11" fill="#cbd5e1">SQLite  ·  &lt;project&gt;/.cgx/sessions.db</text>
+    <text x="60" y="550" font-size="11" fill="#cbd5e1">sessions · tasks · facts · decisions · artifacts</text>
+    <text x="60" y="568" font-size="11" fill="#cbd5e1">every write _emits a typed Event</text>
+    <text x="60" y="592" font-size="10" fill="#64748b">restart-safe: web UI, TUI and CLI share one store</text>
+  </g>
+  <g>
+    <rect x="420" y="486" width="420" height="140" rx="12" fill="url(#moduleFill)" stroke="#38bdf8" stroke-width="2"/>
+    <text x="440" y="510" font-size="13" font-weight="700" fill="#38bdf8">Event bus  ·  cgx.session.events</text>
+    <text x="440" y="532" font-size="11" fill="#cbd5e1">store subscribers → SSE  GET /api/agent-session/{sid}/events</text>
+    <text x="440" y="550" font-size="11" fill="#cbd5e1">task_started · task_progress · task_done · decision_needed ...</text>
+    <text x="440" y="568" font-size="11" fill="#cbd5e1">TUI stream + agent.log trace consume the same feed</text>
+    <text x="440" y="592" font-size="10" fill="#64748b">~/.cgx/agent-sessions/&lt;sid&gt;/agent.log · llm_trace per call</text>
+  </g>
+  <g>
+    <rect x="880" y="486" width="360" height="140" rx="12" fill="url(#moduleFill)" stroke="#a78bfa" stroke-width="2"/>
+    <text x="900" y="510" font-size="13" font-weight="700" fill="#a78bfa">Two mode chains  ·  SessionMode</text>
+    <text x="900" y="532" font-size="11" fill="#cbd5e1">explore: EXPLORE → ASK → INVESTIGATE → RECOMMEND</text>
+    <text x="900" y="550" font-size="11" fill="#cbd5e1">  → ASK → PLAN_CHANGE → ASK → APPLY → VERIFY</text>
+    <text x="900" y="568" font-size="11" fill="#cbd5e1">greenfield: CLARIFY → ASK → DECOMPOSE → ASK →</text>
+    <text x="900" y="586" font-size="11" fill="#cbd5e1">  SCAFFOLD → APPLY → BOOTSTRAP_ENV → API_CHECK →</text>
+    <text x="900" y="604" font-size="11" fill="#cbd5e1">  SMOKE → VERIFY → RUNTIME_VERIFY</text>
   </g>
 
-  <!-- Event timeline -->
-  <text x="40" y="966" font-size="13" font-weight="700" fill="#cbd5e1" font-family="Inter, sans-serif">SSE event stream (per task)</text>
-  <line x1="40" y1="974" x2="1240" y2="974" stroke="#1e293b"/>
-  <g font-size="11" font-family="JetBrains Mono, monospace">
-    <rect x="40"  y="990" width="80"  height="30" rx="6" fill="#0b1220" stroke="#38bdf8"/>
-    <text x="80" y="1010" text-anchor="middle" fill="#38bdf8">plan</text>
-    <rect x="140" y="990" width="110" height="30" rx="6" fill="#0b1220" stroke="#34d399"/>
-    <text x="195" y="1010" text-anchor="middle" fill="#34d399">task_start</text>
-    <rect x="270" y="990" width="160" height="30" rx="6" fill="#0b1220" stroke="#f59e0b"/>
-    <text x="350" y="1010" text-anchor="middle" fill="#f59e0b">task_progress · Nx</text>
-    <rect x="450" y="990" width="80"  height="30" rx="6" fill="#0b1220" stroke="#a78bfa"/>
-    <text x="490" y="1010" text-anchor="middle" fill="#a78bfa">judge</text>
-    <rect x="550" y="990" width="110" height="30" rx="6" fill="#0b1220" stroke="#34d399"/>
-    <text x="605" y="1010" text-anchor="middle" fill="#34d399">task_done</text>
-    <rect x="680" y="990" width="120" height="30" rx="6" fill="#0b1220" stroke="#94a3b8"/>
-    <text x="740" y="1010" text-anchor="middle" fill="#cbd5e1">task_skipped</text>
-    <rect x="820" y="990" width="120" height="30" rx="6" fill="#0b1220" stroke="#f87171"/>
-    <text x="880" y="1010" text-anchor="middle" fill="#f87171">task_failed?</text>
-    <rect x="960" y="990" width="100" height="30" rx="6" fill="#0b1220" stroke="#a78bfa"/>
-    <text x="1010" y="1010" text-anchor="middle" fill="#a78bfa">summary</text>
-    <line x1="120" y1="1005" x2="138" y2="1005" stroke="#475569" stroke-width="1.5" marker-end="url(#darrowMuted)"/>
-    <line x1="250" y1="1005" x2="268" y2="1005" stroke="#475569" stroke-width="1.5" marker-end="url(#darrowMuted)"/>
-    <line x1="430" y1="1005" x2="448" y2="1005" stroke="#475569" stroke-width="1.5" marker-end="url(#darrowMuted)"/>
-    <line x1="530" y1="1005" x2="548" y2="1005" stroke="#475569" stroke-width="1.5" marker-end="url(#darrowMuted)"/>
-    <line x1="660" y1="1005" x2="678" y2="1005" stroke="#475569" stroke-width="1.5" marker-end="url(#darrowMuted)"/>
-    <line x1="800" y1="1005" x2="818" y2="1005" stroke="#475569" stroke-width="1.5" marker-end="url(#darrowMuted)"/>
-    <line x1="940" y1="1005" x2="958" y2="1005" stroke="#475569" stroke-width="1.5" marker-end="url(#darrowMuted)"/>
+  <!-- Row 4: failure recovery band -->
+  <g>
+    <rect x="40" y="692" width="1200" height="120" rx="12" fill="url(#retryFill)" stroke="#f87171" stroke-width="2"/>
+    <text x="60" y="716" font-size="13" font-weight="700" fill="#f87171">Failure recovery  ·  bounded, evidence-driven</text>
+    <text x="60" y="738" font-size="11" fill="#cbd5e1">VERIFY / RUNTIME_VERIFY / SMOKE / API_CHECK fail → REPAIR (cgx.session.repair classifies: import_error · syntax_error · logic_error) → targeted APPLY → re-verify</text>
+    <text x="60" y="756" font-size="11" fill="#cbd5e1">retryable executor failures (DECOMPOSE cycle, invalid JSON, syntax) → Router folds the failure note into the goal and re-runs the same task, bounded per kind</text>
+    <text x="60" y="774" font-size="11" fill="#cbd5e1">repair-progress stall detection · loop budgets → budget ASK_USER checkpoint instead of silent spin · anything unrecoverable ends the session as FAILED with a lesson recorded</text>
+    <text x="60" y="798" font-size="10" fill="#64748b">every branch pauses at a typed ASK_USER decision in the UI; `cgx agent` auto-mode answers them with defaults</text>
   </g>
+
+  <!-- Arrows: surfaces → runner -->
+  <path d="M 155 204 L 155 240 L 210 240 L 210 268" fill="none" stroke="#38bdf8" stroke-width="2" marker-end="url(#darrow)"/>
+  <path d="M 425 204 L 425 232 L 300 232 L 300 268" fill="none" stroke="#475569" stroke-width="2" marker-end="url(#darrowMuted)"/>
+  <path d="M 695 204 L 695 248 L 340 248 L 340 268" fill="none" stroke="#475569" stroke-width="2" marker-end="url(#darrowMuted)"/>
+  <!-- runner → executors → router -->
+  <path d="M 380 345 L 418 345" fill="none" stroke="#34d399" stroke-width="2" marker-end="url(#darrow)"/>
+  <path d="M 840 345 L 878 345" fill="none" stroke="#f59e0b" stroke-width="2" marker-end="url(#darrowAmber)"/>
+  <!-- executors → providers -->
+  <path d="M 700 268 L 700 240 L 1045 240 L 1045 206" fill="none" stroke="#a78bfa" stroke-width="2" marker-end="url(#darrowPurple)"/>
+  <!-- router → store (via runner _apply_plan) -->
+  <path d="M 1060 420 L 1060 452 L 210 452 L 210 484" fill="none" stroke="#f59e0b" stroke-width="2" marker-end="url(#darrowAmber)"/>
+  <!-- store → event bus → surfaces -->
+  <path d="M 380 556 L 418 556" fill="none" stroke="#38bdf8" stroke-width="2" marker-end="url(#darrow)"/>
+  <path d="M 630 486 L 630 424" fill="none" stroke="#38bdf8" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#darrow)"/>
+  <!-- repair band feedback into the chains -->
+  <path d="M 1060 692 L 1060 628" fill="none" stroke="#f87171" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#darrowAmber)"/>
 </svg>

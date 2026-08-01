@@ -22,6 +22,10 @@ class DashboardState:
     base_url: str = "http://localhost:11434"
     profile_name: Optional[str] = None
     context_pct: int = 100
+    # Session agent loop: the active session for this dashboard, and the
+    # open ASK_USER (if any) that the next plain message will answer.
+    agent_session_id: Optional[str] = None
+    pending_ask: Optional[dict] = None
 
 
 @dataclass

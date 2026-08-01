@@ -259,21 +259,9 @@ The engine itself lives in `cgx.answer.engine`. Two entry points
 matter. `answer_with_llm` handles a read-only question: it runs
 retrieval, builds the Code Map, calls the provider, returns the
 answer plus the citations. `generate_code_plan` does the same but
-asks the provider for a structured plan-with-diffs response,
-threading in the symbol-table context from `cgx.codegen.symbol_map`
-so the model is reminded what already exists. A third entry point,
-`generate_project_scaffold`, drives the new-project branch of the
-agent loop where no index exists yet.
-
-`cgx.codegen.symbol_map.build_symbol_map` deserves a paragraph of its
-own. It walks the same JSONL records the retriever uses, normalises
-each chunk id of the form `path::kind::symbol` to a project-relative
-path, and returns a compact `{relative_path: [symbol, ...]}` map. The
-engine renders this map as an `# AVAILABLE CONTEXT` block and injects
-it into every `plan`-kind prompt. The result, for a small model that
-would otherwise re-implement `parse_codebase` from scratch, is a
-working-memory aide that says *these symbols already exist; reuse
-them.*
+asks the provider for a structured plan-with-diffs response. A
+third entry point, `generate_project_scaffold`, drives the
+new-project branch of the agent loop where no index exists yet.
 
 ---
 
@@ -344,97 +332,79 @@ calls `run_pytest_paths` against every discovered test file.
 
 ## Chapter 7 -- The agent
 
-`cgx.agents.run_agent` ties the pieces of Chapter 6 to the prompt
-machinery of Chapter 5 with a three-component loop: Planner,
-Tracker, Judge.
+`cgx.session` ties the disk-writing pieces of Chapter 6 to the
+prompt machinery of Chapter 5 with a persistent, checkpointed loop
+built from four parts: a **store**, a **runner**, a **router**, and
+a registry of **executors**.
 
-![alt text](images/chapter_7.png)
+A session is a durable aggregate -- one `Session` row plus its
+`TaskNode`s, `Fact`s, `Decision`s, and `Artifact`s -- persisted by
+`cgx.session.store.SessionStore` in SQLite at
+`<project_root>/.cgx/sessions.db`. Tasks form a DAG: each node
+declares `depends_on` edges, and a task becomes READY only when its
+dependencies are DONE. Because every state transition is written
+through the store, a session survives a process restart and can be
+resumed from the web UI, the terminal dashboard, or `cgx agent` --
+they all drive the same rows.
 
-The **Planner** (`cgx.agents.planner.Planner.plan`) takes a goal
-string and emits a `Plan` -- an ordered list of `Task`s, each with
-a `kind`, a `description`, a `criteria` list the Judge will check,
-and an `inputs` dict the Tracker will hand to the capability. The
-Planner first retrieves a short candidate set against the index
-(so it can ground its decomposition in the real codebase), then
-asks the LLM for a strict-JSON
-`[{name, description, kind, criteria}]` array. The provider's reply
-is parsed with the same balanced-brace JSON extractor the Judge
-uses; if parsing fails, the Planner falls back to a deterministic
-single-task plan that the kind-policy will expand into the canonical
-shape.
+The **executors** (`cgx.session.tasks`, one module per `TaskKind`)
+are the atomic units of work. The explore-mode chain is
+`EXPLORE → INVESTIGATE → RECOMMEND → PLAN_CHANGE → APPLY → VERIFY`
+with `ASK_USER` checkpoints interleaved; the greenfield chain is
+`CLARIFY_REQUIREMENTS → DECOMPOSE → SCAFFOLD → APPLY →
+BOOTSTRAP_ENV → VERIFY`, with `API_CHECK`, `SMOKE`,
+`RUNTIME_VERIFY`, and `REPAIR` joining the tail as the run demands.
+Each executor makes at most one focused LLM call, reads typed
+inputs, writes typed artifacts, and returns an `ExecutorResult`
+that says succeeded, failed (optionally *retryable*), or
+needs-user. `ASK_USER` is itself a task kind: a checkpoint node
+that pauses the session until the user posts a typed `Decision`
+(choose a path, approve a plan, answer a clarify question).
 
-The ten task kinds are: `ask`, `plan`, `scaffold`,
-`scaffold_manifest`, `scaffold_file`, `search`, `summarize`,
-`apply`, `verify`, and `fill_logic`. `_enforce_kind_policy` reads
-the goal and routes it down one of four branches. A *scaffold* goal
-(detected via the `_SCAFFOLD_RE` regex, a verb-plus-tech pairing
-through `_TECH_RE`, a skill match from `skills.detect_skills` --
-the top-level `skills/` package that holds React, FastAPI, Flask,
-Django, Vue, Tailwind, SQLite, Next.js, Express, and python_cli
-templates -- or a literal `scaffold` task from the LLM with no
-existing-codebase hint) becomes `[scaffold_manifest, apply, verify]`,
-where the
-manifest task's runtime output injects one `scaffold_file` task
-per planned file. A *verify-only* goal collapses to a single
-`verify` task. A *read-only* goal collapses to a single `ask` task.
-Every other goal -- the ordinary "modify this code" case -- seeds a
-single `plan` task and the policy appends `apply` and `verify` so
-the chain always terminates with a real disk write and a real test
-gate. Sequential dependencies are wired between consecutive tasks
-so the UI can render the execution DAG.
+The **router** (`cgx.session.router.Router`) owns the policy. On a
+completed task it consults the `TASK_SUCCESSOR` table to spawn the
+next node(s) in the chain; on a failed task, `on_task_failed`
+decides between recovery and a terminal FAILED. Two recovery
+channels matter. A mid-run SCAFFOLD failure re-plans from the last
+good checkpoint. And any executor may mark a failure *retryable* --
+DECOMPOSE does this when its manifest fails the coherence gate --
+in which case the router re-dispatches the same task with the
+failure folded into its constraints, bounded by a per-task retry
+cap, instead of ending the session over one bad LLM reply.
 
-The **Tracker** (`cgx.agents.tracker.Tracker`) is a state machine
-that walks the plan task by task. Each task is dispatched on a
-worker thread to its matching capability -- `ask` to
-`answer_with_llm`, `plan` to `generate_code_plan`, `apply` to
-`apply_diffs_to_disk`, `verify` to `run_tests_on_disk`, and so on.
-While a task runs, the Tracker emits a `task_progress` event every
-`progress_interval` seconds (default `2.0`) with the elapsed
-time, so the UI can show a live spinner instead of going dark for
-a 90-second test run. When a `scaffold_manifest` task returns an
-`inject_tasks` list, the Tracker splices those `scaffold_file`
-tasks into the plan immediately after the manifest so the
-downstream `apply` step sees the full file batch. After every
-successful `apply` task it updates `plan.owned_files`
-(`{relative_path: "applied"|"failed"}`) so the retry loop always
-knows which files are already on disk.
+Mode detection (`cgx.session.mode.detect_mode`) picks the root
+task: a project root with a usable index seeds `EXPLORE`; a
+missing, empty, or unindexed root seeds `CLARIFY_REQUIREMENTS` and
+the greenfield chain. In greenfield mode DECOMPOSE plans a layered
+file manifest, SCAFFOLD generates one file per task, APPLY writes
+the batch to disk with the same `apply_diffs_to_disk` backup
+mechanics as Chapter 6 (files that fail the smoke check land in
+`failed_files` and are re-scaffolded individually rather than
+failing the batch), `BOOTSTRAP_ENV` preflight-installs any
+undeclared imports, and VERIFY runs the generated tests.
 
-The **Judge** (`cgx.agents.judge.Judge`) checks every completed
-task against its criteria. It begins with cheap structural
-short-circuits: a `search` task with `hits > 0` passes
-unconditionally; a `plan` task hard-fails only when both `plan_md`
-and `diffs` are absent; a `scaffold` task hard-fails only when no
-files were produced. For these ground-truth-shaped tasks an LLM
-judge would have nothing meaningful to add -- pytest's return code
-is what it is, and a scaffold either produced source files matching
-the requested stack or it didn't -- so the Judge short-circuits
-with the structural verdict. For the remaining cases (an `ask`
-answer's quality, a `plan`'s reasoning) the Judge calls the LLM
-with a strict-JSON `{verdict, confidence, rationale}` prompt and
-parses the reply with the same balanced-brace extractor the
-Planner uses. The verdict is attached to the task as `task.judge`
-and emitted as a `judge` event.
+When VERIFY fails, the loop tries to fix itself through
+`cgx.session.repair`: `classify` parses the pytest output into
+typed failure kinds and extracts the traceback, `locate` maps the
+traceback to the offending symbol in the generated source, and
+`propose` builds a focused REPAIR prompt that contains only the
+relevant source snippet. The repair loop is progress-aware: it keeps
+funding rounds while the failing-test count strictly drops, with
+every retry counter read and spent through the typed
+`cgx.session.budget.LoopBudget` (absolute ceiling `REPAIR_BUDGET=4`),
+and the whole session is bounded by budgets set at `start_session`
+-- `max_task_runs`, `max_wall_seconds`, and `headless` (pause on an
+`ASK_USER` when interactive; fail terminally when there is no user
+to ask).
 
-When something goes wrong, the loop tries to fix itself. On a
-verify failure, `_diagnose_failure` classifies the pytest output
-into `import_error`, `syntax_error`, or `logic_error`, extracts a
-±5-line snippet of source around the failing line (the *10-line
-buffer rule*, with a `# <-- ERROR HERE` marker so the model cannot
-miss it), and emits a targeted re-plan goal that names exactly the
-broken files and tells the LLM not to touch the files already in
-`plan.owned_files`. `Planner.plan_fix` bypasses the kind-policy
-heuristics -- they would route the retry back through SCAFFOLD and
-overwrite files that already passed -- and emits the canonical
-`[plan, apply, verify]` triple. Apply failures and Judge
-rejections trigger the same recursive retry, up to `max_retries`
-(default `1`). The loop emits a final `summary` event when it is
-done, whether by success or by exhaustion.
-
-`run_agent` returns one of two things depending on `stream`. With
-`stream=True` it returns a generator of `AgentEvent` objects so
-the caller can render progress incrementally. With `stream=False`
-(the default) it consumes the generator internally and returns
-the final `Plan` after the loop has terminated.
+The **runner** (`cgx.session.runner.SessionRunner`) connects the
+parts: `run_next` claims the next READY task, invokes its executor
+with an `ExecutorDeps` bundle (project root, index, provider,
+store), hands the result to the router, and persists the outcome.
+`post_message` and `post_decision` are the two write surfaces the
+UIs share -- a message becomes a follow-up objective or answers an
+open `ASK_USER`, and a decision resolves a checkpoint so the loop
+can continue.
 
 ---
 
@@ -442,27 +412,30 @@ the final `Plan` after the loop has terminated.
 
 The web UI is a FastAPI app composed in `cgx.webui.server.create_app`
 and served by `uvicorn` on `:8765`. Routes are split per feature
-under `cgx.webui.routes` -- `ask`, `plan`, `agent`, `index`, `embed`,
-`hardware`, `sessions`, `tasks`, `rollback`, `setup`, `profiles`,
-`status` -- and a single SPA fallback serves the prebuilt React
-bundle from `cgx/webui/static` for every non-API URL so React
-Router's client-side routing works on a hard refresh.
+under `cgx.webui.routes` -- `ask`, `plan`, `agent_session`, `index`,
+`embed`, `hardware`, `sessions`, `tasks`, `rollback`, `setup`,
+`profiles`, `settings`, `skills`, `status` -- and a single SPA
+fallback serves the prebuilt React bundle from `cgx/webui/static`
+for every non-API URL so React Router's client-side routing works
+on a hard refresh.
 
-The three streaming endpoints -- `POST /api/ask`, `POST /api/plan`,
-`POST /api/agent` -- share a common pattern. Each registers a row
-in the task store, calls the corresponding handler in
-`cgx.webui.handlers` to obtain a synchronous generator of events,
-and wraps that generator with `cgx.webui.sse.bridge_generator`
-into an `EventSourceResponse` (from `sse-starlette`). The bridge
-adapts the synchronous Python generator to an asyncio-driven SSE
-stream, persists every event into `task_events` as it goes, and
-checks a per-task `threading.Event` cancel token between events so
-a *Cancel* click from the UI terminates the underlying generator
-cleanly.
+The streaming endpoints `POST /api/ask` and `POST /api/plan` share
+a common pattern. Each registers a row in the task store, calls the
+corresponding handler in `cgx.webui.handlers` to obtain a
+synchronous generator of events, and wraps that generator with
+`cgx.webui.sse.bridge_generator` into an `EventSourceResponse`
+(from `sse-starlette`). The bridge adapts the synchronous Python
+generator to an asyncio-driven SSE stream, persists every event
+into `task_events` as it goes, and checks a per-task
+`threading.Event` cancel token between events so a *Cancel* click
+from the UI terminates the underlying generator cleanly. The agent
+has its own streaming surface: `GET /api/agent-session/{sid}/events`
+subscribes to the session store's event bus (Chapter 7) rather than
+the task store.
 
 The task store (`cgx.webui.task_store`) is a SQLite database at
 `~/.cgx/tasks.db` with two tables. `tasks` records one row per
-operation: `id`, `type` (`ask`/`plan`/`agent`/`index`), `status`
+operation: `id`, `type` (`ask`/`plan`/`index`), `status`
 (`running`/`done`/`cancelled`/`error`), creation and completion
 timestamps, the request payload as JSON, and any error text.
 `task_events` records one row per SSE event with a foreign-key
@@ -471,13 +444,15 @@ timestamp. The schema is plain -- no migrations, no ORM -- and the
 indexes are kept to one (`idx_task_events_task_id`) because
 replay reads are the only hot path.
 
-This persistence is what enables *tab-switch replay*. The Agent
-tab does not hold the SSE stream open; if the user navigates to
+This persistence is what enables *tab-switch replay*. The Ask and
+Plan tabs do not hold the SSE stream open; if the user navigates to
 Index and back, the React route reads `GET /api/tasks/{id}/events`
 from the registry and replays the events it missed, then resumes
-the live stream from the last `seq`. A long-running scaffold can
-be left to its own devices and the UI rebuilds its state from
-scratch on every visit.
+the live stream from the last `seq`. The Agent tab gets the same
+property from a different store: it re-fetches the session snapshot
+from `sessions.db` and re-subscribes to the session event feed, so
+a long-running scaffold can be left to its own devices and the UI
+rebuilds its state from scratch on every visit.
 
 Conversational state lives in `cgx.sessions`, a dependency-free
 JSONL store under `~/.cgx/sessions/`. Each session is one
@@ -577,13 +552,13 @@ the order this book introduces them:
    `cgx/answer/profiles.py` -- the three glue modules between
    retrieval and the LLM.
 7. `cgx/codegen/pipeline.py`, `cgx/codegen/disk_apply.py`,
-   `cgx/codegen/ast_insert.py`, `cgx/codegen/env_manager.py`, and
-   `cgx/codegen/symbol_map.py` -- validate-and-test, the disk
-   writer with backups, the line-anchored splicer, the preflight
-   installer, and the AVAILABLE CONTEXT builder.
-8. `cgx/agents/planner.py`, `cgx/agents/tracker.py`,
-   `cgx/agents/judge.py`, and `cgx/agents/loop.py` -- the three
-   components and the entry point that wires them.
+   `cgx/codegen/ast_insert.py`, and `cgx/codegen/env_manager.py`
+   -- validate-and-test, the disk writer with backups, the
+   line-anchored splicer, and the preflight installer.
+8. `cgx/session/models.py`, `cgx/session/store.py`,
+   `cgx/session/runner.py`, `cgx/session/router.py`, and
+   `cgx/session/tasks/` -- the session aggregate, the SQLite
+   store, the loop engine, the routing policy, and the executors.
 9. `cgx/webui/server.py`, `cgx/webui/handlers.py`,
    `cgx/webui/sse.py`, and `cgx/webui/task_store.py` -- the
    FastAPI app, the SSE bridge, and the SQLite registry that

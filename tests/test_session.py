@@ -32,7 +32,7 @@ from cgx.session import (
     TaskNode,
     TaskNodeStatus,
 )
-from cgx.session.router import (
+from cgx.session.actions import (
     AttachDecisionToTask,
     CreateTask,
     RecordDecision,
@@ -1248,13 +1248,13 @@ def test_router_api_check_failed_skips_repair_when_flapping():
 def test_router_api_check_failed_budget_exhausted_terminates_session():
     """C: API_CHECK failed with the repair budget spent -> terminal FAILED."""
     from cgx.session.models import SessionMode
-    from cgx.session.router import _REPAIR_BUDGET
+    from cgx.session.budget import REPAIR_BUDGET
     session = Session.new("g", mode=SessionMode.GREENFIELD)
     api = TaskNode.new(
         session.session_id, TaskKind.API_CHECK, "api",
         inputs={"build_artifact_id": "art_build",
                 "mode": SessionMode.GREENFIELD.value,
-                "repair_attempt": _REPAIR_BUDGET,
+                "repair_attempt": REPAIR_BUDGET,
                 "prior_failure_signatures": []})
     api.produced_artifact_id = "art_api"
     api.outputs = {"outcome": "failed", "failed_count": 1,
@@ -1393,13 +1393,13 @@ def test_router_smoke_failed_spawns_repair():
 def test_router_smoke_failed_respects_repair_budget():
     """SMOKE failure does not spawn REPAIR once the budget is exhausted."""
     from cgx.session.models import SessionMode
-    from cgx.session.router import _REPAIR_BUDGET
+    from cgx.session.budget import REPAIR_BUDGET
     session = Session.new("g", mode=SessionMode.GREENFIELD)
     sm = TaskNode.new(
         session.session_id, TaskKind.SMOKE, "smoke",
         inputs={"build_artifact_id": "art_build",
                 "mode": SessionMode.GREENFIELD.value,
-                "repair_attempt": _REPAIR_BUDGET})
+                "repair_attempt": REPAIR_BUDGET})
     sm.produced_artifact_id = "art_smoke"
     sm.outputs = {"outcome": "failed", "failed_count": 1,
                   "failure_signature": "smoke_import|werkzeug"}
@@ -1431,6 +1431,40 @@ def test_router_smoke_failed_flap_detector_blocks_repeat():
     status = [a for a in plan.actions if isinstance(a, UpdateSessionStatus)]
     assert len(status) == 1
     assert status[0].status is SessionStatus.FAILED
+
+
+def test_router_smoke_pass_threads_repair_budget_to_verify():
+    """The repair budget survives the SMOKE -> VERIFY edge.
+
+    A SMOKE that passes mid-repair-loop (e.g. after an install-deps
+    round fixed the imports) hands off to VERIFY; dropping the counters
+    on this edge silently reset the shared budget and re-opened the
+    loop. The LoopBudget threading keeps the whole ledger intact.
+    """
+    from cgx.session.models import SessionMode
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    sm = TaskNode.new(
+        session.session_id, TaskKind.SMOKE, "smoke",
+        inputs={"build_artifact_id": "art_build",
+                "mode": SessionMode.GREENFIELD.value,
+                "repair_attempt": 2,
+                "prior_failure_signatures": ["s1", "s2"],
+                "prior_failing_counts": [5, 3],
+                "prior_passing_counts": [1, 2]})
+    sm.produced_artifact_id = "art_smoke"
+    sm.outputs = {"outcome": "passed", "failed_count": 0,
+                  "tested_count": 2, "failure_signature": ""}
+    sm.status = TaskNodeStatus.DONE
+    plan = Router().on_task_completed(
+        session=session, completed=sm, tasks=[sm])
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    assert len(creates) == 1
+    ver = creates[0].task
+    assert ver.kind is TaskKind.VERIFY
+    assert ver.inputs["repair_attempt"] == 2
+    assert ver.inputs["prior_failure_signatures"] == ["s1", "s2"]
+    assert ver.inputs["prior_failing_counts"] == [5, 3]
+    assert ver.inputs["prior_passing_counts"] == [1, 2]
 
 
 # --------------------- repair-loop router transitions ---------------------
@@ -1674,12 +1708,12 @@ def test_router_runtime_verify_failed_spawns_repair():
 def test_router_runtime_verify_failed_budget_spent_fails_session():
     """A boot failure with the repair budget exhausted is a terminal FAILED."""
     from cgx.session.models import SessionMode
-    from cgx.session.router import _REPAIR_BUDGET
+    from cgx.session.budget import REPAIR_BUDGET
     session = Session.new("g", mode=SessionMode.GREENFIELD)
     rv = TaskNode.new(
         session.session_id, TaskKind.RUNTIME_VERIFY, "runtime",
         inputs={"mode": SessionMode.GREENFIELD.value,
-                "repair_attempt": _REPAIR_BUDGET})
+                "repair_attempt": REPAIR_BUDGET})
     rv.produced_artifact_id = "art_runtime"
     rv.outputs = {"outcome": "failed",
                   "failure_signature": "runtime_boot|app.py"}
@@ -1745,6 +1779,82 @@ def test_router_on_task_failed_noop_when_already_terminal():
     assert list(plan.actions) == []
 
 
+def _failed_decompose(session, *, retries=0, error="DECOMPOSE: bad plan"):
+    task = TaskNode.new(
+        session.session_id, TaskKind.DECOMPOSE, "decompose",
+        inputs={"prior_goal": "build a todo app",
+                "requirements_artifact_id": "art_req",
+                "answers": {"q1": "a1"},
+                "decompose_retry": retries})
+    task.status = TaskNodeStatus.FAILED
+    task.error = error
+    return task
+
+
+def test_router_on_task_failed_retryable_decompose_requeues_with_constraint():
+    """A retryable DECOMPOSE failure re-queues with the failure folded in."""
+    from cgx.session.models import SessionMode
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    task = _failed_decompose(session)
+    plan = Router().on_task_failed(
+        session=session, failed=task, tasks=[task], retryable=True)
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    assert len(creates) == 1
+    retry = creates[0].task
+    assert retry.kind is TaskKind.DECOMPOSE
+    assert retry.parent_task_id == task.task_id
+    assert retry.inputs["decompose_retry"] == 1
+    assert retry.inputs["requirements_artifact_id"] == "art_req"
+    assert retry.inputs["answers"] == {"q1": "a1"}
+    # Original objective survives verbatim; failure is folded as constraint.
+    assert retry.inputs["prior_goal"].startswith("build a todo app")
+    assert "DECOMPOSE: bad plan" in retry.inputs["prior_goal"]
+    # Session stays active -- no terminal transition alongside the retry.
+    assert not any(isinstance(a, UpdateSessionStatus) for a in plan.actions)
+
+
+def test_router_on_task_failed_retryable_decompose_budget_exhausted():
+    """A second retryable DECOMPOSE failure ends the session terminally."""
+    from cgx.session.models import SessionMode
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    task = _failed_decompose(session, retries=1)
+    plan = Router().on_task_failed(
+        session=session, failed=task, tasks=[task], retryable=True)
+    assert not any(isinstance(a, CreateTask) for a in plan.actions)
+    status = [a for a in plan.actions if isinstance(a, UpdateSessionStatus)]
+    assert len(status) == 1
+    assert status[0].status is SessionStatus.FAILED
+
+
+def test_router_on_task_failed_retryable_non_decompose_stays_terminal():
+    """retryable only re-queues DECOMPOSE; other kinds fail terminally."""
+    from cgx.session.models import SessionMode
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    task = TaskNode.new(
+        session.session_id, TaskKind.BOOTSTRAP_ENV, "bootstrap",
+        inputs={"mode": SessionMode.GREENFIELD.value})
+    task.status = TaskNodeStatus.FAILED
+    plan = Router().on_task_failed(
+        session=session, failed=task, tasks=[task], retryable=True)
+    assert not any(isinstance(a, CreateTask) for a in plan.actions)
+    status = [a for a in plan.actions if isinstance(a, UpdateSessionStatus)]
+    assert len(status) == 1
+    assert status[0].status is SessionStatus.FAILED
+
+
+def test_router_on_task_failed_non_retryable_decompose_stays_terminal():
+    """Without the retryable flag a DECOMPOSE failure stays terminal."""
+    from cgx.session.models import SessionMode
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    task = _failed_decompose(session)
+    plan = Router().on_task_failed(
+        session=session, failed=task, tasks=[task])
+    assert not any(isinstance(a, CreateTask) for a in plan.actions)
+    status = [a for a in plan.actions if isinstance(a, UpdateSessionStatus)]
+    assert len(status) == 1
+    assert status[0].status is SessionStatus.FAILED
+
+
 def test_router_verify_repeat_signature_refuses_repair():
     """Progress detector: same signature twice -> no REPAIR (loop guard)."""
     from cgx.session.models import SessionMode
@@ -1764,11 +1874,11 @@ def test_router_verify_repeat_signature_refuses_repair():
 def test_router_verify_exceeds_budget_refuses_repair():
     """Absolute repair cap exhausted -> no REPAIR (loop guard)."""
     from cgx.session.models import SessionMode
-    from cgx.session.router import _REPAIR_BUDGET
+    from cgx.session.budget import REPAIR_BUDGET
     session = Session.new("g", mode=SessionMode.GREENFIELD)
     ver = _greenfield_failed_verify(
-        signature="new", repair_attempt=_REPAIR_BUDGET,
-        prior=[f"old{i}" for i in range(_REPAIR_BUDGET)], session=session)
+        signature="new", repair_attempt=REPAIR_BUDGET,
+        prior=[f"old{i}" for i in range(REPAIR_BUDGET)], session=session)
     plan = Router().on_task_completed(
         session=session, completed=ver, tasks=[ver])
     creates = [a for a in plan.actions if isinstance(a, CreateTask)]
@@ -3434,15 +3544,42 @@ def test_decompose_prunes_glob_dependency(store, monkeypatch):
     assert files[0]["depends_on"] == []
 
 
-def test_decompose_fails_on_dependency_cycle(store, monkeypatch):
+def test_decompose_breaks_dependency_cycle(store, monkeypatch):
+    # depends_on is only an ordering hint, so a cycle (a routine slip
+    # for small local models) is repaired in place -- the back-edge is
+    # dropped -- instead of terminally failing the session.
     result = _run_decompose_with_manifest(store, monkeypatch, {
         "plan_md": "p",
         "layers": [{"name": "core", "files": [
             {"path": "a.py", "description": "a", "depends_on": ["b.py"]},
             {"path": "b.py", "description": "b", "depends_on": ["a.py"]}]}],
     })
-    assert result.failure
-    assert "circular dependency" in result.failure
+    assert result.failure is None
+    files = result.artifact.content["layers"][0]["files"]
+    deps = {f["path"]: f.get("depends_on") or [] for f in files}
+    # Exactly one edge survives; the surviving edge still orders the pair.
+    assert sorted(len(d) for d in deps.values()) == [0, 1]
+    paths = [f["path"] for f in files]
+    kept_src = next(p for p, d in deps.items() if d)
+    assert paths.index(deps[kept_src][0]) < paths.index(kept_src)
+
+
+def test_decompose_breaks_self_and_three_node_cycle(store, monkeypatch):
+    # A longer cycle (a -> b -> c -> a) is also broken deterministically
+    # and the manifest proceeds to a valid topological order.
+    result = _run_decompose_with_manifest(store, monkeypatch, {
+        "plan_md": "p",
+        "layers": [{"name": "core", "files": [
+            {"path": "a.py", "description": "a", "depends_on": ["b.py"]},
+            {"path": "b.py", "description": "b", "depends_on": ["c.py"]},
+            {"path": "c.py", "description": "c", "depends_on": ["a.py"]}]}],
+    })
+    assert result.failure is None
+    files = result.artifact.content["layers"][0]["files"]
+    paths = [f["path"] for f in files]
+    for f in files:
+        for dep in f.get("depends_on") or []:
+            assert paths.index(dep) < paths.index(f["path"])
 
 
 def test_decompose_fails_when_no_source_entry_point(store, monkeypatch):
@@ -8146,7 +8283,7 @@ def test_router_repair_regenerate_abandons_subtree_and_requeues_scaffold():
 
 
 def test_actionable_contract_warnings_filters_endpoints_and_unattributed():
-    from cgx.session.router import _actionable_contract_warnings
+    from cgx.session.greenfield_edges import _actionable_contract_warnings
     got = _actionable_contract_warnings({"contract_warnings": [
         {"kind": "endpoint", "name": "/api/x", "method": "POST"},
         {"kind": "constant", "name": "API_BASE"},  # no module -> skip
@@ -8193,7 +8330,9 @@ def test_router_scaffold_unmet_contract_regenerates_within_budget():
 def test_router_scaffold_placeholder_endpoint_does_not_regenerate():
     # The exact shape from ses_fc44ba67d1cc4835: placeholder endpoints and
     # unattributed constants must NOT force a regenerate.
-    from cgx.session.router import _scaffold_contract_regenerate_actions
+    from cgx.session.greenfield_edges import (
+        _scaffold_contract_regenerate_actions,
+    )
     _session, scaffold = _make_clean_scaffold_with_contracts([
         {"kind": "endpoint", "name": "/api/x", "method": "POST"},
         {"kind": "endpoint", "name": "/api/protected", "method": "GET"},
@@ -8206,18 +8345,22 @@ def test_router_scaffold_placeholder_endpoint_does_not_regenerate():
 def test_router_scaffold_unmet_contract_non_terminal_when_budget_spent():
     # Budget spent -> helper returns nothing (non-terminal): the caller
     # then takes the normal SCAFFOLD -> APPLY edge instead of failing.
-    from cgx.session.router import (_scaffold_contract_regenerate_actions,
-                                    _REGENERATE_BUDGET)
+    from cgx.session.budget import REGENERATE_BUDGET
+    from cgx.session.greenfield_edges import (
+        _scaffold_contract_regenerate_actions,
+    )
     _session, scaffold = _make_clean_scaffold_with_contracts(
         [{"kind": "function", "name": "compute", "module": "src/core.py"}],
-        prior_regens=_REGENERATE_BUDGET)
+        prior_regens=REGENERATE_BUDGET)
     assert _scaffold_contract_regenerate_actions(scaffold, [scaffold]) == []
 
 
 def test_router_scaffold_contract_skipped_when_files_dropped():
     # failed_count > 0 belongs to the dropped-files path; the contract
     # path must defer even if contract warnings are also present.
-    from cgx.session.router import _scaffold_contract_regenerate_actions
+    from cgx.session.greenfield_edges import (
+        _scaffold_contract_regenerate_actions,
+    )
     _session, scaffold = _make_clean_scaffold_with_contracts(
         [{"kind": "function", "name": "compute", "module": "src/core.py"}],
         failed_count=1)
@@ -8226,9 +8369,9 @@ def test_router_scaffold_contract_skipped_when_files_dropped():
 
 def test_router_repair_regenerate_budget_exhausted_fails_session():
     """Once the repair-regenerate budget is hit the session fails terminally."""
-    from cgx.session.router import _REPAIR_REGENERATE_BUDGET
+    from cgx.session.budget import REPAIR_REGENERATE_BUDGET
     session, _scaffold, tasks, rep = _build_regenerate_chain(
-        prior_repair_regens=_REPAIR_REGENERATE_BUDGET)
+        prior_repair_regens=REPAIR_REGENERATE_BUDGET)
     plan = Router().on_task_completed(
         session=session, completed=rep, tasks=tasks)
     creates = [a for a in plan.actions if isinstance(a, CreateTask)]
@@ -8249,11 +8392,11 @@ def test_router_repair_regenerate_allowed_after_syntax_budget_spent():
     syntax-churn budget converging to a clean tree must still afford the
     FIRST semantic (api_check-driven) regenerate.
     """
-    from cgx.session.router import (_REGENERATE_BUDGET,
-                                    _REPAIR_REGENERATE_BUDGET)
-    assert _REPAIR_REGENERATE_BUDGET >= 1
+    from cgx.session.budget import (REGENERATE_BUDGET,
+                                    REPAIR_REGENERATE_BUDGET)
+    assert REPAIR_REGENERATE_BUDGET >= 1
     session, scaffold, tasks, rep = _build_regenerate_chain(
-        prior_regens=_REGENERATE_BUDGET, prior_repair_regens=0)
+        prior_regens=REGENERATE_BUDGET, prior_repair_regens=0)
     plan = Router().on_task_completed(
         session=session, completed=rep, tasks=tasks)
     creates = [a for a in plan.actions if isinstance(a, CreateTask)]
@@ -8386,9 +8529,9 @@ def test_router_apply_failed_files_regenerates_within_budget():
 
 def test_router_apply_failed_files_budget_exhausted_escalates_to_replan():
     """C2: regenerate budget spent -> escalate once to a fresh DECOMPOSE."""
-    from cgx.session.router import _REGENERATE_BUDGET
+    from cgx.session.budget import REGENERATE_BUDGET
     session, scaffold, apply_t, tasks = _build_apply_failed_chain(
-        prior_regens=_REGENERATE_BUDGET)
+        prior_regens=REGENERATE_BUDGET)
     plan = Router().on_task_completed(
         session=session, completed=apply_t, tasks=tasks)
     # No terminal failure yet -- the manifest is re-planned first.
@@ -8411,9 +8554,9 @@ def test_router_apply_failed_files_budget_exhausted_escalates_to_replan():
 def test_router_apply_failed_files_replan_budget_exhausted_proceeds_with_survivors():
     """B: budgets spent but survivors exist -> proceed on the normal
     APPLY -> BOOTSTRAP_ENV edge instead of discarding the run."""
-    from cgx.session.router import _REGENERATE_BUDGET, _REPLAN_BUDGET
+    from cgx.session.budget import REGENERATE_BUDGET, REPLAN_BUDGET
     session, _scaffold, apply_t, tasks = _build_apply_failed_chain(
-        prior_regens=_REGENERATE_BUDGET, prior_replans=_REPLAN_BUDGET)
+        prior_regens=REGENERATE_BUDGET, prior_replans=REPLAN_BUDGET)
     plan = Router().on_task_completed(
         session=session, completed=apply_t, tasks=tasks)
     # No terminal failure: the successfully applied files carry forward.
@@ -8425,9 +8568,9 @@ def test_router_apply_failed_files_replan_budget_exhausted_proceeds_with_survivo
 
 def test_router_apply_failed_files_replan_budget_exhausted_no_survivors_fails():
     """B: budgets spent and nothing generated cleanly -> terminal FAILED."""
-    from cgx.session.router import _REGENERATE_BUDGET, _REPLAN_BUDGET
+    from cgx.session.budget import REGENERATE_BUDGET, REPLAN_BUDGET
     session, _scaffold, apply_t, tasks = _build_apply_failed_chain(
-        prior_regens=_REGENERATE_BUDGET, prior_replans=_REPLAN_BUDGET,
+        prior_regens=REGENERATE_BUDGET, prior_replans=REPLAN_BUDGET,
         survivors=0)
     plan = Router().on_task_completed(
         session=session, completed=apply_t, tasks=tasks)
@@ -8546,9 +8689,9 @@ def test_router_scaffold_failed_files_regenerates_within_budget():
 
 def test_router_scaffold_failed_files_budget_exhausted_escalates_to_replan():
     """C2: SCAFFOLD regenerate budget spent -> escalate to a fresh DECOMPOSE."""
-    from cgx.session.router import _REGENERATE_BUDGET
+    from cgx.session.budget import REGENERATE_BUDGET
     session, _parent, scaffold, tasks = _build_scaffold_failed_chain(
-        prior_regens=_REGENERATE_BUDGET)
+        prior_regens=REGENERATE_BUDGET)
     plan = Router().on_task_completed(
         session=session, completed=scaffold, tasks=tasks)
     assert not [a for a in plan.actions if isinstance(a, UpdateSessionStatus)]
@@ -8571,9 +8714,9 @@ def test_router_scaffold_failed_files_budget_exhausted_escalates_to_replan():
 def test_router_scaffold_failed_files_replan_budget_exhausted_proceeds_with_survivors():
     """B: budgets spent but survivors exist -> proceed on the normal
     SCAFFOLD -> APPLY edge instead of discarding the run."""
-    from cgx.session.router import _REGENERATE_BUDGET, _REPLAN_BUDGET
+    from cgx.session.budget import REGENERATE_BUDGET, REPLAN_BUDGET
     session, _parent, scaffold, tasks = _build_scaffold_failed_chain(
-        prior_regens=_REGENERATE_BUDGET, prior_replans=_REPLAN_BUDGET,
+        prior_regens=REGENERATE_BUDGET, prior_replans=REPLAN_BUDGET,
         with_pending_child=False)
     plan = Router().on_task_completed(
         session=session, completed=scaffold, tasks=tasks)
@@ -8585,9 +8728,9 @@ def test_router_scaffold_failed_files_replan_budget_exhausted_proceeds_with_surv
 
 def test_router_scaffold_failed_files_replan_budget_exhausted_no_survivors_fails():
     """B: budgets spent and nothing generated cleanly -> terminal FAILED."""
-    from cgx.session.router import _REGENERATE_BUDGET, _REPLAN_BUDGET
+    from cgx.session.budget import REGENERATE_BUDGET, REPLAN_BUDGET
     session, _parent, scaffold, tasks = _build_scaffold_failed_chain(
-        prior_regens=_REGENERATE_BUDGET, prior_replans=_REPLAN_BUDGET,
+        prior_regens=REGENERATE_BUDGET, prior_replans=REPLAN_BUDGET,
         with_pending_child=False, survivors=0)
     plan = Router().on_task_completed(
         session=session, completed=scaffold, tasks=tasks)
@@ -8695,9 +8838,9 @@ def test_router_on_task_failed_scaffold_resumes_from_checkpoint():
 
 def test_router_on_task_failed_scaffold_resume_budget_exhausted_fails():
     """B4: a re-crashed SCAFFOLD with no budget left fails the session."""
-    from cgx.session.router import _REGENERATE_BUDGET
+    from cgx.session.budget import REGENERATE_BUDGET
     session, _parent, scaffold, tasks = _build_crashed_scaffold(
-        prior_regens=_REGENERATE_BUDGET, with_pending_child=False)
+        prior_regens=REGENERATE_BUDGET, with_pending_child=False)
     plan = Router().on_task_failed(
         session=session, failed=scaffold, tasks=tasks,
         resume_scaffold_artifact_id="art_ckpt")
@@ -8897,8 +9040,8 @@ def test_relevant_lessons_empty_when_store_missing(tmp_path: Path):
 
 def test_router_verify_pass_with_repair_ancestor_emits_record_lesson():
     """A VERIFY-pass downstream of REPAIR -> RecordLesson action."""
+    from cgx.session.actions import RecordLesson
     from cgx.session.models import SessionMode
-    from cgx.session.router import RecordLesson
     session = Session.new("g", mode=SessionMode.GREENFIELD)
     scaffold = TaskNode.new(
         session.session_id, TaskKind.SCAFFOLD, "scaffold", inputs={})
@@ -8940,8 +9083,8 @@ def test_router_verify_pass_with_repair_ancestor_emits_record_lesson():
 
 def test_router_verify_pass_without_repair_emits_no_lesson():
     """A fresh VERIFY-pass with no REPAIR upstream -> zero RecordLesson actions."""
+    from cgx.session.actions import RecordLesson
     from cgx.session.models import SessionMode
-    from cgx.session.router import RecordLesson
     session = Session.new("g", mode=SessionMode.GREENFIELD)
     scaffold = TaskNode.new(
         session.session_id, TaskKind.SCAFFOLD, "scaffold", inputs={})
@@ -8965,8 +9108,8 @@ def test_router_verify_pass_without_repair_emits_no_lesson():
 def test_runner_writes_lesson_on_successful_repair_cycle(
         store, tmp_path: Path, monkeypatch):
     """End-to-end: SessionRunner._record_lesson lands a row in lessons.jsonl."""
+    from cgx.session.actions import RecordLesson
     from cgx.session.lessons import load_lessons
-    from cgx.session.router import RecordLesson
     lessons_file = tmp_path / "lessons.jsonl"
     monkeypatch.setenv("CGX_LESSONS_PATH", str(lessons_file))
 
@@ -9069,3 +9212,568 @@ def test_scaffold_injects_relevant_lessons_into_goal(
     assert "third_party_import_break" in augmented
     assert "werkzeug" in augmented
 
+
+
+
+# ---------------------------------------------------------------------------
+# Failure-edge matrix (Phase 2). Table-driven suites asserting the loop's
+# core liveness invariant: a greenfield session must never strand 'active'
+# with no runnable work. Every TaskKind's hard-failure route through
+# Router.on_task_failed and every budget-exhaustion path through
+# Router.on_task_completed must either reach a terminal session status or
+# spawn a recovery task. This is the class of test whose absence let the
+# DECOMPOSE session-killer ship.
+# ---------------------------------------------------------------------------
+
+
+def _gf_session():
+    from cgx.session.models import SessionMode
+    return Session.new("g", mode=SessionMode.GREENFIELD)
+
+
+def _hard_failed(session, kind, **extra_inputs):
+    """Build a FAILED task of ``kind`` with the common greenfield wiring."""
+    from cgx.session.models import SessionMode
+    task = TaskNode.new(
+        session.session_id, kind, f"{kind.value} under test",
+        inputs={"mode": SessionMode.GREENFIELD.value,
+                "prior_goal": "build a todo app", **extra_inputs})
+    task.status = TaskNodeStatus.FAILED
+    task.error = f"{kind.value} executor crashed"
+    return task
+
+
+def _done(task, **outputs):
+    task.outputs = outputs
+    task.status = TaskNodeStatus.DONE
+    return task
+
+
+def _assert_terminal_failed(plan):
+    """The plan ends the session FAILED and spawns no further work."""
+    assert [a for a in plan.actions if isinstance(a, CreateTask)] == []
+    status = [a for a in plan.actions if isinstance(a, UpdateSessionStatus)]
+    assert [s.status for s in status] == [SessionStatus.FAILED]
+
+
+def _assert_recovers_with(plan, kind):
+    """The plan spawns exactly one ``kind`` task and no terminal status."""
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    assert len(creates) == 1
+    assert creates[0].task.kind is kind
+    assert not any(isinstance(a, UpdateSessionStatus) for a in plan.actions)
+
+
+@pytest.mark.parametrize("kind", list(TaskKind), ids=lambda k: k.value)
+def test_router_hard_failure_terminates_every_kind(kind):
+    """on_task_failed: a bare hard failure is terminal for every TaskKind."""
+    session = _gf_session()
+    task = _hard_failed(session, kind)
+    plan = Router().on_task_failed(
+        session=session, failed=task, tasks=[task])
+    _assert_terminal_failed(plan)
+
+
+@pytest.mark.parametrize("kind", list(TaskKind), ids=lambda k: k.value)
+def test_router_retryable_failure_only_requeues_decompose(kind):
+    """on_task_failed(retryable): DECOMPOSE re-queues, the rest terminal."""
+    session = _gf_session()
+    task = _hard_failed(session, kind)
+    plan = Router().on_task_failed(
+        session=session, failed=task, tasks=[task], retryable=True)
+    if kind is TaskKind.DECOMPOSE:
+        _assert_recovers_with(plan, TaskKind.DECOMPOSE)
+    else:
+        _assert_terminal_failed(plan)
+
+
+@pytest.mark.parametrize("kind", list(TaskKind), ids=lambda k: k.value)
+def test_router_crash_checkpoint_only_resumes_scaffold(kind):
+    """on_task_failed(resume ckpt): SCAFFOLD resumes, the rest terminal."""
+    session = _gf_session()
+    task = _hard_failed(session, kind)
+    plan = Router().on_task_failed(
+        session=session, failed=task, tasks=[task],
+        resume_scaffold_artifact_id="art_ckpt")
+    if kind is TaskKind.SCAFFOLD:
+        _assert_recovers_with(plan, TaskKind.SCAFFOLD)
+    else:
+        _assert_terminal_failed(plan)
+
+
+def test_router_crash_checkpoint_resume_budget_spent_is_terminal():
+    """A second SCAFFOLD crash exhausts the regenerate budget -> FAILED."""
+    from cgx.session.budget import REGENERATE_BUDGET
+    session = _gf_session()
+    task = _hard_failed(session, TaskKind.SCAFFOLD,
+                        regenerate_attempt=REGENERATE_BUDGET)
+    plan = Router().on_task_failed(
+        session=session, failed=task, tasks=[task],
+        resume_scaffold_artifact_id="art_ckpt")
+    _assert_terminal_failed(plan)
+
+
+# Builders for the completion-time budget-exhaustion matrix. Each returns
+# (session, completed_task, tasks) shaped exactly as the runner would hand
+# them to Router.on_task_completed.
+
+def _exhausted_verify():
+    from cgx.session.budget import REPAIR_BUDGET
+    session = _gf_session()
+    ver = _greenfield_failed_verify(
+        signature="fresh-sig", repair_attempt=REPAIR_BUDGET, session=session)
+    return session, ver, [ver]
+
+
+def _exhausted_runtime_verify():
+    from cgx.session.budget import REPAIR_BUDGET
+    from cgx.session.models import SessionMode
+    session = _gf_session()
+    rv = TaskNode.new(
+        session.session_id, TaskKind.RUNTIME_VERIFY, "runtime",
+        inputs={"mode": SessionMode.GREENFIELD.value,
+                "repair_attempt": REPAIR_BUDGET})
+    rv.produced_artifact_id = "art_runtime"
+    _done(rv, outcome="failed", failure_signature="runtime_boot|app.py")
+    return session, rv, [rv]
+
+
+def _exhausted_api_check():
+    from cgx.session.budget import REPAIR_BUDGET
+    from cgx.session.models import SessionMode
+    session = _gf_session()
+    api = TaskNode.new(
+        session.session_id, TaskKind.API_CHECK, "api",
+        inputs={"build_artifact_id": "art_build",
+                "mode": SessionMode.GREENFIELD.value,
+                "repair_attempt": REPAIR_BUDGET})
+    api.produced_artifact_id = "art_api"
+    _done(api, outcome="failed", failed_count=1,
+          failure_signature="api_check|pkg.symbol")
+    return session, api, [api]
+
+
+def _exhausted_smoke():
+    from cgx.session.budget import REPAIR_BUDGET
+    from cgx.session.models import SessionMode
+    session = _gf_session()
+    sm = TaskNode.new(
+        session.session_id, TaskKind.SMOKE, "smoke",
+        inputs={"build_artifact_id": "art_build",
+                "mode": SessionMode.GREENFIELD.value,
+                "repair_attempt": REPAIR_BUDGET})
+    sm.produced_artifact_id = "art_smoke"
+    _done(sm, outcome="failed", failed_count=1,
+          failure_signature="smoke_import|pkg")
+    return session, sm, [sm]
+
+
+def _dropped_files_scaffold(*, regen_spent, replan_spent, survivors):
+    from cgx.session.budget import REGENERATE_BUDGET, REPLAN_BUDGET
+    from cgx.session.models import SessionMode
+    session = _gf_session()
+    sc = TaskNode.new(
+        session.session_id, TaskKind.SCAFFOLD, "scaffold",
+        inputs={"mode": SessionMode.GREENFIELD.value,
+                "prior_goal": "build a todo app",
+                "regenerate_attempt":
+                    REGENERATE_BUDGET if regen_spent else 0,
+                "replan_attempt": REPLAN_BUDGET if replan_spent else 0})
+    _done(sc, failed_count=1,
+          failed=[{"file": "app.py", "error": "empty patch"}],
+          generated_count=survivors,
+          scaffold_artifact_id="art_scaffold")
+    return session, sc, [sc]
+
+
+def _apply_dropped_files_no_scaffold():
+    from cgx.session.models import SessionMode
+    session = _gf_session()
+    ap = TaskNode.new(
+        session.session_id, TaskKind.APPLY, "apply",
+        inputs={"mode": SessionMode.GREENFIELD.value})
+    _done(ap, failed_count=1,
+          failed_files=[{"file": "app.py", "error": "syntax"}])
+    return session, ap, [ap]
+
+
+def _apply_dropped_files_budgets_spent():
+    from cgx.session.budget import REGENERATE_BUDGET, REPLAN_BUDGET
+    from cgx.session.models import SessionMode
+    session = _gf_session()
+    sc = TaskNode.new(
+        session.session_id, TaskKind.SCAFFOLD, "scaffold",
+        inputs={"mode": SessionMode.GREENFIELD.value,
+                "prior_goal": "build a todo app",
+                "regenerate_attempt": REGENERATE_BUDGET,
+                "replan_attempt": REPLAN_BUDGET})
+    _done(sc, generated_count=0, scaffold_artifact_id="art_scaffold")
+    ap = TaskNode.new(
+        session.session_id, TaskKind.APPLY, "apply",
+        parent_task_id=sc.task_id,
+        inputs={"mode": SessionMode.GREENFIELD.value})
+    _done(ap, failed_count=1,
+          failed_files=[{"file": "app.py", "error": "syntax"}])
+    return session, ap, [sc, ap]
+
+
+def _repair_no_patch():
+    from cgx.session.models import SessionMode
+    session = _gf_session()
+    rep = TaskNode.new(
+        session.session_id, TaskKind.REPAIR, "repair",
+        inputs={"mode": SessionMode.GREENFIELD.value})
+    _done(rep, can_apply=False, classification="unknown", strategy="patch")
+    return session, rep, [rep]
+
+
+def _repair_regenerate_budget_spent():
+    from cgx.session.budget import REPAIR_REGENERATE_BUDGET
+    from cgx.session.models import SessionMode
+    session = _gf_session()
+    sc = TaskNode.new(
+        session.session_id, TaskKind.SCAFFOLD, "scaffold",
+        inputs={"mode": SessionMode.GREENFIELD.value,
+                "repair_regenerate_attempt": REPAIR_REGENERATE_BUDGET})
+    _done(sc, scaffold_artifact_id="art_scaffold")
+    rep = TaskNode.new(
+        session.session_id, TaskKind.REPAIR, "repair",
+        parent_task_id=sc.task_id,
+        inputs={"mode": SessionMode.GREENFIELD.value})
+    _done(rep, can_apply=False, strategy="regenerate",
+          classification="logic_error", extra_constraints={})
+    return session, rep, [sc, rep]
+
+
+# Each row: (id, builder, expectation). Expectation "failed" asserts a
+# terminal FAILED with no spawn; a TaskKind asserts a single recovery task
+# of that kind with no terminal status. Either way the session never
+# strands 'active' with nothing runnable.
+_BUDGET_EXHAUSTION_CASES = [
+    ("verify_repair_budget_spent", _exhausted_verify, "failed"),
+    ("runtime_verify_repair_budget_spent",
+     _exhausted_runtime_verify, "failed"),
+    ("api_check_repair_budget_spent", _exhausted_api_check, "failed"),
+    ("smoke_repair_budget_spent", _exhausted_smoke, "failed"),
+    ("scaffold_dropped_files_regen_left",
+     lambda: _dropped_files_scaffold(
+         regen_spent=False, replan_spent=False, survivors=0),
+     TaskKind.SCAFFOLD),
+    ("scaffold_dropped_files_regen_spent_replans",
+     lambda: _dropped_files_scaffold(
+         regen_spent=True, replan_spent=False, survivors=0),
+     TaskKind.DECOMPOSE),
+    ("scaffold_dropped_files_all_spent_no_survivors",
+     lambda: _dropped_files_scaffold(
+         regen_spent=True, replan_spent=True, survivors=0),
+     "failed"),
+    ("scaffold_dropped_files_all_spent_with_survivors",
+     lambda: _dropped_files_scaffold(
+         regen_spent=True, replan_spent=True, survivors=3),
+     TaskKind.APPLY),
+    ("apply_dropped_files_no_scaffold_lineage",
+     _apply_dropped_files_no_scaffold, "failed"),
+    ("apply_dropped_files_all_budgets_spent",
+     _apply_dropped_files_budgets_spent, "failed"),
+    ("repair_no_patch_no_strategy_left", _repair_no_patch, "failed"),
+    ("repair_regenerate_budget_spent_no_patch",
+     _repair_regenerate_budget_spent, "failed"),
+]
+
+
+@pytest.mark.parametrize(
+    "build,expect",
+    [(b, e) for _, b, e in _BUDGET_EXHAUSTION_CASES],
+    ids=[i for i, _, _ in _BUDGET_EXHAUSTION_CASES])
+def test_router_budget_exhaustion_reaches_terminal_or_recovers(build, expect):
+    """Every budget-exhaustion edge ends terminal or spawns recovery work."""
+    session, completed, tasks = build()
+    plan = Router().on_task_completed(
+        session=session, completed=completed, tasks=tasks)
+    if expect == "failed":
+        _assert_terminal_failed(plan)
+    else:
+        _assert_recovers_with(plan, expect)
+
+
+# --------------------- e2e greenfield smoke (scripted provider) ---------------------
+#
+# Unlike test_runner_full_greenfield_loop (which stubs every executor to
+# pin the router's edges), this suite runs the REAL executors -- CLARIFY,
+# DECOMPOSE, SCAFFOLD, APPLY, VERIFY, REPAIR -- against a tmp_path project
+# with a scripted provider standing in for the local LLM. Only the
+# environment-heavy kinds (BOOTSTRAP_ENV, API_CHECK, SMOKE,
+# RUNTIME_VERIFY) are stubbed, so the whole loop -- including one injected
+# failure + deterministic repair -- is exercised in CI without a GPU.
+
+_E2E_CALCULATOR = (
+    '"""Tiny calculator library."""\n'
+    "\n"
+    "\n"
+    "def add(a, b):\n"
+    "    return a + b\n"
+    "\n"
+    "\n"
+    "def subtract(a, b):\n"
+    "    return a - b\n"
+)
+
+# Deliberate unittest/pytest mix: a pytest-style class (no TestCase base)
+# whose methods call self.assert* helpers. pytest collects it fine, then
+# every test dies with AttributeError: ... 'assertEqual' -- the canonical
+# ``unittest_pytest_mix`` failure the deterministic repair chain fixes by
+# adding the unittest.TestCase base + import.
+_E2E_BROKEN_TEST = (
+    '"""Tests for the calculator."""\n'
+    "\n"
+    "from calculator import add, subtract\n"
+    "\n"
+    "\n"
+    "class TestCalculator:\n"
+    "    def test_add(self):\n"
+    "        self.assertEqual(add(2, 3), 5)\n"
+    "\n"
+    "    def test_subtract(self):\n"
+    "        self.assertEqual(subtract(5, 3), 2)\n"
+)
+
+_E2E_QUESTIONS = {
+    "questions": [
+        {"id": "q1", "prompt": "Which Python version?",
+         "hint": "e.g. 3.11", "suggested": ["3.11"]},
+        {"id": "q2", "prompt": "Which test framework?",
+         "suggested": ["pytest"]},
+        {"id": "q3", "prompt": "Any CLI needed?",
+         "suggested": ["No"]},
+    ]
+}
+
+_E2E_MANIFEST = {
+    "plan_md": "## Plan\n- calculator.py\n- test_calculator.py",
+    "layers": [
+        {"name": "core", "files": [
+            {"path": "calculator.py",
+             "description": "add/subtract helpers"}]},
+        {"name": "tests", "files": [
+            {"path": "test_calculator.py",
+             "description": "pytest suite for the calculator",
+             "depends_on": ["calculator.py"]}]},
+    ],
+}
+
+
+class _ScriptedLocalProvider:
+    """Scripted stand-in for a local LLM.
+
+    Routes each ``chat`` call on its declarative shape -- the
+    ``json_schema`` object identity for CLARIFY/DECOMPOSE, the
+    ``FILE TO GENERATE`` block for per-file scaffolding -- and returns
+    canned JSON, so the real executors parse real provider replies
+    without any network or GPU.
+    """
+
+    def __init__(self, files):
+        self._files = dict(files)
+        self.calls = []
+
+    def chat(self, messages=None, **kwargs):
+        import json as _json
+        from cgx.answer.schemas import (
+            CLARIFY_QUESTIONS_SCHEMA,
+            MANIFEST_SCHEMA,
+        )
+        schema = kwargs.get("json_schema")
+        user = ""
+        for m in reversed(messages or []):
+            if m.get("role") == "user":
+                user = str(m.get("content") or "")
+                break
+        if schema is CLARIFY_QUESTIONS_SCHEMA:
+            self.calls.append("clarify")
+            return {"content": _json.dumps(_E2E_QUESTIONS)}
+        if schema is MANIFEST_SCHEMA:
+            self.calls.append("manifest")
+            return {"content": _json.dumps(_E2E_MANIFEST)}
+        marker = "FILE TO GENERATE:\nPath: "
+        idx = user.find(marker)
+        if idx >= 0:
+            path = user[idx + len(marker):].split("\n", 1)[0].strip()
+            self.calls.append(f"file:{path}")
+            body = self._files.get(path)
+            if body is None:
+                body = ('"""Placeholder module."""\n'
+                        if path.endswith(".py")
+                        else f"placeholder for {path}\n")
+            return {"content": _json.dumps({"content": body})}
+        self.calls.append("unrouted")
+        return {"content": "{}"}
+
+
+def _install_stub_bootstrap_env_host_python():
+    """BOOTSTRAP_ENV stub whose BUILD_REPORT points at the host python.
+
+    The real VERIFY reads ``python_exe`` from the BUILD_REPORT and feeds
+    it to the pytest subprocess; pointing it at ``sys.executable`` (which
+    has pytest installed) lets the real test run happen without a real
+    ``pip install`` bootstrap.
+    """
+    import sys
+
+    @register_executor(TaskKind.BOOTSTRAP_ENV)
+    def _stub(task, deps):
+        artifact = Artifact.new(
+            session_id=task.session_id,
+            produced_by_task_id=task.task_id,
+            kind=ArtifactKind.BUILD_REPORT,
+            content={
+                "apply_artifact_id": task.inputs.get("apply_artifact_id"),
+                "project_type": "python",
+                "venv_path": "",
+                "python_exe": sys.executable,
+                "installed_from": [],
+                "installed_packages": [],
+                "failed_installs": [],
+                "outcome": "succeeded",
+                "pip_log_tail": "",
+            })
+        return ExecutorResult(
+            outputs={"build_artifact_id": artifact.artifact_id,
+                     "outcome": "succeeded",
+                     "project_type": "python",
+                     "python_exe": sys.executable,
+                     "installed_count": 0,
+                     "failed_count": 0},
+            artifact=artifact)
+
+
+def _install_stub_runtime_verify_passed():
+    @register_executor(TaskKind.RUNTIME_VERIFY)
+    def _stub(task, deps):
+        artifact = Artifact.new(
+            session_id=task.session_id,
+            produced_by_task_id=task.task_id,
+            kind=ArtifactKind.RUNTIME_REPORT,
+            content={"probes": [], "outcome": "passed",
+                     "failure_signature": ""})
+        return ExecutorResult(
+            outputs={"runtime_artifact_id": artifact.artifact_id,
+                     "outcome": "passed",
+                     "failed_count": 0,
+                     "failure_signature": ""},
+            artifact=artifact)
+
+
+def test_runner_full_greenfield_loop_with_recovery(tmp_path, store,
+                                                   monkeypatch):
+    """E2E smoke: a scripted provider drives a whole greenfield session.
+
+    CLARIFY -> ASK(clarify_answers) -> DECOMPOSE -> ASK(approve_plan) ->
+    SCAFFOLD -> APPLY -> [boot/api/smoke stubs] -> VERIFY(fails: injected
+    unittest/pytest mix) -> REPAIR(patch) -> APPLY -> [stubs] ->
+    VERIFY(passes) -> RUNTIME_VERIFY -> COMPLETED.
+
+    The scaffold, apply, verify, and repair executors are the real ones:
+    files land on disk under tmp_path and pytest genuinely runs twice
+    (fail, then pass after the deterministic repair rewrites the test).
+    """
+    from cgx.session.models import SessionMode
+
+    monkeypatch.setenv("CGX_LESSONS_PATH", str(tmp_path / "lessons.jsonl"))
+    proj = tmp_path / "proj"
+    proj.mkdir()
+
+    _install_stub_bootstrap_env_host_python()
+    _install_stub_api_check_greenfield()
+    _install_stub_smoke_greenfield()
+    _install_stub_runtime_verify_passed()
+
+    provider = _ScriptedLocalProvider({
+        "calculator.py": _E2E_CALCULATOR,
+        "test_calculator.py": _E2E_BROKEN_TEST,
+        "requirements.txt": "pytest\n",
+        "README.md": "# Calculator\n\nTiny add/subtract library.\n",
+    })
+    deps = ExecutorDeps(project_root=str(proj), store=store,
+                        provider=provider)
+    runner = SessionRunner(store)
+    session = runner.start_session(
+        objective="build a small python calculator library with tests",
+        project_root=str(proj),
+        mode=SessionMode.GREENFIELD)
+
+    def drain():
+        """Run READY tasks until the loop quiesces or pauses on an ASK."""
+        for _ in range(60):
+            t = runner.run_next(session_id=session.session_id, deps=deps)
+            if t is None:
+                return
+            if (t.kind is TaskKind.ASK_USER
+                    and t.status is TaskNodeStatus.IN_PROGRESS):
+                return
+        raise AssertionError("session did not quiesce within 60 steps")
+
+    # 1. CLARIFY runs against the scripted provider, pauses on the
+    #    clarify_answers ASK.
+    drain()
+    ask = next(t for t in store.list_tasks(session.session_id)
+               if t.kind is TaskKind.ASK_USER
+               and t.inputs.get("expected_kind") == "clarify_answers")
+    assert ask.status is TaskNodeStatus.IN_PROGRESS
+    runner.post_decision(
+        session_id=session.session_id,
+        decision=build_decision(
+            session_id=session.session_id, task=ask,
+            chosen={"answers": {"q1": "3.11", "q2": "pytest",
+                                "q3": "No"}}))
+
+    # 2. DECOMPOSE plans the manifest, pauses on the approve_plan ASK.
+    drain()
+    approve = next(t for t in store.list_tasks(session.session_id)
+                   if t.kind is TaskKind.ASK_USER
+                   and t.inputs.get("expected_kind") == "approve_plan")
+    assert approve.status is TaskNodeStatus.IN_PROGRESS
+    runner.post_decision(
+        session_id=session.session_id,
+        decision=build_decision(
+            session_id=session.session_id, task=approve,
+            chosen={"approved": True}))
+
+    # 3. Everything else runs unattended: scaffold + apply land real
+    #    files, the first VERIFY fails on the injected mix, REPAIR
+    #    patches it, and the second VERIFY + RUNTIME_VERIFY complete.
+    drain()
+
+    session_after = store.get_session(session.session_id)
+    assert session_after.status is SessionStatus.COMPLETED
+
+    tasks = store.list_tasks(session.session_id)
+    assert all(t.status is not TaskNodeStatus.READY for t in tasks)
+
+    # The verify ladder ran twice: fail, then pass after the repair.
+    verifies = sorted((t for t in tasks if t.kind is TaskKind.VERIFY),
+                      key=lambda t: t.started_at)
+    assert len(verifies) == 2
+    assert verifies[0].outputs["outcome"] in ("assertions_failed", "failed")
+    assert verifies[0].outputs["failing_count"] == 2
+    assert verifies[1].outputs["outcome"] == "passed"
+    assert verifies[1].outputs["failing_count"] == 0
+
+    # Exactly one deterministic repair, classified and applied.
+    repairs = [t for t in tasks if t.kind is TaskKind.REPAIR]
+    assert len(repairs) == 1
+    assert repairs[0].outputs["classification"] == "unittest_pytest_mix"
+    assert repairs[0].outputs["can_apply"] is True
+
+    # The scaffold and the repair genuinely landed on disk.
+    assert (proj / "calculator.py").read_text(
+        encoding="utf-8") == _E2E_CALCULATOR
+    fixed = (proj / "test_calculator.py").read_text(encoding="utf-8")
+    assert "import unittest" in fixed
+    assert "unittest.TestCase" in fixed
+
+    # The provider was exercised through every scripted shape.
+    assert "clarify" in provider.calls
+    assert "manifest" in provider.calls
+    assert "file:calculator.py" in provider.calls
+    assert "file:test_calculator.py" in provider.calls
+    assert "unrouted" not in provider.calls

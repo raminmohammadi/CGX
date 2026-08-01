@@ -4,9 +4,9 @@
 
 A stdlib-only, Gemini-CLI / Qwen-Code style REPL: an ASCII banner, a
 bordered input box, top/bottom status bars, and slash commands. Plain
-messages are routed through the Planner -> Tracker -> Judge loop
-(:func:`cgx.agents.loop.run_agent`) so a single prompt can ask a
-question, plan an edit, or scaffold a new project.
+messages drive the session agent loop (:mod:`cgx.session`) so a single
+prompt can start a session, answer an open question, or post a
+follow-up objective.
 
 Rendering (:mod:`cgx.cli.tui.render`) is kept as pure string-returning
 functions so it can be unit-tested without a terminal; the interactive

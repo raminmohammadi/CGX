@@ -6,31 +6,19 @@ and applied code changes against a real codebase. It is intended for
 community contributors who want to understand how the agent works
 today and where it could be pushed further.
 
-CGX ships **two agent shapes**:
-
-* **Session-based agent** (default) -- a persistent DAG of typed tasks
-  with structured human-in-the-loop checkpoints. Code under
-  [`src/cgx/session/`](../src/cgx/session/); HTTP at
-  `/api/agent-session/*`; UI at `/agent`. Designed for multi-turn
-  exploration that may or may not end in a code change.
-* **Batch agent** (legacy) -- a one-shot Planner → Tracker → Judge
-  loop that commits a full plan up front and streams it over SSE. Code
-  under [`src/cgx/agents/`](../src/cgx/agents/); HTTP at `/api/agent`;
-  UI preserved at `/agent-legacy`. Sections 2–8 below describe this
-  shape; it is still the entry point exposed by
-  [`cgx.agents.run_agent`](../src/cgx/agents/loop.py) and the CLI.
-
-The two shapes coexist: the session backbone reuses the same retrieval,
-codegen, and provider stacks, so a `PLAN_CHANGE` task in a session goes
-through the same `generate_code_plan` path that the batch agent's
-`plan` task does. They differ in **state model** (persistent vs.
-batch), **interaction model** (typed decisions vs. fire-and-forget),
-and **execution model** (deterministic router + per-kind executors
-vs. LLM-emitted plan + capability dispatch).
+CGX ships **one agent shape**: the **session-based agent** -- a
+persistent DAG of typed tasks with structured human-in-the-loop
+checkpoints. Code under [`src/cgx/session/`](../src/cgx/session/);
+HTTP at `/api/agent-session/*`; UI at `/agent`; terminal surface via
+the interactive dashboard and the one-shot `cgx agent` CLI. It is
+designed for multi-turn exploration that may or may not end in a code
+change, and reuses the same retrieval, codegen, and provider stacks as
+the ask/plan surfaces (a `PLAN_CHANGE` task goes through the same
+`generate_code_plan` path that `cgx plan` does).
 
 ---
 
-## 1A. Session-Based Agent (default)
+## 1A. Session-Based Agent
 
 The session-based agent treats every interaction as part of an
 ongoing **Session**: a persistent record of the user's objective, the
@@ -40,9 +28,9 @@ decision log of typed user choices. State survives process restarts;
 the user can return to a session days later and pick up where they
 left off.
 
-### 1A.1 Why a different shape?
+### 1A.1 Why this shape?
 
-The batch agent treats every goal as a one-shot job: plan up front,
+A one-shot agent treats every goal as a single job: plan up front,
 execute, judge, return. That works for well-scoped goals ("add
 docstrings", "create a FastAPI todo app") but breaks down for
 exploratory work ("how should we refactor the parser layer?") where
@@ -93,8 +81,8 @@ Task kinds (`TaskKind`):
 | `EXPLORE`               | Survey the codebase for directions that bear on the user's objective. Produces a `DIRECTIONS_LIST` artifact and anchor facts. *(explore mode)* |
 | `INVESTIGATE`           | Deeper retrieval anchored on a single chunk; produces a `FINDINGS_BUNDLE`. *(explore mode)* |
 | `RECOMMEND`             | Synthesize concrete next-step recommendations from the investigation; produces a `RECOMMENDATION_LIST`. *(explore mode)* |
-| `CLARIFY_REQUIREMENTS`  | Structured LLM call (or deterministic fallback) producing 3–6 clarification questions about the user's greenfield goal; emits a `REQUIREMENTS_SHEET`. *(greenfield mode)* |
-| `DECOMPOSE`             | Folds the user's clarify answers into the goal, runs `plan_scaffold_manifest`, and emits a `WORK_PLAN` (`plan_md` + layered file manifest). **Contract-first (P0)**: the plan now also carries a `contracts` block -- the *shared interfaces* every file must agree on, normalised by `_coerce_contracts` over four categories: `endpoints` (method + path), `schemas` (model/class names), `functions` (name + owning module) and `constants` (module-level names). `contract_count` is reported on the task output. The block is threaded verbatim into every per-file generation so cross-file assumptions are declared once, not re-derived per file. *(greenfield mode)* |
+| `CLARIFY_REQUIREMENTS`  | Structured LLM call (or deterministic fallback) producing 3–6 clarification questions about the user's greenfield goal; emits a `REQUIREMENTS_SHEET`. **Schema-constrained (Phase 3.1)**: `CLARIFY_QUESTIONS_SCHEMA` (`cgx.answer.schemas`) rides as `json_schema` on the provider call so a schema-capable local backend decodes valid JSON by construction; the reply is checked by `validate_json_schema` with one bounded re-ask that folds the concrete violations back into the prompt before the deterministic fallback bank fires. *(greenfield mode)* |
+| `DECOMPOSE`             | Folds the user's clarify answers into the goal, runs `plan_scaffold_manifest`, and emits a `WORK_PLAN` (`plan_md` + layered file manifest). **Schema-constrained (Phase 3.1)**: `MANIFEST_SCHEMA` rides as `json_schema` on the planning `provider.chat` call and the parsed reply gets one `validate_json_schema` re-ask (violations folded into the prompt) before the executor sees it. **Contract-first (P0)**: the plan now also carries a `contracts` block -- the *shared interfaces* every file must agree on, normalised by `_coerce_contracts` over four categories: `endpoints` (method + path), `schemas` (model/class names), `functions` (name + owning module) and `constants` (module-level names). `contract_count` is reported on the task output. The block is threaded verbatim into every per-file generation so cross-file assumptions are declared once, not re-derived per file. *(greenfield mode)* |
 | `SCAFFOLD`              | Walks the `WORK_PLAN` layers, calls `generate_single_scaffold_file` per entry while accumulating sibling-file context, emits `SCAFFOLD_PATCHES`. **Phase B robustness**: each generated file is syntax-validated inline (Python `ast`, JSON, TOML, and the JS/TS/JSX/Vue family via tree-sitter) with one hardened per-file retry surfacing the concrete error (`_SYNTAX_RETRY_INSTR`); additional single-file gates (extension/content mismatch, duplicate content, undefined first-party imports, and a pytest test-collectability check) each get one targeted retry before the file is dropped. Only the failed paths are regenerated on a retry (prior-good diffs are reused verbatim). Files within a layer can be generated concurrently via a bounded worker pool (`CGX_SCAFFOLD_CONCURRENCY`, default 1/serial). Progress is checkpointed after every layer (`_checkpoint_progress`) so a crash mid-run is resumable (`_resume_generated_files` seeds completed files on the next attempt). Each `generate_single_scaffold_file` call receives the `WORK_PLAN` `contracts` block (**P0**) so every file honours the same declared interfaces. After the per-file loop, two best-effort static gates from `cgx.session.scaffold_validate` run before `APPLY`: a **coherence pass** (`_reconcile_import_warnings` + `cross_check_first_party_imports`, **#2**) that regenerates *only* importer files referencing a first-party symbol no sibling defines (bounded by `_COHERENCE_PASS_BUDGET`), and a **contract enforcement gate** (`check_contract_compliance`, **#1**) that verifies the tree satisfies the declared endpoints/schemas/functions/constants. Both record `import_warnings` / `contract_warnings` on `SCAFFOLD_PATCHES` (the router can fold either into a regenerate constraint) rather than failing the scaffold. *(greenfield mode)* |
 | `PLAN_CHANGE`           | Turn an approved recommendation into a unified-diff change plan; produces a `CODE_CHANGE_PLAN`. *(explore mode)* |
 | `APPLY`                 | Write an approved plan's (or scaffold's) diffs to disk; produces `APPLIED_CHANGES` (with `backup_dir`). |
@@ -102,7 +90,7 @@ Task kinds (`TaskKind`):
 | `API_CHECK`             | After `BOOTSTRAP_ENV`, statically walks every applied file and resolves every `from <third_party> import <name>` and aliased `pkg.attr` access under the bootstrapped venv via `importlib` + `inspect.getmembers`. Unresolved references surface as a structured `API_CHECK_REPORT` (`outcome ∈ {passed, failed, skipped}`, `unresolved: [{file, line, module, name}]`, `failure_signature`). A clean run chains to `SMOKE`; `failed` routes to `REPAIR` carrying the `API_CHECK_REPORT` as the source artifact. *(greenfield mode, **Phase 2.2**)* |
 | `SMOKE`                 | Cheap fail-fast gate between `API_CHECK` and `VERIFY`: spawns `<venv>/bin/python -c "import <pkg>"` for every top-level module the applied files declare, with a 30s wall-clock budget. Produces a `SMOKE_REPORT` (`outcome`, `imports: [{module, ok, stderr_tail}]`, `failure_signature`). On `passed` / `skipped` chains to `VERIFY`; on `failed` routes to `REPAIR` (typical trigger: `ImportError: cannot import name 'url_quote' from 'werkzeug.urls'` -- the Flask/Werkzeug peer pin mismatch that motivated the whole plan). *(greenfield mode, **Phase 2.1**)* |
 | `VERIFY`                | Run impacted tests against the working tree. Stack detection is delegated to a pluggable test-runner registry (`cgx.codegen.test_runners`): every registered runner whose markers match the project (pytest for Python, `npm test`/`npm run build` for JS/TS) is executed and their outcomes merged worst-case-wins, so a polyglot repo (Python backend beside a JS frontend) is verified in one pass and an unknown stack degrades to a soft skip rather than a hard failure. For the Python runner it produces a `VERIFY_REPORT` whose `outcome` token classifies pytest's exit code (`passed` / `assertions_failed` / `collection_error` / `no_tests_collected` / `timeout` / `pytest_missing` / `skipped`). Uses `BUILD_REPORT.python_exe` when available so pytest runs inside the project venv, not CGX's interpreter. Pytest is now invoked with `--junitxml=<tmp> -rN --tb=long` and the XML is parsed via stdlib `xml.etree` into a structured `failures: [{nodeid, type, message, traceback}]` list (**Phase 3.1**) so the classifier can consume types rather than re-regexing stdout. Also surfaces `reproduce_cmd` -- a single `shlex.quote`-escaped shell line that re-runs the exact failing pytest invocation under the project venv (**Phase 1.2**) -- and a `failure_signature` (sha1 of outcome + returncode + first error line) used by the autonomous repair loop. Also emits `passing_count` and `collected_count` (**#5**) so the router's coverage-aware progress ledger can tell a repair that traded a failure for a new pass apart from one that merely moved the failure. |
-| `RUNTIME_VERIFY`        | Post-`VERIFY` runtime gate (**greenfield only, P1**). A unit suite the model wrote can pass while the app never boots (an import-time `NameError`, a broken `create_app`, a config read that throws at module load). For each detected entry module (`app.py` / `main.py` / a file that statically references `Flask(` / `FastAPI(` / `create_app`) `run_runtime_verify` runs an import-and-call smoke *under the bootstrapped venv* -- importing the module and, when present, invoking the `create_app` factory -- and emits a `RUNTIME_REPORT` whose `probes` pair each entry with `ok` / `kind` (`ok` / `import_error` / `timeout` / `launch_error`) / `stderr_tail`. The `outcome` token (`passed` / `failed` / `timeout` / `error` / `skipped`) drives the terminal branch: `passed` / `skipped` COMPLETE the session; a hard boot outcome routes to `REPAIR` with the `RUNTIME_REPORT` as the source artifact (**#3**). Like `SMOKE` it never returns `ExecutorResult.failure` for a boot failure -- the structured report is always persisted so the classifier has something to work with. *(greenfield mode)* |                | Classify a failed `VERIFY` / `SMOKE` / `API_CHECK` and emit a typed `REPAIR_PLAN` (diffs + rationale + located classes + `strategy` + `extra_constraints`). The classifier is a small registry in `cgx.session.repair.classify`; v1 ships: `unittest_pytest_mix` (rewrite class header to inherit `unittest.TestCase`), `missing_module_pythonpath` (create/extend project-root `conftest.py` so pytest can resolve scaffolded packages -- but **Fix G2**: `locate_missing_module_pythonpath` only proposes the `conftest.py` fix when the target's *full* dotted path resolves on disk; a missing *leaf* module such as `tests.auth` where `tests/` exists but `tests/auth.py` does not yields no diff and, because `missing_module_pythonpath` is in `_REGENERATE_CLASSES`, routes to `strategy=regenerate` rather than a no-op pythonpath patch), `missing_fixture` (hoist an `@pytest.fixture` definition into `tests/conftest.py` or project-root `conftest.py`), `hallucinated_api` (rename / drop the broken symbol surfaced by `API_CHECK`), and `third_party_import_break` (**Phase 3.2** -- recognises `ImportError: cannot import name '<x>' from '<pkg>'` and `ModuleNotFoundError` for third-party modules, then `propose_third_party_pin` queries the PyPI JSON API via `cgx.session.repair.pypi_client` -- with an on-disk cache under `~/.cgx/pypi-cache/` -- to compute a corrective version pin and emit a `requirements.txt` diff). A failure with no deterministic fix no longer escalates straight to the user: **Phase D** adds a *bounded LLM repair* fallback (`_propose_llm_logic_repair` -> `cgx.answer.engine.generate_repair_files`) that hands the model the goal, the failing test tail, and the complete contents of the most relevant source/test files (capped at `_PATCH_DIFF_LIMIT=5`) and takes back complete corrected file bodies, each re-validated by `_validate_repair_source` (the same per-language syntax gate as scaffold) before it reaches `APPLY`. Only when the model declines (`{"files": []}`) or every candidate fails validation does the plan stay empty and escalate to `ASK_USER(freeform)`. Repair has two branches (**Phase 6.1**): `strategy=patch` writes the proposed diffs through the shared `APPLY` executor (≤5 diffs in a patchable class); `strategy=regenerate` abandons the failed `SCAFFOLD` subtree and re-queues a fresh `SCAFFOLD` with `regenerate_constraints` folded into the goal so the per-file generator avoids the failure mode this time. Greenfield-only. **Traceback-localized (#4)**: `_propose_llm_logic_repair` builds its candidate file set failure-first -- `traceback_source_files` surfaces the files named in the crash frames (which may be a source file `APPLY` never touched this attempt) *before* the files `APPLY` wrote/selected. **Retrieval-fed (#6)**: any file slot the localized candidates leave unused (up to `_LLM_REPAIR_MAX_FILES`) is filled by hybrid retrieval over the project index (`_retrieval_relevant_files` -> `run_query_auto`) so a fix reaching a symbol neither the traceback nor `APPLY` named is still in scope -- a no-op in greenfield (no index) and self-disabling on any retrieval error. **Progress-aware budget (P2 / #5)**: the old flat 2-shot cap is replaced by `_repair_progress_stalled` -- the loop keeps going while the failing-test count strictly drops round over round (backed by the passing-count trend), gated by a `failure_signature` flap backstop and the absolute `_REPAIR_BUDGET` (raised to 4); the regenerate branch is still capped at one re-scaffold per ancestor chain. |
+| `RUNTIME_VERIFY`        | Post-`VERIFY` runtime gate (**greenfield only, P1**). A unit suite the model wrote can pass while the app never boots (an import-time `NameError`, a broken `create_app`, a config read that throws at module load). For each detected entry module (`app.py` / `main.py` / a file that statically references `Flask(` / `FastAPI(` / `create_app`) `run_runtime_verify` runs an import-and-call smoke *under the bootstrapped venv* -- importing the module and, when present, invoking the `create_app` factory -- and emits a `RUNTIME_REPORT` whose `probes` pair each entry with `ok` / `kind` (`ok` / `import_error` / `timeout` / `launch_error`) / `stderr_tail`. The `outcome` token (`passed` / `failed` / `timeout` / `error` / `skipped`) drives the terminal branch: `passed` / `skipped` COMPLETE the session; a hard boot outcome routes to `REPAIR` with the `RUNTIME_REPORT` as the source artifact (**#3**). Like `SMOKE` it never returns `ExecutorResult.failure` for a boot failure -- the structured report is always persisted so the classifier has something to work with. *(greenfield mode)* |                | Classify a failed `VERIFY` / `SMOKE` / `API_CHECK` and emit a typed `REPAIR_PLAN` (diffs + rationale + located classes + `strategy` + `extra_constraints`). The classifier is a small registry in `cgx.session.repair.classify`; v1 ships: `unittest_pytest_mix` (rewrite class header to inherit `unittest.TestCase`), `missing_module_pythonpath` (create/extend project-root `conftest.py` so pytest can resolve scaffolded packages -- but **Fix G2**: `locate_missing_module_pythonpath` only proposes the `conftest.py` fix when the target's *full* dotted path resolves on disk; a missing *leaf* module such as `tests.auth` where `tests/` exists but `tests/auth.py` does not yields no diff and, because `missing_module_pythonpath` is in `_REGENERATE_CLASSES`, routes to `strategy=regenerate` rather than a no-op pythonpath patch), `missing_fixture` (hoist an `@pytest.fixture` definition into `tests/conftest.py` or project-root `conftest.py`), `hallucinated_api` (rename / drop the broken symbol surfaced by `API_CHECK`), and `third_party_import_break` (**Phase 3.2** -- recognises `ImportError: cannot import name '<x>' from '<pkg>'` and `ModuleNotFoundError` for third-party modules, then `propose_third_party_pin` queries the PyPI JSON API via `cgx.session.repair.pypi_client` -- with an on-disk cache under `~/.cgx/pypi-cache/` -- to compute a corrective version pin and emit a `requirements.txt` diff). A failure with no deterministic fix no longer escalates straight to the user: **Phase D** adds a *bounded LLM repair* fallback (`_propose_llm_logic_repair` -> `cgx.answer.engine.generate_repair_files`) that hands the model the goal, the failing test tail, and the complete contents of the most relevant source/test files (capped at `_PATCH_DIFF_LIMIT=5`) and takes back complete corrected file bodies, each re-validated by `_validate_repair_source` (the same per-language syntax gate as scaffold) before it reaches `APPLY`. Only when the model declines (`{"files": []}`) or every candidate fails validation does the plan stay empty and escalate to `ASK_USER(freeform)`. Repair has two branches (**Phase 6.1**): `strategy=patch` writes the proposed diffs through the shared `APPLY` executor (≤5 diffs in a patchable class); `strategy=regenerate` abandons the failed `SCAFFOLD` subtree and re-queues a fresh `SCAFFOLD` with `regenerate_constraints` folded into the goal so the per-file generator avoids the failure mode this time. Greenfield-only. **Traceback-localized (#4)**: `_propose_llm_logic_repair` builds its candidate file set failure-first -- `traceback_source_files` surfaces the files named in the crash frames (which may be a source file `APPLY` never touched this attempt) *before* the files `APPLY` wrote/selected. **Retrieval-fed (#6)**: any file slot the localized candidates leave unused (up to `_LLM_REPAIR_MAX_FILES`) is filled by hybrid retrieval over the project index (`_retrieval_relevant_files` -> `run_query_auto`) so a fix reaching a symbol neither the traceback nor `APPLY` named is still in scope -- a no-op in greenfield (no index) and self-disabling on any retrieval error. **Progress-aware budget (P2 / #5)**: the old flat 2-shot cap is replaced by `_repair_progress_stalled` -- the loop keeps going while the failing-test count strictly drops round over round (backed by the passing-count trend), gated by a `failure_signature` flap backstop and the absolute `REPAIR_BUDGET` (4, `cgx.session.budget`); the regenerate branch is double-capped by `REGENERATE_BUDGET=3` (syntax churn per manifest) and `REPAIR_REGENERATE_BUDGET=2` (semantic whole-tree rewrites per ancestor chain). The LLM repair reply is itself schema-constrained (**Phase 3.1**): `REPAIR_FILES_SCHEMA` rides as `json_schema` on the call with one `validate_json_schema` re-ask. |
 | `ASK_USER`              | Structured pause; carries an `expected_kind` indicating which decision contract the UI must satisfy. |
 | `SEARCH` / `SUMMARIZE`  | Utility kinds the router may interleave. |
 
@@ -111,11 +99,17 @@ Task kinds (`TaskKind`):
 `cgx.session.router.Router` is the central state machine. It is **pure
 Python with no LLM calls and no I/O**: every method takes the current
 session state plus an event and returns a `RouterPlan` of typed
-actions (`CreateTask`, `UpdateTaskStatus`, `RecordDecision`,
-`AttachDecisionToTask`, `RecordLesson`) that the caller applies to
-the store.
+actions (`CreateTask`, `UpdateTaskStatus`, `UpdateSessionStatus`,
+`RecordDecision`, `AttachDecisionToTask`, `RecordLesson`) that the
+caller applies to the store. The router is split across three
+modules: the action vocabulary and `RouterPlan` live in
+`cgx.session.actions`, the greenfield edge helpers it dispatches to
+live in `cgx.session.greenfield_edges`, and every bounded retry
+counter is read and spent through the typed
+`cgx.session.budget.LoopBudget` (see the budget table below) rather
+than hand-copied dict keys.
 
-Three entry points cover every transition:
+Five entry points cover every transition:
 
 * `on_user_message(session, message, tasks)` -- user posts a fresh
   objective or a follow-up. If no tasks exist, spawn the root task:
@@ -126,7 +120,12 @@ Three entry points cover every transition:
   the current root (treats the message as a course-correction
   objective).
 * `on_task_completed(session, completed, tasks)` -- an executor
-  finished a task; dispatch via the `TASK_SUCCESSOR` table:
+  finished a task. An explicit `_COMPLETION_GUARDS` chain (REPAIR
+  install-deps / regenerate / terminal-failure, SCAFFOLD failed-files
+  / contract-regenerate, APPLY failed-files -- guard bodies in
+  `cgx.session.greenfield_edges`) is consulted in declaration order
+  first; each guard returns pre-empting actions or declines, falling
+  through to the `TASK_SUCCESSOR` table:
   - Explore loop: `EXPLORE → ASK_USER(choose_path)`,
     `INVESTIGATE → RECOMMEND`,
     `RECOMMEND → ASK_USER(choose_recommendation)`,
@@ -141,7 +140,7 @@ Three entry points cover every transition:
     `APPLY (failed_files) → SCAFFOLD` (**Fix G1** -- an APPLY that
     parses-and-drops an invalid-syntax file leaves a core module
     missing, so instead of limping into BOOTSTRAP_ENV the router
-    re-scaffolds within `_REGENERATE_BUDGET`, carrying an
+    re-scaffolds within `REGENERATE_BUDGET=3`, carrying an
     `invalid_scaffold_syntax` constraint that enumerates each dropped
     file with its concrete error; no SCAFFOLD ancestor or spent
     budget → terminal `FAILED`),
@@ -156,16 +155,21 @@ Three entry points cover every transition:
     source).  Explore mode keeps the direct `APPLY → VERIFY` edge
     and never spawns `API_CHECK` / `SMOKE`.
   - Repair loop (greenfield only): `VERIFY (assertions_failed |
-    collection_error) → REPAIR` (when `repair_attempt < 2` and the
-    new `failure_signature` is not in `prior_failure_signatures`);
+    collection_error) → REPAIR` (funded via `LoopBudget.spend_repair`:
+    the progress ledger keeps the loop alive while the failing-test
+    count strictly drops round over round, under the absolute
+    `REPAIR_BUDGET=4` ceiling, and the new `failure_signature` must
+    not already be in `prior_failure_signatures`);
     `REPAIR (strategy=patch, can_apply) → APPLY` (carrying
     `build_artifact_id` forward so BOOTSTRAP_ENV is skipped);
     `REPAIR (strategy=regenerate) → SCAFFOLD` (**Phase 6.1** -- the
     router walks up to the nearest `SCAFFOLD` ancestor, marks every
     live descendant `ABANDONED`, and re-queues a fresh `SCAFFOLD`
     via `propose_regenerate` with the failure-derived
-    `regenerate_constraints` appended to its `inputs`; capped at
-    one re-scaffold per ancestor chain by `_REGENERATE_BUDGET=1`);
+    `regenerate_constraints` appended to its `inputs`; syntax churn
+    is capped at `REGENERATE_BUDGET=3` per manifest and semantic
+    rewrites of an already-applied tree at
+    `REPAIR_REGENERATE_BUDGET=2` per ancestor chain);
     `REPAIR (empty plan) → ASK_USER(freeform)`. The cycle re-enters
     `VERIFY` and either terminates (`passed`) or escalates once the
     budget / signature guard fires.
@@ -176,14 +180,20 @@ Three entry points cover every transition:
     it into a `record_lesson(...)` call against
     `~/.cgx/lessons.jsonl` (override via `$CGX_LESSONS_PATH`) so
     future `SCAFFOLD` runs in any session can re-use the rule.
-* `on_task_failed(session, failed, tasks)` -- terminal transition
-  for a *hard* failure (**Fix F3**): an executor that returned
-  `ExecutorResult.failure` or crashed produced no `outputs`, so the
-  `outputs`-keyed successor table can never run. Greenfield write
-  loops must always reach a terminal status, so any unrecoverable
-  hard failure (e.g. a BOOTSTRAP_ENV whose `pip install` failed)
-  ends the session `FAILED` rather than hanging in `active` with a
-  dead FAILED leaf and no successor. Explore-mode sessions keep
+* `on_task_failed(session, failed, tasks, retryable=False)` --
+  terminal transition for a *hard* failure (**Fix F3**): an executor
+  that returned `ExecutorResult.failure` or crashed produced no
+  `outputs`, so the `outputs`-keyed successor table can never run.
+  Greenfield write loops must always reach a terminal status, so any
+  unrecoverable hard failure (e.g. a BOOTSTRAP_ENV whose `pip
+  install` failed) ends the session `FAILED` rather than hanging in
+  `active` with a dead FAILED leaf and no successor. One recoverable
+  exception: a `DECOMPOSE` whose executor marked the failure
+  `retryable` (an empty or unbuildable manifest -- a plan-quality
+  problem, not a crash) is re-queued once by
+  `_decompose_retry_actions` with the concrete failure folded into
+  its goal as a constraint, bounded by `DECOMPOSE_RETRY_BUDGET=1`; a
+  second identical failure is terminal. Explore-mode sessions keep
   their user-driven lifecycle (empty plan); a no-op once the session
   is already `COMPLETED` / `FAILED` / `ABANDONED`.
 * `on_budget_exhausted(session, over_task, tasks, reason)` --
@@ -205,6 +215,51 @@ Three entry points cover every transition:
   an `ASK_USER` via a typed `Decision`. The router records the
   decision, attaches it to the ASK_USER, marks the ASK_USER `DONE`,
   and spawns the successor implied by the decision shape (see §1A.5).
+
+#### Loop budgets: `cgx.session.budget.LoopBudget`
+
+Every bounded recovery loop above spends one typed, immutable
+`LoopBudget` object instead of hand-copied dict keys. Router edges
+read it with `LoopBudget.from_inputs(task.inputs)`, spend it with the
+`spend_*` helpers, and serialize it back onto successor tasks with
+`repair_chain_inputs()`. The wire format is unchanged -- the same
+flat input keys as before -- so persisted in-flight sessions resume
+cleanly.
+
+| Budget constant | Cap | Bounds |
+|-----------------|-----|--------|
+| `REPAIR_BUDGET` | 4 | Absolute ceiling on repair rounds per greenfield write loop; the progress ledger usually ends a loop sooner. |
+| `REGENERATE_BUDGET` | 3 | Targeted re-scaffolds per SCAFFOLD ancestor chain for *syntax churn* (files dropped before the tree is applied). |
+| `REPAIR_REGENERATE_BUDGET` | 2 | Whole-tree *semantic* rewrites of an already-applied tree per ancestor chain -- kept separate so syntax churn cannot starve the first semantic repair. |
+| `REPLAN_BUDGET` | 1 | Escalations to a fresh `DECOMPOSE` when a manifest spends its regenerate budget; once spent the loop proceeds with the surviving files rather than failing terminally. |
+| `DECOMPOSE_RETRY_BUDGET` | 1 | Constraint-folded `DECOMPOSE` retries after a `retryable` executor failure (empty / unbuildable manifest). |
+
+The recovery ladder these budgets fund, cheapest rung first:
+
+```mermaid
+flowchart TB
+    F["failure signal<br/>(VERIFY / SMOKE / API_CHECK /<br/>RUNTIME_VERIFY report)"] --> R1
+
+    R1{"repair patch?<br/>spend_repair -- REPAIR_BUDGET=4<br/>+ progress ledger + flap guard"}
+    R1 -- funded --> P(["REPAIR → APPLY → re-VERIFY"])
+    R1 -- "exhausted / stalled" --> R2
+
+    R2{"regenerate subtree?<br/>spend_regenerate (syntax, 3) /<br/>spend_repair_regenerate (semantic, 2)"}
+    R2 -- funded --> G(["fresh SCAFFOLD +<br/>regenerate_constraints"])
+    R2 -- exhausted --> R3
+
+    R3{"re-plan?<br/>spend_replan -- REPLAN_BUDGET=1"}
+    R3 -- funded --> D(["fresh DECOMPOSE with<br/>failure folded into goal"])
+    R3 -- exhausted --> T(["proceed with surviving files<br/>or terminal FAILED"])
+
+    classDef gate fill:#7d5ba6,stroke:#4c3575,color:#fff;
+    classDef act fill:#3b6ea5,stroke:#274c73,color:#fff;
+    classDef term fill:#bc4749,stroke:#7f2d2f,color:#fff;
+    class R1,R2,R3 gate;
+    class P,G,D act;
+    class T term;
+```
+
 
 ### 1A.4 The Runner and executors
 
@@ -425,22 +480,25 @@ Five router-level guardrails keep the loop honest:
   each as a structured signal in <1 s rather than an opaque pytest
   collection error 30 s later.
 * The autonomous `REPAIR` cycle is greenfield-only and bounded by
-  three orthogonal guards. The retry budget (`repair_attempt`
-  capped at 2) prevents the loop from monopolising the session.
-  The progress detector (a sha1 over the verify outcome,
+  three orthogonal guards, all read and spent through the typed
+  `cgx.session.budget.LoopBudget` (§1A.3). The progress-aware
+  budget keeps the loop alive while the failing-test count strictly
+  drops round over round, under the absolute `REPAIR_BUDGET=4`
+  ceiling. The flap detector (a sha1 over the verify outcome,
   returncode, and first error line, tracked in
   `prior_failure_signatures` on every downstream task) refuses a
   second attempt when the signature matches a prior failure, so a
   fix that "succeeds" but leaves the same crash in place escalates
-  to `ASK_USER` instead of looping forever. The
-  `_REGENERATE_BUDGET=1` cap on `propose_regenerate` (**Phase
-  6.1**) prevents the patch-vs-regenerate branch from re-
-  scaffolding the same subtree more than once.
+  instead of looping forever. The regenerate branch is double-capped
+  (**Phase 6.1**): `REGENERATE_BUDGET=3` bounds syntax churn per
+  manifest and `REPAIR_REGENERATE_BUDGET=2` bounds semantic
+  whole-tree rewrites of an already-applied tree per SCAFFOLD
+  ancestor chain.
 * Every greenfield failure path is terminal. A hard executor
   failure that never returns `outputs` ends the session `FAILED`
   via `on_task_failed` (**Fix F3**) rather than hanging in
   `active`; and an APPLY that parses-and-drops an invalid-syntax
-  file re-scaffolds within `_REGENERATE_BUDGET` with an
+  file re-scaffolds within `REGENERATE_BUDGET=3` with an
   `invalid_scaffold_syntax` constraint enumerating the dropped
   files, then falls to terminal `FAILED` once no SCAFFOLD ancestor
   remains or the budget is spent (**Fix G1**). The loop never limps
@@ -582,7 +640,7 @@ the router (`on_user_message`, `on_task_completed`,
 (`classify`, `locate`, `propose`), and the LLM / retrieval / codegen
 entry points (`cgx.answer.engine`, `cgx.retrieval.orchestrator`,
 `cgx.pipeline.auto`, `cgx.codegen.{disk_apply, env_manager,
-test_runner}`, `cgx.agents.loop`). The `@traced(category)`
+test_runner}`). The `@traced(category)`
 decorator emits a `trace_enter` and either a `trace_exit`
 (with `elapsed_ms`) or a `trace_error` (with `error_type` +
 truncated message) for every call, routed to
@@ -685,6 +743,10 @@ same 404 on every mount.
 | The state model                   | `src/cgx/session/models.py` |
 | Mode auto-detection               | `src/cgx/session/mode.py` :: `detect_mode` |
 | Transitions / successor table     | `src/cgx/session/router.py` |
+| Typed router actions / `RouterPlan` | `src/cgx/session/actions.py` |
+| Greenfield edge helpers / completion guards | `src/cgx/session/greenfield_edges.py` |
+| Loop budgets (`LoopBudget`)       | `src/cgx/session/budget.py` |
+| LLM JSON schemas (Phase 3.1)      | `src/cgx/answer/schemas.py` |
 | The runner sequencer              | `src/cgx/session/runner.py` |
 | Persistence schema                | `src/cgx/session/store.py` |
 | Project-local agent log (Phase 1.3) | `src/cgx/session/agent_log.py`, `src/cgx/logging_setup.py` |
@@ -703,453 +765,7 @@ same 404 on every mount.
 | UI                                | `frontend/src/pages/AgentPage.tsx` + `frontend/src/components/agent/` |
 | Integration tests                 | `tests/test_webui_agent_session.py`, `tests/test_session.py` |
 
-The remainder of this document (sections 1–8 below) describes the
-**legacy batch agent**, which still backs `/agent-legacy`, the
-`cgx agent` CLI, and `cgx.agents.run_agent`.
-
 ---
-
-## 1. Agent Type
-
-CGX ships **one** agent: a single-actor, multi-role **orchestrator**
-that operates strictly **local-first**.
-
-* **Single-actor, not multi-agent.** There is one logical agent. Inside
-  it, three cooperating roles share the same process and the same LLM
-  provider -- they are not independent agents communicating over a bus.
-* **Plan-and-execute, not ReAct.** A full plan is committed up front;
-  the executor does not call the LLM mid-task to decide the next step.
-  Retries re-enter the planner, they do not branch off it.
-* **Capability-dispatched.** The agent never makes raw shell or file
-  calls. Each task is routed to a named **capability** callable
-  (`ask`, `plan`, `scaffold`, `apply`, `verify`, …). Callers can
-  replace the capability table with stubs for tests or sandboxing.
-* **Local-first by default.** The agent runs against a local Ollama
-  daemon, a local FAISS index, and a local working tree. No cloud
-  service is required, no telemetry is emitted, and the entire loop
-  works offline once models and the index are present. Cloud
-  providers (Gemini, OpenAI-compatible) are opt-in.
-* **Streaming, not blocking.** The default UI path streams
-  `AgentEvent` records over SSE so the user sees plan, per-task start,
-  heartbeats, completion, judge verdicts, and retry transitions as
-  they happen.
-
----
-
-## 2. Architecture -- Planner → Tracker → Judge
-
-```
-                   ┌─────────┐
-        goal ────▶ │ Planner │ ──▶ Plan(tasks=[…], rationale)
-                   └─────────┘
-                        │
-                        ▼
-                   ┌─────────┐        capability table
-                   │ Tracker │ ──▶  ask/plan/scaffold/search/
-                   └─────────┘      summarize/apply/verify/fill_logic
-                        │
-                ┌───────┴────────┐
-                ▼                ▼
-           AgentEvent…       ┌───────┐
-           (SSE stream)      │ Judge │ -- verdict + rationale per task
-                             └───────┘
-                        │
-                  failures? ──▶ planner.plan_fix() ──▶ retry plan
-```
-
-* **`Planner`** ([`planner.py`](../src/cgx/agents/planner.py)) -- asks
-  the LLM for a strict-JSON plan (`{rationale, tasks:[{name,
-  description, kind, criteria}]}`), then runs `_enforce_kind_policy()`
-  to route the goal down one of four branches: **SCAFFOLD**,
-  **PLAN+APPLY+VERIFY**, **VERIFY-only**, or read-only
-  **SEARCH/ASK/SUMMARIZE**. When the LLM is absent or returns
-  unparseable output, a deterministic fallback consults
-  `cgx.answer.intent.detect_intent` and emits a one-task plan that
-  matches legacy single-shot behaviour. For code-change goals the
-  Planner fetches the retriever result once and derives three grounding
-  signals from it without extra queries: candidate files, the
-  change-impact **blast radius**, and a read-only **understand brief**
-  (`_build_understand_brief`) -- a bounded structured view of the code
-  the edit will touch (relevant files, key symbols already defined,
-  existing tests to extend, language conventions). The brief is rendered
-  into the planning prompt and stamped onto each `PLAN` task's `inputs`
-  (`understand_brief`); the `plan` capability then folds it into the
-  generator's task text so edits reuse existing code instead of
-  recreating it. Alongside these query-derived signals the Planner also
-  receives a **hierarchical repo map** (`cgx.answer.repo_map`, built and
-  cached at index time) via its `repo_map` provider and renders a budgeted
-  slice of it (`_render_repo_map`) into the prompt, so decomposition for
-  both add-to-existing and edit goals is grounded in the repo's real
-  package/file/symbol structure rather than the retrieved slice alone. The planning LLM call selects its strategy from the
-  provider's capability tier
-  (`cgx.answer.model_caps.get_prompt_strategy`): weak local (small-tier)
-  models get an explicit strict-JSON reminder and a tight token ceiling,
-  while strong models take the lean path with more room -- no per-model
-  special cases.
-* **`Tracker`** ([`tracker.py`](../src/cgx/agents/tracker.py)) -- index
-  loop over `plan.tasks` (so tasks injected mid-run, like
-  `SCAFFOLD_MANIFEST` expanding into per-file tasks, are visited).
-  Dispatches each task to its capability, emits heartbeats every
-  `progress_interval` seconds while a capability is blocked, and
-  persists `task.output` + `task.judge` back into the plan.
-* **`Judge`** ([`judge.py`](../src/cgx/agents/judge.py)) -- validates
-  each completed task against its `criteria` list. LLM-grounded when a
-  provider is available; otherwise heuristic (artifact shape +
-  per-skill structural checks). Returns `{verdict, rationale,
-  confidence}`. A `fail` verdict on a hard-fail kind aborts the plan
-  (subject to `_SOFT_FAIL_KINDS`, currently only `SCAFFOLD_FILE`,
-  which continues so partial scaffolds survive).
-
-  **Structural pre-gates for `ASK` / `SUMMARIZE`.** Before any
-  LLM-grader call, `_structural_check` applies cheap deterministic
-  length/shape gates so obviously-bad output fails without a model
-  round-trip, and only within-budget output is handed to the strict
-  local-model judge for substance (grounding/citations). The budgets
-  are module-level constants in `judge.py`: `_ASK_MAX_WORDS = 1000`
-  (a non-clarify `ASK` answer longer than this hard-fails);
-  `_SUMMARIZE_MAX_BULLETS = 8` (mirrors the "<=8 bullets" contract of
-  the `summarize` capability) and `_SUMMARIZE_MAX_WORDS = 400` (a
-  `SUMMARIZE` output that is empty, exceeds the bullet count, or
-  exceeds the word budget hard-fails). `_LIST_ITEM_RE` counts
-  bullet/ordered list items while excluding Markdown `#` headings so a
-  heading is never miscounted as a bullet. Small local models tend to
-  emit "wall of text" answers; these gates catch that class of failure
-  cheaply and deterministically.
-
-The whole loop is wired in
-[`run_agent()`](../src/cgx/agents/loop.py). The streaming variant
-adds `_stream_with_retry` on top, which re-enters the planner when
-`verify` or `apply` fails and renames the next plan's events from
-`plan` to `retry_plan` so the UI appends rather than replaces.
-
----
-
-## 3. Agentic Capabilities (Task Kinds)
-
-The agent's atomic operations are enumerated in
-[`TaskKind`](../src/cgx/agents/types.py). Each kind maps 1:1 to a
-capability in the default capability table built by
-`_build_default_capabilities`.
-
-| Kind                 | Purpose                                                              | Backing function |
-|----------------------|----------------------------------------------------------------------|------------------|
-| `search`             | Retrieve code chunks from the FAISS index for the current goal.      | `cgx.pipeline.auto.run_query_auto` |
-| `ask`                | Answer a grounded natural-language question over the indexed code.   | `cgx.answer.engine.answer_with_llm` |
-| `summarize`          | Condense prior task outputs into ≤8 bullets via the LLM.             | inline `provider.chat` call |
-| `plan`               | Produce a unified-diff change plan against an **existing** codebase. | `cgx.answer.engine.generate_code_plan` |
-| `scaffold`           | Generate a brand-new project from scratch (no index required).       | `cgx.answer.engine.generate_project_scaffold` |
-| `scaffold_manifest`  | Cheap LLM call that returns only the file list for a new project.    | injects `scaffold_file` tasks into the running plan |
-| `scaffold_file`      | Generate exactly **one** file given its spec + sibling context.      | per-file scaffold call |
-| `fill_logic`         | Phase-2 of skeleton-and-fill: replace empty bodies in a skeleton.    | targeted edit call |
-| `apply`              | Write a prior `plan`/`scaffold` diff set to disk + smoke-test.       | `cgx.codegen.disk_apply.apply_diffs_to_disk` |
-| `verify`             | Run impacted (or all) pytest tests against the working tree.         | `cgx.codegen.test_runner.run_tests_on_disk` / `run_pytest_paths` |
-
-The kinds are intentionally **coarse** -- each one is the cheapest
-unit of work that still produces a verifiable artifact. There is no
-"call this Python function" or "edit this hunk" primitive; the agent
-expresses fine-grained intent through the prompt to the underlying
-capability, not through more atomic tools.
-
----
-
-## 4. Agent Style
-
-The behavioural choices that distinguish the CGX agent from a generic
-"LLM + tools" loop:
-
-* **Local-first, offline-capable.** No external API is required for
-  any capability. The default provider is `OllamaProvider`; the
-  default retrieval stack is on-disk FAISS + a JSONL record store.
-  Cloud providers (`GeminiProvider`, `OpenAICompatProvider`) are
-  optional drop-ins through the same `LLMProvider` interface.
-* **Plan-first, with a deterministic safety net.** The LLM is asked
-  for a strict-JSON plan; if it returns malformed JSON, no JSON, or
-  no tasks, `Planner._fallback_plan` synthesises a single-task plan
-  from intent classification so the agent never deadlocks on a bad
-  model response.
-* **Skill-aware decomposition.** The `skills/` package contributes
-  three signals: (1) it influences the planner's SCAFFOLD vs. PLAN
-  routing decision; (2) it injects technology-specific instructions
-  into the system prompts of `plan`/`scaffold`; (3) it adds
-  per-skill structural checks to the Judge (e.g. "a React scaffold
-  must include a `package.json` and an `App.jsx`/`App.tsx`").
-* **Diff-shaped output, always.** Even scaffolds are emitted as
-  `--- /dev/null` new-file unified diffs so the `apply` capability
-  has a single code path for both new and edited files.
-* **Retrieval is a task, not a side-effect.** When the goal mentions
-  a file, symbol, or behaviour, the planner is expected to emit an
-  explicit `search` task whose hits feed downstream `ask`/`plan`
-  tasks via `prior_outputs`. This keeps index access auditable and
-  lets the UI render the retrieval result.
-* **Verify is the contract.** Code-change goals always terminate in
-  a `verify` task. The plan is only "complete" when `verify`
-  succeeds -- or when its failure is classified as unrecoverable
-  sandbox / `sys.path` noise (see §5).
-* **Errors are structured, not opaque.** Tracker exceptions are
-  caught, surfaced as `task_failed` events, persisted on
-  `task.error`, and (where applicable) post-processed by
-  `_diagnose_failure` so the retry loop can quote the offending file
-  and line back to the LLM.
-* **UI feedback is incremental.** Long-running capabilities emit
-  `task_progress` heartbeats every two seconds; the React Agent page
-  consumes these to keep the timeline alive without polling.
-
----
-
-## 5. The Retry Loop and Self-Correction
-
-`run_agent` re-enters the planner up to `max_retries` times (default
-`1`) when the first plan ends with failures. The retry path is
-**targeted, not blanket**:
-
-1. **Failure classification.** `_extract_verify_failures`,
-   `_extract_apply_failures`, and `_extract_core_failures` partition
-   the failed tasks. `_diagnose_failure` parses pytest tracebacks and
-   classifies the error as `import_error`, `syntax_error`,
-   `logic_error`, or `unknown`, then extracts the responsible
-   project-relative file paths.
-2. **Sandbox-failure short-circuit.**
-   `_verify_failure_is_unrecoverable` detects pytest collection
-   errors (`rc == 2`) caused by `ModuleNotFoundError` on a first-party
-   project directory. These are packaging / `sys.path` issues the LLM
-   cannot fix by regenerating code, so the retry is skipped and the
-   `verify` task is demoted to "complete with warnings".
-3. **Targeted regeneration.**
-   * If only `scaffold_file` tasks failed, the loop builds a
-     scaffold-retry plan (`_build_scaffold_retry_plan`) that
-     regenerates only the broken files and preserves the siblings
-     already on disk via `plan.owned_files`.
-   * If `verify` failed against an existing codebase, the loop calls
-     `planner.plan_fix(fix_goal, broken_files=…, already_good_files=…)`
-     which constrains the new PLAN task to a `target_files` /
-     `do_not_change` allow-list folded into the prompt.
-4. **The 10-line buffer rule.** `_extract_error_snippet` pulls ±5
-   lines around the first traceback line from the failing file and
-   injects them into the retry prompt. Small models (3B-class) drown
-   in full tracebacks; a tight snippet keeps them focused.
-5. **Streaming continuity.** Retry plans are streamed under the
-   `retry_plan` event so the UI appends new task rows instead of
-   replacing the original timeline; a `retry_start` event carries
-   the human-readable reason.
-
-The retry is bounded: one re-plan by default. There is no open-ended
-"keep trying until it works" loop, because every retry costs an LLM
-call and a test run, and unbounded retries against a 3B-class model
-diverge faster than they converge.
-
----
-
-## 6. Integration Surfaces
-
-* **Web UI.** The `/api/agent` SSE endpoint streams `AgentEvent`
-  records. The React Agent page renders the plan DAG, per-task
-  status, judge verdicts, and the rationale card from the `plan`
-  event payload. Visual helpers live in
-  [`viz.py`](../src/cgx/agents/viz.py).
-* **CLI.** `cgx agent "<goal>"` is the terminal entrypoint; it
-  consumes the same stream and prints a compact task table.
-* **Programmatic.**
-
-  ```python
-  from cgx.agents import run_agent
-  from cgx.answer.providers import OllamaProvider
-
-  prov = OllamaProvider(model="qwen2.5-coder:3b")
-
-  for event in run_agent(
-      goal="Add docstrings to every public function in cgx.parser",
-      provider=prov,
-      index_dir="/tmp/cgx_index/indices",
-      records_path="/tmp/cgx_index/records.jsonl",
-      project_root=".",
-      stream=True,
-  ):
-      print(event.type, event.payload)
-  ```
-
-  Tests inject their own capability map to bypass the LLM and disk
-  entirely -- see `tests/test_agents_*` and the example in
-  [`docs/usage.md`](usage.md#programmatic-use).
-
----
-
-## 7. Rooms for Improvement
-
-The current design is deliberately conservative -- one actor, one
-plan, one retry, no live tool-calling. That makes the loop legible
-and reproducible, but it leaves clear headroom. The items below are
-the most impactful next steps the maintainers and community have
-identified; contributions are welcome on any of them.
-
-### 7.1 Orchestration
-
-* **Parallel task execution.** The Tracker walks tasks sequentially
-  even when they have no data dependency. `Task.dependencies` already
-  carries the DAG edges; a topological scheduler that runs
-  independent tasks (e.g. multiple `scaffold_file` siblings, or a
-  `search` task in parallel with a `summarize`) would significantly
-  cut wall-clock time on multi-layer scaffolds. Streaming would need
-  per-task lanes in the SSE protocol.
-* **True multi-agent split.** The "Planner / Tracker / Judge" roles
-  share one provider today. A reviewer / critic role with a
-  different (possibly larger, possibly slower) model could review
-  PLAN outputs before APPLY, in the style of a reflective
-  critic-actor pair. This is independent of parallelism: the agent
-  would still be a single orchestrator, but its sub-roles would each
-  speak through their own provider configuration.
-* **Plan revision mid-stream.** Today a plan is committed up front
-  and only re-planned at the end. A capability that lets the
-  Tracker request a plan amendment (e.g. "this scaffold revealed I
-  need a new layer") would close the gap between plan-and-execute
-  and ReAct, without giving up the structured plan event the UI
-  depends on.
-* **Unbounded retry budgets with confidence gating.** `max_retries`
-  is a hard cap. Replacing it with a confidence-weighted budget
-  (e.g. "keep retrying while the Judge's confidence is trending up")
-  would let strong models converge on harder problems without
-  letting weak models loop indefinitely.
-
-### 7.2 Tool-Use Expansion
-
-* **Finer-grained file ops.** The agent only writes whole-file diffs
-  via `apply`. Adding a `patch` / `rename` / `delete` task kind with
-  its own Judge contract would let small models make surgical
-  changes the current diff-only pipeline forces them to express as
-  full-file rewrites.
-* **Shell execution as a first-class capability.** `verify` runs
-  pytest, but there is no general `run_command` kind. A sandboxed
-  shell capability -- gated on a per-command allow-list and confined
-  to the project venv -- would unlock `npm install`, `cargo check`,
-  `tsc --noEmit`, and other language-native verifiers that are
-  currently impossible to plan.
-* **HTTP / network capability.** Goals like "fetch the OpenAPI spec
-  at URL X and generate a client" cannot be expressed today. A
-  bounded `fetch` capability with a domain allow-list would open
-  the door without breaking the air-gapped default (it would be
-  off unless the user opts in).
-* **Browser / headless rendering.** For UI-heavy scaffolds, a
-  Playwright-backed `screenshot` or `dom_snapshot` capability would
-  let the Judge verify *visual* criteria rather than just structural
-  ones. This is high-value for React / Vue / Svelte goals where the
-  current Judge can only check file structure.
-* **IDE / LSP integration.** The agent currently runs blind to
-  language-server diagnostics. Piping `pyright` / `tsc` / `gopls`
-  output into the apply-time smoke test would catch type errors
-  before they reach `verify` and waste a full test run.
-
-### 7.3 Planner Quality
-
-* **Learned routing instead of regex-based intent.**
-  `_SCAFFOLD_RE`, `_CHANGE_VERB_RE`, `_TECH_RE`, and
-  `_VERIFY_ONLY_RE` are brittle. A small classifier (logistic
-  regression on goal embeddings against a labelled corpus of past
-  agent runs) would generalise better and degrade more gracefully
-  than the current regex cascade.
-* **Plan-rationale grounding.** The planner emits a free-text
-  `rationale` but it is not currently validated. The Judge could
-  cross-check that every claim in the rationale ("the goal needs a
-  React UI, FastAPI backend, and pytest suite") matches at least
-  one task -- catching planner hallucination at zero extra LLM cost.
-* **Goal disambiguation.** Ambiguous goals collapse to whatever the
-  LLM picks. A pre-planner clarification step ("Did you mean to
-  modify the existing project at `./` or to create a new project?")
-  driven by the `_EXISTING_CODE_HINT_RE` signal would prevent the
-  whole-plan misroute that is currently the most expensive failure
-  mode.
-
-### 7.4 Verifier and Sandbox Hardening
-
-* **Container-isolated `verify`.** Today `verify` runs pytest in the
-  project's own venv, but on the host filesystem and host user.
-  Running it inside a rootless Podman / Docker container with a
-  read-only mount of the staging directory would close the gap
-  where generated code can execute arbitrary code at collection
-  time.
-* **Resource caps.** There is no CPU / memory / wall-time cap on
-  generated test runs beyond `timeout_seconds`. Cgroup limits or
-  the equivalent on macOS would prevent an infinite-loop test from
-  saturating the user's machine.
-* **Verifier diversity.** `verify` is pytest-only. Adding language
-  detectors that pick `vitest`, `jest`, `cargo test`, `go test`,
-  `phpunit`, etc. based on the project manifest would make the
-  contract real for non-Python scaffolds (which today get a
-  `verify` task that finds nothing to run).
-* **Coverage-aware test selection.** `discover_all_tests` runs the
-  whole suite when there is no APPLY history. A coverage map keyed
-  on the changed files would let `verify` run only the impacted
-  subset even on first-touch goals.
-
-### 7.5 Skills System
-
-* **Skill discovery from disk.** Skills are hand-registered in
-  `skills/__init__.py`. A `skills/` directory scan with a
-  registration decorator would let third-party packages contribute
-  skills without forking the registry.
-* **Skill versioning.** Skill detection is binary (does it fire?).
-  Versioning ("React 18 vs. React 19") would let the system prompts
-  and Judge checks track upstream changes without conditional
-  branches inside each skill module.
-* **Cross-skill conflict resolution.** Today a goal can legitimately
-  trigger React + FastAPI + SQLite + Tailwind at once. There is no
-  explicit conflict layer when two skills disagree (e.g. two
-  competing build tools). A conflict matrix consulted at planning
-  time would let the planner ask for clarification instead of
-  emitting a plan that mixes incompatible toolchains.
-
-### 7.6 Memory and Context
-
-* **Cross-run memory.** Each `run_agent` invocation starts fresh.
-  Persisting a per-project "agent memory" (what worked, what didn't,
-  which files the user reverted) would let the planner avoid
-  repeating known-bad approaches. The `.cgx_runs/` directory is the
-  natural home for this.
-* **Symbol-map freshness.** `build_symbol_context_prompt` reads
-  from the records store at plan time, but does not detect when the
-  user has edited the project since the last index. An auto-reindex
-  trigger on `mtime` changes would prevent the planner from
-  emitting diffs that conflict with files it cannot see.
-* **Citation-grounded answers.** `ask` outputs include citations,
-  but the Judge does not currently penalise an answer that fails to
-  cite a hit. Tightening that contract would reduce hallucinated
-  references in read-only flows.
-
-### 7.7 Observability
-
-* **Structured event log on disk.** SSE events are streamed to the
-  UI but not persisted. Writing them to `.cgx_runs/<plan_id>.jsonl`
-  would give users a complete replay log per run -- essential for
-  bug reports and for the cross-run memory item above.
-* **Cost / token accounting.** There is no per-task token or
-  wall-time accounting surfaced in the UI. Adding it would help
-  users tell whether a slow run is dominated by planning, a single
-  scaffold call, or verify execution -- and would let the planner
-  cost-budget its own decomposition.
-* **Trace export.** OpenTelemetry-compatible trace export (opt-in,
-  off by default to preserve the air-gapped guarantee) would let
-  teams running CGX in production tie agent runs to their existing
-  observability stack.
-
----
-
-## 8. Where to Start Contributing
-
-If you want to land your first change in the agent layer, the
-easiest on-ramps are:
-
-* Add a new **skill** (see [`CONTRIBUTING.md`](../CONTRIBUTING.md)).
-  Skills are the lowest-coupling extension point: one file, one
-  test file, no changes to the orchestrator.
-* Add a new **capability** by extending `TaskKind`, wiring it into
-  `_build_default_capabilities`, and adding a Judge branch. The
-  `fill_logic` capability is the most recent example of this
-  pattern and is a good template.
-* Improve a **diagnoser** in `loop.py` -- `_diagnose_failure` and
-  `_extract_error_snippet` are pure functions over failure
-  payloads, easy to unit-test, and produce immediate user-visible
-  quality gains in the retry loop.
-* Improve the **planner prompt** in `planner.py::SYSTEM_PROMPT` and
-  add a regression test under `tests/test_agents_planner.py` that
-  pins the new behaviour against the deterministic fallback.
 
 See [`docs/architecture.md`](architecture.md) for the broader
 system context and [`docs/book.md`](book.md) for the deep technical

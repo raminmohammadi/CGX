@@ -28,6 +28,7 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from cgx.session.budget import LoopBudget
 from cgx.session.models import (
     Artifact,
     ArtifactKind,
@@ -73,7 +74,7 @@ logger = logging.getLogger(__name__)
 _PATCH_DIFF_LIMIT = 5
 
 # Bounded LLM logic-repair caps. The router already gates the overall
-# loop via ``_REPAIR_BUDGET`` + the progress-aware failing-test-count
+# loop via ``REPAIR_BUDGET`` + the progress-aware failing-test-count
 # trend (P2) + flap detection on ``failure_signature``; these caps keep a
 # single REPAIR call's LLM cost and blast radius proportional to the
 # failure. LLM repair is attempted on every repair attempt the router
@@ -172,7 +173,7 @@ def run_repair(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     content = dict(verify_artifact.content or {})
     classification = classify_verify_report(content)
     signature = failure_signature(content)
-    attempt = int(task.inputs.get("repair_attempt") or 1)
+    attempt = LoopBudget.from_inputs(task.inputs).repair_attempt or 1
 
     diffs: List[Dict[str, str]] = []
     rationale = ""
@@ -321,7 +322,7 @@ def _run_smoke_repair(task: TaskNode, deps: ExecutorDeps,
     signature = str(content.get("failure_signature") or "").strip()
     if not signature:
         signature = "smoke_import|" + ",".join(sorted(failed))
-    attempt = int(task.inputs.get("repair_attempt") or 1)
+    attempt = LoopBudget.from_inputs(task.inputs).repair_attempt or 1
     classification = "smoke_import_failure"
     build_stderr = ""
     if failed:
@@ -414,7 +415,7 @@ def _run_runtime_repair(task: TaskNode, deps: ExecutorDeps,
     signature = str(content.get("failure_signature") or "").strip()
     if not signature:
         signature = "runtime_boot|" + ",".join(sorted(failed))
-    attempt = int(task.inputs.get("repair_attempt") or 1)
+    attempt = LoopBudget.from_inputs(task.inputs).repair_attempt or 1
     error_text = runtime_failure_text(content)
     if failed:
         rationale = (
@@ -509,7 +510,7 @@ def _run_api_check_repair(task: TaskNode, deps: ExecutorDeps,
         parts = sorted(
             f"{r.get('module')}.{r.get('name')}" for r in failed)
         signature = "api_check|" + ",".join(parts)
-    attempt = int(task.inputs.get("repair_attempt") or 1)
+    attempt = LoopBudget.from_inputs(task.inputs).repair_attempt or 1
     classification = "api_check_failure"
     if failed:
         # Split "module could not be imported at all" (a wrong-path or
@@ -609,7 +610,7 @@ def _run_missing_dependency_repair(
     signature = str(content.get("failure_signature") or "").strip()
     if not signature:
         signature = "api_check|missing:" + ",".join(mods)
-    attempt = int(task.inputs.get("repair_attempt") or 1)
+    attempt = LoopBudget.from_inputs(task.inputs).repair_attempt or 1
     classification = "missing_dependency"
     rationale = (
         f"Missing third-party dependency(ies): {', '.join(mods)}. The "
@@ -738,7 +739,7 @@ def _propose_llm_logic_repair(
     """
     if deps.provider is None or not deps.project_root:
         return []
-    attempt = int(task.inputs.get("repair_attempt") or 1)
+    attempt = LoopBudget.from_inputs(task.inputs).repair_attempt or 1
     if attempt > _LLM_REPAIR_MAX_ATTEMPT:
         return []
     from cgx.answer.engine import generate_repair_files

@@ -52,11 +52,18 @@ class ExecutorResult:
     * ``failure`` non-empty -> task transitions to ``FAILED`` instead
       of ``DONE``; the runner still persists any facts the executor
       surfaced before erroring.
+    * ``retryable`` True (only meaningful with ``failure``) -> the
+      failure is a *plan-quality* problem an LLM retry could fix (e.g.
+      a manifest that failed validation), not a hard environment/crash
+      error. The router may re-queue the task once with the failure
+      message folded into its goal as a constraint instead of ending
+      the session terminally.
     """
     outputs: Dict[str, Any] = field(default_factory=dict)
     facts: List[Fact] = field(default_factory=list)
     artifact: Optional[Artifact] = None
     failure: Optional[str] = None
+    retryable: bool = False
 
 
 Executor = Callable[[TaskNode, ExecutorDeps], ExecutorResult]

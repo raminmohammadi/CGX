@@ -1,15 +1,13 @@
 
 
-"""Session-shaped agent backbone (Phase 0 of the redesign).
+"""Session-shaped agent backbone -- CGX's core agent loop.
 
-This package owns the persistent, cross-turn state for the new
+This package owns the persistent, cross-turn state for the
 session-based agent loop: ``Session`` objects, the task tree
 (``TaskNode``), an append-only ``KnowledgeBase``, the ``DecisionLog``,
-and produced ``Artifact``s. Phase 0 ships the data layer only -- the
-Router, executors, and UI integration arrive in later phases.
-
-Nothing in :mod:`cgx.agents` imports from here yet. The new
-``/api/session/*`` routes (Phase 1) will be the first consumer.
+and produced ``Artifact``s, plus the Router, task executors, and the
+``SessionRunner`` that drives them. The web UI (``/api/agent-session``)
+and the terminal dashboard are its consumers.
 """
 
 from __future__ import annotations
@@ -32,7 +30,8 @@ from cgx.session.models import (
 )
 from cgx.session.events import Event, EventBus, EventType, get_default_bus
 from cgx.session.mode import detect_mode
-from cgx.session.router import Router, RouterPlan
+from cgx.session.actions import RouterPlan
+from cgx.session.router import Router
 from cgx.session.runner import SessionRunner
 from cgx.session.store import SessionStore
 

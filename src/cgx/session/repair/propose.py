@@ -20,6 +20,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from cgx.session.budget import LoopBudget
 from cgx.session.models import TaskKind, TaskNode
 from cgx.session.repair.locate import (
     MissingFixtureLocation,
@@ -531,7 +532,7 @@ def propose_regenerate(
       pairs and the candidate pins that didn't work). SCAFFOLD's prompt
       builder reads this list to inject prior-constraint warnings.
     * ``regenerate_attempt`` -- incremented monotonically so the router
-      can cap the loop via :data:`_REGENERATE_BUDGET`.
+      can cap the loop via :data:`cgx.session.budget.REGENERATE_BUDGET`.
     * ``regenerated_from_task_id`` -- back-pointer to the SCAFFOLD that
       was abandoned, useful for the UI and for cross-session learning
       (Phase 7).
@@ -570,7 +571,7 @@ def propose_regenerate(
         prior_constraints.append(dict(new_constraints))
     inputs["regenerate_constraints"] = prior_constraints
     inputs["regenerate_attempt"] = (
-        int(inputs.get("regenerate_attempt") or 0) + 1)
+        LoopBudget.from_inputs(inputs).spend_regenerate().regenerate_attempt)
     inputs["regenerated_from_task_id"] = scaffold_task.task_id
     targeted = [str(p).strip() for p in (regenerate_files or [])
                 if str(p).strip()]

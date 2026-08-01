@@ -69,15 +69,17 @@ def run_decompose(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     contracts = _coerce_contracts((result or {}).get("contracts"))
     if not _layer_file_count(layers):
         return ExecutorResult(
-            failure="DECOMPOSE: planner returned an empty manifest")
+            failure="DECOMPOSE: planner returned an empty manifest",
+            retryable=True)
 
-    # Deterministic coherence gate: fail early (with an actionable message
-    # the router folds into a retry constraint) when the manifest is
-    # logically broken, then topologically order files by dependency hints
-    # so SCAFFOLD generates dependencies before their consumers.
+    # Deterministic coherence gate: repair what can be repaired in place
+    # (dangling depends_on, dependency cycles -- both only ordering
+    # hints), fail early only when the manifest is logically unbuildable,
+    # then topologically order files by dependency hints so SCAFFOLD
+    # generates dependencies before their consumers.
     coherence_error = _validate_manifest_coherence(layers)
     if coherence_error:
-        return ExecutorResult(failure=coherence_error)
+        return ExecutorResult(failure=coherence_error, retryable=True)
     layers = _order_manifest_layers(layers)
 
     artifact = Artifact.new(
@@ -313,20 +315,22 @@ def _validate_manifest_coherence(
         layers: List[Dict[str, Any]]) -> Optional[str]:
     """Deterministic manifest sanity check.
 
-    Fails DECOMPOSE early (with an actionable message the router folds
-    into a retry constraint) when the plan is logically broken: a
-    dependency cycle, or a manifest carrying no runnable source file
-    (only docs/config/tests -- nothing to build or to test against).
+    Fails DECOMPOSE early only when the plan is logically unbuildable:
+    a manifest carrying no runnable source file (only docs/config/tests
+    -- nothing to build or to test against).
 
-    A dangling ``depends_on`` entry (a phantom path or a glob like
-    ``src/components/*.jsx``) is *not* fatal: ``depends_on`` is only a
-    topological / context-scoping hint, so a stray reference -- a common
-    planner slip, especially on the last-resort re-plan -- is pruned in
-    place with a warning rather than sinking an otherwise-buildable
-    manifest and terminally failing the whole session.
+    ``depends_on`` problems are *not* fatal: it is only a topological /
+    context-scoping hint, so a common planner slip -- a dangling entry
+    (a phantom path or a glob like ``src/components/*.jsx``) or a
+    dependency cycle (``a -> b -> a``, routine for small local models)
+    -- is repaired in place with a warning rather than sinking an
+    otherwise-buildable manifest and terminally failing the session.
+    A cycle is broken by dropping the back-edge that closes it; the
+    remaining edges still give the toposort a usable generation order.
     """
     files = _manifest_files(layers)
     path_set = {f["path"] for f in files}
+    by_path = {f["path"]: f for f in files}
 
     for f in files:
         deps = f.get("depends_on") or []
@@ -338,11 +342,17 @@ def _validate_manifest_coherence(
                 dropped, f["path"])
             f["depends_on"] = kept
 
+    # Each pass removes exactly one edge, so this terminates.
     cycle = _find_dependency_cycle(files)
-    if cycle:
-        return ("DECOMPOSE: manifest has a circular dependency: "
-                + " -> ".join(cycle)
-                + ". Break the cycle so files generate dependency-first.")
+    while cycle:
+        src, dst = cycle[-2], cycle[-1]
+        entry = by_path[src]
+        entry["depends_on"] = [d for d in (entry.get("depends_on") or [])
+                               if d != dst]
+        logger.warning(
+            "DECOMPOSE: breaking dependency cycle %s by dropping edge "
+            "%r -> %r", " -> ".join(cycle), src, dst)
+        cycle = _find_dependency_cycle(files)
 
     non_test_source = [f["path"] for f in files
                        if _is_source_file(f["path"])

@@ -19,6 +19,10 @@ import json
 import logging
 from typing import Any, Dict, List
 
+from cgx.answer.schemas import (
+    CLARIFY_QUESTIONS_SCHEMA,
+    validate_json_schema,
+)
 from cgx.session.models import (
     Artifact,
     ArtifactKind,
@@ -107,24 +111,63 @@ def run_clarify_requirements(task: TaskNode,
 
 def _ask_llm_for_questions(goal: str,
                            deps: ExecutorDeps) -> List[Dict[str, Any]]:
-    """Round-trip the prompt. Returns ``[]`` when the model can't help."""
+    """Round-trip the prompt. Returns ``[]`` when the model can't help.
+
+    The call requests schema-constrained decoding; when the backend
+    ignores the schema and the reply still parses to no usable question,
+    one bounded re-ask folds the concrete violations back to the model.
+    A second miss returns ``[]`` and the fallback bank takes over.
+    """
     if deps.provider is None:
         return []
+    messages = [
+        {"role": "system", "content": _SYSTEM_PROMPT},
+        {"role": "user", "content": f"GOAL: {goal}"},
+    ]
     try:
         resp = deps.provider.chat(
-            messages=[
-                {"role": "system", "content": _SYSTEM_PROMPT},
-                {"role": "user", "content": f"GOAL: {goal}"},
-            ],
+            messages=messages,
             temperature=0.2,
             force_json=True,
+            json_schema=CLARIFY_QUESTIONS_SCHEMA,
         )
     except Exception as exc:
         logger.warning("CLARIFY_REQUIREMENTS: provider.chat failed: %s: %s",
                        type(exc).__name__, exc)
         return []
     raw = (resp or {}).get("content") or ""
-    return _parse_questions(raw)
+    questions = _parse_questions(raw)
+    if questions or not raw.strip():
+        return questions
+    try:
+        parsed = json.loads(raw.strip())
+    except Exception:
+        parsed = {}
+    violations = (validate_json_schema(parsed, CLARIFY_QUESTIONS_SCHEMA)
+                  or ["$.questions: fewer than 3 well-formed questions "
+                      "(each needs a non-empty prompt)"])
+    logger.warning("CLARIFY_REQUIREMENTS: schema violation, re-asking -- %s",
+                   "; ".join(violations[:4]))
+    messages.append({"role": "assistant", "content": raw})
+    messages.append({"role": "user", "content": (
+        "Your reply did not match the required schema. Violations:\n- "
+        + "\n- ".join(violations[:8])
+        + "\n\nReply again with STRICT JSON only, exactly: "
+          '{"questions": [{"id": "q1", "prompt": "...", '
+          '"hint": "...", "suggested": ["..."]}]} with 3 to 6 questions. '
+          "No prose outside JSON.")})
+    try:
+        resp = deps.provider.chat(
+            messages=messages,
+            temperature=0.0,
+            force_json=True,
+            json_schema=CLARIFY_QUESTIONS_SCHEMA,
+        )
+    except Exception as exc:
+        logger.warning("CLARIFY_REQUIREMENTS: re-ask failed: %s: %s",
+                       type(exc).__name__, exc)
+        return []
+    return _parse_questions((resp or {}).get("content") or "")
 
 
 _HINT_MARKERS = (

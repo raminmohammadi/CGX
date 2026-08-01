@@ -216,14 +216,14 @@ def _cmd_plan(args: argparse.Namespace) -> None:
 
 
 def _cmd_agent(args: argparse.Namespace) -> None:
-    """Stream the full Planner → Tracker → Judge agent loop."""
+    """Run one unattended turn of the session agent loop."""
     from cgx.cli.tui import ops
 
     state = _state_from_args(args)
     goal = " ".join(args.goal)
     _run_cli_stream(lambda ce: ops.agent_events(
         state, goal, index_dir=args.index_dir, records=args.records,
-        stop_on_fail=args.stop_on_fail, cancel_event=ce))
+        auto=True, cancel_event=ce))
 
 
 def _cmd_status(args: argparse.Namespace) -> None:
@@ -336,12 +336,10 @@ def main(argv: list[str] | None = None) -> None:
     _add_provider_flags(p_plan)
     p_plan.set_defaults(func=_cmd_plan)
 
-    # agent -- full Planner -> Tracker -> Judge loop
+    # agent -- one unattended turn of the session agent loop
     p_ag = sub.add_parser(
-        "agent", help="Run the multi-step agent loop toward a goal.")
+        "agent", help="Run the session agent loop toward a goal.")
     p_ag.add_argument("goal", nargs="+", help="The goal for the agent.")
-    p_ag.add_argument("--stop-on-fail", action="store_true",
-                      help="Halt the loop on the first failed task.")
     _add_provider_flags(p_ag)
     p_ag.set_defaults(func=_cmd_agent)
 

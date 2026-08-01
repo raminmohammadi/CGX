@@ -3,9 +3,12 @@
 CGX already forces JSON mode (`force_json`) and defensively re-extracts the
 first balanced-brace object from whatever the model returns. On weak local
 models that is not always enough: the reply can be valid JSON of the *wrong*
-shape (missing ``tasks``, an object instead of an array, prose smuggled into a
-field). Schema-constrained decoding closes that gap by handing the provider a
-machine-checkable contract so the sampler can only emit conforming tokens.
+shape (missing ``layers``, an object instead of an array, prose smuggled into
+a field). Schema-constrained decoding closes that gap by handing the provider
+a machine-checkable contract so the sampler can only emit conforming tokens,
+and :func:`validate_json_schema` re-checks the parsed reply at the executor
+boundary so a backend that silently ignored the schema still gets caught with
+an actionable violation list (folded into one bounded re-ask).
 
 Each provider expresses constrained decoding differently, so this module keeps
 the canonical JSON-Schema definitions in one place plus small, pure translation
@@ -23,53 +26,155 @@ gracefully instead of failing.
 
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 # ---------------------------------------------------------------------------
 # Canonical schemas (draft-07 subset shared by all providers)
 # ---------------------------------------------------------------------------
 
-# Planner decomposition. Mirrors planner.SYSTEM_PROMPT exactly: a single object
-# with an optional prose ``rationale`` and a non-empty ``tasks`` array whose
-# ``kind`` is drawn from the six planner-visible capabilities.
-PLAN_SCHEMA: Dict[str, Any] = {
+# DECOMPOSE manifest. Mirrors engine._MANIFEST_SYSTEM: a prose ``plan_md``,
+# optional shared ``contracts`` (left an open object -- its four categories
+# hold heterogeneous nested shapes and are normalised leniently downstream),
+# and a non-empty ``layers`` array of ``{name, files:[{path, description,
+# depends_on}]}``.
+MANIFEST_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "properties": {
-        "rationale": {"type": "string"},
-        "tasks": {
+        "plan_md": {"type": "string"},
+        "contracts": {"type": "object"},
+        "layers": {
             "type": "array",
+            "minItems": 1,
             "items": {
                 "type": "object",
                 "properties": {
                     "name": {"type": "string"},
-                    "description": {"type": "string"},
-                    "kind": {
-                        "type": "string",
-                        "enum": [
-                            "ask", "plan", "scaffold",
-                            "search", "summarize", "verify",
-                        ],
+                    "files": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string"},
+                                "description": {"type": "string"},
+                                "depends_on": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                },
+                            },
+                            "required": ["path"],
+                        },
                     },
-                    "criteria": {"type": "array", "items": {"type": "string"}},
                 },
-                "required": ["description", "kind"],
+                "required": ["files"],
             },
         },
     },
-    "required": ["tasks"],
+    "required": ["layers"],
 }
 
-# Judge verdict. A closed vocabulary verdict, a bounded confidence and a short
-# rationale -- the shape Judge._llm_judge parses.
-JUDGE_SCHEMA: Dict[str, Any] = {
+# CLARIFY_REQUIREMENTS questions. Mirrors the executor's _SYSTEM_PROMPT:
+# 3-6 short questions, each with a required ``prompt`` plus optional
+# ``id`` / ``hint`` / ``suggested`` chips.
+CLARIFY_QUESTIONS_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "properties": {
-        "verdict": {"type": "string", "enum": ["pass", "fail"]},
-        "confidence": {"type": "number"},
-        "rationale": {"type": "string"},
+        "questions": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "prompt": {"type": "string"},
+                    "hint": {"type": "string"},
+                    "suggested": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                },
+                "required": ["prompt"],
+            },
+        },
     },
-    "required": ["verdict"],
+    "required": ["questions"],
 }
+
+# REPAIR whole-file rewrites. Mirrors engine._LOGIC_REPAIR_SYSTEM: the model
+# returns complete corrected files as ``{files:[{path, content}]}`` (an empty
+# array is its explicit "no fix" signal).
+REPAIR_FILES_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "files": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+    "required": ["files"],
+}
+
+
+# ---------------------------------------------------------------------------
+# Boundary validation (pure)
+# ---------------------------------------------------------------------------
+def validate_json_schema(
+    obj: Any, schema: Dict[str, Any], path: str = "$",
+) -> List[str]:
+    """Validate ``obj`` against the draft-07 subset this module emits.
+
+    Constrained decoding is best-effort -- a backend may silently ignore the
+    schema (older Ollama, ``json_object``-only servers), so executors re-check
+    the parsed reply here and fold the returned violations into a bounded
+    re-ask. Supports exactly the keys the schemas above use (``type``,
+    ``properties``, ``required``, ``items``, ``minItems``, ``enum``); each
+    violation is a human-readable ``"$.layers[0].files: ..."`` string the
+    model can act on. Empty list means conforming.
+    """
+    errs: List[str] = []
+    t = schema.get("type")
+    if t == "object":
+        if not isinstance(obj, dict):
+            return [f"{path}: expected an object, got {type(obj).__name__}"]
+        for key in schema.get("required") or []:
+            if key not in obj:
+                errs.append(f"{path}.{key}: required key is missing")
+        for key, sub in (schema.get("properties") or {}).items():
+            if key in obj and isinstance(sub, dict):
+                errs.extend(validate_json_schema(obj[key], sub, f"{path}.{key}"))
+    elif t == "array":
+        if not isinstance(obj, list):
+            return [f"{path}: expected an array, got {type(obj).__name__}"]
+        min_items = schema.get("minItems")
+        if isinstance(min_items, int) and len(obj) < min_items:
+            errs.append(f"{path}: expected at least {min_items} item(s), "
+                        f"got {len(obj)}")
+        items = schema.get("items")
+        if isinstance(items, dict):
+            for i, val in enumerate(obj):
+                errs.extend(validate_json_schema(val, items, f"{path}[{i}]"))
+    elif t == "string":
+        if not isinstance(obj, str):
+            errs.append(f"{path}: expected a string, got {type(obj).__name__}")
+    elif t == "number":
+        if isinstance(obj, bool) or not isinstance(obj, (int, float)):
+            errs.append(f"{path}: expected a number, got {type(obj).__name__}")
+    elif t == "integer":
+        if isinstance(obj, bool) or not isinstance(obj, int):
+            errs.append(f"{path}: expected an integer, got {type(obj).__name__}")
+    elif t == "boolean":
+        if not isinstance(obj, bool):
+            errs.append(f"{path}: expected a boolean, got {type(obj).__name__}")
+    enum = schema.get("enum")
+    if isinstance(enum, list) and enum and obj not in enum:
+        errs.append(f"{path}: expected one of {enum!r}")
+    return errs
 
 
 # ---------------------------------------------------------------------------

@@ -472,22 +472,6 @@ export const api = {
   rollback: (project_root: string, backup_dir: string) =>
     jsonReq<RollbackResponse>("/api/rollback", "POST", { project_root, backup_dir }),
 
-  agentPlan: (body: {
-    goal: string;
-    project_root?: string | null;
-    stop_on_fail?: boolean;
-    index: IndexLocation;
-    provider: ProviderConfig;
-  }) =>
-    jsonReq<{
-      plan?: { id: string; goal: string; tasks: any[]; rationale?: string };
-      error?: string;
-    }>(
-      "/api/agent/plan",
-      "POST",
-      body,
-    ),
-
   // --- session-shaped agent (Phase 4) ---
   agentSessionCreate: (body: {
     objective: string;
