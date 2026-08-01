@@ -9494,3 +9494,286 @@ def test_router_budget_exhaustion_reaches_terminal_or_recovers(build, expect):
         _assert_terminal_failed(plan)
     else:
         _assert_recovers_with(plan, expect)
+
+
+# --------------------- e2e greenfield smoke (scripted provider) ---------------------
+#
+# Unlike test_runner_full_greenfield_loop (which stubs every executor to
+# pin the router's edges), this suite runs the REAL executors -- CLARIFY,
+# DECOMPOSE, SCAFFOLD, APPLY, VERIFY, REPAIR -- against a tmp_path project
+# with a scripted provider standing in for the local LLM. Only the
+# environment-heavy kinds (BOOTSTRAP_ENV, API_CHECK, SMOKE,
+# RUNTIME_VERIFY) are stubbed, so the whole loop -- including one injected
+# failure + deterministic repair -- is exercised in CI without a GPU.
+
+_E2E_CALCULATOR = (
+    '"""Tiny calculator library."""\n'
+    "\n"
+    "\n"
+    "def add(a, b):\n"
+    "    return a + b\n"
+    "\n"
+    "\n"
+    "def subtract(a, b):\n"
+    "    return a - b\n"
+)
+
+# Deliberate unittest/pytest mix: a pytest-style class (no TestCase base)
+# whose methods call self.assert* helpers. pytest collects it fine, then
+# every test dies with AttributeError: ... 'assertEqual' -- the canonical
+# ``unittest_pytest_mix`` failure the deterministic repair chain fixes by
+# adding the unittest.TestCase base + import.
+_E2E_BROKEN_TEST = (
+    '"""Tests for the calculator."""\n'
+    "\n"
+    "from calculator import add, subtract\n"
+    "\n"
+    "\n"
+    "class TestCalculator:\n"
+    "    def test_add(self):\n"
+    "        self.assertEqual(add(2, 3), 5)\n"
+    "\n"
+    "    def test_subtract(self):\n"
+    "        self.assertEqual(subtract(5, 3), 2)\n"
+)
+
+_E2E_QUESTIONS = {
+    "questions": [
+        {"id": "q1", "prompt": "Which Python version?",
+         "hint": "e.g. 3.11", "suggested": ["3.11"]},
+        {"id": "q2", "prompt": "Which test framework?",
+         "suggested": ["pytest"]},
+        {"id": "q3", "prompt": "Any CLI needed?",
+         "suggested": ["No"]},
+    ]
+}
+
+_E2E_MANIFEST = {
+    "plan_md": "## Plan\n- calculator.py\n- test_calculator.py",
+    "layers": [
+        {"name": "core", "files": [
+            {"path": "calculator.py",
+             "description": "add/subtract helpers"}]},
+        {"name": "tests", "files": [
+            {"path": "test_calculator.py",
+             "description": "pytest suite for the calculator",
+             "depends_on": ["calculator.py"]}]},
+    ],
+}
+
+
+class _ScriptedLocalProvider:
+    """Scripted stand-in for a local LLM.
+
+    Routes each ``chat`` call on its declarative shape -- the
+    ``json_schema`` object identity for CLARIFY/DECOMPOSE, the
+    ``FILE TO GENERATE`` block for per-file scaffolding -- and returns
+    canned JSON, so the real executors parse real provider replies
+    without any network or GPU.
+    """
+
+    def __init__(self, files):
+        self._files = dict(files)
+        self.calls = []
+
+    def chat(self, messages=None, **kwargs):
+        import json as _json
+        from cgx.answer.schemas import (
+            CLARIFY_QUESTIONS_SCHEMA,
+            MANIFEST_SCHEMA,
+        )
+        schema = kwargs.get("json_schema")
+        user = ""
+        for m in reversed(messages or []):
+            if m.get("role") == "user":
+                user = str(m.get("content") or "")
+                break
+        if schema is CLARIFY_QUESTIONS_SCHEMA:
+            self.calls.append("clarify")
+            return {"content": _json.dumps(_E2E_QUESTIONS)}
+        if schema is MANIFEST_SCHEMA:
+            self.calls.append("manifest")
+            return {"content": _json.dumps(_E2E_MANIFEST)}
+        marker = "FILE TO GENERATE:\nPath: "
+        idx = user.find(marker)
+        if idx >= 0:
+            path = user[idx + len(marker):].split("\n", 1)[0].strip()
+            self.calls.append(f"file:{path}")
+            body = self._files.get(path)
+            if body is None:
+                body = ('"""Placeholder module."""\n'
+                        if path.endswith(".py")
+                        else f"placeholder for {path}\n")
+            return {"content": _json.dumps({"content": body})}
+        self.calls.append("unrouted")
+        return {"content": "{}"}
+
+
+def _install_stub_bootstrap_env_host_python():
+    """BOOTSTRAP_ENV stub whose BUILD_REPORT points at the host python.
+
+    The real VERIFY reads ``python_exe`` from the BUILD_REPORT and feeds
+    it to the pytest subprocess; pointing it at ``sys.executable`` (which
+    has pytest installed) lets the real test run happen without a real
+    ``pip install`` bootstrap.
+    """
+    import sys
+
+    @register_executor(TaskKind.BOOTSTRAP_ENV)
+    def _stub(task, deps):
+        artifact = Artifact.new(
+            session_id=task.session_id,
+            produced_by_task_id=task.task_id,
+            kind=ArtifactKind.BUILD_REPORT,
+            content={
+                "apply_artifact_id": task.inputs.get("apply_artifact_id"),
+                "project_type": "python",
+                "venv_path": "",
+                "python_exe": sys.executable,
+                "installed_from": [],
+                "installed_packages": [],
+                "failed_installs": [],
+                "outcome": "succeeded",
+                "pip_log_tail": "",
+            })
+        return ExecutorResult(
+            outputs={"build_artifact_id": artifact.artifact_id,
+                     "outcome": "succeeded",
+                     "project_type": "python",
+                     "python_exe": sys.executable,
+                     "installed_count": 0,
+                     "failed_count": 0},
+            artifact=artifact)
+
+
+def _install_stub_runtime_verify_passed():
+    @register_executor(TaskKind.RUNTIME_VERIFY)
+    def _stub(task, deps):
+        artifact = Artifact.new(
+            session_id=task.session_id,
+            produced_by_task_id=task.task_id,
+            kind=ArtifactKind.RUNTIME_REPORT,
+            content={"probes": [], "outcome": "passed",
+                     "failure_signature": ""})
+        return ExecutorResult(
+            outputs={"runtime_artifact_id": artifact.artifact_id,
+                     "outcome": "passed",
+                     "failed_count": 0,
+                     "failure_signature": ""},
+            artifact=artifact)
+
+
+def test_runner_full_greenfield_loop_with_recovery(tmp_path, store,
+                                                   monkeypatch):
+    """E2E smoke: a scripted provider drives a whole greenfield session.
+
+    CLARIFY -> ASK(clarify_answers) -> DECOMPOSE -> ASK(approve_plan) ->
+    SCAFFOLD -> APPLY -> [boot/api/smoke stubs] -> VERIFY(fails: injected
+    unittest/pytest mix) -> REPAIR(patch) -> APPLY -> [stubs] ->
+    VERIFY(passes) -> RUNTIME_VERIFY -> COMPLETED.
+
+    The scaffold, apply, verify, and repair executors are the real ones:
+    files land on disk under tmp_path and pytest genuinely runs twice
+    (fail, then pass after the deterministic repair rewrites the test).
+    """
+    from cgx.session.models import SessionMode
+
+    monkeypatch.setenv("CGX_LESSONS_PATH", str(tmp_path / "lessons.jsonl"))
+    proj = tmp_path / "proj"
+    proj.mkdir()
+
+    _install_stub_bootstrap_env_host_python()
+    _install_stub_api_check_greenfield()
+    _install_stub_smoke_greenfield()
+    _install_stub_runtime_verify_passed()
+
+    provider = _ScriptedLocalProvider({
+        "calculator.py": _E2E_CALCULATOR,
+        "test_calculator.py": _E2E_BROKEN_TEST,
+        "requirements.txt": "pytest\n",
+        "README.md": "# Calculator\n\nTiny add/subtract library.\n",
+    })
+    deps = ExecutorDeps(project_root=str(proj), store=store,
+                        provider=provider)
+    runner = SessionRunner(store)
+    session = runner.start_session(
+        objective="build a small python calculator library with tests",
+        project_root=str(proj),
+        mode=SessionMode.GREENFIELD)
+
+    def drain():
+        """Run READY tasks until the loop quiesces or pauses on an ASK."""
+        for _ in range(60):
+            t = runner.run_next(session_id=session.session_id, deps=deps)
+            if t is None:
+                return
+            if (t.kind is TaskKind.ASK_USER
+                    and t.status is TaskNodeStatus.IN_PROGRESS):
+                return
+        raise AssertionError("session did not quiesce within 60 steps")
+
+    # 1. CLARIFY runs against the scripted provider, pauses on the
+    #    clarify_answers ASK.
+    drain()
+    ask = next(t for t in store.list_tasks(session.session_id)
+               if t.kind is TaskKind.ASK_USER
+               and t.inputs.get("expected_kind") == "clarify_answers")
+    assert ask.status is TaskNodeStatus.IN_PROGRESS
+    runner.post_decision(
+        session_id=session.session_id,
+        decision=build_decision(
+            session_id=session.session_id, task=ask,
+            chosen={"answers": {"q1": "3.11", "q2": "pytest",
+                                "q3": "No"}}))
+
+    # 2. DECOMPOSE plans the manifest, pauses on the approve_plan ASK.
+    drain()
+    approve = next(t for t in store.list_tasks(session.session_id)
+                   if t.kind is TaskKind.ASK_USER
+                   and t.inputs.get("expected_kind") == "approve_plan")
+    assert approve.status is TaskNodeStatus.IN_PROGRESS
+    runner.post_decision(
+        session_id=session.session_id,
+        decision=build_decision(
+            session_id=session.session_id, task=approve,
+            chosen={"approved": True}))
+
+    # 3. Everything else runs unattended: scaffold + apply land real
+    #    files, the first VERIFY fails on the injected mix, REPAIR
+    #    patches it, and the second VERIFY + RUNTIME_VERIFY complete.
+    drain()
+
+    session_after = store.get_session(session.session_id)
+    assert session_after.status is SessionStatus.COMPLETED
+
+    tasks = store.list_tasks(session.session_id)
+    assert all(t.status is not TaskNodeStatus.READY for t in tasks)
+
+    # The verify ladder ran twice: fail, then pass after the repair.
+    verifies = sorted((t for t in tasks if t.kind is TaskKind.VERIFY),
+                      key=lambda t: t.started_at)
+    assert len(verifies) == 2
+    assert verifies[0].outputs["outcome"] in ("assertions_failed", "failed")
+    assert verifies[0].outputs["failing_count"] == 2
+    assert verifies[1].outputs["outcome"] == "passed"
+    assert verifies[1].outputs["failing_count"] == 0
+
+    # Exactly one deterministic repair, classified and applied.
+    repairs = [t for t in tasks if t.kind is TaskKind.REPAIR]
+    assert len(repairs) == 1
+    assert repairs[0].outputs["classification"] == "unittest_pytest_mix"
+    assert repairs[0].outputs["can_apply"] is True
+
+    # The scaffold and the repair genuinely landed on disk.
+    assert (proj / "calculator.py").read_text(
+        encoding="utf-8") == _E2E_CALCULATOR
+    fixed = (proj / "test_calculator.py").read_text(encoding="utf-8")
+    assert "import unittest" in fixed
+    assert "unittest.TestCase" in fixed
+
+    # The provider was exercised through every scripted shape.
+    assert "clarify" in provider.calls
+    assert "manifest" in provider.calls
+    assert "file:calculator.py" in provider.calls
+    assert "file:test_calculator.py" in provider.calls
+    assert "unrouted" not in provider.calls
