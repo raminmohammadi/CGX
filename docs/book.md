@@ -388,7 +388,10 @@ When VERIFY fails, the loop tries to fix itself through
 typed failure kinds and extracts the traceback, `locate` maps the
 traceback to the offending symbol in the generated source, and
 `propose` builds a focused REPAIR prompt that contains only the
-relevant source snippet. The repair loop is bounded per failure,
+relevant source snippet. The repair loop is progress-aware: it keeps
+funding rounds while the failing-test count strictly drops, with
+every retry counter read and spent through the typed
+`cgx.session.budget.LoopBudget` (absolute ceiling `REPAIR_BUDGET=4`),
 and the whole session is bounded by budgets set at `start_session`
 -- `max_task_runs`, `max_wall_seconds`, and `headless` (pause on an
 `ASK_USER` when interactive; fail terminally when there is no user

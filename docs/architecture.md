@@ -421,7 +421,7 @@ matching the convention already used by `cgx.sessions`.
 * Explore loop: `EXPLORE`, `INVESTIGATE`, `RECOMMEND`, `PLAN_CHANGE`.
 * Greenfield loop: `CLARIFY_REQUIREMENTS`, `DECOMPOSE`, `SCAFFOLD`,
   `BOOTSTRAP_ENV`, `API_CHECK` (**Phase 2.2**), `SMOKE`
-  (**Phase 2.1**), `REPAIR`.
+  (**Phase 2.1**), `RUNTIME_VERIFY` (**P1**), `REPAIR`.
 * Shared: `APPLY`, `VERIFY`, `ASK_USER`, plus utility kinds
   `SEARCH` / `SUMMARIZE`.
 
@@ -435,15 +435,24 @@ until a `Decision` arrives.
 `Router` is the deterministic planning brain of the loop. **Pure
 Python, no LLM calls, no I/O**: every method takes the current session state
 plus an event and returns a `RouterPlan` of typed actions
-(`CreateTask`, `UpdateTaskStatus`, `RecordDecision`,
-`AttachDecisionToTask`, `RecordLesson`) that the caller applies to
-the store. The `RecordLesson` action (**Phase 7.1**) is emitted
-whenever a `VERIFY` finishes with `outcome=passed` AND a `REPAIR`
-is on its ancestor chain -- the runner then writes a structured row
-to `~/.cgx/lessons.jsonl` so future `SCAFFOLD` runs in any session
-can apply the rule.
+(`CreateTask`, `UpdateTaskStatus`, `UpdateSessionStatus`,
+`RecordDecision`, `AttachDecisionToTask`, `RecordLesson`) that the
+caller applies to the store. The router is split across three
+modules: the action vocabulary and `RouterPlan` live in
+`cgx.session.actions`, the greenfield edge helpers (including the
+`_COMPLETION_GUARDS` chain consulted before the `TASK_SUCCESSOR`
+lookup) live in `cgx.session.greenfield_edges`, and every bounded
+retry counter is read and spent through the typed
+`cgx.session.budget.LoopBudget` (`REPAIR_BUDGET=4`,
+`REGENERATE_BUDGET=3`, `REPAIR_REGENERATE_BUDGET=2`,
+`REPLAN_BUDGET=1`, `DECOMPOSE_RETRY_BUDGET=1`) rather than
+hand-copied dict keys. The `RecordLesson` action (**Phase 7.1**) is
+emitted whenever a `VERIFY` finishes with `outcome=passed` AND a
+`REPAIR` is on its ancestor chain -- the runner then writes a
+structured row to `~/.cgx/lessons.jsonl` so future `SCAFFOLD` runs
+in any session can apply the rule.
 
-Four entry points cover every transition:
+Five entry points cover every transition:
 
 * `on_user_message(session, message, tasks)` -- no tasks yet → spawn
   the root task. In explore mode this is `EXPLORE`; in greenfield
@@ -480,7 +489,7 @@ Four entry points cover every transition:
                                      invalid_scaffold_syntax constraint that
                                      enumerates each dropped file with its
                                      concrete error; capped at
-                                     _REGENERATE_BUDGET=1 -- no SCAFFOLD
+                                     REGENERATE_BUDGET=3 -- no SCAFFOLD
                                      ancestor or spent budget -> terminal
                                      FAILED)
   BOOTSTRAP_ENV        -> API_CHECK    (Phase 2.2, threads build_artifact_id)
@@ -498,7 +507,9 @@ Four entry points cover every transition:
 
   # Autonomous repair loop (greenfield only)
   VERIFY (assertions_failed | collection_error)
-                       -> REPAIR  (when repair_attempt < 2 and
+                       -> REPAIR  (funded via LoopBudget.spend_repair:
+                                   failing-test count still strictly dropping,
+                                   repair_attempt < REPAIR_BUDGET=4, and
                                    failure_signature not in prior_failure_signatures)
   REPAIR (strategy=patch, can_apply)
                        -> APPLY   (carries build_artifact_id forward
@@ -510,20 +521,28 @@ Four entry points cover every transition:
                                      fresh SCAFFOLD via
                                      propose_regenerate with
                                      regenerate_constraints in inputs;
-                                     capped at _REGENERATE_BUDGET=1
+                                     syntax churn capped at
+                                     REGENERATE_BUDGET=3 per manifest,
+                                     semantic rewrites of an applied tree
+                                     at REPAIR_REGENERATE_BUDGET=2
                                      per ancestor chain)
   REPAIR (empty plan)  -> ASK_USER(freeform)
   APPLY (repair)       -> VERIFY (no BOOTSTRAP_ENV)
   ```
-* `on_task_failed(session, failed, tasks)` -- terminal transition for
-  a *hard* failure (an executor that returned `ExecutorResult.failure`
-  or crashed, so it produced no `outputs` and the `outputs`-keyed
-  successor table can never run). Greenfield write loops must always
-  reach a terminal status, so any unrecoverable hard failure (e.g. a
-  BOOTSTRAP_ENV whose `pip install` failed) ends the session `FAILED`
-  rather than leaving it hung in `active` with a dead FAILED leaf and
-  no successor -- asking the user to hand-fix AI-generated code is
-  never a valid recovery. Explore-mode sessions keep their
+* `on_task_failed(session, failed, tasks, retryable=False)` --
+  terminal transition for a *hard* failure (an executor that returned
+  `ExecutorResult.failure` or crashed, so it produced no `outputs`
+  and the `outputs`-keyed successor table can never run). Greenfield
+  write loops must always reach a terminal status, so any
+  unrecoverable hard failure (e.g. a BOOTSTRAP_ENV whose `pip
+  install` failed) ends the session `FAILED` rather than leaving it
+  hung in `active` with a dead FAILED leaf and no successor -- asking
+  the user to hand-fix AI-generated code is never a valid recovery.
+  One recoverable exception: a `DECOMPOSE` whose executor marked the
+  failure `retryable` (an empty or unbuildable manifest) is re-queued
+  once by `_decompose_retry_actions` with the concrete failure folded
+  into its goal as a constraint, bounded by
+  `DECOMPOSE_RETRY_BUDGET=1`. Explore-mode sessions keep their
   user-driven lifecycle (return an empty plan); a no-op once the
   session is already `COMPLETED` / `FAILED` / `ABANDONED`.
 * `on_budget_exhausted(session, over_task, tasks, reason)` --
@@ -630,11 +649,13 @@ this subsection first; the six moving parts are:
    (`prior_passing_counts`) so a repair that trades one failure for a new
    pass still counts as forward motion. A `failure_signature` flap
    backstop covers non-assertion outcomes, and everything sits under the
-   absolute `_REPAIR_BUDGET` (raised to 4). The ledgers
-   (`prior_failing_counts`, `prior_passing_counts`,
-   `prior_failure_signatures`) are threaded through every intermediate
+   absolute `REPAIR_BUDGET` (4, `cgx.session.budget`). The counters and
+   ledgers (`repair_attempt`, `prior_failing_counts`,
+   `prior_passing_counts`, `prior_failure_signatures`) are read, spent,
+   and re-serialized through the typed immutable
+   `cgx.session.budget.LoopBudget` and threaded onto every intermediate
    node (`REPAIR -> APPLY -> VERIFY -> RUNTIME_VERIFY`) so the router
-   stays IO-free.
+   stays IO-free and no edge can silently reset a budget.
 
 6. **Traceback-localized, retrieval-fed `REPAIR`.** When no
    deterministic classifier matches, `_propose_llm_logic_repair` builds
@@ -871,7 +892,7 @@ Concrete executors:
 | `tasks/api_check.py` *(Phase 2.2)*  | `API_CHECK_REPORT` artifact: statically walks every applied file under the bootstrapped venv and resolves each `from <third_party> import <name>` and aliased `<pkg>.<attr>` reference via `importlib` + `inspect.getmembers`. Unresolved references surface as a structured `unresolved: [{file, line, module, name}]` list plus an `outcome` token (`passed` / `failed` / `skipped`) and a `failure_signature` for the flap detector. Hands off to `SMOKE` on a clean run; on `failed` the router routes to `REPAIR` with the `API_CHECK_REPORT` as the source artifact. *(greenfield mode)* |
 | `tasks/smoke.py` *(Phase 2.1)*      | `SMOKE_REPORT` artifact: for every top-level module the applied files declare, runs `<venv>/bin/python -c "import <pkg>"` with a 30s wall-clock budget for the whole batch; collects `imports: [{module, ok, stderr_tail}]` plus an `outcome` token (`passed` / `failed` / `skipped`) and a `failure_signature`. The point is to catch a third-party import break (e.g. `ImportError: cannot import name 'url_quote' from 'werkzeug.urls'`) before pytest collection. Routes to `REPAIR` on `failed` (source = `SMOKE_REPORT`), otherwise chains to `VERIFY`. *(greenfield mode)* |
 | `tasks/verify.py`                   | `VERIFY_REPORT` artifact via the impacted-tests runner. Reads `python_exe` from the upstream `BUILD_REPORT` (when present) so pytest runs inside the project venv; classifies pytest's exit code into an `outcome` token (`passed` / `assertions_failed` / `collection_error` / `no_tests_collected` / `timeout` / `pytest_missing` / `skipped`). Invokes pytest with `--junitxml=<tmp> -rN --tb=long` and parses the XML into a structured `failures: [{nodeid, type, message, traceback}]` list via stdlib `xml.etree` (**Phase 3.1**) so the classifier consumes typed records rather than re-regexing stdout. Persists a `reproduce_cmd` -- a single `shlex.quote`-escaped shell line that re-runs the exact failing pytest invocation under the project venv (**Phase 1.2**) -- which the UI renders above the stdout pane. Also computes and stores a `failure_signature` (sha1 of outcome + returncode + first error line, truncated) so the router's progress detector can compare attempts without re-reading the artifact. In greenfield mode, "no tests discovered yet" reports `ran=False` + `skipped_reason` instead of failing. |
-| `tasks/repair.py`                   | `REPAIR_PLAN` artifact: reads the upstream `VERIFY_REPORT` / `SMOKE_REPORT` / `API_CHECK_REPORT`, classifies the failure via `cgx.session.repair.classify` (deterministic, LLM-free; refactored to a small registry in **Phase 3.2**), locates offending classes/modules/fixtures via `cgx.session.repair.locate` (AST scan + project-root resolution), and emits unified diffs via `cgx.session.repair.propose` shaped for the shared APPLY executor. v1 classifications: `unittest_pytest_mix`, `missing_module_pythonpath` (Fix G2: `locate_missing_module_pythonpath` only resolves a target when its *full* dotted path exists on disk via `_dotted_path_resolves` -- a genuine sys.path gap yields a `conftest.py` diff and stays on the `patch` branch, whereas a missing *leaf* module such as `tests.auth` where `tests/` exists but `tests/auth.py` does not produces no diff and, because `missing_module_pythonpath` is now in `_REGENERATE_CLASSES`, routes to `strategy=regenerate` rather than being papered over with an unhelpful pythonpath patch), `missing_fixture`, `hallucinated_api`, and `third_party_import_break` (**Phase 3.2**, recognises `ImportError: cannot import name '<x>' from '<pkg>'` and `ModuleNotFoundError` for third-party modules; `propose_third_party_pin` reads `installed_packages` from BUILD_REPORT, queries `https://pypi.org/pypi/{pkg}/{version}/json` via `cgx.session.repair.pypi_client` -- on-disk cache under `~/.cgx/pypi-cache/`, fake-fetcher DI for tests -- computes a corrective pin from the peer-dependency table, and emits a `requirements.txt` diff). `_select_repair_strategy` then chooses between two branches (**Phase 6.1**): `strategy=patch` (≤5 diffs in a patchable class) writes through the shared APPLY executor; `strategy=regenerate` (no diffs in a regenerate-eligible class, or >5 diffs; always for SMOKE / API_CHECK breaks) -- the router walks up to the nearest `SCAFFOLD` ancestor via `propose_regenerate`, marks every live descendant `ABANDONED`, and re-queues a fresh `SCAFFOLD` with bumped `regenerate_attempt`, `regenerate_constraints` appended to its `inputs`, and a `regenerated_from_task_id` back-pointer (capped at `_REGENERATE_BUDGET=1` per ancestor chain). Content carries `classification`, `failure_signature`, `repair_attempt`, `strategy`, `extra_constraints`, `rationale`, `locations`, and `diffs`. Empty diffs (classification `unknown`, or proposer marker already present) escalate via the router to `ASK_USER(freeform)`. *(greenfield mode)* |
+| `tasks/repair.py`                   | `REPAIR_PLAN` artifact: reads the upstream `VERIFY_REPORT` / `SMOKE_REPORT` / `API_CHECK_REPORT`, classifies the failure via `cgx.session.repair.classify` (deterministic, LLM-free; refactored to a small registry in **Phase 3.2**), locates offending classes/modules/fixtures via `cgx.session.repair.locate` (AST scan + project-root resolution), and emits unified diffs via `cgx.session.repair.propose` shaped for the shared APPLY executor. v1 classifications: `unittest_pytest_mix`, `missing_module_pythonpath` (Fix G2: `locate_missing_module_pythonpath` only resolves a target when its *full* dotted path exists on disk via `_dotted_path_resolves` -- a genuine sys.path gap yields a `conftest.py` diff and stays on the `patch` branch, whereas a missing *leaf* module such as `tests.auth` where `tests/` exists but `tests/auth.py` does not produces no diff and, because `missing_module_pythonpath` is now in `_REGENERATE_CLASSES`, routes to `strategy=regenerate` rather than being papered over with an unhelpful pythonpath patch), `missing_fixture`, `hallucinated_api`, and `third_party_import_break` (**Phase 3.2**, recognises `ImportError: cannot import name '<x>' from '<pkg>'` and `ModuleNotFoundError` for third-party modules; `propose_third_party_pin` reads `installed_packages` from BUILD_REPORT, queries `https://pypi.org/pypi/{pkg}/{version}/json` via `cgx.session.repair.pypi_client` -- on-disk cache under `~/.cgx/pypi-cache/`, fake-fetcher DI for tests -- computes a corrective pin from the peer-dependency table, and emits a `requirements.txt` diff). `_select_repair_strategy` then chooses between two branches (**Phase 6.1**): `strategy=patch` (≤5 diffs in a patchable class) writes through the shared APPLY executor; `strategy=regenerate` (no diffs in a regenerate-eligible class, or >5 diffs; always for SMOKE / API_CHECK breaks) -- the router walks up to the nearest `SCAFFOLD` ancestor via `propose_regenerate`, marks every live descendant `ABANDONED`, and re-queues a fresh `SCAFFOLD` with bumped `regenerate_attempt`, `regenerate_constraints` appended to its `inputs`, and a `regenerated_from_task_id` back-pointer (syntax churn capped at `REGENERATE_BUDGET=3` per manifest, semantic rewrites of an applied tree at `REPAIR_REGENERATE_BUDGET=2` per ancestor chain). Content carries `classification`, `failure_signature`, `repair_attempt`, `strategy`, `extra_constraints`, `rationale`, `locations`, and `diffs`. Empty diffs (classification `unknown`, or proposer marker already present) escalate via the router to `ASK_USER(freeform)`. *(greenfield mode)* |
 | `tasks/ask.py`                      | Pseudo-executor: surfaces the question payload; the runner keeps the task at `IN_PROGRESS` until `build_decision` consumes a user reply. |
 
 `ExecutorDeps` carries optional `project_root`, `index_dir`,

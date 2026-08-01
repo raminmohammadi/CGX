@@ -397,91 +397,83 @@ The router fires a deterministic repair cycle from four upstream
 sources: an `API_CHECK` that ends `failed` (**Phase 2.2**), a
 `SMOKE` that ends `failed` (**Phase 2.1**), a `VERIFY` that ends
 `assertions_failed` / `collection_error`, or a `RUNTIME_VERIFY` whose
-app boot ends `failed` / `timeout` / `error` (**P1 / #3**). The cycle
-is bounded by a **progress-aware budget** (`_repair_progress_stalled`:
-keep going while the failing-test count strictly drops round over
-round, backed by a passing-count trend, #5) under an absolute
-`_REPAIR_BUDGET=4` ceiling AND a `failure_signature`-hash flap
-detector, plus a per-ancestor-chain `_REGENERATE_BUDGET=1` for the
-regenerate branch added in **Phase 6.1**. When no deterministic
+app boot ends `failed` / `timeout` / `error` (**P1 / #3**). Every
+counter below is read and spent through the typed
+`cgx.session.budget.LoopBudget`: the cycle is bounded by a
+**progress-aware budget** (`_repair_progress_stalled`: keep going
+while the failing-test count strictly drops round over round, backed
+by a passing-count trend, #5) under an absolute `REPAIR_BUDGET=4`
+ceiling AND a `failure_signature`-hash flap detector, plus a
+double-capped regenerate branch (**Phase 6.1**): `REGENERATE_BUDGET=3`
+for syntax churn per manifest and `REPAIR_REGENERATE_BUDGET=2` for
+semantic rewrites of an already-applied tree per ancestor chain.
+
+The deterministic classifier registry (`cgx.session.repair.classify`,
+**Phase 3.2**) ships `unittest_pytest_mix`, `missing_module_pythonpath`,
+`missing_fixture`, `hallucinated_api`, and `third_party_import_break`
+(`propose_third_party_pin` reads `BUILD_REPORT.installed_packages`,
+queries `pypi.org/pypi/<pkg>/<ver>/json` via `pypi_client` with an
+on-disk cache under `~/.cgx/pypi-cache/`, and emits a
+`requirements.txt` diff against the peer-dependency table). When no
 classifier matches, the bounded LLM repair is **traceback-localized**
-(crash-frame files first) and **retrieval-fed** (remaining candidate
-slots filled from the project index; a no-op in greenfield):
+(crash-frame files first), **retrieval-fed** (remaining candidate
+slots filled from the project index; a no-op in greenfield), and
+**schema-constrained** (**Phase 3.1**: `REPAIR_FILES_SCHEMA` rides as
+`json_schema` on the call, with one `validate_json_schema` re-ask):
 
-```
-   +-----------+   +-------+   +--------+
-   | API_CHECK |   | SMOKE |   | VERIFY |   any of these can route
-   +-----------+   +-------+   +--------+   to REPAIR
-        | failed       | failed     | assertions_failed|collection_error
-        +--------------+------------+
-                            |  (source artifact threaded into REPAIR.inputs:
-                            |   API_CHECK_REPORT | SMOKE_REPORT |
-                            |   VERIFY_REPORT, each carrying its own
-                            |   failure_signature)
-                            v
-                       +--------+
-                       | REPAIR |  classify via cgx.session.repair.classify
-                       +--------+  (Phase 3.2 registry):
-                            |        - unittest_pytest_mix
-                            |        - missing_module_pythonpath
-                            |        - missing_fixture
-                            |        - hallucinated_api
-                            |        - third_party_import_break
-                            |             (Phase 3.2; propose_third_party_pin
-                            |              reads BUILD_REPORT.installed_packages,
-                            |              queries pypi.org/pypi/<pkg>/<ver>/json
-                            |              via pypi_client (~/.cgx/pypi-cache/),
-                            |              emits a requirements.txt diff against
-                            |              the peer-dependency table)
-                            |        - unknown
-                            |
-                            v
-                _select_repair_strategy()  (Phase 6.1)
-                /                       \
-               /  patch                   \  regenerate
-              v   (<=5 diffs in a          v  (no diffs in a regenerate-
-        +----------+ patchable class)   +----------+ eligible class, or
-        |  APPLY   |                    | SCAFFOLD | >5 diffs; always for
-        +----------+                    +----------+ SMOKE / API_CHECK
-              |   carries build_artifact_id    |     breaks)
-              |   forward, BOOTSTRAP_ENV       |   propose_regenerate:
-              |   is skipped on this pass      |     - walks up to nearest
-              v                                |       SCAFFOLD ancestor
-        +----------+                           |     - marks live descendants
-        |  VERIFY  |                           |       ABANDONED
-        +----------+                           |     - re-queues fresh
-              | passed                         |       SCAFFOLD with bumped
-              v                                |       regenerate_attempt +
-   +------------------+                        |       regenerate_constraints
-   | RecordLesson     |  Phase 7.1: emitted    |       in inputs
-   | -> lessons.jsonl |  iff a REPAIR is on    |     - capped at
-   +------------------+  the ancestor chain    |       _REGENERATE_BUDGET=1
-                                               v
-                                          (re-enters greenfield loop:
-                                           SCAFFOLD -> APPLY ->
-                                           BOOTSTRAP_ENV -> API_CHECK ->
-                                           SMOKE -> VERIFY)
+```mermaid
+flowchart TB
+    AC["API_CHECK<br/>failed"] --> SRC
+    SM["SMOKE<br/>failed"] --> SRC
+    VF["VERIFY<br/>assertions_failed /<br/>collection_error"] --> SRC
+    RV["RUNTIME_VERIFY<br/>failed / timeout / error"] --> SRC
+    SRC["source report threaded into REPAIR.inputs<br/>(each carries its own failure_signature)"] --> GUARD
 
-   empty diffs (classification=unknown OR proposer marker already
-   present) -> ASK_USER(freeform) carrying classification + rationale
+    GUARD{"LoopBudget.spend_repair<br/>REPAIR_BUDGET=4 + progress ledger<br/>+ signature flap guard"}
+    GUARD -- "exhausted / stalled / flap" --> FAIL((terminal FAILED))
+    GUARD -- funded --> REP["REPAIR<br/>classify → locate → propose<br/>(deterministic registry, then bounded<br/>LLM fallback under REPAIR_FILES_SCHEMA)"]
 
-   loop guards (terminal if any fires):
-     - repair_attempt >= _REPAIR_BUDGET (4)
-     - failing-test count stopped strictly dropping (progress ledger, #5)
-     - new failure_signature already in prior_failure_signatures
-     - regenerate_attempt would exceed _REGENERATE_BUDGET on the chain
+    REP --> STRAT{"_select_repair_strategy<br/>(Phase 6.1)"}
+
+    STRAT -- "patch<br/>(≤5 diffs, patchable class)" --> APP["APPLY<br/>build_artifact_id carried forward,<br/>BOOTSTRAP_ENV skipped"]
+    APP --> VER2["VERIFY"]
+    VER2 -- passed --> LES["RecordLesson → lessons.jsonl<br/>(Phase 7.1, iff REPAIR on chain)"]
+    VER2 -- "still failing" --> GUARD
+
+    STRAT -- "regenerate<br/>(no diffs / >5 diffs; always for<br/>SMOKE & API_CHECK breaks)" --> RGUARD{"spend_regenerate — 3, syntax churn /<br/>spend_repair_regenerate — 2, semantic"}
+    RGUARD -- funded --> SCA["fresh SCAFFOLD via propose_regenerate:<br/>nearest ancestor, live descendants<br/>ABANDONED, regenerate_constraints in inputs"]
+    SCA --> LOOP(["re-enters greenfield loop:<br/>SCAFFOLD → APPLY → BOOTSTRAP_ENV →<br/>API_CHECK → SMOKE → VERIFY"])
+    RGUARD -- exhausted --> RPL{"spend_replan<br/>REPLAN_BUDGET=1"}
+    RPL -- funded --> DEC["fresh DECOMPOSE with the failure<br/>folded into its goal"]
+    RPL -- exhausted --> SURV(["proceed with surviving files"])
+
+    STRAT -- "empty diffs<br/>(unknown / marker present)" --> ASK["ASK_USER(freeform)<br/>classification + rationale"]
+
+    classDef road fill:#3b6ea5,stroke:#274c73,color:#fff;
+    classDef gate fill:#7d5ba6,stroke:#4c3575,color:#fff;
+    classDef term fill:#4c956c,stroke:#2c6e49,color:#fff;
+    classDef bad fill:#bc4749,stroke:#7f2d2f,color:#fff;
+    class AC,SM,VF,RV,SRC,REP,APP,VER2,SCA,DEC,ASK road;
+    class GUARD,STRAT,RGUARD,RPL gate;
+    class LES,LOOP,SURV term;
+    class FAIL bad;
 ```
 
 Three pieces of code own every transition:
 
 * **`cgx.session.router.Router`** is pure Python with no LLM calls
-  and no I/O. Every transition is one of three entry points
-  (`on_user_message`, `on_task_completed`, `on_decision_recorded`)
-  that returns a `RouterPlan` of typed actions (`CreateTask`,
-  `UpdateTaskStatus`, `RecordDecision`, `AttachDecisionToTask`,
-  `RecordLesson`). The successor for any non-ASK kind comes from the
-  `TASK_SUCCESSOR` dispatch table; the successor for an `ASK_USER`
-  is driven by the shape of the resolving `Decision`.
+  and no I/O. Every transition is one of five entry points
+  (`on_user_message`, `on_task_completed`, `on_task_failed`,
+  `on_budget_exhausted`, `on_decision_recorded`) that returns a
+  `RouterPlan` of typed actions (`CreateTask`, `UpdateTaskStatus`,
+  `UpdateSessionStatus`, `RecordDecision`, `AttachDecisionToTask`,
+  `RecordLesson` -- vocabulary in `cgx.session.actions`). Completion
+  first runs the explicit `_COMPLETION_GUARDS` chain (guard bodies in
+  `cgx.session.greenfield_edges`); a guard that declines falls
+  through to the `TASK_SUCCESSOR` dispatch table. The successor for
+  an `ASK_USER` is driven by the shape of the resolving `Decision`,
+  and every bounded retry counter is spent through the typed
+  `cgx.session.budget.LoopBudget`.
 * **`cgx.session.runner.SessionRunner`** is the orchestrator the
   HTTP routes call. It sequences router plans through the store,
   acquires a per-session lock so concurrent requests can't interleave

@@ -64,9 +64,11 @@ backend that streams progress over Server-Sent Events.
     failures with no mechanical fix, falls back to a **bounded LLM
     repair** that rewrites the smallest set of files (≤5) from the
     failing test output and re-validates their syntax before applying.
-    The loop is capped at 2 attempts and gated by a failure-signature
-    hash, so repeated failures escalate to `ASK_USER` instead of
-    looping. A session-level budget (`max_task_runs` /
+    The loop runs as long as the failing-test count keeps strictly
+    dropping (under an absolute 4-round ceiling, all counters managed
+    by one typed `LoopBudget`) and is gated by a failure-signature
+    hash, so repeated identical failures escalate instead of looping.
+    A session-level budget (`max_task_runs` /
     `max_wall_seconds`) backstops the whole autonomous run: an
     interactive session pauses on an `ASK_USER` when the budget is
     spent, a headless one ends terminally `FAILED`.
@@ -506,7 +508,8 @@ CLARIFY_REQUIREMENTS -> ASK_USER(clarify_answers)
                                             -> (reject halts the loop)        |
                                                                               | (greenfield
                                                                               | fixable
-# Autonomous repair (greenfield only; <= 2 attempts, signature-gated)         | failures)
+# Autonomous repair (greenfield only; progress-aware LoopBudget,              | failures)
+# absolute ceiling 4 rounds, signature-gated)
 VERIFY (fail) -> REPAIR -> APPLY (skips BOOTSTRAP_ENV) -> VERIFY -------------+
               \ (empty plan)
                -> ASK_USER(freeform)
@@ -516,8 +519,11 @@ Three modules own every transition:
 
 * `cgx.session.router.Router` -- pure-Python deterministic state
   machine. No LLM calls, no I/O; returns a typed `RouterPlan` of
-  `CreateTask` / `UpdateTaskStatus` / `RecordDecision` /
-  `AttachDecisionToTask` actions. Reads `session.mode` to choose
+  `CreateTask` / `UpdateTaskStatus` / `UpdateSessionStatus` /
+  `RecordDecision` / `AttachDecisionToTask` / `RecordLesson` actions
+  (vocabulary in `cgx.session.actions`, greenfield edges in
+  `cgx.session.greenfield_edges`, retry counters in
+  `cgx.session.budget.LoopBudget`). Reads `session.mode` to choose
   the root task and the `TASK_SUCCESSOR` chain.
 * `cgx.session.runner.SessionRunner` -- per-session lock, executor
   dispatch, failure handling, persistence sequencing, and the
@@ -528,7 +534,8 @@ Three modules own every transition:
   explore-mode (`EXPLORE`, `INVESTIGATE`, `RECOMMEND`,
   `PLAN_CHANGE`), greenfield-mode (`CLARIFY_REQUIREMENTS`,
   `DECOMPOSE`, `SCAFFOLD`, `BOOTSTRAP_ENV`, `API_CHECK`, `SMOKE`,
-  `REPAIR`), and shared (`APPLY`, `VERIFY`, `ASK_USER`).
+  `RUNTIME_VERIFY`, `REPAIR`), and shared (`APPLY`, `VERIFY`,
+  `ASK_USER`).
 
 The HTTP surface is JSON-only at `/api/agent-session/*` (create /
 list / get / message / decision / delete). Mutating endpoints

@@ -804,17 +804,19 @@ flowchart TB
       VER["verify.py"]
       REP["repair.py"]
       ROU["router.py"]
+      BUD["budget.py<br/>LoopBudget"]
     end
     DEC -->|contracts| SCA
     SCA -->|generated tree| SVAL
     SVAL -->|warnings| SCA
     VER -->|pass/fail counts| ROU
     RTV -->|boot outcome| ROU
+    BUD -->|typed counters| ROU
     ROU -->|funds a round?| REP
     REP -->|REPAIR_PLAN| SCA
 
     classDef choc fill:#6f4e37,stroke:#3e2723,color:#fff;
-    class DEC,SCA,SVAL,RTV,VER,REP,ROU choc;
+    class DEC,SCA,SVAL,RTV,VER,REP,ROU,BUD choc;
 ```
 
 ### UI controls
