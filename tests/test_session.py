@@ -1248,13 +1248,13 @@ def test_router_api_check_failed_skips_repair_when_flapping():
 def test_router_api_check_failed_budget_exhausted_terminates_session():
     """C: API_CHECK failed with the repair budget spent -> terminal FAILED."""
     from cgx.session.models import SessionMode
-    from cgx.session.router import _REPAIR_BUDGET
+    from cgx.session.budget import REPAIR_BUDGET
     session = Session.new("g", mode=SessionMode.GREENFIELD)
     api = TaskNode.new(
         session.session_id, TaskKind.API_CHECK, "api",
         inputs={"build_artifact_id": "art_build",
                 "mode": SessionMode.GREENFIELD.value,
-                "repair_attempt": _REPAIR_BUDGET,
+                "repair_attempt": REPAIR_BUDGET,
                 "prior_failure_signatures": []})
     api.produced_artifact_id = "art_api"
     api.outputs = {"outcome": "failed", "failed_count": 1,
@@ -1393,13 +1393,13 @@ def test_router_smoke_failed_spawns_repair():
 def test_router_smoke_failed_respects_repair_budget():
     """SMOKE failure does not spawn REPAIR once the budget is exhausted."""
     from cgx.session.models import SessionMode
-    from cgx.session.router import _REPAIR_BUDGET
+    from cgx.session.budget import REPAIR_BUDGET
     session = Session.new("g", mode=SessionMode.GREENFIELD)
     sm = TaskNode.new(
         session.session_id, TaskKind.SMOKE, "smoke",
         inputs={"build_artifact_id": "art_build",
                 "mode": SessionMode.GREENFIELD.value,
-                "repair_attempt": _REPAIR_BUDGET})
+                "repair_attempt": REPAIR_BUDGET})
     sm.produced_artifact_id = "art_smoke"
     sm.outputs = {"outcome": "failed", "failed_count": 1,
                   "failure_signature": "smoke_import|werkzeug"}
@@ -1431,6 +1431,40 @@ def test_router_smoke_failed_flap_detector_blocks_repeat():
     status = [a for a in plan.actions if isinstance(a, UpdateSessionStatus)]
     assert len(status) == 1
     assert status[0].status is SessionStatus.FAILED
+
+
+def test_router_smoke_pass_threads_repair_budget_to_verify():
+    """The repair budget survives the SMOKE -> VERIFY edge.
+
+    A SMOKE that passes mid-repair-loop (e.g. after an install-deps
+    round fixed the imports) hands off to VERIFY; dropping the counters
+    on this edge silently reset the shared budget and re-opened the
+    loop. The LoopBudget threading keeps the whole ledger intact.
+    """
+    from cgx.session.models import SessionMode
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    sm = TaskNode.new(
+        session.session_id, TaskKind.SMOKE, "smoke",
+        inputs={"build_artifact_id": "art_build",
+                "mode": SessionMode.GREENFIELD.value,
+                "repair_attempt": 2,
+                "prior_failure_signatures": ["s1", "s2"],
+                "prior_failing_counts": [5, 3],
+                "prior_passing_counts": [1, 2]})
+    sm.produced_artifact_id = "art_smoke"
+    sm.outputs = {"outcome": "passed", "failed_count": 0,
+                  "tested_count": 2, "failure_signature": ""}
+    sm.status = TaskNodeStatus.DONE
+    plan = Router().on_task_completed(
+        session=session, completed=sm, tasks=[sm])
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    assert len(creates) == 1
+    ver = creates[0].task
+    assert ver.kind is TaskKind.VERIFY
+    assert ver.inputs["repair_attempt"] == 2
+    assert ver.inputs["prior_failure_signatures"] == ["s1", "s2"]
+    assert ver.inputs["prior_failing_counts"] == [5, 3]
+    assert ver.inputs["prior_passing_counts"] == [1, 2]
 
 
 # --------------------- repair-loop router transitions ---------------------
@@ -1674,12 +1708,12 @@ def test_router_runtime_verify_failed_spawns_repair():
 def test_router_runtime_verify_failed_budget_spent_fails_session():
     """A boot failure with the repair budget exhausted is a terminal FAILED."""
     from cgx.session.models import SessionMode
-    from cgx.session.router import _REPAIR_BUDGET
+    from cgx.session.budget import REPAIR_BUDGET
     session = Session.new("g", mode=SessionMode.GREENFIELD)
     rv = TaskNode.new(
         session.session_id, TaskKind.RUNTIME_VERIFY, "runtime",
         inputs={"mode": SessionMode.GREENFIELD.value,
-                "repair_attempt": _REPAIR_BUDGET})
+                "repair_attempt": REPAIR_BUDGET})
     rv.produced_artifact_id = "art_runtime"
     rv.outputs = {"outcome": "failed",
                   "failure_signature": "runtime_boot|app.py"}
@@ -1840,11 +1874,11 @@ def test_router_verify_repeat_signature_refuses_repair():
 def test_router_verify_exceeds_budget_refuses_repair():
     """Absolute repair cap exhausted -> no REPAIR (loop guard)."""
     from cgx.session.models import SessionMode
-    from cgx.session.router import _REPAIR_BUDGET
+    from cgx.session.budget import REPAIR_BUDGET
     session = Session.new("g", mode=SessionMode.GREENFIELD)
     ver = _greenfield_failed_verify(
-        signature="new", repair_attempt=_REPAIR_BUDGET,
-        prior=[f"old{i}" for i in range(_REPAIR_BUDGET)], session=session)
+        signature="new", repair_attempt=REPAIR_BUDGET,
+        prior=[f"old{i}" for i in range(REPAIR_BUDGET)], session=session)
     plan = Router().on_task_completed(
         session=session, completed=ver, tasks=[ver])
     creates = [a for a in plan.actions if isinstance(a, CreateTask)]
@@ -8309,11 +8343,11 @@ def test_router_scaffold_placeholder_endpoint_does_not_regenerate():
 def test_router_scaffold_unmet_contract_non_terminal_when_budget_spent():
     # Budget spent -> helper returns nothing (non-terminal): the caller
     # then takes the normal SCAFFOLD -> APPLY edge instead of failing.
-    from cgx.session.router import (_scaffold_contract_regenerate_actions,
-                                    _REGENERATE_BUDGET)
+    from cgx.session.budget import REGENERATE_BUDGET
+    from cgx.session.router import _scaffold_contract_regenerate_actions
     _session, scaffold = _make_clean_scaffold_with_contracts(
         [{"kind": "function", "name": "compute", "module": "src/core.py"}],
-        prior_regens=_REGENERATE_BUDGET)
+        prior_regens=REGENERATE_BUDGET)
     assert _scaffold_contract_regenerate_actions(scaffold, [scaffold]) == []
 
 
@@ -8329,9 +8363,9 @@ def test_router_scaffold_contract_skipped_when_files_dropped():
 
 def test_router_repair_regenerate_budget_exhausted_fails_session():
     """Once the repair-regenerate budget is hit the session fails terminally."""
-    from cgx.session.router import _REPAIR_REGENERATE_BUDGET
+    from cgx.session.budget import REPAIR_REGENERATE_BUDGET
     session, _scaffold, tasks, rep = _build_regenerate_chain(
-        prior_repair_regens=_REPAIR_REGENERATE_BUDGET)
+        prior_repair_regens=REPAIR_REGENERATE_BUDGET)
     plan = Router().on_task_completed(
         session=session, completed=rep, tasks=tasks)
     creates = [a for a in plan.actions if isinstance(a, CreateTask)]
@@ -8352,11 +8386,11 @@ def test_router_repair_regenerate_allowed_after_syntax_budget_spent():
     syntax-churn budget converging to a clean tree must still afford the
     FIRST semantic (api_check-driven) regenerate.
     """
-    from cgx.session.router import (_REGENERATE_BUDGET,
-                                    _REPAIR_REGENERATE_BUDGET)
-    assert _REPAIR_REGENERATE_BUDGET >= 1
+    from cgx.session.budget import (REGENERATE_BUDGET,
+                                    REPAIR_REGENERATE_BUDGET)
+    assert REPAIR_REGENERATE_BUDGET >= 1
     session, scaffold, tasks, rep = _build_regenerate_chain(
-        prior_regens=_REGENERATE_BUDGET, prior_repair_regens=0)
+        prior_regens=REGENERATE_BUDGET, prior_repair_regens=0)
     plan = Router().on_task_completed(
         session=session, completed=rep, tasks=tasks)
     creates = [a for a in plan.actions if isinstance(a, CreateTask)]
@@ -8489,9 +8523,9 @@ def test_router_apply_failed_files_regenerates_within_budget():
 
 def test_router_apply_failed_files_budget_exhausted_escalates_to_replan():
     """C2: regenerate budget spent -> escalate once to a fresh DECOMPOSE."""
-    from cgx.session.router import _REGENERATE_BUDGET
+    from cgx.session.budget import REGENERATE_BUDGET
     session, scaffold, apply_t, tasks = _build_apply_failed_chain(
-        prior_regens=_REGENERATE_BUDGET)
+        prior_regens=REGENERATE_BUDGET)
     plan = Router().on_task_completed(
         session=session, completed=apply_t, tasks=tasks)
     # No terminal failure yet -- the manifest is re-planned first.
@@ -8514,9 +8548,9 @@ def test_router_apply_failed_files_budget_exhausted_escalates_to_replan():
 def test_router_apply_failed_files_replan_budget_exhausted_proceeds_with_survivors():
     """B: budgets spent but survivors exist -> proceed on the normal
     APPLY -> BOOTSTRAP_ENV edge instead of discarding the run."""
-    from cgx.session.router import _REGENERATE_BUDGET, _REPLAN_BUDGET
+    from cgx.session.budget import REGENERATE_BUDGET, REPLAN_BUDGET
     session, _scaffold, apply_t, tasks = _build_apply_failed_chain(
-        prior_regens=_REGENERATE_BUDGET, prior_replans=_REPLAN_BUDGET)
+        prior_regens=REGENERATE_BUDGET, prior_replans=REPLAN_BUDGET)
     plan = Router().on_task_completed(
         session=session, completed=apply_t, tasks=tasks)
     # No terminal failure: the successfully applied files carry forward.
@@ -8528,9 +8562,9 @@ def test_router_apply_failed_files_replan_budget_exhausted_proceeds_with_survivo
 
 def test_router_apply_failed_files_replan_budget_exhausted_no_survivors_fails():
     """B: budgets spent and nothing generated cleanly -> terminal FAILED."""
-    from cgx.session.router import _REGENERATE_BUDGET, _REPLAN_BUDGET
+    from cgx.session.budget import REGENERATE_BUDGET, REPLAN_BUDGET
     session, _scaffold, apply_t, tasks = _build_apply_failed_chain(
-        prior_regens=_REGENERATE_BUDGET, prior_replans=_REPLAN_BUDGET,
+        prior_regens=REGENERATE_BUDGET, prior_replans=REPLAN_BUDGET,
         survivors=0)
     plan = Router().on_task_completed(
         session=session, completed=apply_t, tasks=tasks)
@@ -8649,9 +8683,9 @@ def test_router_scaffold_failed_files_regenerates_within_budget():
 
 def test_router_scaffold_failed_files_budget_exhausted_escalates_to_replan():
     """C2: SCAFFOLD regenerate budget spent -> escalate to a fresh DECOMPOSE."""
-    from cgx.session.router import _REGENERATE_BUDGET
+    from cgx.session.budget import REGENERATE_BUDGET
     session, _parent, scaffold, tasks = _build_scaffold_failed_chain(
-        prior_regens=_REGENERATE_BUDGET)
+        prior_regens=REGENERATE_BUDGET)
     plan = Router().on_task_completed(
         session=session, completed=scaffold, tasks=tasks)
     assert not [a for a in plan.actions if isinstance(a, UpdateSessionStatus)]
@@ -8674,9 +8708,9 @@ def test_router_scaffold_failed_files_budget_exhausted_escalates_to_replan():
 def test_router_scaffold_failed_files_replan_budget_exhausted_proceeds_with_survivors():
     """B: budgets spent but survivors exist -> proceed on the normal
     SCAFFOLD -> APPLY edge instead of discarding the run."""
-    from cgx.session.router import _REGENERATE_BUDGET, _REPLAN_BUDGET
+    from cgx.session.budget import REGENERATE_BUDGET, REPLAN_BUDGET
     session, _parent, scaffold, tasks = _build_scaffold_failed_chain(
-        prior_regens=_REGENERATE_BUDGET, prior_replans=_REPLAN_BUDGET,
+        prior_regens=REGENERATE_BUDGET, prior_replans=REPLAN_BUDGET,
         with_pending_child=False)
     plan = Router().on_task_completed(
         session=session, completed=scaffold, tasks=tasks)
@@ -8688,9 +8722,9 @@ def test_router_scaffold_failed_files_replan_budget_exhausted_proceeds_with_surv
 
 def test_router_scaffold_failed_files_replan_budget_exhausted_no_survivors_fails():
     """B: budgets spent and nothing generated cleanly -> terminal FAILED."""
-    from cgx.session.router import _REGENERATE_BUDGET, _REPLAN_BUDGET
+    from cgx.session.budget import REGENERATE_BUDGET, REPLAN_BUDGET
     session, _parent, scaffold, tasks = _build_scaffold_failed_chain(
-        prior_regens=_REGENERATE_BUDGET, prior_replans=_REPLAN_BUDGET,
+        prior_regens=REGENERATE_BUDGET, prior_replans=REPLAN_BUDGET,
         with_pending_child=False, survivors=0)
     plan = Router().on_task_completed(
         session=session, completed=scaffold, tasks=tasks)
@@ -8798,9 +8832,9 @@ def test_router_on_task_failed_scaffold_resumes_from_checkpoint():
 
 def test_router_on_task_failed_scaffold_resume_budget_exhausted_fails():
     """B4: a re-crashed SCAFFOLD with no budget left fails the session."""
-    from cgx.session.router import _REGENERATE_BUDGET
+    from cgx.session.budget import REGENERATE_BUDGET
     session, _parent, scaffold, tasks = _build_crashed_scaffold(
-        prior_regens=_REGENERATE_BUDGET, with_pending_child=False)
+        prior_regens=REGENERATE_BUDGET, with_pending_child=False)
     plan = Router().on_task_failed(
         session=session, failed=scaffold, tasks=tasks,
         resume_scaffold_artifact_id="art_ckpt")

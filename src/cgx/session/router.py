@@ -28,6 +28,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Union
 
+from cgx.session.budget import LoopBudget
 from cgx.session.models import (
     Decision,
     DecisionKind,
@@ -229,7 +230,7 @@ def _apply_to_verify(parent: TaskNode) -> List[TaskNode]:
     mode = str(parent.inputs.get("mode") or "").strip()
     has_build_artifact = bool(
         str(parent.inputs.get("build_artifact_id") or "").strip())
-    repair_attempt = int(parent.inputs.get("repair_attempt") or 0)
+    budget = LoopBudget.from_inputs(parent.inputs)
     if mode == SessionMode.GREENFIELD.value and not has_build_artifact:
         return [TaskNode.new(
             session_id=parent.session_id,
@@ -245,6 +246,7 @@ def _apply_to_verify(parent: TaskNode) -> List[TaskNode]:
                     parent.inputs.get("scaffold_artifact_id"),
                 "prior_goal": parent.inputs.get("prior_goal"),
                 "mode": mode,
+                **budget.repair_chain_inputs(),
             },
         )]
     return [TaskNode.new(
@@ -261,13 +263,7 @@ def _apply_to_verify(parent: TaskNode) -> List[TaskNode]:
             "build_artifact_id": parent.inputs.get("build_artifact_id"),
             "prior_goal": parent.inputs.get("prior_goal"),
             "mode": parent.inputs.get("mode"),
-            "repair_attempt": repair_attempt,
-            "prior_failure_signatures":
-                list(parent.inputs.get("prior_failure_signatures") or []),
-            "prior_failing_counts":
-                list(parent.inputs.get("prior_failing_counts") or []),
-            "prior_passing_counts":
-                list(parent.inputs.get("prior_passing_counts") or []),
+            **budget.repair_chain_inputs(),
         },
     )]
 
@@ -298,9 +294,7 @@ def _bootstrap_to_api_check(parent: TaskNode) -> List[TaskNode]:
                 parent.inputs.get("scaffold_artifact_id"),
             "prior_goal": parent.inputs.get("prior_goal"),
             "mode": parent.inputs.get("mode"),
-            "prior_failure_signatures":
-                list(parent.inputs.get("prior_failure_signatures") or []),
-            "repair_attempt": int(parent.inputs.get("repair_attempt") or 0),
+            **LoopBudget.from_inputs(parent.inputs).repair_chain_inputs(),
         },
     )]
 
@@ -322,6 +316,7 @@ def _api_check_to_smoke_or_repair(parent: TaskNode) -> List[TaskNode]:
     outputs = parent.outputs or {}
     outcome = str(outputs.get("outcome") or "").strip()
     mode = str(parent.inputs.get("mode") or "").strip()
+    budget = LoopBudget.from_inputs(parent.inputs)
     if outcome not in _REPAIRABLE_API_CHECK_OUTCOMES:
         return [TaskNode.new(
             session_id=parent.session_id,
@@ -340,24 +335,18 @@ def _api_check_to_smoke_or_repair(parent: TaskNode) -> List[TaskNode]:
                     parent.inputs.get("scaffold_artifact_id"),
                 "prior_goal": parent.inputs.get("prior_goal"),
                 "mode": mode,
-                "prior_failure_signatures":
-                    list(parent.inputs.get("prior_failure_signatures")
-                         or []),
-                "repair_attempt":
-                    int(parent.inputs.get("repair_attempt") or 0),
+                **budget.repair_chain_inputs(),
             },
         )]
     if mode != SessionMode.GREENFIELD.value:
         return []
-    repair_attempt = int(parent.inputs.get("repair_attempt") or 0)
-    if repair_attempt >= _REPAIR_BUDGET:
+    if budget.repair_exhausted:
         return []
     new_signature = str(outputs.get("failure_signature") or "").strip()
     if not new_signature:
         failed = outputs.get("failed_count")
         new_signature = f"api_check_failed|count={failed}"
-    prior = list(parent.inputs.get("prior_failure_signatures") or [])
-    if new_signature in prior:
+    if budget.seen(new_signature):
         return []
     return [TaskNode.new(
         session_id=parent.session_id,
@@ -374,8 +363,7 @@ def _api_check_to_smoke_or_repair(parent: TaskNode) -> List[TaskNode]:
             "apply_artifact_id": parent.inputs.get("apply_artifact_id"),
             "prior_goal": parent.inputs.get("prior_goal"),
             "mode": mode,
-            "repair_attempt": repair_attempt + 1,
-            "prior_failure_signatures": prior + [new_signature],
+            **budget.spend_repair(new_signature).repair_chain_inputs(),
         },
     )]
 
@@ -399,6 +387,7 @@ def _smoke_to_verify_or_repair(parent: TaskNode) -> List[TaskNode]:
     outputs = parent.outputs or {}
     outcome = str(outputs.get("outcome") or "").strip()
     mode = str(parent.inputs.get("mode") or "").strip()
+    budget = LoopBudget.from_inputs(parent.inputs)
     if outcome not in _REPAIRABLE_SMOKE_OUTCOMES:
         return [TaskNode.new(
             session_id=parent.session_id,
@@ -416,19 +405,18 @@ def _smoke_to_verify_or_repair(parent: TaskNode) -> List[TaskNode]:
                     parent.inputs.get("scaffold_artifact_id"),
                 "prior_goal": parent.inputs.get("prior_goal"),
                 "mode": mode,
+                **budget.repair_chain_inputs(),
             },
         )]
     if mode != SessionMode.GREENFIELD.value:
         return []
-    repair_attempt = int(parent.inputs.get("repair_attempt") or 0)
-    if repair_attempt >= _REPAIR_BUDGET:
+    if budget.repair_exhausted:
         return []
     new_signature = str(outputs.get("failure_signature") or "").strip()
     if not new_signature:
         failed = outputs.get("failed_count")
         new_signature = f"smoke_failed|count={failed}"
-    prior = list(parent.inputs.get("prior_failure_signatures") or [])
-    if new_signature in prior:
+    if budget.seen(new_signature):
         return []
     return [TaskNode.new(
         session_id=parent.session_id,
@@ -444,8 +432,7 @@ def _smoke_to_verify_or_repair(parent: TaskNode) -> List[TaskNode]:
             "apply_artifact_id": parent.inputs.get("apply_artifact_id"),
             "prior_goal": parent.inputs.get("prior_goal"),
             "mode": mode,
-            "repair_attempt": repair_attempt + 1,
-            "prior_failure_signatures": prior + [new_signature],
+            **budget.spend_repair(new_signature).repair_chain_inputs(),
         },
     )]
 
@@ -487,16 +474,6 @@ def _decompose_to_ask(parent: TaskNode) -> List[TaskNode]:
     )]
 
 
-# Absolute ceiling on repair rounds for a single greenfield write loop.
-# The progress-aware gate (see :func:`_repair_progress_stalled`) ends a
-# loop as soon as the failing-test count stops strictly dropping, so most
-# loops terminate well before this cap; the cap only bounds a loop whose
-# failure signature keeps mutating with no usable count trend. Raised from
-# the original 2-shot limit so a genuinely-progressing hard task can
-# iterate further without ever running unbounded.
-_REPAIR_BUDGET = 4
-
-
 def _coerce_count(value: Any) -> Optional[int]:
     """Best-effort ``int`` coercion; returns ``None`` for missing/garbage."""
     try:
@@ -529,7 +506,7 @@ def _repair_progress_stalled(
     where a test count is not a meaningful progress signal) is
     inconclusive and never on its own declares a stall: the caller still
     applies the signature-flap backstop and the absolute
-    :data:`_REPAIR_BUDGET` cap.
+    :data:`~cgx.session.budget.REPAIR_BUDGET` cap.
     """
     if new_count is None or not prior_counts:
         return False
@@ -538,43 +515,6 @@ def _repair_progress_stalled(
                     and bool(prior_passing)
                     and new_passing > prior_passing[-1])
     return not (failing_dropped or passing_rose)
-
-# Maximum number of targeted regenerate attempts per SCAFFOLD ancestor
-# chain. Each attempt re-generates only the files that dropped, seeding
-# the survivors from the prior checkpoint, so a retry is fast and does
-# not disturb good work. A local/flaky model routinely drops a single
-# file to a read timeout or an empty patch, so a shallow budget escalated
-# straight to a disruptive re-plan (and re-approval); a few in-place
-# retries clear the common case before the manifest is ever blamed.
-_REGENERATE_BUDGET = 3
-
-# Maximum number of *semantic-repair* regenerations per SCAFFOLD ancestor
-# chain -- deliberately separate from :data:`_REGENERATE_BUDGET`. That
-# budget bounds *syntax churn* (SCAFFOLD/APPLY dropping files that do not
-# parse, ``failed_count > 0``) *before* the tree is applied; this one
-# bounds a whole-tree rewrite of a tree that already generated and applied
-# cleanly but references a symbol a downstream gate (API_CHECK / VERIFY /
-# RUNTIME_VERIFY) proved wrong. Conflating the two on one counter let a
-# scaffold that spent its whole syntax budget converging to a clean tree
-# arrive at the *first* semantic repair with nothing left, failing a run
-# that was one rewrite from green. ``repair_attempt`` cannot bound this
-# loop -- it does not survive a scaffold regeneration (``propose_regenerate``
-# copies the SCAFFOLD's inputs, not the REPAIR's) -- so this dedicated,
-# scaffold-carried counter is what keeps the semantic repair <-> regenerate
-# loop finite and loop-safe.
-_REPAIR_REGENERATE_BUDGET = 2
-
-# Maximum number of *re-plan* escalations per session. When a SCAFFOLD or
-# APPLY spends its per-manifest regenerate budget the manifest itself is
-# the suspect (not the generation of any single file), so the router
-# escalates once to a fresh DECOMPOSE that revises the plan with the
-# accumulated failure folded into its goal. When the re-plan budget is
-# also spent the router does NOT discard the run: as long as the partial
-# scaffold produced survivors it proceeds along the normal edge (APPLY
-# writes them, VERIFY judges them) rather than failing terminally and
-# throwing away every successfully generated file. Only a scaffold that
-# produced nothing usable is a genuine dead end.
-_REPLAN_BUDGET = 1
 
 
 # Outcomes that REPAIR knows how to attempt a fix for. ``passed`` and
@@ -621,7 +561,8 @@ def _verify_to_repair_or_terminal(parent: TaskNode) -> List[TaskNode]:
       list the loop is churning and we refuse another REPAIR. This still
       covers non-assertion outcomes where a test count is meaningless.
 
-    Both sit under the absolute :data:`_REPAIR_BUDGET` cap. The attempt
+    Both sit under the absolute :data:`~cgx.session.budget.REPAIR_BUDGET`
+    cap. The attempt
     counter lives in ``parent.inputs["repair_attempt"]`` (incremented by
     the REPAIR -> APPLY -> VERIFY chain), so the router can read it
     without walking the task tree.
@@ -641,8 +582,8 @@ def _verify_to_repair_or_terminal(parent: TaskNode) -> List[TaskNode]:
     if (outcome == "no_tests_collected"
             and int(outputs.get("tests_selected_count") or 0) <= 0):
         return []
-    repair_attempt = int(parent.inputs.get("repair_attempt") or 0)
-    if repair_attempt >= _REPAIR_BUDGET:
+    budget = LoopBudget.from_inputs(parent.inputs)
+    if budget.repair_exhausted:
         return []
     # Coverage-aware progress gate (#5): for a real test failure the
     # failing-test count is a truer progress signal than failure-signature
@@ -662,16 +603,10 @@ def _verify_to_repair_or_terminal(parent: TaskNode) -> List[TaskNode]:
     new_count = (_coerce_count(outputs.get("failing_count"))
                  if outcome in ("assertions_failed", "collection_error")
                  else None)
-    prior_counts = [c for c in (
-        _coerce_count(x)
-        for x in (parent.inputs.get("prior_failing_counts") or []))
-        if c is not None]
+    prior_counts = list(budget.prior_failing_counts)
     new_passing = (_coerce_count(outputs.get("passing_count"))
                    if outcome == "assertions_failed" else None)
-    prior_passing = [c for c in (
-        _coerce_count(x)
-        for x in (parent.inputs.get("prior_passing_counts") or []))
-        if c is not None]
+    prior_passing = list(budget.prior_passing_counts)
     if _repair_progress_stalled(
             new_count, prior_counts, new_passing, prior_passing):
         return []
@@ -683,13 +618,8 @@ def _verify_to_repair_or_terminal(parent: TaskNode) -> List[TaskNode]:
     new_signature = str(outputs.get("failure_signature") or "").strip()
     if not new_signature:
         new_signature = f"{outcome}|rc={outputs.get('returncode')}"
-    prior = list(parent.inputs.get("prior_failure_signatures") or [])
-    if new_signature in prior:
+    if budget.seen(new_signature):
         return []
-    next_counts = (prior_counts + [new_count] if new_count is not None
-                   else prior_counts)
-    next_passing = (prior_passing + [new_passing] if new_passing is not None
-                    else prior_passing)
     verify_artifact_id = parent.produced_artifact_id
     return [TaskNode.new(
         session_id=parent.session_id,
@@ -704,10 +634,9 @@ def _verify_to_repair_or_terminal(parent: TaskNode) -> List[TaskNode]:
             "apply_artifact_id": parent.inputs.get("apply_artifact_id"),
             "prior_goal": parent.inputs.get("prior_goal"),
             "mode": mode,
-            "repair_attempt": repair_attempt + 1,
-            "prior_failure_signatures": prior + [new_signature],
-            "prior_failing_counts": next_counts,
-            "prior_passing_counts": next_passing,
+            **budget.spend_repair(
+                new_signature, failing_count=new_count,
+                passing_count=new_passing).repair_chain_inputs(),
         },
     )]
 
@@ -751,13 +680,7 @@ def _runtime_verify_node(parent: TaskNode) -> List[TaskNode]:
             # Thread the shared repair budget through the runtime gate so a
             # boot failure can route to REPAIR under the same attempt cap +
             # flap detector as the pre-VERIFY gates (#3).
-            "repair_attempt": int(parent.inputs.get("repair_attempt") or 0),
-            "prior_failure_signatures":
-                list(parent.inputs.get("prior_failure_signatures") or []),
-            "prior_failing_counts":
-                list(parent.inputs.get("prior_failing_counts") or []),
-            "prior_passing_counts":
-                list(parent.inputs.get("prior_passing_counts") or []),
+            **LoopBudget.from_inputs(parent.inputs).repair_chain_inputs(),
         },
     )]
 
@@ -787,15 +710,14 @@ def _runtime_verify_to_repair_or_terminal(parent: TaskNode) -> List[TaskNode]:
         return []
     if outcome not in _REPAIRABLE_RUNTIME_OUTCOMES:
         return []
-    repair_attempt = int(parent.inputs.get("repair_attempt") or 0)
-    if repair_attempt >= _REPAIR_BUDGET:
+    budget = LoopBudget.from_inputs(parent.inputs)
+    if budget.repair_exhausted:
         return []
     new_signature = str(outputs.get("failure_signature") or "").strip()
     if not new_signature:
         failed = outputs.get("failed_count")
         new_signature = f"runtime_failed|count={failed}"
-    prior = list(parent.inputs.get("prior_failure_signatures") or [])
-    if new_signature in prior:
+    if budget.seen(new_signature):
         return []
     return [TaskNode.new(
         session_id=parent.session_id,
@@ -812,12 +734,7 @@ def _runtime_verify_to_repair_or_terminal(parent: TaskNode) -> List[TaskNode]:
             "scaffold_artifact_id": parent.inputs.get("scaffold_artifact_id"),
             "prior_goal": parent.inputs.get("prior_goal"),
             "mode": mode,
-            "repair_attempt": repair_attempt + 1,
-            "prior_failure_signatures": prior + [new_signature],
-            "prior_failing_counts":
-                list(parent.inputs.get("prior_failing_counts") or []),
-            "prior_passing_counts":
-                list(parent.inputs.get("prior_passing_counts") or []),
+            **budget.spend_repair(new_signature).repair_chain_inputs(),
         },
     )]
 
@@ -836,9 +753,10 @@ def _repair_to_apply_or_ask(parent: TaskNode) -> List[TaskNode]:
     outputs = parent.outputs or {}
     can_apply = bool(outputs.get("can_apply"))
     signature = str(outputs.get("failure_signature") or "")
+    budget = LoopBudget.from_inputs(parent.inputs)
     attempt = int(outputs.get("repair_attempt")
-                  or parent.inputs.get("repair_attempt") or 1)
-    prior = list(parent.inputs.get("prior_failure_signatures") or [])
+                  or budget.repair_attempt or 1)
+    budget = budget.with_repair_attempt(attempt).with_signature(signature)
     if not can_apply:
         return []
     return [TaskNode.new(
@@ -853,13 +771,7 @@ def _repair_to_apply_or_ask(parent: TaskNode) -> List[TaskNode]:
             "build_artifact_id": parent.inputs.get("build_artifact_id"),
             "prior_goal": parent.inputs.get("prior_goal"),
             "mode": parent.inputs.get("mode"),
-            "repair_attempt": attempt,
-            "prior_failure_signatures": (
-                prior if signature in prior else prior + [signature]),
-            "prior_failing_counts":
-                list(parent.inputs.get("prior_failing_counts") or []),
-            "prior_passing_counts":
-                list(parent.inputs.get("prior_passing_counts") or []),
+            **budget.repair_chain_inputs(),
         },
     )]
 
@@ -1168,7 +1080,8 @@ class Router:
           instead of discarding every completed file.
         * a DECOMPOSE whose executor marked the failure ``retryable``
           (a plan-quality problem such as an empty or unbuildable
-          manifest). Bounded by :data:`_DECOMPOSE_RETRY_BUDGET`, re-queue
+          manifest). Bounded by
+          :data:`~cgx.session.budget.DECOMPOSE_RETRY_BUDGET`, re-queue
           a fresh DECOMPOSE with the failure message folded into its
           goal so the planner LLM sees the constraint it must satisfy.
 
@@ -1307,9 +1220,9 @@ def _repair_install_deps_actions(
     if strategy != "install_deps":
         return []
     inputs = completed.inputs or {}
-    repair_attempt = int(outputs.get("repair_attempt")
-                         or inputs.get("repair_attempt") or 1)
-    prior = list(inputs.get("prior_failure_signatures") or [])
+    budget = LoopBudget.from_inputs(inputs)
+    budget = budget.with_repair_attempt(
+        int(outputs.get("repair_attempt") or budget.repair_attempt or 1))
     missing = [str(m) for m in outputs.get("missing_modules") or []]
     boot = TaskNode.new(
         session_id=completed.session_id,
@@ -1327,8 +1240,7 @@ def _repair_install_deps_actions(
             "prior_goal": inputs.get("prior_goal"),
             "mode": inputs.get("mode") or SessionMode.GREENFIELD.value,
             "missing_modules": missing,
-            "repair_attempt": repair_attempt,
-            "prior_failure_signatures": prior,
+            **budget.repair_chain_inputs(),
         },
     )
     return [CreateTask(boot)]
@@ -1353,7 +1265,8 @@ def _repair_regenerate_actions(completed: TaskNode,
     :func:`_scaffold_failed_files_actions` / :func:`_apply_failed_files_actions`
     making the tree parse. A scaffold that burned its whole syntax budget
     converging to a clean, applied tree must still afford the correctness
-    loop its full :data:`_REPAIR_REGENERATE_BUDGET`; the regenerated
+    loop its full :data:`~cgx.session.budget.REPAIR_REGENERATE_BUDGET`;
+    the regenerated
     SCAFFOLD carries ``repair_regenerate_attempt + 1`` so this loop stays
     finite even though ``repair_attempt`` does not survive the regenerate.
     """
@@ -1369,9 +1282,8 @@ def _repair_regenerate_actions(completed: TaskNode,
     scaffold = _find_scaffold_ancestor(completed, tasks)
     if scaffold is None:
         return []
-    prior_repair_regens = int(
-        scaffold.inputs.get("repair_regenerate_attempt") or 0)
-    if prior_repair_regens >= _REPAIR_REGENERATE_BUDGET:
+    scaffold_budget = LoopBudget.from_inputs(scaffold.inputs)
+    if scaffold_budget.repair_regenerate_exhausted:
         return []
     abandon_targets = _collect_descendants(scaffold.task_id, tasks)
     actions: List[RouterAction] = []
@@ -1383,7 +1295,8 @@ def _repair_regenerate_actions(completed: TaskNode,
         actions.append(UpdateTaskStatus(
             task_id=t.task_id, status=TaskNodeStatus.ABANDONED))
     new_scaffold = propose_regenerate(scaffold, extra_constraints)
-    new_scaffold.inputs["repair_regenerate_attempt"] = prior_repair_regens + 1
+    new_scaffold.inputs["repair_regenerate_attempt"] = (
+        scaffold_budget.spend_repair_regenerate().repair_regenerate_attempt)
     actions.append(CreateTask(new_scaffold))
     return actions
 
@@ -1398,7 +1311,8 @@ def _apply_failed_files_actions(completed: TaskNode,
     Continuing to BOOTSTRAP_ENV / VERIFY with a core module silently
     missing guarantees a downstream collection error, so any greenfield
     APPLY that dropped a file re-scaffolds within
-    :data:`_REGENERATE_BUDGET` instead of limping forward. When the
+    :data:`~cgx.session.budget.REGENERATE_BUDGET` instead of limping
+    forward. When the
     regenerate budget is spent the router escalates once to a revised
     manifest via :func:`_replan_or_fail` (a fresh DECOMPOSE); when the
     re-plan budget is also spent that helper proceeds with the survivors
@@ -1426,8 +1340,7 @@ def _apply_failed_files_actions(completed: TaskNode,
         failed_count,
         apply_failed=outputs.get("failed_files"),
         scaffold_failed=scaffold_outputs.get("failed"))
-    prior_regens = int(scaffold.inputs.get("regenerate_attempt") or 0)
-    if prior_regens >= _REGENERATE_BUDGET:
+    if LoopBudget.from_inputs(scaffold.inputs).regenerate_exhausted:
         return _replan_or_fail(
             completed, tasks, scaffold=scaffold,
             failure_note=str(constraint.get("rationale") or ""))
@@ -1468,15 +1381,6 @@ def _fold_failure_into_goal(prior_goal: str, failure_note: str) -> str:
     return f"{goal}\n\n{banner}" if goal else banner
 
 
-# Maximum number of constraint-folded DECOMPOSE retries after a failure
-# the executor marked retryable (a plan-quality problem: an empty or
-# unbuildable manifest). One retry with the concrete failure folded into
-# the goal is enough to move a deterministic (temperature 0) planner off
-# the broken output; a second identical failure means the model cannot
-# satisfy the constraint and the session fails terminally.
-_DECOMPOSE_RETRY_BUDGET = 1
-
-
 def _decompose_retry_actions(failed: TaskNode) -> List[RouterAction]:
     """Re-queue a DECOMPOSE whose executor marked the failure retryable.
 
@@ -1484,15 +1388,15 @@ def _decompose_retry_actions(failed: TaskNode) -> List[RouterAction]:
     folds ``failed.error`` into ``prior_goal`` via
     :func:`_fold_failure_into_goal` so the planner LLM sees exactly what
     invalidated the prior manifest. Bounded by
-    :data:`_DECOMPOSE_RETRY_BUDGET` (counter carried in
+    :data:`~cgx.session.budget.DECOMPOSE_RETRY_BUDGET` (counter carried in
     ``inputs["decompose_retry"]``); returns an empty list for any other
     task kind or a spent budget so :meth:`Router.on_task_failed` falls
     through to the terminal ``FAILED``.
     """
     if failed.kind is not TaskKind.DECOMPOSE:
         return []
-    prior_retries = int(failed.inputs.get("decompose_retry") or 0)
-    if prior_retries >= _DECOMPOSE_RETRY_BUDGET:
+    budget = LoopBudget.from_inputs(failed.inputs)
+    if budget.decompose_retry_exhausted:
         return []
     prior_goal = str(failed.inputs.get("prior_goal") or "").strip()
     answers = failed.inputs.get("answers")
@@ -1509,8 +1413,8 @@ def _decompose_retry_actions(failed: TaskNode) -> List[RouterAction]:
             "requirements_artifact_id":
                 failed.inputs.get("requirements_artifact_id"),
             "answers": dict(answers) if isinstance(answers, dict) else {},
-            "decompose_retry": prior_retries + 1,
-            "replan_attempt": int(failed.inputs.get("replan_attempt") or 0),
+            "decompose_retry": budget.spend_decompose_retry().decompose_retry,
+            "replan_attempt": budget.replan_attempt,
         },
     )
     return [CreateTask(retry)]
@@ -1522,10 +1426,11 @@ def _replan_or_fail(completed: TaskNode, tasks: List[TaskNode], *,
     """Escalate an exhausted regenerate budget to a fresh DECOMPOSE.
 
     When a SCAFFOLD/APPLY has spent its per-manifest
-    :data:`_REGENERATE_BUDGET` the manifest itself is the suspect, not
-    the generation of any single file. Before failing the session
-    terminally the router escalates *once* (capped by
-    :data:`_REPLAN_BUDGET`) to a revised plan: it abandons the live
+    :data:`~cgx.session.budget.REGENERATE_BUDGET` the manifest itself is
+    the suspect, not the generation of any single file. Before failing
+    the session terminally the router escalates *once* (capped by
+    :data:`~cgx.session.budget.REPLAN_BUDGET`) to a revised plan: it
+    abandons the live
     subtree under the failing SCAFFOLD and spawns a fresh DECOMPOSE whose
     goal folds in ``failure_note`` so the planner can restructure the
     manifest. The ``replan_attempt`` counter threads DECOMPOSE ->
@@ -1539,8 +1444,8 @@ def _replan_or_fail(completed: TaskNode, tasks: List[TaskNode], *,
         session_id=completed.session_id, status=SessionStatus.FAILED)]
     if scaffold is None:
         return fail
-    prior_replans = int(scaffold.inputs.get("replan_attempt") or 0)
-    if prior_replans >= _REPLAN_BUDGET:
+    budget = LoopBudget.from_inputs(scaffold.inputs)
+    if budget.replan_exhausted:
         # Budgets spent. Rather than discard every file that generated
         # cleanly, proceed with the survivors on the normal edge (the
         # empty return lets the dispatcher take SCAFFOLD -> APPLY /
@@ -1569,7 +1474,7 @@ def _replan_or_fail(completed: TaskNode, tasks: List[TaskNode], *,
             "requirements_artifact_id":
                 scaffold.inputs.get("requirements_artifact_id"),
             "answers": answers,
-            "replan_attempt": prior_replans + 1,
+            "replan_attempt": budget.spend_replan().replan_attempt,
         },
     )
     actions: List[RouterAction] = []
@@ -1596,7 +1501,8 @@ def _scaffold_failed_files_actions(completed: TaskNode,
     downstream collection error the test-repair loop cannot fix: there is
     nothing to patch because the file is simply absent. Mirroring
     :func:`_apply_failed_files_actions`, any SCAFFOLD that dropped a file
-    re-scaffolds within :data:`_REGENERATE_BUDGET`, folding the concrete
+    re-scaffolds within :data:`~cgx.session.budget.REGENERATE_BUDGET`,
+    folding the concrete
     per-file errors into the regenerate constraint so the retry has
     actionable feedback. When that budget is spent the router escalates
     once to a revised manifest via :func:`_replan_or_fail` (a fresh
@@ -1615,8 +1521,7 @@ def _scaffold_failed_files_actions(completed: TaskNode,
     constraint = _invalid_scaffold_constraint(
         failed_count, apply_failed=None,
         scaffold_failed=outputs.get("failed"))
-    prior_regens = int(completed.inputs.get("regenerate_attempt") or 0)
-    if prior_regens >= _REGENERATE_BUDGET:
+    if LoopBudget.from_inputs(completed.inputs).regenerate_exhausted:
         return _replan_or_fail(
             completed, tasks, scaffold=completed,
             failure_note=str(constraint.get("rationale") or ""))
@@ -1686,7 +1591,8 @@ def _scaffold_contract_regenerate_actions(
     a scaffold where every file generated but a file-attributable contract
     (a declared function/constant/schema whose named module never provides
     it) is unmet, folding the unmet contracts in as a whole-tree
-    regenerate constraint. Bounded by :data:`_REGENERATE_BUDGET` and
+    regenerate constraint. Bounded by
+    :data:`~cgx.session.budget.REGENERATE_BUDGET` and
     deliberately **non-terminal**: once the budget is spent the empty
     return lets the dispatcher take SCAFFOLD -> APPLY so VERIFY -- which
     exercises the contract against a real suite -- makes the final call
@@ -1702,8 +1608,7 @@ def _scaffold_contract_regenerate_actions(
     actionable = _actionable_contract_warnings(outputs)
     if not actionable:
         return []
-    prior_regens = int(completed.inputs.get("regenerate_attempt") or 0)
-    if prior_regens >= _REGENERATE_BUDGET:
+    if LoopBudget.from_inputs(completed.inputs).regenerate_exhausted:
         return []
     constraint = _contract_regenerate_constraint(actionable)
     actions: List[RouterAction] = []
@@ -1743,8 +1648,7 @@ def _scaffold_resume_actions(
     resume_id = str(resume_scaffold_artifact_id or "").strip()
     if not resume_id:
         return []
-    prior_regens = int(failed.inputs.get("regenerate_attempt") or 0)
-    if prior_regens >= _REGENERATE_BUDGET:
+    if LoopBudget.from_inputs(failed.inputs).regenerate_exhausted:
         return []
     actions: List[RouterAction] = []
     skip_states = {TaskNodeStatus.DONE, TaskNodeStatus.FAILED,

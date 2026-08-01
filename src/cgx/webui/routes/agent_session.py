@@ -141,7 +141,7 @@ async def _drain_ready(runner: SessionRunner, session_id: str,
     API_CHECK / SMOKE / VERIFY failure can splice in a bounded REPAIR
     detour -- either a regenerate (fresh SCAFFOLD -> APPLY -> ...) or a
     patch (APPLY -> VERIFY). Those detours are capped inside the router
-    (``_REPAIR_BUDGET`` / ``_REGENERATE_BUDGET`` plus no-progress
+    (``REPAIR_BUDGET`` / ``REGENERATE_BUDGET`` plus no-progress
     signature guards), so the total per drive is bounded well under the
     cap; the previous default of 6 cut the very first repair cycle off
     mid-pipeline and left the regenerated APPLY stuck at READY.
