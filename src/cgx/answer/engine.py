@@ -3637,6 +3637,26 @@ def generate_single_scaffold_file(
                 syntax_ok = False
                 syntax_error = diag.error
 
+    # requirements.txt content gate: symmetric with the JSON/TOML gates
+    # above. There is no stdlib parser for pip's requirements format, but
+    # the live failure mode is severe: a model pasted a Python module's
+    # source into requirements.txt and pip tolerated enough of it that
+    # the venv provisioned against a corrupted manifest. Validate
+    # line-by-line against a plausible PEP-508-ish specifier shape with
+    # one targeted repair retry; an unfixable body fails the file so the
+    # regenerate edge retries it rather than APPLY shipping garbage.
+    if syntax_ok and content and _is_requirements_txt_path(path):
+        req_err = _requirements_content_error(content)
+        if req_err:
+            retry = _syntax_repair_retry(
+                provider, path=path, lang="pip requirements",
+                error=req_err, broken=content, budget=budget)
+            if retry and not _requirements_content_error(retry):
+                content = retry
+            else:
+                syntax_ok = False
+                syntax_error = req_err
+
     # Extension/content mismatch check: a 3B model frequently emits Vue
     # SFC content under a .jsx path, or vice versa. These heuristics catch
     # the cross-framework mistakes before APPLY writes garbage to disk.
@@ -3744,6 +3764,56 @@ def _is_pytest_test_path(path: str) -> bool:
         return False
     base = p.rsplit("/", 1)[-1]
     return base.startswith("test_") or base.endswith("_test.py")
+
+
+def _is_requirements_txt_path(path: str) -> bool:
+    """True when ``path`` is a pip requirements file (requirements*.txt)."""
+    base = path.strip().lower().rsplit("/", 1)[-1]
+    return base.startswith("requirements") and base.endswith(".txt")
+
+
+# One plausible pip-requirements line: an include/option flag, or a PEP
+# 508-ish specifier -- distribution name, optional extras, then an
+# optional version-specifier list / direct-URL reference / environment
+# marker. Deliberately permissive about versions; its job is rejecting
+# source code masquerading as a requirement, not full PEP 508 parsing.
+_REQ_SPEC_OPS = r"(?:===|==|!=|<=|>=|~=|<|>)"
+_REQUIREMENT_LINE_RE = re.compile(
+    r"^(?:"
+    r"-(?:r|c|e)\s+\S+"                                   # -r/-c/-e refs
+    r"|--?[A-Za-z][A-Za-z0-9-]*(?:[= ]\s*\S+)?"           # pip options
+    r"|[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?"        # dist name
+    r"(?:\[[A-Za-z0-9,._\s-]*\])?"                        # extras
+    r"(?:\s*@\s*\S+"                                      # direct URL
+    r"|\s*" + _REQ_SPEC_OPS + r"\s*[A-Za-z0-9.*+!_-]+"    # version spec
+    r"(?:\s*,\s*" + _REQ_SPEC_OPS + r"\s*[A-Za-z0-9.*+!_-]+)*)?"
+    r"(?:\s*;.*)?"                                        # env marker
+    r")$"
+)
+
+
+def _requirements_content_error(content: str) -> Optional[str]:
+    """Return a diagnostic when ``content`` is not a requirements file.
+
+    Checks every non-empty, non-comment line against
+    :data:`_REQUIREMENT_LINE_RE`; ``None`` means every line is a
+    plausible requirement specifier. The message lists the first few
+    offending lines so the repair retry (and the router's regenerate
+    constraint on failure) is concrete.
+    """
+    bad: List[str] = []
+    for i, raw in enumerate(content.splitlines(), start=1):
+        line = re.split(r"\s#", raw)[0].strip()
+        if not line or line.startswith("#"):
+            continue
+        if not _REQUIREMENT_LINE_RE.match(line):
+            bad.append(f"line {i}: {line[:80]!r}")
+            if len(bad) >= 5:
+                break
+    if not bad:
+        return None
+    return ("not a valid pip requirements file; offending line(s): "
+            + "; ".join(bad))
 
 
 def _has_collectable_pytest_test(content: str) -> bool:

@@ -75,17 +75,20 @@ def run_api_check(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     else:
         timeout = float(task.inputs.get("probe_timeout")
                         or _DEFAULT_PROBE_TIMEOUT)
-        rows, probe_error = _probe_references(python_exe, specs, timeout)
+        rows, probe_error = _probe_references(python_exe, specs, timeout,
+                                              root)
         if probe_error:
             outcome = "skipped"
         else:
             outcome = "passed" if all(r["ok"] for r in rows) else "failed"
 
     first_party_mods = _applied_first_party_modules(applied_files)
+    uninstallable_roots = _uninstallable_import_roots(task, deps)
     rows = _attach_references(rows, references)
     for r in rows:
         if not r.get("ok"):
-            r["category"] = _row_category(r, first_party_mods)
+            r["category"] = _row_category(r, first_party_mods,
+                                          uninstallable_roots)
     failed = [r for r in rows if not r["ok"]]
     # A top-level package that is simply absent from the venv is a
     # bootstrap/install problem, not a hallucinated API. Split those out
@@ -260,18 +263,27 @@ print(json.dumps(out))
 def _probe_references(python_exe: str,
                       specs: List[Tuple[str, str]],
                       timeout: float,
+                      root: Path,
                       ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
     """Run all (module, name) probes in a single subprocess.
 
     Returns (rows, probe_error). When ``probe_error`` is non-empty
     the run never completed -- callers should treat the result as
     ``skipped`` and surface the message for diagnostics.
+
+    The probe runs with ``cwd=root`` and ``-I`` (isolated mode) so it
+    sees exactly the project venv's import universe. Without this the
+    subprocess inherits the CGX server's working directory, which ``-c``
+    puts on ``sys.path``, letting the server's own files (e.g. a root
+    ``app.py`` launcher) shadow the probed modules and produce false
+    verdicts.
     """
     payload = json.dumps([list(s) for s in specs])
     try:
         proc = subprocess.run(
-            [python_exe, "-c", _PROBE_SCRIPT],
+            [python_exe, "-I", "-c", _PROBE_SCRIPT],
             input=payload, capture_output=True, text=True, timeout=timeout,
+            cwd=str(root),
         )
     except subprocess.TimeoutExpired:
         return [], "[timeout]"
@@ -330,8 +342,37 @@ def _applied_first_party_modules(applied_files: List[str]) -> frozenset:
     return frozenset(mods)
 
 
+def _uninstallable_import_roots(task: TaskNode,
+                                deps: ExecutorDeps) -> frozenset:
+    """Import roots BOOTSTRAP_ENV already failed to pip-install.
+
+    Reads the ``uninstallable`` list from the upstream BUILD_REPORT --
+    scan-discovered (undeclared) packages whose install failed, recorded
+    non-fatally so this task owns their diagnosis -- and maps the PyPI
+    names back to plausible import roots. A probe failure on such a root
+    must not be classified ``missing_dependency``: pip has already
+    proven it cannot satisfy the name, so an ``install_deps`` repair
+    would loop. Best-effort: any lookup problem yields the empty set.
+    """
+    build_id = str(task.inputs.get("build_artifact_id") or "").strip()
+    if not build_id or deps.store is None:
+        return frozenset()
+    art = deps.store.get_artifact(build_id)
+    if art is None or art.kind is not ArtifactKind.BUILD_REPORT:
+        return frozenset()
+    names = (art.content or {}).get("uninstallable")
+    if not isinstance(names, list) or not names:
+        return frozenset()
+    try:
+        from cgx.session.tasks.bootstrap_env import _import_roots_for
+        return _import_roots_for([str(n) for n in names])
+    except Exception:  # pragma: no cover - defensive
+        return frozenset(str(n).lower().replace("-", "_") for n in names)
+
+
 def _row_category(row: Dict[str, Any],
-                  first_party_mods: frozenset) -> str:
+                  first_party_mods: frozenset,
+                  uninstallable_roots: frozenset = frozenset()) -> str:
     """Classify a failed probe row as missing-dependency vs hallucination.
 
     ``missing_dependency`` when a whole top-level package is absent from
@@ -340,9 +381,11 @@ def _row_category(row: Dict[str, Any],
     module present on disk. That is a bootstrap/install problem: the
     referenced symbol may be perfectly valid. Everything else -- an
     ``AttributeError`` on an installed module, a missing *submodule* of an
-    installed package (``No module named 'flask.foo'``), or a dotless name
+    installed package (``No module named 'flask.foo'``), a dotless name
     that matches a first-party module reached by the wrong import path
-    (``app`` when the file is ``backend/app.py``) -- is a genuine
+    (``app`` when the file is ``backend/app.py``), or a name BOOTSTRAP_ENV
+    already failed to pip-install (``uninstallable_roots`` -- typically a
+    hallucinated module like ``core``) -- is a genuine
     ``api_check_failure`` (hallucinated / mis-routed import) that pip
     cannot fix, so it routes to a regenerate instead of a no-op
     ``install_deps`` loop.
@@ -350,7 +393,10 @@ def _row_category(row: Dict[str, Any],
     err = str(row.get("error") or "")
     m = _NO_MODULE_RE.search(err)
     if m and "." not in m.group(1):
-        if m.group(1) in first_party_mods:
+        root_name = m.group(1)
+        if root_name in first_party_mods:
+            return "api_check_failure"
+        if root_name.lower().replace("-", "_") in uninstallable_roots:
             return "api_check_failure"
         return "missing_dependency"
     return "api_check_failure"

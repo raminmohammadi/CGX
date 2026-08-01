@@ -666,6 +666,54 @@ def test_scaffold_py_syntax_error_flags_when_retry_still_broken():
     assert out.get("syntax_error")
 
 
+# Live failure shape: a Python module's source pasted into
+# requirements.txt (pip tolerated enough of it that the venv provisioned
+# against a corrupted manifest).
+_BAD_REQS = ("import sqlite3\n\n"
+             "def init_db():\n    return True\n")
+_GOOD_REQS = ("# web stack\n"
+              "flask==2.3.2\n"
+              "flask-cors>=4.0.0\n"
+              "uvicorn[standard]\n"
+              "-r base.txt\n"
+              "pytest; python_version >= \"3.8\"\n")
+
+
+def test_requirements_content_error_accepts_valid_specifiers():
+    from cgx.answer.engine import _requirements_content_error
+    assert _requirements_content_error(_GOOD_REQS) is None
+
+
+def test_requirements_content_error_rejects_python_source():
+    from cgx.answer.engine import _requirements_content_error
+    err = _requirements_content_error(_BAD_REQS)
+    assert err and "line 1" in err
+
+
+def test_scaffold_requirements_gate_retries_and_recovers():
+    from cgx.answer.engine import generate_single_scaffold_file
+    provider = _QueueProvider([_BAD_REQS, _GOOD_REQS])
+    out = generate_single_scaffold_file(
+        "requirements.txt", "python deps", provider,
+        layer="deps", goal="build an app",
+    )
+    assert provider.calls == 2, "requirements gate must trigger one retry"
+    assert out["syntax_ok"] is True
+    assert out["content"] == _GOOD_REQS
+
+
+def test_scaffold_requirements_gate_flags_when_retry_still_broken():
+    from cgx.answer.engine import generate_single_scaffold_file
+    provider = _QueueProvider([_BAD_REQS, _BAD_REQS])
+    out = generate_single_scaffold_file(
+        "requirements.txt", "python deps", provider,
+        layer="deps", goal="build an app",
+    )
+    assert provider.calls == 2
+    assert out["syntax_ok"] is False
+    assert "requirements" in out.get("syntax_error", "")
+
+
 def test_new_file_body_from_patch_roundtrips_and_rejects_modifications():
     from cgx.answer.engine import (
         _content_to_new_file_patch, _new_file_body_from_patch)

@@ -25,7 +25,7 @@ APPLY / VERIFY without changing the router's shape.
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from cgx.session.actions import (
     AttachDecisionToTask,
@@ -795,7 +795,26 @@ def _preverify_gate_terminal_actions(
 
 
 def _scaffold_to_apply(parent: TaskNode) -> List[TaskNode]:
-    """Spawn the APPLY follow-up for a finished SCAFFOLD."""
+    """Spawn the APPLY follow-up for a finished SCAFFOLD.
+
+    A repair-driven regenerate folds the failed chain's flap ledger
+    (``prior_failure_signatures``) into the SCAFFOLD's inputs; thread it
+    into the new APPLY -> ... -> VERIFY chain so a regenerated tree that
+    reproduces the identical failure is stopped by ``budget.seen()``
+    instead of looping. The repair *attempt* counter deliberately does
+    not survive (each regenerated tree gets a fresh repair budget,
+    bounded by ``repair_regenerate_attempt``).
+    """
+    inputs: Dict[str, Any] = {
+        "scaffold_artifact_id": parent.produced_artifact_id,
+        "plan_artifact_id": parent.produced_artifact_id,
+        "prior_goal": parent.inputs.get("prior_goal"),
+        "mode": SessionMode.GREENFIELD.value,
+    }
+    signatures = list(LoopBudget.from_inputs(
+        parent.inputs).prior_failure_signatures)
+    if signatures:
+        inputs["prior_failure_signatures"] = signatures
     return [TaskNode.new(
         session_id=parent.session_id,
         kind=TaskKind.APPLY,
@@ -803,12 +822,7 @@ def _scaffold_to_apply(parent: TaskNode) -> List[TaskNode]:
         description=("Apply the generated file contents to the working "
                      "tree."),
         parent_task_id=parent.task_id,
-        inputs={
-            "scaffold_artifact_id": parent.produced_artifact_id,
-            "plan_artifact_id": parent.produced_artifact_id,
-            "prior_goal": parent.inputs.get("prior_goal"),
-            "mode": SessionMode.GREENFIELD.value,
-        },
+        inputs=inputs,
     )]
 
 

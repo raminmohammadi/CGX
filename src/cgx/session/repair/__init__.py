@@ -26,19 +26,23 @@ the router will hand off to ASK_USER instead of looping forever.
 from cgx.session.repair.classify import (
     REPAIR_CLASSIFICATIONS,
     RepairClassification,
+    circular_import_modules,
     classify_verify_report,
     failure_signature,
     missing_fixture_names,
     missing_module_names,
+    required_package_names,
     third_party_import_breaks,
 )
 
 __all__ = [
     "REPAIR_CLASSIFICATIONS",
     "RepairClassification",
+    "circular_import_modules",
     "classify_verify_report",
     "failure_signature",
     "missing_fixture_names",
     "missing_module_names",
+    "required_package_names",
     "third_party_import_breaks",
 ]

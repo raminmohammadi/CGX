@@ -28,9 +28,11 @@ from cgx.trace import traced
 
 
 REPAIR_CLASSIFICATIONS: Tuple[str, ...] = (
+    "circular_import",
     "third_party_import_break",
     "relative_import_error",
     "unittest_pytest_mix",
+    "missing_dependency",
     "missing_module_pythonpath",
     "missing_fixture",
     "empty_test_suite",
@@ -61,6 +63,19 @@ _UNITTEST_HELPER_RE = re.compile(
 _MODULE_NOT_FOUND_RE = re.compile(
     r"ModuleNotFoundError:\s+No module named\s+"
     r"'([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)'"
+)
+
+# A library named the exact pip package it needs: optional-extra guards
+# like starlette's ``testclient`` raise ``RuntimeError("The
+# starlette.testclient module requires the httpx package to be
+# installed...")`` when the transitive extra is absent. No first-party
+# file imports the package directly, so BOOTSTRAP_ENV's file-scan
+# preflight never installs it -- and regenerating source can never fix
+# it. Matched *before* ``missing_module_pythonpath``: the same failure
+# text usually carries the guard's internal ModuleNotFoundError, which
+# would otherwise misroute the repair to a source regenerate.
+_REQUIRES_PACKAGE_RE = re.compile(
+    r"requires the\s+([A-Za-z0-9][A-Za-z0-9._-]*)\s+package to be installed"
 )
 
 # Pytest emits ``fixture '<name>' not found`` (with a leading ``E`` in
@@ -95,6 +110,25 @@ _CANNOT_IMPORT_NAME_RE = re.compile(
     r"from\s+'([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)'"
 )
 
+# A first-party import cycle. Python names the module it could not finish
+# initialising in one of two shapes -- ``ImportError: cannot import name
+# 'x' from partially initialized module 'm'`` or ``AttributeError:
+# partially initialized module 'm' has no attribute 'x'`` -- usually
+# suffixed with ``(most likely due to a circular import)``. Matched before
+# every other pattern: no single-file patch can decide which import to
+# break or where the shared symbols belong, so REPAIR re-authors the
+# offending module(s) via a regenerate constraint (like
+# ``relative_import_error``) instead of the bounded LLM patch, which a
+# live run showed produces a no-op diff and burns the repair budget.
+_PARTIALLY_INITIALIZED_MODULE_RE = re.compile(
+    r"partially initialized module\s+"
+    r"'([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)'"
+)
+_CIRCULAR_IMPORT_RE = re.compile(
+    r"partially initialized module|"
+    r"most likely due to a circular import"
+)
+
 # A relative import that resolves above the package root -- ``from ..x
 # import y`` in a module that is not deep enough, or a first-party module
 # run without its package context. Python renders this as
@@ -118,12 +152,16 @@ _RELATIVE_IMPORT_RE = re.compile(
 _ClassifierFn = Callable[[Dict[str, Any]], bool]
 
 _CLASSIFIER_REGISTRY: Tuple[Tuple[RepairClassification, _ClassifierFn], ...] = (
+    ("circular_import",
+     lambda c: bool(_CIRCULAR_IMPORT_RE.search(_failure_text(c)))),
     ("third_party_import_break",
      lambda c: bool(_CANNOT_IMPORT_NAME_RE.search(_failure_text(c)))),
     ("relative_import_error",
      lambda c: bool(_RELATIVE_IMPORT_RE.search(_failure_text(c)))),
     ("unittest_pytest_mix",
      lambda c: bool(_UNITTEST_HELPER_RE.search(_failure_text(c)))),
+    ("missing_dependency",
+     lambda c: bool(_REQUIRES_PACKAGE_RE.search(_failure_text(c)))),
     ("missing_module_pythonpath",
      lambda c: bool(_MODULE_NOT_FOUND_RE.search(_failure_text(c)))),
     ("missing_fixture",
@@ -194,6 +232,40 @@ def missing_module_names(content: Dict[str, Any]) -> Tuple[str, ...]:
     blob = _failure_text(content)
     out: List[str] = []
     for m in _MODULE_NOT_FOUND_RE.finditer(blob):
+        name = m.group(1)
+        if name and name not in out:
+            out.append(name)
+    return tuple(out)
+
+
+def required_package_names(content: Dict[str, Any]) -> Tuple[str, ...]:
+    """Return the pip packages the failure explicitly asked to install.
+
+    Extracted from the ``requires the <pkg> package to be installed``
+    RuntimeError shape -- the library names the exact distribution, so
+    the install-deps route can pass it straight to pip. Order-preserving
+    and de-duplicated.
+    """
+    blob = _failure_text(content)
+    out: List[str] = []
+    for m in _REQUIRES_PACKAGE_RE.finditer(blob):
+        name = m.group(1)
+        if name and name not in out:
+            out.append(name)
+    return tuple(out)
+
+
+def circular_import_modules(content: Dict[str, Any]) -> Tuple[str, ...]:
+    """Return the dotted module names Python reported partially initialized.
+
+    These are the members of the import cycle the failure flowed through;
+    the REPAIR executor folds them into the regenerate constraint so the
+    re-authored scaffold knows exactly which modules must stop importing
+    each other. Order-preserving and de-duplicated.
+    """
+    blob = _failure_text(content)
+    out: List[str] = []
+    for m in _PARTIALLY_INITIALIZED_MODULE_RE.finditer(blob):
         name = m.group(1)
         if name and name not in out:
             out.append(name)

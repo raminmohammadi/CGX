@@ -18,8 +18,10 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from cgx.session.models import (
@@ -32,6 +34,7 @@ from cgx.session.repair.pypi_client import PyPIClient
 from cgx.session.scaffold_validate import (
     check_contract_compliance,
     cross_check_first_party_imports,
+    is_requirements_path,
     validate_scaffold_diffs,
 )
 from cgx.session.tasks.base import (
@@ -354,6 +357,60 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     if reconciled_count:
         _checkpoint_progress(deps, artifact)
 
+    # Import-coherence gate: a generated .py file that imports a module
+    # which resolves nowhere -- not to the manifest or the generated
+    # batch, not to a file on disk, not to a dependency declared in
+    # requirements.txt, and not to a real installed package -- ships a
+    # hallucinated first-party import (live failure: ``from core import
+    # compute`` with no core module anywhere). Left alone it reaches
+    # BOOTSTRAP_ENV, where pip tries to install the fabricated name and
+    # the session fails terminally. Fail the importer files here instead
+    # so the router's regenerate edge retries them with the concrete
+    # unknown-module constraint. Best-effort: a raised checker leaves
+    # the bundle untouched.
+    try:
+        coherence_failed = _import_coherence_failures(
+            existing_with_content, layers, deps.project_root)
+    except Exception:  # pragma: no cover - defensive: gate is best-effort
+        logger.exception("SCAFFOLD: import-coherence gate raised; skipping")
+        coherence_failed = []
+    if coherence_failed:
+        dropped = {f["file"] for f in coherence_failed}
+        failed.extend(coherence_failed)
+        diffs[:] = [d for d in diffs if d.get("file") not in dropped]
+        generated[:] = [g for g in generated
+                        if g.get("file") not in dropped]
+        existing_with_content[:] = [
+            e for e in existing_with_content
+            if e.get("path") not in dropped]
+        _checkpoint_progress(deps, artifact)
+
+    # Circular-import gate: two (or more) generated first-party modules
+    # importing each other survive every per-file check -- each import
+    # resolves to a real sibling -- but Python cannot initialise the
+    # cycle: pytest collection dies with "cannot import name ... from
+    # partially initialized module ..." (live failure: backend/routes.py
+    # <-> backend/models.py importing each other). Detect cycles
+    # statically over the batch's import graph and fail one file per
+    # cycle so the router's regenerate edge breaks it with a concrete
+    # constraint. Best-effort: a raised checker leaves the bundle
+    # untouched.
+    try:
+        cycle_failed = _circular_import_failures(existing_with_content)
+    except Exception:  # pragma: no cover - defensive: gate is best-effort
+        logger.exception("SCAFFOLD: circular-import gate raised; skipping")
+        cycle_failed = []
+    if cycle_failed:
+        dropped = {f["file"] for f in cycle_failed}
+        failed.extend(cycle_failed)
+        diffs[:] = [d for d in diffs if d.get("file") not in dropped]
+        generated[:] = [g for g in generated
+                        if g.get("file") not in dropped]
+        existing_with_content[:] = [
+            e for e in existing_with_content
+            if e.get("path") not in dropped]
+        _checkpoint_progress(deps, artifact)
+
     # Phase 4.1: tighten upper bounds on known-fragile peers using the
     # consumer's PyPI ``requires_dist`` *before* APPLY writes the file.
     # Network / fetch failures degrade to no-op (returns the original
@@ -429,6 +486,291 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         },
         artifact=artifact,
     )
+
+
+def _import_coherence_failures(
+        files_with_content: List[Dict[str, str]],
+        layers: List[Any],
+        project_root: Optional[str],
+) -> List[Dict[str, str]]:
+    """Flag generated ``.py`` files whose absolute imports resolve nowhere.
+
+    An import root is *unknown* when it is not stdlib, does not match any
+    module or package name derivable from the work-plan manifest or the
+    generated batch (``.py`` basenames and directory segments), does not
+    exist under ``project_root`` on disk, is not declared in the batch's
+    (or project's) requirements.txt, and is not a real package findable
+    in the running environment. Such an import can only be a
+    hallucination: APPLY would write it and BOOTSTRAP_ENV's preflight
+    would then ``pip install`` the fabricated name and fail. Returns
+    ``{file, error}`` entries shaped for the router's regenerate splice.
+    """
+    import ast as _ast
+    from cgx.codegen.env_manager import (
+        _IMPORT_TO_PYPI, _NAMESPACE_ROOTS, _STDLIB_TOP, _is_local_package)
+
+    # Module/package names resolvable inside the project: every ``.py``
+    # basename and directory segment from the manifest + generated batch.
+    known_local: set = set()
+    manifest_paths = [
+        str(e.get("path") or "").strip()
+        for lay in layers if isinstance(lay, dict)
+        for e in (lay.get("files") or []) if isinstance(e, dict)]
+    batch_paths = [str(e.get("path") or "") for e in files_with_content]
+    for p in manifest_paths + batch_paths:
+        parts = [seg for seg in p.split("/") if seg]
+        if not parts:
+            continue
+        base = parts[-1]
+        if base.endswith(".py") and base != "__init__.py":
+            known_local.add(base[:-3])
+        for seg in parts[:-1]:
+            known_local.add(seg)
+
+    # Distributions declared in the batch's requirements.txt, falling
+    # back to the on-disk one; normalised for comparison.
+    req_text: Optional[str] = None
+    for e in files_with_content:
+        if is_requirements_path(str(e.get("path") or "")):
+            req_text = str(e.get("content") or "")
+            break
+    if req_text is None and project_root:
+        req_file = Path(project_root) / "requirements.txt"
+        if req_file.is_file():
+            try:
+                req_text = req_file.read_text(encoding="utf-8",
+                                              errors="ignore")
+            except Exception:
+                req_text = None
+    declared: set = set()
+    for line in (req_text or "").splitlines():
+        line = line.split("#")[0].strip()
+        if not line or line.startswith("-"):
+            continue
+        pkg = re.split(r"[>=<!~;\[ @]", line, maxsplit=1)[0].strip()
+        if pkg:
+            declared.add(pkg.lower().replace("-", "_"))
+
+    _known_cache: Dict[str, bool] = {}
+
+    def _known(root_name: str) -> bool:
+        cached = _known_cache.get(root_name)
+        if cached is not None:
+            return cached
+        _known_cache[root_name] = True  # optimistic; flipped below
+        norm = root_name.lower().replace("-", "_")
+        if (root_name == "__future__" or norm in _STDLIB_TOP
+                or root_name in _NAMESPACE_ROOTS
+                or root_name in known_local or norm in declared):
+            return True
+        pypi = _IMPORT_TO_PYPI.get(root_name)
+        if pypi and pypi.lower().replace("-", "_") in declared:
+            return True
+        if project_root and _is_local_package(root_name, project_root):
+            return True
+        # Known-real-package probe: findable in the running environment
+        # (its site-packages or the stdlib tree) means pip can plausibly
+        # satisfy it too. Origins under the server's own cwd are ignored
+        # so CGX's own first-party modules never whitelist a name.
+        import importlib.util as _ilu
+        try:
+            spec = _ilu.find_spec(root_name)
+        except Exception:
+            spec = None
+        if spec is not None:
+            origin = getattr(spec, "origin", None) or ""
+            locations = list(
+                getattr(spec, "submodule_search_locations", None) or [])
+            stdlib_dir = os.path.dirname(os.__file__)
+            for loc in [origin] + locations:
+                loc = str(loc or "")
+                if origin in ("built-in", "frozen"):
+                    return True
+                if ("site-packages" in loc or "dist-packages" in loc
+                        or loc.startswith(stdlib_dir)):
+                    return True
+        _known_cache[root_name] = False
+        return False
+
+    out: List[Dict[str, str]] = []
+    for entry in files_with_content:
+        path = str(entry.get("path") or "")
+        content = entry.get("content") or ""
+        if not path.endswith(".py") or not content:
+            continue
+        try:
+            tree = _ast.parse(content)
+        except SyntaxError:
+            continue
+        unknown: List[str] = []
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.Import):
+                mods = [a.name or "" for a in node.names]
+            elif isinstance(node, _ast.ImportFrom) and not node.level:
+                mods = [node.module or ""]
+            else:
+                continue
+            for mod in mods:
+                root_name = mod.split(".")[0]
+                if (root_name and root_name not in unknown
+                        and not _known(root_name)):
+                    unknown.append(root_name)
+        if unknown:
+            out.append({
+                "file": path,
+                "error": (
+                    f"imports unknown module(s) {sorted(unknown)}: not "
+                    "defined in the project manifest, not on disk, and "
+                    "not declared in requirements.txt -- import only "
+                    "from the manifest's modules or its declared "
+                    "dependencies"),
+            })
+    return out
+
+
+# Basenames that mark a module as "foundational" -- the layer others build
+# on. When an import cycle must be broken, the foundational member is the
+# one regenerated (models must not import from routes, not vice versa) so
+# the retry converges on the conventional one-way layering instead of
+# arbitrarily rewriting the higher-level module.
+_FOUNDATION_MODULE_NAMES = frozenset({
+    "models", "model", "db", "database", "config", "settings",
+    "constants", "schemas", "types", "utils", "helpers", "core",
+})
+
+
+def _circular_import_failures(
+        files_with_content: List[Dict[str, str]],
+) -> List[Dict[str, str]]:
+    """Flag generated ``.py`` files that form a first-party import cycle.
+
+    Builds the directed import graph over the generated batch (module ->
+    imported sibling module, covering ``import a.b``, ``from a import b``
+    and relative forms) and finds its strongly connected components. Any
+    component with more than one module is a cycle Python cannot
+    initialise: pytest collection dies with ``ImportError: cannot import
+    name ... from partially initialized module ...``. One file per cycle
+    -- the most foundational-looking member, falling back to the first in
+    module order -- is failed with a constraint naming the modules it
+    must stop importing, shaped ``{file, error}`` for the router's
+    regenerate splice.
+    """
+    import ast as _ast
+
+    # Dotted module name + source for every generated .py file.
+    mod_by_path: Dict[str, str] = {}
+    content_by_path: Dict[str, str] = {}
+    for entry in files_with_content:
+        path = str(entry.get("path") or "")
+        content = entry.get("content")
+        if not path.endswith(".py") or not isinstance(content, str):
+            continue
+        parts = [seg for seg in path.split("/") if seg]
+        if not parts:
+            continue
+        if parts[-1] == "__init__.py":
+            dotted = ".".join(parts[:-1])
+        else:
+            dotted = ".".join(parts)[:-3]
+        if dotted:
+            mod_by_path[path] = dotted
+            content_by_path[path] = content
+    path_by_mod = {m: p for p, m in mod_by_path.items()}
+
+    def _resolve(name: str) -> Optional[str]:
+        # Longest batch module matching ``name`` or one of its prefixes:
+        # ``import backend.models.extra`` depends on ``backend.models``.
+        while name:
+            if name in path_by_mod:
+                return name
+            name = name.rpartition(".")[0]
+        return None
+
+    edges: Dict[str, set] = {m: set() for m in path_by_mod}
+    for path, mod in mod_by_path.items():
+        try:
+            tree = _ast.parse(content_by_path[path])
+        except SyntaxError:
+            continue
+        pkg_parts = mod.split(".")
+        if not path.endswith("__init__.py"):
+            pkg_parts = pkg_parts[:-1]
+        for node in _ast.walk(tree):
+            targets: List[str] = []
+            if isinstance(node, _ast.Import):
+                targets = [a.name or "" for a in node.names]
+            elif isinstance(node, _ast.ImportFrom):
+                if node.level:
+                    cut = len(pkg_parts) - (node.level - 1)
+                    if cut < 0:
+                        continue
+                    head = pkg_parts[:cut]
+                    if node.module:
+                        head = head + node.module.split(".")
+                    base = ".".join(head)
+                else:
+                    base = node.module or ""
+                if base:
+                    # ``from a import b`` may name the submodule a.b.
+                    targets = [base] + [f"{base}.{a.name}"
+                                        for a in node.names]
+            for name in targets:
+                dep = _resolve(name)
+                if dep and dep != mod:
+                    edges[mod].add(dep)
+
+    # Tarjan SCC: every component with >1 member is an import cycle.
+    index: Dict[str, int] = {}
+    low: Dict[str, int] = {}
+    on_stack: set = set()
+    stack: List[str] = []
+    cycles: List[List[str]] = []
+    counter = [0]
+
+    def _scc(v: str) -> None:
+        index[v] = low[v] = counter[0]
+        counter[0] += 1
+        stack.append(v)
+        on_stack.add(v)
+        for w in sorted(edges.get(v, ())):
+            if w not in index:
+                _scc(w)
+                low[v] = min(low[v], low[w])
+            elif w in on_stack:
+                low[v] = min(low[v], index[w])
+        if low[v] == index[v]:
+            comp: List[str] = []
+            while True:
+                w = stack.pop()
+                on_stack.discard(w)
+                comp.append(w)
+                if w == v:
+                    break
+            if len(comp) > 1:
+                cycles.append(sorted(comp))
+
+    for v in sorted(edges):
+        if v not in index:
+            _scc(v)
+
+    out: List[Dict[str, str]] = []
+    for comp in cycles:
+        members = set(comp)
+        foundational = [m for m in comp
+                        if m.rsplit(".", 1)[-1] in _FOUNDATION_MODULE_NAMES]
+        target = foundational[0] if foundational else comp[0]
+        offenders = sorted(edges[target] & members)
+        out.append({
+            "file": path_by_mod[target],
+            "error": (
+                f"circular import among first-party modules {comp}: this "
+                f"file imports {offenders}, which import(s) it back, so "
+                "Python cannot finish initialising either module -- "
+                f"regenerate this file WITHOUT importing {offenders}; "
+                "define the needed symbols locally (or accept them as "
+                "function parameters) so the dependency is one-way"),
+        })
+    return out
 
 
 def _generate_one(

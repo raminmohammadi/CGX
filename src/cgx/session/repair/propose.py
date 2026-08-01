@@ -516,6 +516,7 @@ def propose_regenerate(
     regenerate_files: Optional[Sequence[str]] = None,
     prior_scaffold_artifact_id: Optional[str] = None,
     resume_scaffold_artifact_id: Optional[str] = None,
+    prior_failure_signatures: Optional[Sequence[str]] = None,
 ) -> TaskNode:
     """Return a sibling SCAFFOLD task with ``new_constraints`` folded in.
 
@@ -587,6 +588,19 @@ def propose_regenerate(
         inputs["resume_scaffold_artifact_id"] = str(resume_scaffold_artifact_id)
     else:
         inputs.pop("resume_scaffold_artifact_id", None)
+    # Fold the failed chain's flap ledger into the new SCAFFOLD so the
+    # regenerated APPLY -> ... -> VERIFY chain is not amnesiac: a
+    # regenerate that reproduces the identical failure signature is
+    # stopped by the router's ``budget.seen()`` backstop instead of
+    # burning the whole regenerate budget on a fix that cannot work.
+    if prior_failure_signatures:
+        merged = [str(s) for s in
+                  (inputs.get("prior_failure_signatures") or [])]
+        for sig in prior_failure_signatures:
+            s = str(sig).strip()
+            if s and s not in merged:
+                merged.append(s)
+        inputs["prior_failure_signatures"] = merged
     return TaskNode.new(
         session_id=scaffold_task.session_id,
         kind=TaskKind.SCAFFOLD,

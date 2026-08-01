@@ -130,6 +130,11 @@ def _repair_regenerate_actions(completed: TaskNode,
     the regenerated
     SCAFFOLD carries ``repair_regenerate_attempt + 1`` so this loop stays
     finite even though ``repair_attempt`` does not survive the regenerate.
+    ``prior_failure_signatures`` *do* survive: they are folded into the
+    new SCAFFOLD's inputs (and threaded down its APPLY -> ... -> VERIFY
+    chain) so a regenerated tree that fails on the identical signature
+    is stopped by the flap detector instead of looping until the
+    regenerate budget is spent.
     """
     from cgx.session.repair.propose import propose_regenerate  # local import: dep direction
 
@@ -155,7 +160,10 @@ def _repair_regenerate_actions(completed: TaskNode,
             continue
         actions.append(UpdateTaskStatus(
             task_id=t.task_id, status=TaskNodeStatus.ABANDONED))
-    new_scaffold = propose_regenerate(scaffold, extra_constraints)
+    new_scaffold = propose_regenerate(
+        scaffold, extra_constraints,
+        prior_failure_signatures=LoopBudget.from_inputs(
+            completed.inputs).prior_failure_signatures)
     new_scaffold.inputs["repair_regenerate_attempt"] = (
         scaffold_budget.spend_repair_regenerate().repair_regenerate_attempt)
     actions.append(CreateTask(new_scaffold))
