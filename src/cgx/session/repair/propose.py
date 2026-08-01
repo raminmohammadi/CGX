@@ -514,6 +514,7 @@ def propose_regenerate(
     new_constraints: Dict[str, Any],
     *,
     regenerate_files: Optional[Sequence[str]] = None,
+    additional_files: Optional[Sequence[Dict[str, Any]]] = None,
     prior_scaffold_artifact_id: Optional[str] = None,
     resume_scaffold_artifact_id: Optional[str] = None,
     prior_failure_signatures: Optional[Sequence[str]] = None,
@@ -554,6 +555,13 @@ def propose_regenerate(
     logic failure), any stale targeted markers copied from the prior
     inputs are cleared so the next attempt regenerates the full tree.
 
+    ``additional_files`` (``{path, description}`` dicts) covers the
+    failure mode regeneration alone cannot fix: a file the toolchain
+    requires but the manifest never named. They accumulate across
+    attempts under ``additional_files`` -- deduplicated by path, first
+    description wins -- and SCAFFOLD appends them to the manifest it
+    generates from.
+
     When ``resume_scaffold_artifact_id`` is supplied (the crash-resume
     router path for a SCAFFOLD that died mid-run), it is stamped into
     ``inputs`` so the fresh SCAFFOLD seeds every file the crashed attempt
@@ -584,6 +592,10 @@ def propose_regenerate(
         # prior inputs so a later attempt cannot silently skip files.
         inputs.pop("regenerate_files", None)
         inputs.pop("prior_scaffold_artifact_id", None)
+    extra_files = _merge_additional_files(
+        inputs.get("additional_files"), additional_files)
+    if extra_files:
+        inputs["additional_files"] = extra_files
     if resume_scaffold_artifact_id:
         inputs["resume_scaffold_artifact_id"] = str(resume_scaffold_artifact_id)
     else:
@@ -612,6 +624,35 @@ def propose_regenerate(
 
 
 # --------------------- helpers ---------------------
+
+
+def _merge_additional_files(
+        prior: Any,
+        new: Optional[Sequence[Dict[str, Any]]]) -> List[Dict[str, str]]:
+    """Merge two ``{path, description}`` lists, deduplicated by path.
+
+    Accumulating rather than replacing matters: a second regenerate that
+    names a different missing file must not drop the first one, or the
+    loop alternates between two absent entry points forever. Malformed
+    entries and blank paths are discarded; the first description for a
+    path wins, so a later, vaguer restatement cannot dilute it.
+    """
+    out: List[Dict[str, str]] = []
+    seen: set = set()
+    for source in (prior, new):
+        if not isinstance(source, (list, tuple)):
+            continue
+        for item in source:
+            if not isinstance(item, dict):
+                continue
+            path = str(item.get("path") or "").strip()
+            if not path or path in seen:
+                continue
+            seen.add(path)
+            out.append(
+                {"path": path,
+                 "description": str(item.get("description") or path).strip()})
+    return out
 
 # ``class Foo:`` or ``class Foo(Bar, Baz):`` -- captures the indent,
 # the name, the optional base list, and the trailing colon (with any

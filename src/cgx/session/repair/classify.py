@@ -141,6 +141,18 @@ _RELATIVE_IMPORT_RE = re.compile(
     r"with no known parent package)"
 )
 
+# A bundler (Vite/Rollup) that cannot find the file it was told to start
+# from: ``[UNRESOLVED_ENTRY] Cannot resolve entry module index.html`` /
+# ``Could not resolve entry module "src/main.jsx"``. Unlike every other
+# build error this one is not a defect *in* a generated file -- the file
+# is absent -- so the regenerate loop must add it, not re-author around
+# it.
+_UNRESOLVED_ENTRY_RE = re.compile(
+    r"(?:annot|ould not) resolve entry module\s+[\"']?"
+    r"([A-Za-z0-9_.@/\\-]+?)[\"']?[.\s]*$",
+    re.MULTILINE,
+)
+
 
 # --------------------- registry ---------------------
 
@@ -286,6 +298,24 @@ def missing_fixture_names(content: Dict[str, Any]) -> Tuple[str, ...]:
         name = m.group(1)
         if name and name not in out:
             out.append(name)
+    return tuple(out)
+
+
+def unresolved_entry_paths(text: str) -> Tuple[str, ...]:
+    """Return the entry modules a bundler reported it could not resolve.
+
+    Takes the raw build stderr (the SMOKE build-smoke tail) rather than a
+    report dict because that is the only place the error appears. The
+    paths are normalised to forward slashes and stripped of a leading
+    ``./``; order-preserving and de-duplicated. Callers treat these as
+    files that must be *added* to the manifest -- the bundler is looking
+    for something the scaffold never generated.
+    """
+    out: List[str] = []
+    for m in _UNRESOLVED_ENTRY_RE.finditer(str(text or "")):
+        path = m.group(1).replace("\\", "/").strip().lstrip("./")
+        if path and path not in out:
+            out.append(path)
     return tuple(out)
 
 

@@ -133,6 +133,17 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     # back to a whole-tree regenerate when the marker or prior artifact is
     # absent, so the happy path is unchanged.
     regen_set = _resolve_regenerate_set(task, deps)
+
+    # Regenerate that must *add* files (B: missing entry point): a build
+    # that cannot resolve an entry module is not fixable by re-authoring
+    # the planned files -- the file the toolchain wants was never in the
+    # manifest. REPAIR names it in ``additional_files``; fold those
+    # entries into the manifest for this attempt (and into the targeted
+    # set, so they are actually generated rather than skipped).
+    layers, added_paths = _with_additional_files(task, layers)
+    if added_paths and regen_set is not None:
+        regen_set = regen_set | set(added_paths)
+
     if regen_set is not None:
         for reused in _reused_good_files(task, deps, regen_set):
             diffs.append({"file": reused["path"], "patch": reused["patch"]})
@@ -973,6 +984,59 @@ def _resolve_regenerate_set(
         return None
     regen = {str(p).strip() for p in files if str(p).strip()}
     return regen or None
+
+
+def _with_additional_files(
+        task: TaskNode,
+        layers: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Return ``layers`` extended with the regenerate's ``additional_files``.
+
+    A missing entry point (``[UNRESOLVED_ENTRY] Cannot resolve entry
+    module index.html``) is a file that does not exist, not a file that
+    is wrong: regenerating the manifest verbatim reproduces it forever,
+    which is exactly how a repair loop burns its whole budget on one
+    build error. REPAIR therefore names the absent paths and SCAFFOLD
+    appends them to the last populated layer, so they are generated with
+    the rest of the tree as context.
+
+    The work plan artifact is never mutated -- the affected layer is
+    shallow-copied. Paths already in the manifest are ignored, so a
+    stale marker cannot duplicate an entry. Returns the (possibly
+    unchanged) layers and the paths that were added.
+    """
+    raw = task.inputs.get("additional_files")
+    if not isinstance(raw, list) or not raw:
+        return layers, []
+    have = {str(e.get("path") or "").strip()
+            for lay in layers if isinstance(lay, dict)
+            for e in (lay.get("files") or []) if isinstance(e, dict)}
+    new_entries: List[Dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("path") or "").strip()
+        if not path or path in have:
+            continue
+        have.add(path)
+        new_entries.append(
+            {"path": path,
+             "description": str(item.get("description") or path).strip()})
+    if not new_entries:
+        return layers, []
+    idx = next((i for i in range(len(layers) - 1, -1, -1)
+                if isinstance(layers[i], dict) and layers[i].get("files")),
+               None)
+    if idx is None:
+        return layers, []
+    out = list(layers)
+    target = dict(out[idx])
+    target["files"] = list(target.get("files") or []) + new_entries
+    out[idx] = target
+    added = [e["path"] for e in new_entries]
+    logger.warning(
+        "SCAFFOLD: regenerate adds file(s) absent from the manifest: %s",
+        added)
+    return out, added
 
 
 def _reused_good_files(

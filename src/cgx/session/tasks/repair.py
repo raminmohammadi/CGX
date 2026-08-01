@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from cgx.session.budget import LoopBudget
 from cgx.session.models import (
@@ -45,6 +45,7 @@ from cgx.session.repair.classify import (
     runtime_failure_text,
     third_party_import_breaks,
     traceback_source_files,
+    unresolved_entry_paths,
 )
 from cgx.session.repair.locate import (
     MissingFixtureLocation,
@@ -61,6 +62,7 @@ from cgx.session.repair.propose import (
     propose_unittest_pytest_mix,
 )
 from cgx.session.repair.pypi_client import PyPIClient
+from cgx.session.scaffold_validate import stack_entry_description
 from cgx.session.tasks.base import (
     ExecutorDeps,
     ExecutorResult,
@@ -364,6 +366,7 @@ def _run_smoke_repair(task: TaskNode, deps: ExecutorDeps,
     attempt = LoopBudget.from_inputs(task.inputs).repair_attempt or 1
     classification = "smoke_import_failure"
     build_stderr = ""
+    missing_entries: Tuple[str, ...] = ()
     if failed:
         rationale = (
             f"Third-party import(s) {', '.join(failed)} failed under the "
@@ -378,10 +381,20 @@ def _run_smoke_repair(task: TaskNode, deps: ExecutorDeps,
         # only fix, so fold the build error into the regenerate feedback.
         build_stderr = str(build_smoke.get("stderr_tail") or "")
         label = str(build_smoke.get("label") or "npm run build")
-        rationale = (
-            f"The JS/TS build-smoke (`{label}`) failed: the applied "
-            "frontend does not build. Re-author the failing file(s) to "
-            "fix the reported build error.")
+        # ... unless the bundler could not resolve its *entry module*, in
+        # which case no amount of re-authoring helps: the file is absent
+        # from the manifest, so the regenerate has to add it.
+        missing_entries = unresolved_entry_paths(build_stderr)
+        if missing_entries:
+            rationale = (
+                f"The JS/TS build-smoke (`{label}`) could not resolve its "
+                f"entry module(s) {', '.join(missing_entries)}: the "
+                "file(s) were never generated. Add them to the tree.")
+        else:
+            rationale = (
+                f"The JS/TS build-smoke (`{label}`) failed: the applied "
+                "frontend does not build. Re-author the failing file(s) to "
+                "fix the reported build error.")
     else:
         rationale = (
             "SMOKE reported a failure but no failed modules were "
@@ -394,6 +407,14 @@ def _run_smoke_repair(task: TaskNode, deps: ExecutorDeps,
     if build_broke:
         extra_constraints["kind"] = "invalid_build_smoke"
         extra_constraints["build_error"] = build_stderr
+    if missing_entries:
+        # Mechanical fix for the one build failure regeneration cannot
+        # reach: the router threads these into the new SCAFFOLD's
+        # ``additional_files`` so the manifest grows the missing entry.
+        extra_constraints["kind"] = "missing_entry_module"
+        extra_constraints["missing_files"] = [
+            {"path": p, "description": stack_entry_description(p)}
+            for p in missing_entries]
     artifact = Artifact.new(
         session_id=task.session_id,
         produced_by_task_id=task.task_id,

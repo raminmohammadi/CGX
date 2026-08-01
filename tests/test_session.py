@@ -6953,6 +6953,62 @@ def test_repair_executor_emits_regenerate_for_build_smoke_failure(
     assert "build" in result.artifact.content["rationale"].lower()
 
 
+def test_repair_executor_names_unresolved_entry_module_as_missing_file(
+        store, tmp_path: Path):
+    """An unresolved entry module -> the absent file is named for the regenerate."""
+    from cgx.session.tasks import repair as _repair_module  # noqa: F401
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    smoke_task = TaskNode.new(
+        session.session_id, TaskKind.SMOKE, "smoke", inputs={})
+    smoke_artifact = Artifact.new(
+        session_id=session.session_id,
+        produced_by_task_id=smoke_task.task_id,
+        kind=ArtifactKind.SMOKE_REPORT,
+        content={"outcome": "failed",
+                 "failed_modules": [],
+                 "failure_signature": "smoke_import|npm run build --silent",
+                 "modules": [],
+                 "build_smoke": {
+                     "label": "npm run build --silent",
+                     "ok": False,
+                     "stderr_tail": (
+                         "error during build:\n"
+                         "[UNRESOLVED_ENTRY] Cannot resolve entry module "
+                         "index.html.\n")}})
+    store.save_task(smoke_task)
+    store.save_artifact(smoke_artifact)
+    repair_task = TaskNode.new(
+        session.session_id, TaskKind.REPAIR, "repair",
+        inputs={"smoke_artifact_id": smoke_artifact.artifact_id,
+                "mode": SessionMode.GREENFIELD.value,
+                "repair_attempt": 1})
+    deps = ExecutorDeps(project_root=str(tmp_path), store=store)
+    from cgx.session.tasks.base import _REGISTRY
+    result = _REGISTRY[TaskKind.REPAIR](repair_task, deps)
+    assert result.failure is None
+    assert result.outputs["strategy"] == "regenerate"
+    constraints = result.outputs["extra_constraints"]
+    assert constraints["kind"] == "missing_entry_module"
+    assert [f["path"] for f in constraints["missing_files"]] == ["index.html"]
+    assert constraints["missing_files"][0]["description"]
+
+
+def test_unresolved_entry_paths_parses_rollup_and_vite_wordings():
+    from cgx.session.repair.classify import unresolved_entry_paths
+    assert unresolved_entry_paths(
+        "[UNRESOLVED_ENTRY] Cannot resolve entry module index.html.") == (
+            "index.html",)
+    assert unresolved_entry_paths(
+        'Could not resolve entry module "./src/main.jsx".') == (
+            "src/main.jsx",)
+    # Deduplicated across repeats, and an unrelated build error is inert.
+    assert unresolved_entry_paths(
+        "Cannot resolve entry module index.html\n"
+        "Cannot resolve entry module index.html\n") == ("index.html",)
+    assert unresolved_entry_paths("src/App.jsx: TS2345") == ()
+
+
 def test_classify_missing_module_pythonpath_from_collection_error():
     """ModuleNotFoundError during collection -> missing_module_pythonpath."""
     from cgx.session.repair.classify import classify_verify_report
@@ -8947,6 +9003,62 @@ def test_propose_regenerate_carries_prior_failure_signatures():
     assert scaffold.inputs["prior_failure_signatures"] == ["sig-old"]
 
 
+def test_propose_regenerate_accumulates_additional_files():
+    """additional_files survive and merge across regenerate attempts."""
+    from cgx.session.repair.propose import propose_regenerate
+    scaffold = TaskNode.new(
+        "sess-A", TaskKind.SCAFFOLD, "scaffold",
+        inputs={"work_plan_artifact_id": "art_plan"})
+    first = propose_regenerate(
+        scaffold, {"kind": "missing_entry_module", "rationale": "r"},
+        additional_files=[{"path": "index.html", "description": "entry html"}])
+    assert first.inputs["additional_files"] == [
+        {"path": "index.html", "description": "entry html"}]
+    # A second attempt that names a different file keeps both, and a
+    # repeat of the first does not duplicate it.
+    second = propose_regenerate(
+        first, {"kind": "missing_entry_module", "rationale": "r"},
+        additional_files=[{"path": "index.html", "description": "again"},
+                          {"path": "src/main.jsx", "description": "entry js"}])
+    assert [f["path"] for f in second.inputs["additional_files"]] == [
+        "index.html", "src/main.jsx"]
+    assert second.inputs["additional_files"][0]["description"] == "entry html"
+    # No additional files -> the key is never introduced.
+    plain = propose_regenerate(scaffold, {"kind": "unknown", "rationale": "r"})
+    assert "additional_files" not in plain.inputs
+
+
+def test_scaffold_with_additional_files_extends_last_layer():
+    """Regenerate-added paths land in the manifest without mutating the plan."""
+    from cgx.session.tasks.scaffold import _with_additional_files
+    layers = [{"name": "ui", "files": [{"path": "src/main.jsx",
+                                        "description": "entry"}]},
+              {"name": "config", "files": [{"path": "vite.config.js",
+                                            "description": "config"}]}]
+    task = TaskNode.new(
+        "sess-A", TaskKind.SCAFFOLD, "scaffold",
+        inputs={"additional_files": [
+            {"path": "index.html", "description": "entry html"},
+            {"path": "src/main.jsx", "description": "already planned"}]})
+    out, added = _with_additional_files(task, layers)
+    assert added == ["index.html"]
+    assert [f["path"] for f in out[1]["files"]] == ["vite.config.js",
+                                                    "index.html"]
+    # The caller's layers (and the stored work plan they came from) are
+    # left untouched.
+    assert [f["path"] for f in layers[1]["files"]] == ["vite.config.js"]
+
+
+def test_scaffold_with_additional_files_noop_without_marker():
+    from cgx.session.tasks.scaffold import _with_additional_files
+    layers = [{"name": "ui", "files": [{"path": "src/main.jsx",
+                                        "description": "entry"}]}]
+    task = TaskNode.new("sess-A", TaskKind.SCAFFOLD, "scaffold", inputs={})
+    out, added = _with_additional_files(task, layers)
+    assert added == []
+    assert out is layers
+
+
 def _build_regenerate_chain(*, prior_regens: int = 0,
                             prior_repair_regens: int = 0,
                             extra_descendants: bool = True):
@@ -9022,6 +9134,25 @@ def test_router_repair_regenerate_abandons_subtree_and_requeues_scaffold():
     # DONE tasks must not be abandoned.
     done_ids = {t.task_id for t in tasks if t.status is TaskNodeStatus.DONE}
     assert abandoned_ids.isdisjoint(done_ids)
+
+
+def test_router_repair_regenerate_threads_missing_files():
+    """A missing-entry-module verdict grows the next SCAFFOLD's manifest."""
+    session, _scaffold, tasks, rep = _build_regenerate_chain()
+    rep.outputs = dict(rep.outputs)
+    rep.outputs["classification"] = "smoke_import_failure"
+    rep.outputs["extra_constraints"] = {
+        "kind": "missing_entry_module",
+        "rationale": "entry module absent",
+        "missing_files": [{"path": "index.html",
+                           "description": "entry html"}],
+    }
+    plan = Router().on_task_completed(
+        session=session, completed=rep, tasks=tasks)
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    assert len(creates) == 1
+    assert creates[0].task.inputs["additional_files"] == [
+        {"path": "index.html", "description": "entry html"}]
 
 
 def test_router_repair_regenerate_preserves_failure_signatures():

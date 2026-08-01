@@ -683,6 +683,24 @@ _STACK_ENTRY_RULES: Tuple[Tuple[Tuple[str, ...], str,
 )
 
 
+def stack_entry_description(path: str) -> str:
+    """Return the manifest description to use for entry file ``path``.
+
+    Shared by the DECOMPOSE injection and the REPAIR regenerate path so a
+    file added late (because the bundler could not resolve it) is
+    described exactly as it would have been had the planner remembered
+    it. Falls back to a generic entry-module description for paths no
+    rule covers.
+    """
+    want = str(path or "").strip().replace("\\", "/").lstrip("./")
+    for _triggers, required, _alternatives, description in _STACK_ENTRY_RULES:
+        if required == want:
+            return description
+    return (f"Build entry module {want!r}: the bundler resolves the "
+            "application from this file, so it must exist and load the "
+            "app's script entry point.")
+
+
 def missing_stack_entry_files(paths: Sequence[str]) -> List[Dict[str, str]]:
     """Return the entry files ``paths`` implies but does not contain.
 

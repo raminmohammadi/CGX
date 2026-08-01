@@ -160,8 +160,16 @@ def _repair_regenerate_actions(completed: TaskNode,
             continue
         actions.append(UpdateTaskStatus(
             task_id=t.task_id, status=TaskNodeStatus.ABANDONED))
+    # A classification whose fix is a *missing* file (a bundler entry
+    # module that was never generated) names it under ``missing_files``;
+    # thread it through so the regenerated SCAFFOLD extends the manifest
+    # instead of re-authoring the same unbuildable tree.
+    missing_files = extra_constraints.get("missing_files")
+    if not isinstance(missing_files, list):
+        missing_files = None
     new_scaffold = propose_regenerate(
         scaffold, extra_constraints,
+        additional_files=missing_files,
         prior_failure_signatures=LoopBudget.from_inputs(
             completed.inputs).prior_failure_signatures)
     new_scaffold.inputs["repair_regenerate_attempt"] = (
