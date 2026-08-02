@@ -9871,9 +9871,33 @@ def test_select_repair_strategy_regenerates_missing_fixture_without_diffs():
     strategy, constraints = _select_repair_strategy(
         classification="missing_fixture", diffs=[],
         rationale="fixture 'username' is never defined",
-        extra_plan_fields={}, locations_payload=[])
+        extra_plan_fields={"missing_fixtures": ["client", "db"]},
+        locations_payload=[])
     assert strategy == "regenerate"
     assert constraints["kind"] == "missing_fixture"
+    # The names pytest reported ride along as a structured field so the
+    # regenerated SCAFFOLD is told exactly which fixtures to author.
+    assert constraints["missing_fixtures"] == ["client", "db"]
+
+
+def test_fixture_rationale_instructs_authoring_when_no_definition():
+    """No on-disk fixture -> the rationale is an actionable authoring order.
+
+    Regression for the E2E halt where a model-authored Flask test requested
+    a ``client`` fixture that no @pytest.fixture defined. The old rationale
+    only *described* the gap, so the weak model re-emitted the same test.
+    The rationale must now instruct the regenerate to author the fixture,
+    add a conftest.py for shared fixtures, and build a web client fixture
+    from the app's test client -- naming the missing fixture.
+    """
+    from cgx.session.tasks.repair import _fixture_rationale
+    content = {"stdout": "E       fixture 'client' not found\n"}
+    text = _fixture_rationale(content, [], has_diff=False).lower()
+    assert "client" in text
+    assert "conftest" in text
+    assert "test_client" in text
+    # It is an instruction to author, not merely a diagnosis.
+    assert "author" in text
 
 
 def test_select_repair_strategy_regenerates_when_patch_oversized():

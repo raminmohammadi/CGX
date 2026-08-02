@@ -40,6 +40,7 @@ from cgx.session.repair.classify import (
     classify_runtime_report,
     classify_verify_report,
     failure_signature,
+    missing_fixture_names,
     missing_module_names,
     required_package_names,
     runtime_failure_text,
@@ -234,6 +235,12 @@ def run_repair(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             Path(deps.project_root), fx_locations)
         rationale = _fixture_rationale(content, fx_locations, bool(diffs))
         locations_payload = [_fx_loc_to_dict(loc) for loc in fx_locations]
+        # The names pytest reported live in the VERIFY content, not the
+        # located-on-disk set (empty when nothing was found to hoist -- the
+        # exact case the regenerate must author). Carry them so the
+        # regenerate constraint names the fixtures to define.
+        extra_plan_fields["missing_fixtures"] = list(
+            missing_fixture_names(content))
     elif classification == "third_party_import_break":
         pairs = third_party_import_breaks(content)
         installed = _installed_packages_from_build(deps, content)
@@ -1028,6 +1035,14 @@ def _select_repair_strategy(
             entry.get("class_name")
             for entry in locations_payload
             if entry.get("class_name")})
+    elif classification == "missing_fixture":
+        # No fixture was located to hoist, so the regenerate must author the
+        # fixtures itself. Carry the names pytest reported (threaded through
+        # extra_plan_fields from the VERIFY content) alongside the
+        # actionable rationale so SCAFFOLD's prompt builder can surface
+        # exactly which fixtures the regenerated tests must define.
+        constraints["missing_fixtures"] = list(
+            extra_plan_fields.get("missing_fixtures") or [])
     if diff_count > _PATCH_DIFF_LIMIT:
         constraints["oversized_patch"] = {
             "diff_count": diff_count,
@@ -1308,11 +1323,26 @@ def _fixture_rationale(
     from cgx.session.repair.classify import missing_fixture_names
     wanted = missing_fixture_names(content)
     if not locations:
-        names = ", ".join(wanted) if wanted else "(unknown)"
-        return (f"Pytest reported missing fixture(s) {names}, but no "
-                "matching @pytest.fixture definition was found anywhere "
-                "in the project; the fixture must be authored before "
-                "the failure can be auto-repaired.")
+        names = ", ".join(wanted) if wanted else "the reported fixture(s)"
+        # No on-disk @pytest.fixture matches, so there is nothing to hoist:
+        # the fixture was never authored. A diagnostic-only rationale left
+        # the regenerate loop churning (a weak model re-emitted the same
+        # test with the same undefined fixture). Emit an explicit authoring
+        # instruction instead so the bounded regenerate directs the model
+        # to define what it uses -- covering the common web-app ``client``
+        # fixture without hard-coding any single framework.
+        return (f"Pytest could not find the fixture(s) {names}: the test(s) "
+                "request them as arguments but no @pytest.fixture defines "
+                "them anywhere in the project. Author each missing fixture. "
+                "Put a fixture shared across test modules in a "
+                "tests/conftest.py (or the project-root conftest.py) so "
+                "pytest discovers it during collection. If a fixture is a "
+                "web-app test client (commonly named 'client'), build it "
+                "from the application object's test client -- e.g. a Flask "
+                "app's app.test_client() with app.config['TESTING']=True, or "
+                "the equivalent for the framework in use -- and never leave "
+                "a test depending on a fixture that no @pytest.fixture "
+                "provides.")
     targets = sorted({loc.target_rel_path for loc in locations})
     names = ", ".join(loc.fixture_name for loc in locations)
     if not has_diff:
