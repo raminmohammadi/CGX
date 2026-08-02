@@ -3291,6 +3291,25 @@ def _format_syntax_error(exc: SyntaxError) -> str:
     return f"{base}; offending line {getattr(exc, 'lineno', '?')}: {text[:120]!r}"
 
 
+def _looks_newline_collapsed(content: str) -> bool:
+    """True when a file body arrived as a single physical line.
+
+    Asked for strict JSON, some models never emit an escaped newline:
+    they join every line of the file with a space, so ``import sqlite3``
+    + ``from fastapi import FastAPI`` arrives as ``import sqlite3 from
+    fastapi import FastAPI``. The body is then unparseable at line 1, and
+    because every recovery path re-asks in JSON mode the *same* encoder
+    reproduces it byte for byte -- the regenerate loop cannot converge.
+    Recognising the shape lets the caller route around JSON mode instead
+    of retrying into it. The length floor keeps genuinely one-line files
+    (a single export, a one-line config) out of scope.
+    """
+    body = (content or "").strip()
+    if not body or "\n" in body:
+        return False
+    return len(body) > 120
+
+
 @traced("llm")
 def generate_single_scaffold_file(
     path: str,
@@ -3518,7 +3537,11 @@ def generate_single_scaffold_file(
     parsed = _extract_json_object(raw)
     content = str(parsed.get("content") or "") if parsed else ""
 
-    if not content:
+    # The freeform path is also the escape hatch for a body whose newlines
+    # the JSON encoder dropped: a fenced block carries real line breaks, so
+    # re-asking there is the one retry that can come back different.
+    collapsed = _looks_newline_collapsed(content)
+    if not content or collapsed:
         # Fallback to freeform. Carry the same skill constraints over.
         ff_system = _SINGLE_FILE_FREEFORM_SYSTEM
         if skill_fragment:
@@ -3541,12 +3564,17 @@ def generate_single_scaffold_file(
             body = _new_file_body_from_patch(p)
             return body if body is not None else p
 
+        ff_body = ""
         for d in (parsed_ff.get("diffs") or []):
             if isinstance(d, dict) and d.get("file") == path:
-                content = _patch_to_body(d)
+                ff_body = _patch_to_body(d)
                 break
-        if not content and parsed_ff.get("diffs"):
-            content = _patch_to_body(parsed_ff["diffs"][0])
+        if not ff_body and parsed_ff.get("diffs"):
+            ff_body = _patch_to_body(parsed_ff["diffs"][0])
+        # A collapsed body is real content, just unusable: only replace it
+        # when the fallback actually came back with line structure.
+        if not collapsed or (ff_body and not _looks_newline_collapsed(ff_body)):
+            content = ff_body or content
 
     # Inline syntax validation.
     syntax_ok = True
@@ -4002,6 +4030,44 @@ _SYNTAX_FIX_SYSTEM = (
     "no ellipsis, no unified-diff markers."
 )
 
+_SYNTAX_FIX_FREEFORM_SYSTEM = (
+    "You are a code-repair tool. You are given exactly ONE source file that "
+    "failed to parse, together with the parser's error. Fix ONLY the syntax "
+    "so the file parses cleanly; preserve the code's intent, structure, and "
+    "every identifier. Do not add, remove, or rename any functionality.\n\n"
+    "Return the COMPLETE corrected file as raw text inside a single fenced "
+    "code block, with REAL line breaks -- one statement per line, correctly "
+    "indented. No commentary, no ellipsis, no unified-diff markers."
+)
+
+
+def _syntax_fix_call(
+        provider: Any, user: str, budget: Dict[str, Any],
+        *, force_json: bool) -> str:
+    """One syntax-repair round-trip. Returns the fence-stripped body."""
+    try:
+        raw = provider.chat(
+            messages=[
+                {"role": "system",
+                 "content": (_SYNTAX_FIX_SYSTEM if force_json
+                             else _SYNTAX_FIX_FREEFORM_SYSTEM)},
+                {"role": "user", "content": user},
+            ],
+            temperature=0.0,
+            max_tokens=budget["output_tokens"],
+            force_json=force_json,
+        ).get("content", "")
+    except Exception:  # pragma: no cover - defensive: provider hiccup
+        return ""
+    if force_json:
+        parsed = _extract_json_object(raw)
+        out = str(parsed.get("content") or "") if parsed else ""
+    else:
+        out = str(raw or "")
+    if not out.strip():
+        return ""
+    return _unwrap_wrapping_code_fence(out.strip()) if "```" in out else out
+
 
 def _syntax_repair_retry(
         provider: Any, *, path: str, lang: str, error: str,
@@ -4017,6 +4083,12 @@ def _syntax_repair_retry(
     focused. Pinned to temperature 0 for a deterministic correction.
     Returns the fence-stripped ``content`` string, or ``""`` on any
     provider/parse failure.
+
+    A body whose newlines the JSON encoder dropped
+    (:func:`_looks_newline_collapsed`) is asked for in freeform first: a
+    fenced block carries real line breaks, whereas a JSON-mode retry goes
+    back through the encoder that caused the damage and returns the same
+    single line, so the file can never recover.
     """
     user = (
         f"File: {path}\n"
@@ -4029,28 +4101,18 @@ def _syntax_repair_retry(
         "correct delimiter.\n\n"
         f"BROKEN FILE:\n{broken}"
     )
-    try:
-        raw = provider.chat(
-            messages=[
-                {"role": "system", "content": _SYNTAX_FIX_SYSTEM},
-                {"role": "user", "content": user},
-            ],
-            temperature=0.0,
-            max_tokens=budget["output_tokens"],
-            force_json=True,
-        ).get("content", "")
-    except Exception:  # pragma: no cover - defensive: provider hiccup
-        return ""
-    parsed = _extract_json_object(raw)
-    out = str(parsed.get("content") or "") if parsed else ""
-    if out:
-        stripped = out.strip()
-        if stripped.startswith("```"):
-            m = re.match(r"^```[a-zA-Z0-9_+\-]*\s*\n(.*?)\n```\s*$",
-                         stripped, re.DOTALL)
-            if m:
-                out = m.group(1)
-    return out
+    collapsed = _looks_newline_collapsed(broken)
+    if collapsed:
+        user += (
+            "\n\nNOTE: every line break in the file above was lost -- the "
+            "whole body arrived as one physical line. Restore the line "
+            "structure: one statement per line, with correct indentation."
+        )
+    for force_json in ((False, True) if collapsed else (True,)):
+        out = _syntax_fix_call(provider, user, budget, force_json=force_json)
+        if out and not _looks_newline_collapsed(out):
+            return out
+    return ""
 
 
 _GITIGNORE_TEMPLATE = (

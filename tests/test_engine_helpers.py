@@ -666,6 +666,97 @@ def test_scaffold_py_syntax_error_flags_when_retry_still_broken():
     assert out.get("syntax_error")
 
 
+# Live failure shape: the model, asked for strict JSON, never emits an
+# escaped newline -- the whole file arrives as one space-joined line.
+_COLLAPSED_PY = (
+    "import sqlite3 from fastapi import FastAPI, HTTPException, Depends "
+    "from starlette.middleware.cors import CORSMiddleware "
+    "app = FastAPI() def read_root(): return {'ok': True}"
+)
+
+
+class _JsonCollapsingProvider:
+    """JSON mode drops every newline; freeform returns a fenced body."""
+
+    def __init__(self, path: str, good: str) -> None:
+        self.path = path
+        self.good = good
+        self.json_calls = 0
+        self.freeform_calls = 0
+
+    def chat(self, messages=None, **kw):  # noqa: ANN001 -- duck type
+        if kw.get("force_json", True):
+            self.json_calls += 1
+            return {"content": json.dumps({"content": _COLLAPSED_PY})}
+        self.freeform_calls += 1
+        return {"content": f"```python path={self.path}\n{self.good}\n```"}
+
+
+def test_looks_newline_collapsed():
+    from cgx.answer.engine import _looks_newline_collapsed
+
+    assert _looks_newline_collapsed(_COLLAPSED_PY) is True
+    assert _looks_newline_collapsed(_VALID_PY) is False
+    assert _looks_newline_collapsed("") is False
+    # A genuinely one-line file is left alone.
+    assert _looks_newline_collapsed("export default 1;\n") is False
+
+
+def test_scaffold_collapsed_json_body_recovers_via_freeform():
+    """A newline-collapsed body is re-asked in freeform, not in JSON mode.
+
+    Re-asking the same JSON encoder reproduces the single line verbatim,
+    so the file can never converge; a fenced block carries real line
+    breaks and is the only retry that can come back different.
+    """
+    from cgx.answer.engine import generate_single_scaffold_file
+    provider = _JsonCollapsingProvider("backend/main.py", _VALID_PY)
+    out = generate_single_scaffold_file(
+        "backend/main.py", "api entry point", provider,
+        layer="core", goal="build an api",
+    )
+    assert provider.json_calls == 1 and provider.freeform_calls == 1
+    assert out["syntax_ok"] is True
+    assert "def compute" in out["content"] and "\n" in out["content"]
+
+
+def test_syntax_repair_retry_asks_freeform_for_a_collapsed_body():
+    from cgx.answer.engine import _syntax_repair_retry
+    seen: List[Any] = []
+
+    class _P:
+        def chat(self, messages=None, **kw):  # noqa: ANN001 -- duck type
+            seen.append(kw.get("force_json"))
+            if kw.get("force_json"):
+                return {"content": json.dumps({"content": _COLLAPSED_PY})}
+            return {"content": "```python\n" + _VALID_PY + "```"}
+
+    out = _syntax_repair_retry(
+        _P(), path="backend/main.py", lang="Python",
+        error="invalid syntax (line 1)", broken=_COLLAPSED_PY,
+        budget={"output_tokens": 512})
+    assert seen == [False], "the collapsed body must skip JSON mode"
+    assert out.strip().startswith("def compute")
+
+
+def test_syntax_repair_retry_stays_in_json_mode_for_a_normal_break():
+    from cgx.answer.engine import _syntax_repair_retry
+    seen: List[Any] = []
+
+    class _P:
+        def chat(self, messages=None, **kw):  # noqa: ANN001 -- duck type
+            seen.append(kw.get("force_json"))
+            return {"content": json.dumps({"content": _VALID_PY})}
+
+    out = _syntax_repair_retry(
+        _P(), path="src/calculator.py", lang="Python",
+        error="invalid syntax (line 1)", broken=_BROKEN_PY,
+        budget={"output_tokens": 512})
+    assert seen == [True]
+    assert out == _VALID_PY
+
+
+
 # Live failure shape: a Python module's source pasted into
 # requirements.txt (pip tolerated enough of it that the venv provisioned
 # against a corrupted manifest).
