@@ -4250,10 +4250,12 @@ def test_scaffold_import_coherence_gate_flags_hallucinated_import(
     bodies = {
         # Stdlib import only -> passes the gate.
         "calc.py": "import json\n\ndef add(a, b):\n    return a + b\n",
-        # Sibling manifest import passes; the hallucinated module --
-        # resolvable nowhere -- flags the file.
+        # Sibling manifest import passes; the hallucinated module -- a bare
+        # single-word root that resolves nowhere and reads as a
+        # (possibly-forgotten) dependency, not a first-party module -- is
+        # not synthesized and flags the file.
         "app.py": ("from calc import add\n"
-                   "from zz_hallucinated_core import compute\n"),
+                   "from zzhallucinatedcore import compute\n"),
     }
 
     def fake_generate(path, *a, **kw):
@@ -4271,7 +4273,7 @@ def test_scaffold_import_coherence_gate_flags_hallucinated_import(
     assert [d["file"] for d in result.artifact.content["diffs"]] == ["calc.py"]
     failed = result.artifact.content["failed"]
     assert failed[0]["file"] == "app.py"
-    assert "zz_hallucinated_core" in failed[0]["error"]
+    assert "zzhallucinatedcore" in failed[0]["error"]
 
 
 def test_scaffold_circular_import_gate_breaks_cycle(store, monkeypatch):
@@ -4486,6 +4488,41 @@ def test_missing_first_party_imports_ignores_stdlib_deps_and_self():
                      "from tests.test_app import helper\n")},
     ]
     layers = [{"files": [{"path": f["path"]} for f in files]}]
+    assert _missing_first_party_imports(files, layers, None) == {}
+
+
+def test_missing_first_party_imports_detects_source_named_import():
+    """A snake_case named import from a *source* file is a synthesis candidate.
+
+    Mirrors the live failure where the entry point imported an application
+    module the plan omitted (``from calculation_service import compute`` in
+    ``backend/app.py``). The compound root reads as first-party, so it is
+    authored rather than dropping the importer.
+    """
+    from cgx.session.tasks.scaffold import _missing_first_party_imports
+    files = [
+        {"path": "backend/app.py",
+         "content": "from calculation_service import compute\n"},
+    ]
+    layers = [{"files": [{"path": "backend/app.py"}]}]
+    missing = _missing_first_party_imports(files, layers, None)
+    assert set(missing) == {"calculation_service"}
+    assert missing["calculation_service"]["path"] == "calculation_service.py"
+    assert missing["calculation_service"]["symbols"] == {"compute"}
+
+
+def test_missing_first_party_imports_skips_single_word_source_import():
+    """A named single-word import from a source file is left to req repair.
+
+    ``from cerberus import Schema`` in a non-test file names a plausible
+    (forgotten) third-party dependency, not a first-party module: with no
+    dotted path and no snake_case compound root there is no first-party
+    signal, so it is not fabricated as an empty module here.
+    """
+    from cgx.session.tasks.scaffold import _missing_first_party_imports
+    files = [{"path": "backend/app.py",
+              "content": "from cerberus import Schema\n"}]
+    layers = [{"files": [{"path": "backend/app.py"}]}]
     assert _missing_first_party_imports(files, layers, None) == {}
 
 

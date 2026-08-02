@@ -783,6 +783,20 @@ def _is_test_path(path: str) -> bool:
             or "/tests/" in norm)
 
 
+def _looks_local_module_ref(mod: str, root: str) -> bool:
+    """True when a named-symbol import reads as a project-local module.
+
+    Consulted only after the root has resolved nowhere a build could
+    satisfy it and is not a known PyPI import alias. A dotted path
+    (``pkg.mod``) is a submodule reference and a snake_case compound root
+    (``calculation_service``) reads as an application module; a genuinely
+    forgotten third-party distribution is imported by its bare single-word
+    top name instead, so that shape is left to the requirements repair
+    rather than fabricated as an empty first-party module.
+    """
+    return "." in mod or "_" in root
+
+
 def _synthesized_module_description(
         mod: str, path: str, symbols: List[str]) -> str:
     """Generation brief for a first-party module the planner omitted.
@@ -822,14 +836,19 @@ def _missing_first_party_imports(
 
     * its root segment is a generated project source directory (a dotted
       import into an existing package the plan under-populated); or
-    * it is imported *with named symbols by a test/conftest module* and its
-      root resolves nowhere a build could satisfy it (not stdlib, not
-      installed, not declared in requirements) and is not a known PyPI
-      import alias -- so it can only be the module-under-test the plan
-      forgot.
+    * it is imported *with named symbols* (``from X import a, b``), its root
+      resolves nowhere a build could satisfy it (not stdlib, not installed,
+      not declared in requirements) and is not a known PyPI import alias,
+      *and* either the importer is a test/conftest module (any such
+      reference is the module-under-test the plan forgot) or the reference
+      reads as project-local -- a dotted submodule path or a snake_case
+      compound root (see :func:`_looks_local_module_ref`).
 
-    Self-imports and already-generated modules are skipped; parse failures
-    abstain for that file.
+    A bare single-word import (``import X`` with no named symbols, or a
+    named import of a plain single-word root from a non-test file) carries
+    no first-party signal and is left to the requirements repair rather than
+    fabricated here. Self-imports and already-generated modules are skipped;
+    parse failures abstain for that file.
     """
     import ast as _ast
     from cgx.codegen.env_manager import _IMPORT_TO_PYPI
@@ -897,8 +916,9 @@ def _missing_first_party_imports(
                 first_party = False
                 if root in fp_roots:
                     first_party = True
-                elif (symbols and is_test and not known(root)
-                        and root not in _IMPORT_TO_PYPI):
+                elif (symbols and not known(root)
+                        and root not in _IMPORT_TO_PYPI
+                        and (is_test or _looks_local_module_ref(mod, root))):
                     first_party = True
                 if first_party:
                     _record(mod, path, symbols)
