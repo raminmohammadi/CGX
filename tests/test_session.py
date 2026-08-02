@@ -1359,6 +1359,38 @@ def test_router_repair_install_deps_spawns_bootstrap_env():
     assert boot.inputs["prior_failure_signatures"] == [sig]
 
 
+def test_router_repair_resolve_deps_spawns_bootstrap_env():
+    """REPAIR strategy=resolve_deps -> re-queue BOOTSTRAP_ENV (not regenerate)."""
+    from cgx.session.models import SessionMode
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    sig = "api_check|conflict:flask,werkzeug"
+    rep = TaskNode.new(
+        session.session_id, TaskKind.REPAIR, "repair",
+        inputs={"api_check_artifact_id": "art_api",
+                "apply_artifact_id": "art_applied",
+                "plan_artifact_id": "art_plan",
+                "mode": SessionMode.GREENFIELD.value,
+                "repair_attempt": 1,
+                "prior_failure_signatures": [sig]})
+    rep.produced_artifact_id = "art_plan_repair"
+    rep.outputs = {"classification": "dependency_conflict",
+                   "strategy": "resolve_deps", "can_apply": False,
+                   "diff_count": 0, "repair_attempt": 1,
+                   "conflict_packages": ["flask", "werkzeug"],
+                   "failure_signature": sig}
+    rep.status = TaskNodeStatus.DONE
+    plan = Router().on_task_completed(
+        session=session, completed=rep, tasks=[rep])
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    assert len(creates) == 1
+    boot = creates[0].task
+    assert boot.kind is TaskKind.BOOTSTRAP_ENV
+    assert boot.inputs["apply_artifact_id"] == "art_applied"
+    assert boot.inputs["resolve_packages"] == ["flask", "werkzeug"]
+    assert boot.inputs["repair_attempt"] == 1
+    assert boot.inputs["prior_failure_signatures"] == [sig]
+
+
 def test_router_smoke_passed_spawns_verify():
     """SMOKE finishes with outcome=passed -> VERIFY runs."""
     from cgx.session.models import SessionMode
@@ -6000,6 +6032,60 @@ def test_api_check_splits_missing_dependency_from_hallucination(
     assert cats[("cerberus", "Schema")] == "api_check_failure"
 
 
+def test_api_check_splits_dependency_conflict_from_missing(
+        tmp_path, store, monkeypatch):
+    """``cannot import name ... from '<peer>'`` -> dependency_conflict.
+
+    The package is installed but its own import chain broke on an
+    incompatible peer major (the Flask 2.0.1 / Werkzeug 3 url_quote
+    break). Distinct from an absent package; surfaced separately so the
+    router re-resolves the env instead of regenerating valid code.
+    """
+    from cgx.session.tasks import api_check as api_mod
+    from cgx.session.tasks.api_check import run_api_check
+    (tmp_path / "app.py").write_text(
+        "from flask import Flask\n", encoding="utf-8")
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    build_art = Artifact.new(
+        session_id=session.session_id, produced_by_task_id="t_build",
+        kind=ArtifactKind.BUILD_REPORT,
+        content={"python_exe": "/fake/.venv/bin/python"})
+    store.save_artifact(build_art)
+
+    def fake_probe(python_exe, specs, timeout, root):
+        rows = []
+        for module, name in specs:
+            if module == "flask":
+                rows.append({
+                    "module": module, "name": name, "ok": False,
+                    "error": ("ImportError: cannot import name 'url_quote' "
+                              "from 'werkzeug.urls'")})
+            else:
+                rows.append({"module": module, "name": name, "ok": True,
+                             "error": ""})
+        return rows, None
+
+    monkeypatch.setattr(api_mod, "_probe_references", fake_probe)
+    t = TaskNode.new(session.session_id, TaskKind.API_CHECK, "api",
+                     inputs={"applied_files": ["app.py"],
+                             "build_artifact_id": build_art.artifact_id})
+    result = run_api_check(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    assert result.outputs["outcome"] == "failed"
+    assert result.outputs["missing_module_count"] == 0
+    assert result.outputs["conflict_count"] == 1
+    # Consumer (flask) and the incompatible peer (werkzeug) are both
+    # surfaced so the resolver can move the whole set to a consistent one.
+    assert result.outputs["conflict_packages"] == ["flask", "werkzeug"]
+    content = result.artifact.content
+    assert content["conflict_packages"] == ["flask", "werkzeug"]
+    assert content["missing_modules"] == []
+    cats = {(r["module"], r["name"]): r.get("category")
+            for r in content["references"] if not r["ok"]}
+    assert cats[("flask", "Flask")] == "dependency_conflict"
+
+
 def test_api_check_wrong_path_first_party_is_not_missing_dependency(
         tmp_path, store, monkeypatch):
     """A first-party module reached by the wrong import path is a
@@ -6290,6 +6376,47 @@ def test_repair_api_check_missing_dependency_installs(tmp_path, store):
     assert plan.content["strategy"] == "install_deps"
     assert plan.content["missing_modules"] == ["flask", "flask_cors"]
     assert "flask" in plan.content["rationale"]
+    assert plan.content["diffs"] == []
+
+
+def test_repair_api_check_dependency_conflict_resolves(tmp_path, store):
+    """API_CHECK conflict_packages -> strategy=resolve_deps, not regenerate."""
+    from cgx.session.tasks.repair import run_repair
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    report = Artifact.new(
+        session_id=session.session_id, produced_by_task_id="t_api",
+        kind=ArtifactKind.API_CHECK_REPORT,
+        content={
+            "outcome": "failed",
+            "failed_references": [{"module": "flask", "name": "Flask"}],
+            "missing_modules": [],
+            "conflict_packages": ["flask", "werkzeug"],
+            "conflict_references": [
+                {"module": "flask", "name": "Flask",
+                 "error": ("ImportError: cannot import name 'url_quote' "
+                           "from 'werkzeug.urls'")}],
+            "hallucinated_references": [],
+            "failure_signature": "api_check|conflict:flask,werkzeug",
+        })
+    store.save_artifact(report)
+    t = TaskNode.new(
+        session.session_id, TaskKind.REPAIR, "repair",
+        inputs={"api_check_artifact_id": report.artifact_id,
+                "repair_attempt": 1,
+                "mode": SessionMode.GREENFIELD.value})
+    result = run_repair(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    assert result.failure is None
+    assert result.outputs["classification"] == "dependency_conflict"
+    assert result.outputs["strategy"] == "resolve_deps"
+    assert result.outputs["can_apply"] is False
+    assert result.outputs["conflict_packages"] == ["flask", "werkzeug"]
+    plan = result.artifact
+    assert plan.kind is ArtifactKind.REPAIR_PLAN
+    assert plan.content["strategy"] == "resolve_deps"
+    assert plan.content["conflict_packages"] == ["flask", "werkzeug"]
+    assert "werkzeug" in plan.content["rationale"]
     assert plan.content["diffs"] == []
 
 

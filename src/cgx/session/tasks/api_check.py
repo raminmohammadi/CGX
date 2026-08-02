@@ -96,10 +96,17 @@ def run_api_check(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     # references a perfectly valid symbol.
     missing_dep_rows = [r for r in failed
                         if r.get("category") == "missing_dependency"]
+    # An installed package whose own import chain broke on an incompatible
+    # peer is a dependency-resolution fault: re-resolve the env, never
+    # regenerate the (valid) code that references it.
+    conflict_rows = [r for r in failed
+                     if r.get("category") == "dependency_conflict"]
     hallucinated = [r for r in failed
-                    if r.get("category") != "missing_dependency"]
+                    if r.get("category") not in ("missing_dependency",
+                                                 "dependency_conflict")]
     missing_modules = sorted({_missing_module_name(r)
                               for r in missing_dep_rows})
+    conflict_packages = _conflict_packages(conflict_rows)
     signature = _signature(failed) if outcome == "failed" else ""
     content: Dict[str, Any] = {
         "build_artifact_id": task.inputs.get("build_artifact_id"),
@@ -115,6 +122,10 @@ def run_api_check(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
                                "category": r.get("category", "")}
                               for r in failed],
         "missing_modules": missing_modules,
+        "conflict_packages": conflict_packages,
+        "conflict_references": [{"module": r["module"], "name": r["name"],
+                                 "error": r.get("error", "")}
+                                for r in conflict_rows],
         "hallucinated_references": [{"module": r["module"], "name": r["name"]}
                                     for r in hallucinated],
         "failure_signature": signature,
@@ -133,6 +144,8 @@ def run_api_check(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             "failed_count": len(failed),
             "checked_count": len(rows),
             "missing_module_count": len(missing_modules),
+            "conflict_count": len(conflict_rows),
+            "conflict_packages": conflict_packages,
             "hallucinated_count": len(hallucinated),
             "failure_signature": signature,
         },
@@ -315,6 +328,19 @@ def _attach_references(rows: List[Dict[str, Any]],
 
 _NO_MODULE_RE = re.compile(r"No module named '([^']+)'")
 
+# A transitive version conflict: importing the referenced package failed
+# *inside its own dependency chain* -- ``ImportError: cannot import name
+# '<sym>' from '<peer>'`` -- because a stale pin dragged in an incompatible
+# peer major (the Flask 2.0.1 / Werkzeug 3 ``url_quote`` break). Distinct
+# from a hallucinated symbol (the probe imports the module fine and reports
+# an ``AttributeError`` on ``hasattr``) and from an absent package (a
+# dotless ``No module named``). Regenerating source can never fix it; the
+# fix is to re-resolve the environment. The captured group is the peer
+# whose incompatible version needs re-resolving.
+_CANNOT_IMPORT_NAME_RE = re.compile(
+    r"cannot import name\s+'[^']+'\s+from\s+"
+    r"'([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)'")
+
 
 def _applied_first_party_modules(applied_files: List[str]) -> frozenset:
     """Top-level module names that resolve to a first-party file on disk.
@@ -399,7 +425,33 @@ def _row_category(row: Dict[str, Any],
         if root_name.lower().replace("-", "_") in uninstallable_roots:
             return "api_check_failure"
         return "missing_dependency"
+    # The module is installed but its own import chain broke on an
+    # incompatible peer -- a dependency-resolution fault, not authoring.
+    if _CANNOT_IMPORT_NAME_RE.search(err):
+        return "dependency_conflict"
     return "api_check_failure"
+
+
+def _conflict_packages(rows: List[Dict[str, Any]]) -> List[str]:
+    """Top-level distributions implicated in an import-time version conflict.
+
+    For each ``dependency_conflict`` row, the consumer (the referenced
+    module's root, whose stale pin drags in an incompatible peer) and the
+    peer named in the ``cannot import name ... from '<peer>'`` error. Both
+    are handed to the resolve-deps repair so pip re-resolves a consistent
+    set. Order-preserving and de-duplicated.
+    """
+    out: List[str] = []
+    for r in rows:
+        consumer = str(r.get("module") or "").split(".")[0]
+        if consumer and consumer not in out:
+            out.append(consumer)
+        m = _CANNOT_IMPORT_NAME_RE.search(str(r.get("error") or ""))
+        if m:
+            peer = m.group(1).split(".")[0]
+            if peer and peer not in out:
+                out.append(peer)
+    return out
 
 
 def _missing_module_name(row: Dict[str, Any]) -> str:

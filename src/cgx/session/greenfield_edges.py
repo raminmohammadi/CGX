@@ -108,6 +108,56 @@ def _repair_install_deps_actions(
     return [CreateTask(boot)]
 
 
+def _repair_resolve_deps_actions(
+        completed: TaskNode) -> List[RouterAction]:
+    """Return the router actions that execute a resolve-deps verdict.
+
+    A ``resolve_deps`` verdict (set by the REPAIR executor for an
+    API_CHECK ``dependency_conflict`` failure) tells the router to
+    re-resolve the environment rather than rewrite code: it re-queues a
+    BOOTSTRAP_ENV that force-upgrades the implicated distributions to a
+    self-consistent set and re-pins requirements.txt reproducibly.
+    BOOTSTRAP_ENV's own successor
+    (:func:`cgx.session.router._bootstrap_to_api_check`) then re-probes
+    the same symbols, so a successful re-resolve flows straight back into
+    SMOKE/VERIFY while the shared ``repair_attempt`` +
+    ``prior_failure_signatures`` budget on API_CHECK prevents a
+    re-resolve loop. Returns an empty list for any other strategy so the
+    dispatcher falls through to the install-deps / regenerate / patch /
+    ASK_USER paths.
+    """
+    outputs = completed.outputs or {}
+    strategy = str(outputs.get("strategy") or "").strip()
+    if strategy != "resolve_deps":
+        return []
+    inputs = completed.inputs or {}
+    budget = LoopBudget.from_inputs(inputs)
+    budget = budget.with_repair_attempt(
+        int(outputs.get("repair_attempt") or budget.repair_attempt or 1))
+    packages = [str(p) for p in outputs.get("conflict_packages") or []]
+    boot = TaskNode.new(
+        session_id=completed.session_id,
+        kind=TaskKind.BOOTSTRAP_ENV,
+        name="Re-resolve conflicting dependencies",
+        description=("Re-resolve the project venv to move off the stale "
+                     "exact pin(s) whose transitive peer major broke the "
+                     "referenced package's import chain, re-pin "
+                     "requirements.txt to the resolved versions, then "
+                     "re-probe via API_CHECK."),
+        parent_task_id=completed.task_id,
+        inputs={
+            "apply_artifact_id": inputs.get("apply_artifact_id"),
+            "plan_artifact_id": inputs.get("plan_artifact_id"),
+            "scaffold_artifact_id": inputs.get("scaffold_artifact_id"),
+            "prior_goal": inputs.get("prior_goal"),
+            "mode": inputs.get("mode") or SessionMode.GREENFIELD.value,
+            "resolve_packages": packages,
+            **budget.repair_chain_inputs(),
+        },
+    )
+    return [CreateTask(boot)]
+
+
 def _repair_regenerate_actions(completed: TaskNode,
                                tasks: List[TaskNode]) -> List[RouterAction]:
     """Return the router actions that execute a regenerate verdict.

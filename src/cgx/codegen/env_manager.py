@@ -450,3 +450,154 @@ def preflight_install(
     )
     results = install_packages(missing, python=python)
     return missing, results
+
+
+# Leading distribution-name token of a requirements line: the run of name
+# characters before any version specifier / extras / marker. Spelled out
+# (no ``\w``) for cross-engine portability with the rest of the codebase.
+_REQ_NAME_RE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)")
+
+
+def _requirement_name(line: str) -> Optional[str]:
+    """Return the raw distribution name a requirements line declares.
+
+    Strips an inline comment and surrounding whitespace, then reads the
+    leading name token (before any ``>=<!~;[`` specifier / extras / marker).
+    Returns ``None`` for blank lines, comments, and pip flags
+    (``-r`` / ``-e`` / ``--hash`` ...), which carry no package to re-pin.
+    """
+    text = line.split("#", 1)[0].strip()
+    if not text or text.startswith("-"):
+        return None
+    m = _REQ_NAME_RE.match(text)
+    return m.group(1) if m else None
+
+
+def _import_root_to_pypi(root: str) -> str:
+    """Map a top-level import root to its pip distribution name."""
+    key = (root or "").strip()
+    if not key:
+        return ""
+    if key in _IMPORT_TO_PYPI:
+        return _IMPORT_TO_PYPI[key]
+    return key.replace("_", "-")
+
+
+def _pip_freeze_versions(python: Optional[str] = None) -> Dict[str, str]:
+    """Return ``{normalised distribution name: installed version}``.
+
+    Parses ``pip freeze`` output; editable / URL installs (which carry no
+    ``==`` version) are skipped. Best-effort: any failure yields an empty
+    map so the caller leaves the manifest untouched.
+    """
+    py = python or sys.executable
+    out: Dict[str, str] = {}
+    try:
+        proc = subprocess.run(
+            [py, "-m", "pip", "freeze"],
+            capture_output=True, text=True, timeout=120,
+        )
+    except Exception as exc:
+        logger.warning("env_manager: pip freeze raised %s", exc)
+        return out
+    if proc.returncode != 0:
+        return out
+    for raw in (proc.stdout or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("-") or "==" not in line or " @ " in line:
+            continue
+        name, _, version = line.partition("==")
+        key = name.strip().lower().replace("-", "_")
+        version = version.strip()
+        if key and version:
+            out[key] = version
+    return out
+
+
+def _repin_requirements(text: str, installed: Dict[str, str]) -> str:
+    """Rewrite each declared requirement to the version actually installed.
+
+    For every line that declares a package present in ``installed``, replace
+    whatever specifier the model wrote with an exact ``==`` pin on the
+    resolved version -- so the manifest is reproducible *and* internally
+    consistent after a conflict re-resolve. Comments, blank lines, pip
+    flags, and packages with no installed version are preserved verbatim.
+    """
+    lines_out: List[str] = []
+    for raw in text.splitlines():
+        name = _requirement_name(raw)
+        if name is None:
+            lines_out.append(raw)
+            continue
+        version = installed.get(name.lower().replace("-", "_"))
+        if not version:
+            lines_out.append(raw)
+            continue
+        comment = ("  #" + raw.split("#", 1)[1]) if "#" in raw else ""
+        lines_out.append(f"{name}=={version}{comment}".rstrip())
+    result = "\n".join(lines_out)
+    return result + "\n" if text.endswith("\n") else result
+
+
+@traced("codegen")
+def resolve_dependency_conflict(
+    project_root: str,
+    packages: List[str],
+    python: Optional[str] = None,
+) -> Dict[str, object]:
+    """Re-resolve a transitive dependency conflict, then re-pin reproducibly.
+
+    ``packages`` are the top-level import roots API_CHECK found implicated
+    in an import-time version conflict -- the consumer whose stale pin is
+    too old (``flask``) and the peer whose incompatible major got resolved
+    in (``werkzeug``). Force-upgrades those distributions so pip moves off
+    the satisfied-but-broken pins and resolves a self-consistent set, then
+    re-pins every *declared* requirement to the version actually installed
+    (:func:`_repin_requirements`). The result is a requirements.txt that
+    both installs cleanly and stays reproducible -- never left unpinned.
+
+    Non-fatal by contract: any pip failure is logged and reflected in the
+    returned summary; BOOTSTRAP_ENV re-probes via API_CHECK regardless, and
+    the shared repair budget halts a conflict that cannot be resolved.
+    """
+    py = python or sys.executable
+    dists: List[str] = []
+    for root in packages:
+        name = _import_root_to_pypi(str(root))
+        if name and name not in dists:
+            dists.append(name)
+    summary: Dict[str, object] = {
+        "packages": list(dists), "upgraded": False, "repinned": []}
+    if not dists:
+        return summary
+    try:
+        proc = subprocess.run(
+            [py, "-m", "pip", "install", "--upgrade", "--no-input", *dists],
+            capture_output=True, text=True, timeout=300,
+        )
+    except Exception as exc:
+        logger.warning("env_manager: conflict re-resolve raised %s", exc)
+        return summary
+    if proc.returncode != 0:
+        logger.warning(
+            "env_manager: conflict re-resolve upgrade failed (rc=%d): %s",
+            proc.returncode, (proc.stderr or "")[:300])
+        return summary
+    summary["upgraded"] = True
+    req_path = Path(project_root) / "requirements.txt"
+    if not req_path.is_file():
+        return summary
+    installed = _pip_freeze_versions(py)
+    if not installed:
+        return summary
+    before = req_path.read_text(encoding="utf-8", errors="ignore")
+    after = _repin_requirements(before, installed)
+    if after != before:
+        req_path.write_text(after, encoding="utf-8")
+        summary["repinned"] = sorted(
+            n for n in (_requirement_name(ln) for ln in after.splitlines())
+            if n)
+        logger.info(
+            "env_manager: re-pinned requirements.txt after conflict "
+            "re-resolve (%s)", ", ".join(dists))
+    return summary

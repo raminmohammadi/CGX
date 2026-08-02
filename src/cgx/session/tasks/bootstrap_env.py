@@ -200,6 +200,29 @@ def run_bootstrap_env(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             if not pip_log_tail:
                 pip_log_tail = f"{type(exc).__name__}: {exc}"
 
+    # Repair-driven re-resolve: a ``resolve_deps`` verdict threads the
+    # API_CHECK report's ``conflict_packages`` (the consumer whose stale
+    # exact pin dragged in an incompatible peer, plus that peer) through
+    # task.inputs. The package is installed but its own import chain is
+    # broken, so no install/regenerate can help; force-upgrade the
+    # implicated distributions to a self-consistent set and re-pin
+    # requirements.txt reproducibly, then let the runtime-import gate and
+    # API_CHECK re-probe confirm the fix.
+    resolve_requested = [str(p).strip()
+                         for p in (task.inputs.get("resolve_packages") or [])
+                         if str(p).strip()]
+    if resolve_requested:
+        from cgx.codegen.env_manager import resolve_dependency_conflict
+        try:
+            resolve_dependency_conflict(
+                str(root), resolve_requested, python=python_exe)
+        except Exception as exc:
+            logger.warning(
+                "BOOTSTRAP_ENV: dependency conflict re-resolve raised %s",
+                exc)
+            if not pip_log_tail:
+                pip_log_tail = f"{type(exc).__name__}: {exc}"
+
     # Defense-in-depth: only a *declared* dependency that fails to
     # install is a fatal environment problem. A scan-discovered import
     # that pip cannot satisfy (typically a hallucinated first-party-

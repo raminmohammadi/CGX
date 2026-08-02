@@ -43,6 +43,7 @@ from cgx.session.greenfield_edges import (
     _make_budget_ask,
     _repair_install_deps_actions,
     _repair_regenerate_actions,
+    _repair_resolve_deps_actions,
     _repair_terminal_failure_actions,
     _scaffold_contract_regenerate_actions,
     _scaffold_failed_files_actions,
@@ -882,6 +883,8 @@ _CompletionGuard = Callable[[TaskNode, List[TaskNode]], List[RouterAction]]
 _COMPLETION_GUARDS: Tuple[Tuple[TaskKind, _CompletionGuard], ...] = (
     (TaskKind.REPAIR,
      lambda completed, tasks: _repair_install_deps_actions(completed)),
+    (TaskKind.REPAIR,
+     lambda completed, tasks: _repair_resolve_deps_actions(completed)),
     (TaskKind.REPAIR, _repair_regenerate_actions),
     (TaskKind.REPAIR,
      lambda completed, tasks: _repair_terminal_failure_actions(completed)),
