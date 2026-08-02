@@ -10,6 +10,7 @@ from cgx.answer.model_caps import (
     get_context_map_budget,
     get_model_context_window,
     get_prompt_strategy,
+    get_scaffold_budget,
     get_summary_budget,
     provider_model_name,
 )
@@ -145,8 +146,9 @@ def test_generate_single_scaffold_file_uses_provider_budget():
     user_msg = prov.calls[0]["messages"][1]["content"]
     # max_files=12 → exactly 12 "### " context-block headers.
     assert user_msg.count("### f") == 12, user_msg.count("### f")
-    # output_tokens=2000 for the tiny tier.
-    assert prov.calls[0]["max_tokens"] == 2_000
+    # Whole-file generation uses the raised scaffold cap, not the summary
+    # one: 4000 for the tiny tier (vs 2000 for a summary).
+    assert prov.calls[0]["max_tokens"] == 4_000
 
     prov2 = _RecordingProvider("gemini-2.5-flash", canned)
     generate_single_scaffold_file(
@@ -156,7 +158,36 @@ def test_generate_single_scaffold_file_uses_provider_budget():
     # Top tier: all 50 prior files fit (cap 120).
     user_msg2 = prov2.calls[0]["messages"][1]["content"]
     assert user_msg2.count("### f") == 50
-    assert prov2.calls[0]["max_tokens"] == 8_000
+    assert prov2.calls[0]["max_tokens"] == 16_000
+
+
+# ---------------------------------------------------------------------------
+# get_scaffold_budget: whole-file generation raises only the output cap
+# ---------------------------------------------------------------------------
+def test_scaffold_budget_raises_output_cap_but_keeps_context_caps():
+    # Same context caps as the summary budget in every tier, but a strictly
+    # larger output-token ceiling so whole-file generation is not truncated.
+    for model in ("llama3", "qwen2.5-coder:3b", "gpt-4o", "gemini-2.5-flash"):
+        summ = get_summary_budget(_Prov(model))
+        scaf = get_scaffold_budget(_Prov(model))
+        assert scaf["max_chars"] == summ["max_chars"]
+        assert scaf["max_files"] == summ["max_files"]
+        assert scaf["output_tokens"] > summ["output_tokens"]
+
+
+def test_scaffold_budget_tier_values():
+    assert get_scaffold_budget(_Prov("llama3"))["output_tokens"] == 4_000
+    assert get_scaffold_budget(_Prov("qwen2.5-coder:3b"))["output_tokens"] \
+        == 8_000
+    assert get_scaffold_budget(_Prov("gpt-4o"))["output_tokens"] == 12_000
+    assert get_scaffold_budget(_Prov("gemini-2.5-flash"))["output_tokens"] \
+        == 16_000
+
+
+def test_scaffold_budget_returns_a_copy():
+    b = get_scaffold_budget(_Prov("llama3"))
+    b["output_tokens"] = 1
+    assert get_scaffold_budget(_Prov("llama3"))["output_tokens"] == 4_000
 
 
 # ---------------------------------------------------------------------------

@@ -3552,8 +3552,8 @@ def generate_single_scaffold_file(
     # model context window. Local 8K models get tight caps; cloud
     # models with 200K+ windows get generous ones. See
     # :mod:`cgx.answer.model_caps`.
-    from cgx.answer.model_caps import get_summary_budget
-    budget = get_summary_budget(provider)
+    from cgx.answer.model_caps import get_scaffold_budget
+    budget = get_scaffold_budget(provider)
 
     if existing_files_with_content:
         # Send a *structural summary* of each prior file (imports +
@@ -4466,6 +4466,67 @@ def _trivial_boilerplate_content(path: str) -> Optional[str]:
     return _TRIVIAL_BOILERPLATE.get(base)
 
 
+# Whole-file generation grows its output cap on a length-cap stop up to
+# this many times (each step doubles ``num_predict``), so an occasional
+# large file that overruns the tier ceiling still completes instead of
+# being truncated and dropped. Bounded so a runaway generation cannot spin.
+_MAX_TRUNCATION_RETRIES = 2
+
+
+def _response_finish_was_length(resp: Any) -> bool:
+    """True when a provider stopped because the output-token cap was hit.
+
+    Recognises the length-cap stop across the three provider response
+    shapes carried in ``resp["raw"]``: Ollama ``done_reason == "length"``,
+    OpenAI-compatible ``choices[0].finish_reason == "length"`` and Gemini
+    ``candidates[0].finishReason == "MAX_TOKENS"``. A whole-file body cut
+    at the cap is otherwise indistinguishable from a complete one and gets
+    silently dropped by the syntax gate.
+    """
+    if not isinstance(resp, dict):
+        return False
+    raw = resp.get("raw")
+    if not isinstance(raw, dict):
+        return False
+    if str(raw.get("done_reason") or "").lower() == "length":
+        return True
+    choices = raw.get("choices")
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        if str(choices[0].get("finish_reason") or "").lower() == "length":
+            return True
+    candidates = raw.get("candidates")
+    if isinstance(candidates, list) and candidates and isinstance(candidates[0], dict):
+        if str(candidates[0].get("finishReason") or "").upper() == "MAX_TOKENS":
+            return True
+    return False
+
+
+def _blocking_scaffold_call(
+        provider: Any, messages: List[Dict[str, str]],
+        max_tokens: int) -> str:
+    """Blocking JSON-mode generation that grows on a truncated response.
+
+    A single ``provider.chat`` cut off at ``num_predict`` returns a partial
+    file body whose truncated JSON fails to parse (or parses to a
+    syntactically broken body) and is then silently dropped downstream. When
+    the provider reports a length-cap stop, re-issue with a doubled budget
+    -- up to :data:`_MAX_TRUNCATION_RETRIES` times -- so a large file is
+    generated to completion instead of lost.
+    """
+    resp = provider.chat(
+        messages=messages, temperature=0.2,
+        max_tokens=max_tokens, force_json=True)
+    attempts = 0
+    while (_response_finish_was_length(resp)
+           and attempts < _MAX_TRUNCATION_RETRIES):
+        max_tokens *= 2
+        attempts += 1
+        resp = provider.chat(
+            messages=messages, temperature=0.2,
+            max_tokens=max_tokens, force_json=True)
+    return resp.get("content", "") if isinstance(resp, dict) else ""
+
+
 def _scaffold_primary_call(
         provider: Any, system: str, context: str,
         budget: Dict[str, Any],
@@ -4505,14 +4566,11 @@ def _scaffold_primary_call(
         parsed = _extract_json_object(raw)
         if parsed and str(parsed.get("content") or ""):
             return raw
-        # Stream failed or produced unparseable text -- fall back to the
-        # reliable blocking call so we never regress generation success.
-    return provider.chat(
-        messages=messages,
-        temperature=0.2,
-        max_tokens=max_tokens,
-        force_json=True,
-    ).get("content", "")
+        # Stream failed or produced unparseable text (a mid-JSON truncation
+        # looks exactly like this) -- fall back to the reliable blocking
+        # call, which additionally grows its budget on a length-cap stop so
+        # a truncated body is regenerated to completion instead of dropped.
+    return _blocking_scaffold_call(provider, messages, max_tokens)
 
 
 def _regenerate_scaffold_file(

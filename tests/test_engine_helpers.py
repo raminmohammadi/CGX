@@ -1599,3 +1599,70 @@ def test_answer_clarify_paths_empty_sources_degrades_gracefully():
     assert out["citations"] == []
     assert out["confidence"] <= 0.2
     assert "Re-index" in out["answer_md"] or "narrow" in out["answer_md"]
+
+
+# ---------------------------------------------------------------------------
+# Truncation detection + truncation-aware whole-file generation
+# ---------------------------------------------------------------------------
+def test_response_finish_was_length_across_provider_shapes():
+    from cgx.answer.engine import _response_finish_was_length
+    # Ollama length-cap stop.
+    assert _response_finish_was_length({"raw": {"done_reason": "length"}})
+    # OpenAI-compatible length-cap stop.
+    assert _response_finish_was_length(
+        {"raw": {"choices": [{"finish_reason": "length"}]}})
+    # Gemini MAX_TOKENS.
+    assert _response_finish_was_length(
+        {"raw": {"candidates": [{"finishReason": "MAX_TOKENS"}]}})
+    # A clean stop is not truncation.
+    assert not _response_finish_was_length({"raw": {"done_reason": "stop"}})
+    assert not _response_finish_was_length(
+        {"raw": {"choices": [{"finish_reason": "stop"}]}})
+    # Missing / malformed shapes never claim truncation.
+    assert not _response_finish_was_length({"content": "x"})
+    assert not _response_finish_was_length({"raw": "opaque"})
+    assert not _response_finish_was_length("nope")
+
+
+class _TruncatingProvider:
+    """Reports a length-cap stop for the first ``truncate_n`` calls, then
+    returns a clean response. Records every ``max_tokens`` it is called with."""
+
+    def __init__(self, truncate_n: int, content: str = "print('ok')\n"):
+        self._left = truncate_n
+        self._content = content
+        self.max_tokens_seen: List[int] = []
+
+    def chat(self, messages, **kw):  # noqa: ANN001 -- duck type
+        self.max_tokens_seen.append(kw.get("max_tokens"))
+        if self._left > 0:
+            self._left -= 1
+            return {"content": self._content, "raw": {"done_reason": "length"}}
+        return {"content": self._content, "raw": {"done_reason": "stop"}}
+
+
+def test_blocking_scaffold_call_grows_budget_on_truncation():
+    from cgx.answer.engine import _blocking_scaffold_call
+    prov = _TruncatingProvider(truncate_n=1)
+    out = _blocking_scaffold_call(prov, [{"role": "user", "content": "x"}], 4_000)
+    assert out == "print('ok')\n"
+    # One truncated pass then a clean retry at double the budget.
+    assert prov.max_tokens_seen == [4_000, 8_000]
+
+
+def test_blocking_scaffold_call_bounds_the_retries():
+    from cgx.answer.engine import _MAX_TRUNCATION_RETRIES, _blocking_scaffold_call
+    # Always truncates -> stops after the bounded number of retries.
+    prov = _TruncatingProvider(truncate_n=99)
+    _blocking_scaffold_call(prov, [{"role": "user", "content": "x"}], 4_000)
+    assert len(prov.max_tokens_seen) == _MAX_TRUNCATION_RETRIES + 1
+    # Each step doubles: 4000 -> 8000 -> 16000.
+    assert prov.max_tokens_seen == [4_000, 8_000, 16_000]
+
+
+def test_blocking_scaffold_call_no_retry_on_clean_stop():
+    from cgx.answer.engine import _blocking_scaffold_call
+    prov = _TruncatingProvider(truncate_n=0)
+    out = _blocking_scaffold_call(prov, [{"role": "user", "content": "x"}], 4_000)
+    assert out == "print('ok')\n"
+    assert prov.max_tokens_seen == [4_000]
