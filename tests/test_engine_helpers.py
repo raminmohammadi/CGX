@@ -702,6 +702,46 @@ def test_looks_newline_collapsed():
     assert _looks_newline_collapsed("export default 1;\n") is False
 
 
+def test_looks_newline_collapsed_partial_import_block():
+    """The encoder often collapses only the imports, not the whole file.
+
+    The function bodies below keep their line breaks, so the body has
+    newlines and reads as an ordinary line-1 syntax error -- but it is
+    the same JSON-mode defect, and a JSON retry reproduces it. It must
+    be routed to freeform like a wholly collapsed body.
+    """
+    from cgx.answer.engine import _looks_newline_collapsed
+
+    partial = (
+        "from fastapi import Depends, HTTPException, status from "
+        "sqlalchemy.orm import Session from backend.main import app\n"
+        "\n"
+        "def get_db():\n"
+        "    return None\n"
+    )
+    assert _looks_newline_collapsed(partial) is True
+
+
+def test_looks_newline_collapsed_ignores_parseable_and_quoted_imports():
+    """Valid source is never collapsed, whatever its prose says.
+
+    A docstring narrating ``import x from y import z`` matches the
+    joined-import shape textually; parsing first keeps it out of scope.
+    JS/TS imports name a quoted module, so they are excluded too --
+    otherwise every React file would be reported.
+    """
+    from cgx.answer.engine import _looks_newline_collapsed
+
+    prose = ('def f():\n'
+             '    """Given import a from b import c, do nothing."""\n'
+             '    return 1\n')
+    assert _looks_newline_collapsed(prose) is False
+    js = 'import React from "react";\nimport {useState} from "react";\n'
+    assert _looks_newline_collapsed(js) is False
+    # Unparseable, but the bad line is not a joined-import line.
+    assert _looks_newline_collapsed("def f(:\n    return 1\n") is False
+
+
 def test_scaffold_collapsed_json_body_recovers_via_freeform():
     """A newline-collapsed body is re-asked in freeform, not in JSON mode.
 

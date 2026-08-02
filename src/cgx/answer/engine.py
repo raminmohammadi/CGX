@@ -3298,8 +3298,33 @@ def _format_syntax_error(exc: SyntaxError) -> str:
     return f"{base}; offending line {getattr(exc, 'lineno', '?')}: {text[:120]!r}"
 
 
+_IMPORT_KW_RE = re.compile(r"\bimport\b")
+_FROM_KW_RE = re.compile(r"\bfrom\b")
+
+
+def _line_joins_imports(line: str) -> bool:
+    """True when one physical line carries several import statements.
+
+    A well-formed Python import line is either ``import a, b`` (one
+    ``import``, no ``from``) or ``from a import b`` (one of each), so a
+    second occurrence of either keyword means separate statements were
+    joined. Lines carrying a quote or a semicolon are skipped: a string
+    literal can mention the keywords, and ``import a; import b`` is
+    unusual but legal. A trailing comment is cut for the same reason.
+    The quote guard also takes JS/TS out of scope, where every import
+    names a quoted module.
+    """
+    stmt = line.split("#", 1)[0]
+    if not stmt.lstrip().startswith(("import ", "from ")):
+        return False
+    if any(c in stmt for c in "\"';"):
+        return False
+    return (len(_IMPORT_KW_RE.findall(stmt)) > 1
+            or len(_FROM_KW_RE.findall(stmt)) > 1)
+
+
 def _looks_newline_collapsed(content: str) -> bool:
-    """True when a file body arrived as a single physical line.
+    """True when a file body lost the line breaks between statements.
 
     Asked for strict JSON, some models never emit an escaped newline:
     they join every line of the file with a space, so ``import sqlite3``
@@ -3308,13 +3333,37 @@ def _looks_newline_collapsed(content: str) -> bool:
     because every recovery path re-asks in JSON mode the *same* encoder
     reproduces it byte for byte -- the regenerate loop cannot converge.
     Recognising the shape lets the caller route around JSON mode instead
-    of retrying into it. The length floor keeps genuinely one-line files
-    (a single export, a one-line config) out of scope.
+    of retrying into it.
+
+    The damage is not always total. The same encoder often collapses only
+    the import block and leaves the function bodies below it correctly
+    delimited, which reads as an ordinary line-1 syntax error while being
+    the identical JSON-mode defect -- so keying solely on a body with no
+    newline at all sends exactly the shape that needs freeform back into
+    JSON mode. Both are reported here. The length floor keeps genuinely
+    one-line files (a single export, a one-line config) out of scope.
+
+    A partially collapsed body is only ever inspected line by line once
+    the body as a whole has failed to parse: source that compiles is by
+    construction not collapsed, and skipping it keeps prose that merely
+    reads like joined imports (a docstring narrating an ``import``) from
+    being mistaken for one.
     """
     body = (content or "").strip()
-    if not body or "\n" in body:
+    if not body:
         return False
-    return len(body) > 120
+    if "\n" not in body:
+        return len(body) > 120
+    import ast as _ast
+    try:
+        _ast.parse(body)
+    except SyntaxError:
+        pass
+    except (ValueError, MemoryError, RecursionError):
+        return False
+    else:
+        return False
+    return any(_line_joins_imports(ln) for ln in body.splitlines())
 
 
 @traced("llm")
