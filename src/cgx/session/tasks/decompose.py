@@ -23,7 +23,8 @@ from cgx.session.models import (
     TaskKind,
     TaskNode,
 )
-from cgx.session.scaffold_validate import missing_stack_entry_files
+from cgx.session.scaffold_validate import (missing_stack_entry_files,
+                                           stack_entry_description)
 from cgx.session.tasks.base import (
     ExecutorDeps,
     ExecutorResult,
@@ -314,6 +315,46 @@ def _find_dependency_cycle(
     return None
 
 
+def _relocate_misplaced_stack_entries(
+        files: List[Dict[str, Any]],
+        missing: List[Dict[str, str]]) -> List[str]:
+    """Move an entry file the planner put in the wrong directory.
+
+    A planner that declares ``public/index.html`` has not forgotten the
+    Vite entry, it has misfiled it: ``public/`` is copied verbatim as a
+    static asset, so the bundler still cannot resolve an entry. Injecting
+    a second node makes it worse -- both paths get the same boilerplate
+    and SCAFFOLD's duplicate-content gate then drops one of them, which
+    is exactly the root entry that has to exist. Rewriting the existing
+    node's path keeps one file, in the only place the toolchain looks.
+
+    Mutates the manifest nodes in place, repoints any ``depends_on``
+    naming the old path, and returns the paths that were moved.
+    """
+    moved: List[str] = []
+    for entry in list(missing):
+        want = entry["path"]
+        base = want.rsplit("/", 1)[-1]
+        candidates = sorted(
+            (f for f in files
+             if f["path"] != want and f["path"].rsplit("/", 1)[-1] == base),
+            key=lambda f: (f["path"].count("/"), f["path"]))
+        if not candidates:
+            continue
+        node = candidates[0]
+        old = node["path"]
+        node["path"] = want
+        node["description"] = stack_entry_description(want)
+        for other in files:
+            deps = other.get("depends_on")
+            if not isinstance(deps, list) or old not in deps:
+                continue
+            other["depends_on"] = [want if d == old else d for d in deps]
+        missing.remove(entry)
+        moved.append(f"{old} -> {want}")
+    return moved
+
+
 def _inject_stack_entry_files(layers: List[Dict[str, Any]]) -> List[str]:
     """Add toolchain-mandated entry files the planner left out.
 
@@ -330,6 +371,13 @@ def _inject_stack_entry_files(layers: List[Dict[str, Any]]) -> List[str]:
     missing = missing_stack_entry_files(paths)
     if not missing:
         return []
+    moved = _relocate_misplaced_stack_entries(files, missing)
+    if moved:
+        logger.warning(
+            "DECOMPOSE: manifest misfiled required entry file(s) %s; "
+            "moving them to where the toolchain resolves them", moved)
+    if not missing:
+        return []
     # Append to the last layer that has files so the generator sees the
     # whole tree (notably the script entry point the HTML must reference)
     # as context, and declare the dependency so the toposort keeps that
@@ -338,7 +386,7 @@ def _inject_stack_entry_files(layers: List[Dict[str, Any]]) -> List[str]:
                    if isinstance(lay, dict) and lay.get("files")), None)
     if target is None:
         return []
-    script = next((p for p in paths
+    script = next((p for p in (f["path"] for f in files)
                    if p.rsplit("/", 1)[-1].split(".")[0] in ("main", "index")
                    and p.rsplit(".", 1)[-1] in ("jsx", "tsx", "js", "ts")),
                   None)

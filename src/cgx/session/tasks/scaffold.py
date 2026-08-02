@@ -631,6 +631,18 @@ def _import_coherence_failures(
         _known_cache[root_name] = False
         return False
 
+    # The importable first-party inventory, named in the error so the
+    # regenerate edge has something to aim at. Without it a model that
+    # invented ``import app`` has no way to learn the module is really
+    # ``backend.main`` and simply invents it again on every retry.
+    from cgx.session.scaffold_validate import _module_name_for_path
+    inventory = sorted({
+        mod for p in manifest_paths + batch_paths
+        if p.strip().replace("\\", "/").lstrip("./").endswith(".py")
+        for mod in (_module_name_for_path(
+            p.strip().replace("\\", "/").lstrip("./")),)
+        if mod})[:12]
+
     out: List[Dict[str, str]] = []
     for entry in files_with_content:
         path = str(entry.get("path") or "")
@@ -662,7 +674,7 @@ def _import_coherence_failures(
                     "defined in the project manifest, not on disk, and "
                     "not declared in requirements.txt -- import only "
                     "from the manifest's modules or its declared "
-                    "dependencies"),
+                    f"dependencies; the project's modules are {inventory}"),
             })
     return out
 

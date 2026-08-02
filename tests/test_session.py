@@ -3674,6 +3674,53 @@ def test_missing_stack_entry_files_ignores_non_vite_manifests():
     assert missing_stack_entry_files(["backend/main.py"]) == []
 
 
+def test_inject_stack_entry_relocates_misfiled_vite_entry():
+    """``public/index.html`` is misfiled, not missing.
+
+    Injecting a second node made SCAFFOLD generate near-identical
+    boilerplate twice, and the duplicate-content gate then dropped the
+    root entry -- the one file Vite cannot build without.
+    """
+    from cgx.session.tasks.decompose import _inject_stack_entry_files
+    layers = [{"name": "ui", "files": [
+        {"path": "vite.config.js", "description": "v"},
+        {"path": "public/index.html", "description": "html"},
+        {"path": "src/main.jsx", "description": "e",
+         "depends_on": ["public/index.html"]},
+    ]}]
+    assert _inject_stack_entry_files(layers) == []
+    files = layers[0]["files"]
+    assert [f["path"] for f in files] == [
+        "vite.config.js", "index.html", "src/main.jsx"]
+    assert files[2]["depends_on"] == ["index.html"]
+    assert "Vite entry HTML" in files[1]["description"]
+
+
+def test_inject_stack_entry_still_injects_when_truly_absent():
+    from cgx.session.tasks.decompose import _inject_stack_entry_files
+    layers = [{"name": "ui", "files": [
+        {"path": "vite.config.js", "description": "v"},
+        {"path": "src/main.jsx", "description": "e"},
+    ]}]
+    assert _inject_stack_entry_files(layers) == ["index.html"]
+    assert [f["path"] for f in layers[0]["files"]][-1] == "index.html"
+
+
+def test_import_coherence_error_names_the_project_modules():
+    """A bare hallucinated root gets no locator without the inventory."""
+    from cgx.session.tasks.scaffold import _import_coherence_failures
+    layers = [{"files": [{"path": "backend/__init__.py"},
+                         {"path": "backend/main.py"},
+                         {"path": "tests/test_main.py"}]}]
+    batch = [{"path": "tests/test_main.py",
+              "content": "from app import client\n"}]
+    failures = _import_coherence_failures(batch, layers, None)
+    assert len(failures) == 1
+    error = failures[0]["error"]
+    assert "['app']" in error
+    assert "backend.main" in error
+
+
 def test_scaffold_executor_missing_work_plan_fails(store):
     from cgx.session.tasks.scaffold import run_scaffold
     session = Session.new("g", mode=SessionMode.GREENFIELD)
