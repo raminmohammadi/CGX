@@ -345,6 +345,31 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         return ExecutorResult(
             failure="SCAFFOLD: every file generation failed")
 
+    # Manifest-coherence synthesis: the planner regularly authors tests
+    # and entry points that import a first-party application module it
+    # never planned (``from backend.app import app`` with no
+    # ``backend/app.py`` anywhere in the manifest or the batch). The
+    # import-coherence and phantom gates below would drop those importers
+    # -- discarding the very suite that proves the app works. Author the
+    # omitted modules against their callers first, so the gates see them as
+    # first-party and keep the importers, and so the coherence pass that
+    # follows can symbol-check a freshly authored module against its
+    # callers. Best-effort and bounded; a failure leaves the bundle
+    # untouched.
+    synthesized_modules: List[str] = []
+    try:
+        synthesized_modules = _synthesize_missing_first_party_modules(
+            diffs=diffs, generated=generated,
+            existing_with_content=existing_with_content, layers=layers,
+            goal=goal, provider=deps.provider, contracts=contracts,
+            skills=skills, project_root=deps.project_root)
+    except Exception:  # pragma: no cover - defensive: pass is best-effort
+        logger.exception(
+            "SCAFFOLD: first-party module synthesis raised; skipping")
+        synthesized_modules = []
+    if synthesized_modules:
+        _checkpoint_progress(deps, artifact)
+
     # Global coherence pass (#2): the per-file loop resolves imports
     # against whichever siblings existed when each file was generated (and
     # the parallel path freezes a per-layer snapshot), so a file can still
@@ -530,6 +555,7 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     artifact.content["contract_warnings"] = contract_warnings
     artifact.content["reconciled_count"] = reconciled_count
     artifact.content["js_deps_added"] = js_deps_added
+    artifact.content["synthesized_modules"] = synthesized_modules
     artifact.content["complete"] = True
     return ExecutorResult(
         outputs={
@@ -543,29 +569,32 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             "contract_warnings": contract_warnings,
             "reconciled_count": reconciled_count,
             "js_deps_added": js_deps_added,
+            "synthesized_modules": synthesized_modules,
         },
         artifact=artifact,
     )
 
 
-def _import_coherence_failures(
+def _known_import_root_resolver(
         files_with_content: List[Dict[str, str]],
         layers: List[Any],
         project_root: Optional[str],
-) -> List[Dict[str, str]]:
-    """Flag generated ``.py`` files whose absolute imports resolve nowhere.
+) -> Tuple[Callable[[str], bool], set]:
+    """Build ``(is_known, known_local)`` for judging first-party import roots.
 
-    An import root is *unknown* when it is not stdlib, does not match any
-    module or package name derivable from the work-plan manifest or the
-    generated batch (``.py`` basenames and directory segments), does not
-    exist under ``project_root`` on disk, is not declared in the batch's
-    (or project's) requirements.txt, and is not a real package findable
-    in the running environment. Such an import can only be a
-    hallucination: APPLY would write it and BOOTSTRAP_ENV's preflight
-    would then ``pip install`` the fabricated name and fail. Returns
-    ``{file, error}`` entries shaped for the router's regenerate splice.
+    ``is_known(root)`` returns True when the top-level segment of an import
+    resolves somewhere a build could satisfy it: the ``__future__``
+    pseudo-module, the stdlib, a namespace root, a module/directory name
+    derivable from the work-plan manifest or the generated batch, a
+    distribution declared in the batch's (or on-disk) ``requirements.txt``,
+    or a package findable under ``project_root`` / in the running
+    environment. ``known_local`` is the set of project-local module and
+    directory names the manifest + batch define. Shared by the
+    import-coherence gate (which drops an importer of an unknown root as a
+    hallucination) and the first-party synthesizer (which reads the same
+    verdict the other way: a plainly first-party unknown root names a
+    module the planner omitted, to be authored rather than dropped).
     """
-    import ast as _ast
     from cgx.codegen.env_manager import (
         _IMPORT_TO_PYPI, _NAMESPACE_ROOTS, _STDLIB_TOP, _is_local_package)
 
@@ -652,6 +681,37 @@ def _import_coherence_failures(
         _known_cache[root_name] = False
         return False
 
+    return _known, known_local
+
+
+def _import_coherence_failures(
+        files_with_content: List[Dict[str, str]],
+        layers: List[Any],
+        project_root: Optional[str],
+) -> List[Dict[str, str]]:
+    """Flag generated ``.py`` files whose absolute imports resolve nowhere.
+
+    An import root is *unknown* when it is not stdlib, does not match any
+    module or package name derivable from the work-plan manifest or the
+    generated batch (``.py`` basenames and directory segments), does not
+    exist under ``project_root`` on disk, is not declared in the batch's
+    (or project's) requirements.txt, and is not a real package findable
+    in the running environment. Such an import can only be a
+    hallucination: APPLY would write it and BOOTSTRAP_ENV's preflight
+    would then ``pip install`` the fabricated name and fail. Returns
+    ``{file, error}`` entries shaped for the router's regenerate splice.
+    """
+    import ast as _ast
+
+    known, _known_local = _known_import_root_resolver(
+        files_with_content, layers, project_root)
+
+    manifest_paths = [
+        str(e.get("path") or "").strip()
+        for lay in layers if isinstance(lay, dict)
+        for e in (lay.get("files") or []) if isinstance(e, dict)]
+    batch_paths = [str(e.get("path") or "") for e in files_with_content]
+
     # The importable first-party inventory, named in the error so the
     # regenerate edge has something to aim at. Without it a model that
     # invented ``import app`` has no way to learn the module is really
@@ -685,7 +745,7 @@ def _import_coherence_failures(
             for mod in mods:
                 root_name = mod.split(".")[0]
                 if (root_name and root_name not in unknown
-                        and not _known(root_name)):
+                        and not known(root_name)):
                     unknown.append(root_name)
         if unknown:
             out.append({
@@ -698,6 +758,249 @@ def _import_coherence_failures(
                     f"dependencies; the project's modules are {inventory}"),
             })
     return out
+
+
+# Cap on first-party modules synthesized per SCAFFOLD when generated files
+# import a module the planner omitted. Bounded so a badly-planned tree (or a
+# model that keeps inventing new names) cannot fan the pass out into an
+# unbounded generation loop; anything past the cap falls through to the drop
+# gates exactly as before.
+_SYNTH_MODULE_BUDGET = 8
+
+
+def _module_to_source_path(dotted: str) -> str:
+    """The ``.py`` file path backing a dotted first-party module name."""
+    return dotted.replace(".", "/") + ".py"
+
+
+def _is_test_path(path: str) -> bool:
+    """True when ``path`` is a pytest test module or a conftest."""
+    norm = (path or "").replace("\\", "/").strip("/")
+    base = norm.rsplit("/", 1)[-1]
+    return (base == "conftest.py" or base.startswith("test_")
+            or base.endswith("_test.py")
+            or norm == "tests" or norm.startswith("tests/")
+            or "/tests/" in norm)
+
+
+def _synthesized_module_description(
+        mod: str, path: str, symbols: List[str]) -> str:
+    """Generation brief for a first-party module the planner omitted.
+
+    Names the module and the file to author and -- crucially -- lists the
+    exact top-level symbols its callers already import, so the generator
+    writes a public surface that lines up with the rest of the tree instead
+    of re-deriving an interface that will not match.
+    """
+    needs = ""
+    if symbols:
+        needs = (" It must define these top-level names that other generated "
+                 f"files already import from it: {', '.join(symbols)}.")
+    return (
+        f"First-party module `{mod}` (file `{path}`). Other generated files "
+        f"import from this module, but the work plan omitted it, so author "
+        f"it now to match how its callers already use it.{needs}")
+
+
+def _missing_first_party_imports(
+        files_with_content: List[Dict[str, str]],
+        layers: List[Any],
+        project_root: Optional[str],
+) -> Dict[str, Dict[str, Any]]:
+    """First-party modules generated files import but the plan omits.
+
+    The planner routinely authors a test suite (or an entry point) that
+    imports the application module it forgot to plan -- ``from backend.app
+    import app, compute`` with no ``backend/app.py`` anywhere in the
+    manifest or the batch. The importer is correct; the module is simply
+    missing. Returns, per omitted module, everything needed to author it:
+    the ``.py`` path to create, the union of the symbols siblings import
+    from it, and the importer paths (fed back as generation context).
+
+    A reference is a synthesis candidate only when it is unambiguously
+    first-party -- never a mistyped dependency:
+
+    * its root segment is a generated project source directory (a dotted
+      import into an existing package the plan under-populated); or
+    * it is imported *with named symbols by a test/conftest module* and its
+      root resolves nowhere a build could satisfy it (not stdlib, not
+      installed, not declared in requirements) and is not a known PyPI
+      import alias -- so it can only be the module-under-test the plan
+      forgot.
+
+    Self-imports and already-generated modules are skipped; parse failures
+    abstain for that file.
+    """
+    import ast as _ast
+    from cgx.codegen.env_manager import _IMPORT_TO_PYPI
+    from cgx.session.scaffold_validate import _module_name_for_path
+
+    known, _known_local = _known_import_root_resolver(
+        files_with_content, layers, project_root)
+
+    manifest_paths = [
+        str(e.get("path") or "") for lay in layers if isinstance(lay, dict)
+        for e in (lay.get("files") or []) if isinstance(e, dict)]
+    batch_paths = [str(e.get("path") or "") for e in files_with_content]
+    py_paths = [
+        p.strip().replace("\\", "/").lstrip("./")
+        for p in manifest_paths + batch_paths
+        if p.strip().replace("\\", "/").lstrip("./").endswith(".py")]
+    existing_paths = set(py_paths)
+
+    modules: set = set()
+    prefixes: set = set()
+    for p in py_paths:
+        mod = _module_name_for_path(p)
+        if not mod:
+            continue
+        modules.add(mod)
+        parts = mod.split(".")
+        for i in range(1, len(parts)):
+            prefixes.add(".".join(parts[:i]))
+    fp_roots = {p.split("/")[0] for p in py_paths if "/" in p}
+
+    candidates: Dict[str, Dict[str, Any]] = {}
+
+    def _record(mod: str, importer: str, symbols: List[str]) -> None:
+        target = _module_to_source_path(mod)
+        if mod in modules or mod in prefixes or target in existing_paths:
+            return
+        rec = candidates.setdefault(
+            mod, {"path": target, "symbols": set(), "importers": []})
+        rec["symbols"].update(s for s in symbols if s and s != "*")
+        if importer and importer not in rec["importers"]:
+            rec["importers"].append(importer)
+
+    for entry in files_with_content:
+        path = str(entry.get("path") or "").replace("\\", "/").lstrip("./")
+        content = entry.get("content") or ""
+        if not path.endswith(".py") or not content:
+            continue
+        try:
+            tree = _ast.parse(content)
+        except SyntaxError:
+            continue
+        importer_mod = _module_name_for_path(path)
+        is_test = _is_test_path(path)
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.ImportFrom) and not node.level:
+                refs = [(node.module or "", [a.name for a in node.names])]
+            elif isinstance(node, _ast.Import):
+                refs = [(a.name or "", []) for a in node.names]
+            else:
+                continue
+            for mod, symbols in refs:
+                if not mod or mod == importer_mod:
+                    continue
+                root = mod.split(".")[0]
+                first_party = False
+                if root in fp_roots:
+                    first_party = True
+                elif (symbols and is_test and not known(root)
+                        and root not in _IMPORT_TO_PYPI):
+                    first_party = True
+                if first_party:
+                    _record(mod, path, symbols)
+    return candidates
+
+
+def _synthesize_missing_first_party_modules(
+        *,
+        diffs: List[Dict[str, str]],
+        generated: List[Dict[str, Any]],
+        existing_with_content: List[Dict[str, str]],
+        layers: List[Any],
+        goal: str,
+        provider: Any,
+        contracts: Optional[Dict[str, Any]],
+        skills: Optional[List[str]],
+        project_root: Optional[str],
+) -> List[str]:
+    """Author first-party modules generated files import but the plan omits.
+
+    Symmetric with the requirements.txt / package.json salvage: rather than
+    letting the import-coherence and phantom gates drop the tests and entry
+    points that reference an omitted application module,
+    :func:`_missing_first_party_imports` finds those modules and this
+    generates each one against its callers -- so the model derives the
+    module's contract from the symbols they already use -- then splices the
+    results into the diff bundle *and* the in-memory manifest so the
+    downstream gates treat them as first-party and leave the importers
+    intact. A dotted module in a package with no generated ``__init__.py``
+    also gets an empty package marker so pytest can import it. Bounded by
+    :data:`_SYNTH_MODULE_BUDGET`; a module whose generation fails is left
+    for the drop gates, so the pass can only add resolvable files (or
+    no-op). Mutates the passed lists/manifest in place and returns the paths
+    authored.
+    """
+    if provider is None:
+        return []
+    missing = _missing_first_party_imports(
+        existing_with_content, layers, project_root)
+    if not missing:
+        return []
+
+    from cgx.answer.engine import _content_to_new_file_patch
+
+    existing_paths = {
+        str(e.get("path") or "").replace("\\", "/").lstrip("./")
+        for e in existing_with_content}
+    synth_files: List[Dict[str, Any]] = []
+    added: List[str] = []
+
+    def _add(path: str, content: str,
+             ok_meta: Optional[Dict[str, Any]]) -> None:
+        patch = (ok_meta["patch"] if ok_meta
+                 else _content_to_new_file_patch(path, content))
+        diffs.append({"file": path, "patch": patch})
+        generated.append({
+            "file": path, "layer": "synthesized",
+            "syntax_ok": bool(ok_meta["syntax_ok"]) if ok_meta else True,
+            "confidence": ok_meta.get("confidence") if ok_meta else None,
+            "bytes": len(content), "synthesized": True})
+        existing_with_content.append({"path": path, "content": content})
+        existing_paths.add(path.replace("\\", "/").lstrip("./"))
+        synth_files.append({"path": path})
+        added.append(path)
+
+    # Deterministic order + hard cap so the pass is reproducible and cannot
+    # fan out unboundedly on a badly-planned tree.
+    for mod, info in sorted(missing.items(), key=lambda kv: kv[0])[
+            :_SYNTH_MODULE_BUDGET]:
+        target = str(info["path"])
+        if target.replace("\\", "/").lstrip("./") in existing_paths:
+            continue
+        # Package markers for every intermediate package so ``a.b.c`` stays
+        # importable even when the plan never created the package dirs.
+        parts = mod.split(".")
+        for i in range(1, len(parts)):
+            pkg_init = "/".join(parts[:i]) + "/__init__.py"
+            if pkg_init not in existing_paths:
+                _add(pkg_init, '"""Package marker."""\n', None)
+        symbols = sorted(info.get("symbols") or [])
+        importer_set = set(info.get("importers") or [])
+        context = [e for e in existing_with_content
+                   if str(e.get("path") or "") in importer_set] \
+            or list(existing_with_content)
+        desc = _synthesized_module_description(mod, target, symbols)
+        ok, _fail = _generate_one(
+            target, desc, "synthesized", context, provider, goal,
+            depends_on=None, contracts=contracts, skills=skills)
+        if ok is None:
+            logger.warning(
+                "SCAFFOLD: could not synthesize omitted first-party module "
+                "%r (imported by %s); leaving importer(s) for the drop gate",
+                mod, sorted(importer_set)[:3])
+            continue
+        _add(ok["file"], ok["content"], ok)
+
+    if synth_files:
+        layers.append({"name": "synthesized", "files": synth_files})
+        logger.warning(
+            "SCAFFOLD: work plan omitted first-party module(s) imported by "
+            "generated files; synthesized %s so the importers resolve", added)
+    return added
 
 
 def _phantom_first_party_import_failures(

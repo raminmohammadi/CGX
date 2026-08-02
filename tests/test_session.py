@@ -4452,6 +4452,88 @@ def test_phantom_import_gate_abstains_on_src_layout_and_manifest_peers():
     assert _phantom_first_party_import_failures(files, layers) == []
 
 
+def test_missing_first_party_imports_detects_module_under_test():
+    """A test importing named symbols from an unplanned module is a candidate.
+
+    Mirrors the live failure: the planner authored ``tests/test_app.py`` +
+    ``tests/conftest.py`` importing ``backend.app`` but never planned
+    ``backend/app.py``. The importers are correct; the module is missing, so
+    it must be authored rather than dropped.
+    """
+    from cgx.session.tasks.scaffold import _missing_first_party_imports
+    files = [
+        {"path": "tests/test_app.py",
+         "content": "from backend.app import app, compute\n"},
+        {"path": "tests/conftest.py",
+         "content": "from backend.app import app\n"},
+    ]
+    layers = [{"files": [{"path": f["path"]} for f in files]}]
+    missing = _missing_first_party_imports(files, layers, None)
+    assert set(missing) == {"backend.app"}
+    rec = missing["backend.app"]
+    assert rec["path"] == "backend/app.py"
+    assert rec["symbols"] == {"app", "compute"}
+    assert set(rec["importers"]) == {"tests/test_app.py", "tests/conftest.py"}
+
+
+def test_missing_first_party_imports_ignores_stdlib_deps_and_self():
+    """Stdlib, declared deps, and self-imports are never synthesis candidates."""
+    from cgx.session.tasks.scaffold import _missing_first_party_imports
+    files = [
+        {"path": "requirements.txt", "content": "flask\n"},
+        {"path": "tests/test_app.py",
+         "content": ("import os\nfrom flask import Flask\n"
+                     "from tests.test_app import helper\n")},
+    ]
+    layers = [{"files": [{"path": f["path"]} for f in files]}]
+    assert _missing_first_party_imports(files, layers, None) == {}
+
+
+def test_scaffold_synthesizes_omitted_first_party_module(store, monkeypatch):
+    """A planned test importing an unplanned app module gets the module authored.
+
+    The manifest plans only ``tests/test_app.py`` (which imports
+    ``backend.app``); the coherence/phantom gates would otherwise drop the
+    test. The synthesis pass authors ``backend/app.py`` (plus its package
+    marker) against the importer so the gates keep the test and the tree
+    resolves.
+    """
+    from cgx.session.tasks.scaffold import run_scaffold
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    plan = Artifact.new(
+        session.session_id, "task_x", ArtifactKind.WORK_PLAN, {
+            "plan_md": "", "composed_goal": "g", "prior_goal": "g",
+            "layers": [{"name": "app", "files": [
+                {"path": "tests/test_app.py", "description": ""}]}],
+        })
+    store.save_artifact(plan)
+
+    bodies = {
+        "tests/test_app.py": (
+            "from backend.app import compute\n\n\n"
+            "def test_add():\n    assert compute(1, 1) == 2\n"),
+        "backend/app.py": "def compute(a, b):\n    return a + b\n",
+    }
+
+    def fake_generate(path, *a, **kw):
+        return {"file": path, "patch": f"+++ {path}\nx",
+                "content": bodies[path], "syntax_ok": True}
+
+    monkeypatch.setattr("cgx.answer.engine.generate_single_scaffold_file",
+                        fake_generate)
+    t = TaskNode.new(session.session_id, TaskKind.SCAFFOLD, "s",
+                     inputs={"work_plan_artifact_id": plan.artifact_id})
+    result = run_scaffold(
+        t, ExecutorDeps(provider=_StubProvider(""), store=store))
+    assert result.failure is None
+    files = [d["file"] for d in result.artifact.content["diffs"]]
+    assert "tests/test_app.py" in files
+    assert "backend/app.py" in files
+    assert "backend/__init__.py" in files
+    assert result.artifact.content["failed"] == []
+
+
 def test_scaffold_targeted_regenerate_reuses_good_diffs(store, monkeypatch):
     """regenerate_files -> only the failed path is generated; good diffs reused."""
     from cgx.answer.engine import _content_to_new_file_patch
