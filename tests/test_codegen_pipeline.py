@@ -479,6 +479,46 @@ def test_repin_requirements_pins_declared_to_installed_versions():
     assert "werkzeug" not in out
 
 
+def test_requirements_lock_marker_roundtrip(tmp_path):
+    """mark_requirements_locked -> requirements_locked True; absent -> False."""
+    from cgx.codegen.env_manager import (
+        mark_requirements_locked, requirements_locked)
+    root = str(tmp_path)
+    assert requirements_locked(root) is False
+    mark_requirements_locked(root)
+    assert requirements_locked(root) is True
+    # The marker lives under the hidden .cgx dir, never in the project tree.
+    assert (tmp_path / ".cgx" / "requirements.locked").is_file()
+
+
+def test_resolve_conflict_marks_requirements_locked(tmp_path, monkeypatch):
+    """A successful conflict re-resolve re-pins AND marks the file env-locked.
+
+    The lock marker is what lets a later whole-tree regenerate carry the
+    resolved pins forward instead of re-emitting the model's stale manifest.
+    """
+    from cgx.codegen import env_manager
+    (tmp_path / "requirements.txt").write_text(
+        "flask==2.0.1\n", encoding="utf-8")
+
+    class _Proc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(env_manager.subprocess, "run",
+                        lambda *a, **k: _Proc())
+    monkeypatch.setattr(env_manager, "_pip_freeze_versions",
+                        lambda py: {"flask": "3.1.3", "werkzeug": "3.1.8"})
+    summary = env_manager.resolve_dependency_conflict(
+        str(tmp_path), ["flask", "werkzeug"])
+    assert summary["upgraded"] is True
+    # The stale pin was rewritten to the resolved, conflict-free version...
+    assert "flask==3.1.3" in (tmp_path / "requirements.txt").read_text()
+    # ...and the file is now marked env-locked so a regenerate preserves it.
+    assert env_manager.requirements_locked(str(tmp_path)) is True
+
+
 # -- _apply_hunks context-verification regression tests -----------------
 
 def _two_func_src() -> str:

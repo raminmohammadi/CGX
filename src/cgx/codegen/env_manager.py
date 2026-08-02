@@ -430,6 +430,40 @@ def update_requirements(project_root: str, new_packages: List[str]) -> None:
                 len(to_add), to_add)
 
 
+# Marker recording that requirements.txt on disk is env-managed -- a
+# repair re-pinned it to a self-consistent, conflict-free set, so a later
+# whole-tree regenerate must carry it forward verbatim instead of
+# re-emitting the model's stale manifest. Kept under the session's hidden
+# ``.cgx`` dir so it never pollutes the generated project tree.
+_REQUIREMENTS_LOCK_MARKER = os.path.join(".cgx", "requirements.locked")
+
+
+def mark_requirements_locked(project_root: str) -> None:
+    """Record that requirements.txt is env-managed (repair-resolved).
+
+    A whole-tree regenerate reads this marker (:func:`requirements_locked`)
+    and carries the resolved requirements.txt forward verbatim instead of
+    re-generating it from the model, so a deterministic dependency fix
+    survives a re-scaffold. Best-effort: a write failure is logged and
+    swallowed so it never breaks the repair that resolved the conflict.
+    """
+    try:
+        marker = Path(project_root) / _REQUIREMENTS_LOCK_MARKER
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("", encoding="utf-8")
+    except Exception as exc:  # pragma: no cover - best-effort marker
+        logger.warning(
+            "env_manager: could not write requirements lock marker: %s", exc)
+
+
+def requirements_locked(project_root: str) -> bool:
+    """Return True when a repair marked requirements.txt env-managed."""
+    try:
+        return (Path(project_root) / _REQUIREMENTS_LOCK_MARKER).is_file()
+    except Exception:  # pragma: no cover - defensive
+        return False
+
+
 @traced("codegen")
 def preflight_install(
     generated_files: List[str],
@@ -597,6 +631,10 @@ def resolve_dependency_conflict(
         summary["repinned"] = sorted(
             n for n in (_requirement_name(ln) for ln in after.splitlines())
             if n)
+        # Mark the file env-managed so a later whole-tree regenerate
+        # carries these resolved pins forward instead of re-emitting the
+        # model's stale manifest and reintroducing the conflict.
+        mark_requirements_locked(project_root)
         logger.info(
             "env_manager: re-pinned requirements.txt after conflict "
             "re-resolve (%s)", ", ".join(dists))

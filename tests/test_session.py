@@ -1308,6 +1308,51 @@ def test_router_api_check_failed_budget_exhausted_terminates_session():
     assert status[0].status is SessionStatus.FAILED
 
 
+def test_router_api_check_terminal_records_honest_gate_reason():
+    """H-B: a terminal gate failure attaches a concrete reason to the task.
+
+    Without this the CLI epilogue only shows a bare "session failed
+    (N done, 0 failed)". The router keeps the gate task DONE (it ran fine;
+    its report is what failed) but records an ``error`` naming the gate,
+    why it could not be repaired, and the failure signature so the reason
+    is surfaced to the user.
+    """
+    from cgx.session.models import SessionMode
+    from cgx.session.budget import REPAIR_BUDGET
+    sig = "api_check|werkzeug.urls.url_quote"
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    api = TaskNode.new(
+        session.session_id, TaskKind.API_CHECK, "api",
+        inputs={"build_artifact_id": "art_build",
+                "mode": SessionMode.GREENFIELD.value,
+                "repair_attempt": REPAIR_BUDGET,
+                "prior_failure_signatures": []})
+    api.produced_artifact_id = "art_api"
+    api.outputs = {"outcome": "failed", "failed_count": 1,
+                   "failure_signature": sig}
+    api.status = TaskNodeStatus.DONE
+    plan = Router().on_task_completed(
+        session=session, completed=api, tasks=[api])
+    task_updates = [a for a in plan.actions
+                    if isinstance(a, UpdateTaskStatus)
+                    and a.task_id == api.task_id]
+    assert len(task_updates) == 1
+    update = task_updates[0]
+    # The gate task stays DONE -- it ran; its report is what failed.
+    assert update.status is TaskNodeStatus.DONE
+    assert update.error
+    assert "api_check" in update.error
+    assert "budget" in update.error
+    assert sig in update.error
+    # The honest reason precedes the terminal session status.
+    session_status = [a for a in plan.actions
+                      if isinstance(a, UpdateSessionStatus)]
+    assert len(session_status) == 1
+    assert session_status[0].status is SessionStatus.FAILED
+    assert (plan.actions.index(update)
+            < plan.actions.index(session_status[0]))
+
+
 def test_router_api_check_passed_does_not_terminate_session():
     """C guard is scoped to failures: a passed gate spawns SMOKE, no status."""
     from cgx.session.models import SessionMode
@@ -4791,6 +4836,102 @@ def test_scaffold_targeted_regenerate_falls_back_without_prior(store, monkeypatc
     assert result.failure is None
     # Prior artifact unresolvable -> every manifest file is regenerated.
     assert seen == ["a.py", "b.py"]
+
+
+def _carry_forward_plan(session):
+    """A work plan whose manifest includes requirements.txt + one source."""
+    return Artifact.new(
+        session.session_id, "task_x", ArtifactKind.WORK_PLAN, {
+            "prior_goal": "g", "composed_goal": "build a flask api",
+            "answers": {}, "plan_md": "",
+            "layers": [{"name": "app", "files": [
+                {"path": "requirements.txt", "description": "deps"},
+                {"path": "backend/app.py", "description": "flask app"}]}],
+        })
+
+
+def test_scaffold_carries_forward_locked_requirements_on_regenerate(
+        tmp_path, store, monkeypatch):
+    """A repair-locked requirements.txt survives a whole-tree regenerate.
+
+    env_manager re-pinned requirements.txt to a conflict-free set and
+    marked it locked; the regenerate must reuse that on-disk file verbatim
+    (never re-emit the model's stale manifest) so the dependency fix holds.
+    """
+    from cgx.answer.engine import _content_to_new_file_patch
+    from cgx.codegen.env_manager import mark_requirements_locked
+    from cgx.session.tasks.scaffold import run_scaffold
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    plan = _carry_forward_plan(session)
+    store.save_artifact(plan)
+    # The resolved, conflict-free requirements.txt already on disk, marked
+    # env-locked by the repair that re-pinned it.
+    resolved = "flask==3.1.3\nwerkzeug==3.1.8\n"
+    (tmp_path / "requirements.txt").write_text(resolved, encoding="utf-8")
+    mark_requirements_locked(str(tmp_path))
+
+    seen: list = []
+
+    def fake_generate(path, *a, **kw):
+        seen.append(path)
+        body = "from flask import Flask\napp = Flask(__name__)\n"
+        return {"file": path,
+                "patch": _content_to_new_file_patch(path, body),
+                "content": body, "syntax_ok": True, "confidence": 0.9}
+
+    monkeypatch.setattr("cgx.answer.engine.generate_single_scaffold_file",
+                        fake_generate)
+    t = TaskNode.new(
+        session.session_id, TaskKind.SCAFFOLD, "s",
+        inputs={"work_plan_artifact_id": plan.artifact_id,
+                "regenerated_from_task_id": "task_sc0"})
+    result = run_scaffold(t, ExecutorDeps(
+        provider=_StubProvider(""), store=store, project_root=str(tmp_path)))
+    assert result.failure is None
+    # requirements.txt was carried forward -- never handed to the model.
+    assert "requirements.txt" in {d["file"]
+                                  for d in result.artifact.content["diffs"]}
+    assert seen == ["backend/app.py"]
+    req_diff = next(d for d in result.artifact.content["diffs"]
+                    if d["file"] == "requirements.txt")
+    assert "flask==3.1.3" in req_diff["patch"]
+    gen = {g["file"]: g for g in result.artifact.content["generated"]}
+    assert gen["requirements.txt"].get("carried") is True
+
+
+def test_scaffold_regenerates_requirements_without_lock_marker(
+        tmp_path, store, monkeypatch):
+    """No lock marker -> requirements.txt is regenerated normally (no carry)."""
+    from cgx.answer.engine import _content_to_new_file_patch
+    from cgx.session.tasks.scaffold import run_scaffold
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    plan = _carry_forward_plan(session)
+    store.save_artifact(plan)
+    # An on-disk requirements.txt but NO lock marker -> not env-managed.
+    (tmp_path / "requirements.txt").write_text(
+        "flask==2.0.1\n", encoding="utf-8")
+
+    seen: list = []
+
+    def fake_generate(path, *a, **kw):
+        seen.append(path)
+        return {"file": path,
+                "patch": _content_to_new_file_patch(path, "x\n"),
+                "content": "x\n", "syntax_ok": True, "confidence": 0.9}
+
+    monkeypatch.setattr("cgx.answer.engine.generate_single_scaffold_file",
+                        fake_generate)
+    t = TaskNode.new(
+        session.session_id, TaskKind.SCAFFOLD, "s",
+        inputs={"work_plan_artifact_id": plan.artifact_id,
+                "regenerated_from_task_id": "task_sc0"})
+    result = run_scaffold(t, ExecutorDeps(
+        provider=_StubProvider(""), store=store, project_root=str(tmp_path)))
+    assert result.failure is None
+    # Without the marker both manifest files are regenerated from the model.
+    assert set(seen) == {"requirements.txt", "backend/app.py"}
 
 
 def test_scaffold_checkpoints_progress_after_each_layer(store, monkeypatch):
