@@ -2427,6 +2427,100 @@ def test_verify_failures_empty_when_junitxml_missing(
     assert result.artifact.content["failures"] == []
 
 
+def test_verify_collection_error_empty_junit_reports_no_false_progress(
+        tmp_path, store, monkeypatch):
+    """A collection error with no junit must not read as "0 failing".
+
+    Regression for the false-success signal: pytest exit 4 (and often 2)
+    writes no per-testcase junit, so ``failures`` is empty. Reporting
+    ``failing_count: 0`` / ``passing_count: N`` there let the router's
+    progress ledger read a total collection failure as forward progress
+    and loop. The suite never executed, so passing must be 0 and failing
+    must be unknown (``None``) -- the router then falls back to the
+    signature-flap + REPAIR_BUDGET backstops.
+    """
+    from cgx.codegen.test_runner import TestRunOutcome
+    from cgx.session.tasks.verify import run_verify
+
+    (tmp_path / "tests").mkdir()
+    test_file = tmp_path / "tests" / "test_x.py"
+    test_file.write_text("def test_x(): assert 1\n", encoding="utf-8")
+
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+
+    monkeypatch.setattr(
+        "cgx.codegen.test_runner.run_tests_on_disk",
+        lambda root, files, **_kw: TestRunOutcome(
+            ran=True, returncode=4,
+            stdout="", stderr="ERROR: usage error during collection",
+            tests_selected=[str(test_file)],
+        ))
+    t = TaskNode.new(session.session_id, TaskKind.VERIFY, "verify",
+                     inputs={"mode": SessionMode.GREENFIELD.value})
+    store.save_task(t)
+    result = run_verify(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    assert result.failure is None
+    assert result.outputs["outcome"] == "collection_error"
+    # Nothing executed: no false "N passing", and failing is unknown so the
+    # router's progress gate stays inconclusive rather than seeing 0 < prior.
+    assert result.outputs["passing_count"] == 0
+    assert result.outputs["failing_count"] is None
+    assert result.outputs["collected_count"] == 1
+
+
+def test_verify_collection_error_with_junit_errors_keeps_failing_count(
+        tmp_path, store, monkeypatch):
+    """A collection error that enumerates erroring modules keeps the trend.
+
+    The router trusts a strictly-dropping ``failing_count`` on a
+    ``collection_error`` as import fixes landing one module at a time, so
+    a junit that actually lists erroring testcases must still surface the
+    real count (here 2) -- only the empty-junit case degrades to ``None``.
+    """
+    from cgx.codegen.test_runner import TestRunOutcome
+    from cgx.session.tasks.verify import run_verify
+
+    (tmp_path / "tests").mkdir()
+    test_file = tmp_path / "tests" / "test_x.py"
+    test_file.write_text("def test_x(): assert 1\n", encoding="utf-8")
+
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+
+    def _fake_run(root, files, **kw):
+        for arg in kw.get("extra_pytest_args") or ():
+            if isinstance(arg, str) and arg.startswith("--junitxml="):
+                Path(arg.split("=", 1)[1]).write_text(
+                    '<?xml version="1.0" encoding="utf-8"?>'
+                    '<testsuites><testsuite name="pytest" tests="2" errors="2">'
+                    '<testcase classname="tests.test_x" name="test_x">'
+                    '<error type="ImportError" message="no module a">'
+                    'ImportError: no module a\n</error></testcase>'
+                    '<testcase classname="tests.test_y" name="test_y">'
+                    '<error type="ImportError" message="no module b">'
+                    'ImportError: no module b\n</error></testcase>'
+                    '</testsuite></testsuites>',
+                    encoding="utf-8")
+                break
+        return TestRunOutcome(
+            ran=True, returncode=2, stdout="", stderr="",
+            tests_selected=[str(test_file)])
+
+    monkeypatch.setattr(
+        "cgx.codegen.test_runner.run_tests_on_disk", _fake_run)
+    t = TaskNode.new(session.session_id, TaskKind.VERIFY, "verify",
+                     inputs={"mode": SessionMode.GREENFIELD.value})
+    store.save_task(t)
+    result = run_verify(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    assert result.failure is None
+    assert result.outputs["outcome"] == "collection_error"
+    assert result.outputs["failing_count"] == 2
+    assert result.outputs["passing_count"] == 0
+
+
 def test_verify_npm_only_build_failure_is_failed(
         tmp_path, store, monkeypatch):
     """A package.json-only project runs NpmRunner; a build break -> failed."""
