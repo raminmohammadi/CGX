@@ -434,6 +434,15 @@ def _replan_or_fail(completed: TaskNode, tasks: List[TaskNode], *,
                 scaffold.inputs.get("requirements_artifact_id"),
             "answers": answers,
             "replan_attempt": budget.spend_replan().replan_attempt,
+            # Carry the *spent* syntax-churn regenerate count into the
+            # revised manifest's chain. Left to reset, a fresh
+            # DECOMPOSE -> SCAFFOLD would be born at ``regenerate_attempt=0``
+            # and hand the re-planned manifest a whole second
+            # ``REGENERATE_BUDGET``, so the total syntax-churn budget would
+            # multiply by the number of re-plans. Threading it (like
+            # ``replan_attempt`` and the flap ledger below) makes the
+            # regenerate budget a per-session ceiling, not a per-manifest one.
+            "regenerate_attempt": budget.regenerate_attempt,
             "prior_failure_signatures":
                 _merged_failure_signatures(scaffold, completed),
         },

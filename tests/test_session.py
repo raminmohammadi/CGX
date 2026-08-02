@@ -10344,6 +10344,50 @@ def test_router_flap_ledger_threads_replan_decompose_to_scaffold():
     assert ap.inputs["prior_failure_signatures"] == ["sig-old"]
 
 
+def test_router_replan_carries_regenerate_attempt_into_new_decompose():
+    """A re-plan must not hand the revised manifest a fresh regenerate budget.
+
+    Left to reset, a fresh DECOMPOSE -> SCAFFOLD would be born at
+    ``regenerate_attempt=0`` and get a whole second ``REGENERATE_BUDGET``,
+    multiplying the total syntax-churn budget by the number of re-plans.
+    The spent count must ride the new DECOMPOSE so the regenerate budget
+    stays a per-session ceiling.
+    """
+    from cgx.session.budget import REGENERATE_BUDGET
+    session, _parent, scaffold, tasks = _build_scaffold_failed_chain(
+        prior_regens=REGENERATE_BUDGET)
+    plan = Router().on_task_completed(
+        session=session, completed=scaffold, tasks=tasks)
+    dec = [a.task for a in plan.actions if isinstance(a, CreateTask)][0]
+    assert dec.kind is TaskKind.DECOMPOSE
+    assert dec.inputs["regenerate_attempt"] == REGENERATE_BUDGET
+
+
+def test_router_regenerate_attempt_threads_replan_decompose_to_scaffold():
+    """regenerate_attempt rides DECOMPOSE -> ASK(APPROVE_PLAN) -> SCAFFOLD."""
+    from cgx.session.budget import REGENERATE_BUDGET
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    dec = TaskNode.new(
+        session.session_id, TaskKind.DECOMPOSE, "revise",
+        inputs={"prior_goal": "g", "requirements_artifact_id": "art_req",
+                "replan_attempt": 1,
+                "regenerate_attempt": REGENERATE_BUDGET})
+    dec.produced_artifact_id = "art_plan2"
+    dec.status = TaskNodeStatus.DONE
+    plan = Router().on_task_completed(
+        session=session, completed=dec, tasks=[dec])
+    ask = [a.task for a in plan.actions if isinstance(a, CreateTask)][0]
+    assert ask.inputs["regenerate_attempt"] == REGENERATE_BUDGET
+    decision = Decision.new(
+        session.session_id, ask.task_id, DecisionKind.APPROVE_PLAN,
+        "approve plan", {"approved": True})
+    plan2 = Router().on_decision_recorded(
+        session=session, decision=decision, tasks=[ask])
+    sc = [a.task for a in plan2.actions if isinstance(a, CreateTask)][0]
+    assert sc.kind is TaskKind.SCAFFOLD
+    assert sc.inputs["regenerate_attempt"] == REGENERATE_BUDGET
+
+
 def test_router_first_run_scaffold_has_no_flap_ledger_key():
     """A non-re-planned approval leaves the ledger key off entirely."""
     session = Session.new("g", mode=SessionMode.GREENFIELD)

@@ -391,9 +391,11 @@ def _decompose_to_ask(parent: TaskNode) -> List[TaskNode]:
     """Spawn the ASK_USER(APPROVE_PLAN) gate for a finished DECOMPOSE.
 
     A re-planned DECOMPOSE carries the failed chain's flap ledger
-    (``prior_failure_signatures``); it rides the approval gate down to
-    the new SCAFFOLD so the revised manifest's chain is not amnesiac
-    about failures the previous manifest already produced.
+    (``prior_failure_signatures``) and the spent ``regenerate_attempt``
+    count; both ride the approval gate down to the new SCAFFOLD so the
+    revised manifest's chain is not amnesiac about failures the previous
+    manifest already produced and cannot silently reset the syntax-churn
+    regenerate budget to zero.
     """
     inputs: Dict[str, Any] = {
         "expected_kind": DecisionKind.APPROVE_PLAN.value,
@@ -402,6 +404,7 @@ def _decompose_to_ask(parent: TaskNode) -> List[TaskNode]:
         "requirements_artifact_id":
             parent.inputs.get("requirements_artifact_id"),
         "replan_attempt": parent.inputs.get("replan_attempt"),
+        "regenerate_attempt": parent.inputs.get("regenerate_attempt"),
     }
     signatures = list(LoopBudget.from_inputs(
         parent.inputs).prior_failure_signatures)
@@ -1305,10 +1308,12 @@ def _from_approve_plan(ask: TaskNode,
                        decision: Decision) -> Optional[TaskNode]:
     """Spawn SCAFFOLD when the user approves the work plan.
 
-    Carries the flap ledger a re-plan folded into the approval gate, so
-    :func:`_scaffold_to_apply` threads it down the new chain and a
-    revised manifest that reproduces an already-seen failure is stopped
-    by ``budget.seen()`` instead of spending a fresh repair budget.
+    Carries the flap ledger and the spent ``regenerate_attempt`` count a
+    re-plan folded into the approval gate, so :func:`_scaffold_to_apply`
+    threads them down the new chain: a revised manifest that reproduces an
+    already-seen failure is stopped by ``budget.seen()`` instead of
+    spending a fresh repair budget, and the syntax-churn regenerate budget
+    stays a per-session ceiling rather than resetting to zero per manifest.
     """
     if not bool(decision.chosen.get("approved")):
         return None
@@ -1322,6 +1327,7 @@ def _from_approve_plan(ask: TaskNode,
             ask.inputs.get("requirements_artifact_id"),
         "prior_goal": ask.inputs.get("prior_goal"),
         "replan_attempt": ask.inputs.get("replan_attempt"),
+        "regenerate_attempt": ask.inputs.get("regenerate_attempt"),
         "decision_id": decision.decision_id,
     }
     signatures = list(LoopBudget.from_inputs(
