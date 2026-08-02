@@ -202,6 +202,12 @@ def _repair_terminal_failure_actions(
     error = ("Automated repair could not produce a patch "
              f"(classification={classification}); no regenerate or "
              "dependency-install path remained.")
+    # An escalated verdict (e.g. an unrecognized collection_error) carries
+    # a human-readable rationale explaining why no automated path applies;
+    # surface it so the terminal failure is actionable rather than opaque.
+    rationale = str(outputs.get("rationale") or "").strip()
+    if rationale:
+        error = f"{error} {rationale}"
     return [
         UpdateTaskStatus(task_id=completed.task_id,
                          status=TaskNodeStatus.FAILED, error=error),

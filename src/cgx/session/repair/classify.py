@@ -37,6 +37,7 @@ REPAIR_CLASSIFICATIONS: Tuple[str, ...] = (
     "missing_fixture",
     "empty_test_suite",
     "undefined_name",
+    "collection_error",
     "unknown",
 )
 
@@ -241,6 +242,17 @@ def classify_verify_report(content: Dict[str, Any]) -> RepairClassification:
     for token, predicate in _CLASSIFIER_REGISTRY:
         if predicate(content):
             return token
+    # No mechanical classifier matched. An assertion failure is an
+    # ordinary logic defect the bounded LLM-repair / regenerate path can
+    # still attempt, so it stays ``unknown``. An *unrecognized* collection
+    # error is different: pytest could not even import the suite for a
+    # reason none of the classifiers understand (a broken conftest, a
+    # pytest CLI/setup error, an import break outside the generated
+    # first-party modules), and a blind re-scaffold structurally cannot
+    # fix it. Surface it as its own first-class token so the executor
+    # escalates instead of burning the regenerate budget looping.
+    if outcome == "collection_error":
+        return "collection_error"
     return "unknown"
 
 

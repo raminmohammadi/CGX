@@ -7665,6 +7665,121 @@ def test_repair_executor_missing_leaf_module_regenerates(store, tmp_path: Path):
         "missing_module_pythonpath"
 
 
+def test_classify_unrecognized_collection_error_is_first_class():
+    """A collection_error that matches no classifier is its own token.
+
+    Before this fix it fell back to ``unknown`` (-> silent regenerate);
+    now it surfaces as ``collection_error`` so the executor can escalate.
+    An assertion failure with no pattern must still stay ``unknown``.
+    """
+    from cgx.session.repair.classify import classify_verify_report
+    cerr = {
+        "outcome": "collection_error",
+        "returncode": 4,
+        "stdout": ("ERROR: usage: pytest [options]\n"
+                   "pytest: error: unrecognized arguments: --foo\n"),
+        "stderr": "",
+    }
+    assert classify_verify_report(cerr) == "collection_error"
+    assert_fail = {
+        "outcome": "assertions_failed",
+        "returncode": 1,
+        "stdout": "E   assert 1 == 2\n",
+        "stderr": "",
+    }
+    assert classify_verify_report(assert_fail) == "unknown"
+
+
+def test_repair_executor_unrecognized_collection_error_escalates(
+        store, tmp_path: Path):
+    """An opaque collection_error escalates instead of regenerating.
+
+    pytest could not collect the suite and no mechanical classifier
+    matched; the REPAIR plan must carry strategy='escalate' /
+    can_apply=False (so the router halts) rather than strategy='regenerate'
+    (the whack-a-mole loop).
+    """
+    from cgx.session.tasks import repair as _repair_module  # noqa: F401
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    verify_task = TaskNode.new(
+        session.session_id, TaskKind.VERIFY, "verify",
+        inputs={"mode": SessionMode.GREENFIELD.value})
+    verify_artifact = Artifact.new(
+        session_id=session.session_id,
+        produced_by_task_id=verify_task.task_id,
+        kind=ArtifactKind.VERIFY_REPORT,
+        content={
+            "outcome": "collection_error",
+            "returncode": 4,
+            "stdout": ("ERROR: usage: pytest [options]\n"
+                       "pytest: error: unrecognized arguments: --foo\n"),
+            "stderr": "",
+        })
+    verify_task.produced_artifact_id = verify_artifact.artifact_id
+    verify_task.status = TaskNodeStatus.DONE
+    store.save_task(verify_task)
+    store.save_artifact(verify_artifact)
+    repair_task = TaskNode.new(
+        session.session_id, TaskKind.REPAIR, "repair",
+        inputs={"verify_artifact_id": verify_artifact.artifact_id,
+                "mode": SessionMode.GREENFIELD.value,
+                "repair_attempt": 1})
+    deps = ExecutorDeps(project_root=str(tmp_path), store=store)
+    from cgx.session.tasks.base import _REGISTRY
+    result = _REGISTRY[TaskKind.REPAIR](repair_task, deps)
+    assert result.failure is None
+    assert result.outputs["classification"] == "collection_error"
+    assert result.outputs["can_apply"] is False
+    assert result.outputs["diff_count"] == 0
+    assert result.outputs["strategy"] == "escalate"
+    assert result.outputs["rationale"]
+    assert result.artifact.content["extra_constraints"]["kind"] == \
+        "collection_error"
+
+
+def test_router_repair_escalate_terminates_not_regenerate():
+    """An escalate verdict halts the session even with regenerate available.
+
+    A REPAIR that escalated an unrecognized collection_error carries
+    strategy='escalate' / can_apply=False. Despite a SCAFFOLD ancestor and
+    unspent regenerate budget, the router must NOT re-scaffold; it fails
+    the session and marks the REPAIR node FAILED with the rationale.
+    """
+    from cgx.session.models import SessionMode
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    scaffold = TaskNode.new(
+        session.session_id, TaskKind.SCAFFOLD, "scaffold",
+        inputs={"mode": SessionMode.GREENFIELD.value})
+    scaffold.status = TaskNodeStatus.DONE
+    repair = TaskNode.new(
+        session.session_id, TaskKind.REPAIR, "repair",
+        parent_task_id=scaffold.task_id,
+        inputs={"mode": SessionMode.GREENFIELD.value})
+    repair.produced_artifact_id = "art_plan"
+    repair.outputs = {
+        "classification": "collection_error",
+        "strategy": "escalate",
+        "can_apply": False,
+        "failure_signature": "verify|collection_error|x",
+        "rationale": "pytest could not collect the test suite.",
+    }
+    repair.status = TaskNodeStatus.DONE
+    plan = Router().on_task_completed(
+        session=session, completed=repair, tasks=[scaffold, repair])
+    assert [a for a in plan.actions if isinstance(a, CreateTask)] == []
+    session_status = [a for a in plan.actions
+                      if isinstance(a, UpdateSessionStatus)]
+    assert len(session_status) == 1
+    assert session_status[0].status is SessionStatus.FAILED
+    task_status = [a for a in plan.actions
+                   if isinstance(a, UpdateTaskStatus)]
+    assert len(task_status) == 1
+    assert task_status[0].status is TaskNodeStatus.FAILED
+    assert "collection_error" in (task_status[0].error or "")
+    assert "collect the test suite" in (task_status[0].error or "")
+
+
 def test_repair_verify_missing_dependency_routes_to_install_deps(
         store, tmp_path: Path):
     """VERIFY missing_dependency -> strategy=install_deps, not regenerate.

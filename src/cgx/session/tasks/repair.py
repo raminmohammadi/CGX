@@ -191,6 +191,14 @@ def run_repair(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             task, verify_artifact_id, content,
             list(required_package_names(content)), signature)
 
+    if classification == "collection_error":
+        # An unrecognized collection failure: pytest could not import the
+        # suite and no mechanical classifier matched. A re-scaffold cannot
+        # fix a broken conftest / CLI-setup error / out-of-tree import, so
+        # escalate to a clean halt instead of looping on regenerate.
+        return _run_verify_collection_error_escalation(
+            task, verify_artifact_id, content, signature, attempt)
+
     diffs: List[Dict[str, str]] = []
     rationale = ""
     locations_payload: List[Dict[str, Any]] = []
@@ -358,6 +366,68 @@ def run_repair(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
 
 
 # --------------------- helpers ---------------------
+
+def _run_verify_collection_error_escalation(
+        task: TaskNode, verify_artifact_id: str,
+        content: Dict[str, Any], signature: str,
+        attempt: int) -> ExecutorResult:
+    """Escalate an unrecognized ``collection_error`` instead of looping.
+
+    pytest could not collect the suite and none of the mechanical
+    classifiers (circular/relative import, undefined name, missing
+    module/fixture/dependency) matched -- the failure is a broken
+    conftest, a pytest CLI/setup error, or an import break outside the
+    generated first-party modules, none of which a re-scaffold can fix.
+    Rather than burn the regenerate budget re-authoring code that was
+    never the cause, the plan carries ``strategy='escalate'`` /
+    ``can_apply=False`` so the router's terminal guard halts the loop with
+    the captured collection error surfaced for manual inspection.
+    """
+    from cgx.session.repair.classify import failure_text  # dep direction
+
+    error_text = failure_text(content)
+    rationale = (
+        "pytest could not collect the test suite (collection_error) and no "
+        "mechanical repair classifier matched the failure -- typically a "
+        "broken conftest, a pytest CLI/setup error, or an import error "
+        "outside the generated first-party modules. A re-scaffold cannot "
+        "fix this, so the loop halts for manual inspection instead of "
+        "regenerating code that was never the cause.")
+    extra_constraints: Dict[str, Any] = {
+        "kind": "collection_error",
+        "rationale": rationale,
+        "collection_error": error_text,
+    }
+    plan = Artifact.new(
+        session_id=task.session_id,
+        produced_by_task_id=task.task_id,
+        kind=ArtifactKind.REPAIR_PLAN,
+        content={
+            "verify_artifact_id": verify_artifact_id,
+            "classification": "collection_error",
+            "failure_signature": signature,
+            "repair_attempt": attempt,
+            "rationale": rationale,
+            "diffs": [],
+            "strategy": "escalate",
+            "extra_constraints": extra_constraints,
+        },
+    )
+    return ExecutorResult(
+        outputs={
+            "repair_artifact_id": plan.artifact_id,
+            "classification": "collection_error",
+            "failure_signature": signature,
+            "repair_attempt": attempt,
+            "diff_count": 0,
+            "can_apply": False,
+            "strategy": "escalate",
+            "rationale": rationale,
+            "extra_constraints": extra_constraints,
+        },
+        artifact=plan,
+    )
+
 
 def _run_smoke_repair(task: TaskNode, deps: ExecutorDeps,
                       smoke_artifact_id: str) -> ExecutorResult:
