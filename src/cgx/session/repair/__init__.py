@@ -33,6 +33,7 @@ from cgx.session.repair.classify import (
     missing_module_names,
     required_package_names,
     third_party_import_breaks,
+    undefined_names,
 )
 
 __all__ = [
@@ -45,4 +46,5 @@ __all__ = [
     "missing_module_names",
     "required_package_names",
     "third_party_import_breaks",
+    "undefined_names",
 ]

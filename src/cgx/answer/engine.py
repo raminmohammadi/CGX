@@ -3756,6 +3756,38 @@ def generate_single_scaffold_file(
                     f"{first['missing']} from module '{first['module']}'")
                 content = ""
 
+    # Undefined-name gate: a file can parse cleanly, import only modules
+    # that really exist, and still die the instant anything touches it
+    # because it uses a name nothing ever bound -- `class Operation(str,
+    # enum.Enum)` with no `import enum` (live failure: pytest aborted at
+    # collection with "NameError: name 'enum' is not defined", taking the
+    # whole suite with it via the conftest chain). Every other gate here
+    # judges imports that are present; none can see a name that is
+    # absent. Retry once naming the unbound names, then fail the file so
+    # APPLY drops it rather than persisting a module that cannot import.
+    if content and syntax_ok and ext == "py":
+        unbound = _undefined_module_names(content)
+        if unbound:
+            retry = _regenerate_scaffold_file(
+                provider, system, context, budget,
+                _undefined_name_retry_instruction(unbound))
+            retry_ok = False
+            if retry:
+                import ast as _ast
+                try:
+                    _ast.parse(retry)
+                    retry_ok = not _undefined_module_names(retry)
+                except SyntaxError:
+                    retry_ok = False
+            if retry_ok:
+                content = retry
+            else:
+                syntax_ok = False
+                syntax_error = (
+                    f"uses undefined name(s) {unbound}: never imported, "
+                    "assigned, or defined anywhere in this file")
+                content = ""
+
     # Test-collectability gate: a pytest module that parses cleanly but
     # defines no module-top-level `def test_*` collects zero tests (pytest
     # exit 5) and stalls the verify->repair->regenerate loop -- the single
@@ -4004,6 +4036,85 @@ def _symbol_retry_instruction(violations: List[Dict[str, Any]]) -> str:
         "Return the COMPLETE, corrected file. Import ONLY symbols that "
         "actually exist in those modules (listed above) and call their "
         "real API. Do NOT invent names or add markdown fences.")
+
+
+# Module attributes Python provides implicitly. Absent from
+# ``dir(builtins)``, so they must be seeded explicitly or the
+# undefined-name gate would flag ordinary ``if __name__ == "__main__"``
+# blocks and ``__all__`` declarations.
+_IMPLICIT_MODULE_NAMES = frozenset({
+    "__name__", "__file__", "__doc__", "__package__", "__spec__",
+    "__loader__", "__builtins__", "__debug__", "__path__", "__dict__",
+})
+
+
+def _undefined_module_names(source: str) -> List[str]:
+    """Return names the module loads but never binds, in first-use order.
+
+    A deliberately over-generous binding collector: every name bound
+    *anywhere* in the file (any import, assignment, parameter, ``def`` /
+    ``class``, comprehension or ``except`` target, ``global`` /
+    ``nonlocal`` declaration) counts as bound for the whole file, so
+    scoping subtleties can only ever make this abstain, never
+    false-positive. What is left is a name that no scope could possibly
+    supply -- a guaranteed ``NameError`` the moment that line executes.
+
+    Abstains entirely (returns ``[]``) on an unparsable file or a
+    ``from x import *``, whose bindings are not knowable statically.
+    """
+    import ast as _ast
+    import builtins as _builtins
+
+    try:
+        tree = _ast.parse(source)
+    except SyntaxError:
+        return []
+
+    bound = set(dir(_builtins)) | set(_IMPLICIT_MODULE_NAMES)
+    used: List[str] = []
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.Import):
+            for alias in node.names:
+                bound.add((alias.asname or alias.name).split(".")[0])
+        elif isinstance(node, _ast.ImportFrom):
+            for alias in node.names:
+                if alias.name == "*":
+                    return []
+                bound.add(alias.asname or alias.name)
+        elif isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef,
+                               _ast.ClassDef)):
+            bound.add(node.name)
+        elif isinstance(node, _ast.arg):
+            bound.add(node.arg)
+        elif isinstance(node, (_ast.Global, _ast.Nonlocal)):
+            bound.update(node.names)
+        elif isinstance(node, _ast.ExceptHandler) and node.name:
+            bound.add(node.name)
+        elif isinstance(node, _ast.Name):
+            if isinstance(node.ctx, _ast.Store):
+                bound.add(node.id)
+            elif isinstance(node.ctx, _ast.Load):
+                used.append(node.id)
+
+    out: List[str] = []
+    for name in used:
+        if name not in bound and name not in out:
+            out.append(name)
+    return out
+
+
+def _undefined_name_retry_instruction(names: List[str]) -> str:
+    """Build the hardened retry prompt listing every unbound name."""
+    listed = ", ".join(repr(n) for n in names)
+    return (
+        "\n\nCRITICAL RETRY -- YOUR PREVIOUS ATTEMPT WAS REJECTED:\n"
+        f"The file used the name(s) {listed} without ever binding them: "
+        "they were not imported, not assigned, and not defined anywhere "
+        "in the file, so it raises NameError as soon as it is imported.\n"
+        "Return the COMPLETE, corrected file. Every module, class, "
+        "function and constant the file references must be either "
+        "imported at the top of the file or defined in it -- if you use "
+        "'enum.Enum' you must 'import enum'. Do NOT add markdown fences.")
 
 
 # Extension -> tree-sitter grammar name for the JS/TS/Vue family. Mirrors

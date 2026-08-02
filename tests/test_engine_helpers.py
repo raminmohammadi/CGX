@@ -1441,6 +1441,68 @@ def test_answer_clarify_paths_backfills_from_candidates_when_model_fails_twice()
     assert "Review" in out["answer_md"]
 
 
+def test_undefined_module_names_flags_unimported_module():
+    """`enum.Enum` with no `import enum` is a guaranteed NameError.
+
+    The live failure this gate exists for: the file parses, every import
+    it declares resolves, and it still kills pytest at collection.
+    """
+    from cgx.answer.engine import _undefined_module_names
+    src = (
+        "from pydantic import BaseModel\n"
+        "\n"
+        "class Operation(str, enum.Enum):\n"
+        "    add = 'add'\n"
+    )
+    assert _undefined_module_names(src) == ["enum"]
+
+
+def test_undefined_module_names_flags_unassigned_constant():
+    from cgx.answer.engine import _undefined_module_names
+    src = (
+        "import pytest\n"
+        "\n"
+        "@pytest.fixture\n"
+        "def headers(token):\n"
+        "    return {'Authorization': f'{AUTH_SCHEME} {token}'}\n"
+    )
+    assert _undefined_module_names(src) == ["AUTH_SCHEME"]
+
+
+def test_undefined_module_names_clean_file_has_no_findings():
+    """Builtins, dunders, params, comprehensions and defs all count as bound."""
+    from cgx.answer.engine import _undefined_module_names
+    src = (
+        "import enum\n"
+        "from typing import List\n"
+        "\n"
+        "__all__ = ['Op', 'run']\n"
+        "\n"
+        "class Op(str, enum.Enum):\n"
+        "    add = 'add'\n"
+        "\n"
+        "def run(items: List[int]) -> int:\n"
+        "    with open(__file__) as fh:\n"
+        "        fh.read()\n"
+        "    try:\n"
+        "        return sum(x for x in items if x)\n"
+        "    except ValueError as exc:\n"
+        "        raise RuntimeError(str(exc))\n"
+        "\n"
+        "if __name__ == '__main__':\n"
+        "    print(run([1]))\n"
+    )
+    assert _undefined_module_names(src) == []
+
+
+def test_undefined_module_names_abstains_on_star_import_and_syntax_error():
+    """Bindings unknowable -> abstain rather than fail a valid file."""
+    from cgx.answer.engine import _undefined_module_names
+    assert _undefined_module_names(
+        "from config import *\n\nDEBUG = SETTINGS\n") == []
+    assert _undefined_module_names("def broken(:\n") == []
+
+
 def test_answer_clarify_paths_empty_sources_degrades_gracefully():
     from cgx.answer.engine import _answer_clarify_paths
     prep = {"sources": [], "merged_hits": []}

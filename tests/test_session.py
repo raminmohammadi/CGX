@@ -6396,6 +6396,51 @@ def test_classify_no_tests_collected_is_empty_test_suite():
     assert classify_verify_report(content) == "empty_test_suite"
 
 
+def test_classify_undefined_name_from_collection_stderr():
+    """A collection-time NameError is repairable, not `unknown`.
+
+    Live failure: a conftest import chain died on ``enum.Enum`` with no
+    ``import enum``. Pytest writes that to stderr and produces no junit
+    XML, so the report carries no structured ``failures``.
+    """
+    from cgx.session.repair.classify import (
+        classify_verify_report, undefined_names)
+    content = {
+        "outcome": "collection_error",
+        "returncode": 4,
+        "stdout": "",
+        "stderr": (
+            "ImportError while loading conftest 'tests/conftest.py'.\n"
+            "tests/conftest.py:3: in <module>\n"
+            "    from backend.main import app\n"
+            "backend/main.py:13: in <module>\n"
+            "    class Operation(str, enum.Enum):\n"
+            "E   NameError: name 'enum' is not defined. Did you forget "
+            "to import 'enum'"),
+        "failures": [],
+    }
+    assert classify_verify_report(content) == "undefined_name"
+    assert undefined_names(content) == ("enum",)
+
+
+def test_classify_prefers_mechanical_class_over_undefined_name():
+    """A run surfacing both keeps the classification with a locator."""
+    from cgx.session.repair.classify import classify_verify_report
+    content = {
+        "outcome": "collection_error",
+        "returncode": 2,
+        "stdout": "ModuleNotFoundError: No module named 'backend'",
+        "stderr": "NameError: name 'enum' is not defined",
+    }
+    assert classify_verify_report(content) == "missing_module_pythonpath"
+
+
+def test_undefined_name_routes_to_regenerate():
+    """No mechanical patch exists, so REPAIR must re-author the module."""
+    from cgx.session.tasks.repair import _REGENERATE_CLASSES
+    assert "undefined_name" in _REGENERATE_CLASSES
+
+
 def test_failure_signature_stable_across_runs():
     """Same outcome + rc + first error line -> same signature."""
     from cgx.session.repair.classify import failure_signature

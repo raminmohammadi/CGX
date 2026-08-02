@@ -36,6 +36,7 @@ REPAIR_CLASSIFICATIONS: Tuple[str, ...] = (
     "missing_module_pythonpath",
     "missing_fixture",
     "empty_test_suite",
+    "undefined_name",
     "unknown",
 )
 
@@ -163,6 +164,20 @@ _UNRESOLVED_ENTRY_RE = re.compile(
     re.MULTILINE,
 )
 
+# A name a generated module uses but never binds -- ``class
+# Operation(str, enum.Enum)`` with no ``import enum``, a constant
+# referenced in an f-string that was never assigned. The file parses,
+# every import it *does* declare resolves, and it still dies the moment
+# anything touches it: pytest aborts the whole run at collection
+# (``NameError: name 'enum' is not defined``), often via a conftest
+# chain, so no individual test is ever reported. There is no mechanical
+# patch -- the missing binding could be an import, an assignment, or a
+# definition the author forgot -- so this routes to a regenerate with
+# the unbound names folded in as a constraint.
+_UNDEFINED_NAME_RE = re.compile(
+    r"NameError:\s+name\s+'([A-Za-z_][A-Za-z0-9_]*)'\s+is not defined"
+)
+
 
 # --------------------- registry ---------------------
 
@@ -188,6 +203,11 @@ _CLASSIFIER_REGISTRY: Tuple[Tuple[RepairClassification, _ClassifierFn], ...] = (
      lambda c: bool(_MODULE_NOT_FOUND_RE.search(_failure_text(c)))),
     ("missing_fixture",
      lambda c: bool(missing_fixture_names(c))),
+    # Last: an undefined name is an authoring defect with no mechanical
+    # locator, so every classification that *does* have one is preferred
+    # when a run surfaces both.
+    ("undefined_name",
+     lambda c: bool(_UNDEFINED_NAME_RE.search(_failure_text(c)))),
 )
 
 
@@ -288,6 +308,23 @@ def circular_import_modules(content: Dict[str, Any]) -> Tuple[str, ...]:
     blob = _failure_text(content)
     out: List[str] = []
     for m in _PARTIALLY_INITIALIZED_MODULE_RE.finditer(blob):
+        name = m.group(1)
+        if name and name not in out:
+            out.append(name)
+    return tuple(out)
+
+
+def undefined_names(content: Dict[str, Any]) -> Tuple[str, ...]:
+    """Return the names Python reported as not defined.
+
+    Fed into the ``undefined_name`` regenerate constraint so the
+    re-authored module knows exactly which bindings it must supply
+    (an import, an assignment, or a definition). Order-preserving and
+    de-duplicated.
+    """
+    blob = _failure_text(content)
+    out: List[str] = []
+    for m in _UNDEFINED_NAME_RE.finditer(blob):
         name = m.group(1)
         if name and name not in out:
             out.append(name)

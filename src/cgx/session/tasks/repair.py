@@ -45,6 +45,7 @@ from cgx.session.repair.classify import (
     runtime_failure_text,
     third_party_import_breaks,
     traceback_source_files,
+    undefined_names,
     unresolved_entry_paths,
 )
 from cgx.session.repair.locate import (
@@ -114,6 +115,7 @@ _REGENERATE_CLASSES = frozenset({
     "empty_test_suite",
     "missing_fixture",
     "missing_module_pythonpath",
+    "undefined_name",
     "unknown",
 })
 
@@ -283,6 +285,24 @@ def run_repair(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             "so the dependency is strictly one-way -- move shared symbols "
             "into the lower-level module (or a new shared module) and never "
             "import back from a module that imports this one.")
+    elif classification == "undefined_name":
+        # A generated module uses a name it never binds, so it explodes
+        # at import time (``NameError: name 'enum' is not defined``) and
+        # takes the whole collection down with it. The missing binding
+        # could be an import, an assignment or a definition, so there is
+        # no mechanical patch; re-scaffold with the unbound names folded
+        # in as a constraint.
+        names = undefined_names(content)
+        extra_plan_fields["undefined_names"] = list(names)
+        name_list = (", ".join(repr(n) for n in names) if names
+                     else "the name(s) reported in the traceback")
+        rationale = (
+            f"Test collection failed with NameError: {name_list} used but "
+            "never defined in the module that referenced it. Re-author the "
+            "offending module(s) so every name is bound before use -- add "
+            "the missing import, assignment or definition -- and make sure "
+            "every module, class and constant the file references is either "
+            "imported at the top of the file or defined in it.")
     else:
         diffs = _propose_llm_logic_repair(task, deps, content)
         if diffs:
@@ -853,6 +873,9 @@ def _select_repair_strategy(
     elif classification == "circular_import":
         constraints["modules"] = list(
             extra_plan_fields.get("circular_modules") or [])
+    elif classification == "undefined_name":
+        constraints["undefined_names"] = list(
+            extra_plan_fields.get("undefined_names") or [])
     elif classification == "unittest_pytest_mix":
         constraints["affected_classes"] = sorted({
             entry.get("class_name")
