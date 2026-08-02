@@ -133,6 +133,9 @@ class NpmRunner(TestRunner):
             except Exception as e:
                 logger.debug("npm install skipped: %s", e)
         label = " ".join(cmd)
+        # ``npm test`` runs a real suite; the ``npm run build`` fallback is a
+        # buildability smoke only, so a passing build is not a passing suite.
+        ran_tests = cmd[:2] == ["npm", "test"]
         try:
             proc = subprocess.run(
                 cmd, cwd=root, capture_output=True, text=True,
@@ -141,13 +144,14 @@ class NpmRunner(TestRunner):
         except subprocess.TimeoutExpired as e:
             return TestRunOutcome(
                 ran=True, returncode=124, stdout=e.stdout or "",
-                stderr=(e.stderr or "") + "\n[timeout]", tests_selected=[label])
+                stderr=(e.stderr or "") + "\n[timeout]", tests_selected=[label],
+                ran_tests=ran_tests)
         except Exception as e:
             return TestRunOutcome(
                 ran=False, skipped_reason=f"{type(e).__name__}: {e}")
         return TestRunOutcome(
             ran=True, returncode=proc.returncode, stdout=proc.stdout,
-            stderr=proc.stderr, tests_selected=[label])
+            stderr=proc.stderr, tests_selected=[label], ran_tests=ran_tests)
 
 
 # Registry of default runners, checked in order. Append new stacks here.

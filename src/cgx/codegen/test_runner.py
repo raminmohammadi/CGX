@@ -48,6 +48,11 @@ class TestRunOutcome:
     tests_selected: List[str] = field(default_factory=list)
     sandbox_dir: Optional[str] = None
     skipped_reason: Optional[str] = None
+    # True when the runner executed an actual test suite; False when it only
+    # ran a build/compile smoke because the project wired up no tests. Lets
+    # VERIFY tell a passing *build* apart from a passing *test suite* so a
+    # test-free scaffold is not reported as green.
+    ran_tests: bool = True
 
 
 _IMPORT_RE = re.compile(r"^\s*(?:from\s+([\w.]+)\s+import|import\s+([\w.]+))", re.MULTILINE)

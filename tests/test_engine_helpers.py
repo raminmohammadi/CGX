@@ -702,6 +702,46 @@ def test_looks_newline_collapsed():
     assert _looks_newline_collapsed("export default 1;\n") is False
 
 
+def test_looks_newline_collapsed_partial_import_block():
+    """The encoder often collapses only the imports, not the whole file.
+
+    The function bodies below keep their line breaks, so the body has
+    newlines and reads as an ordinary line-1 syntax error -- but it is
+    the same JSON-mode defect, and a JSON retry reproduces it. It must
+    be routed to freeform like a wholly collapsed body.
+    """
+    from cgx.answer.engine import _looks_newline_collapsed
+
+    partial = (
+        "from fastapi import Depends, HTTPException, status from "
+        "sqlalchemy.orm import Session from backend.main import app\n"
+        "\n"
+        "def get_db():\n"
+        "    return None\n"
+    )
+    assert _looks_newline_collapsed(partial) is True
+
+
+def test_looks_newline_collapsed_ignores_parseable_and_quoted_imports():
+    """Valid source is never collapsed, whatever its prose says.
+
+    A docstring narrating ``import x from y import z`` matches the
+    joined-import shape textually; parsing first keeps it out of scope.
+    JS/TS imports name a quoted module, so they are excluded too --
+    otherwise every React file would be reported.
+    """
+    from cgx.answer.engine import _looks_newline_collapsed
+
+    prose = ('def f():\n'
+             '    """Given import a from b import c, do nothing."""\n'
+             '    return 1\n')
+    assert _looks_newline_collapsed(prose) is False
+    js = 'import React from "react";\nimport {useState} from "react";\n'
+    assert _looks_newline_collapsed(js) is False
+    # Unparseable, but the bad line is not a joined-import line.
+    assert _looks_newline_collapsed("def f(:\n    return 1\n") is False
+
+
 def test_scaffold_collapsed_json_body_recovers_via_freeform():
     """A newline-collapsed body is re-asked in freeform, not in JSON mode.
 
@@ -793,16 +833,124 @@ def test_scaffold_requirements_gate_retries_and_recovers():
     assert out["content"] == _GOOD_REQS
 
 
-def test_scaffold_requirements_gate_flags_when_retry_still_broken():
-    from cgx.answer.engine import generate_single_scaffold_file
+def test_scaffold_requirements_gate_salvages_when_retry_still_broken():
+    """When the model retry also fails, the gate must NOT drop the
+    manifest -- requirements.txt is foundational (its absence misdetects a
+    node-only project and skips venv provisioning). It is salvaged into a
+    valid, non-dropped file instead."""
+    from cgx.answer.engine import (
+        _requirements_content_error,
+        generate_single_scaffold_file,
+    )
     provider = _QueueProvider([_BAD_REQS, _BAD_REQS])
     out = generate_single_scaffold_file(
         "requirements.txt", "python deps", provider,
         layer="deps", goal="build an app",
     )
     assert provider.calls == 2
-    assert out["syntax_ok"] is False
-    assert "requirements" in out.get("syntax_error", "")
+    # Salvaged, not dropped: valid content survives.
+    assert out["syntax_ok"] is True
+    assert out["content"]
+    assert _requirements_content_error(out["content"]) is None
+    # The pasted Python source is gone.
+    assert "def init_db" not in out["content"]
+
+
+def test_deterministic_requirements_repair_strips_source_lines():
+    from cgx.answer.engine import (
+        _deterministic_requirements_repair,
+        _requirements_content_error,
+    )
+    corrupt = ("# deps\n"
+               "flask==2.3.2\n"
+               "import os\n"
+               "def go():\n    return 1\n"
+               "requests\n")
+    out = _deterministic_requirements_repair(corrupt, None)
+    assert _requirements_content_error(out) is None
+    assert "flask==2.3.2" in out
+    assert "requests" in out
+    assert "def go" not in out and "import os" not in out
+
+
+def test_deterministic_requirements_repair_backfills_from_imports():
+    from cgx.answer.engine import (
+        _deterministic_requirements_repair,
+        _requirements_content_error,
+    )
+    # No salvageable specifier survives, so it backfills from real imports.
+    existing = [
+        {"path": "app.py",
+         "content": "import flask\nimport os\nfrom app import helper\n"},
+        {"path": "helper.py", "content": "import yaml\n"},
+    ]
+    out = _deterministic_requirements_repair(_BAD_REQS, existing)
+    assert _requirements_content_error(out) is None
+    assert "flask" in out
+    assert "PyYAML" in out            # import alias -> PyPI name
+    assert "os" not in out            # stdlib dropped
+    assert "\napp\n" not in out       # first-party dropped
+
+
+def test_js_package_name_from_specifier_filters_non_packages():
+    from cgx.answer.engine import _js_package_name_from_specifier
+    # Relative / builtin / node: specifiers are never deps.
+    assert _js_package_name_from_specifier("./App") is None
+    assert _js_package_name_from_specifier("../lib/util") is None
+    assert _js_package_name_from_specifier("fs") is None
+    assert _js_package_name_from_specifier("node:path") is None
+    # Bare + subpath reduce to the package root; scoped keeps @scope/name.
+    assert _js_package_name_from_specifier("axios") == "axios"
+    assert _js_package_name_from_specifier("react-dom/client") == "react-dom"
+    assert _js_package_name_from_specifier("@scope/pkg/sub") == "@scope/pkg"
+    assert _js_package_name_from_specifier("@nope") is None
+
+
+def test_js_external_imports_covers_import_require_and_bare():
+    from cgx.answer.engine import _js_external_imports
+    src = (
+        "import React from 'react';\n"
+        "import axios from 'axios';\n"
+        "import './styles.css';\n"
+        "import 'zone.js';\n"
+        "const cors = require('cors');\n"
+        "import App from './App';\n"
+    )
+    got = _js_external_imports(src)
+    assert got == ["react", "axios", "zone.js", "cors"]
+
+
+def test_deterministic_package_json_repair_adds_missing_runtime_dep():
+    import json
+    from cgx.answer.engine import _deterministic_package_json_repair
+    pkg = json.dumps({
+        "dependencies": {"react": ">=18", "react-dom": ">=18"},
+        "devDependencies": {"vite": ">=4"},
+    })
+    js = [
+        {"path": "src/App.jsx",
+         "content": "import React from 'react';\nimport axios from 'axios';\n"},
+        {"path": "src/main.jsx",
+         "content": "import App from './App';\n"},   # relative -> ignored
+    ]
+    out = _deterministic_package_json_repair(pkg, js)
+    assert out is not None
+    parsed = json.loads(out)
+    assert parsed["dependencies"]["axios"] == "*"
+    # Already-declared deps are untouched; relative import adds nothing.
+    assert parsed["dependencies"]["react"] == ">=18"
+
+
+def test_deterministic_package_json_repair_noop_when_complete():
+    import json
+    from cgx.answer.engine import _deterministic_package_json_repair
+    pkg = json.dumps({"dependencies": {"react": "*", "axios": "*"}})
+    js = [{"path": "a.jsx",
+           "content": "import React from 'react';\nimport axios from 'axios';\n"}]
+    # Nothing missing -> None so the caller leaves the diff untouched.
+    assert _deterministic_package_json_repair(pkg, js) is None
+    # Unparseable manifest -> None (never raises).
+    assert _deterministic_package_json_repair("{not json", js) is None
 
 
 def test_new_file_body_from_patch_roundtrips_and_rejects_modifications():
@@ -1512,3 +1660,70 @@ def test_answer_clarify_paths_empty_sources_degrades_gracefully():
     assert out["citations"] == []
     assert out["confidence"] <= 0.2
     assert "Re-index" in out["answer_md"] or "narrow" in out["answer_md"]
+
+
+# ---------------------------------------------------------------------------
+# Truncation detection + truncation-aware whole-file generation
+# ---------------------------------------------------------------------------
+def test_response_finish_was_length_across_provider_shapes():
+    from cgx.answer.engine import _response_finish_was_length
+    # Ollama length-cap stop.
+    assert _response_finish_was_length({"raw": {"done_reason": "length"}})
+    # OpenAI-compatible length-cap stop.
+    assert _response_finish_was_length(
+        {"raw": {"choices": [{"finish_reason": "length"}]}})
+    # Gemini MAX_TOKENS.
+    assert _response_finish_was_length(
+        {"raw": {"candidates": [{"finishReason": "MAX_TOKENS"}]}})
+    # A clean stop is not truncation.
+    assert not _response_finish_was_length({"raw": {"done_reason": "stop"}})
+    assert not _response_finish_was_length(
+        {"raw": {"choices": [{"finish_reason": "stop"}]}})
+    # Missing / malformed shapes never claim truncation.
+    assert not _response_finish_was_length({"content": "x"})
+    assert not _response_finish_was_length({"raw": "opaque"})
+    assert not _response_finish_was_length("nope")
+
+
+class _TruncatingProvider:
+    """Reports a length-cap stop for the first ``truncate_n`` calls, then
+    returns a clean response. Records every ``max_tokens`` it is called with."""
+
+    def __init__(self, truncate_n: int, content: str = "print('ok')\n"):
+        self._left = truncate_n
+        self._content = content
+        self.max_tokens_seen: List[int] = []
+
+    def chat(self, messages, **kw):  # noqa: ANN001 -- duck type
+        self.max_tokens_seen.append(kw.get("max_tokens"))
+        if self._left > 0:
+            self._left -= 1
+            return {"content": self._content, "raw": {"done_reason": "length"}}
+        return {"content": self._content, "raw": {"done_reason": "stop"}}
+
+
+def test_blocking_scaffold_call_grows_budget_on_truncation():
+    from cgx.answer.engine import _blocking_scaffold_call
+    prov = _TruncatingProvider(truncate_n=1)
+    out = _blocking_scaffold_call(prov, [{"role": "user", "content": "x"}], 4_000)
+    assert out == "print('ok')\n"
+    # One truncated pass then a clean retry at double the budget.
+    assert prov.max_tokens_seen == [4_000, 8_000]
+
+
+def test_blocking_scaffold_call_bounds_the_retries():
+    from cgx.answer.engine import _MAX_TRUNCATION_RETRIES, _blocking_scaffold_call
+    # Always truncates -> stops after the bounded number of retries.
+    prov = _TruncatingProvider(truncate_n=99)
+    _blocking_scaffold_call(prov, [{"role": "user", "content": "x"}], 4_000)
+    assert len(prov.max_tokens_seen) == _MAX_TRUNCATION_RETRIES + 1
+    # Each step doubles: 4000 -> 8000 -> 16000.
+    assert prov.max_tokens_seen == [4_000, 8_000, 16_000]
+
+
+def test_blocking_scaffold_call_no_retry_on_clean_stop():
+    from cgx.answer.engine import _blocking_scaffold_call
+    prov = _TruncatingProvider(truncate_n=0)
+    out = _blocking_scaffold_call(prov, [{"role": "user", "content": "x"}], 4_000)
+    assert out == "print('ok')\n"
+    assert prov.max_tokens_seen == [4_000]

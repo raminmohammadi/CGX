@@ -448,6 +448,36 @@ def test_find_missing_packages_reports_declared_but_uninstalled(
     assert "flask" in missing
 
 
+def test_requirement_name_parses_specifiers_and_skips_flags():
+    from cgx.codegen.env_manager import _requirement_name
+    assert _requirement_name("flask==2.0.1") == "flask"
+    assert _requirement_name("Flask-Cors>=3.0  # cors") == "Flask-Cors"
+    assert _requirement_name("uvicorn[standard]==0.29.0") == "uvicorn"
+    assert _requirement_name("# a comment") is None
+    assert _requirement_name("-r base.txt") is None
+    assert _requirement_name("   ") is None
+
+
+def test_repin_requirements_pins_declared_to_installed_versions():
+    from cgx.codegen.env_manager import _repin_requirements
+    text = (
+        "# pinned by the model\n"
+        "flask==2.0.1\n"
+        "flask-cors>=3.0.9  # cors extra\n"
+        "gunicorn\n")
+    installed = {"flask": "3.1.3", "flask_cors": "6.0.1",
+                 "werkzeug": "3.1.8"}
+    out = _repin_requirements(text, installed)
+    lines = out.splitlines()
+    # Comment preserved; stale pins rewritten to the resolved versions;
+    # the inline comment survives; an undeclared installed dep is not added.
+    assert lines[0] == "# pinned by the model"
+    assert lines[1] == "flask==3.1.3"
+    assert lines[2] == "flask-cors==6.0.1  # cors extra"
+    # gunicorn has no installed version in the map -> left verbatim.
+    assert lines[3] == "gunicorn"
+    assert "werkzeug" not in out
+
 
 # -- _apply_hunks context-verification regression tests -----------------
 

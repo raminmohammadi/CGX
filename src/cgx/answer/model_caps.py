@@ -18,8 +18,10 @@ set of accessors:
   context window. This is the single source of truth every budget /
   prompt-strategy decision keys off, so a new model only needs a window
   entry and never a per-model branch at the call sites.
-* :func:`get_summary_budget` / :func:`get_context_map_budget` --
-  tier-indexed prompt/response budgets (looked up in the tables below).
+* :func:`get_summary_budget` / :func:`get_scaffold_budget` /
+  :func:`get_context_map_budget` -- tier-indexed prompt/response budgets
+  (looked up in the tables below). ``get_scaffold_budget`` raises only the
+  output-token ceiling for whole-file generation.
 * :func:`get_prompt_strategy` -- tier-driven prompt knobs (planning
   ``max_tokens``, whether to reinforce the strict-JSON contract) so
   weak local models get the hardening they need while strong models
@@ -224,6 +226,22 @@ _SUMMARY_BUDGETS: Dict[CapabilityTier, Dict[str, int]] = {
     "xlarge": {"max_chars": 3_000, "max_files": 120, "output_tokens": 8_000},
 }
 
+# Tier -> whole-file scaffold generation output cap. Distinct from the
+# summary budget's ``output_tokens`` (which sizes short digests): a
+# scaffolder emits an *entire* file per call, so the cap has to cover a
+# realistic source file end-to-end. Too tight and the body is cut off
+# mid-file, the truncated JSON fails to parse (or parses to a partial,
+# syntactically broken body), and APPLY's syntax gate silently drops the
+# file. These ceilings are generous enough that a normal file completes in
+# one pass; :func:`cgx.answer.engine._blocking_scaffold_call` still grows
+# them on a length-cap stop as a backstop for the occasional large file.
+_SCAFFOLD_OUTPUT_TOKENS: Dict[CapabilityTier, int] = {
+    "small":  4_000,
+    "medium": 8_000,
+    "large":  12_000,
+    "xlarge": 16_000,
+}
+
 _CONTEXT_MAP_BUDGETS: Dict[CapabilityTier, Dict[str, int]] = {
     "small": {
         "primary_chars": 900,  "neighbor_chars": 220,
@@ -273,6 +291,22 @@ def get_summary_budget(provider: Any) -> Dict[str, int]:
     models get a tight one so we never overflow.
     """
     return dict(_SUMMARY_BUDGETS[get_capability_tier(provider)])
+
+
+def get_scaffold_budget(provider: Any) -> Dict[str, int]:
+    """Return the per-file budget for whole-file scaffold generation.
+
+    Same prompt-context caps as :func:`get_summary_budget` (``max_chars`` /
+    ``max_files`` still size the prior-file digest), but ``output_tokens``
+    is raised to a whole-file generation ceiling (see
+    :data:`_SCAFFOLD_OUTPUT_TOKENS`) so a moderately sized source file is
+    generated to completion in one pass instead of being truncated at the
+    summary-sized cap and dropped by the downstream syntax gate.
+    """
+    tier = get_capability_tier(provider)
+    budget = dict(_SUMMARY_BUDGETS[tier])
+    budget["output_tokens"] = _SCAFFOLD_OUTPUT_TOKENS[tier]
+    return budget
 
 
 def get_context_map_budget(provider: Any) -> Dict[str, int]:

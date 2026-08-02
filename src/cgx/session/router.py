@@ -43,6 +43,7 @@ from cgx.session.greenfield_edges import (
     _make_budget_ask,
     _repair_install_deps_actions,
     _repair_regenerate_actions,
+    _repair_resolve_deps_actions,
     _repair_terminal_failure_actions,
     _scaffold_contract_regenerate_actions,
     _scaffold_failed_files_actions,
@@ -391,9 +392,11 @@ def _decompose_to_ask(parent: TaskNode) -> List[TaskNode]:
     """Spawn the ASK_USER(APPROVE_PLAN) gate for a finished DECOMPOSE.
 
     A re-planned DECOMPOSE carries the failed chain's flap ledger
-    (``prior_failure_signatures``); it rides the approval gate down to
-    the new SCAFFOLD so the revised manifest's chain is not amnesiac
-    about failures the previous manifest already produced.
+    (``prior_failure_signatures``) and the spent ``regenerate_attempt``
+    count; both ride the approval gate down to the new SCAFFOLD so the
+    revised manifest's chain is not amnesiac about failures the previous
+    manifest already produced and cannot silently reset the syntax-churn
+    regenerate budget to zero.
     """
     inputs: Dict[str, Any] = {
         "expected_kind": DecisionKind.APPROVE_PLAN.value,
@@ -402,6 +405,7 @@ def _decompose_to_ask(parent: TaskNode) -> List[TaskNode]:
         "requirements_artifact_id":
             parent.inputs.get("requirements_artifact_id"),
         "replan_attempt": parent.inputs.get("replan_attempt"),
+        "regenerate_attempt": parent.inputs.get("regenerate_attempt"),
     }
     signatures = list(LoopBudget.from_inputs(
         parent.inputs).prior_failure_signatures)
@@ -470,7 +474,10 @@ def _repair_progress_stalled(
 # still terminates cleanly. ``failed`` is a non-pytest runner (e.g. an
 # ``npm`` build/test) that exited non-zero: it classifies as ``unknown``
 # in the repair classifier, which routes to a re-scaffold (regenerate)
-# so a JS/TS build break is not a silent false success.
+# so a JS/TS build break is not a silent false success. ``no_tests`` is
+# deliberately absent: a JS/TS project whose build passes but wired up no
+# tests has nothing for a regenerate to mechanically fix, so it is not
+# repairable (it terminates honestly rather than looping).
 _REPAIRABLE_VERIFY_OUTCOMES = frozenset({
     "assertions_failed",
     "collection_error",
@@ -483,7 +490,9 @@ _REPAIRABLE_VERIFY_OUTCOMES = frozenset({
 # a working suite. Everything else that reaches a terminal VERIFY (with
 # no REPAIR spawned) is a definitive failure -- never a "success" and
 # never an ASK_USER prompt. ``skipped`` counts as success because it is
-# an explicit opt-out, not a broken suite.
+# an explicit opt-out, not a broken suite. ``no_tests`` is deliberately
+# absent: a passing build with no test suite is not a verified suite, so
+# it fails honestly instead of reporting a false green.
 _VERIFY_SUCCESS_OUTCOMES = frozenset({"passed", "skipped"})
 
 
@@ -874,6 +883,8 @@ _CompletionGuard = Callable[[TaskNode, List[TaskNode]], List[RouterAction]]
 _COMPLETION_GUARDS: Tuple[Tuple[TaskKind, _CompletionGuard], ...] = (
     (TaskKind.REPAIR,
      lambda completed, tasks: _repair_install_deps_actions(completed)),
+    (TaskKind.REPAIR,
+     lambda completed, tasks: _repair_resolve_deps_actions(completed)),
     (TaskKind.REPAIR, _repair_regenerate_actions),
     (TaskKind.REPAIR,
      lambda completed, tasks: _repair_terminal_failure_actions(completed)),
@@ -1305,10 +1316,12 @@ def _from_approve_plan(ask: TaskNode,
                        decision: Decision) -> Optional[TaskNode]:
     """Spawn SCAFFOLD when the user approves the work plan.
 
-    Carries the flap ledger a re-plan folded into the approval gate, so
-    :func:`_scaffold_to_apply` threads it down the new chain and a
-    revised manifest that reproduces an already-seen failure is stopped
-    by ``budget.seen()`` instead of spending a fresh repair budget.
+    Carries the flap ledger and the spent ``regenerate_attempt`` count a
+    re-plan folded into the approval gate, so :func:`_scaffold_to_apply`
+    threads them down the new chain: a revised manifest that reproduces an
+    already-seen failure is stopped by ``budget.seen()`` instead of
+    spending a fresh repair budget, and the syntax-churn regenerate budget
+    stays a per-session ceiling rather than resetting to zero per manifest.
     """
     if not bool(decision.chosen.get("approved")):
         return None
@@ -1322,6 +1335,7 @@ def _from_approve_plan(ask: TaskNode,
             ask.inputs.get("requirements_artifact_id"),
         "prior_goal": ask.inputs.get("prior_goal"),
         "replan_attempt": ask.inputs.get("replan_attempt"),
+        "regenerate_attempt": ask.inputs.get("regenerate_attempt"),
         "decision_id": decision.decision_id,
     }
     signatures = list(LoopBudget.from_inputs(

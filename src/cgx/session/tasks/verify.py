@@ -56,13 +56,16 @@ logger = logging.getLogger(__name__)
 # Outcome enum surfaced in VERIFY_REPORT.outcome. ``passed`` is the
 # happy path; ``assertions_failed`` is a real logic failure; ``failed``
 # is a non-pytest runner (e.g. an ``npm`` build/test) that exited
-# non-zero; everything else is a setup / environment problem that the
-# user (or a future retry loop) should resolve before the tests can be
-# trusted.
+# non-zero; ``no_tests`` is a non-pytest runner that only ran a build
+# smoke because the project wired up no tests (a passing *build* is not
+# a passing *suite*); everything else is a setup / environment problem
+# that the user (or a future retry loop) should resolve before the tests
+# can be trusted.
 VERIFY_OUTCOMES: Tuple[str, ...] = (
     "passed",
     "assertions_failed",
     "failed",
+    "no_tests",
     "collection_error",
     "no_tests_collected",
     "timeout",
@@ -189,12 +192,15 @@ def run_verify(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             # trend; ``passing_count`` / ``collected_count`` let a round
             # that fixed nothing net-new still count as forward progress
             # when it made MORE tests pass or collected more tests than the
-            # previous round. All three are junit-derived (pytest only), so
-            # they stay comparable round over round.
-            "failing_count": len(failures),
-            "collected_count": len(combined.pytest_tests_selected),
-            "passing_count": max(
-                0, len(combined.pytest_tests_selected) - len(failures)),
+            # previous round. They are only a trustworthy *execution*
+            # signal when the suite actually ran to completion; on a
+            # non-executing outcome (collection_error / timeout / ...) an
+            # empty junit means "nothing ran", not "nothing failed", so
+            # :func:`_progress_counts` forces ``passing_count`` to 0 and
+            # leaves ``failing_count`` unknown rather than emitting a false
+            # "0 failing / N passing" that the router reads as progress.
+            **_progress_counts(
+                verify_outcome, failures, combined.pytest_tests_selected),
             "failure_signature": sig,
             "returncode": combined.returncode,
         },
@@ -245,6 +251,47 @@ def _resolve_python_exe(task: TaskNode,
         return None
     py = (artifact.content or {}).get("python_exe")
     return str(py) if isinstance(py, str) and py else None
+
+
+# Outcomes where pytest actually executed the suite to completion, so a
+# junit-derived pass/fail count is a trustworthy, round-over-round
+# comparable progress signal. Every other outcome means the suite never
+# ran (collection error, timeout, missing pytest, empty collection): a
+# junit that enumerates zero failures there is "nothing executed", NOT
+# "nothing failed".
+_EXECUTED_VERIFY_OUTCOMES: frozenset = frozenset(
+    {"passed", "assertions_failed"})
+
+
+def _progress_counts(
+        outcome: str,
+        failures: Sequence[Dict[str, str]],
+        pytest_selected: Sequence[str]) -> Dict[str, Optional[int]]:
+    """Return the junit-derived {failing,collected,passing}_count ledger.
+
+    See :func:`cgx.session.router._repair_progress_stalled`. When the
+    suite executed (:data:`_EXECUTED_VERIFY_OUTCOMES`) the counts are the
+    plain junit arithmetic. When it did not, ``passing_count`` is 0 (no
+    test passed) and ``failing_count`` is the real erroring-module count
+    only when junit actually enumerated one (a comparable per-collection
+    trend the router trusts for ``collection_error``); an empty junit
+    yields ``None`` so the router's progress gate stays inconclusive and
+    the signature-flap + REPAIR_BUDGET backstops bound the loop instead of
+    a bogus "dropped to 0 failing" that reads as forward progress.
+    """
+    n_fail = len(failures)
+    n_sel = len(pytest_selected)
+    if outcome in _EXECUTED_VERIFY_OUTCOMES:
+        return {
+            "failing_count": n_fail,
+            "collected_count": n_sel,
+            "passing_count": max(0, n_sel - n_fail),
+        }
+    return {
+        "failing_count": n_fail if n_fail > 0 else None,
+        "collected_count": n_sel,
+        "passing_count": 0,
+    }
 
 
 def _classify_outcome(outcome: Any) -> str:
@@ -311,19 +358,24 @@ def _classify_other_outcome(outcome: Any) -> str:
     """Map a non-pytest :class:`TestRunOutcome` to a VERIFY token.
 
     Non-pytest runners (npm, ...) do not follow pytest's exit-code
-    contract, so the mapping is coarse: a zero exit is ``passed``, the
-    timeout sentinel (124) is ``timeout``, and any other non-zero exit
-    is the generic ``failed``. A runner that never ran degrades to
+    contract, so the mapping is coarse: the timeout sentinel (124) is
+    ``timeout`` and any other non-zero exit is the generic ``failed``. A
+    zero exit is ``passed`` only when the runner executed a real test
+    suite; a zero exit from a build-only smoke (``ran_tests`` False, i.e.
+    the project wired up no tests) is the honest ``no_tests`` -- a passing
+    build is not a passing suite. A runner that never ran degrades to
     ``skipped`` (e.g. npm not installed, or no test/build script).
     """
     if not outcome.ran:
         return "skipped"
     rc = int(outcome.returncode)
-    if rc == 0:
-        return "passed"
     if rc == 124:
         return "timeout"
-    return "failed"
+    if rc != 0:
+        return "failed"
+    if not getattr(outcome, "ran_tests", True):
+        return "no_tests"
+    return "passed"
 
 
 def _run_other_runners(
@@ -367,7 +419,7 @@ def _pick_combined_token(
         hard.sort(key=lambda t: (_HARD_FAILURE_SEVERITY[t[1]], t[0]),
                   reverse=True)
         return hard[0][1]
-    for want in ("passed", "no_tests_collected", "pytest_missing"):
+    for want in ("passed", "no_tests", "no_tests_collected", "pytest_missing"):
         if any(token == want for _, token in tokens):
             return want
     return "skipped"

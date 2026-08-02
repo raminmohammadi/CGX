@@ -17,6 +17,8 @@ nothing here touches the store or an LLM.
 
 from __future__ import annotations
 
+import hashlib
+import re
 from typing import Dict, List, Optional
 
 from cgx.session.actions import (
@@ -100,6 +102,56 @@ def _repair_install_deps_actions(
             "prior_goal": inputs.get("prior_goal"),
             "mode": inputs.get("mode") or SessionMode.GREENFIELD.value,
             "missing_modules": missing,
+            **budget.repair_chain_inputs(),
+        },
+    )
+    return [CreateTask(boot)]
+
+
+def _repair_resolve_deps_actions(
+        completed: TaskNode) -> List[RouterAction]:
+    """Return the router actions that execute a resolve-deps verdict.
+
+    A ``resolve_deps`` verdict (set by the REPAIR executor for an
+    API_CHECK ``dependency_conflict`` failure) tells the router to
+    re-resolve the environment rather than rewrite code: it re-queues a
+    BOOTSTRAP_ENV that force-upgrades the implicated distributions to a
+    self-consistent set and re-pins requirements.txt reproducibly.
+    BOOTSTRAP_ENV's own successor
+    (:func:`cgx.session.router._bootstrap_to_api_check`) then re-probes
+    the same symbols, so a successful re-resolve flows straight back into
+    SMOKE/VERIFY while the shared ``repair_attempt`` +
+    ``prior_failure_signatures`` budget on API_CHECK prevents a
+    re-resolve loop. Returns an empty list for any other strategy so the
+    dispatcher falls through to the install-deps / regenerate / patch /
+    ASK_USER paths.
+    """
+    outputs = completed.outputs or {}
+    strategy = str(outputs.get("strategy") or "").strip()
+    if strategy != "resolve_deps":
+        return []
+    inputs = completed.inputs or {}
+    budget = LoopBudget.from_inputs(inputs)
+    budget = budget.with_repair_attempt(
+        int(outputs.get("repair_attempt") or budget.repair_attempt or 1))
+    packages = [str(p) for p in outputs.get("conflict_packages") or []]
+    boot = TaskNode.new(
+        session_id=completed.session_id,
+        kind=TaskKind.BOOTSTRAP_ENV,
+        name="Re-resolve conflicting dependencies",
+        description=("Re-resolve the project venv to move off the stale "
+                     "exact pin(s) whose transitive peer major broke the "
+                     "referenced package's import chain, re-pin "
+                     "requirements.txt to the resolved versions, then "
+                     "re-probe via API_CHECK."),
+        parent_task_id=completed.task_id,
+        inputs={
+            "apply_artifact_id": inputs.get("apply_artifact_id"),
+            "plan_artifact_id": inputs.get("plan_artifact_id"),
+            "scaffold_artifact_id": inputs.get("scaffold_artifact_id"),
+            "prior_goal": inputs.get("prior_goal"),
+            "mode": inputs.get("mode") or SessionMode.GREENFIELD.value,
+            "resolve_packages": packages,
             **budget.repair_chain_inputs(),
         },
     )
@@ -200,6 +252,12 @@ def _repair_terminal_failure_actions(
     error = ("Automated repair could not produce a patch "
              f"(classification={classification}); no regenerate or "
              "dependency-install path remained.")
+    # An escalated verdict (e.g. an unrecognized collection_error) carries
+    # a human-readable rationale explaining why no automated path applies;
+    # surface it so the terminal failure is actionable rather than opaque.
+    rationale = str(outputs.get("rationale") or "").strip()
+    if rationale:
+        error = f"{error} {rationale}"
     return [
         UpdateTaskStatus(task_id=completed.task_id,
                          status=TaskNodeStatus.FAILED, error=error),
@@ -219,7 +277,9 @@ def _apply_failed_files_actions(completed: TaskNode,
     missing guarantees a downstream collection error, so any greenfield
     APPLY that dropped a file re-scaffolds within
     :data:`~cgx.session.budget.REGENERATE_BUDGET` instead of limping
-    forward. When the
+    forward -- unless :func:`_scaffold_failure_signature` shows the
+    previous attempt already produced this exact failure, in which case
+    the remaining attempts are skipped for the escalation below. When the
     regenerate budget is spent the router escalates once to a revised
     manifest via :func:`_replan_or_fail` (a fresh DECOMPOSE); when the
     re-plan budget is also spent that helper proceeds with the survivors
@@ -247,7 +307,20 @@ def _apply_failed_files_actions(completed: TaskNode,
         failed_count,
         apply_failed=outputs.get("failed_files"),
         scaffold_failed=scaffold_outputs.get("failed"))
-    if LoopBudget.from_inputs(scaffold.inputs).regenerate_exhausted:
+    # Foundational-file guard: a dropped environment manifest is never
+    # fixable by the per-file regenerate loop (re-asking the same model
+    # reproduces the drop), so skip that budget and escalate straight to a
+    # re-plan that can restructure the manifest.
+    foundational = _dropped_foundational_files(
+        scaffold_outputs.get("failed"), outputs.get("failed_files"))
+    if foundational:
+        return _replan_or_fail(
+            completed, tasks, scaffold=scaffold,
+            failure_note=_foundational_failure_note(foundational))
+    budget = LoopBudget.from_inputs(scaffold.inputs)
+    signature = _scaffold_failure_signature(
+        scaffold_outputs.get("failed"), outputs.get("failed_files"))
+    if budget.regenerate_exhausted or (signature and budget.seen(signature)):
         return _replan_or_fail(
             completed, tasks, scaffold=scaffold,
             failure_note=str(constraint.get("rationale") or ""))
@@ -266,7 +339,8 @@ def _apply_failed_files_actions(completed: TaskNode,
     actions.append(CreateTask(propose_regenerate(
         scaffold, constraint,
         regenerate_files=regen_files,
-        prior_scaffold_artifact_id=prior_id)))
+        prior_scaffold_artifact_id=prior_id,
+        prior_failure_signatures=_appended_signature(budget, signature))))
     return actions
 
 
@@ -375,7 +449,7 @@ def _replan_or_fail(completed: TaskNode, tasks: List[TaskNode], *,
     progress, and the gate that sees it again must stop the run rather
     than spend a fresh repair budget re-deriving the same dead end.
     """
-    fail = [UpdateSessionStatus(
+    fail: List[RouterAction] = [UpdateSessionStatus(
         session_id=completed.session_id, status=SessionStatus.FAILED)]
     if scaffold is None:
         return fail
@@ -410,6 +484,15 @@ def _replan_or_fail(completed: TaskNode, tasks: List[TaskNode], *,
                 scaffold.inputs.get("requirements_artifact_id"),
             "answers": answers,
             "replan_attempt": budget.spend_replan().replan_attempt,
+            # Carry the *spent* syntax-churn regenerate count into the
+            # revised manifest's chain. Left to reset, a fresh
+            # DECOMPOSE -> SCAFFOLD would be born at ``regenerate_attempt=0``
+            # and hand the re-planned manifest a whole second
+            # ``REGENERATE_BUDGET``, so the total syntax-churn budget would
+            # multiply by the number of re-plans. Threading it (like
+            # ``replan_attempt`` and the flap ledger below) makes the
+            # regenerate budget a per-session ceiling, not a per-manifest one.
+            "regenerate_attempt": budget.regenerate_attempt,
             "prior_failure_signatures":
                 _merged_failure_signatures(scaffold, completed),
         },
@@ -441,7 +524,11 @@ def _scaffold_failed_files_actions(completed: TaskNode,
     re-scaffolds within :data:`~cgx.session.budget.REGENERATE_BUDGET`,
     folding the concrete
     per-file errors into the regenerate constraint so the retry has
-    actionable feedback. When that budget is spent the router escalates
+    actionable feedback. A retry that reproduces the identical dropped
+    file set with the identical error is not feedback the generator can
+    act on, so :func:`_scaffold_failure_signature` short-circuits the
+    remaining attempts onto the same escalation the spent budget takes.
+    When that budget is spent the router escalates
     once to a revised manifest via :func:`_replan_or_fail` (a fresh
     DECOMPOSE); when the re-plan budget is also spent that helper proceeds
     with the survivors on the normal SCAFFOLD -> APPLY edge rather than
@@ -458,7 +545,18 @@ def _scaffold_failed_files_actions(completed: TaskNode,
     constraint = _invalid_scaffold_constraint(
         failed_count, apply_failed=None,
         scaffold_failed=outputs.get("failed"))
-    if LoopBudget.from_inputs(completed.inputs).regenerate_exhausted:
+    # Foundational-file guard (mirrors _apply_failed_files_actions): a
+    # dropped environment manifest escalates straight to a re-plan rather
+    # than burning the per-file regenerate budget on a file the same model
+    # just failed to produce.
+    foundational = _dropped_foundational_files(outputs.get("failed"), None)
+    if foundational:
+        return _replan_or_fail(
+            completed, tasks, scaffold=completed,
+            failure_note=_foundational_failure_note(foundational))
+    budget = LoopBudget.from_inputs(completed.inputs)
+    signature = _scaffold_failure_signature(outputs.get("failed"))
+    if budget.regenerate_exhausted or (signature and budget.seen(signature)):
         return _replan_or_fail(
             completed, tasks, scaffold=completed,
             failure_note=str(constraint.get("rationale") or ""))
@@ -475,8 +573,77 @@ def _scaffold_failed_files_actions(completed: TaskNode,
     actions.append(CreateTask(propose_regenerate(
         completed, constraint,
         regenerate_files=regen_files,
-        prior_scaffold_artifact_id=prior_id)))
+        prior_scaffold_artifact_id=prior_id,
+        prior_failure_signatures=_appended_signature(budget, signature))))
     return actions
+
+
+# Bracketed lists, quoted literals and digits inside a scaffold gate's
+# error carry the *instance* of the fault (which module was hallucinated,
+# which file the content duplicated); the fault is the prose around them.
+# Stripping them collapses "imports unknown module(s) ['app']" and the
+# next attempt's ``['api']`` onto one signature, so a retry that trades
+# one hallucination for another is recognised as no progress.
+_SIGNATURE_NOISE = re.compile(r"\[[^\]]*\]|'[^']*'|\"[^\"]*\"|[0-9]+")
+
+# Cap on the per-file error prose folded into a signature. Long enough to
+# separate two gates that reject the same file, short enough that a tail
+# carrying a path or a count cannot make two identical faults look
+# distinct.
+_SIGNATURE_ERROR_CHARS = 80
+
+
+def _scaffold_failure_signature(scaffold_failed: object,
+                                apply_failed: object = None) -> str:
+    """Return a flap signature for a dropped-file set.
+
+    A regenerate is only worth its budget slot if the retry can plausibly
+    differ. Observed live: the same file failed the same gate on all
+    three ``regenerate_attempt``s, each round paying a full generation
+    pass to re-derive the identical rejection. The signature keys on the
+    dropped paths plus the normalized error prose, so
+    :meth:`~cgx.session.budget.LoopBudget.seen` can route the second
+    occurrence to the escalation a spent budget takes -- a re-plan, where
+    the manifest, the actual suspect, is rewritten.
+
+    Draws from the same two ``{"file", "error"}`` sources as
+    :func:`_invalid_scaffold_constraint` and :func:`_failed_scaffold_paths`
+    so a SCAFFOLD-dropped file and an APPLY-dropped one are keyed
+    identically, and is order-insensitive: the same files rejected for the
+    same reasons hash the same however the executor ordered them.
+
+    Returns ``""`` when nothing usable can be derived, which callers read
+    as "no flap evidence" and leave to the normal budget.
+    """
+    parts: List[str] = []
+    seen: set = set()
+    for entry in _dropped_file_entries(scaffold_failed, apply_failed):
+        path = str(entry.get("file") or "").strip()
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        err = _SIGNATURE_NOISE.sub(" ", str(entry.get("error") or "")).lower()
+        parts.append(
+            f"{path}:{' '.join(err.split())[:_SIGNATURE_ERROR_CHARS]}")
+    if not parts:
+        return ""
+    raw = ";".join(sorted(parts)).encode("utf-8", errors="replace")
+    return "scaffold|" + hashlib.sha1(raw).hexdigest()[:16]
+
+
+def _appended_signature(budget: LoopBudget,
+                        signature: str) -> Optional[List[str]]:
+    """Return the flap ledger to thread onto a regenerated SCAFFOLD.
+
+    Recording the signature is what makes the *next* round's
+    ``budget.seen`` check meaningful; without it every attempt looks
+    like the first. Returns ``None`` for an underivable or
+    already-recorded signature so ``propose_regenerate`` leaves the
+    inherited ledger untouched.
+    """
+    if not signature or budget.seen(signature):
+        return None
+    return list(budget.prior_failure_signatures) + [signature]
 
 
 # Contract-warning kinds a regenerate can actually satisfy: a declared
@@ -497,7 +664,10 @@ def _actionable_contract_warnings(
     dropped so an unsatisfiable planner contract never forces a retry.
     """
     out: List[Dict[str, object]] = []
-    for w in outputs.get("contract_warnings") or []:
+    warnings = outputs.get("contract_warnings")
+    if not isinstance(warnings, (list, tuple)):
+        return out
+    for w in warnings:
         if not isinstance(w, dict):
             continue
         if (w.get("kind") in _CONTRACT_REGENERATE_KINDS
@@ -529,13 +699,16 @@ def _scaffold_contract_regenerate_actions(
     (a declared function/constant/schema whose named module never provides
     it) is unmet, folding the unmet contracts in as a whole-tree
     regenerate constraint. Bounded by
-    :data:`~cgx.session.budget.REGENERATE_BUDGET` and
-    deliberately **non-terminal**: once the budget is spent the empty
+    :data:`~cgx.session.budget.REGENERATE_BUDGET`, by the same flap
+    signature the dropped-file paths use (a retry that leaves the
+    identical contracts unmet has shown the constraint is one this
+    generator cannot satisfy), and deliberately **non-terminal**: on
+    either bound the empty
     return lets the dispatcher take SCAFFOLD -> APPLY so VERIFY -- which
     exercises the contract against a real suite -- makes the final call
     rather than failing the session on a static gate. Returns an empty
     list (normal edge) for a compliant scaffold, one that dropped files,
-    or a spent budget.
+    a repeated failure, or a spent budget.
     """
     from cgx.session.repair.propose import propose_regenerate  # dep direction
 
@@ -545,7 +718,12 @@ def _scaffold_contract_regenerate_actions(
     actionable = _actionable_contract_warnings(outputs)
     if not actionable:
         return []
-    if LoopBudget.from_inputs(completed.inputs).regenerate_exhausted:
+    budget = LoopBudget.from_inputs(completed.inputs)
+    signature = _scaffold_failure_signature(
+        [{"file": str(w.get("module") or ""),
+          "error": f"unmet contract {w.get('kind')} {w.get('name')}"}
+         for w in actionable])
+    if budget.regenerate_exhausted or (signature and budget.seen(signature)):
         return []
     constraint = _contract_regenerate_constraint(actionable)
     actions: List[RouterAction] = []
@@ -556,7 +734,9 @@ def _scaffold_contract_regenerate_actions(
             continue
         actions.append(UpdateTaskStatus(
             task_id=t.task_id, status=TaskNodeStatus.ABANDONED))
-    actions.append(CreateTask(propose_regenerate(completed, constraint)))
+    actions.append(CreateTask(propose_regenerate(
+        completed, constraint,
+        prior_failure_signatures=_appended_signature(budget, signature))))
     return actions
 
 
@@ -616,9 +796,7 @@ def _invalid_scaffold_constraint(
     """
     seen: set = set()
     details: List[str] = []
-    for entry in (list(scaffold_failed or []) + list(apply_failed or [])):
-        if not isinstance(entry, dict):
-            continue
+    for entry in _dropped_file_entries(scaffold_failed, apply_failed):
         path = str(entry.get("file") or "").strip()
         if not path or path in seen:
             continue
@@ -655,15 +833,80 @@ def _failed_scaffold_paths(scaffold_failed: object,
     """
     out: List[str] = []
     seen: set = set()
-    for entry in (list(scaffold_failed or []) + list(apply_failed or [])):
-        if not isinstance(entry, dict):
-            continue
+    for entry in _dropped_file_entries(scaffold_failed, apply_failed):
         path = str(entry.get("file") or "").strip()
         if not path or path in seen:
             continue
         seen.add(path)
         out.append(path)
     return out
+
+
+def _dropped_file_entries(scaffold_failed: object,
+                          apply_failed: object) -> List[Dict[str, object]]:
+    """Return the ``{"file", "error"}`` dicts from both dropped sources.
+
+    The SCAFFOLD's own ``failed`` generations and APPLY's
+    ``failed_files`` are read straight off persisted task outputs, so
+    neither is guaranteed to be a list of dicts on a resumed or
+    hand-edited session. Both are validated once here rather than in
+    each of the three consumers (constraint, targeted paths, flap
+    signature), which keeps them keyed off exactly the same entries.
+    """
+    out: List[Dict[str, object]] = []
+    for source in (scaffold_failed, apply_failed):
+        if not isinstance(source, (list, tuple)):
+            continue
+        out.extend(e for e in source if isinstance(e, dict))
+    return out
+
+
+# Environment-manifest files whose absence structurally breaks recovery.
+# BOOTSTRAP_ENV keys project-type detection off exactly these (see
+# ``cgx.session.tasks.bootstrap_env._detect_project_type``), so a dropped
+# requirements.txt / package.json misdetects the stack and the Python
+# venv (or node_modules) is never provisioned -- every downstream gate
+# then fails against an unprovisioned environment, a state the per-file
+# regenerate loop cannot escape because re-asking the same weak model for
+# the file it just dropped reproduces the same drop.
+_FOUNDATIONAL_FILES: frozenset = frozenset({
+    "pyproject.toml", "setup.py", "setup.cfg", "package.json",
+})
+
+
+def _is_foundational_path(path: str) -> bool:
+    """True when ``path`` is an environment manifest (see _FOUNDATIONAL_FILES).
+
+    Matches the ``requirements*.txt`` family by shape and the remaining
+    manifests by exact basename, both case-folded and directory-stripped.
+    """
+    base = path.strip().lower().rsplit("/", 1)[-1]
+    if base.startswith("requirements") and base.endswith(".txt"):
+        return True
+    return base in _FOUNDATIONAL_FILES
+
+
+def _dropped_foundational_files(scaffold_failed: object,
+                                apply_failed: object) -> List[str]:
+    """Return the dropped file paths that are environment manifests."""
+    return [p for p in _failed_scaffold_paths(scaffold_failed, apply_failed)
+            if _is_foundational_path(p)]
+
+
+def _foundational_failure_note(foundational: List[str]) -> str:
+    """Re-plan note for a dropped environment manifest.
+
+    Distinct from :func:`_invalid_scaffold_constraint` (which asks the
+    generator to re-emit the same file): naming the manifests and why they
+    matter steers the DECOMPOSE toward a plan that emits each as a minimal
+    valid file, since regenerating them in place has already failed.
+    """
+    files = ", ".join(sorted(set(foundational)))
+    return ("Foundational environment manifest(s) were dropped as invalid: "
+            f"{files}. These files drive project-type detection and "
+            "environment provisioning, so regenerating them in place cannot "
+            "recover the build -- restructure the plan so each is emitted as "
+            "a minimal, valid manifest.")
 
 
 def _verify_lesson_actions(completed: TaskNode,

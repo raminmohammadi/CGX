@@ -191,6 +191,14 @@ def run_repair(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             task, verify_artifact_id, content,
             list(required_package_names(content)), signature)
 
+    if classification == "collection_error":
+        # An unrecognized collection failure: pytest could not import the
+        # suite and no mechanical classifier matched. A re-scaffold cannot
+        # fix a broken conftest / CLI-setup error / out-of-tree import, so
+        # escalate to a clean halt instead of looping on regenerate.
+        return _run_verify_collection_error_escalation(
+            task, verify_artifact_id, content, signature, attempt)
+
     diffs: List[Dict[str, str]] = []
     rationale = ""
     locations_payload: List[Dict[str, Any]] = []
@@ -358,6 +366,68 @@ def run_repair(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
 
 
 # --------------------- helpers ---------------------
+
+def _run_verify_collection_error_escalation(
+        task: TaskNode, verify_artifact_id: str,
+        content: Dict[str, Any], signature: str,
+        attempt: int) -> ExecutorResult:
+    """Escalate an unrecognized ``collection_error`` instead of looping.
+
+    pytest could not collect the suite and none of the mechanical
+    classifiers (circular/relative import, undefined name, missing
+    module/fixture/dependency) matched -- the failure is a broken
+    conftest, a pytest CLI/setup error, or an import break outside the
+    generated first-party modules, none of which a re-scaffold can fix.
+    Rather than burn the regenerate budget re-authoring code that was
+    never the cause, the plan carries ``strategy='escalate'`` /
+    ``can_apply=False`` so the router's terminal guard halts the loop with
+    the captured collection error surfaced for manual inspection.
+    """
+    from cgx.session.repair.classify import failure_text  # dep direction
+
+    error_text = failure_text(content)
+    rationale = (
+        "pytest could not collect the test suite (collection_error) and no "
+        "mechanical repair classifier matched the failure -- typically a "
+        "broken conftest, a pytest CLI/setup error, or an import error "
+        "outside the generated first-party modules. A re-scaffold cannot "
+        "fix this, so the loop halts for manual inspection instead of "
+        "regenerating code that was never the cause.")
+    extra_constraints: Dict[str, Any] = {
+        "kind": "collection_error",
+        "rationale": rationale,
+        "collection_error": error_text,
+    }
+    plan = Artifact.new(
+        session_id=task.session_id,
+        produced_by_task_id=task.task_id,
+        kind=ArtifactKind.REPAIR_PLAN,
+        content={
+            "verify_artifact_id": verify_artifact_id,
+            "classification": "collection_error",
+            "failure_signature": signature,
+            "repair_attempt": attempt,
+            "rationale": rationale,
+            "diffs": [],
+            "strategy": "escalate",
+            "extra_constraints": extra_constraints,
+        },
+    )
+    return ExecutorResult(
+        outputs={
+            "repair_artifact_id": plan.artifact_id,
+            "classification": "collection_error",
+            "failure_signature": signature,
+            "repair_attempt": attempt,
+            "diff_count": 0,
+            "can_apply": False,
+            "strategy": "escalate",
+            "rationale": rationale,
+            "extra_constraints": extra_constraints,
+        },
+        artifact=plan,
+    )
+
 
 def _run_smoke_repair(task: TaskNode, deps: ExecutorDeps,
                       smoke_artifact_id: str) -> ExecutorResult:
@@ -583,6 +653,12 @@ def _run_api_check_repair(task: TaskNode, deps: ExecutorDeps,
     if missing_modules:
         return _run_missing_dependency_repair(
             task, api_check_artifact_id, content, missing_modules)
+    conflict_packages = [str(p).strip()
+                         for p in content.get("conflict_packages") or []
+                         if str(p).strip()]
+    if conflict_packages:
+        return _run_dependency_conflict_repair(
+            task, api_check_artifact_id, content, conflict_packages)
     failed = [dict(r) for r in content.get("failed_references") or []
               if isinstance(r, dict)]
     signature = str(content.get("failure_signature") or "").strip()
@@ -602,11 +678,11 @@ def _run_api_check_repair(task: TaskNode, deps: ExecutorDeps,
         unresolved = [r for r in failed
                       if "No module named" in str(r.get("error") or "")]
         absent = [r for r in failed if r not in unresolved]
-        parts: List[str] = []
+        guidance: List[str] = []
         if unresolved:
             mods = ", ".join(sorted({str(r.get("module"))
                                      for r in unresolved}))
-            parts.append(
+            guidance.append(
                 f"The module(s) {mods} could NOT be imported (No module "
                 "named ...). They are not installable third-party packages. "
                 "If a module is defined elsewhere in this project, import it "
@@ -619,7 +695,7 @@ def _run_api_check_repair(task: TaskNode, deps: ExecutorDeps,
                 f"{r.get('module')}.{r.get('name')}" for r in absent[:5])
             if len(absent) > 5:
                 names += f", ... (+{len(absent) - 5} more)"
-            parts.append(
+            guidance.append(
                 f"The symbol(s) {names} do NOT exist in the installed "
                 "package version (API_CHECK resolved the module but the "
                 "attribute is absent -- a hallucinated or outdated import). "
@@ -628,7 +704,7 @@ def _run_api_check_repair(task: TaskNode, deps: ExecutorDeps,
                 "the installed version instead. In particular, do not import "
                 "a test client from werkzeug -- a Flask test uses "
                 "`app.test_client()` obtained from the app object.")
-        rationale = " ".join(parts)
+        rationale = " ".join(guidance)
     else:
         rationale = (
             "API_CHECK reported a failure but no failed references were "
@@ -732,6 +808,77 @@ def _run_missing_dependency_repair(
             "can_apply": False,
             "strategy": "install_deps",
             "missing_modules": mods,
+            "extra_constraints": extra_constraints,
+        },
+        artifact=plan,
+    )
+
+
+def _run_dependency_conflict_repair(
+        task: TaskNode,
+        api_check_artifact_id: str,
+        content: Dict[str, Any],
+        conflict_packages: List[str]) -> ExecutorResult:
+    """Emit a REPAIR_PLAN that re-resolves a transitive version conflict.
+
+    A ``dependency_conflict`` failure means the referenced package *is*
+    installed but its own import chain broke on an incompatible peer
+    major that a stale exact pin dragged in (the Flask 2.0.1 / Werkzeug 3
+    ``url_quote`` break). The scaffold code is correct, so regenerating
+    it can never help; the fix lives in the environment layer. The router
+    consumes ``strategy='resolve_deps'`` to re-run BOOTSTRAP_ENV, whose
+    resolver force-upgrades the implicated distributions to a
+    self-consistent set and re-pins requirements.txt reproducibly, then
+    re-probes via API_CHECK.
+    """
+    pkgs = sorted(dict.fromkeys(p for p in conflict_packages if p))
+    signature = str(content.get("failure_signature") or "").strip()
+    if not signature:
+        signature = "api_check|conflict:" + ",".join(pkgs)
+    attempt = LoopBudget.from_inputs(task.inputs).repair_attempt or 1
+    classification = "dependency_conflict"
+    rationale = (
+        f"Transitive dependency conflict involving: {', '.join(pkgs)}. The "
+        "package(s) are installed but a stale exact pin pulled in an "
+        "incompatible peer major, so importing the (valid) referenced "
+        "symbol fails inside the dependency's own import chain. The correct "
+        "fix is to re-resolve the environment to a self-consistent set and "
+        "re-pin requirements.txt, not to regenerate code that references "
+        "valid APIs.")
+    extra_constraints = {
+        "kind": classification,
+        "conflict_packages": pkgs,
+        "rationale": rationale,
+    }
+    plan = Artifact.new(
+        session_id=task.session_id,
+        produced_by_task_id=task.task_id,
+        kind=ArtifactKind.REPAIR_PLAN,
+        content={
+            "api_check_artifact_id": api_check_artifact_id,
+            "build_artifact_id": content.get("build_artifact_id"),
+            "apply_artifact_id": content.get("apply_artifact_id"),
+            "classification": classification,
+            "failure_signature": signature,
+            "repair_attempt": attempt,
+            "rationale": rationale,
+            "conflict_packages": pkgs,
+            "diffs": [],
+            "strategy": "resolve_deps",
+            "extra_constraints": extra_constraints,
+            "mode": task.inputs.get("mode"),
+        },
+    )
+    return ExecutorResult(
+        outputs={
+            "repair_artifact_id": plan.artifact_id,
+            "classification": classification,
+            "failure_signature": signature,
+            "repair_attempt": attempt,
+            "diff_count": 0,
+            "can_apply": False,
+            "strategy": "resolve_deps",
+            "conflict_packages": pkgs,
             "extra_constraints": extra_constraints,
         },
         artifact=plan,
