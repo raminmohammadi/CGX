@@ -2603,9 +2603,14 @@ def test_verify_npm_only_build_failure_is_failed(
     assert content["reproduce_cmd"] is None
 
 
-def test_verify_npm_only_build_pass_is_passed(
+def test_verify_npm_only_build_pass_is_no_tests(
         tmp_path, store, monkeypatch):
-    """A package.json-only project whose build/test succeeds -> passed."""
+    """A build-only project that builds but wired up no tests -> no_tests.
+
+    A passing *build* is not a passing *suite*: with no ``test`` script the
+    NpmRunner ran only a build smoke (``ran_tests`` False), so VERIFY must
+    report the honest ``no_tests`` rather than a false green ``passed``.
+    """
     from cgx.codegen.test_runner import TestRunOutcome
     from cgx.codegen import test_runners
     from cgx.session.tasks.verify import run_verify
@@ -2621,7 +2626,39 @@ def test_verify_npm_only_build_pass_is_passed(
         test_runners.NpmRunner, "run",
         lambda self, root, files, **kw: TestRunOutcome(
             ran=True, returncode=0, stdout="built ok", stderr="",
-            tests_selected=["npm run build"]))
+            tests_selected=["npm run build"], ran_tests=False))
+
+    t = TaskNode.new(session.session_id, TaskKind.VERIFY, "verify",
+                     inputs={"changed_files": ["src/App.jsx"],
+                             "mode": SessionMode.GREENFIELD.value})
+    store.save_task(t)
+    result = run_verify(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    assert result.failure is None
+    assert result.outputs["outcome"] == "no_tests"
+    assert result.outputs["tests_passed"] is False
+    assert result.outputs["passing_count"] == 0
+
+
+def test_verify_npm_real_test_pass_is_passed(
+        tmp_path, store, monkeypatch):
+    """A project whose real ``test`` script passes -> passed (ran_tests)."""
+    from cgx.codegen.test_runner import TestRunOutcome
+    from cgx.codegen import test_runners
+    from cgx.session.tasks.verify import run_verify
+
+    (tmp_path / "package.json").write_text(
+        '{"name": "app", "scripts": {"test": "vitest run"}}',
+        encoding="utf-8")
+
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+
+    monkeypatch.setattr(
+        test_runners.NpmRunner, "run",
+        lambda self, root, files, **kw: TestRunOutcome(
+            ran=True, returncode=0, stdout="2 passed", stderr="",
+            tests_selected=["npm test"], ran_tests=True))
 
     t = TaskNode.new(session.session_id, TaskKind.VERIFY, "verify",
                      inputs={"changed_files": ["src/App.jsx"],
@@ -2632,6 +2669,25 @@ def test_verify_npm_only_build_pass_is_passed(
     assert result.failure is None
     assert result.outputs["outcome"] == "passed"
     assert result.outputs["tests_passed"] is True
+
+
+def test_classify_other_outcome_build_only_is_no_tests():
+    """rc==0 build smoke -> no_tests; rc==0 real suite -> passed."""
+    from cgx.codegen.test_runner import TestRunOutcome
+    from cgx.session.tasks.verify import _classify_other_outcome
+
+    build_only = TestRunOutcome(
+        ran=True, returncode=0, tests_selected=["npm run build"],
+        ran_tests=False)
+    real_suite = TestRunOutcome(
+        ran=True, returncode=0, tests_selected=["npm test"], ran_tests=True)
+    assert _classify_other_outcome(build_only) == "no_tests"
+    assert _classify_other_outcome(real_suite) == "passed"
+    # A non-zero build is still a hard ``failed``, unaffected by ran_tests.
+    broke = TestRunOutcome(
+        ran=True, returncode=1, tests_selected=["npm run build"],
+        ran_tests=False)
+    assert _classify_other_outcome(broke) == "failed"
 
 
 def test_verify_polyglot_npm_failure_surfaces_over_pytest_pass(

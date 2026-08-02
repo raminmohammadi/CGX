@@ -89,6 +89,42 @@ def test_npm_runner_skips_when_npm_missing(tmp_path, monkeypatch):
     assert "npm not installed" in (outcome.skipped_reason or "")
 
 
+class _Proc:
+    def __init__(self, returncode):
+        self.returncode = returncode
+        self.stdout = ""
+        self.stderr = ""
+
+
+def test_npm_runner_build_only_marks_ran_tests_false(tmp_path, monkeypatch):
+    """The build-smoke fallback records ran_tests=False (no real suite)."""
+    _write(tmp_path, "package.json", '{"scripts": {"build": "tsc"}}')
+    (tmp_path / "node_modules").mkdir()  # skip the install step
+    monkeypatch.setattr(
+        "cgx.codegen.test_runners.shutil.which", lambda _: "/usr/bin/npm")
+    monkeypatch.setattr(
+        "cgx.codegen.test_runners.subprocess.run",
+        lambda *a, **k: _Proc(0))
+    outcome = NpmRunner().run(str(tmp_path), [])
+    assert outcome.ran is True
+    assert outcome.returncode == 0
+    assert outcome.ran_tests is False
+
+
+def test_npm_runner_real_test_marks_ran_tests_true(tmp_path, monkeypatch):
+    """A real ``test`` script records ran_tests=True."""
+    _write(tmp_path, "package.json", '{"scripts": {"test": "vitest run"}}')
+    (tmp_path / "node_modules").mkdir()
+    monkeypatch.setattr(
+        "cgx.codegen.test_runners.shutil.which", lambda _: "/usr/bin/npm")
+    monkeypatch.setattr(
+        "cgx.codegen.test_runners.subprocess.run",
+        lambda *a, **k: _Proc(0))
+    outcome = NpmRunner().run(str(tmp_path), [])
+    assert outcome.ran is True
+    assert outcome.ran_tests is True
+
+
 # --------------------------------------------------------------------------
 # Orchestration
 # --------------------------------------------------------------------------

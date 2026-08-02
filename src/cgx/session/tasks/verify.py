@@ -56,13 +56,16 @@ logger = logging.getLogger(__name__)
 # Outcome enum surfaced in VERIFY_REPORT.outcome. ``passed`` is the
 # happy path; ``assertions_failed`` is a real logic failure; ``failed``
 # is a non-pytest runner (e.g. an ``npm`` build/test) that exited
-# non-zero; everything else is a setup / environment problem that the
-# user (or a future retry loop) should resolve before the tests can be
-# trusted.
+# non-zero; ``no_tests`` is a non-pytest runner that only ran a build
+# smoke because the project wired up no tests (a passing *build* is not
+# a passing *suite*); everything else is a setup / environment problem
+# that the user (or a future retry loop) should resolve before the tests
+# can be trusted.
 VERIFY_OUTCOMES: Tuple[str, ...] = (
     "passed",
     "assertions_failed",
     "failed",
+    "no_tests",
     "collection_error",
     "no_tests_collected",
     "timeout",
@@ -355,19 +358,24 @@ def _classify_other_outcome(outcome: Any) -> str:
     """Map a non-pytest :class:`TestRunOutcome` to a VERIFY token.
 
     Non-pytest runners (npm, ...) do not follow pytest's exit-code
-    contract, so the mapping is coarse: a zero exit is ``passed``, the
-    timeout sentinel (124) is ``timeout``, and any other non-zero exit
-    is the generic ``failed``. A runner that never ran degrades to
+    contract, so the mapping is coarse: the timeout sentinel (124) is
+    ``timeout`` and any other non-zero exit is the generic ``failed``. A
+    zero exit is ``passed`` only when the runner executed a real test
+    suite; a zero exit from a build-only smoke (``ran_tests`` False, i.e.
+    the project wired up no tests) is the honest ``no_tests`` -- a passing
+    build is not a passing suite. A runner that never ran degrades to
     ``skipped`` (e.g. npm not installed, or no test/build script).
     """
     if not outcome.ran:
         return "skipped"
     rc = int(outcome.returncode)
-    if rc == 0:
-        return "passed"
     if rc == 124:
         return "timeout"
-    return "failed"
+    if rc != 0:
+        return "failed"
+    if not getattr(outcome, "ran_tests", True):
+        return "no_tests"
+    return "passed"
 
 
 def _run_other_runners(
@@ -411,7 +419,7 @@ def _pick_combined_token(
         hard.sort(key=lambda t: (_HARD_FAILURE_SEVERITY[t[1]], t[0]),
                   reverse=True)
         return hard[0][1]
-    for want in ("passed", "no_tests_collected", "pytest_missing"):
+    for want in ("passed", "no_tests", "no_tests_collected", "pytest_missing"):
         if any(token == want for _, token in tokens):
             return want
     return "skipped"

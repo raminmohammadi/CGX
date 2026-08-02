@@ -473,7 +473,10 @@ def _repair_progress_stalled(
 # still terminates cleanly. ``failed`` is a non-pytest runner (e.g. an
 # ``npm`` build/test) that exited non-zero: it classifies as ``unknown``
 # in the repair classifier, which routes to a re-scaffold (regenerate)
-# so a JS/TS build break is not a silent false success.
+# so a JS/TS build break is not a silent false success. ``no_tests`` is
+# deliberately absent: a JS/TS project whose build passes but wired up no
+# tests has nothing for a regenerate to mechanically fix, so it is not
+# repairable (it terminates honestly rather than looping).
 _REPAIRABLE_VERIFY_OUTCOMES = frozenset({
     "assertions_failed",
     "collection_error",
@@ -486,7 +489,9 @@ _REPAIRABLE_VERIFY_OUTCOMES = frozenset({
 # a working suite. Everything else that reaches a terminal VERIFY (with
 # no REPAIR spawned) is a definitive failure -- never a "success" and
 # never an ASK_USER prompt. ``skipped`` counts as success because it is
-# an explicit opt-out, not a broken suite.
+# an explicit opt-out, not a broken suite. ``no_tests`` is deliberately
+# absent: a passing build with no test suite is not a verified suite, so
+# it fails honestly instead of reporting a false green.
 _VERIFY_SUCCESS_OUTCOMES = frozenset({"passed", "skipped"})
 
 
