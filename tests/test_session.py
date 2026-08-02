@@ -9749,6 +9749,44 @@ def test_router_scaffold_failed_files_regenerates_within_budget():
     assert set(new_scaffold.inputs["regenerate_files"]) == {
         "src/components/Calculator.jsx", "backend/main.py"}
     assert new_scaffold.inputs["prior_scaffold_artifact_id"] == "art_scaffold"
+    # The retry carries the failure signature so a repeat is detectable.
+    from cgx.session.greenfield_edges import _scaffold_failure_signature
+    assert new_scaffold.inputs["prior_failure_signatures"] == [
+        _scaffold_failure_signature(scaffold.outputs["failed"])]
+
+
+def test_router_scaffold_failed_files_repeat_failure_skips_regenerate():
+    """A retry that reproduces the identical drop is not worth a slot.
+
+    Budget remains, but three more generation passes cannot produce a
+    different outcome for the same files failing the same gate, so the
+    router escalates to the manifest instead.
+    """
+    from cgx.session.greenfield_edges import _scaffold_failure_signature
+    session, _parent, scaffold, tasks = _build_scaffold_failed_chain()
+    scaffold.inputs["prior_failure_signatures"] = [
+        _scaffold_failure_signature(scaffold.outputs["failed"])]
+    plan = Router().on_task_completed(
+        session=session, completed=scaffold, tasks=tasks)
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    assert len(creates) == 1
+    assert creates[0].task.kind is TaskKind.DECOMPOSE
+    assert creates[0].task.inputs["replan_attempt"] == 1
+
+
+def test_scaffold_failure_signature_ignores_the_hallucinated_name():
+    """Trading one invented module for another is not progress."""
+    from cgx.session.greenfield_edges import _scaffold_failure_signature
+    def sig(err):
+        return _scaffold_failure_signature([{"file": "tests/test_main.py",
+                                             "error": err}])
+    assert sig("imports unknown module(s) ['app']: not in the manifest") == \
+        sig("imports unknown module(s) ['api']: not in the manifest")
+    assert sig("imports unknown module(s) ['app']") != sig("duplicate content")
+    assert sig("x") != _scaffold_failure_signature(
+        [{"file": "backend/main.py", "error": "x"}])
+    assert _scaffold_failure_signature([]) == ""
+    assert _scaffold_failure_signature([{"file": "", "error": "x"}]) == ""
 
 
 def test_router_scaffold_failed_files_budget_exhausted_escalates_to_replan():

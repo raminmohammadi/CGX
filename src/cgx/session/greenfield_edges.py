@@ -17,6 +17,8 @@ nothing here touches the store or an LLM.
 
 from __future__ import annotations
 
+import hashlib
+import re
 from typing import Dict, List, Optional
 
 from cgx.session.actions import (
@@ -441,7 +443,11 @@ def _scaffold_failed_files_actions(completed: TaskNode,
     re-scaffolds within :data:`~cgx.session.budget.REGENERATE_BUDGET`,
     folding the concrete
     per-file errors into the regenerate constraint so the retry has
-    actionable feedback. When that budget is spent the router escalates
+    actionable feedback. A retry that reproduces the identical dropped
+    file set with the identical error is not feedback the generator can
+    act on, so :func:`_scaffold_failure_signature` short-circuits the
+    remaining attempts onto the same escalation the spent budget takes.
+    When that budget is spent the router escalates
     once to a revised manifest via :func:`_replan_or_fail` (a fresh
     DECOMPOSE); when the re-plan budget is also spent that helper proceeds
     with the survivors on the normal SCAFFOLD -> APPLY edge rather than
@@ -458,7 +464,9 @@ def _scaffold_failed_files_actions(completed: TaskNode,
     constraint = _invalid_scaffold_constraint(
         failed_count, apply_failed=None,
         scaffold_failed=outputs.get("failed"))
-    if LoopBudget.from_inputs(completed.inputs).regenerate_exhausted:
+    budget = LoopBudget.from_inputs(completed.inputs)
+    signature = _scaffold_failure_signature(outputs.get("failed"))
+    if budget.regenerate_exhausted or (signature and budget.seen(signature)):
         return _replan_or_fail(
             completed, tasks, scaffold=completed,
             failure_note=str(constraint.get("rationale") or ""))
@@ -475,8 +483,52 @@ def _scaffold_failed_files_actions(completed: TaskNode,
     actions.append(CreateTask(propose_regenerate(
         completed, constraint,
         regenerate_files=regen_files,
-        prior_scaffold_artifact_id=prior_id)))
+        prior_scaffold_artifact_id=prior_id,
+        prior_failure_signatures=(
+            list(budget.prior_failure_signatures) + [signature]
+            if signature else None))))
     return actions
+
+
+# Bracketed lists, quoted literals and digits inside a scaffold gate's
+# error carry the *instance* of the fault (which module was hallucinated,
+# which file the content duplicated); the fault is the prose around them.
+# Stripping them collapses "imports unknown module(s) ['app']" and the
+# next attempt's ``['api']`` onto one signature, so a retry that trades
+# one hallucination for another is recognised as no progress.
+_SIGNATURE_NOISE = re.compile(r"\[[^\]]*\]|'[^']*'|\"[^\"]*\"|[0-9]+")
+
+
+def _scaffold_failure_signature(scaffold_failed: object) -> str:
+    """Return a flap signature for a SCAFFOLD's dropped-file set.
+
+    A regenerate is only worth its budget slot if the retry can plausibly
+    differ. Observed live: the same file failed the same gate on all
+    three ``regenerate_attempt``s, each round paying a full generation
+    pass to re-derive the identical rejection. The signature keys on the
+    dropped paths plus the normalized error prose, so
+    :meth:`~cgx.session.budget.LoopBudget.seen` can route the second
+    occurrence to a re-plan -- where the manifest, the actual suspect,
+    is rewritten -- instead of a fourth identical attempt.
+
+    Returns ``""`` when nothing usable can be derived, which the caller
+    reads as "no flap evidence" and lets the normal budget decide.
+    """
+    parts: List[str] = []
+    seen: set = set()
+    for entry in list(scaffold_failed or []):
+        if not isinstance(entry, dict):
+            continue
+        path = str(entry.get("file") or "").strip()
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        err = _SIGNATURE_NOISE.sub(" ", str(entry.get("error") or "")).lower()
+        parts.append(f"{path}:{' '.join(err.split())[:80]}")
+    if not parts:
+        return ""
+    raw = ";".join(sorted(parts)).encode("utf-8", errors="replace")
+    return "scaffold|" + hashlib.sha1(raw).hexdigest()[:16]
 
 
 # Contract-warning kinds a regenerate can actually satisfy: a declared
