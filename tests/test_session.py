@@ -9419,6 +9419,25 @@ def test_router_scaffold_unmet_contract_non_terminal_when_budget_spent():
     assert _scaffold_contract_regenerate_actions(scaffold, [scaffold]) == []
 
 
+def test_router_scaffold_unmet_contract_repeat_is_non_terminal():
+    """The same contracts unmet twice ends the loop, budget or not.
+
+    Round-trips the ledger the first regenerate records, so the test
+    cannot drift from how the signature is derived.
+    """
+    from cgx.session.greenfield_edges import (
+        _scaffold_contract_regenerate_actions,
+    )
+    _session, scaffold = _make_clean_scaffold_with_contracts(
+        [{"kind": "function", "name": "compute", "module": "src/core.py"}])
+    first = _scaffold_contract_regenerate_actions(scaffold, [scaffold])
+    retry = [a for a in first if isinstance(a, CreateTask)][0].task
+    signatures = retry.inputs["prior_failure_signatures"]
+    assert signatures
+    scaffold.inputs["prior_failure_signatures"] = signatures
+    assert _scaffold_contract_regenerate_actions(scaffold, [scaffold]) == []
+
+
 def test_router_scaffold_contract_skipped_when_files_dropped():
     # failed_count > 0 belongs to the dropped-files path; the contract
     # path must defer even if contract warnings are also present.
@@ -9589,6 +9608,25 @@ def test_router_apply_failed_files_regenerates_within_budget():
     assert set(new_scaffold.inputs["regenerate_files"]) == {
         "backend/main.py", "backend/models.py", "tests/test_auth.py"}
     assert new_scaffold.inputs["prior_scaffold_artifact_id"] == "art_scaffold"
+    # The retry carries the SCAFFOLD+APPLY failure signature so a repeat
+    # of the identical drop is detectable on the next round.
+    assert new_scaffold.inputs["prior_failure_signatures"]
+
+
+def test_router_apply_failed_files_repeat_failure_skips_regenerate():
+    """The same files dropped for the same reasons -> re-plan, not retry."""
+    session, scaffold, apply_t, tasks = _build_apply_failed_chain()
+    first = Router().on_task_completed(
+        session=session, completed=apply_t, tasks=tasks)
+    retry = [a for a in first.actions if isinstance(a, CreateTask)][0].task
+    scaffold.inputs["prior_failure_signatures"] = (
+        retry.inputs["prior_failure_signatures"])
+    plan = Router().on_task_completed(
+        session=session, completed=apply_t, tasks=tasks)
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    assert len(creates) == 1
+    assert creates[0].task.kind is TaskKind.DECOMPOSE
+    assert creates[0].task.inputs["replan_attempt"] == 1
 
 
 def test_router_apply_failed_files_budget_exhausted_escalates_to_replan():

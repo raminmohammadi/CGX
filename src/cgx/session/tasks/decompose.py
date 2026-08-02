@@ -492,7 +492,7 @@ def _toposort_files(
                 adj[dep].append(f["path"])
                 indeg[f["path"]] += 1
     ready = sorted((p for p in paths if indeg[p] == 0),
-                   key=order_index.get)
+                   key=lambda p: order_index[p])
     ordered: List[str] = []
     while ready:
         p = ready.pop(0)
@@ -504,7 +504,7 @@ def _toposort_files(
                 newly.append(nxt)
         if newly:
             ready.extend(newly)
-            ready.sort(key=order_index.get)
+            ready.sort(key=lambda p: order_index[p])
     if len(ordered) != len(paths):
         # A cycle slipped past validation -- keep declared order.
         return list(files)

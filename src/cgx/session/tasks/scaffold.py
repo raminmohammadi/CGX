@@ -1087,7 +1087,7 @@ def _make_stream_beat(
         _emit_scaffold_progress(
             deps, task, file=file, layer=layer,
             index=index, total=total, status="stream",
-            bytes=state["chars"], failed_count=failed_count)
+            bytes=int(state["chars"]), failed_count=failed_count)
 
     return _beat
 
