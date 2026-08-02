@@ -68,6 +68,21 @@ REPLAN_BUDGET = 1
 # satisfy the constraint and the session fails terminally.
 DECOMPOSE_RETRY_BUDGET = 1
 
+# Outer per-session circuit breaker for autonomous greenfield builds. The
+# per-subtree budgets above bound each recovery loop individually, but
+# nested re-plans (each seeding a fresh SCAFFOLD subtree with its own
+# fresh counters) can still multiply total work beyond what any single
+# counter sees. These caps are the session-wide backstop the runner
+# enforces before dispatching each work task: a build that has not
+# converged after this many compute-task runs -- or this much wall-clock
+# -- halts and escalates (interactive: an ASK_USER pause; headless:
+# terminal FAILED) instead of grinding on through nested budgets that look
+# infinite. ASK_USER waits are budget-exempt, so a build that legitimately
+# needs clarification is never charged for the pause. Explore mode stays
+# unbounded by default -- its loops are user-gated, not autonomous.
+GREENFIELD_MAX_TASK_RUNS = 60
+GREENFIELD_MAX_WALL_SECONDS = 1800.0
+
 
 def _coerce_int(value: Any) -> Optional[int]:
     """Best-effort ``int`` coercion; returns ``None`` for missing/garbage."""

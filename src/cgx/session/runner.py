@@ -43,6 +43,10 @@ from cgx.session.actions import (
     UpdateSessionStatus,
     UpdateTaskStatus,
 )
+from cgx.session.budget import (
+    GREENFIELD_MAX_TASK_RUNS,
+    GREENFIELD_MAX_WALL_SECONDS,
+)
 from cgx.session.router import Router
 from cgx.session.agent_log import log_event
 from cgx.session.store import SessionStore
@@ -112,7 +116,21 @@ class SessionRunner:
         exhaustion terminal ``FAILED`` instead of pausing on an ASK_USER.
         ``skills`` pins the plan/scaffold executors to an explicit skill
         list instead of auto-detecting from the objective text.
+
+        Greenfield runs are autonomous (auto-apply, no per-step approval
+        gate), so an unset cap defaults to the finite
+        :data:`~cgx.session.budget.GREENFIELD_MAX_TASK_RUNS` /
+        :data:`~cgx.session.budget.GREENFIELD_MAX_WALL_SECONDS` backstop:
+        a non-converging build halts and escalates instead of grinding
+        through nested per-subtree budgets that look infinite. An explicit
+        cap (including a caller that opts back into unlimited) always wins;
+        explore mode stays unlimited by default.
         """
+        if mode is SessionMode.GREENFIELD:
+            if max_task_runs is None:
+                max_task_runs = GREENFIELD_MAX_TASK_RUNS
+            if max_wall_seconds is None:
+                max_wall_seconds = GREENFIELD_MAX_WALL_SECONDS
         session = Session.new(original_objective=objective,
                               project_root=project_root, title=title,
                               mode=mode, max_task_runs=max_task_runs,

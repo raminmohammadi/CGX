@@ -702,6 +702,46 @@ def test_runner_no_budget_configured_runs_all_tasks(store):
                 if t.kind is TaskKind.ASK_USER]
 
 
+def test_start_session_applies_greenfield_budget_defaults(store):
+    """Greenfield runs are autonomous, so an unset cap gets the finite
+    session-wide backstop; explore stays unlimited."""
+    from cgx.session.budget import (
+        GREENFIELD_MAX_TASK_RUNS,
+        GREENFIELD_MAX_WALL_SECONDS,
+    )
+    from cgx.session.models import SessionMode
+
+    runner = SessionRunner(store)
+    gf = runner.start_session(objective="build a Flask api",
+                              project_root="/tmp/proj",
+                              mode=SessionMode.GREENFIELD)
+    gf = store.get_session(gf.session_id)
+    assert gf.max_task_runs == GREENFIELD_MAX_TASK_RUNS
+    assert gf.max_wall_seconds == GREENFIELD_MAX_WALL_SECONDS
+
+    # Explore is user-gated, not autonomous -- it stays unbounded.
+    _install_stub_explore()
+    ex = runner.start_session(objective="improve retrieval")
+    ex = store.get_session(ex.session_id)
+    assert ex.max_task_runs is None
+    assert ex.max_wall_seconds is None
+
+
+def test_start_session_explicit_cap_overrides_greenfield_default(store):
+    """An explicit cap always wins over the greenfield default -- including
+    a caller that opts a greenfield build back into a smaller budget."""
+    from cgx.session.models import SessionMode
+
+    runner = SessionRunner(store)
+    gf = runner.start_session(objective="build a Flask api",
+                              project_root="/tmp/proj",
+                              mode=SessionMode.GREENFIELD,
+                              max_task_runs=3, max_wall_seconds=42.0)
+    gf = store.get_session(gf.session_id)
+    assert gf.max_task_runs == 3
+    assert gf.max_wall_seconds == 42.0
+
+
 def test_build_decision_rejects_choose_path_without_anchor():
     session = Session.new("g")
     ask = TaskNode.new(session.session_id, TaskKind.ASK_USER, "pick",
