@@ -3706,6 +3706,80 @@ def test_inject_stack_entry_still_injects_when_truly_absent():
     assert [f["path"] for f in layers[0]["files"]][-1] == "index.html"
 
 
+def test_cross_language_depends_on_drops_unsatisfiable_pytest():
+    """A pytest file planned against JSX sources can never be written.
+
+    Verbatim from a real manifest: the planner laid a React frontend
+    beside a Python backend and covered the components with pytest.
+    SCAFFOLD invents a module name to import, the phantom-import gate
+    rejects it, and each regenerate invents a different one -- three
+    scaffold rounds and a replan to discard one planner slip.
+    """
+    from cgx.session.tasks.decompose import _validate_manifest_coherence
+    layers = [{"name": "project", "files": [
+        {"path": "src/App.jsx", "description": "a"},
+        {"path": "src/main.jsx", "description": "m",
+         "depends_on": ["src/App.jsx"]},
+        {"path": "tests/test_main.py",
+         "description": "Unit tests for main React components",
+         "depends_on": ["src/main.jsx", "src/App.jsx"]},
+        {"path": "backend/app.py", "description": "api"},
+        {"path": "tests/test_app.py", "description": "t",
+         "depends_on": ["backend/app.py"]},
+    ]}]
+    assert _validate_manifest_coherence(layers) is None
+    paths = [f["path"] for f in layers[0]["files"]]
+    assert "tests/test_main.py" not in paths
+    # The same-language test is untouched.
+    assert "tests/test_app.py" in paths
+    assert layers[0]["files"][-1]["depends_on"] == ["backend/app.py"]
+
+
+def test_cross_language_prune_spares_agnostic_and_nontest_files():
+    """Only edges between two known, differing runtimes are cut.
+
+    HTML/CSS/config/data are runtime-agnostic -- index.html referencing
+    src/main.jsx and requirements.txt following backend/app.py are both
+    correct, and the injected entry-point ordering depends on them
+    surviving. A non-test file is never dropped: a mislinked module is
+    still buildable, so only its bad edge goes.
+    """
+    from cgx.session.tasks.decompose import _validate_manifest_coherence
+    layers = [{"name": "project", "files": [
+        {"path": "index.html", "description": "h",
+         "depends_on": ["src/main.jsx"]},
+        {"path": "src/main.jsx", "description": "m"},
+        {"path": "backend/app.py", "description": "a",
+         "depends_on": ["src/main.jsx"]},
+        {"path": "requirements.txt", "description": "r",
+         "depends_on": ["backend/app.py"]},
+    ]}]
+    assert _validate_manifest_coherence(layers) is None
+    by_path = {f["path"]: f.get("depends_on") for f in layers[0]["files"]}
+    assert by_path["index.html"] == ["src/main.jsx"]
+    assert by_path["requirements.txt"] == ["backend/app.py"]
+    # Cut the edge, keep the module.
+    assert by_path["backend/app.py"] == []
+
+
+def test_cross_language_prune_keeps_partially_valid_test():
+    """A test reaching one same-language module keeps that edge and lives."""
+    from cgx.session.tasks.decompose import _validate_manifest_coherence
+    layers = [{"name": "project", "files": [
+        {"path": "backend/app.py", "description": "a"},
+        {"path": "src/App.tsx", "description": "x"},
+        {"path": "tests/test_app.py", "description": "t",
+         "depends_on": ["backend/app.py", "src/App.tsx"]},
+        {"path": "tests/App.test.ts", "description": "j",
+         "depends_on": ["src/App.tsx"]},
+    ]}]
+    assert _validate_manifest_coherence(layers) is None
+    by_path = {f["path"]: f.get("depends_on") for f in layers[0]["files"]}
+    assert by_path["tests/test_app.py"] == ["backend/app.py"]
+    # .ts -> .tsx is one family; nothing to cut.
+    assert by_path["tests/App.test.ts"] == ["src/App.tsx"]
+
+
 def test_import_coherence_error_names_the_project_modules():
     """A bare hallucinated root gets no locator without the inventory."""
     from cgx.session.tasks.scaffold import _import_coherence_failures

@@ -279,6 +279,94 @@ def _manifest_files(layers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             if isinstance(f, dict) and f.get("path")]
 
 
+# Source extensions grouped by the runtime that imports them. Only
+# families whose members can import each other are listed: a file's
+# ``depends_on`` is an import hint, so an edge between two families is
+# not a build-order slip but a statement no language can express.
+# Markup, styling, config and data files are deliberately absent -- they
+# are runtime-agnostic (index.html legitimately references src/main.jsx,
+# requirements.txt legitimately follows backend/app.py) and must never
+# be pruned.
+_LANG_FAMILIES = {
+    "py": {".py"},
+    "js": {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".vue"},
+    "go": {".go"},
+    "rs": {".rs"},
+    "rb": {".rb"},
+    "php": {".php"},
+    "java": {".java"},
+}
+_EXT_LANG = {ext: fam for fam, exts in _LANG_FAMILIES.items() for ext in exts}
+
+
+def _lang_family(path: str) -> Optional[str]:
+    """Return the importing runtime for ``path``, or None if agnostic."""
+    return _EXT_LANG.get(_file_ext(path))
+
+
+def _repair_cross_language_deps(
+        files: List[Dict[str, Any]],
+        layers: List[Dict[str, Any]]) -> None:
+    """Drop ``depends_on`` edges no import statement could express.
+
+    A planner that lays out a React frontend beside a Python backend
+    routinely writes a pytest file covering the JSX components --
+    ``tests/test_main.py depends_on ['src/main.jsx', 'src/App.jsx']``,
+    described as "unit tests for main React components". Python cannot
+    import JSX, so the node is unsatisfiable: SCAFFOLD invents a module
+    name to import, the phantom-import gate rejects it, and every
+    regenerate invents a different name for the same missing module.
+    The manifest is the only place this is fixable.
+
+    Edges are only cut between two *known, differing* runtimes; anything
+    agnostic (HTML, CSS, config, data) keeps its edges, so the injected
+    ``index.html -> src/main.jsx`` and ``requirements.txt ->
+    backend/app.py`` orderings survive untouched.
+
+    A test file whose dependencies were *entirely* cross-language is
+    dropped rather than kept with an empty hint list: the planner's own
+    description ties it to sources it cannot reach, and generating it
+    anyway just relocates the hallucination from the import list to the
+    test bodies. Non-test files are never dropped -- a mislinked module
+    is still buildable, and losing one silently could gut the project.
+    """
+    doomed: set = set()
+    for f in files:
+        deps = [str(d) for d in (f.get("depends_on") or [])]
+        if not deps:
+            continue
+        own = _lang_family(f["path"])
+        if own is None:
+            continue
+        alien = [d for d in deps
+                 if (_lang_family(d) or own) != own]
+        if not alien:
+            continue
+        kept = [d for d in deps if d not in alien]
+        f["depends_on"] = kept
+        logger.warning(
+            "DECOMPOSE: dropping cross-language depends_on %s from %r "
+            "(%s cannot import them)", alien, f["path"], own)
+        if not kept and _is_test_file(f["path"]):
+            doomed.add(f["path"])
+    if not doomed:
+        return
+    logger.warning(
+        "DECOMPOSE: dropping unsatisfiable test file(s) %s -- every file "
+        "they were planned to cover is in another language",
+        sorted(doomed))
+    for lay in layers:
+        if not isinstance(lay, dict):
+            continue
+        lay["files"] = [f for f in (lay.get("files") or [])
+                        if not (isinstance(f, dict)
+                                and f.get("path") in doomed)]
+    for f in files:
+        surviving = f.get("depends_on")
+        if isinstance(surviving, list) and surviving:
+            f["depends_on"] = [d for d in surviving if d not in doomed]
+
+
 def _find_dependency_cycle(
         files: List[Dict[str, Any]]) -> Optional[List[str]]:
     """Return a cyclic path (``a -> b -> a``) among intra-manifest deps."""
@@ -415,7 +503,8 @@ def _validate_manifest_coherence(
 
     ``depends_on`` problems are *not* fatal: it is only a topological /
     context-scoping hint, so a common planner slip -- a dangling entry
-    (a phantom path or a glob like ``src/components/*.jsx``) or a
+    (a phantom path or a glob like ``src/components/*.jsx``), a
+    cross-language edge (a pytest file covering JSX components), or a
     dependency cycle (``a -> b -> a``, routine for small local models)
     -- is repaired in place with a warning rather than sinking an
     otherwise-buildable manifest and terminally failing the session.
@@ -424,7 +513,6 @@ def _validate_manifest_coherence(
     """
     files = _manifest_files(layers)
     path_set = {f["path"] for f in files}
-    by_path = {f["path"]: f for f in files}
 
     for f in files:
         deps = f.get("depends_on") or []
@@ -435,6 +523,13 @@ def _validate_manifest_coherence(
                 "DECOMPOSE: pruning dangling depends_on %s from %r",
                 dropped, f["path"])
             f["depends_on"] = kept
+
+    # Runs after the dangling prune so a phantom path is reported as
+    # phantom rather than as a foreign language, and before the cycle
+    # search so a dropped node cannot leave a half-lit cycle behind.
+    _repair_cross_language_deps(files, layers)
+    files = _manifest_files(layers)
+    by_path = {f["path"]: f for f in files}
 
     # Each pass removes exactly one edge, so this terminates.
     cycle = _find_dependency_cycle(files)
