@@ -475,6 +475,28 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             if e.get("path") not in dropped]
         _checkpoint_progress(deps, artifact)
 
+    # Import-smoke synthesis: when the plan authored a test suite but every
+    # generated test was unrecoverable and the gates above dropped them all,
+    # the tree reaches VERIFY with source modules and no test -- the honest
+    # but unsatisfying ``no_tests``. Synthesize a deterministic
+    # tests/test_smoke.py that imports every surviving first-party source
+    # module, turning that into a real signal: it passes only if the tree
+    # loads (no missing dep, syntax error, or circular import) and fails
+    # honestly otherwise. Runs after every Python drop gate so it probes the
+    # exact surviving set, and never overrides a model-authored test that
+    # survived. Best-effort: any failure leaves the bundle untouched.
+    smoke_test_synthesized: Optional[str] = None
+    try:
+        smoke_test_synthesized = _synthesize_import_smoke_test(
+            diffs=diffs, generated=generated,
+            existing_with_content=existing_with_content, layers=layers)
+    except Exception:  # pragma: no cover - defensive: pass is best-effort
+        logger.exception(
+            "SCAFFOLD: import-smoke synthesis raised; skipping")
+        smoke_test_synthesized = None
+    if smoke_test_synthesized:
+        _checkpoint_progress(deps, artifact)
+
     # JS runtime-dependency guard: symmetric with the deterministic
     # requirements.txt salvage. A weak model routinely imports a runtime
     # package (e.g. ``axios``) in a component while omitting it from
@@ -556,6 +578,7 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     artifact.content["reconciled_count"] = reconciled_count
     artifact.content["js_deps_added"] = js_deps_added
     artifact.content["synthesized_modules"] = synthesized_modules
+    artifact.content["smoke_test_synthesized"] = smoke_test_synthesized
     artifact.content["complete"] = True
     return ExecutorResult(
         outputs={
@@ -570,6 +593,7 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             "reconciled_count": reconciled_count,
             "js_deps_added": js_deps_added,
             "synthesized_modules": synthesized_modules,
+            "smoke_test_synthesized": smoke_test_synthesized,
         },
         artifact=artifact,
     )
@@ -1021,6 +1045,145 @@ def _synthesize_missing_first_party_modules(
             "SCAFFOLD: work plan omitted first-party module(s) imported by "
             "generated files; synthesized %s so the importers resolve", added)
     return added
+
+
+_SMOKE_TEST_PATH = "tests/test_smoke.py"
+
+
+def _is_pytest_test_module(path: str) -> bool:
+    """True when ``path`` is a runnable pytest test module (not a conftest)."""
+    base = (path or "").replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+    return base.startswith("test_") or base.endswith("_test.py")
+
+
+def _importable_module_name(path: str) -> Optional[str]:
+    """Runtime-importable dotted name for a first-party source ``.py`` path.
+
+    Mirrors the generated root ``conftest.py`` (and the smoke test's own
+    ``sys.path`` bootstrap), which prepend ``src/`` to ``sys.path`` for the
+    src/ layout: a module under ``src/`` imports by the name *below* ``src/``
+    (``src/calc.py`` -> ``calc``); everything else imports by its
+    project-root-relative dotted path (``backend/app.py`` -> ``backend.app``).
+    Returns ``None`` for non-Python paths and for a bare ``src`` package.
+    """
+    from cgx.session.scaffold_validate import _module_name_for_path
+    mod = _module_name_for_path(path)
+    if not mod or mod == "src":
+        return None
+    if mod.startswith("src."):
+        return mod[len("src."):]
+    return mod
+
+
+def _render_import_smoke_test(modules: List[str]) -> str:
+    """Render the deterministic import-smoke test body for ``modules``."""
+    listed = "\n".join(f"    {m!r}," for m in modules)
+    return (
+        '"""Auto-generated import smoke test.\n'
+        "\n"
+        "Imports every first-party source module and fails if any raises at\n"
+        "import time (missing dependency, syntax error, circular import). A\n"
+        "green run proves the package tree loads; it asserts no behaviour.\n"
+        "Synthesized only when the plan produced no usable test module, so\n"
+        "VERIFY exercises the code instead of reporting no_tests.\n"
+        '"""\n'
+        "import importlib\n"
+        "import os\n"
+        "import sys\n"
+        "\n"
+        "_HERE = os.path.dirname(os.path.abspath(__file__))\n"
+        "_ROOT = os.path.dirname(_HERE)\n"
+        '_SRC = os.path.join(_ROOT, "src")\n'
+        "for _p in (_ROOT, _SRC):\n"
+        "    if os.path.isdir(_p) and _p not in sys.path:\n"
+        "        sys.path.insert(0, _p)\n"
+        "\n"
+        "MODULES = [\n"
+        f"{listed}\n"
+        "]\n"
+        "\n"
+        "\n"
+        "def test_first_party_modules_import():\n"
+        "    errors = []\n"
+        "    for _name in MODULES:\n"
+        "        try:\n"
+        "            importlib.import_module(_name)\n"
+        "        except Exception as exc:  # noqa: BLE001\n"
+        "            errors.append(\n"
+        '                "%s: %s: %s" % (_name, type(exc).__name__, exc))\n'
+        "    assert not errors, (\n"
+        '        "first-party modules failed to import: " + "; ".join(errors))\n'
+    )
+
+
+def _synthesize_import_smoke_test(
+        *,
+        diffs: List[Dict[str, str]],
+        generated: List[Dict[str, Any]],
+        existing_with_content: List[Dict[str, str]],
+        layers: List[Any],
+) -> Optional[str]:
+    """Author ``tests/test_smoke.py`` when planned tests were all dropped.
+
+    The weak-model failure mode this closes: the planner authored a test
+    suite, but every generated test was unrecoverable (collapsed newlines,
+    truncation) and the gates dropped them all, leaving a tree with source
+    modules and no test. VERIFY would then report the honest-but-useless
+    ``no_tests``. Rather than fake a pass, synthesize a deterministic smoke
+    test that ``importlib.import_module()``s every surviving first-party
+    source module: it passes only if the tree actually loads (no missing
+    dependency, syntax error, or circular import) and fails honestly
+    otherwise -- a real signal VERIFY can gate on.
+
+    Kept narrow so it never disturbs a well-formed scaffold: it fires only
+    when the *manifest planned* at least one pytest test module, *none*
+    survived the gates, and there is at least one importable source module
+    to probe. A model-authored test that survived is always left in place.
+    Mutates the passed lists/manifest in place; returns the path authored
+    (or ``None``).
+    """
+    from cgx.answer.engine import _content_to_new_file_patch
+
+    manifest_paths = [
+        str(e.get("path") or "") for lay in layers if isinstance(lay, dict)
+        for e in (lay.get("files") or []) if isinstance(e, dict)]
+    # Only step in for the "planned tests, kept none" shape.
+    if not any(_is_pytest_test_module(p) for p in manifest_paths):
+        return None
+    surviving = [str(e.get("path") or "").replace("\\", "/").lstrip("./")
+                 for e in existing_with_content]
+    if any(_is_pytest_test_module(p) for p in surviving):
+        return None
+
+    modules: List[str] = []
+    for path in surviving:
+        if not path.endswith(".py"):
+            continue
+        base = path.rsplit("/", 1)[-1]
+        if base == "__init__.py" or _is_test_path(path):
+            continue
+        name = _importable_module_name(path)
+        if name:
+            modules.append(name)
+    modules = sorted(dict.fromkeys(modules))
+    if not modules:
+        return None
+
+    content = _render_import_smoke_test(modules)
+    patch = _content_to_new_file_patch(_SMOKE_TEST_PATH, content)
+    diffs.append({"file": _SMOKE_TEST_PATH, "patch": patch})
+    generated.append({
+        "file": _SMOKE_TEST_PATH, "layer": "smoke", "syntax_ok": True,
+        "confidence": 1.0, "bytes": len(content), "synthesized": True})
+    existing_with_content.append(
+        {"path": _SMOKE_TEST_PATH, "content": content})
+    layers.append({"name": "smoke", "files": [{"path": _SMOKE_TEST_PATH}]})
+    logger.warning(
+        "SCAFFOLD: the plan's test module(s) were all dropped; synthesized %s "
+        "importing %d first-party module(s) so VERIFY runs a real import "
+        "smoke test instead of reporting no_tests", _SMOKE_TEST_PATH,
+        len(modules))
+    return _SMOKE_TEST_PATH
 
 
 def _phantom_first_party_import_failures(

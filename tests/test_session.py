@@ -4571,6 +4571,119 @@ def test_scaffold_synthesizes_omitted_first_party_module(store, monkeypatch):
     assert result.artifact.content["failed"] == []
 
 
+def test_synthesize_import_smoke_test_adds_probe_for_source_modules():
+    """Planned tests all dropped -> a smoke test importing the survivors.
+
+    The manifest planned ``tests/test_app.py`` but only source modules
+    survived the gates; the synthesizer authors ``tests/test_smoke.py``
+    that ``importlib.import_module()``s every first-party source module.
+    """
+    from cgx.session.tasks.scaffold import _synthesize_import_smoke_test
+    diffs = [{"file": "backend/app.py", "patch": "x"}]
+    generated = [{"file": "backend/app.py"}]
+    existing = [
+        {"path": "backend/__init__.py", "content": ""},
+        {"path": "backend/app.py",
+         "content": "def compute(a, b):\n    return a + b\n"},
+    ]
+    layers = [{"name": "app", "files": [
+        {"path": "backend/__init__.py"},
+        {"path": "backend/app.py"},
+        {"path": "tests/test_app.py"}]}]
+    added = _synthesize_import_smoke_test(
+        diffs=diffs, generated=generated,
+        existing_with_content=existing, layers=layers)
+    assert added == "tests/test_smoke.py"
+    smoke = next(e for e in existing if e["path"] == "tests/test_smoke.py")
+    assert "backend.app" in smoke["content"]
+    assert "importlib.import_module" in smoke["content"]
+    # backend/__init__.py is a package marker, not a probe target.
+    assert "'backend'," not in smoke["content"]
+    assert "tests/test_smoke.py" in [d["file"] for d in diffs]
+
+
+def test_synthesize_import_smoke_test_skipped_when_a_test_survives():
+    """A model-authored test that survived the gates is never overridden."""
+    from cgx.session.tasks.scaffold import _synthesize_import_smoke_test
+    diffs: list = []
+    generated: list = []
+    existing = [
+        {"path": "backend/app.py", "content": "x = 1\n"},
+        {"path": "tests/test_app.py",
+         "content": "def test_x():\n    assert True\n"},
+    ]
+    layers = [{"name": "app", "files": [
+        {"path": "backend/app.py"}, {"path": "tests/test_app.py"}]}]
+    assert _synthesize_import_smoke_test(
+        diffs=diffs, generated=generated,
+        existing_with_content=existing, layers=layers) is None
+    assert diffs == []
+
+
+def test_synthesize_import_smoke_test_skipped_when_no_test_was_planned():
+    """A scaffold that never planned a test is left alone (no smoke test)."""
+    from cgx.session.tasks.scaffold import _synthesize_import_smoke_test
+    diffs = [{"file": "backend/app.py", "patch": "x"}]
+    generated = [{"file": "backend/app.py"}]
+    existing = [{"path": "backend/app.py", "content": "x = 1\n"}]
+    layers = [{"name": "app", "files": [{"path": "backend/app.py"}]}]
+    assert _synthesize_import_smoke_test(
+        diffs=diffs, generated=generated,
+        existing_with_content=existing, layers=layers) is None
+    assert [d["file"] for d in diffs] == ["backend/app.py"]
+
+
+def test_scaffold_synthesizes_smoke_test_when_planned_test_is_dropped(
+        store, monkeypatch):
+    """End-to-end: the planned test is unrecoverable, a smoke test replaces it.
+
+    The manifest plans ``backend/app.py`` + ``tests/test_app.py``; the
+    generated test imports an undefined dotted module so the phantom gate
+    drops it, leaving a source module and no test. SCAFFOLD then synthesizes
+    ``tests/test_smoke.py`` importing ``backend.app`` so VERIFY runs a real
+    suite instead of reporting no_tests.
+    """
+    from cgx.session.tasks.scaffold import run_scaffold
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    plan = Artifact.new(
+        session.session_id, "task_x", ArtifactKind.WORK_PLAN, {
+            "plan_md": "", "composed_goal": "g", "prior_goal": "g",
+            "layers": [{"name": "app", "files": [
+                {"path": "backend/__init__.py", "description": ""},
+                {"path": "backend/app.py", "description": ""},
+                {"path": "tests/test_app.py", "description": ""}]}],
+        })
+    store.save_artifact(plan)
+
+    bodies = {
+        "backend/__init__.py": "",
+        "backend/app.py": "def compute(a, b):\n    return a + b\n",
+        # Imports a dotted first-party module that is never defined -> the
+        # phantom gate drops this test (an unrecoverable model slip).
+        "tests/test_app.py": "from backend.missing import gone\n",
+    }
+
+    def fake_generate(path, *a, **kw):
+        return {"file": path, "patch": f"+++ {path}\nx",
+                "content": bodies[path], "syntax_ok": True}
+
+    monkeypatch.setattr("cgx.answer.engine.generate_single_scaffold_file",
+                        fake_generate)
+    t = TaskNode.new(session.session_id, TaskKind.SCAFFOLD, "s",
+                     inputs={"work_plan_artifact_id": plan.artifact_id})
+    result = run_scaffold(
+        t, ExecutorDeps(provider=_StubProvider(""), store=store))
+    assert result.failure is None
+    assert result.outputs["smoke_test_synthesized"] == "tests/test_smoke.py"
+    files = [d["file"] for d in result.artifact.content["diffs"]]
+    assert "tests/test_app.py" not in files
+    assert "tests/test_smoke.py" in files
+    smoke = next(d for d in result.artifact.content["diffs"]
+                 if d["file"] == "tests/test_smoke.py")
+    assert "backend.app" in smoke["patch"]
+
+
 def test_scaffold_targeted_regenerate_reuses_good_diffs(store, monkeypatch):
     """regenerate_files -> only the failed path is generated; good diffs reused."""
     from cgx.answer.engine import _content_to_new_file_patch
