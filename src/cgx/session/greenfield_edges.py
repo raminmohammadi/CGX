@@ -257,6 +257,16 @@ def _apply_failed_files_actions(completed: TaskNode,
         failed_count,
         apply_failed=outputs.get("failed_files"),
         scaffold_failed=scaffold_outputs.get("failed"))
+    # Foundational-file guard: a dropped environment manifest is never
+    # fixable by the per-file regenerate loop (re-asking the same model
+    # reproduces the drop), so skip that budget and escalate straight to a
+    # re-plan that can restructure the manifest.
+    foundational = _dropped_foundational_files(
+        scaffold_outputs.get("failed"), outputs.get("failed_files"))
+    if foundational:
+        return _replan_or_fail(
+            completed, tasks, scaffold=scaffold,
+            failure_note=_foundational_failure_note(foundational))
     budget = LoopBudget.from_inputs(scaffold.inputs)
     signature = _scaffold_failure_signature(
         scaffold_outputs.get("failed"), outputs.get("failed_files"))
@@ -476,6 +486,15 @@ def _scaffold_failed_files_actions(completed: TaskNode,
     constraint = _invalid_scaffold_constraint(
         failed_count, apply_failed=None,
         scaffold_failed=outputs.get("failed"))
+    # Foundational-file guard (mirrors _apply_failed_files_actions): a
+    # dropped environment manifest escalates straight to a re-plan rather
+    # than burning the per-file regenerate budget on a file the same model
+    # just failed to produce.
+    foundational = _dropped_foundational_files(outputs.get("failed"), None)
+    if foundational:
+        return _replan_or_fail(
+            completed, tasks, scaffold=completed,
+            failure_note=_foundational_failure_note(foundational))
     budget = LoopBudget.from_inputs(completed.inputs)
     signature = _scaffold_failure_signature(outputs.get("failed"))
     if budget.regenerate_exhausted or (signature and budget.seen(signature)):
@@ -781,6 +800,54 @@ def _dropped_file_entries(scaffold_failed: object,
             continue
         out.extend(e for e in source if isinstance(e, dict))
     return out
+
+
+# Environment-manifest files whose absence structurally breaks recovery.
+# BOOTSTRAP_ENV keys project-type detection off exactly these (see
+# ``cgx.session.tasks.bootstrap_env._detect_project_type``), so a dropped
+# requirements.txt / package.json misdetects the stack and the Python
+# venv (or node_modules) is never provisioned -- every downstream gate
+# then fails against an unprovisioned environment, a state the per-file
+# regenerate loop cannot escape because re-asking the same weak model for
+# the file it just dropped reproduces the same drop.
+_FOUNDATIONAL_FILES: frozenset = frozenset({
+    "pyproject.toml", "setup.py", "setup.cfg", "package.json",
+})
+
+
+def _is_foundational_path(path: str) -> bool:
+    """True when ``path`` is an environment manifest (see _FOUNDATIONAL_FILES).
+
+    Matches the ``requirements*.txt`` family by shape and the remaining
+    manifests by exact basename, both case-folded and directory-stripped.
+    """
+    base = path.strip().lower().rsplit("/", 1)[-1]
+    if base.startswith("requirements") and base.endswith(".txt"):
+        return True
+    return base in _FOUNDATIONAL_FILES
+
+
+def _dropped_foundational_files(scaffold_failed: object,
+                                apply_failed: object) -> List[str]:
+    """Return the dropped file paths that are environment manifests."""
+    return [p for p in _failed_scaffold_paths(scaffold_failed, apply_failed)
+            if _is_foundational_path(p)]
+
+
+def _foundational_failure_note(foundational: List[str]) -> str:
+    """Re-plan note for a dropped environment manifest.
+
+    Distinct from :func:`_invalid_scaffold_constraint` (which asks the
+    generator to re-emit the same file): naming the manifests and why they
+    matter steers the DECOMPOSE toward a plan that emits each as a minimal
+    valid file, since regenerating them in place has already failed.
+    """
+    files = ", ".join(sorted(set(foundational)))
+    return ("Foundational environment manifest(s) were dropped as invalid: "
+            f"{files}. These files drive project-type detection and "
+            "environment provisioning, so regenerating them in place cannot "
+            "recover the build -- restructure the plan so each is emitted as "
+            "a minimal, valid manifest.")
 
 
 def _verify_lesson_actions(completed: TaskNode,

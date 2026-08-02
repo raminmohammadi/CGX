@@ -9852,7 +9852,8 @@ def _build_apply_failed_chain(*, prior_regens: int = 0,
                               prior_replans: int = 0,
                               mode: str = "greenfield",
                               with_scaffold: bool = True,
-                              survivors: int = 8):
+                              survivors: int = 8,
+                              apply_failed_files=None):
     """Build a SCAFFOLD -> APPLY chain where APPLY dropped invalid files."""
     from cgx.session.models import SessionMode
     session = Session.new("g", mode=(SessionMode.GREENFIELD
@@ -9881,15 +9882,17 @@ def _build_apply_failed_chain(*, prior_regens: int = 0,
         session.session_id, TaskKind.APPLY, "apply",
         parent_task_id=parent_id,
         inputs={"mode": mode, "scaffold_artifact_id": "art_scaffold"})
-    apply_t.outputs = {
-        "apply_artifact_id": "art_applied",
-        "applied_count": 1, "failed_count": 2,
-        "failed_files": [
+    if apply_failed_files is None:
+        apply_failed_files = [
             {"file": "backend/models.py",
              "error": "python syntax: unexpected unindent (models.py, line 10)"},
             {"file": "tests/test_auth.py",
              "error": "python syntax: unexpected unindent (test_auth.py, "
-                      "line 19)"}]}
+                      "line 19)"}]
+    apply_t.outputs = {
+        "apply_artifact_id": "art_applied",
+        "applied_count": 1, "failed_count": len(apply_failed_files),
+        "failed_files": apply_failed_files}
     apply_t.status = TaskNodeStatus.DONE
     tasks.append(apply_t)
     return session, scaffold, apply_t, tasks
@@ -9934,6 +9937,61 @@ def test_router_apply_failed_files_regenerates_within_budget():
     # The retry carries the SCAFFOLD+APPLY failure signature so a repeat
     # of the identical drop is detectable on the next round.
     assert new_scaffold.inputs["prior_failure_signatures"]
+
+
+def test_is_foundational_path_recognises_environment_manifests():
+    from cgx.session.greenfield_edges import (
+        _dropped_foundational_files,
+        _is_foundational_path,
+    )
+    for p in ("requirements.txt", "requirements-dev.txt", "backend/package.json",
+              "pyproject.toml", "setup.py", "setup.cfg"):
+        assert _is_foundational_path(p), p
+    for p in ("app.py", "src/components/App.jsx", "README.md", "tests/test_x.py"):
+        assert not _is_foundational_path(p), p
+    # De-duplicated, drawn from both dropped sources.
+    got = _dropped_foundational_files(
+        [{"file": "backend/main.py"}, {"file": "package.json"}],
+        [{"file": "requirements.txt"}])
+    assert set(got) == {"package.json", "requirements.txt"}
+
+
+def test_router_apply_dropped_foundational_file_escalates_to_replan():
+    """A dropped environment manifest bypasses the per-file regenerate loop
+    (even with budget to spare) and re-plans the manifest instead."""
+    session, scaffold, apply_t, tasks = _build_apply_failed_chain(
+        apply_failed_files=[
+            {"file": "package.json",
+             "error": "JSON parse error: Expecting value: line 1"}])
+    plan = Router().on_task_completed(
+        session=session, completed=apply_t, tasks=tasks)
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    assert len(creates) == 1
+    dec = creates[0].task
+    # A re-plan (DECOMPOSE), NOT a regenerate SCAFFOLD.
+    assert dec.kind is TaskKind.DECOMPOSE
+    assert dec.inputs["replan_attempt"] == 1
+    # The foundational note is folded into the revised goal.
+    assert "package.json" in dec.inputs["prior_goal"]
+    assert "manifest" in dec.inputs["prior_goal"]
+    # No terminal failure while a re-plan is still possible.
+    assert not [a for a in plan.actions if isinstance(a, UpdateSessionStatus)]
+
+
+def test_router_scaffold_dropped_foundational_file_escalates_to_replan():
+    """Mirror of the APPLY guard on the SCAFFOLD dropped-file edge."""
+    session, parent, scaffold, tasks = _build_scaffold_failed_chain(
+        scaffold_failed_files=[
+            {"file": "requirements.txt",
+             "error": "not a valid pip requirements file"}])
+    plan = Router().on_task_completed(
+        session=session, completed=scaffold, tasks=tasks)
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    assert len(creates) == 1
+    dec = creates[0].task
+    assert dec.kind is TaskKind.DECOMPOSE
+    assert "requirements.txt" in dec.inputs["prior_goal"]
+    assert not [a for a in plan.actions if isinstance(a, UpdateSessionStatus)]
 
 
 def test_router_apply_failed_files_repeat_failure_skips_regenerate():
@@ -10033,7 +10091,8 @@ def _build_scaffold_failed_chain(*, prior_regens: int = 0,
                                  prior_replans: int = 0,
                                  failed_count: int = 2,
                                  with_pending_child: bool = True,
-                                 survivors: int = 8):
+                                 survivors: int = 8,
+                                 scaffold_failed_files=None):
     """Build a SCAFFOLD that dropped files, with an optional live APPLY child.
 
     Mirrors :func:`_build_apply_failed_chain` but the failure surfaces on
@@ -10054,14 +10113,16 @@ def _build_scaffold_failed_chain(*, prior_regens: int = 0,
                 "regenerate_attempt": prior_regens,
                 "replan_attempt": prior_replans})
     scaffold.produced_artifact_id = "art_scaffold"
-    failed = [
-        {"file": "src/components/Calculator.jsx",
-         "error": "ReadTimeout: read timed out (read timeout=300.0)"},
-        {"file": "backend/main.py",
-         "error": "generator returned empty patch"}][:failed_count]
+    if scaffold_failed_files is None:
+        scaffold_failed_files = [
+            {"file": "src/components/Calculator.jsx",
+             "error": "ReadTimeout: read timed out (read timeout=300.0)"},
+            {"file": "backend/main.py",
+             "error": "generator returned empty patch"}][:failed_count]
+    failed = scaffold_failed_files
     scaffold.outputs = {"scaffold_artifact_id": "art_scaffold",
                         "generated_count": survivors,
-                        "failed_count": failed_count, "failed": failed}
+                        "failed_count": len(failed), "failed": failed}
     scaffold.status = TaskNodeStatus.DONE
     tasks = [parent, scaffold]
     if with_pending_child:
