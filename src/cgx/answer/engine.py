@@ -3746,8 +3746,12 @@ def generate_single_scaffold_file(
     # source into requirements.txt and pip tolerated enough of it that
     # the venv provisioned against a corrupted manifest. Validate
     # line-by-line against a plausible PEP-508-ish specifier shape with
-    # one targeted repair retry; an unfixable body fails the file so the
-    # regenerate edge retries it rather than APPLY shipping garbage.
+    # one targeted repair retry. requirements.txt is foundational -- if it
+    # is dropped, BOOTSTRAP_ENV misdetects a node-only project and the
+    # Python venv is never provisioned, so downstream recovery is
+    # structurally impossible. When the model retry also fails, salvage the
+    # manifest deterministically (strip non-specifier lines, backfill from
+    # real imports) rather than failing the file into a drop.
     if syntax_ok and content and _is_requirements_txt_path(path):
         req_err = _requirements_content_error(content)
         if req_err:
@@ -3757,8 +3761,8 @@ def generate_single_scaffold_file(
             if retry and not _requirements_content_error(retry):
                 content = retry
             else:
-                syntax_ok = False
-                syntax_error = req_err
+                content = _deterministic_requirements_repair(
+                    content, existing_files_with_content)
 
     # Extension/content mismatch check: a 3B model frequently emits Vue
     # SFC content under a .jsx path, or vice versa. These heuristics catch
@@ -3949,6 +3953,93 @@ def _requirements_content_error(content: str) -> Optional[str]:
         return None
     return ("not a valid pip requirements file; offending line(s): "
             + "; ".join(bad))
+
+
+def _synthesize_requirements_from_imports(
+        existing_files_with_content: Optional[List[Dict[str, str]]],
+) -> List[str]:
+    """Best-effort requirement lines from the generated .py files' imports.
+
+    Scans every already-generated Python file for its third-party import
+    roots, drops stdlib and first-party (project-local) roots, and maps the
+    survivors to their PyPI distribution names via the same
+    :data:`~cgx.codegen.env_manager._IMPORT_TO_PYPI` table the dynamic
+    installer uses. Used only as a backfill when a corrupted manifest has
+    no salvageable specifier line, so the venv still gets the obvious
+    dependencies instead of an empty file.
+    """
+    from cgx.codegen.env_manager import (
+        _IMPORT_TO_PYPI,
+        _NAMESPACE_ROOTS,
+        _STDLIB_TOP,
+        _extract_imports_python,
+    )
+    first_party: set = set()
+    imports: set = set()
+    for ef in existing_files_with_content or []:
+        ep = (ef.get("path") or "").strip()
+        ec = ef.get("content") or ""
+        if not ep.endswith(".py") or not ec:
+            continue
+        parts = [p for p in ep.split("/") if p]
+        if parts:
+            first_party.add(parts[0][:-3] if parts[0].endswith(".py")
+                            else parts[0])
+            first_party.add(parts[-1][:-3])
+        imports |= _extract_imports_python(ec)
+    dotted_roots = {n.split(".", 1)[0] for n in imports if "." in n}
+    dists: set = set()
+    for name in imports:
+        if name in _NAMESPACE_ROOTS and name in dotted_roots:
+            continue
+        root = name.split(".")[0]
+        if root.lower().replace("-", "_") in _STDLIB_TOP:
+            continue
+        if root in first_party:
+            continue
+        if name in _IMPORT_TO_PYPI:
+            dists.add(_IMPORT_TO_PYPI[name])
+        elif "." in name:
+            continue
+        else:
+            dists.add(name)
+    return sorted(dists)
+
+
+def _deterministic_requirements_repair(
+        content: str,
+        existing_files_with_content: Optional[List[Dict[str, str]]],
+) -> str:
+    """Salvage a corrupted requirements.txt into a valid one, no model call.
+
+    Keeps every comment/blank line and every line that already parses as a
+    plausible specifier (:data:`_REQUIREMENT_LINE_RE`), dropping the rest --
+    typically Python source a weak model pasted into the manifest. When no
+    specifier line survives, backfills from the third-party imports the
+    generated ``.py`` files actually use. The result is guaranteed to
+    satisfy :func:`_requirements_content_error`, so requirements.txt is
+    never dropped for a content fault (which would misdetect a node-only
+    project and skip Python venv provisioning entirely).
+    """
+    kept: List[str] = []
+    kept_specs = False
+    for raw in content.splitlines():
+        line = re.split(r"\s#", raw)[0].strip()
+        if not line or line.startswith("#"):
+            kept.append(raw)
+            continue
+        if _REQUIREMENT_LINE_RE.match(line):
+            kept.append(raw)
+            kept_specs = True
+    if not kept_specs:
+        synth = _synthesize_requirements_from_imports(
+            existing_files_with_content)
+        if synth:
+            kept.append("# synthesised from project imports "
+                        "(original manifest was not a valid requirements file)")
+            kept.extend(synth)
+    text = "\n".join(kept).strip()
+    return text + "\n" if text else "# no third-party dependencies detected\n"
 
 
 def _has_collectable_pytest_test(content: str) -> bool:

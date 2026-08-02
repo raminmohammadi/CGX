@@ -833,16 +833,63 @@ def test_scaffold_requirements_gate_retries_and_recovers():
     assert out["content"] == _GOOD_REQS
 
 
-def test_scaffold_requirements_gate_flags_when_retry_still_broken():
-    from cgx.answer.engine import generate_single_scaffold_file
+def test_scaffold_requirements_gate_salvages_when_retry_still_broken():
+    """When the model retry also fails, the gate must NOT drop the
+    manifest -- requirements.txt is foundational (its absence misdetects a
+    node-only project and skips venv provisioning). It is salvaged into a
+    valid, non-dropped file instead."""
+    from cgx.answer.engine import (
+        _requirements_content_error,
+        generate_single_scaffold_file,
+    )
     provider = _QueueProvider([_BAD_REQS, _BAD_REQS])
     out = generate_single_scaffold_file(
         "requirements.txt", "python deps", provider,
         layer="deps", goal="build an app",
     )
     assert provider.calls == 2
-    assert out["syntax_ok"] is False
-    assert "requirements" in out.get("syntax_error", "")
+    # Salvaged, not dropped: valid content survives.
+    assert out["syntax_ok"] is True
+    assert out["content"]
+    assert _requirements_content_error(out["content"]) is None
+    # The pasted Python source is gone.
+    assert "def init_db" not in out["content"]
+
+
+def test_deterministic_requirements_repair_strips_source_lines():
+    from cgx.answer.engine import (
+        _deterministic_requirements_repair,
+        _requirements_content_error,
+    )
+    corrupt = ("# deps\n"
+               "flask==2.3.2\n"
+               "import os\n"
+               "def go():\n    return 1\n"
+               "requests\n")
+    out = _deterministic_requirements_repair(corrupt, None)
+    assert _requirements_content_error(out) is None
+    assert "flask==2.3.2" in out
+    assert "requests" in out
+    assert "def go" not in out and "import os" not in out
+
+
+def test_deterministic_requirements_repair_backfills_from_imports():
+    from cgx.answer.engine import (
+        _deterministic_requirements_repair,
+        _requirements_content_error,
+    )
+    # No salvageable specifier survives, so it backfills from real imports.
+    existing = [
+        {"path": "app.py",
+         "content": "import flask\nimport os\nfrom app import helper\n"},
+        {"path": "helper.py", "content": "import yaml\n"},
+    ]
+    out = _deterministic_requirements_repair(_BAD_REQS, existing)
+    assert _requirements_content_error(out) is None
+    assert "flask" in out
+    assert "PyYAML" in out            # import alias -> PyPI name
+    assert "os" not in out            # stdlib dropped
+    assert "\napp\n" not in out       # first-party dropped
 
 
 def test_new_file_body_from_patch_roundtrips_and_rejects_modifications():
