@@ -450,6 +450,25 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             if e.get("path") not in dropped]
         _checkpoint_progress(deps, artifact)
 
+    # JS runtime-dependency guard: symmetric with the deterministic
+    # requirements.txt salvage. A weak model routinely imports a runtime
+    # package (e.g. ``axios``) in a component while omitting it from
+    # package.json, so the build resolves nothing and VERIFY ends on an
+    # unrecoverable red. Cross-check every generated JS/TS file's external
+    # imports against package.json and splice the missing ones into
+    # ``dependencies`` in place. Best-effort: any failure leaves the bundle
+    # untouched.
+    js_deps_added: List[str] = []
+    try:
+        js_deps_added = _reconcile_js_dependencies(
+            diffs=diffs, existing_with_content=existing_with_content)
+    except Exception:  # pragma: no cover - defensive: gate is best-effort
+        logger.exception(
+            "SCAFFOLD: JS dependency reconciliation raised; skipping")
+        js_deps_added = []
+    if js_deps_added:
+        _checkpoint_progress(deps, artifact)
+
     # Phase 4.1: tighten upper bounds on known-fragile peers using the
     # consumer's PyPI ``requires_dist`` *before* APPLY writes the file.
     # Network / fetch failures degrade to no-op (returns the original
@@ -510,6 +529,7 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     artifact.content["import_warnings"] = import_warnings
     artifact.content["contract_warnings"] = contract_warnings
     artifact.content["reconciled_count"] = reconciled_count
+    artifact.content["js_deps_added"] = js_deps_added
     artifact.content["complete"] = True
     return ExecutorResult(
         outputs={
@@ -522,6 +542,7 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             "contract_warnings_count": len(contract_warnings),
             "contract_warnings": contract_warnings,
             "reconciled_count": reconciled_count,
+            "js_deps_added": js_deps_added,
         },
         artifact=artifact,
     )
@@ -1338,6 +1359,74 @@ def _augment_goal_with_constraints(
     if len(lines) == 2:
         return goal
     return f"{goal}\n" + "\n".join(lines) if goal else "\n".join(lines[1:])
+
+
+def _reconcile_js_dependencies(
+        *,
+        diffs: List[Dict[str, str]],
+        existing_with_content: List[Dict[str, str]],
+) -> List[str]:
+    """Splice missing runtime deps into package.json in place.
+
+    Locates the ``package.json`` diff, reconstructs its content, and hands
+    it to :func:`cgx.answer.engine._deterministic_package_json_repair`
+    together with every generated JS/TS file so any bare import the manifest
+    omits is added under ``dependencies``. Rewrites the diff (and the
+    matching ``existing_with_content`` entry) with the repaired JSON using
+    the same new-file unified-diff helpers APPLY expects. No-ops (returns
+    ``[]``) when there is no package.json or nothing to add. Returns the
+    list of added package names for the artifact/telemetry.
+    """
+    from cgx.answer.engine import (
+        _content_to_new_file_patch,
+        _deterministic_package_json_repair,
+    )
+
+    pkg_idx = -1
+    for i, d in enumerate(diffs):
+        if str(d.get("file") or "").strip().rsplit("/", 1)[-1] == "package.json":
+            pkg_idx = i
+            break
+    if pkg_idx < 0:
+        return []
+    pkg_path = str(diffs[pkg_idx].get("file") or "").strip()
+
+    ei = -1
+    for i, e in enumerate(existing_with_content):
+        if str(e.get("path") or "").strip() == pkg_path:
+            ei = i
+            break
+    if ei < 0:
+        return []
+    before = str(existing_with_content[ei].get("content") or "")
+
+    import json as _json
+    try:
+        before_deps = set((_json.loads(before) or {}).get("dependencies") or {})
+    except Exception:
+        before_deps = set()
+
+    repaired = _deterministic_package_json_repair(
+        before, list(existing_with_content))
+    if repaired is None:
+        return []
+    try:
+        after_deps = set((_json.loads(repaired) or {}).get("dependencies") or {})
+    except Exception:
+        return []
+    added = sorted(after_deps - before_deps)
+    if not added:
+        return []
+
+    diffs[pkg_idx] = {
+        "file": pkg_path,
+        "patch": _content_to_new_file_patch(pkg_path, repaired),
+    }
+    existing_with_content[ei] = {"path": pkg_path, "content": repaired}
+    logger.warning(
+        "SCAFFOLD: package.json omitted imported runtime dep(s) %s; "
+        "adding them so the project can build", added)
+    return added
 
 
 def _reconcile_import_warnings(

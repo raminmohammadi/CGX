@@ -4042,6 +4042,116 @@ def _deterministic_requirements_repair(
     return text + "\n" if text else "# no third-party dependencies detected\n"
 
 
+# ES-module / CommonJS import specifier extractors. Deliberately narrow:
+# they only need to recover the *module specifier* string so the caller can
+# decide whether it is a bare (external) package. Both grammars are matched
+# because a weak model mixes ``import``/``require`` freely in the same file.
+_JS_IMPORT_FROM_RE = re.compile(
+    r"""(?:import|export)\b[^;'"]*?\bfrom\s*['"]([^'"]+)['"]""")
+_JS_BARE_IMPORT_RE = re.compile(r"""\bimport\s*['"]([^'"]+)['"]""")
+_JS_REQUIRE_RE = re.compile(r"""\brequire\s*\(\s*['"]([^'"]+)['"]\s*\)""")
+
+# Node core modules that must never be added to package.json. Not
+# exhaustive, but covers the builtins a scaffold model actually reaches for.
+_NODE_BUILTINS = frozenset({
+    "assert", "buffer", "child_process", "cluster", "console", "crypto",
+    "dgram", "dns", "events", "fs", "http", "http2", "https", "net", "os",
+    "path", "perf_hooks", "process", "punycode", "querystring", "readline",
+    "stream", "string_decoder", "timers", "tls", "tty", "url", "util", "v8",
+    "vm", "worker_threads", "zlib",
+})
+
+
+def _js_package_name_from_specifier(spec: str) -> Optional[str]:
+    """Return the installable npm package name for an import specifier.
+
+    ``None`` for relative (``./`` / ``../``), absolute, alias (``@/`` /
+    bare ``@``-with-no-scope-path), builtin, and ``node:`` specifiers --
+    none of which map to a package.json dependency. A scoped package keeps
+    its ``@scope/name`` root; an unscoped subpath (``react-dom/client``) is
+    reduced to its package root (``react-dom``).
+    """
+    s = (spec or "").strip()
+    if not s or s.startswith((".", "/")):
+        return None
+    if s.startswith("node:"):
+        return None
+    if s.startswith("@"):
+        parts = s.split("/")
+        if len(parts) < 2 or not parts[0][1:] or not parts[1]:
+            return None
+        return f"{parts[0]}/{parts[1]}"
+    root = s.split("/", 1)[0]
+    if not root or root in _NODE_BUILTINS:
+        return None
+    return root
+
+
+def _js_external_imports(content: str) -> List[str]:
+    """External npm package names imported/required by one JS/TS source."""
+    found: List[str] = []
+    for rx in (_JS_IMPORT_FROM_RE, _JS_BARE_IMPORT_RE, _JS_REQUIRE_RE):
+        for spec in rx.findall(content or ""):
+            name = _js_package_name_from_specifier(spec)
+            if name and name not in found:
+                found.append(name)
+    return found
+
+
+def _deterministic_package_json_repair(
+        content: str,
+        js_files_with_content: Optional[List[Dict[str, str]]],
+) -> Optional[str]:
+    """Add npm deps that generated JS/TS source imports but package.json omits.
+
+    Symmetric with :func:`_deterministic_requirements_repair`: a weak model
+    routinely imports a runtime package (``axios``) in a component while
+    leaving it out of ``package.json``, so the build resolves nothing and
+    VERIFY fails with an unrecoverable red. Scans every generated JS/TS file
+    for external (bare) imports, and adds any not already present under
+    ``dependencies``/``devDependencies``/``peerDependencies`` to
+    ``dependencies`` with a permissive ``"*"`` range (the lockfile pins the
+    concrete version at install time). Returns the rewritten JSON text, or
+    ``None`` when the manifest is unparseable or nothing needs adding, so
+    the caller leaves the original diff untouched.
+    """
+    import json as _json
+    try:
+        pkg = _json.loads(content)
+    except Exception:
+        return None
+    if not isinstance(pkg, dict):
+        return None
+
+    declared: set = set()
+    for key in ("dependencies", "devDependencies", "peerDependencies",
+                "optionalDependencies"):
+        section = pkg.get(key)
+        if isinstance(section, dict):
+            declared.update(str(k) for k in section)
+
+    wanted: List[str] = []
+    for entry in (js_files_with_content or []):
+        path = str(entry.get("path") or "")
+        ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+        if ext not in _JS_TS_GRAMMAR_BY_EXT:
+            continue
+        for name in _js_external_imports(str(entry.get("content") or "")):
+            if name not in declared and name not in wanted:
+                wanted.append(name)
+
+    if not wanted:
+        return None
+
+    deps = pkg.get("dependencies")
+    if not isinstance(deps, dict):
+        deps = {}
+    for name in wanted:
+        deps[name] = "*"
+    pkg["dependencies"] = deps
+    return _json.dumps(pkg, indent=2) + "\n"
+
+
 def _has_collectable_pytest_test(content: str) -> bool:
     """True when ``content`` defines at least one pytest-collectable test.
 

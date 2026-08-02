@@ -892,6 +892,67 @@ def test_deterministic_requirements_repair_backfills_from_imports():
     assert "\napp\n" not in out       # first-party dropped
 
 
+def test_js_package_name_from_specifier_filters_non_packages():
+    from cgx.answer.engine import _js_package_name_from_specifier
+    # Relative / builtin / node: specifiers are never deps.
+    assert _js_package_name_from_specifier("./App") is None
+    assert _js_package_name_from_specifier("../lib/util") is None
+    assert _js_package_name_from_specifier("fs") is None
+    assert _js_package_name_from_specifier("node:path") is None
+    # Bare + subpath reduce to the package root; scoped keeps @scope/name.
+    assert _js_package_name_from_specifier("axios") == "axios"
+    assert _js_package_name_from_specifier("react-dom/client") == "react-dom"
+    assert _js_package_name_from_specifier("@scope/pkg/sub") == "@scope/pkg"
+    assert _js_package_name_from_specifier("@nope") is None
+
+
+def test_js_external_imports_covers_import_require_and_bare():
+    from cgx.answer.engine import _js_external_imports
+    src = (
+        "import React from 'react';\n"
+        "import axios from 'axios';\n"
+        "import './styles.css';\n"
+        "import 'zone.js';\n"
+        "const cors = require('cors');\n"
+        "import App from './App';\n"
+    )
+    got = _js_external_imports(src)
+    assert got == ["react", "axios", "zone.js", "cors"]
+
+
+def test_deterministic_package_json_repair_adds_missing_runtime_dep():
+    import json
+    from cgx.answer.engine import _deterministic_package_json_repair
+    pkg = json.dumps({
+        "dependencies": {"react": ">=18", "react-dom": ">=18"},
+        "devDependencies": {"vite": ">=4"},
+    })
+    js = [
+        {"path": "src/App.jsx",
+         "content": "import React from 'react';\nimport axios from 'axios';\n"},
+        {"path": "src/main.jsx",
+         "content": "import App from './App';\n"},   # relative -> ignored
+    ]
+    out = _deterministic_package_json_repair(pkg, js)
+    assert out is not None
+    parsed = json.loads(out)
+    assert parsed["dependencies"]["axios"] == "*"
+    # Already-declared deps are untouched; relative import adds nothing.
+    assert parsed["dependencies"]["react"] == ">=18"
+
+
+def test_deterministic_package_json_repair_noop_when_complete():
+    import json
+    from cgx.answer.engine import _deterministic_package_json_repair
+    pkg = json.dumps({"dependencies": {"react": "*", "axios": "*"}})
+    js = [{"path": "a.jsx",
+           "content": "import React from 'react';\nimport axios from 'axios';\n"}]
+    # Nothing missing -> None so the caller leaves the diff untouched.
+    assert _deterministic_package_json_repair(pkg, js) is None
+    # Unparseable manifest -> None (never raises).
+    assert _deterministic_package_json_repair("{not json", js) is None
+
+
 def test_new_file_body_from_patch_roundtrips_and_rejects_modifications():
     from cgx.answer.engine import (
         _content_to_new_file_patch, _new_file_body_from_patch)

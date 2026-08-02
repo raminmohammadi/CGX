@@ -4241,6 +4241,54 @@ def test_scaffold_circular_import_gate_breaks_cycle(store, monkeypatch):
     assert "backend.routes" in failed[0]["error"]
 
 
+def test_reconcile_js_dependencies_splices_missing_dep_into_package_json():
+    """A runtime import missing from package.json is added to dependencies."""
+    import json
+    from cgx.answer.engine import _content_to_new_file_patch
+    from cgx.session.tasks.scaffold import (
+        _content_from_new_file_patch,
+        _reconcile_js_dependencies,
+    )
+
+    pkg = json.dumps({"dependencies": {"react": ">=18", "react-dom": ">=18"}})
+    diffs = [
+        {"file": "package.json",
+         "patch": _content_to_new_file_patch("package.json", pkg)},
+        {"file": "src/App.jsx",
+         "patch": _content_to_new_file_patch(
+             "src/App.jsx",
+             "import React from 'react';\nimport axios from 'axios';\n")},
+    ]
+    existing = [
+        {"path": "package.json", "content": pkg},
+        {"path": "src/App.jsx",
+         "content": "import React from 'react';\nimport axios from 'axios';\n"},
+    ]
+    added = _reconcile_js_dependencies(
+        diffs=diffs, existing_with_content=existing)
+    assert added == ["axios"]
+    # The rewritten diff carries the repaired manifest APPLY will write.
+    rewritten = json.loads(
+        _content_from_new_file_patch(diffs[0]["patch"]))
+    assert rewritten["dependencies"]["axios"] == "*"
+    assert rewritten["dependencies"]["react"] == ">=18"
+    # The context copy is updated in place too, so later gates see the dep.
+    assert json.loads(existing[0]["content"])["dependencies"]["axios"] == "*"
+
+
+def test_reconcile_js_dependencies_noop_without_package_json():
+    """No package.json in the bundle -> no-op, returns []."""
+    from cgx.answer.engine import _content_to_new_file_patch
+    from cgx.session.tasks.scaffold import _reconcile_js_dependencies
+    diffs = [{"file": "src/App.jsx",
+              "patch": _content_to_new_file_patch(
+                  "src/App.jsx", "import axios from 'axios';\n")}]
+    existing = [{"path": "src/App.jsx",
+                 "content": "import axios from 'axios';\n"}]
+    assert _reconcile_js_dependencies(
+        diffs=diffs, existing_with_content=existing) == []
+
+
 def test_circular_import_failures_ignores_one_way_imports():
     """An acyclic first-party import graph produces no failures."""
     from cgx.session.tasks.scaffold import _circular_import_failures
