@@ -8,6 +8,21 @@ session-based agent loop: ``Session`` objects, the task tree
 and produced ``Artifact``s, plus the Router, task executors, and the
 ``SessionRunner`` that drives them. The web UI (``/api/agent-session``)
 and the terminal dashboard are its consumers.
+
+The autonomous greenfield write loop is designed to be *honest* and
+*halting*. Honest: a non-executing ``VERIFY`` outcome
+(``collection_error`` / ``timeout`` / ``pytest_missing``) reports
+``passing_count=0`` so the router never mistakes "nothing ran" for
+forward progress, and ``collection_error`` is a first-class REPAIR
+classification that escalates to ``ASK_USER`` instead of silently
+regenerating. Halting: every recovery loop is bounded by a typed
+``LoopBudget`` (``cgx.session.budget``), the whole session is capped by
+``GREENFIELD_MAX_TASK_RUNS`` / ``GREENFIELD_MAX_WALL_SECONDS``, and the
+per-loop ledgers are carried across the ``DECOMPOSE -> approve_plan ->
+SCAFFOLD`` re-plan so a re-plan cannot reset a spent budget. A dropped
+foundational manifest (``requirements*.txt`` / ``pyproject.toml`` /
+``setup.{py,cfg}`` / ``package.json``) escalates straight to a re-plan
+rather than burning the per-file regenerate budget.
 """
 
 from __future__ import annotations
