@@ -4011,6 +4011,56 @@ def test_circular_import_failures_detects_relative_cycle():
     assert "circular import" in out[0]["error"]
 
 
+def test_phantom_import_gate_flags_undefined_dotted_module():
+    """``from backend.core import x`` with no backend/core.py is failed."""
+    from cgx.session.tasks.scaffold import (
+        _phantom_first_party_import_failures)
+    files = [
+        {"path": "backend/__init__.py", "content": ""},
+        {"path": "backend/main.py",
+         "content": "from backend.core import calculate\n"},
+        {"path": "backend/models.py", "content": "X = 1\n"},
+    ]
+    layers = [{"files": [{"path": f["path"]} for f in files]}]
+    out = _phantom_first_party_import_failures(files, layers)
+    assert [f["file"] for f in out] == ["backend/main.py"]
+    assert "backend.core" in out[0]["error"]
+    assert "backend.models" in out[0]["error"]
+
+
+def test_phantom_import_gate_flags_bare_import_of_packaged_module():
+    """``from main import app`` when the module is backend/main.py."""
+    from cgx.session.tasks.scaffold import (
+        _phantom_first_party_import_failures)
+    files = [
+        {"path": "backend/__init__.py", "content": ""},
+        {"path": "backend/main.py", "content": "app = 1\n"},
+        {"path": "tests/test_main.py", "content": "from main import app\n"},
+    ]
+    layers = [{"files": [{"path": f["path"]} for f in files]}]
+    out = _phantom_first_party_import_failures(files, layers)
+    assert [f["file"] for f in out] == ["tests/test_main.py"]
+    assert "backend.main" in out[0]["error"]
+
+
+def test_phantom_import_gate_abstains_on_src_layout_and_manifest_peers():
+    """Bare src/-layout imports and not-yet-generated manifest peers pass."""
+    from cgx.session.tasks.scaffold import (
+        _phantom_first_party_import_failures)
+    files = [
+        {"path": "src/calc.py", "content": "def add(a, b):\n    return a\n"},
+        {"path": "tests/test_calc.py", "content": "from calc import add\n"},
+    ]
+    layers = [{"files": [{"path": f["path"]} for f in files]}]
+    assert _phantom_first_party_import_failures(files, layers) == []
+    # backend/routers/calculator.py is planned but not in this batch.
+    files = [{"path": "backend/main.py",
+              "content": "from backend.routers.calculator import router\n"}]
+    layers = [{"files": [{"path": "backend/main.py"},
+                         {"path": "backend/routers/calculator.py"}]}]
+    assert _phantom_first_party_import_failures(files, layers) == []
+
+
 def test_scaffold_targeted_regenerate_reuses_good_diffs(store, monkeypatch):
     """regenerate_files -> only the failed path is generated; good diffs reused."""
     from cgx.answer.engine import _content_to_new_file_patch

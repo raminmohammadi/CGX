@@ -396,6 +396,34 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             if e.get("path") not in dropped]
         _checkpoint_progress(deps, artifact)
 
+    # Phantom first-party import gate: the coherence gate above only
+    # judges an import's root segment, so ``from backend.core import
+    # calculate_expression`` passes on the strength of a ``backend/``
+    # directory even when no ``backend/core.py`` is planned or generated,
+    # and ``from main import app`` passes because ``backend/main.py``
+    # contributed the basename. Both die at import time (live failure:
+    # pytest collection with "No module named 'main'"). Fail the importer
+    # files here with the real module inventory so the regenerate edge
+    # retries them against it. Best-effort: a raised checker leaves the
+    # bundle untouched.
+    try:
+        phantom_failed = _phantom_first_party_import_failures(
+            existing_with_content, layers)
+    except Exception:  # pragma: no cover - defensive: gate is best-effort
+        logger.exception(
+            "SCAFFOLD: phantom-import gate raised; skipping")
+        phantom_failed = []
+    if phantom_failed:
+        dropped = {f["file"] for f in phantom_failed}
+        failed.extend(phantom_failed)
+        diffs[:] = [d for d in diffs if d.get("file") not in dropped]
+        generated[:] = [g for g in generated
+                        if g.get("file") not in dropped]
+        existing_with_content[:] = [
+            e for e in existing_with_content
+            if e.get("path") not in dropped]
+        _checkpoint_progress(deps, artifact)
+
     # Circular-import gate: two (or more) generated first-party modules
     # importing each other survive every per-file check -- each import
     # resolves to a real sibling -- but Python cannot initialise the
@@ -636,6 +664,128 @@ def _import_coherence_failures(
                     "from the manifest's modules or its declared "
                     "dependencies"),
             })
+    return out
+
+
+def _phantom_first_party_import_failures(
+        files_with_content: List[Dict[str, str]],
+        layers: List[Any],
+) -> List[Dict[str, str]]:
+    """Flag first-party imports that name a module the project never defines.
+
+    :func:`_import_coherence_failures` judges only an import's *root*
+    segment, so ``from backend.core import calculate_expression`` passes
+    whenever a ``backend/`` directory exists -- even with no
+    ``backend/core.py`` anywhere in the manifest or the batch. The
+    cross-check in ``scaffold_validate`` abstains on the same import for
+    the mirror reason: it has no source to verify the *name* against. The
+    tree therefore ships with an import that dies the moment anything
+    touches it (live failure: every entry point and the whole test module
+    unimportable).
+
+    Two shapes are decidable from the paths alone and caught here:
+
+    * a dotted import whose root is a first-party source directory but
+      whose full dotted name is neither a generated module nor one of
+      their package prefixes;
+    * a bare ``from main import app`` naming a module that only exists
+      inside a generated *package* (``backend/main.py``), whose real
+      importable name is ``backend.main`` -- pytest otherwise dies with
+      ``ModuleNotFoundError: No module named 'main'``.
+
+    Returns ``{file, error}`` entries shaped for the router's regenerate
+    splice. Any parse failure abstains for that file.
+    """
+    import ast as _ast
+    from cgx.session.scaffold_validate import _module_name_for_path
+
+    manifest_paths = [
+        str(e.get("path") or "") for lay in layers if isinstance(lay, dict)
+        for e in (lay.get("files") or []) if isinstance(e, dict)]
+    batch_paths = [str(e.get("path") or "") for e in files_with_content]
+    py_paths: List[str] = []
+    for p in manifest_paths + batch_paths:
+        s = p.strip().replace("\\", "/").lstrip("./")
+        if s.endswith(".py"):
+            py_paths.append(s)
+
+    modules: set = set()
+    prefixes: set = set()
+    for p in py_paths:
+        mod = _module_name_for_path(p)
+        if not mod:
+            continue
+        modules.add(mod)
+        parts = mod.split(".")
+        for i in range(1, len(parts)):
+            prefixes.add(".".join(parts[:i]))
+    # Only roots that are first-party source directories are judged: a
+    # flat or src/-layout module is imported by bare name via sys.path,
+    # so its root says nothing about what should exist on disk.
+    fp_roots = {p.split("/")[0] for p in py_paths if "/" in p}
+    # A directory is a package only with a generated ``__init__.py``; a
+    # module inside one is importable as ``pkg.mod``, never bare.
+    pkg_dirs = {p.rsplit("/", 1)[0] for p in py_paths
+                if p.endswith("/__init__.py")}
+    nested: Dict[str, str] = {}
+    for p in py_paths:
+        directory, _, base = p.rpartition("/")
+        if not directory or directory not in pkg_dirs or base == "__init__.py":
+            continue
+        bare = base[:-3]
+        if bare in modules:
+            # Also importable top-level: the bare form is legitimate.
+            continue
+        nested.setdefault(bare, _module_name_for_path(p) or "")
+
+    inventory = sorted(modules)[:12]
+    out: List[Dict[str, str]] = []
+    for entry in files_with_content:
+        path = str(entry.get("path") or "")
+        content = entry.get("content") or ""
+        if not path.endswith(".py") or not content:
+            continue
+        try:
+            tree = _ast.parse(content)
+        except SyntaxError:
+            continue
+        phantom: List[str] = []
+        misrooted: List[Tuple[str, str]] = []
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.Import):
+                mods = [a.name or "" for a in node.names]
+            elif isinstance(node, _ast.ImportFrom) and not node.level:
+                mods = [node.module or ""]
+            else:
+                continue
+            for mod in mods:
+                if not mod:
+                    continue
+                if "." in mod:
+                    if (mod.split(".")[0] in fp_roots
+                            and mod not in modules and mod not in prefixes
+                            and mod not in phantom):
+                        phantom.append(mod)
+                elif mod in nested and (mod, nested[mod]) not in misrooted:
+                    misrooted.append((mod, nested[mod]))
+        if not phantom and not misrooted:
+            continue
+        msgs: List[str] = []
+        if phantom:
+            msgs.append(
+                f"imports first-party module(s) {sorted(phantom)} that no "
+                "generated file defines")
+        for bare, real in sorted(misrooted):
+            msgs.append(
+                f"imports {bare!r} as a top-level module, but that module "
+                f"is {real!r} inside a generated package")
+        out.append({
+            "file": path,
+            "error": (
+                "; ".join(msgs)
+                + " -- regenerate importing only these modules: "
+                + f"{inventory}"),
+        })
     return out
 
 
