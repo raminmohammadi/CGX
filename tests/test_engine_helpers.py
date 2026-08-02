@@ -666,6 +666,145 @@ def test_scaffold_py_syntax_error_flags_when_retry_still_broken():
     assert out.get("syntax_error")
 
 
+# Live failure shape: the model, asked for strict JSON, never emits an
+# escaped newline -- the whole file arrives as one space-joined line.
+_COLLAPSED_PY = (
+    "import sqlite3 from fastapi import FastAPI, HTTPException, Depends "
+    "from starlette.middleware.cors import CORSMiddleware "
+    "app = FastAPI() def read_root(): return {'ok': True}"
+)
+
+
+class _JsonCollapsingProvider:
+    """JSON mode drops every newline; freeform returns a fenced body."""
+
+    def __init__(self, path: str, good: str) -> None:
+        self.path = path
+        self.good = good
+        self.json_calls = 0
+        self.freeform_calls = 0
+
+    def chat(self, messages=None, **kw):  # noqa: ANN001 -- duck type
+        if kw.get("force_json", True):
+            self.json_calls += 1
+            return {"content": json.dumps({"content": _COLLAPSED_PY})}
+        self.freeform_calls += 1
+        return {"content": f"```python path={self.path}\n{self.good}\n```"}
+
+
+def test_looks_newline_collapsed():
+    from cgx.answer.engine import _looks_newline_collapsed
+
+    assert _looks_newline_collapsed(_COLLAPSED_PY) is True
+    assert _looks_newline_collapsed(_VALID_PY) is False
+    assert _looks_newline_collapsed("") is False
+    # A genuinely one-line file is left alone.
+    assert _looks_newline_collapsed("export default 1;\n") is False
+
+
+def test_scaffold_collapsed_json_body_recovers_via_freeform():
+    """A newline-collapsed body is re-asked in freeform, not in JSON mode.
+
+    Re-asking the same JSON encoder reproduces the single line verbatim,
+    so the file can never converge; a fenced block carries real line
+    breaks and is the only retry that can come back different.
+    """
+    from cgx.answer.engine import generate_single_scaffold_file
+    provider = _JsonCollapsingProvider("backend/main.py", _VALID_PY)
+    out = generate_single_scaffold_file(
+        "backend/main.py", "api entry point", provider,
+        layer="core", goal="build an api",
+    )
+    assert provider.json_calls == 1 and provider.freeform_calls == 1
+    assert out["syntax_ok"] is True
+    assert "def compute" in out["content"] and "\n" in out["content"]
+
+
+def test_syntax_repair_retry_asks_freeform_for_a_collapsed_body():
+    from cgx.answer.engine import _syntax_repair_retry
+    seen: List[Any] = []
+
+    class _P:
+        def chat(self, messages=None, **kw):  # noqa: ANN001 -- duck type
+            seen.append(kw.get("force_json"))
+            if kw.get("force_json"):
+                return {"content": json.dumps({"content": _COLLAPSED_PY})}
+            return {"content": "```python\n" + _VALID_PY + "```"}
+
+    out = _syntax_repair_retry(
+        _P(), path="backend/main.py", lang="Python",
+        error="invalid syntax (line 1)", broken=_COLLAPSED_PY,
+        budget={"output_tokens": 512})
+    assert seen == [False], "the collapsed body must skip JSON mode"
+    assert out.strip().startswith("def compute")
+
+
+def test_syntax_repair_retry_stays_in_json_mode_for_a_normal_break():
+    from cgx.answer.engine import _syntax_repair_retry
+    seen: List[Any] = []
+
+    class _P:
+        def chat(self, messages=None, **kw):  # noqa: ANN001 -- duck type
+            seen.append(kw.get("force_json"))
+            return {"content": json.dumps({"content": _VALID_PY})}
+
+    out = _syntax_repair_retry(
+        _P(), path="src/calculator.py", lang="Python",
+        error="invalid syntax (line 1)", broken=_BROKEN_PY,
+        budget={"output_tokens": 512})
+    assert seen == [True]
+    assert out == _VALID_PY
+
+
+
+# Live failure shape: a Python module's source pasted into
+# requirements.txt (pip tolerated enough of it that the venv provisioned
+# against a corrupted manifest).
+_BAD_REQS = ("import sqlite3\n\n"
+             "def init_db():\n    return True\n")
+_GOOD_REQS = ("# web stack\n"
+              "flask==2.3.2\n"
+              "flask-cors>=4.0.0\n"
+              "uvicorn[standard]\n"
+              "-r base.txt\n"
+              "pytest; python_version >= \"3.8\"\n")
+
+
+def test_requirements_content_error_accepts_valid_specifiers():
+    from cgx.answer.engine import _requirements_content_error
+    assert _requirements_content_error(_GOOD_REQS) is None
+
+
+def test_requirements_content_error_rejects_python_source():
+    from cgx.answer.engine import _requirements_content_error
+    err = _requirements_content_error(_BAD_REQS)
+    assert err and "line 1" in err
+
+
+def test_scaffold_requirements_gate_retries_and_recovers():
+    from cgx.answer.engine import generate_single_scaffold_file
+    provider = _QueueProvider([_BAD_REQS, _GOOD_REQS])
+    out = generate_single_scaffold_file(
+        "requirements.txt", "python deps", provider,
+        layer="deps", goal="build an app",
+    )
+    assert provider.calls == 2, "requirements gate must trigger one retry"
+    assert out["syntax_ok"] is True
+    assert out["content"] == _GOOD_REQS
+
+
+def test_scaffold_requirements_gate_flags_when_retry_still_broken():
+    from cgx.answer.engine import generate_single_scaffold_file
+    provider = _QueueProvider([_BAD_REQS, _BAD_REQS])
+    out = generate_single_scaffold_file(
+        "requirements.txt", "python deps", provider,
+        layer="deps", goal="build an app",
+    )
+    assert provider.calls == 2
+    assert out["syntax_ok"] is False
+    assert "requirements" in out.get("syntax_error", "")
+
+
 def test_new_file_body_from_patch_roundtrips_and_rejects_modifications():
     from cgx.answer.engine import (
         _content_to_new_file_patch, _new_file_body_from_patch)
@@ -1300,6 +1439,68 @@ def test_answer_clarify_paths_backfills_from_candidates_when_model_fails_twice()
     # The deterministic backfill renders a generic "Review <stem>" title
     # so the user can distinguish it from a model-authored option.
     assert "Review" in out["answer_md"]
+
+
+def test_undefined_module_names_flags_unimported_module():
+    """`enum.Enum` with no `import enum` is a guaranteed NameError.
+
+    The live failure this gate exists for: the file parses, every import
+    it declares resolves, and it still kills pytest at collection.
+    """
+    from cgx.answer.engine import _undefined_module_names
+    src = (
+        "from pydantic import BaseModel\n"
+        "\n"
+        "class Operation(str, enum.Enum):\n"
+        "    add = 'add'\n"
+    )
+    assert _undefined_module_names(src) == ["enum"]
+
+
+def test_undefined_module_names_flags_unassigned_constant():
+    from cgx.answer.engine import _undefined_module_names
+    src = (
+        "import pytest\n"
+        "\n"
+        "@pytest.fixture\n"
+        "def headers(token):\n"
+        "    return {'Authorization': f'{AUTH_SCHEME} {token}'}\n"
+    )
+    assert _undefined_module_names(src) == ["AUTH_SCHEME"]
+
+
+def test_undefined_module_names_clean_file_has_no_findings():
+    """Builtins, dunders, params, comprehensions and defs all count as bound."""
+    from cgx.answer.engine import _undefined_module_names
+    src = (
+        "import enum\n"
+        "from typing import List\n"
+        "\n"
+        "__all__ = ['Op', 'run']\n"
+        "\n"
+        "class Op(str, enum.Enum):\n"
+        "    add = 'add'\n"
+        "\n"
+        "def run(items: List[int]) -> int:\n"
+        "    with open(__file__) as fh:\n"
+        "        fh.read()\n"
+        "    try:\n"
+        "        return sum(x for x in items if x)\n"
+        "    except ValueError as exc:\n"
+        "        raise RuntimeError(str(exc))\n"
+        "\n"
+        "if __name__ == '__main__':\n"
+        "    print(run([1]))\n"
+    )
+    assert _undefined_module_names(src) == []
+
+
+def test_undefined_module_names_abstains_on_star_import_and_syntax_error():
+    """Bindings unknowable -> abstain rather than fail a valid file."""
+    from cgx.answer.engine import _undefined_module_names
+    assert _undefined_module_names(
+        "from config import *\n\nDEBUG = SETTINGS\n") == []
+    assert _undefined_module_names("def broken(:\n") == []
 
 
 def test_answer_clarify_paths_empty_sources_degrades_gracefully():

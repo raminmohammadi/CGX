@@ -92,7 +92,7 @@ def run_smoke(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         timeout = float(task.inputs.get("timeout_per_module")
                         or _DEFAULT_TIMEOUT_PER_MODULE)
         for pkg in candidates:
-            ok, tail = _probe_import(python_exe, pkg, timeout)
+            ok, tail = _probe_import(python_exe, pkg, timeout, root)
             modules.append({"name": pkg, "ok": ok, "stderr_tail": tail})
         py_outcome = "passed" if all(m["ok"] for m in modules) else "failed"
 
@@ -260,12 +260,20 @@ def _is_first_party(root: Path, pkg: str) -> bool:
 
 
 def _probe_import(python_exe: str, pkg: str,
-                  timeout: float) -> Tuple[bool, str]:
-    """Run ``python -c "import <pkg>"`` and report ok + stderr tail."""
+                  timeout: float, root: Path) -> Tuple[bool, str]:
+    """Run ``python -I -c "import <pkg>"`` in ``root``; report ok + stderr tail.
+
+    ``cwd=root`` plus ``-I`` (isolated mode) keep the probe pinned to
+    the project venv's import universe -- without them the subprocess
+    inherits the CGX server's working directory, which ``-c`` puts on
+    ``sys.path``, letting the server's own files shadow the probed
+    module and produce a false verdict.
+    """
     try:
         proc = subprocess.run(
-            [python_exe, "-c", f"import {pkg}"],
+            [python_exe, "-I", "-c", f"import {pkg}"],
             capture_output=True, text=True, timeout=timeout,
+            cwd=str(root),
         )
     except subprocess.TimeoutExpired as e:
         tail = (e.stderr or "")[-_STDERR_TAIL_CHARS:] + "\n[timeout]"

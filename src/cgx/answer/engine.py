@@ -1877,7 +1877,8 @@ _SCAFFOLD_SYSTEM = (
     "    tests/      -- ALL test files live here (test_*.py for Python, *.test.jsx "
     "or *.test.ts for JS/TS). REQUIRED -- every scaffold MUST emit at least one "
     "test file covering its primary logic.\n"
-    "    public/     -- static assets (index.html, favicons) for frontend projects\n"
+    "    public/     -- static assets (favicons, images) for frontend projects. "
+    "The HTML entry point is NOT here -- it is index.html at the project root.\n"
     "- All paths must be lowercase-with-underscores or kebab-case. No spaces.\n"
     "Requirements:\n"
     "- content: complete, working file content -- NOT stubs or placeholders\n"
@@ -1894,12 +1895,16 @@ _SCAFFOLD_SYSTEM = (
     "  * At least one real test file under tests/ exercising the main code paths.\n"
     "- For FRONTEND projects (React, Vue, Angular, Svelte, etc.):\n"
     "  * Generate actual component files (e.g. src/App.jsx, src/components/MyComponent.jsx)\n"
-    "  * Include public/index.html (for CRA) or index.html at root (for Vite)\n"
-    "  * Include src/index.js or src/main.jsx as the React/Vue entry point\n"
+    "  * Use Vite -- it is the only supported frontend toolchain. Include "
+    "vite.config.js, and index.html AT THE PROJECT ROOT (never public/index.html: "
+    "Vite resolves its entry module from the root file and the build fails "
+    "without it). The root index.html must load the script entry with "
+    "<script type=\"module\" src=\"/src/main.jsx\"> and contain the mount element.\n"
+    "  * Include src/main.jsx (or src/main.tsx) as the React/Vue entry point\n"
     "  * Tests go under tests/ as <Component>.test.jsx using Jest + "
     "@testing-library/react conventions.\n"
-    "  * Do NOT generate webpack.config.js, babel.config.js, or other build tooling -- "
-    "use Create React App (react-scripts) or Vite conventions instead\n"
+    "  * Do NOT generate webpack.config.js, babel.config.js, react-scripts, or any "
+    "other build tooling\n"
     "  * Do NOT include conftest.py, requirements.txt, or any Python files\n"
     "- For PYTHON projects only: include a conftest.py at the project root "
     "that adds src/ to sys.path so test imports work without package installation:\n"
@@ -1927,7 +1932,8 @@ _SCAFFOLD_FREEFORM_SYSTEM = (
     "folder. WRONG: 'calculator/src/App.jsx'. RIGHT: 'src/App.jsx'.\n"
     "- Canonical layout shared with sibling tasks: src/ (frontend or main code), "
     "backend/ (Python backend when distinct), tests/ (REQUIRED -- at least one "
-    "test file per scaffold), public/ (static assets).\n"
+    "test file per scaffold), public/ (static assets other than the HTML entry "
+    "point).\n"
     "Rules:\n"
     "- Use any language tag (python, javascript, jsx, tsx, text, yaml, toml, etc.) followed by path=<relative/path>\n"
     "- Generate complete, working code -- not stubs\n"
@@ -1936,7 +1942,9 @@ _SCAFFOLD_FREEFORM_SYSTEM = (
     "- Use relative POSIX paths only\n"
     "- CRITICAL: If the goal names a specific technology (React, Vue, FastAPI, etc.), use it exactly. "
     "Do NOT substitute a different technology.\n"
-    "- For FRONTEND projects (React, Vue, etc.): generate component files (App.jsx, index.js, etc.), "
+    "- For FRONTEND projects (React, Vue, etc.): use Vite -- generate component files "
+    "(src/App.jsx, src/main.jsx), vite.config.js, and index.html AT THE PROJECT ROOT "
+    "(never public/index.html: Vite resolves its entry module from the root file). "
     "NOT webpack/babel config files. Do NOT include conftest.py or requirements.txt.\n"
     "- For PYTHON projects only: include a conftest.py at the root that does:\n"
     "  import sys, os; sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))\n"
@@ -2307,6 +2315,9 @@ _MANIFEST_SYSTEM = (
     "re-inventing endpoint paths, field names, or signatures per file.\n"
     "- 3 to 15 files total. Prefer completeness over brevity.\n"
     "- Canonical top-level dirs: src/, backend/, tests/, public/, docs/.\n"
+    "- A frontend manifest uses Vite and MUST list index.html at the project "
+    "root (not public/index.html) alongside vite.config.js -- Vite resolves its "
+    "entry module from that file, so a manifest without it cannot build.\n"
 )
 
 
@@ -3280,6 +3291,25 @@ def _format_syntax_error(exc: SyntaxError) -> str:
     return f"{base}; offending line {getattr(exc, 'lineno', '?')}: {text[:120]!r}"
 
 
+def _looks_newline_collapsed(content: str) -> bool:
+    """True when a file body arrived as a single physical line.
+
+    Asked for strict JSON, some models never emit an escaped newline:
+    they join every line of the file with a space, so ``import sqlite3``
+    + ``from fastapi import FastAPI`` arrives as ``import sqlite3 from
+    fastapi import FastAPI``. The body is then unparseable at line 1, and
+    because every recovery path re-asks in JSON mode the *same* encoder
+    reproduces it byte for byte -- the regenerate loop cannot converge.
+    Recognising the shape lets the caller route around JSON mode instead
+    of retrying into it. The length floor keeps genuinely one-line files
+    (a single export, a one-line config) out of scope.
+    """
+    body = (content or "").strip()
+    if not body or "\n" in body:
+        return False
+    return len(body) > 120
+
+
 @traced("llm")
 def generate_single_scaffold_file(
     path: str,
@@ -3507,7 +3537,11 @@ def generate_single_scaffold_file(
     parsed = _extract_json_object(raw)
     content = str(parsed.get("content") or "") if parsed else ""
 
-    if not content:
+    # The freeform path is also the escape hatch for a body whose newlines
+    # the JSON encoder dropped: a fenced block carries real line breaks, so
+    # re-asking there is the one retry that can come back different.
+    collapsed = _looks_newline_collapsed(content)
+    if not content or collapsed:
         # Fallback to freeform. Carry the same skill constraints over.
         ff_system = _SINGLE_FILE_FREEFORM_SYSTEM
         if skill_fragment:
@@ -3530,12 +3564,17 @@ def generate_single_scaffold_file(
             body = _new_file_body_from_patch(p)
             return body if body is not None else p
 
+        ff_body = ""
         for d in (parsed_ff.get("diffs") or []):
             if isinstance(d, dict) and d.get("file") == path:
-                content = _patch_to_body(d)
+                ff_body = _patch_to_body(d)
                 break
-        if not content and parsed_ff.get("diffs"):
-            content = _patch_to_body(parsed_ff["diffs"][0])
+        if not ff_body and parsed_ff.get("diffs"):
+            ff_body = _patch_to_body(parsed_ff["diffs"][0])
+        # A collapsed body is real content, just unusable: only replace it
+        # when the fallback actually came back with line structure.
+        if not collapsed or (ff_body and not _looks_newline_collapsed(ff_body)):
+            content = ff_body or content
 
     # Inline syntax validation.
     syntax_ok = True
@@ -3637,6 +3676,26 @@ def generate_single_scaffold_file(
                 syntax_ok = False
                 syntax_error = diag.error
 
+    # requirements.txt content gate: symmetric with the JSON/TOML gates
+    # above. There is no stdlib parser for pip's requirements format, but
+    # the live failure mode is severe: a model pasted a Python module's
+    # source into requirements.txt and pip tolerated enough of it that
+    # the venv provisioned against a corrupted manifest. Validate
+    # line-by-line against a plausible PEP-508-ish specifier shape with
+    # one targeted repair retry; an unfixable body fails the file so the
+    # regenerate edge retries it rather than APPLY shipping garbage.
+    if syntax_ok and content and _is_requirements_txt_path(path):
+        req_err = _requirements_content_error(content)
+        if req_err:
+            retry = _syntax_repair_retry(
+                provider, path=path, lang="pip requirements",
+                error=req_err, broken=content, budget=budget)
+            if retry and not _requirements_content_error(retry):
+                content = retry
+            else:
+                syntax_ok = False
+                syntax_error = req_err
+
     # Extension/content mismatch check: a 3B model frequently emits Vue
     # SFC content under a .jsx path, or vice versa. These heuristics catch
     # the cross-framework mistakes before APPLY writes garbage to disk.
@@ -3697,6 +3756,38 @@ def generate_single_scaffold_file(
                     f"{first['missing']} from module '{first['module']}'")
                 content = ""
 
+    # Undefined-name gate: a file can parse cleanly, import only modules
+    # that really exist, and still die the instant anything touches it
+    # because it uses a name nothing ever bound -- `class Operation(str,
+    # enum.Enum)` with no `import enum` (live failure: pytest aborted at
+    # collection with "NameError: name 'enum' is not defined", taking the
+    # whole suite with it via the conftest chain). Every other gate here
+    # judges imports that are present; none can see a name that is
+    # absent. Retry once naming the unbound names, then fail the file so
+    # APPLY drops it rather than persisting a module that cannot import.
+    if content and syntax_ok and ext == "py":
+        unbound = _undefined_module_names(content)
+        if unbound:
+            retry = _regenerate_scaffold_file(
+                provider, system, context, budget,
+                _undefined_name_retry_instruction(unbound))
+            retry_ok = False
+            if retry:
+                import ast as _ast
+                try:
+                    _ast.parse(retry)
+                    retry_ok = not _undefined_module_names(retry)
+                except SyntaxError:
+                    retry_ok = False
+            if retry_ok:
+                content = retry
+            else:
+                syntax_ok = False
+                syntax_error = (
+                    f"uses undefined name(s) {unbound}: never imported, "
+                    "assigned, or defined anywhere in this file")
+                content = ""
+
     # Test-collectability gate: a pytest module that parses cleanly but
     # defines no module-top-level `def test_*` collects zero tests (pytest
     # exit 5) and stalls the verify->repair->regenerate loop -- the single
@@ -3744,6 +3835,56 @@ def _is_pytest_test_path(path: str) -> bool:
         return False
     base = p.rsplit("/", 1)[-1]
     return base.startswith("test_") or base.endswith("_test.py")
+
+
+def _is_requirements_txt_path(path: str) -> bool:
+    """True when ``path`` is a pip requirements file (requirements*.txt)."""
+    base = path.strip().lower().rsplit("/", 1)[-1]
+    return base.startswith("requirements") and base.endswith(".txt")
+
+
+# One plausible pip-requirements line: an include/option flag, or a PEP
+# 508-ish specifier -- distribution name, optional extras, then an
+# optional version-specifier list / direct-URL reference / environment
+# marker. Deliberately permissive about versions; its job is rejecting
+# source code masquerading as a requirement, not full PEP 508 parsing.
+_REQ_SPEC_OPS = r"(?:===|==|!=|<=|>=|~=|<|>)"
+_REQUIREMENT_LINE_RE = re.compile(
+    r"^(?:"
+    r"-(?:r|c|e)\s+\S+"                                   # -r/-c/-e refs
+    r"|--?[A-Za-z][A-Za-z0-9-]*(?:[= ]\s*\S+)?"           # pip options
+    r"|[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?"        # dist name
+    r"(?:\[[A-Za-z0-9,._\s-]*\])?"                        # extras
+    r"(?:\s*@\s*\S+"                                      # direct URL
+    r"|\s*" + _REQ_SPEC_OPS + r"\s*[A-Za-z0-9.*+!_-]+"    # version spec
+    r"(?:\s*,\s*" + _REQ_SPEC_OPS + r"\s*[A-Za-z0-9.*+!_-]+)*)?"
+    r"(?:\s*;.*)?"                                        # env marker
+    r")$"
+)
+
+
+def _requirements_content_error(content: str) -> Optional[str]:
+    """Return a diagnostic when ``content`` is not a requirements file.
+
+    Checks every non-empty, non-comment line against
+    :data:`_REQUIREMENT_LINE_RE`; ``None`` means every line is a
+    plausible requirement specifier. The message lists the first few
+    offending lines so the repair retry (and the router's regenerate
+    constraint on failure) is concrete.
+    """
+    bad: List[str] = []
+    for i, raw in enumerate(content.splitlines(), start=1):
+        line = re.split(r"\s#", raw)[0].strip()
+        if not line or line.startswith("#"):
+            continue
+        if not _REQUIREMENT_LINE_RE.match(line):
+            bad.append(f"line {i}: {line[:80]!r}")
+            if len(bad) >= 5:
+                break
+    if not bad:
+        return None
+    return ("not a valid pip requirements file; offending line(s): "
+            + "; ".join(bad))
 
 
 def _has_collectable_pytest_test(content: str) -> bool:
@@ -3897,6 +4038,85 @@ def _symbol_retry_instruction(violations: List[Dict[str, Any]]) -> str:
         "real API. Do NOT invent names or add markdown fences.")
 
 
+# Module attributes Python provides implicitly. Absent from
+# ``dir(builtins)``, so they must be seeded explicitly or the
+# undefined-name gate would flag ordinary ``if __name__ == "__main__"``
+# blocks and ``__all__`` declarations.
+_IMPLICIT_MODULE_NAMES = frozenset({
+    "__name__", "__file__", "__doc__", "__package__", "__spec__",
+    "__loader__", "__builtins__", "__debug__", "__path__", "__dict__",
+})
+
+
+def _undefined_module_names(source: str) -> List[str]:
+    """Return names the module loads but never binds, in first-use order.
+
+    A deliberately over-generous binding collector: every name bound
+    *anywhere* in the file (any import, assignment, parameter, ``def`` /
+    ``class``, comprehension or ``except`` target, ``global`` /
+    ``nonlocal`` declaration) counts as bound for the whole file, so
+    scoping subtleties can only ever make this abstain, never
+    false-positive. What is left is a name that no scope could possibly
+    supply -- a guaranteed ``NameError`` the moment that line executes.
+
+    Abstains entirely (returns ``[]``) on an unparsable file or a
+    ``from x import *``, whose bindings are not knowable statically.
+    """
+    import ast as _ast
+    import builtins as _builtins
+
+    try:
+        tree = _ast.parse(source)
+    except SyntaxError:
+        return []
+
+    bound = set(dir(_builtins)) | set(_IMPLICIT_MODULE_NAMES)
+    used: List[str] = []
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.Import):
+            for alias in node.names:
+                bound.add((alias.asname or alias.name).split(".")[0])
+        elif isinstance(node, _ast.ImportFrom):
+            for alias in node.names:
+                if alias.name == "*":
+                    return []
+                bound.add(alias.asname or alias.name)
+        elif isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef,
+                               _ast.ClassDef)):
+            bound.add(node.name)
+        elif isinstance(node, _ast.arg):
+            bound.add(node.arg)
+        elif isinstance(node, (_ast.Global, _ast.Nonlocal)):
+            bound.update(node.names)
+        elif isinstance(node, _ast.ExceptHandler) and node.name:
+            bound.add(node.name)
+        elif isinstance(node, _ast.Name):
+            if isinstance(node.ctx, _ast.Store):
+                bound.add(node.id)
+            elif isinstance(node.ctx, _ast.Load):
+                used.append(node.id)
+
+    out: List[str] = []
+    for name in used:
+        if name not in bound and name not in out:
+            out.append(name)
+    return out
+
+
+def _undefined_name_retry_instruction(names: List[str]) -> str:
+    """Build the hardened retry prompt listing every unbound name."""
+    listed = ", ".join(repr(n) for n in names)
+    return (
+        "\n\nCRITICAL RETRY -- YOUR PREVIOUS ATTEMPT WAS REJECTED:\n"
+        f"The file used the name(s) {listed} without ever binding them: "
+        "they were not imported, not assigned, and not defined anywhere "
+        "in the file, so it raises NameError as soon as it is imported.\n"
+        "Return the COMPLETE, corrected file. Every module, class, "
+        "function and constant the file references must be either "
+        "imported at the top of the file or defined in it -- if you use "
+        "'enum.Enum' you must 'import enum'. Do NOT add markdown fences.")
+
+
 # Extension -> tree-sitter grammar name for the JS/TS/Vue family. Mirrors
 # ``cgx.codegen.validate._JS_TS_LANGS`` (plus ``vue``) so the inline scaffold
 # syntax gate covers exactly the frontend files APPLY's own gate would
@@ -3921,6 +4141,44 @@ _SYNTAX_FIX_SYSTEM = (
     "no ellipsis, no unified-diff markers."
 )
 
+_SYNTAX_FIX_FREEFORM_SYSTEM = (
+    "You are a code-repair tool. You are given exactly ONE source file that "
+    "failed to parse, together with the parser's error. Fix ONLY the syntax "
+    "so the file parses cleanly; preserve the code's intent, structure, and "
+    "every identifier. Do not add, remove, or rename any functionality.\n\n"
+    "Return the COMPLETE corrected file as raw text inside a single fenced "
+    "code block, with REAL line breaks -- one statement per line, correctly "
+    "indented. No commentary, no ellipsis, no unified-diff markers."
+)
+
+
+def _syntax_fix_call(
+        provider: Any, user: str, budget: Dict[str, Any],
+        *, force_json: bool) -> str:
+    """One syntax-repair round-trip. Returns the fence-stripped body."""
+    try:
+        raw = provider.chat(
+            messages=[
+                {"role": "system",
+                 "content": (_SYNTAX_FIX_SYSTEM if force_json
+                             else _SYNTAX_FIX_FREEFORM_SYSTEM)},
+                {"role": "user", "content": user},
+            ],
+            temperature=0.0,
+            max_tokens=budget["output_tokens"],
+            force_json=force_json,
+        ).get("content", "")
+    except Exception:  # pragma: no cover - defensive: provider hiccup
+        return ""
+    if force_json:
+        parsed = _extract_json_object(raw)
+        out = str(parsed.get("content") or "") if parsed else ""
+    else:
+        out = str(raw or "")
+    if not out.strip():
+        return ""
+    return _unwrap_wrapping_code_fence(out.strip()) if "```" in out else out
+
 
 def _syntax_repair_retry(
         provider: Any, *, path: str, lang: str, error: str,
@@ -3936,6 +4194,12 @@ def _syntax_repair_retry(
     focused. Pinned to temperature 0 for a deterministic correction.
     Returns the fence-stripped ``content`` string, or ``""`` on any
     provider/parse failure.
+
+    A body whose newlines the JSON encoder dropped
+    (:func:`_looks_newline_collapsed`) is asked for in freeform first: a
+    fenced block carries real line breaks, whereas a JSON-mode retry goes
+    back through the encoder that caused the damage and returns the same
+    single line, so the file can never recover.
     """
     user = (
         f"File: {path}\n"
@@ -3948,28 +4212,18 @@ def _syntax_repair_retry(
         "correct delimiter.\n\n"
         f"BROKEN FILE:\n{broken}"
     )
-    try:
-        raw = provider.chat(
-            messages=[
-                {"role": "system", "content": _SYNTAX_FIX_SYSTEM},
-                {"role": "user", "content": user},
-            ],
-            temperature=0.0,
-            max_tokens=budget["output_tokens"],
-            force_json=True,
-        ).get("content", "")
-    except Exception:  # pragma: no cover - defensive: provider hiccup
-        return ""
-    parsed = _extract_json_object(raw)
-    out = str(parsed.get("content") or "") if parsed else ""
-    if out:
-        stripped = out.strip()
-        if stripped.startswith("```"):
-            m = re.match(r"^```[a-zA-Z0-9_+\-]*\s*\n(.*?)\n```\s*$",
-                         stripped, re.DOTALL)
-            if m:
-                out = m.group(1)
-    return out
+    collapsed = _looks_newline_collapsed(broken)
+    if collapsed:
+        user += (
+            "\n\nNOTE: every line break in the file above was lost -- the "
+            "whole body arrived as one physical line. Restore the line "
+            "structure: one statement per line, with correct indentation."
+        )
+    for force_json in ((False, True) if collapsed else (True,)):
+        out = _syntax_fix_call(provider, user, budget, force_json=force_json)
+        if out and not _looks_newline_collapsed(out):
+            return out
+    return ""
 
 
 _GITIGNORE_TEMPLATE = (

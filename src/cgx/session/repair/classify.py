@@ -28,12 +28,15 @@ from cgx.trace import traced
 
 
 REPAIR_CLASSIFICATIONS: Tuple[str, ...] = (
+    "circular_import",
     "third_party_import_break",
     "relative_import_error",
     "unittest_pytest_mix",
+    "missing_dependency",
     "missing_module_pythonpath",
     "missing_fixture",
     "empty_test_suite",
+    "undefined_name",
     "unknown",
 )
 
@@ -63,6 +66,19 @@ _MODULE_NOT_FOUND_RE = re.compile(
     r"'([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)'"
 )
 
+# A library named the exact pip package it needs: optional-extra guards
+# like starlette's ``testclient`` raise ``RuntimeError("The
+# starlette.testclient module requires the httpx package to be
+# installed...")`` when the transitive extra is absent. No first-party
+# file imports the package directly, so BOOTSTRAP_ENV's file-scan
+# preflight never installs it -- and regenerating source can never fix
+# it. Matched *before* ``missing_module_pythonpath``: the same failure
+# text usually carries the guard's internal ModuleNotFoundError, which
+# would otherwise misroute the repair to a source regenerate.
+_REQUIRES_PACKAGE_RE = re.compile(
+    r"requires the\s+([A-Za-z0-9][A-Za-z0-9._-]*)\s+package to be installed"
+)
+
 # Pytest emits ``fixture '<name>' not found`` (with a leading ``E`` in
 # the captured traceback) whenever a test function declares an argument
 # that no @pytest.fixture / conftest in scope provides. The fix is to
@@ -71,6 +87,16 @@ _MODULE_NOT_FOUND_RE = re.compile(
 _FIXTURE_NOT_FOUND_RE = re.compile(
     r"fixture\s+'([A-Za-z_][A-Za-z0-9_]*)'\s+not found"
 )
+
+# Names pytest reports as a "missing fixture" that no fixture can ever
+# supply. ``self``/``cls`` mean a test method was collected outside a
+# collected class (a helper class pytest picked up, or a ``Test`` class
+# with an ``__init__``); ``request`` is a pytest builtin, so its absence
+# means the plugin machinery is broken, not the tree. Treating any of
+# them as a fixture sends the loop hunting a definition that cannot
+# exist -- observed live, where a whole-tree regenerate was ordered to
+# create a fixture named ``self``.
+_NON_FIXTURE_NAMES = frozenset({"self", "cls", "request"})
 
 # Traceback frame shapes that name a source file + line. Pytest renders
 # its own frames as ``path/to/file.py:123: in func`` (and a trailing
@@ -95,6 +121,25 @@ _CANNOT_IMPORT_NAME_RE = re.compile(
     r"from\s+'([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)'"
 )
 
+# A first-party import cycle. Python names the module it could not finish
+# initialising in one of two shapes -- ``ImportError: cannot import name
+# 'x' from partially initialized module 'm'`` or ``AttributeError:
+# partially initialized module 'm' has no attribute 'x'`` -- usually
+# suffixed with ``(most likely due to a circular import)``. Matched before
+# every other pattern: no single-file patch can decide which import to
+# break or where the shared symbols belong, so REPAIR re-authors the
+# offending module(s) via a regenerate constraint (like
+# ``relative_import_error``) instead of the bounded LLM patch, which a
+# live run showed produces a no-op diff and burns the repair budget.
+_PARTIALLY_INITIALIZED_MODULE_RE = re.compile(
+    r"partially initialized module\s+"
+    r"'([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)'"
+)
+_CIRCULAR_IMPORT_RE = re.compile(
+    r"partially initialized module|"
+    r"most likely due to a circular import"
+)
+
 # A relative import that resolves above the package root -- ``from ..x
 # import y`` in a module that is not deep enough, or a first-party module
 # run without its package context. Python renders this as
@@ -105,6 +150,32 @@ _CANNOT_IMPORT_NAME_RE = re.compile(
 _RELATIVE_IMPORT_RE = re.compile(
     r"attempted relative import (?:beyond top-level package|"
     r"with no known parent package)"
+)
+
+# A bundler (Vite/Rollup) that cannot find the file it was told to start
+# from: ``[UNRESOLVED_ENTRY] Cannot resolve entry module index.html`` /
+# ``Could not resolve entry module "src/main.jsx"``. Unlike every other
+# build error this one is not a defect *in* a generated file -- the file
+# is absent -- so the regenerate loop must add it, not re-author around
+# it.
+_UNRESOLVED_ENTRY_RE = re.compile(
+    r"(?:annot|ould not) resolve entry module\s+[\"']?"
+    r"([A-Za-z0-9_.@/\\-]+?)[\"']?[.\s]*$",
+    re.MULTILINE,
+)
+
+# A name a generated module uses but never binds -- ``class
+# Operation(str, enum.Enum)`` with no ``import enum``, a constant
+# referenced in an f-string that was never assigned. The file parses,
+# every import it *does* declare resolves, and it still dies the moment
+# anything touches it: pytest aborts the whole run at collection
+# (``NameError: name 'enum' is not defined``), often via a conftest
+# chain, so no individual test is ever reported. There is no mechanical
+# patch -- the missing binding could be an import, an assignment, or a
+# definition the author forgot -- so this routes to a regenerate with
+# the unbound names folded in as a constraint.
+_UNDEFINED_NAME_RE = re.compile(
+    r"NameError:\s+name\s+'([A-Za-z_][A-Za-z0-9_]*)'\s+is not defined"
 )
 
 
@@ -118,16 +189,25 @@ _RELATIVE_IMPORT_RE = re.compile(
 _ClassifierFn = Callable[[Dict[str, Any]], bool]
 
 _CLASSIFIER_REGISTRY: Tuple[Tuple[RepairClassification, _ClassifierFn], ...] = (
+    ("circular_import",
+     lambda c: bool(_CIRCULAR_IMPORT_RE.search(_failure_text(c)))),
     ("third_party_import_break",
      lambda c: bool(_CANNOT_IMPORT_NAME_RE.search(_failure_text(c)))),
     ("relative_import_error",
      lambda c: bool(_RELATIVE_IMPORT_RE.search(_failure_text(c)))),
     ("unittest_pytest_mix",
      lambda c: bool(_UNITTEST_HELPER_RE.search(_failure_text(c)))),
+    ("missing_dependency",
+     lambda c: bool(_REQUIRES_PACKAGE_RE.search(_failure_text(c)))),
     ("missing_module_pythonpath",
      lambda c: bool(_MODULE_NOT_FOUND_RE.search(_failure_text(c)))),
     ("missing_fixture",
-     lambda c: bool(_FIXTURE_NOT_FOUND_RE.search(_failure_text(c)))),
+     lambda c: bool(missing_fixture_names(c))),
+    # Last: an undefined name is an authoring defect with no mechanical
+    # locator, so every classification that *does* have one is preferred
+    # when a run surfaces both.
+    ("undefined_name",
+     lambda c: bool(_UNDEFINED_NAME_RE.search(_failure_text(c)))),
 )
 
 
@@ -200,6 +280,57 @@ def missing_module_names(content: Dict[str, Any]) -> Tuple[str, ...]:
     return tuple(out)
 
 
+def required_package_names(content: Dict[str, Any]) -> Tuple[str, ...]:
+    """Return the pip packages the failure explicitly asked to install.
+
+    Extracted from the ``requires the <pkg> package to be installed``
+    RuntimeError shape -- the library names the exact distribution, so
+    the install-deps route can pass it straight to pip. Order-preserving
+    and de-duplicated.
+    """
+    blob = _failure_text(content)
+    out: List[str] = []
+    for m in _REQUIRES_PACKAGE_RE.finditer(blob):
+        name = m.group(1)
+        if name and name not in out:
+            out.append(name)
+    return tuple(out)
+
+
+def circular_import_modules(content: Dict[str, Any]) -> Tuple[str, ...]:
+    """Return the dotted module names Python reported partially initialized.
+
+    These are the members of the import cycle the failure flowed through;
+    the REPAIR executor folds them into the regenerate constraint so the
+    re-authored scaffold knows exactly which modules must stop importing
+    each other. Order-preserving and de-duplicated.
+    """
+    blob = _failure_text(content)
+    out: List[str] = []
+    for m in _PARTIALLY_INITIALIZED_MODULE_RE.finditer(blob):
+        name = m.group(1)
+        if name and name not in out:
+            out.append(name)
+    return tuple(out)
+
+
+def undefined_names(content: Dict[str, Any]) -> Tuple[str, ...]:
+    """Return the names Python reported as not defined.
+
+    Fed into the ``undefined_name`` regenerate constraint so the
+    re-authored module knows exactly which bindings it must supply
+    (an import, an assignment, or a definition). Order-preserving and
+    de-duplicated.
+    """
+    blob = _failure_text(content)
+    out: List[str] = []
+    for m in _UNDEFINED_NAME_RE.finditer(blob):
+        name = m.group(1)
+        if name and name not in out:
+            out.append(name)
+    return tuple(out)
+
+
 def missing_fixture_names(content: Dict[str, Any]) -> Tuple[str, ...]:
     """Return the fixture names pytest reported as not found.
 
@@ -207,13 +338,38 @@ def missing_fixture_names(content: Dict[str, Any]) -> Tuple[str, ...]:
     ``@pytest.fixture`` definition; if every name resolves to an
     on-disk fixture, the proposer hoists the bodies into a conftest.
     Order-preserving and de-duplicated.
+
+    :data:`_NON_FIXTURE_NAMES` are dropped: pytest words the "collected
+    a method outside a collected class" failure as a missing fixture
+    named ``self``, and no repair can conjure that fixture. Filtering
+    here also demotes the classification (the registry predicate reads
+    this function), so such a report falls through to the classifiers
+    that can actually act on it.
     """
     blob = _failure_text(content)
     out: List[str] = []
     for m in _FIXTURE_NOT_FOUND_RE.finditer(blob):
         name = m.group(1)
-        if name and name not in out:
+        if name and name not in out and name not in _NON_FIXTURE_NAMES:
             out.append(name)
+    return tuple(out)
+
+
+def unresolved_entry_paths(text: str) -> Tuple[str, ...]:
+    """Return the entry modules a bundler reported it could not resolve.
+
+    Takes the raw build stderr (the SMOKE build-smoke tail) rather than a
+    report dict because that is the only place the error appears. The
+    paths are normalised to forward slashes and stripped of a leading
+    ``./``; order-preserving and de-duplicated. Callers treat these as
+    files that must be *added* to the manifest -- the bundler is looking
+    for something the scaffold never generated.
+    """
+    out: List[str] = []
+    for m in _UNRESOLVED_ENTRY_RE.finditer(str(text or "")):
+        path = m.group(1).replace("\\", "/").strip().lstrip("./")
+        if path and path not in out:
+            out.append(path)
     return tuple(out)
 
 

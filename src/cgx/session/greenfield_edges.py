@@ -130,6 +130,11 @@ def _repair_regenerate_actions(completed: TaskNode,
     the regenerated
     SCAFFOLD carries ``repair_regenerate_attempt + 1`` so this loop stays
     finite even though ``repair_attempt`` does not survive the regenerate.
+    ``prior_failure_signatures`` *do* survive: they are folded into the
+    new SCAFFOLD's inputs (and threaded down its APPLY -> ... -> VERIFY
+    chain) so a regenerated tree that fails on the identical signature
+    is stopped by the flap detector instead of looping until the
+    regenerate budget is spent.
     """
     from cgx.session.repair.propose import propose_regenerate  # local import: dep direction
 
@@ -155,7 +160,18 @@ def _repair_regenerate_actions(completed: TaskNode,
             continue
         actions.append(UpdateTaskStatus(
             task_id=t.task_id, status=TaskNodeStatus.ABANDONED))
-    new_scaffold = propose_regenerate(scaffold, extra_constraints)
+    # A classification whose fix is a *missing* file (a bundler entry
+    # module that was never generated) names it under ``missing_files``;
+    # thread it through so the regenerated SCAFFOLD extends the manifest
+    # instead of re-authoring the same unbuildable tree.
+    missing_files = extra_constraints.get("missing_files")
+    if not isinstance(missing_files, list):
+        missing_files = None
+    new_scaffold = propose_regenerate(
+        scaffold, extra_constraints,
+        additional_files=missing_files,
+        prior_failure_signatures=LoopBudget.from_inputs(
+            completed.inputs).prior_failure_signatures)
     new_scaffold.inputs["repair_regenerate_attempt"] = (
         scaffold_budget.spend_repair_regenerate().repair_regenerate_attempt)
     actions.append(CreateTask(new_scaffold))
@@ -307,9 +323,31 @@ def _decompose_retry_actions(failed: TaskNode) -> List[RouterAction]:
             "answers": dict(answers) if isinstance(answers, dict) else {},
             "decompose_retry": budget.spend_decompose_retry().decompose_retry,
             "replan_attempt": budget.replan_attempt,
+            "prior_failure_signatures":
+                list(budget.prior_failure_signatures),
         },
     )
     return [CreateTask(retry)]
+
+
+def _merged_failure_signatures(*nodes: Optional[TaskNode]) -> List[str]:
+    """Union the flap ledgers of ``nodes``, order-preserving.
+
+    A re-plan hops out of the repair chain (SCAFFOLD/APPLY -> DECOMPOSE)
+    and back into a fresh one, so the ledger has to be carried by hand
+    or the new chain is amnesiac: observed live, where a re-planned tree
+    reproduced the identical build failure and spent a second full
+    repair budget on it before the flap detector -- which had never seen
+    the signature on the new chain -- could stop the loop.
+    """
+    out: List[str] = []
+    for node in nodes:
+        if node is None:
+            continue
+        for sig in LoopBudget.from_inputs(node.inputs).prior_failure_signatures:
+            if sig and sig not in out:
+                out.append(sig)
+    return out
 
 
 def _replan_or_fail(completed: TaskNode, tasks: List[TaskNode], *,
@@ -331,6 +369,11 @@ def _replan_or_fail(completed: TaskNode, tasks: List[TaskNode], *,
     revised manifest falls through to terminal ``FAILED``. Returns the
     terminal-fail action when no SCAFFOLD lineage exists or the re-plan
     budget is already spent.
+
+    ``prior_failure_signatures`` ride the same path: a revised manifest
+    that reproduces a failure the previous plan already hit is not
+    progress, and the gate that sees it again must stop the run rather
+    than spend a fresh repair budget re-deriving the same dead end.
     """
     fail = [UpdateSessionStatus(
         session_id=completed.session_id, status=SessionStatus.FAILED)]
@@ -367,6 +410,8 @@ def _replan_or_fail(completed: TaskNode, tasks: List[TaskNode], *,
                 scaffold.inputs.get("requirements_artifact_id"),
             "answers": answers,
             "replan_attempt": budget.spend_replan().replan_attempt,
+            "prior_failure_signatures":
+                _merged_failure_signatures(scaffold, completed),
         },
     )
     actions: List[RouterAction] = []

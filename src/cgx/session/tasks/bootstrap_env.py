@@ -15,6 +15,9 @@ wasn't installed". Concretely:
   packages missing from ``requirements.txt`` (via
   :func:`cgx.codegen.env_manager.preflight_install`); successful adds
   are appended to ``requirements.txt`` so the manifest stays in sync.
+* Install any ``missing_modules`` threaded through ``task.inputs`` by an
+  ``install_deps`` repair verdict (import roots the API_CHECK probe found
+  absent from the venv), syncing ``requirements.txt`` likewise.
 * Snapshot the resolved venv contents via ``pip freeze --all`` so
   downstream REPAIR can reason about *resolved* dependency versions
   (e.g. detect a Flask 2.1 + Werkzeug 3 mismatch) rather than guess
@@ -133,6 +136,90 @@ def run_bootstrap_env(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             "BOOTSTRAP_ENV: preflight_install raised %s", exc)
         pip_log_tail = f"{type(exc).__name__}: {exc}"
 
+    # Repair-driven installs: an ``install_deps`` verdict threads the
+    # API_CHECK report's ``missing_modules`` (import roots that failed to
+    # resolve in the venv) through task.inputs. The preflight above only
+    # covers imports scanned from applied files, so consume the explicit
+    # list too -- otherwise the install_deps strategy is a no-op whenever
+    # the file scan disagrees with the probe.
+    requested = [str(m).strip()
+                 for m in (task.inputs.get("missing_modules") or [])
+                 if str(m).strip()]
+    if requested:
+        from cgx.codegen.env_manager import (
+            find_missing_python_packages, install_packages)
+        try:
+            to_install = find_missing_python_packages(
+                set(requested), str(root), python=python_exe)
+            results = install_packages(to_install, python=python_exe) \
+                if to_install else {}
+            newly: List[str] = []
+            for pkg, ok in (results or {}).items():
+                if ok:
+                    newly.append(pkg)
+                    if pkg not in installed_packages:
+                        installed_packages.append(pkg)
+                else:
+                    failed_installs[pkg] = False
+            if newly:
+                update_requirements(str(root), newly)
+        except Exception as exc:
+            logger.warning(
+                "BOOTSTRAP_ENV: missing_modules install raised %s", exc)
+            if not pip_log_tail:
+                pip_log_tail = f"{type(exc).__name__}: {exc}"
+
+    # Transitive test-client extra: fastapi/starlette's TestClient needs
+    # httpx at import time, but no first-party file imports httpx
+    # directly, so neither the file-scan preflight above nor
+    # requirements.txt covers it and VERIFY would die at collection.
+    # Detect TestClient usage in the applied files and install the extra
+    # up front.
+    extras = _testclient_extra_roots(root, applied_files)
+    if extras:
+        from cgx.codegen.env_manager import (
+            find_missing_python_packages, install_packages)
+        try:
+            to_install = find_missing_python_packages(
+                set(extras), str(root), python=python_exe)
+            results = install_packages(to_install, python=python_exe) \
+                if to_install else {}
+            newly = []
+            for pkg, ok in (results or {}).items():
+                if ok:
+                    newly.append(pkg)
+                    if pkg not in installed_packages:
+                        installed_packages.append(pkg)
+                else:
+                    failed_installs[pkg] = False
+            if newly:
+                update_requirements(str(root), newly)
+        except Exception as exc:
+            logger.warning(
+                "BOOTSTRAP_ENV: test-client extra install raised %s", exc)
+            if not pip_log_tail:
+                pip_log_tail = f"{type(exc).__name__}: {exc}"
+
+    # Defense-in-depth: only a *declared* dependency that fails to
+    # install is a fatal environment problem. A scan-discovered import
+    # that pip cannot satisfy (typically a hallucinated first-party-
+    # looking name like ``core``, or an unresolvable guess) is a code
+    # problem: record it as ``uninstallable`` and proceed so API_CHECK
+    # probes honestly and routes the failure to a regenerate, instead of
+    # ending the session in a terminal bootstrap failure.
+    from cgx.codegen.env_manager import _read_requirements
+    declared_names = _read_requirements(str(root))
+    fatal_installs = {
+        pkg: ok for pkg, ok in failed_installs.items()
+        if pkg.lower().replace("-", "_") in declared_names}
+    uninstallable = sorted(p for p in failed_installs
+                           if p not in fatal_installs)
+    if uninstallable:
+        logger.warning(
+            "BOOTSTRAP_ENV: %d undeclared import(s) could not be "
+            "installed (non-fatal, deferred to API_CHECK): %s",
+            len(uninstallable), uninstallable)
+
     style_issues = _preflight_test_style_lint(root, applied_files)
 
     # Snapshot the fully-resolved venv contents so REPAIR can diagnose
@@ -147,16 +234,19 @@ def run_bootstrap_env(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         resolved_packages, pip_freeze_text = _capture_pip_freeze(python_exe)
 
     outcome = _classify_outcome(
-        venv_path=venv_path, failed_installs=failed_installs)
+        venv_path=venv_path, failed_installs=fatal_installs)
     # Honesty gate: even when nothing failed to *install*, the scaffold's
     # own third-party imports must actually resolve in the venv. If they
     # don't (a malformed/unresolvable requirements line that aborted the
     # batch install, a bad import→PyPI mapping, ...), the app cannot run
-    # and BOOTSTRAP must not report success.
+    # and BOOTSTRAP must not report success. Roots already recorded as
+    # ``uninstallable`` are excluded -- proceeding past those is the
+    # deliberate decision above, and API_CHECK owns their diagnosis.
     missing_runtime: List[str] = []
     if outcome == "succeeded":
         missing_runtime = _verify_runtime_imports(
-            root, applied_files, python_exe)
+            root, applied_files, python_exe,
+            skip_roots=_import_roots_for(uninstallable))
         if missing_runtime:
             outcome = "failed"
     artifact = _build_artifact(
@@ -169,15 +259,16 @@ def run_bootstrap_env(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         resolved_packages=resolved_packages,
         pip_freeze_text=pip_freeze_text,
         missing_imports=missing_runtime,
+        uninstallable=uninstallable,
         note=None,
     )
     failure: Optional[str] = None
     if outcome == "failed":
         reasons: List[str] = []
-        if failed_installs:
+        if fatal_installs:
             reasons.append(
-                f"{len(failed_installs)} package(s) could not be "
-                f"installed: {sorted(failed_installs)}")
+                f"{len(fatal_installs)} declared package(s) could not be "
+                f"installed: {sorted(fatal_installs)}")
         if missing_runtime:
             reasons.append(
                 f"{len(missing_runtime)} runtime import(s) not importable "
@@ -191,7 +282,8 @@ def run_bootstrap_env(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             "venv_path": venv_path,
             "python_exe": python_exe,
             "installed_count": len(installed_packages),
-            "failed_count": len(failed_installs),
+            "failed_count": len(fatal_installs),
+            "uninstallable_count": len(uninstallable),
             "missing_import_count": len(missing_runtime),
             "style_issue_count": len(style_issues),
         },
@@ -412,17 +504,73 @@ def _detect_venv_path(root: Path, python_exe: str) -> Optional[str]:
     return None
 
 
+def _import_roots_for(pypi_names: List[str]) -> frozenset:
+    """Map PyPI distribution names back to plausible import roots.
+
+    The normalised distribution name itself is usually the import root
+    (``core`` -> ``core``, ``flask-cors`` -> ``flask_cors``); known
+    divergent pairs are recovered by reversing
+    :data:`cgx.codegen.env_manager._IMPORT_TO_PYPI` (``PyYAML`` ->
+    ``yaml``). Used to exclude already-recorded uninstallable packages
+    from the runtime-import honesty gate.
+    """
+    if not pypi_names:
+        return frozenset()
+    try:
+        from cgx.codegen.env_manager import _IMPORT_TO_PYPI
+    except Exception:  # pragma: no cover - defensive
+        _IMPORT_TO_PYPI = {}
+    roots = set()
+    for pkg in pypi_names:
+        norm = str(pkg).lower().replace("-", "_")
+        roots.add(norm)
+        for imp, dist in _IMPORT_TO_PYPI.items():
+            if dist.lower().replace("-", "_") == norm:
+                roots.add(imp.lower().replace("-", "_"))
+    return frozenset(roots)
+
+
+# Substrings that mark a file as using the fastapi/starlette test
+# client, whose import pulls in the optional ``httpx`` extra at runtime.
+_TESTCLIENT_MARKERS = ("fastapi.testclient", "starlette.testclient")
+
+
+def _testclient_extra_roots(root: Path,
+                            applied_files: List[str]) -> List[str]:
+    """Return the import roots the TestClient transitively requires.
+
+    Scans the applied ``.py`` files for a fastapi/starlette
+    ``testclient`` reference and returns ``["httpx"]`` when found --
+    the optional extra ``starlette.testclient`` imports at module load
+    but which no first-party file imports directly. Best-effort: read
+    errors skip the file so a probe hiccup never fails bootstrap.
+    """
+    for rel in applied_files:
+        if not str(rel).endswith(".py"):
+            continue
+        try:
+            text = (root / rel).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError, ValueError):
+            continue
+        if any(marker in text for marker in _TESTCLIENT_MARKERS):
+            return ["httpx"]
+    return []
+
+
 def _verify_runtime_imports(
         root: Path,
         applied_files: List[str],
-        python_exe: Optional[str]) -> List[str]:
+        python_exe: Optional[str],
+        skip_roots: frozenset = frozenset()) -> List[str]:
     """Return third-party import roots the scaffold uses but can't import.
 
     Scans the applied ``.py`` files for top-level import roots, drops
-    stdlib / first-party / bare-namespace roots, then probes the
-    remaining roots in the provisioned venv. A non-empty result means
-    the app cannot import its own dependencies even though provisioning
-    did not raise -- the caller degrades the outcome to ``failed``.
+    stdlib / first-party / bare-namespace roots (and any root in
+    ``skip_roots`` -- packages already recorded as uninstallable, whose
+    diagnosis belongs to API_CHECK), then probes the remaining roots in
+    the provisioned venv. A non-empty result means the app cannot import
+    its own dependencies even though provisioning did not raise -- the
+    caller degrades the outcome to ``failed``.
     Best-effort: any import/probe error yields ``[]`` so a transient
     hiccup never fabricates a bootstrap failure.
     """
@@ -445,6 +593,7 @@ def _verify_runtime_imports(
             r for r in roots
             if r
             and r.lower().replace("-", "_") not in _STDLIB_TOP
+            and r.lower().replace("-", "_") not in skip_roots
             and r not in _NAMESPACE_ROOTS
             and not _is_local_package(r, str(root)))
         if not candidates:
@@ -463,8 +612,11 @@ def _classify_outcome(*, venv_path: Optional[str],
 
     ``no_venv`` means ``ensure_project_venv`` fell back to the host
     interpreter (offline / missing venv module). ``failed`` means at
-    least one preflight install failed. ``succeeded`` is the happy
-    path; ``partial`` is reserved for future per-stack outcomes.
+    least one *declared* preflight install failed (the caller passes the
+    declared-only partition; undeclared scan-install failures are
+    recorded as ``uninstallable`` and deferred to API_CHECK).
+    ``succeeded`` is the happy path; ``partial`` is reserved for future
+    per-stack outcomes.
     """
     if venv_path is None:
         return "no_venv"
@@ -489,8 +641,15 @@ def _build_artifact(
     pip_freeze_text: str,
     note: Optional[str],
     missing_imports: Optional[List[str]] = None,
+    uninstallable: Optional[List[str]] = None,
 ) -> Artifact:
-    """Construct the ``BUILD_REPORT`` artifact for this bootstrap run."""
+    """Construct the ``BUILD_REPORT`` artifact for this bootstrap run.
+
+    ``uninstallable`` lists scan-discovered (undeclared) packages whose
+    install failed -- recorded non-fatally so API_CHECK can classify the
+    corresponding import failures as hallucinated modules rather than
+    missing dependencies.
+    """
     content: Dict[str, Any] = {
         "apply_artifact_id": task.inputs.get("apply_artifact_id"),
         "scaffold_artifact_id": task.inputs.get("scaffold_artifact_id"),
@@ -500,6 +659,7 @@ def _build_artifact(
         "installed_from": list(installed_from),
         "installed_packages": list(installed_packages),
         "failed_installs": sorted(failed_installs.keys()),
+        "uninstallable": list(uninstallable or []),
         "missing_imports": list(missing_imports or []),
         "outcome": outcome,
         "pip_log_tail": pip_log_tail or "",

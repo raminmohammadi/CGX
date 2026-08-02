@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from cgx.session.budget import LoopBudget
 from cgx.session.models import (
@@ -36,12 +36,17 @@ from cgx.session.models import (
     TaskNode,
 )
 from cgx.session.repair.classify import (
+    circular_import_modules,
     classify_runtime_report,
     classify_verify_report,
     failure_signature,
+    missing_module_names,
+    required_package_names,
     runtime_failure_text,
     third_party_import_breaks,
     traceback_source_files,
+    undefined_names,
+    unresolved_entry_paths,
 )
 from cgx.session.repair.locate import (
     MissingFixtureLocation,
@@ -58,6 +63,7 @@ from cgx.session.repair.propose import (
     propose_unittest_pytest_mix,
 )
 from cgx.session.repair.pypi_client import PyPIClient
+from cgx.session.scaffold_validate import stack_entry_description
 from cgx.session.tasks.base import (
     ExecutorDeps,
     ExecutorResult,
@@ -100,6 +106,7 @@ _LLM_REPAIR_RETRIEVAL_SLACK = 4
 # written. Used by :func:`_select_repair_strategy` when no diff was
 # produced.
 _REGENERATE_CLASSES = frozenset({
+    "circular_import",
     "third_party_import_break",
     "relative_import_error",
     "smoke_import_failure",
@@ -108,6 +115,7 @@ _REGENERATE_CLASSES = frozenset({
     "empty_test_suite",
     "missing_fixture",
     "missing_module_pythonpath",
+    "undefined_name",
     "unknown",
 })
 
@@ -175,6 +183,14 @@ def run_repair(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     signature = failure_signature(content)
     attempt = LoopBudget.from_inputs(task.inputs).repair_attempt or 1
 
+    if classification == "missing_dependency":
+        # The failure names the exact pip package it needs (e.g.
+        # starlette's TestClient guard for httpx). Route straight to
+        # install_deps -- no source rewrite can install a package.
+        return _run_verify_missing_dependency_repair(
+            task, verify_artifact_id, content,
+            list(required_package_names(content)), signature)
+
     diffs: List[Dict[str, str]] = []
     rationale = ""
     locations_payload: List[Dict[str, Any]] = []
@@ -192,6 +208,15 @@ def run_repair(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             Path(deps.project_root), content)
         diffs = propose_missing_module_pythonpath(
             Path(deps.project_root), pp_locations)
+        if not diffs and not pp_locations:
+            # No project file claims the missing name at all: this is a
+            # package absent from the venv (e.g. a transitive test-client
+            # extra), not an authoring gap a regenerate could fill.
+            pip_roots = _pip_installable_roots(
+                Path(deps.project_root), content)
+            if pip_roots:
+                return _run_verify_missing_dependency_repair(
+                    task, verify_artifact_id, content, pip_roots, signature)
         rationale = _pythonpath_rationale(pp_locations, bool(diffs))
         locations_payload = [_pp_loc_to_dict(loc) for loc in pp_locations]
     elif classification == "missing_fixture":
@@ -242,6 +267,42 @@ def run_repair(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             "every first-party import targets a module that actually exists "
             "in the project -- prefer absolute imports rooted at the top-level "
             "package, and never import a module that was not generated.")
+    elif classification == "circular_import":
+        # First-party modules import each other in a cycle, so Python could
+        # not finish initialising them ("partially initialized module"). No
+        # single-file patch can decide which import to break or where the
+        # shared symbols belong; re-scaffold with the cycle folded in as a
+        # constraint so the regenerated module(s) keep the dependency
+        # one-way.
+        cycle_mods = circular_import_modules(content)
+        extra_plan_fields["circular_modules"] = list(cycle_mods)
+        mod_list = (", ".join(cycle_mods) if cycle_mods
+                    else "the modules named in the traceback")
+        rationale = (
+            "Test collection failed on a circular import: "
+            f"{mod_list} could not finish initialising because first-party "
+            "modules import each other. Re-author the offending module(s) "
+            "so the dependency is strictly one-way -- move shared symbols "
+            "into the lower-level module (or a new shared module) and never "
+            "import back from a module that imports this one.")
+    elif classification == "undefined_name":
+        # A generated module uses a name it never binds, so it explodes
+        # at import time (``NameError: name 'enum' is not defined``) and
+        # takes the whole collection down with it. The missing binding
+        # could be an import, an assignment or a definition, so there is
+        # no mechanical patch; re-scaffold with the unbound names folded
+        # in as a constraint.
+        names = undefined_names(content)
+        extra_plan_fields["undefined_names"] = list(names)
+        name_list = (", ".join(repr(n) for n in names) if names
+                     else "the name(s) reported in the traceback")
+        rationale = (
+            f"Test collection failed with NameError: {name_list} used but "
+            "never defined in the module that referenced it. Re-author the "
+            "offending module(s) so every name is bound before use -- add "
+            "the missing import, assignment or definition -- and make sure "
+            "every module, class and constant the file references is either "
+            "imported at the top of the file or defined in it.")
     else:
         diffs = _propose_llm_logic_repair(task, deps, content)
         if diffs:
@@ -325,6 +386,7 @@ def _run_smoke_repair(task: TaskNode, deps: ExecutorDeps,
     attempt = LoopBudget.from_inputs(task.inputs).repair_attempt or 1
     classification = "smoke_import_failure"
     build_stderr = ""
+    missing_entries: Tuple[str, ...] = ()
     if failed:
         rationale = (
             f"Third-party import(s) {', '.join(failed)} failed under the "
@@ -339,10 +401,20 @@ def _run_smoke_repair(task: TaskNode, deps: ExecutorDeps,
         # only fix, so fold the build error into the regenerate feedback.
         build_stderr = str(build_smoke.get("stderr_tail") or "")
         label = str(build_smoke.get("label") or "npm run build")
-        rationale = (
-            f"The JS/TS build-smoke (`{label}`) failed: the applied "
-            "frontend does not build. Re-author the failing file(s) to "
-            "fix the reported build error.")
+        # ... unless the bundler could not resolve its *entry module*, in
+        # which case no amount of re-authoring helps: the file is absent
+        # from the manifest, so the regenerate has to add it.
+        missing_entries = unresolved_entry_paths(build_stderr)
+        if missing_entries:
+            rationale = (
+                f"The JS/TS build-smoke (`{label}`) could not resolve its "
+                f"entry module(s) {', '.join(missing_entries)}: the "
+                "file(s) were never generated. Add them to the tree.")
+        else:
+            rationale = (
+                f"The JS/TS build-smoke (`{label}`) failed: the applied "
+                "frontend does not build. Re-author the failing file(s) to "
+                "fix the reported build error.")
     else:
         rationale = (
             "SMOKE reported a failure but no failed modules were "
@@ -355,6 +427,14 @@ def _run_smoke_repair(task: TaskNode, deps: ExecutorDeps,
     if build_broke:
         extra_constraints["kind"] = "invalid_build_smoke"
         extra_constraints["build_error"] = build_stderr
+    if missing_entries:
+        # Mechanical fix for the one build failure regeneration cannot
+        # reach: the router threads these into the new SCAFFOLD's
+        # ``additional_files`` so the manifest grows the missing entry.
+        extra_constraints["kind"] = "missing_entry_module"
+        extra_constraints["missing_files"] = [
+            {"path": p, "description": stack_entry_description(p)}
+            for p in missing_entries]
     artifact = Artifact.new(
         session_id=task.session_id,
         produced_by_task_id=task.task_id,
@@ -658,6 +738,99 @@ def _run_missing_dependency_repair(
     )
 
 
+def _pip_installable_roots(project_root: Path,
+                           content: Dict[str, Any]) -> List[str]:
+    """Missing-import roots that are pip problems, not authoring problems.
+
+    A ModuleNotFoundError root whose top-level name has no ``<top>.py``
+    file or ``<top>/`` directory under ``project_root`` cannot be fixed
+    by regenerating source -- nothing on disk claims the name, so the
+    realistic fix is a package install. Roots that do exist on disk (a
+    missing *leaf* of a real package) stay with the regenerate path.
+    Order-preserving and de-duplicated on the top-level name.
+    """
+    roots: List[str] = []
+    for dotted in missing_module_names(content):
+        top = dotted.split(".", 1)[0]
+        if not top or top in roots:
+            continue
+        if (project_root / f"{top}.py").exists() \
+                or (project_root / top).is_dir():
+            continue
+        roots.append(top)
+    return roots
+
+
+def _run_verify_missing_dependency_repair(
+        task: TaskNode,
+        verify_artifact_id: str,
+        content: Dict[str, Any],
+        missing_modules: List[str],
+        signature: str) -> ExecutorResult:
+    """Emit an install-deps REPAIR_PLAN for a VERIFY-time missing package.
+
+    Mirrors :func:`_run_missing_dependency_repair` for the VERIFY path:
+    pytest collection died because a package is absent from the venv --
+    typically a transitive extra no first-party file imports directly
+    (e.g. the fastapi/starlette TestClient's ``httpx``), so neither the
+    bootstrap preflight nor a source regenerate can ever satisfy it.
+    The plan carries ``strategy='install_deps'`` with the explicit
+    module list so the router re-runs BOOTSTRAP_ENV, which installs the
+    package(s) and flows back to VERIFY through API_CHECK/SMOKE.
+    """
+    mods = sorted(dict.fromkeys(m for m in missing_modules if m))
+    if not signature:
+        signature = "verify|missing:" + ",".join(mods)
+    attempt = LoopBudget.from_inputs(task.inputs).repair_attempt or 1
+    classification = "missing_dependency"
+    rationale = (
+        f"Missing third-party dependency(ies): {', '.join(mods)}. Test "
+        "collection failed because the package(s) are not installed in "
+        "the project venv -- typically a transitive extra (such as the "
+        "fastapi/starlette TestClient's httpx) that no first-party file "
+        "imports directly. The correct fix is to install the package(s) "
+        "(adding them to requirements.txt) and re-verify, not to "
+        "regenerate source code that never imports them.")
+    extra_constraints = {
+        "kind": classification,
+        "missing_modules": mods,
+        "rationale": rationale,
+    }
+    plan = Artifact.new(
+        session_id=task.session_id,
+        produced_by_task_id=task.task_id,
+        kind=ArtifactKind.REPAIR_PLAN,
+        content={
+            "verify_artifact_id": verify_artifact_id,
+            "build_artifact_id": content.get("build_artifact_id"),
+            "apply_artifact_id": content.get("apply_artifact_id"),
+            "classification": classification,
+            "failure_signature": signature,
+            "repair_attempt": attempt,
+            "rationale": rationale,
+            "missing_modules": mods,
+            "diffs": [],
+            "strategy": "install_deps",
+            "extra_constraints": extra_constraints,
+            "mode": content.get("mode") or task.inputs.get("mode"),
+        },
+    )
+    return ExecutorResult(
+        outputs={
+            "repair_artifact_id": plan.artifact_id,
+            "classification": classification,
+            "failure_signature": signature,
+            "repair_attempt": attempt,
+            "diff_count": 0,
+            "can_apply": False,
+            "strategy": "install_deps",
+            "missing_modules": mods,
+            "extra_constraints": extra_constraints,
+        },
+        artifact=plan,
+    )
+
+
 def _select_repair_strategy(
         *, classification: str,
         diffs: List[Dict[str, str]],
@@ -697,6 +870,12 @@ def _select_repair_strategy(
             extra_plan_fields.get("import_breaks") or [])
         constraints["attempted_pins"] = list(
             extra_plan_fields.get("pin_decisions") or [])
+    elif classification == "circular_import":
+        constraints["modules"] = list(
+            extra_plan_fields.get("circular_modules") or [])
+    elif classification == "undefined_name":
+        constraints["undefined_names"] = list(
+            extra_plan_fields.get("undefined_names") or [])
     elif classification == "unittest_pytest_mix":
         constraints["affected_classes"] = sorted({
             entry.get("class_name")

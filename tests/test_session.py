@@ -3181,6 +3181,34 @@ def test_router_scaffold_completion_spawns_apply_with_greenfield_mode():
     assert ap.inputs["mode"] == SessionMode.GREENFIELD.value
 
 
+def test_router_scaffold_to_apply_threads_failure_signatures():
+    """A regenerated SCAFFOLD's flap ledger flows into the new APPLY."""
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    sc = TaskNode.new(
+        session.session_id, TaskKind.SCAFFOLD, "scaffold",
+        inputs={"prior_goal": "g",
+                "work_plan_artifact_id": "art_plan",
+                "prior_failure_signatures": ["verify|collection_error|x"]})
+    sc.produced_artifact_id = "art_scaffold"
+    sc.status = TaskNodeStatus.DONE
+    plan = Router().on_task_completed(
+        session=session, completed=sc, tasks=[sc])
+    ap = [a.task for a in plan.actions if isinstance(a, CreateTask)][0]
+    assert ap.kind is TaskKind.APPLY
+    assert ap.inputs["prior_failure_signatures"] == [
+        "verify|collection_error|x"]
+    # A first-generation SCAFFOLD (no ledger) adds no key at all.
+    sc2 = TaskNode.new(
+        session.session_id, TaskKind.SCAFFOLD, "scaffold",
+        inputs={"prior_goal": "g", "work_plan_artifact_id": "art_plan"})
+    sc2.produced_artifact_id = "art_scaffold2"
+    sc2.status = TaskNodeStatus.DONE
+    plan2 = Router().on_task_completed(
+        session=session, completed=sc2, tasks=[sc2])
+    ap2 = [a.task for a in plan2.actions if isinstance(a, CreateTask)][0]
+    assert "prior_failure_signatures" not in ap2.inputs
+
+
 # --------------------- build_decision validation ---------------------
 
 def test_build_decision_rejects_clarify_answers_without_answers():
@@ -3604,6 +3632,48 @@ def test_decompose_fails_when_only_test_files(store, monkeypatch):
     assert "no runnable source" in result.failure
 
 
+def test_decompose_injects_missing_vite_entry_html(store, monkeypatch):
+    # A Vite manifest without a root index.html cannot build at all, and
+    # the regenerate loop can never add the file -- DECOMPOSE folds it in.
+    result = _run_decompose_with_manifest(store, monkeypatch, {
+        "plan_md": "p",
+        "layers": [
+            {"name": "ui", "files": [
+                {"path": "src/main.jsx", "description": "entry"},
+                {"path": "src/App.jsx", "description": "root component"}]},
+            {"name": "config", "files": [
+                {"path": "vite.config.js", "description": "vite config"},
+                {"path": "package.json", "description": "manifest"}]},
+        ],
+    })
+    assert result.failure is None
+    layers = result.artifact.content["layers"]
+    paths = [f["path"] for lay in layers for f in lay["files"]]
+    assert "index.html" in paths
+    assert result.outputs["file_count"] == 5
+
+
+def test_decompose_keeps_existing_vite_entry_html(store, monkeypatch):
+    # Already coherent -> no injection, no duplicate entry.
+    result = _run_decompose_with_manifest(store, monkeypatch, {
+        "plan_md": "p",
+        "layers": [{"name": "ui", "files": [
+            {"path": "index.html", "description": "entry html"},
+            {"path": "src/main.jsx", "description": "entry"},
+            {"path": "vite.config.js", "description": "vite config"}]}],
+    })
+    assert result.failure is None
+    paths = [f["path"] for f in result.artifact.content["layers"][0]["files"]]
+    assert paths.count("index.html") == 1
+
+
+def test_missing_stack_entry_files_ignores_non_vite_manifests():
+    from cgx.session.scaffold_validate import missing_stack_entry_files
+    assert missing_stack_entry_files(
+        ["src/index.js", "package.json", "public/index.html"]) == []
+    assert missing_stack_entry_files(["backend/main.py"]) == []
+
+
 def test_scaffold_executor_missing_work_plan_fails(store):
     from cgx.session.tasks.scaffold import run_scaffold
     session = Session.new("g", mode=SessionMode.GREENFIELD)
@@ -3809,6 +3879,186 @@ def test_scaffold_syntax_invalid_file_becomes_explicit_failure(store,
     failed = result.artifact.content["failed"]
     assert failed[0]["file"] == "broken.py"
     assert "invalid syntax" in failed[0]["error"]
+
+
+def test_scaffold_import_coherence_gate_flags_hallucinated_import(
+        store, monkeypatch):
+    """A generated file importing a module that resolves nowhere fails.
+
+    Mirrors the live failure: the model emitted ``from core import
+    compute`` with no such module in the manifest, on disk, or in
+    requirements.txt. Left alone the fabricated name reaches
+    BOOTSTRAP_ENV where pip tries to install it and the session dies
+    terminally; the gate fails the importer file here instead so the
+    router's regenerate edge retries it with a concrete constraint.
+    """
+    from cgx.session.tasks.scaffold import run_scaffold
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    plan = Artifact.new(
+        session.session_id, "task_x", ArtifactKind.WORK_PLAN, {
+            "plan_md": "", "composed_goal": "g", "prior_goal": "g",
+            "layers": [{"name": "app", "files": [
+                {"path": "calc.py", "description": ""},
+                {"path": "app.py", "description": ""}]}],
+        })
+    store.save_artifact(plan)
+
+    bodies = {
+        # Stdlib import only -> passes the gate.
+        "calc.py": "import json\n\ndef add(a, b):\n    return a + b\n",
+        # Sibling manifest import passes; the hallucinated module --
+        # resolvable nowhere -- flags the file.
+        "app.py": ("from calc import add\n"
+                   "from zz_hallucinated_core import compute\n"),
+    }
+
+    def fake_generate(path, *a, **kw):
+        return {"file": path, "patch": f"+++ {path}\nx",
+                "content": bodies[path], "syntax_ok": True}
+
+    monkeypatch.setattr("cgx.answer.engine.generate_single_scaffold_file",
+                        fake_generate)
+    t = TaskNode.new(session.session_id, TaskKind.SCAFFOLD, "s",
+                     inputs={"work_plan_artifact_id": plan.artifact_id})
+    result = run_scaffold(
+        t, ExecutorDeps(provider=_StubProvider(""), store=store))
+    assert result.failure is None
+    assert result.outputs["failed_count"] == 1
+    assert [d["file"] for d in result.artifact.content["diffs"]] == ["calc.py"]
+    failed = result.artifact.content["failed"]
+    assert failed[0]["file"] == "app.py"
+    assert "zz_hallucinated_core" in failed[0]["error"]
+
+
+def test_scaffold_circular_import_gate_breaks_cycle(store, monkeypatch):
+    """Two generated modules importing each other fail one file per cycle.
+
+    Mirrors the live failure (ses_c346e309fbcd4f16): backend/routes.py and
+    backend/models.py imported each other, every per-file gate passed
+    (each import resolves to a real sibling), and pytest collection died
+    with "cannot import name ... from partially initialized module ...".
+    The gate detects the cycle statically and fails the foundational
+    member (models) so the regenerate constraint makes the dependency
+    one-way.
+    """
+    from cgx.session.tasks.scaffold import run_scaffold
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    plan = Artifact.new(
+        session.session_id, "task_x", ArtifactKind.WORK_PLAN, {
+            "plan_md": "", "composed_goal": "g", "prior_goal": "g",
+            "layers": [{"name": "backend", "files": [
+                {"path": "backend/routes.py", "description": ""},
+                {"path": "backend/models.py", "description": ""}]}],
+        })
+    store.save_artifact(plan)
+
+    bodies = {
+        "backend/routes.py": (
+            "from backend.models import init_db\n\n\n"
+            "def compute_expression(expr):\n"
+            "    init_db()\n"
+            "    return expr\n"),
+        "backend/models.py": (
+            "from backend.routes import compute_expression\n\n\n"
+            "def init_db():\n"
+            "    return compute_expression\n"),
+    }
+
+    def fake_generate(path, *a, **kw):
+        return {"file": path, "patch": f"+++ {path}\nx",
+                "content": bodies[path], "syntax_ok": True}
+
+    monkeypatch.setattr("cgx.answer.engine.generate_single_scaffold_file",
+                        fake_generate)
+    t = TaskNode.new(session.session_id, TaskKind.SCAFFOLD, "s",
+                     inputs={"work_plan_artifact_id": plan.artifact_id})
+    result = run_scaffold(
+        t, ExecutorDeps(provider=_StubProvider(""), store=store))
+    assert result.failure is None
+    assert result.outputs["failed_count"] == 1
+    assert [d["file"] for d in result.artifact.content["diffs"]] == [
+        "backend/routes.py"]
+    failed = result.artifact.content["failed"]
+    assert failed[0]["file"] == "backend/models.py"
+    assert "circular import" in failed[0]["error"]
+    assert "backend.routes" in failed[0]["error"]
+
+
+def test_circular_import_failures_ignores_one_way_imports():
+    """An acyclic first-party import graph produces no failures."""
+    from cgx.session.tasks.scaffold import _circular_import_failures
+    files = [
+        {"path": "app/routes.py",
+         "content": "from app.models import init_db\n"},
+        {"path": "app/models.py", "content": "def init_db():\n    pass\n"},
+    ]
+    assert _circular_import_failures(files) == []
+
+
+def test_circular_import_failures_detects_relative_cycle():
+    """Cycles authored with relative imports are detected too."""
+    from cgx.session.tasks.scaffold import _circular_import_failures
+    files = [
+        {"path": "pkg/alpha.py", "content": "from .beta import f\n"},
+        {"path": "pkg/beta.py", "content": "from .alpha import g\n"},
+    ]
+    out = _circular_import_failures(files)
+    # No foundational basename in the cycle -> first module in sorted
+    # order is failed; exactly one file per cycle.
+    assert [f["file"] for f in out] == ["pkg/alpha.py"]
+    assert "circular import" in out[0]["error"]
+
+
+def test_phantom_import_gate_flags_undefined_dotted_module():
+    """``from backend.core import x`` with no backend/core.py is failed."""
+    from cgx.session.tasks.scaffold import (
+        _phantom_first_party_import_failures)
+    files = [
+        {"path": "backend/__init__.py", "content": ""},
+        {"path": "backend/main.py",
+         "content": "from backend.core import calculate\n"},
+        {"path": "backend/models.py", "content": "X = 1\n"},
+    ]
+    layers = [{"files": [{"path": f["path"]} for f in files]}]
+    out = _phantom_first_party_import_failures(files, layers)
+    assert [f["file"] for f in out] == ["backend/main.py"]
+    assert "backend.core" in out[0]["error"]
+    assert "backend.models" in out[0]["error"]
+
+
+def test_phantom_import_gate_flags_bare_import_of_packaged_module():
+    """``from main import app`` when the module is backend/main.py."""
+    from cgx.session.tasks.scaffold import (
+        _phantom_first_party_import_failures)
+    files = [
+        {"path": "backend/__init__.py", "content": ""},
+        {"path": "backend/main.py", "content": "app = 1\n"},
+        {"path": "tests/test_main.py", "content": "from main import app\n"},
+    ]
+    layers = [{"files": [{"path": f["path"]} for f in files]}]
+    out = _phantom_first_party_import_failures(files, layers)
+    assert [f["file"] for f in out] == ["tests/test_main.py"]
+    assert "backend.main" in out[0]["error"]
+
+
+def test_phantom_import_gate_abstains_on_src_layout_and_manifest_peers():
+    """Bare src/-layout imports and not-yet-generated manifest peers pass."""
+    from cgx.session.tasks.scaffold import (
+        _phantom_first_party_import_failures)
+    files = [
+        {"path": "src/calc.py", "content": "def add(a, b):\n    return a\n"},
+        {"path": "tests/test_calc.py", "content": "from calc import add\n"},
+    ]
+    layers = [{"files": [{"path": f["path"]} for f in files]}]
+    assert _phantom_first_party_import_failures(files, layers) == []
+    # backend/routers/calculator.py is planned but not in this batch.
+    files = [{"path": "backend/main.py",
+              "content": "from backend.routers.calculator import router\n"}]
+    layers = [{"files": [{"path": "backend/main.py"},
+                         {"path": "backend/routers/calculator.py"}]}]
+    assert _phantom_first_party_import_failures(files, layers) == []
 
 
 def test_scaffold_targeted_regenerate_reuses_good_diffs(store, monkeypatch):
@@ -4439,9 +4689,10 @@ def test_bootstrap_env_provisions_venv_and_records_preflight(
 
 
 def test_bootstrap_env_surfaces_install_failures(tmp_path, store, monkeypatch):
-    """A failed preflight install -> outcome=failed, executor reports failure."""
+    """A failed install of a *declared* dependency -> outcome=failed."""
     from cgx.session.tasks.bootstrap_env import run_bootstrap_env
-    (tmp_path / "requirements.txt").write_text("flask\n", encoding="utf-8")
+    (tmp_path / "requirements.txt").write_text(
+        "flask\nnonexistent-xyz\n", encoding="utf-8")
     (tmp_path / ".venv" / "bin").mkdir(parents=True)
     venv_python = tmp_path / ".venv" / "bin" / "python"
     venv_python.write_text("")
@@ -4470,7 +4721,63 @@ def test_bootstrap_env_surfaces_install_failures(tmp_path, store, monkeypatch):
     assert result.outputs["outcome"] == "failed"
     assert result.outputs["failed_count"] == 1
     assert result.failure and "nonexistent-xyz" in result.failure
+    assert "declared" in result.failure
     assert result.artifact.content["failed_installs"] == ["nonexistent-xyz"]
+    assert result.artifact.content["uninstallable"] == []
+
+
+def test_bootstrap_env_undeclared_install_failure_is_non_fatal(
+        tmp_path, store, monkeypatch):
+    """An undeclared scan-install failure is recorded, never terminal.
+
+    Mirrors the live failure: the scaffold hallucinated ``from core
+    import compute``, preflight scanned the import and pip-installing
+    ``core`` failed, ending the session in a terminal bootstrap failure.
+    An import discovered only by code scanning is a code problem, not an
+    environment problem: record it as ``uninstallable`` and proceed so
+    API_CHECK diagnoses it honestly (and routes it to a regenerate).
+    """
+    from cgx.session.tasks.bootstrap_env import run_bootstrap_env
+    (tmp_path / "requirements.txt").write_text("flask\n", encoding="utf-8")
+    (tmp_path / "app.py").write_text(
+        "import flask\nfrom core import compute\n", encoding="utf-8")
+    (tmp_path / ".venv" / "bin").mkdir(parents=True)
+    venv_python = tmp_path / ".venv" / "bin" / "python"
+    venv_python.write_text("")
+    venv_python.chmod(0o755)
+
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    monkeypatch.setattr("cgx.codegen.test_runner.ensure_project_venv",
+                        lambda root, timeout=300.0: str(venv_python))
+    monkeypatch.setattr(
+        "cgx.codegen.env_manager.preflight_install",
+        lambda files, root, python=None: (["core"], {"core": False}))
+    monkeypatch.setattr(
+        "cgx.codegen.env_manager.update_requirements",
+        lambda root, pkgs: None)
+    monkeypatch.setattr(
+        "cgx.session.tasks.bootstrap_env._capture_pip_freeze",
+        lambda exe, timeout=30.0: ([], ""))
+    # flask resolves in the venv; ``core`` must be excluded from the
+    # honesty gate because its install failure is already recorded.
+    monkeypatch.setattr(
+        "cgx.codegen.env_manager._probe_importable",
+        lambda names, python=None: {"flask"})
+
+    t = TaskNode.new(session.session_id, TaskKind.BOOTSTRAP_ENV, "boot",
+                     inputs={"applied_files": ["app.py"],
+                             "mode": SessionMode.GREENFIELD.value})
+    result = run_bootstrap_env(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    assert result.failure is None
+    assert result.outputs["outcome"] == "succeeded"
+    assert result.outputs["failed_count"] == 0
+    assert result.outputs["uninstallable_count"] == 1
+    content = result.artifact.content
+    assert content["uninstallable"] == ["core"]
+    assert content["failed_installs"] == ["core"]
+    assert content["missing_imports"] == []
 
 
 def test_bootstrap_env_fails_when_runtime_import_missing(
@@ -4714,6 +5021,184 @@ def test_bootstrap_env_skips_pip_freeze_on_no_venv(
     assert result.artifact.content["pip_freeze_text"] == ""
 
 
+def test_bootstrap_env_installs_requested_missing_modules(
+        tmp_path, store, monkeypatch):
+    """install_deps repair: ``missing_modules`` in inputs are installed
+    even when the preflight file scan finds nothing to do."""
+    from cgx.session.tasks.bootstrap_env import run_bootstrap_env
+    (tmp_path / "requirements.txt").write_text("flask\n", encoding="utf-8")
+    (tmp_path / ".venv" / "bin").mkdir(parents=True)
+    venv_python = tmp_path / ".venv" / "bin" / "python"
+    venv_python.write_text("")
+    venv_python.chmod(0o755)
+
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    monkeypatch.setattr("cgx.codegen.test_runner.ensure_project_venv",
+                        lambda root, timeout=300.0: str(venv_python))
+    monkeypatch.setattr("cgx.codegen.env_manager.preflight_install",
+                        lambda files, root, python=None: ([], {}))
+    seen: dict = {}
+
+    def fake_find_missing(imports, root, python=None):
+        seen["imports"] = sorted(imports)
+        return ["uvicorn"]
+
+    def fake_install(pkgs, python=None):
+        seen["installed"] = list(pkgs)
+        return {p: True for p in pkgs}
+
+    monkeypatch.setattr(
+        "cgx.codegen.env_manager.find_missing_python_packages",
+        fake_find_missing)
+    monkeypatch.setattr(
+        "cgx.codegen.env_manager.install_packages", fake_install)
+    captured: dict = {}
+    monkeypatch.setattr(
+        "cgx.codegen.env_manager.update_requirements",
+        lambda root, pkgs: captured.setdefault("pkgs", list(pkgs)))
+    monkeypatch.setattr(
+        "cgx.session.tasks.bootstrap_env._capture_pip_freeze",
+        lambda exe, timeout=30.0: ([], ""))
+
+    t = TaskNode.new(session.session_id, TaskKind.BOOTSTRAP_ENV, "boot",
+                     inputs={"applied_files": ["backend/app.py"],
+                             "missing_modules": ["uvicorn"],
+                             "mode": SessionMode.GREENFIELD.value})
+    result = run_bootstrap_env(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    assert result.failure is None
+    assert result.outputs["outcome"] == "succeeded"
+    assert seen["imports"] == ["uvicorn"]
+    assert seen["installed"] == ["uvicorn"]
+    assert result.outputs["installed_count"] == 1
+    assert result.artifact.content["installed_packages"] == ["uvicorn"]
+    assert captured["pkgs"] == ["uvicorn"]
+
+
+def test_bootstrap_env_installs_testclient_extra(
+        tmp_path, store, monkeypatch):
+    """TestClient usage in applied tests -> httpx installed up front.
+
+    fastapi/starlette's TestClient needs httpx at import time but no
+    first-party file imports it directly, so the file-scan preflight
+    never installs it and VERIFY would die at collection.
+    """
+    from cgx.session.tasks.bootstrap_env import run_bootstrap_env
+    (tmp_path / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+    (tmp_path / ".venv" / "bin").mkdir(parents=True)
+    venv_python = tmp_path / ".venv" / "bin" / "python"
+    venv_python.write_text("")
+    venv_python.chmod(0o755)
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_api.py").write_text(
+        "from fastapi.testclient import TestClient\n"
+        "from backend.app import app\n\n"
+        "client = TestClient(app)\n\n\n"
+        "def test_ping():\n    assert client is not None\n",
+        encoding="utf-8")
+
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    monkeypatch.setattr("cgx.codegen.test_runner.ensure_project_venv",
+                        lambda root, timeout=300.0: str(venv_python))
+    monkeypatch.setattr("cgx.codegen.env_manager.preflight_install",
+                        lambda files, root, python=None: ([], {}))
+    seen: dict = {}
+
+    def fake_find_missing(imports, root, python=None):
+        seen["imports"] = sorted(imports)
+        return sorted(imports)
+
+    def fake_install(pkgs, python=None):
+        seen["installed"] = list(pkgs)
+        return {p: True for p in pkgs}
+
+    monkeypatch.setattr(
+        "cgx.codegen.env_manager.find_missing_python_packages",
+        fake_find_missing)
+    monkeypatch.setattr(
+        "cgx.codegen.env_manager.install_packages", fake_install)
+    captured: dict = {}
+    monkeypatch.setattr(
+        "cgx.codegen.env_manager.update_requirements",
+        lambda root, pkgs: captured.setdefault("pkgs", list(pkgs)))
+    monkeypatch.setattr(
+        "cgx.session.tasks.bootstrap_env._capture_pip_freeze",
+        lambda exe, timeout=30.0: ([], ""))
+    monkeypatch.setattr(
+        "cgx.session.tasks.bootstrap_env._verify_runtime_imports",
+        lambda root, files, python_exe, skip_roots=frozenset(): [])
+
+    t = TaskNode.new(session.session_id, TaskKind.BOOTSTRAP_ENV, "boot",
+                     inputs={"applied_files": ["tests/test_api.py"],
+                             "mode": SessionMode.GREENFIELD.value})
+    result = run_bootstrap_env(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    assert result.failure is None
+    assert result.outputs["outcome"] == "succeeded"
+    assert seen["imports"] == ["httpx"]
+    assert seen["installed"] == ["httpx"]
+    assert result.artifact.content["installed_packages"] == ["httpx"]
+    assert captured["pkgs"] == ["httpx"]
+
+
+def test_testclient_extra_roots_detection(tmp_path):
+    """Only fastapi/starlette testclient files trigger the httpx extra."""
+    from cgx.session.tasks.bootstrap_env import _testclient_extra_roots
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_api.py").write_text(
+        "from starlette.testclient import TestClient\n", encoding="utf-8")
+    (tmp_path / "app.py").write_text("import flask\n", encoding="utf-8")
+    assert _testclient_extra_roots(tmp_path, ["app.py"]) == []
+    assert _testclient_extra_roots(
+        tmp_path, ["app.py", "tests/test_api.py"]) == ["httpx"]
+    # Unreadable / missing files are skipped, never crash.
+    assert _testclient_extra_roots(tmp_path, ["nope.py"]) == []
+
+
+def test_bootstrap_env_requested_modules_already_satisfied(
+        tmp_path, store, monkeypatch):
+    """missing_modules that already import in the venv trigger no install."""
+    from cgx.session.tasks.bootstrap_env import run_bootstrap_env
+    (tmp_path / "requirements.txt").write_text("flask\n", encoding="utf-8")
+    (tmp_path / ".venv" / "bin").mkdir(parents=True)
+    venv_python = tmp_path / ".venv" / "bin" / "python"
+    venv_python.write_text("")
+    venv_python.chmod(0o755)
+
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    monkeypatch.setattr("cgx.codegen.test_runner.ensure_project_venv",
+                        lambda root, timeout=300.0: str(venv_python))
+    monkeypatch.setattr("cgx.codegen.env_manager.preflight_install",
+                        lambda files, root, python=None: ([], {}))
+    monkeypatch.setattr(
+        "cgx.codegen.env_manager.find_missing_python_packages",
+        lambda imports, root, python=None: [])
+
+    def boom(pkgs, python=None):
+        raise AssertionError("install_packages must not run when the "
+                             "requested modules already resolve")
+
+    monkeypatch.setattr("cgx.codegen.env_manager.install_packages", boom)
+    monkeypatch.setattr("cgx.codegen.env_manager.update_requirements",
+                        lambda root, pkgs: None)
+    monkeypatch.setattr(
+        "cgx.session.tasks.bootstrap_env._capture_pip_freeze",
+        lambda exe, timeout=30.0: ([], ""))
+
+    t = TaskNode.new(session.session_id, TaskKind.BOOTSTRAP_ENV, "boot",
+                     inputs={"applied_files": ["app.py"],
+                             "missing_modules": ["flask"],
+                             "mode": SessionMode.GREENFIELD.value})
+    result = run_bootstrap_env(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    assert result.failure is None
+    assert result.outputs["outcome"] == "succeeded"
+    assert result.outputs["installed_count"] == 0
+
+
 def test_pip_freeze_parser_handles_canonical_and_edge_lines():
     """Parser keeps name==version, drops -e/url/comment, PEP 503-normalises."""
     from cgx.session.tasks.bootstrap_env import _parse_pip_freeze
@@ -4851,7 +5336,7 @@ def test_smoke_runs_probes_and_records_failure(tmp_path, store, monkeypatch):
 
     seen: list = []
 
-    def fake_probe(python_exe, pkg, timeout):
+    def fake_probe(python_exe, pkg, timeout, root):
         seen.append(pkg)
         if pkg == "werkzeug":
             return False, ("Traceback ...\n"
@@ -5072,7 +5557,7 @@ def test_api_check_runs_probes_and_records_failure(
         content={"python_exe": "/fake/.venv/bin/python"})
     store.save_artifact(build_art)
 
-    def fake_probe(python_exe, specs, timeout):
+    def fake_probe(python_exe, specs, timeout, root):
         rows = []
         for module, name in specs:
             if module == "werkzeug.urls" and name == "url_quote":
@@ -5120,7 +5605,7 @@ def test_api_check_splits_missing_dependency_from_hallucination(
         content={"python_exe": "/fake/.venv/bin/python"})
     store.save_artifact(build_art)
 
-    def fake_probe(python_exe, specs, timeout):
+    def fake_probe(python_exe, specs, timeout, root):
         rows = []
         for module, name in specs:
             if module == "flask":
@@ -5181,7 +5666,7 @@ def test_api_check_wrong_path_first_party_is_not_missing_dependency(
         content={"python_exe": "/fake/.venv/bin/python"})
     store.save_artifact(build_art)
 
-    def fake_probe(python_exe, specs, timeout):
+    def fake_probe(python_exe, specs, timeout, root):
         rows = []
         for module, name in specs:
             if module == "app":
@@ -5217,6 +5702,45 @@ def test_api_check_wrong_path_first_party_is_not_missing_dependency(
     assert cats[("cerberus", "Schema")] == "missing_dependency"
 
 
+def test_api_check_uninstallable_root_is_hallucination(
+        tmp_path, store, monkeypatch):
+    """A root BOOTSTRAP_ENV already failed to pip-install is never a
+    ``missing_dependency`` -- pip has proven it cannot satisfy the name,
+    so an ``install_deps`` repair would loop. It routes to regenerate."""
+    from cgx.session.tasks import api_check as api_mod
+    from cgx.session.tasks.api_check import run_api_check
+    (tmp_path / "app.py").write_text(
+        "from core import compute\n", encoding="utf-8")
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    build_art = Artifact.new(
+        session_id=session.session_id, produced_by_task_id="t_build",
+        kind=ArtifactKind.BUILD_REPORT,
+        content={"python_exe": "/fake/.venv/bin/python",
+                 "uninstallable": ["core"]})
+    store.save_artifact(build_art)
+
+    def fake_probe(python_exe, specs, timeout, root):
+        rows = [{"module": module, "name": name, "ok": False,
+                 "error": "ModuleNotFoundError: No module named 'core'"}
+                for module, name in specs]
+        return rows, None
+
+    monkeypatch.setattr(api_mod, "_probe_references", fake_probe)
+    t = TaskNode.new(session.session_id, TaskKind.API_CHECK, "api",
+                     inputs={"applied_files": ["app.py"],
+                             "build_artifact_id": build_art.artifact_id})
+    result = run_api_check(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    assert result.outputs["outcome"] == "failed"
+    assert result.outputs["missing_module_count"] == 0
+    assert result.outputs["hallucinated_count"] == 1
+    content = result.artifact.content
+    assert content["missing_modules"] == []
+    assert content["hallucinated_references"] == [
+        {"module": "core", "name": "compute"}]
+
+
 def test_api_check_probe_error_skips_outcome(tmp_path, store, monkeypatch):
     """A probe-level failure (e.g. missing python_exe) -> outcome=skipped."""
     from cgx.session.tasks import api_check as api_mod
@@ -5241,6 +5765,47 @@ def test_api_check_probe_error_skips_outcome(tmp_path, store, monkeypatch):
     assert result.outputs["outcome"] == "skipped"
     assert result.artifact.content["probe_error"].startswith(
         "FileNotFoundError")
+
+
+def test_api_check_probe_isolated_from_server_cwd(tmp_path, monkeypatch):
+    """The reference probe must not resolve modules from the server's cwd.
+
+    Regression for the live failure where a probe launched from the CGX
+    workspace resolved the launcher's root ``app.py`` instead of failing
+    honestly with ``No module named 'app'``.
+    """
+    import sys
+    from cgx.session.tasks.api_check import _probe_references
+    shadow = tmp_path / "server_cwd"
+    shadow.mkdir()
+    (shadow / "app.py").write_text("app = object()\n", encoding="utf-8")
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(shadow)
+    rows, probe_error = _probe_references(
+        sys.executable, [("app", "app"), ("json", "loads")], 30.0, project)
+    assert probe_error is None
+    by_mod = {r["module"]: r for r in rows}
+    assert by_mod["app"]["ok"] is False
+    assert "No module named 'app'" in by_mod["app"]["error"]
+    assert by_mod["json"]["ok"] is True
+
+
+def test_smoke_probe_isolated_from_server_cwd(tmp_path, monkeypatch):
+    """The import probe must not resolve modules from the server's cwd."""
+    import sys
+    from cgx.session.tasks.smoke import _probe_import
+    shadow = tmp_path / "server_cwd"
+    shadow.mkdir()
+    (shadow / "fakedep.py").write_text("value = 1\n", encoding="utf-8")
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(shadow)
+    ok, tail = _probe_import(sys.executable, "fakedep", 30.0, project)
+    assert ok is False
+    assert "No module named 'fakedep'" in tail
+    ok, _ = _probe_import(sys.executable, "json", 30.0, project)
+    assert ok is True
 
 
 def test_repair_handles_api_check_report(tmp_path, store):
@@ -5829,6 +6394,51 @@ def test_classify_no_tests_collected_is_empty_test_suite():
         "stderr": "",
     }
     assert classify_verify_report(content) == "empty_test_suite"
+
+
+def test_classify_undefined_name_from_collection_stderr():
+    """A collection-time NameError is repairable, not `unknown`.
+
+    Live failure: a conftest import chain died on ``enum.Enum`` with no
+    ``import enum``. Pytest writes that to stderr and produces no junit
+    XML, so the report carries no structured ``failures``.
+    """
+    from cgx.session.repair.classify import (
+        classify_verify_report, undefined_names)
+    content = {
+        "outcome": "collection_error",
+        "returncode": 4,
+        "stdout": "",
+        "stderr": (
+            "ImportError while loading conftest 'tests/conftest.py'.\n"
+            "tests/conftest.py:3: in <module>\n"
+            "    from backend.main import app\n"
+            "backend/main.py:13: in <module>\n"
+            "    class Operation(str, enum.Enum):\n"
+            "E   NameError: name 'enum' is not defined. Did you forget "
+            "to import 'enum'"),
+        "failures": [],
+    }
+    assert classify_verify_report(content) == "undefined_name"
+    assert undefined_names(content) == ("enum",)
+
+
+def test_classify_prefers_mechanical_class_over_undefined_name():
+    """A run surfacing both keeps the classification with a locator."""
+    from cgx.session.repair.classify import classify_verify_report
+    content = {
+        "outcome": "collection_error",
+        "returncode": 2,
+        "stdout": "ModuleNotFoundError: No module named 'backend'",
+        "stderr": "NameError: name 'enum' is not defined",
+    }
+    assert classify_verify_report(content) == "missing_module_pythonpath"
+
+
+def test_undefined_name_routes_to_regenerate():
+    """No mechanical patch exists, so REPAIR must re-author the module."""
+    from cgx.session.tasks.repair import _REGENERATE_CLASSES
+    assert "undefined_name" in _REGENERATE_CLASSES
 
 
 def test_failure_signature_stable_across_runs():
@@ -6438,6 +7048,62 @@ def test_repair_executor_emits_regenerate_for_build_smoke_failure(
     assert "build" in result.artifact.content["rationale"].lower()
 
 
+def test_repair_executor_names_unresolved_entry_module_as_missing_file(
+        store, tmp_path: Path):
+    """An unresolved entry module -> the absent file is named for the regenerate."""
+    from cgx.session.tasks import repair as _repair_module  # noqa: F401
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    smoke_task = TaskNode.new(
+        session.session_id, TaskKind.SMOKE, "smoke", inputs={})
+    smoke_artifact = Artifact.new(
+        session_id=session.session_id,
+        produced_by_task_id=smoke_task.task_id,
+        kind=ArtifactKind.SMOKE_REPORT,
+        content={"outcome": "failed",
+                 "failed_modules": [],
+                 "failure_signature": "smoke_import|npm run build --silent",
+                 "modules": [],
+                 "build_smoke": {
+                     "label": "npm run build --silent",
+                     "ok": False,
+                     "stderr_tail": (
+                         "error during build:\n"
+                         "[UNRESOLVED_ENTRY] Cannot resolve entry module "
+                         "index.html.\n")}})
+    store.save_task(smoke_task)
+    store.save_artifact(smoke_artifact)
+    repair_task = TaskNode.new(
+        session.session_id, TaskKind.REPAIR, "repair",
+        inputs={"smoke_artifact_id": smoke_artifact.artifact_id,
+                "mode": SessionMode.GREENFIELD.value,
+                "repair_attempt": 1})
+    deps = ExecutorDeps(project_root=str(tmp_path), store=store)
+    from cgx.session.tasks.base import _REGISTRY
+    result = _REGISTRY[TaskKind.REPAIR](repair_task, deps)
+    assert result.failure is None
+    assert result.outputs["strategy"] == "regenerate"
+    constraints = result.outputs["extra_constraints"]
+    assert constraints["kind"] == "missing_entry_module"
+    assert [f["path"] for f in constraints["missing_files"]] == ["index.html"]
+    assert constraints["missing_files"][0]["description"]
+
+
+def test_unresolved_entry_paths_parses_rollup_and_vite_wordings():
+    from cgx.session.repair.classify import unresolved_entry_paths
+    assert unresolved_entry_paths(
+        "[UNRESOLVED_ENTRY] Cannot resolve entry module index.html.") == (
+            "index.html",)
+    assert unresolved_entry_paths(
+        'Could not resolve entry module "./src/main.jsx".') == (
+            "src/main.jsx",)
+    # Deduplicated across repeats, and an unrelated build error is inert.
+    assert unresolved_entry_paths(
+        "Cannot resolve entry module index.html\n"
+        "Cannot resolve entry module index.html\n") == ("index.html",)
+    assert unresolved_entry_paths("src/App.jsx: TS2345") == ()
+
+
 def test_classify_missing_module_pythonpath_from_collection_error():
     """ModuleNotFoundError during collection -> missing_module_pythonpath."""
     from cgx.session.repair.classify import classify_verify_report
@@ -6452,6 +7118,55 @@ def test_classify_missing_module_pythonpath_from_collection_error():
         "stderr": "",
     }
     assert classify_verify_report(content) == "missing_module_pythonpath"
+
+
+def test_classify_requires_package_runtime_error():
+    """``requires the <pkg> package to be installed`` -> missing_dependency.
+
+    The live failure (starlette's TestClient guard for its optional
+    httpx extra) names the exact pip package; it must route to an
+    install, never a source regenerate.
+    """
+    from cgx.session.repair.classify import classify_verify_report
+    content = {
+        "outcome": "collection_error",
+        "returncode": 2,
+        "stdout": (
+            "E   RuntimeError: The starlette.testclient module requires "
+            "the httpx package to be installed.\n"
+            "E   $ pip install httpx\n"),
+        "stderr": "",
+    }
+    assert classify_verify_report(content) == "missing_dependency"
+
+
+def test_classify_missing_dependency_wins_over_missing_module():
+    """The guard's internal ModuleNotFoundError must not misroute the
+    failure to missing_module_pythonpath (a source regenerate)."""
+    from cgx.session.repair.classify import classify_verify_report
+    content = {
+        "outcome": "collection_error",
+        "returncode": 2,
+        "stdout": (
+            "E   ModuleNotFoundError: No module named 'httpx'\n"
+            "E   RuntimeError: The starlette.testclient module requires "
+            "the httpx package to be installed.\n"),
+        "stderr": "",
+    }
+    assert classify_verify_report(content) == "missing_dependency"
+
+
+def test_required_package_names_extracts_and_dedupes():
+    """Package names from the RuntimeError shape, ordered and deduped."""
+    from cgx.session.repair.classify import required_package_names
+    content = {"stdout": (
+        "E   RuntimeError: The starlette.testclient module requires "
+        "the httpx package to be installed.\n"
+        "E   RuntimeError: The foo module requires the bar-baz package "
+        "to be installed.\n"
+        "E   RuntimeError: The starlette.testclient module requires "
+        "the httpx package to be installed.\n")}
+    assert required_package_names(content) == ("httpx", "bar-baz")
 
 
 def test_classify_relative_import_beyond_top_level():
@@ -6494,6 +7209,58 @@ def test_relative_import_error_routes_to_regenerate():
         locations_payload=[])
     assert strategy == "regenerate"
     assert constraints["kind"] == "relative_import_error"
+
+
+def test_classify_circular_import_partially_initialized():
+    """The circular-import ImportError variant maps to its own token.
+
+    The live failure fell through to ``unknown`` because "cannot import
+    name 'x' from partially initialized module 'm'" does not match the
+    plain from-'<pkg>' shape; the bounded LLM patch then produced a no-op
+    diff and the session died. The dedicated token routes it to a
+    regenerate instead.
+    """
+    from cgx.session.repair.classify import classify_verify_report
+    content = {
+        "outcome": "collection_error",
+        "returncode": 2,
+        "stdout": (
+            "ImportError while importing test module 'tests/test_api.py'.\n"
+            "backend/models.py:3: in <module>\n"
+            "    from backend.routes import compute_expression\n"
+            "E   ImportError: cannot import name 'compute_expression' from "
+            "partially initialized module 'backend.routes' (most likely due "
+            "to a circular import)\n"),
+        "stderr": "",
+    }
+    assert classify_verify_report(content) == "circular_import"
+
+
+def test_circular_import_modules_extracts_names():
+    """Both message shapes yield the module names, deduped and ordered."""
+    from cgx.session.repair.classify import circular_import_modules
+    content = {"stdout": (
+        "E   ImportError: cannot import name 'x' from partially initialized "
+        "module 'backend.routes' (most likely due to a circular import)\n"
+        "E   AttributeError: partially initialized module 'backend.models' "
+        "has no attribute 'y' (most likely due to a circular import)\n"
+        "E   ImportError: cannot import name 'z' from partially initialized "
+        "module 'backend.routes' (most likely due to a circular import)\n")}
+    assert circular_import_modules(content) == (
+        "backend.routes", "backend.models")
+
+
+def test_circular_import_routes_to_regenerate():
+    """The token forces a regenerate carrying the cycle's module names."""
+    from cgx.session.tasks.repair import _select_repair_strategy
+    strategy, constraints = _select_repair_strategy(
+        classification="circular_import", diffs=[],
+        rationale="break the cycle",
+        extra_plan_fields={"circular_modules": ["backend.routes"]},
+        locations_payload=[])
+    assert strategy == "regenerate"
+    assert constraints["kind"] == "circular_import"
+    assert constraints["modules"] == ["backend.routes"]
 
 
 def test_missing_module_names_extracts_dotted_targets():
@@ -6683,6 +7450,113 @@ def test_repair_executor_missing_leaf_module_regenerates(store, tmp_path: Path):
         "missing_module_pythonpath"
 
 
+def test_repair_verify_missing_dependency_routes_to_install_deps(
+        store, tmp_path: Path):
+    """VERIFY missing_dependency -> strategy=install_deps, not regenerate.
+
+    Mirrors the live loop (starlette TestClient's httpx guard): the
+    failure names the exact pip package, so REPAIR must target the venv
+    rather than regenerate source that never imports the package.
+    """
+    from cgx.session.tasks import repair as _repair_module  # noqa: F401
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    verify_task = TaskNode.new(
+        session.session_id, TaskKind.VERIFY, "verify",
+        inputs={"mode": SessionMode.GREENFIELD.value})
+    verify_artifact = Artifact.new(
+        session_id=session.session_id,
+        produced_by_task_id=verify_task.task_id,
+        kind=ArtifactKind.VERIFY_REPORT,
+        content={
+            "outcome": "collection_error",
+            "returncode": 2,
+            "stdout": (
+                "E   RuntimeError: The starlette.testclient module "
+                "requires the httpx package to be installed.\n"
+                "E   $ pip install httpx\n"),
+            "stderr": "",
+        })
+    verify_task.produced_artifact_id = verify_artifact.artifact_id
+    verify_task.status = TaskNodeStatus.DONE
+    store.save_task(verify_task)
+    store.save_artifact(verify_artifact)
+    repair_task = TaskNode.new(
+        session.session_id, TaskKind.REPAIR, "repair",
+        inputs={"verify_artifact_id": verify_artifact.artifact_id,
+                "mode": SessionMode.GREENFIELD.value,
+                "repair_attempt": 1})
+    deps = ExecutorDeps(project_root=str(tmp_path), store=store)
+    from cgx.session.tasks.base import _REGISTRY
+    result = _REGISTRY[TaskKind.REPAIR](repair_task, deps)
+    assert result.failure is None
+    assert result.outputs["classification"] == "missing_dependency"
+    assert result.outputs["strategy"] == "install_deps"
+    assert result.outputs["can_apply"] is False
+    assert result.outputs["missing_modules"] == ["httpx"]
+    plan = result.artifact
+    assert plan.kind is ArtifactKind.REPAIR_PLAN
+    assert plan.content["strategy"] == "install_deps"
+    assert plan.content["missing_modules"] == ["httpx"]
+    assert plan.content["diffs"] == []
+    assert "httpx" in plan.content["rationale"]
+
+
+def test_repair_verify_pip_installable_missing_module_installs(
+        store, tmp_path: Path):
+    """A ModuleNotFoundError no project file claims -> install_deps.
+
+    When the pythonpath locator finds nothing on disk for the missing
+    name, the venv (not the source tree) is what's incomplete -- the
+    repair routes to a package install instead of a doomed regenerate.
+    """
+    from cgx.session.tasks import repair as _repair_module  # noqa: F401
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    verify_task = TaskNode.new(
+        session.session_id, TaskKind.VERIFY, "verify",
+        inputs={"mode": SessionMode.GREENFIELD.value})
+    verify_artifact = Artifact.new(
+        session_id=session.session_id,
+        produced_by_task_id=verify_task.task_id,
+        kind=ArtifactKind.VERIFY_REPORT,
+        content={
+            "outcome": "collection_error",
+            "returncode": 2,
+            "stdout": "E   ModuleNotFoundError: No module named 'httpx'\n",
+            "stderr": "",
+        })
+    verify_task.produced_artifact_id = verify_artifact.artifact_id
+    verify_task.status = TaskNodeStatus.DONE
+    store.save_task(verify_task)
+    store.save_artifact(verify_artifact)
+    repair_task = TaskNode.new(
+        session.session_id, TaskKind.REPAIR, "repair",
+        inputs={"verify_artifact_id": verify_artifact.artifact_id,
+                "mode": SessionMode.GREENFIELD.value,
+                "repair_attempt": 1})
+    deps = ExecutorDeps(project_root=str(tmp_path), store=store)
+    from cgx.session.tasks.base import _REGISTRY
+    result = _REGISTRY[TaskKind.REPAIR](repair_task, deps)
+    assert result.failure is None
+    assert result.outputs["classification"] == "missing_dependency"
+    assert result.outputs["strategy"] == "install_deps"
+    assert result.outputs["missing_modules"] == ["httpx"]
+
+
+def test_pip_installable_roots_skips_project_names(tmp_path):
+    """Names claimed by files/dirs under the project root are excluded."""
+    from cgx.session.tasks.repair import _pip_installable_roots
+    (tmp_path / "app").mkdir()
+    (tmp_path / "util.py").write_text("", encoding="utf-8")
+    content = {"stdout": (
+        "E   ModuleNotFoundError: No module named 'httpx'\n"
+        "E   ModuleNotFoundError: No module named 'app.models'\n"
+        "E   ModuleNotFoundError: No module named 'util'\n"
+        "E   ModuleNotFoundError: No module named 'httpx.client'\n")}
+    assert _pip_installable_roots(tmp_path, content) == ["httpx"]
+
+
 def test_classify_missing_fixture_from_pytest_traceback():
     """``fixture '<name>' not found`` -> missing_fixture classification."""
     from cgx.session.repair.classify import classify_verify_report
@@ -6706,6 +7580,36 @@ def test_missing_fixture_names_extracts_targets_in_order():
         "E       fixture 'db' not found\n"
         "E       fixture 'client' not found\n")}
     assert missing_fixture_names(content) == ("client", "db")
+
+
+def test_missing_fixture_names_rejects_non_fixture_names():
+    """``self``/``cls``/``request`` are never fixtures a repair can add."""
+    from cgx.session.repair.classify import missing_fixture_names
+    content = {"stdout": (
+        "E       fixture 'self' not found\n"
+        "E       fixture 'cls' not found\n"
+        "E       fixture 'request' not found\n")}
+    assert missing_fixture_names(content) == ()
+    # A real fixture alongside them still comes through.
+    content = {"stdout": ("E       fixture 'self' not found\n"
+                          "E       fixture 'client' not found\n")}
+    assert missing_fixture_names(content) == ("client",)
+
+
+def test_classify_does_not_call_self_a_missing_fixture():
+    """A collected method reported as ``fixture 'self' not found`` is not
+    a missing fixture: classifying it as one ordered a whole-tree
+    regenerate to define a fixture that cannot exist."""
+    from cgx.session.repair.classify import classify_verify_report
+    content = {
+        "outcome": "collection_error",
+        "returncode": 2,
+        "stdout": (
+            "tests/test_widget.py:7: in test_widget\n"
+            "E       fixture 'self' not found\n"),
+        "stderr": "",
+    }
+    assert classify_verify_report(content) != "missing_fixture"
 
 
 def test_locate_missing_fixture_finds_hoist_candidate(tmp_path: Path):
@@ -8205,6 +9109,81 @@ def test_propose_regenerate_increments_attempt_and_accumulates_constraints():
     assert len(scaffold.inputs["regenerate_constraints"]) == 1
 
 
+def test_propose_regenerate_carries_prior_failure_signatures():
+    """The flap ledger survives the regenerate (merged and deduped)."""
+    from cgx.session.repair.propose import propose_regenerate
+    scaffold = TaskNode.new(
+        "sess-A", TaskKind.SCAFFOLD, "scaffold",
+        inputs={"work_plan_artifact_id": "art_plan",
+                "prior_failure_signatures": ["sig-old"]})
+    fresh = propose_regenerate(
+        scaffold, {"kind": "missing_dependency", "rationale": "r"},
+        prior_failure_signatures=["sig-old", "sig-new"])
+    assert fresh.inputs["prior_failure_signatures"] == ["sig-old", "sig-new"]
+    # Omitting the ledger leaves the cloned inputs untouched.
+    fresh2 = propose_regenerate(
+        scaffold, {"kind": "missing_dependency", "rationale": "r"})
+    assert fresh2.inputs["prior_failure_signatures"] == ["sig-old"]
+    # Original task's inputs are unaffected (no aliasing).
+    assert scaffold.inputs["prior_failure_signatures"] == ["sig-old"]
+
+
+def test_propose_regenerate_accumulates_additional_files():
+    """additional_files survive and merge across regenerate attempts."""
+    from cgx.session.repair.propose import propose_regenerate
+    scaffold = TaskNode.new(
+        "sess-A", TaskKind.SCAFFOLD, "scaffold",
+        inputs={"work_plan_artifact_id": "art_plan"})
+    first = propose_regenerate(
+        scaffold, {"kind": "missing_entry_module", "rationale": "r"},
+        additional_files=[{"path": "index.html", "description": "entry html"}])
+    assert first.inputs["additional_files"] == [
+        {"path": "index.html", "description": "entry html"}]
+    # A second attempt that names a different file keeps both, and a
+    # repeat of the first does not duplicate it.
+    second = propose_regenerate(
+        first, {"kind": "missing_entry_module", "rationale": "r"},
+        additional_files=[{"path": "index.html", "description": "again"},
+                          {"path": "src/main.jsx", "description": "entry js"}])
+    assert [f["path"] for f in second.inputs["additional_files"]] == [
+        "index.html", "src/main.jsx"]
+    assert second.inputs["additional_files"][0]["description"] == "entry html"
+    # No additional files -> the key is never introduced.
+    plain = propose_regenerate(scaffold, {"kind": "unknown", "rationale": "r"})
+    assert "additional_files" not in plain.inputs
+
+
+def test_scaffold_with_additional_files_extends_last_layer():
+    """Regenerate-added paths land in the manifest without mutating the plan."""
+    from cgx.session.tasks.scaffold import _with_additional_files
+    layers = [{"name": "ui", "files": [{"path": "src/main.jsx",
+                                        "description": "entry"}]},
+              {"name": "config", "files": [{"path": "vite.config.js",
+                                            "description": "config"}]}]
+    task = TaskNode.new(
+        "sess-A", TaskKind.SCAFFOLD, "scaffold",
+        inputs={"additional_files": [
+            {"path": "index.html", "description": "entry html"},
+            {"path": "src/main.jsx", "description": "already planned"}]})
+    out, added = _with_additional_files(task, layers)
+    assert added == ["index.html"]
+    assert [f["path"] for f in out[1]["files"]] == ["vite.config.js",
+                                                    "index.html"]
+    # The caller's layers (and the stored work plan they came from) are
+    # left untouched.
+    assert [f["path"] for f in layers[1]["files"]] == ["vite.config.js"]
+
+
+def test_scaffold_with_additional_files_noop_without_marker():
+    from cgx.session.tasks.scaffold import _with_additional_files
+    layers = [{"name": "ui", "files": [{"path": "src/main.jsx",
+                                        "description": "entry"}]}]
+    task = TaskNode.new("sess-A", TaskKind.SCAFFOLD, "scaffold", inputs={})
+    out, added = _with_additional_files(task, layers)
+    assert added == []
+    assert out is layers
+
+
 def _build_regenerate_chain(*, prior_regens: int = 0,
                             prior_repair_regens: int = 0,
                             extra_descendants: bool = True):
@@ -8280,6 +9259,44 @@ def test_router_repair_regenerate_abandons_subtree_and_requeues_scaffold():
     # DONE tasks must not be abandoned.
     done_ids = {t.task_id for t in tasks if t.status is TaskNodeStatus.DONE}
     assert abandoned_ids.isdisjoint(done_ids)
+
+
+def test_router_repair_regenerate_threads_missing_files():
+    """A missing-entry-module verdict grows the next SCAFFOLD's manifest."""
+    session, _scaffold, tasks, rep = _build_regenerate_chain()
+    rep.outputs = dict(rep.outputs)
+    rep.outputs["classification"] = "smoke_import_failure"
+    rep.outputs["extra_constraints"] = {
+        "kind": "missing_entry_module",
+        "rationale": "entry module absent",
+        "missing_files": [{"path": "index.html",
+                           "description": "entry html"}],
+    }
+    plan = Router().on_task_completed(
+        session=session, completed=rep, tasks=tasks)
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    assert len(creates) == 1
+    assert creates[0].task.inputs["additional_files"] == [
+        {"path": "index.html", "description": "entry html"}]
+
+
+def test_router_repair_regenerate_preserves_failure_signatures():
+    """The failed chain's flap ledger survives into the new SCAFFOLD.
+
+    Without this, a regenerate that reproduces the identical failure
+    signature restarts with an empty ledger and the loop burns the whole
+    regenerate budget on a fix that cannot work (live: ses_612f8d1c).
+    """
+    session, _scaffold, tasks, rep = _build_regenerate_chain()
+    rep.inputs["prior_failure_signatures"] = ["sig-a", "sig-b"]
+    plan = Router().on_task_completed(
+        session=session, completed=rep, tasks=tasks)
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    assert len(creates) == 1
+    new_scaffold = creates[0].task
+    assert new_scaffold.kind is TaskKind.SCAFFOLD
+    assert new_scaffold.inputs["prior_failure_signatures"] == [
+        "sig-a", "sig-b"]
 
 
 def test_actionable_contract_warnings_filters_endpoints_and_unattributed():
@@ -8765,6 +9782,75 @@ def test_router_replan_attempt_threads_decompose_to_scaffold():
     sc = [a.task for a in plan2.actions if isinstance(a, CreateTask)][0]
     assert sc.kind is TaskKind.SCAFFOLD
     assert sc.inputs["replan_attempt"] == 1
+
+
+def test_router_replan_carries_flap_ledger_into_new_decompose():
+    """A re-plan must not restart the failure ledger from empty.
+
+    Observed live: a re-planned manifest reproduced the identical
+    ``smoke_import|npm run build --silent`` failure and, because the new
+    chain had never seen the signature, spent a second full repair
+    budget on it before the session finally failed.
+    """
+    from cgx.session.budget import REGENERATE_BUDGET
+    session, _parent, scaffold, tasks = _build_scaffold_failed_chain(
+        prior_regens=REGENERATE_BUDGET)
+    scaffold.inputs["prior_failure_signatures"] = [
+        "smoke_import|npm run build --silent"]
+    plan = Router().on_task_completed(
+        session=session, completed=scaffold, tasks=tasks)
+    dec = [a.task for a in plan.actions if isinstance(a, CreateTask)][0]
+    assert dec.kind is TaskKind.DECOMPOSE
+    assert dec.inputs["prior_failure_signatures"] == [
+        "smoke_import|npm run build --silent"]
+
+
+def test_router_flap_ledger_threads_replan_decompose_to_scaffold():
+    """The ledger rides DECOMPOSE -> ASK(APPROVE_PLAN) -> SCAFFOLD."""
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    dec = TaskNode.new(
+        session.session_id, TaskKind.DECOMPOSE, "revise",
+        inputs={"prior_goal": "g", "requirements_artifact_id": "art_req",
+                "replan_attempt": 1,
+                "prior_failure_signatures": ["sig-old"]})
+    dec.produced_artifact_id = "art_plan2"
+    dec.status = TaskNodeStatus.DONE
+    plan = Router().on_task_completed(
+        session=session, completed=dec, tasks=[dec])
+    ask = [a.task for a in plan.actions if isinstance(a, CreateTask)][0]
+    assert ask.inputs["prior_failure_signatures"] == ["sig-old"]
+    decision = Decision.new(
+        session.session_id, ask.task_id, DecisionKind.APPROVE_PLAN,
+        "approve plan", {"approved": True})
+    plan2 = Router().on_decision_recorded(
+        session=session, decision=decision, tasks=[ask])
+    sc = [a.task for a in plan2.actions if isinstance(a, CreateTask)][0]
+    assert sc.kind is TaskKind.SCAFFOLD
+    assert sc.inputs["prior_failure_signatures"] == ["sig-old"]
+    # And on down the regenerated write chain.
+    sc.produced_artifact_id = "art_scaffold2"
+    sc.status = TaskNodeStatus.DONE
+    plan3 = Router().on_task_completed(
+        session=session, completed=sc, tasks=[sc])
+    ap = [a.task for a in plan3.actions if isinstance(a, CreateTask)][0]
+    assert ap.kind is TaskKind.APPLY
+    assert ap.inputs["prior_failure_signatures"] == ["sig-old"]
+
+
+def test_router_first_run_scaffold_has_no_flap_ledger_key():
+    """A non-re-planned approval leaves the ledger key off entirely."""
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    ask = TaskNode.new(
+        session.session_id, TaskKind.ASK_USER, "approve",
+        inputs={"expected_kind": "approve_plan",
+                "work_plan_artifact_id": "art_plan"})
+    decision = Decision.new(
+        session.session_id, ask.task_id, DecisionKind.APPROVE_PLAN,
+        "approve plan", {"approved": True})
+    plan = Router().on_decision_recorded(
+        session=session, decision=decision, tasks=[ask])
+    sc = [a.task for a in plan.actions if isinstance(a, CreateTask)][0]
+    assert "prior_failure_signatures" not in sc.inputs
 
 
 def test_router_scaffold_clean_still_spawns_apply():
