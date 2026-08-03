@@ -34,6 +34,7 @@ from cgx.session.repair.pypi_client import PyPIClient
 from cgx.session.scaffold_validate import (
     check_client_server_payload_coherence,
     check_contract_compliance,
+    check_response_contract_coherence,
     cross_check_first_party_imports,
     is_requirements_path,
     validate_scaffold_diffs,
@@ -683,6 +684,22 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         payload_warnings = []
     if payload_warnings:
         contract_warnings = list(contract_warnings) + payload_warnings
+
+    # Response-contract coherence gate (P0c): a handler whose success status
+    # disagrees with the declared endpoint status (returns 200 where the
+    # contract -- and the paired test -- expect 201) is the same
+    # test<->implementation drift REPAIR chases, caught statically here. Fold
+    # any mismatch in as a ``response`` warning so the router regenerates only
+    # the offending handler file. Best-effort: a raised checker is ignored.
+    try:
+        response_warnings = check_response_contract_coherence(
+            xcheck_contents, contracts)
+    except Exception:  # pragma: no cover - defensive: checker is best-effort
+        logger.exception(
+            "SCAFFOLD: response coherence check raised; skipping")
+        response_warnings = []
+    if response_warnings:
+        contract_warnings = list(contract_warnings) + response_warnings
 
     # Finalise the checkpoint artifact in place: pin validation reassigns
     # ``diffs`` to a new list, so re-point the content at it, attach the

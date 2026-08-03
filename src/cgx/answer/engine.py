@@ -2554,12 +2554,19 @@ _ENDPOINT_EXTRACT_SYSTEM = (
     "{\n"
     '  "endpoints": [{"method": "POST", "path": "/api/x",\n'
     '    "request": {"a": "number"}, "response": {"result": "number"},\n'
+    '    "status": 200, "message": "one-line success message",\n'
     '    "description": "one-line purpose"}]\n'
     "}\n\n"
     "Rules:\n"
     "- request/response keys are the EXACT JSON field names the client sends "
     "and the server reads -- choose one spelling per field and keep it "
     "identical on both sides (do not offer synonyms).\n"
+    "- status is the success HTTP status code the handler returns and the "
+    "paired test asserts (e.g. 200 for a read, 201 for a create); choose one "
+    "and keep it identical on both sides.\n"
+    "- message, when the endpoint returns a human-readable success string, is "
+    "the EXACT literal the handler emits and the test asserts (omit it when "
+    "there is none).\n"
     "- Cover every endpoint the client calls and the server routes; nothing "
     "more.\n"
     "- Use the paths the manifest declares or clearly implies. No prose "
@@ -2670,6 +2677,18 @@ def _render_contracts_for_prompt(contracts: Any) -> str:
                 tail.append(f"request={req}")
             if resp:
                 tail.append(f"response={resp}")
+            status = ep.get("status")
+            if isinstance(status, bool):
+                status = None
+            try:
+                status_int = int(status) if status is not None else None
+            except (TypeError, ValueError):
+                status_int = None
+            if status_int is not None:
+                tail.append(f"success_status={status_int}")
+            message = str(ep.get("message") or "").strip()
+            if message:
+                tail.append(f"success_message={message!r}")
             desc = str(ep.get("description") or "").strip()
             if desc:
                 tail.append(desc)

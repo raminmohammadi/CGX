@@ -4023,15 +4023,36 @@ def test_extract_endpoint_contracts_parses_provider_reply():
     from cgx.answer.engine import extract_endpoint_contracts
     reply = ('{"endpoints": [{"method": "post", "path": "/calculate", '
              '"request": {"num1": "number", "num2": "number", '
-             '"operation": "str"}}]}')
+             '"operation": "str"}, "status": 201}]}')
     prov = _StubProvider(reply)
     eps = extract_endpoint_contracts("calc", [{"name": "a", "files": [
         {"path": "backend/app.py", "description": "flask"}]}], prov)
     assert len(eps) == 1 and eps[0]["path"] == "/calculate"
+    # The success status survives contract normalization as an int.
+    assert eps[0]["status"] == 201
     # No files -> nothing to extract; no provider -> abstain.
     assert extract_endpoint_contracts("calc", [], prov) == []
     assert extract_endpoint_contracts("calc", [{"name": "a", "files": [
         {"path": "backend/app.py"}]}], None) == []
+
+
+def test_render_contracts_declares_success_status_and_message():
+    """The endpoint contract prompt states the success status and message.
+
+    Both the handler and the paired test are generated from this fragment,
+    so the response contract (status + message) must appear verbatim.
+    """
+    from cgx.answer.engine import _render_contracts_for_prompt
+    rendered = _render_contracts_for_prompt({"endpoints": [{
+        "method": "POST", "path": "/register", "status": 201,
+        "message": "user created"}]})
+    assert "POST /register" in rendered
+    assert "success_status=201" in rendered
+    assert "user created" in rendered
+    # A boolean/garbage status is dropped rather than rendered as 1/0.
+    no_status = _render_contracts_for_prompt({"endpoints": [{
+        "method": "GET", "path": "/health", "status": True}]})
+    assert "success_status" not in no_status
 
 
 def _cross_seam_manifest():
@@ -10680,6 +10701,88 @@ def test_payload_coherence_abstains_without_seam():
     assert check_client_server_payload_coherence(None) == []
 
 
+# ------------- P0c: response-contract status coherence ---------------
+
+def test_response_coherence_flags_status_drift():
+    """Contract declares 201 but the handler returns an explicit 200."""
+    from cgx.session.scaffold_validate import (
+        check_response_contract_coherence,
+    )
+    contracts = {"endpoints": [
+        {"method": "POST", "path": "/register", "status": 201}]}
+    contents = {
+        "backend/app.py": (
+            "@app.route('/register', methods=['POST'])\n"
+            "def register():\n"
+            "    data = request.json\n"
+            "    return jsonify({'ok': True}), 200\n"),
+    }
+    warnings = check_response_contract_coherence(contents, contracts)
+    assert len(warnings) == 1
+    w = warnings[0]
+    assert w["kind"] == "response"
+    assert w["name"] == "/register"
+    assert w["file"] == "backend/app.py"
+    assert w["expected_status"] == 201
+    assert w["found_statuses"] == [200]
+    assert "201" in w["reason"]
+
+
+def test_response_coherence_flags_implicit_200_vs_declared_201():
+    """A handler with an implicit-200 success path but a declared 201."""
+    from cgx.session.scaffold_validate import (
+        check_response_contract_coherence,
+    )
+    contracts = {"endpoints": [
+        {"method": "POST", "path": "/register", "status": 201}]}
+    contents = {
+        "backend/app.py": (
+            "@app.route('/register', methods=['POST'])\n"
+            "def register():\n"
+            "    return jsonify({'ok': True})\n"),
+    }
+    warnings = check_response_contract_coherence(contents, contracts)
+    assert len(warnings) == 1
+    assert warnings[0]["expected_status"] == 201
+    assert warnings[0]["found_statuses"] == []
+
+
+def test_response_coherence_abstains_on_match_and_error_only():
+    """No warning when the success status matches or cannot be judged."""
+    from cgx.session.scaffold_validate import (
+        check_response_contract_coherence,
+    )
+    # Handler returns the declared 201 explicitly -> coherent.
+    match = {
+        "backend/app.py": (
+            "@app.route('/register', methods=['POST'])\n"
+            "def register():\n"
+            "    return jsonify({'ok': True}), 201\n"),
+    }
+    contracts_201 = {"endpoints": [
+        {"method": "POST", "path": "/register", "status": 201}]}
+    assert check_response_contract_coherence(match, contracts_201) == []
+    # Implicit-200 success with an error branch, contract declares 200 ->
+    # the explicit 400 is not a success code, so nothing to flag.
+    implicit = {
+        "backend/app.py": (
+            "@app.route('/login', methods=['POST'])\n"
+            "def login():\n"
+            "    if not ok:\n"
+            "        return jsonify({'error': 'bad'}), 400\n"
+            "    return jsonify({'token': t})\n"),
+    }
+    contracts_200 = {"endpoints": [
+        {"method": "POST", "path": "/login", "status": 200}]}
+    assert check_response_contract_coherence(implicit, contracts_200) == []
+    # No contract, no status, or no Python route -> abstain.
+    assert check_response_contract_coherence(match, None) == []
+    assert check_response_contract_coherence(match, {"endpoints": [
+        {"method": "POST", "path": "/register"}]}) == []
+    assert check_response_contract_coherence(
+        {"src/App.jsx": "fetch('/register')\n"}, contracts_201) == []
+
+
 def test_scaffold_executor_surfaces_import_warnings(store, monkeypatch):
     """SCAFFOLD runs the cross-check and surfaces ``import_warnings``."""
     from cgx.session.tasks.scaffold import run_scaffold
@@ -11581,6 +11684,44 @@ def test_router_scaffold_payload_repeat_is_non_terminal():
     assert signatures
     scaffold.inputs["prior_failure_signatures"] = signatures
     assert _scaffold_payload_regenerate_actions(scaffold, [scaffold]) == []
+
+
+def _response_warning(file="backend/app.py"):
+    return {"kind": "response", "name": "/register", "file": file,
+            "expected_status": 201, "found_statuses": [200],
+            "reason": "handler returns 200 but the contract declares 201"}
+
+
+def test_actionable_payload_warnings_accepts_response_kind():
+    """The seam edge acts on both payload (client) and response (server)."""
+    from cgx.session.greenfield_edges import _actionable_payload_warnings
+    got = _actionable_payload_warnings({"contract_warnings": [
+        _payload_warning(),
+        _response_warning(),
+        {"kind": "response", "name": "/x"},  # no file -> skip
+    ]})
+    assert [w["file"] for w in got] == [
+        "src/components/Calculator.jsx", "backend/app.py"]
+
+
+def test_router_scaffold_response_mismatch_targeted_regenerate():
+    # A response-status drift regenerates ONLY the offending handler file
+    # against the prior scaffold artifact, with the mismatch folded in.
+    from cgx.session.greenfield_edges import (
+        _scaffold_payload_regenerate_actions,
+    )
+    _session, scaffold = _make_clean_scaffold_with_contracts(
+        [_response_warning()])
+    actions = _scaffold_payload_regenerate_actions(scaffold, [scaffold])
+    creates = [a for a in actions if isinstance(a, CreateTask)]
+    assert len(creates) == 1
+    new_scaffold = creates[0].task
+    assert new_scaffold.kind is TaskKind.SCAFFOLD
+    assert new_scaffold.inputs["regenerate_files"] == ["backend/app.py"]
+    assert new_scaffold.inputs["prior_scaffold_artifact_id"] == "art_s"
+    constraint = new_scaffold.inputs["regenerate_constraints"][-1]
+    assert constraint["kind"] == "payload_mismatch"
+    assert "201" in constraint["rationale"]
 
 
 def test_router_repair_regenerate_budget_exhausted_fails_session():

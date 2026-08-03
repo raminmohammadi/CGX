@@ -761,19 +761,22 @@ def _scaffold_contract_regenerate_actions(
 
 def _actionable_payload_warnings(
         outputs: Dict[str, object]) -> List[Dict[str, object]]:
-    """Return the cross-language payload warnings a regenerate can act on.
+    """Return the cross-language seam warnings a regenerate can act on.
 
-    Keeps only a ``payload`` warning that names a concrete client ``file``
-    -- the offending fetch body is known and re-authoring that file against
-    the backend contract is a satisfiable, targeted goal. Anything without a
-    file is dropped so an unlocatable mismatch never forces a retry.
+    Keeps only a ``payload`` warning (a client fetch body whose keys
+    disagree with the handler) or a ``response`` warning (a handler whose
+    success status disagrees with the declared endpoint) that names a
+    concrete ``file`` -- the offending client/server file is known and
+    re-authoring it against the endpoint contract is a satisfiable, targeted
+    goal. Anything without a file is dropped so an unlocatable mismatch never
+    forces a retry.
     """
     out: List[Dict[str, object]] = []
     warnings = outputs.get("contract_warnings")
     if not isinstance(warnings, (list, tuple)):
         return out
     for w in warnings:
-        if (isinstance(w, dict) and w.get("kind") == "payload"
+        if (isinstance(w, dict) and w.get("kind") in ("payload", "response")
                 and str(w.get("file") or "").strip()):
             out.append(w)
     return out
@@ -781,13 +784,26 @@ def _actionable_payload_warnings(
 
 def _payload_regenerate_constraint(
         warnings: List[Dict[str, object]]) -> Dict[str, object]:
-    """Fold client/server payload mismatches into a regenerate constraint."""
-    items = [f"{w.get('file')} -> {w.get('name')}: send exactly "
-             f"{w.get('expected_keys')}" for w in warnings[:6]]
-    rationale = ("the frontend request payload(s) disagree with the backend "
-                 "contract: " + "; ".join(items)
-                 + ". Re-author each client file so its fetch body keys "
-                 "match the endpoint exactly.")
+    """Fold client/server seam mismatches into a regenerate constraint.
+
+    Handles both ``payload`` warnings (request body keys) and ``response``
+    warnings (success status codes); each item names the file to re-author
+    and the contract it must satisfy.
+    """
+    items: List[str] = []
+    for w in warnings[:6]:
+        if w.get("kind") == "response":
+            items.append(
+                f"{w.get('file')} -> {w.get('name')}: return HTTP status "
+                f"{w.get('expected_status')} (found {w.get('found_statuses')})")
+        else:
+            items.append(
+                f"{w.get('file')} -> {w.get('name')}: send exactly "
+                f"{w.get('expected_keys')}")
+    rationale = ("the generated client/server seam disagrees with the "
+                 "endpoint contract: " + "; ".join(items)
+                 + ". Re-author each named file to match the endpoint "
+                 "contract exactly (request body keys and success status).")
     return {"kind": "payload_mismatch", "rationale": rationale,
             "unmet_payloads": items}
 
@@ -795,15 +811,17 @@ def _payload_regenerate_constraint(
 def _scaffold_payload_regenerate_actions(
         completed: TaskNode,
         tasks: List[TaskNode]) -> List[RouterAction]:
-    """Targeted-regenerate the client file(s) behind a payload mismatch.
+    """Targeted-regenerate the file(s) behind a client/server seam mismatch.
 
     Complements :func:`_scaffold_contract_regenerate_actions`: that path
     handles unmet Python symbol contracts with a whole-tree regenerate;
     this one owns the JS<->Python seam. When SCAFFOLD flagged a ``payload``
     warning (a fetch body whose keys disagree with the handler it targets)
-    and the prior scaffold artifact is available, regenerate *only* the
-    named client file(s) against it -- reusing every prior-good diff -- so
-    the mismatch is corrected without rebuilding the tree. Bounded by
+    or a ``response`` warning (a handler whose success status disagrees with
+    the declared endpoint) and the prior scaffold artifact is available,
+    regenerate *only* the named client/server file(s) against it -- reusing
+    every prior-good diff -- so the mismatch is corrected without rebuilding
+    the tree. Bounded by
     :data:`~cgx.session.budget.REGENERATE_BUDGET` and the same flap
     signature the dropped-file paths use, and deliberately non-terminal: on
     a spent budget, a repeated mismatch, or a missing prior artifact the
