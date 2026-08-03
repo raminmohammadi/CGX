@@ -50,13 +50,14 @@ def _safe_skill_path(name: str) -> Path:
     """
     if not _SKILL_NAME_RE.match(name or ""):
         raise ValueError(f"invalid skill name: {name!r}")
-    base = CUSTOM_SKILLS_DIR.resolve()
-    path = (CUSTOM_SKILLS_DIR / f"{name}.py").resolve()
-    try:
-        path.relative_to(base)
-    except ValueError:
+    # Containment is re-checked with os.path.realpath + str.startswith rather
+    # than Path.resolve()/relative_to: the two are equivalent, but only the
+    # former is recognised as a path-injection barrier by static analysis.
+    base = os.path.realpath(str(CUSTOM_SKILLS_DIR))
+    candidate = os.path.realpath(os.path.join(base, f"{name}.py"))
+    if not candidate.startswith(base + os.sep):
         raise ValueError(f"invalid skill name: {name!r}")
-    return path
+    return Path(candidate)
 
 
 @dataclass
