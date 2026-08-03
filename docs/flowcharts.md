@@ -197,10 +197,11 @@ flowchart LR
     IC -- "passed" --> RUN(["RUNTIME_VERIFY"])
     IC -- "fixable failure" --> REP(["REPAIR"])
     RUN --> IC2{"router"}
-    IC2 -- "boots / no entry" --> DONE((COMPLETED))
+    IC2 -- "boots / no entry (no coverage gap)" --> DONE((COMPLETED))
     IC2 -- "boot fails" --> REP
+    IC2 -- "coverage gap: JS suite unrun / server entry not booted" --> FAIL((FAILED))
     REP --> APP
-    IC -- "budget spent / flap" --> FAIL((FAILED))
+    IC -- "budget spent / flap" --> FAIL
     IC2 -- "budget spent" --> FAIL
 
     classDef road fill:#3b6ea5,stroke:#274c73,color:#fff;
@@ -392,7 +393,11 @@ flowchart TB
                                        create_app) under the venv -> a
                                        RUNTIME_REPORT (P1; outcome=passed|
                                        failed|timeout|error|skipped).
-                                       passed/skipped -> COMPLETED;
+                                       passed/skipped -> COMPLETED, unless
+                                       the fail-closed policy finds a
+                                       coverage gap (unrun scaffolded JS
+                                       suite, or skipped boot with a
+                                       server entry on disk) -> FAILED;
                                        a hard boot failure -> REPAIR (#3)
 ```
 
@@ -550,6 +555,7 @@ Where to look in the repo:
 | Contract + coherence gates | `src/cgx/session/scaffold_validate.py :: {check_contract_compliance, cross_check_first_party_imports, check_client_server_payload_coherence}` |
 | Frontend coherence passes | `src/cgx/session/tasks/scaffold.py :: {_synthesize_missing_frontend_stylesheets, _js_import_coherence_failures}` |
 | Targeted build-smoke repair | `src/cgx/session/repair/classify.py :: unresolved_import_sources` + `src/cgx/session/tasks/repair.py :: _build_smoke_target_files` |
+| Terminal fail-closed policy | `src/cgx/session/router.py :: {_coverage_gap, _verify_terminal_session_actions, _runtime_verify_terminal_session_actions}` |
 | Shared write executors   | `src/cgx/session/tasks/{apply,verify,ask}.py` |
 | Decision validation      | `src/cgx/session/tasks/ask.py :: build_decision` |
 | HTTP routes              | `src/cgx/webui/routes/agent_session.py` |

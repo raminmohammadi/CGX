@@ -719,7 +719,31 @@ this subsection first; the six moving parts are:
    `REPAIR` with the `RUNTIME_REPORT` as the source artifact, under the
    same shared budget + `failure_signature` flap detector as the
    `SMOKE` / `API_CHECK` gates. `passed` / `skipped` COMPLETE the session
-   via `_runtime_verify_terminal_session_actions`.
+   via `_runtime_verify_terminal_session_actions` -- subject to the P2
+   fail-closed policy below.
+
+   **Terminal fail-closed policy (P2).** A gate that reports `passed` /
+   `skipped` can still hide a blind spot that means the delivered app was
+   never actually exercised -- exactly what let ses_4cbf963cdc67435a ship
+   `completed` with a broken, untested React half. `_coverage_gap` is
+   consulted before either `_verify_terminal_session_actions` or
+   `_runtime_verify_terminal_session_actions` reports green, and downgrades
+   a would-be `COMPLETED` to `FAILED` on two gaps: **(a)** a scaffolded JS
+   suite present on disk (`js_tests_present`) that no JS runner executed
+   (`js_tests_ran` falsy) -- the flag is threaded forward from VERIFY onto
+   the RUNTIME_VERIFY node by `_runtime_verify_node` so it survives to the
+   boot gate's terminal, and is read from `outputs` (VERIFY's own report)
+   with an `inputs` fallback (RUNTIME_VERIFY); **(b)** a RUNTIME_VERIFY that
+   `skipped` while its whole-tree scan still surfaced a bootable entry
+   (`entry_files` non-empty) -- a server the tree clearly contains that was
+   never booted (typically a missing bootstrapped interpreter). These are
+   environmental coverage gaps (an absent toolchain / interpreter, not
+   broken source that a regenerate could re-author), so the policy fails
+   the session closed rather than re-queue a loop that would re-hit the
+   identical miss; the productive code-shaped repairs (a boot crash, a JS
+   build/resolve error) are already routed to `REPAIR` upstream. Green is
+   therefore honest: a `completed` greenfield session provably ran every
+   scaffolded suite and booted every detected server.
 
 5. **Progress-aware + coverage-aware budgets.** The old loop gave up
    after two shots even while it was genuinely improving.

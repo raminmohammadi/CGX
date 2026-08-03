@@ -772,11 +772,27 @@ Once `VERIFY` is green in greenfield mode, the router runs a
 `RUNTIME_VERIFY` gate before declaring the session complete: it boots
 each detected entry module (`app.py` / `main.py` / any file that
 constructs a Flask / FastAPI app or defines `create_app`) under the
-bootstrapped venv and emits a `RUNTIME_REPORT`. A clean boot
-(`passed`) -- or a run with no detectable entry to boot (`skipped`) --
-COMPLETES the session; a hard boot failure routes back to `REPAIR`
-under the same budget. This is what turns "the tests the model wrote
-pass" into "the app actually runs".
+bootstrapped venv and emits a `RUNTIME_REPORT`. Entry detection scans
+the whole applied project tree (pruning `node_modules` / `.venv` /
+build / cache dirs), not just the last `APPLY`'s file list, so a nested
+`backend/app.py` written in an earlier chain is still booted rather than
+skipped. A clean boot (`passed`) -- or a run with no detectable entry to
+boot (`skipped`) -- COMPLETES the session; a hard boot failure routes
+back to `REPAIR` under the same budget. This is what turns "the tests
+the model wrote pass" into "the app actually runs".
+
+Completion is additionally held to a **fail-closed policy** so "green"
+is honest. A terminal that would report `COMPLETED` is downgraded to
+`FAILED` when either (a) a JS test suite was scaffolded on disk but no
+JS runner actually executed it (a passing Python half must not mask an
+unrun React suite), or (b) `RUNTIME_VERIFY` `skipped` while a bootable
+server entry was present on disk (a server the tree contains that was
+never exercised -- typically a missing bootstrapped interpreter). These
+are environmental coverage gaps a regenerate cannot fix, so the loop
+fails closed rather than spin; the code-shaped failures (a boot crash, a
+JS build/resolve error) are already routed to `REPAIR`. A `completed`
+greenfield session therefore provably ran every scaffolded suite and
+booted every detected server.
 
 Every greenfield failure path is terminal. A *hard* executor
 failure -- one that returns no `outputs`, such as a `BOOTSTRAP_ENV`
@@ -816,8 +832,9 @@ flowchart LR
     I -- "passed" --> R(["RUNTIME_VERIFY<br/>boot the app"])
     I -- "fixable failure" --> RE(["REPAIR"])
     R --> I2{"router"}
-    I2 -- "boots" --> OK((COMPLETED))
+    I2 -- "boots, no coverage gap" --> OK((COMPLETED))
     I2 -- "boot fails" --> RE
+    I2 -- "coverage gap (JS suite unrun / server not booted)" --> NO((FAILED))
     RE --> A
     I -- "budget spent" --> NO((FAILED))
 

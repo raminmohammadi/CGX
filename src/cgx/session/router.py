@@ -631,6 +631,12 @@ def _runtime_verify_node(parent: TaskNode) -> List[TaskNode]:
             "plan_artifact_id": parent.inputs.get("plan_artifact_id"),
             "prior_goal": parent.inputs.get("prior_goal"),
             "mode": SessionMode.GREENFIELD.value,
+            # Thread VERIFY's JS coverage signal forward so the terminal
+            # fail-closed policy (P2) can see, at RUNTIME_VERIFY completion,
+            # whether a scaffolded JS suite was present but never executed --
+            # RUNTIME_VERIFY's own outputs do not carry it.
+            "js_tests_present": (parent.outputs or {}).get("js_tests_present"),
+            "js_tests_ran": (parent.outputs or {}).get("js_tests_ran"),
             # Thread the shared repair budget through the runtime gate so a
             # boot failure can route to REPAIR under the same attempt cap +
             # flap detector as the pre-VERIFY gates (#3).
@@ -730,6 +736,51 @@ def _repair_to_apply_or_ask(parent: TaskNode) -> List[TaskNode]:
     )]
 
 
+def _coverage_gap(completed: TaskNode) -> Optional[str]:
+    """Return a coverage gap that must block a green completion (P2).
+
+    Terminal fail-closed policy. A gate whose ``outcome`` reads
+    ``passed`` / ``skipped`` can still hide a blind spot that means the
+    delivered app was never actually exercised -- exactly what let
+    ses_4cbf963cdc67435a ship "completed" with a broken, untested React
+    half. Two such gaps block the green:
+
+    * **JS tests present but unrun** -- a scaffolded JS suite exists on
+      disk (``js_tests_present``) yet no JS runner executed a real suite
+      (``js_tests_ran`` falsy), so a passing Python half was masking an
+      unrun React suite. The flags are read from ``outputs`` (a VERIFY
+      terminal's own report) with an ``inputs`` fallback (threaded onto
+      RUNTIME_VERIFY by :func:`_runtime_verify_node`, whose own outputs
+      do not carry them).
+    * **Boot skipped with a server entry present** -- a RUNTIME_VERIFY
+      that ``skipped`` while its whole-tree scan still surfaced a bootable
+      entry (``entry_files`` non-empty) never actually booted a server the
+      tree clearly contains (typically a missing bootstrapped interpreter,
+      not an absent app).
+
+    Returns a short reason token, or ``None`` when the terminal is
+    honestly green. These are unrecoverable-by-regeneration coverage
+    gaps (a missing toolchain / interpreter, not broken source), so the
+    caller fails the session closed rather than re-queue a loop that
+    would re-hit the identical environmental miss.
+    """
+    outputs = completed.outputs or {}
+    inputs = completed.inputs or {}
+
+    def _flag(key: str) -> bool:
+        if key in outputs:
+            return bool(outputs.get(key))
+        return bool(inputs.get(key))
+
+    if _flag("js_tests_present") and not _flag("js_tests_ran"):
+        return "js_tests_present_but_unrun"
+    if (completed.kind is TaskKind.RUNTIME_VERIFY
+            and str(outputs.get("outcome") or "").strip() == "skipped"
+            and outputs.get("entry_files")):
+        return "runtime_boot_skipped_with_server_entry"
+    return None
+
+
 def _verify_terminal_session_actions(
         completed: TaskNode) -> List[RouterAction]:
     """Set the session's terminal status for a greenfield VERIFY.
@@ -740,17 +791,19 @@ def _verify_terminal_session_actions(
     terminal outcome (assertions still failing after the repair budget,
     a flapping signature, a collection error with no fixable cause, or
     no tests at all) is a definitive ``FAILED`` -- never a silent
-    "success". Explore-mode sessions keep their own lifecycle, so this
-    returns an empty list for them.
+    "success". A terminal that would read green is additionally held to
+    the P2 fail-closed policy: an unrun scaffolded JS suite
+    (:func:`_coverage_gap`) downgrades it to ``FAILED`` rather than
+    reporting a false green. Explore-mode sessions keep their own
+    lifecycle, so this returns an empty list for them.
     """
     mode = str(completed.inputs.get("mode") or "").strip()
     if mode != SessionMode.GREENFIELD.value:
         return []
     outputs = completed.outputs or {}
     outcome = str(outputs.get("outcome") or "").strip()
-    status = (SessionStatus.COMPLETED
-              if outcome in _VERIFY_SUCCESS_OUTCOMES
-              else SessionStatus.FAILED)
+    green = outcome in _VERIFY_SUCCESS_OUTCOMES and not _coverage_gap(completed)
+    status = SessionStatus.COMPLETED if green else SessionStatus.FAILED
     return [UpdateSessionStatus(session_id=completed.session_id,
                                 status=status)]
 
@@ -770,17 +823,22 @@ def _runtime_verify_terminal_session_actions(
     A booting app (``passed``) -- or a run with no detectable entry to
     boot (``skipped``) -- COMPLETES the session; any hard boot outcome
     (``failed`` / ``timeout`` / ``error``) is a definitive ``FAILED``.
-    Mirrors :func:`_verify_terminal_session_actions`; explore mode never
-    reaches RUNTIME_VERIFY, so this is a no-op there.
+    A terminal that would read green is additionally held to the P2
+    fail-closed policy (:func:`_coverage_gap`): an unrun scaffolded JS
+    suite (threaded forward from VERIFY) or a boot that ``skipped`` while
+    a server entry was present on disk downgrades it to ``FAILED`` rather
+    than reporting a false green. Mirrors
+    :func:`_verify_terminal_session_actions`; explore mode never reaches
+    RUNTIME_VERIFY, so this is a no-op there.
     """
     mode = str(completed.inputs.get("mode") or "").strip()
     if mode != SessionMode.GREENFIELD.value:
         return []
     outputs = completed.outputs or {}
     outcome = str(outputs.get("outcome") or "").strip()
-    status = (SessionStatus.COMPLETED
-              if outcome in _RUNTIME_VERIFY_SUCCESS_OUTCOMES
-              else SessionStatus.FAILED)
+    green = (outcome in _RUNTIME_VERIFY_SUCCESS_OUTCOMES
+             and not _coverage_gap(completed))
+    status = SessionStatus.COMPLETED if green else SessionStatus.FAILED
     return [UpdateSessionStatus(session_id=completed.session_id,
                                 status=status)]
 

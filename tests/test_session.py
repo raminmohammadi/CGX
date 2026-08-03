@@ -1726,7 +1726,8 @@ def test_router_verify_passed_spawns_runtime_verify():
                 "scaffold_artifact_id": "art_scaffold"})
     ver.produced_artifact_id = "art_verify"
     ver.outputs = {"outcome": "passed", "failure_signature": "p",
-                   "returncode": 0}
+                   "returncode": 0,
+                   "js_tests_present": True, "js_tests_ran": False}
     ver.status = TaskNodeStatus.DONE
     plan = Router().on_task_completed(
         session=session, completed=ver, tasks=[ver])
@@ -1737,6 +1738,10 @@ def test_router_verify_passed_spawns_runtime_verify():
     assert rv.inputs["verify_artifact_id"] == "art_verify"
     assert rv.inputs["build_artifact_id"] == "art_build"
     assert rv.inputs["apply_artifact_id"] == "art_apply"
+    # P2: VERIFY's JS coverage signal is threaded forward so the runtime
+    # gate's terminal action can fail closed on an unrun scaffolded suite.
+    assert rv.inputs["js_tests_present"] is True
+    assert rv.inputs["js_tests_ran"] is False
     # The session status is deferred to the runtime gate, not set here.
     assert not any(isinstance(a, UpdateSessionStatus) for a in plan.actions)
 
@@ -1854,6 +1859,93 @@ def test_router_runtime_verify_explore_is_noop():
     plan = Router().on_task_completed(
         session=session, completed=rv, tasks=[rv])
     assert not any(isinstance(a, UpdateSessionStatus) for a in plan.actions)
+
+
+def test_router_runtime_verify_passed_but_js_unrun_fails_closed():
+    """P2: a booting app with an unrun scaffolded JS suite is not green.
+
+    The ses_4cbf963cdc67435a hole -- the Python half passed and the app
+    booted, but the scaffolded React suite never executed, so "completed"
+    would have been a false green. The terminal fails closed to FAILED.
+    """
+    from cgx.session.models import SessionMode
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    rv = TaskNode.new(
+        session.session_id, TaskKind.RUNTIME_VERIFY, "runtime",
+        inputs={"mode": SessionMode.GREENFIELD.value,
+                "js_tests_present": True, "js_tests_ran": False})
+    rv.outputs = {"outcome": "passed", "failure_signature": ""}
+    rv.status = TaskNodeStatus.DONE
+    plan = Router().on_task_completed(
+        session=session, completed=rv, tasks=[rv])
+    assert [a for a in plan.actions if isinstance(a, CreateTask)] == []
+    status = [a for a in plan.actions if isinstance(a, UpdateSessionStatus)]
+    assert len(status) == 1
+    assert status[0].status is SessionStatus.FAILED
+
+
+def test_router_runtime_verify_passed_with_js_ran_completes():
+    """A booting app whose scaffolded JS suite actually ran is green."""
+    from cgx.session.models import SessionMode
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    rv = TaskNode.new(
+        session.session_id, TaskKind.RUNTIME_VERIFY, "runtime",
+        inputs={"mode": SessionMode.GREENFIELD.value,
+                "js_tests_present": True, "js_tests_ran": True})
+    rv.outputs = {"outcome": "passed", "failure_signature": ""}
+    rv.status = TaskNodeStatus.DONE
+    plan = Router().on_task_completed(
+        session=session, completed=rv, tasks=[rv])
+    status = [a for a in plan.actions if isinstance(a, UpdateSessionStatus)]
+    assert len(status) == 1
+    assert status[0].status is SessionStatus.COMPLETED
+
+
+def test_router_runtime_verify_skipped_with_server_entry_fails_closed():
+    """P2: a boot that skipped while a server entry was on disk is not green.
+
+    The whole-tree scan (P1c) surfaced a bootable ``backend/app.py``, but
+    the gate skipped (e.g. no bootstrapped interpreter) so the server was
+    never actually exercised. Completing green would repeat the
+    ses_4cbf963cdc67435a blind spot, so the terminal fails closed.
+    """
+    from cgx.session.models import SessionMode
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    rv = TaskNode.new(
+        session.session_id, TaskKind.RUNTIME_VERIFY, "runtime",
+        inputs={"mode": SessionMode.GREENFIELD.value})
+    rv.outputs = {"outcome": "skipped", "entry_files": ["backend/app.py"]}
+    rv.status = TaskNodeStatus.DONE
+    plan = Router().on_task_completed(
+        session=session, completed=rv, tasks=[rv])
+    status = [a for a in plan.actions if isinstance(a, UpdateSessionStatus)]
+    assert len(status) == 1
+    assert status[0].status is SessionStatus.FAILED
+
+
+def test_router_verify_skipped_but_js_unrun_fails_closed():
+    """P2: a test-free VERIFY that still carries an unrun JS suite is not green.
+
+    A polyglot repo whose Python half is test-free (combined ``skipped``)
+    but whose scaffolded JS suite was never executed reaches the VERIFY
+    terminal directly (no boot gate). It must fail closed rather than
+    report the write loop delivered a verified app.
+    """
+    from cgx.session.models import SessionMode
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    ver = TaskNode.new(
+        session.session_id, TaskKind.VERIFY, "verify",
+        inputs={"mode": SessionMode.GREENFIELD.value})
+    ver.outputs = {"outcome": "skipped", "failure_signature": "",
+                   "returncode": 5,
+                   "js_tests_present": True, "js_tests_ran": False}
+    ver.status = TaskNodeStatus.DONE
+    plan = Router().on_task_completed(
+        session=session, completed=ver, tasks=[ver])
+    assert [a for a in plan.actions if isinstance(a, CreateTask)] == []
+    status = [a for a in plan.actions if isinstance(a, UpdateSessionStatus)]
+    assert len(status) == 1
+    assert status[0].status is SessionStatus.FAILED
 
 
 def test_router_on_task_failed_greenfield_marks_session_failed():
