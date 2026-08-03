@@ -200,6 +200,33 @@ def test_rollback_rejects_backup_outside_project_root(tmp_path: Path) -> None:
     assert "outside project_root" in (out.get("error") or "")
 
 
+def test_rollback_hides_raw_oserror_from_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A per-file OSError during restore must not surface its (stack-trace
+    # bearing) string to the caller -- the payload is rendered in the UI.
+    _make_project(tmp_path)
+    res = apply_diffs_to_disk(str(tmp_path), [
+        {"file": "pkg/mod.py", "patch": _EDIT_DIFF},
+    ])
+    import cgx.codegen.disk_apply as da
+
+    def boom(src, dst):
+        raise OSError("/secret/internal/path leaked via exception")
+
+    monkeypatch.setattr(da.shutil, "copy2", boom)
+    with caplog.at_level("WARNING", logger="cgx.codegen.disk_apply"):
+        out = da.rollback_from_backup(str(tmp_path), res["backup_dir"])
+
+    assert out["failed_files"]
+    for f in out["failed_files"]:
+        assert f["error"] == "could not restore file"
+    # The real detail is logged server-side only.
+    assert any("/secret/internal/path" in r.getMessage()
+               for r in caplog.records)
+
+
 def test_partial_failure_logs_each_dropped_file(
     tmp_path: Path, caplog: pytest.LogCaptureFixture,
 ) -> None:

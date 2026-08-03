@@ -17,6 +17,7 @@ import importlib.util
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -33,6 +34,27 @@ CUSTOM_SKILLS_DIR = CONFIG_DIR / "skills"
 
 _PROBE_PATH = Path(__file__).resolve().parent / "_skill_probe.py"
 _PROBE_TIMEOUT_SECONDS = 8
+
+# Skill names reach the CRUD helpers straight from a REST path parameter,
+# so they are restricted to a conservative identifier allowlist before ever
+# being turned into a ``<name>.py`` filename. This blocks ``..`` / absolute
+# / separator traversal (path injection) at the door.
+_SKILL_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
+
+
+def _safe_skill_path(name: str) -> Path:
+    """Resolve ``<name>.py`` under :data:`CUSTOM_SKILLS_DIR`.
+
+    Rejects any ``name`` that is not a plain identifier or that would
+    resolve outside the custom-skills directory, raising :class:`ValueError`.
+    """
+    if not _SKILL_NAME_RE.match(name or ""):
+        raise ValueError(f"invalid skill name: {name!r}")
+    base = CUSTOM_SKILLS_DIR.resolve()
+    path = (base / f"{name}.py").resolve()
+    if path.parent != base:
+        raise ValueError(f"invalid skill name: {name!r}")
+    return path
 
 
 @dataclass
@@ -61,7 +83,10 @@ def list_custom_skill_files() -> List[Path]:
 
 
 def read_custom_skill_source(name: str) -> Optional[str]:
-    path = CUSTOM_SKILLS_DIR / f"{name}.py"
+    try:
+        path = _safe_skill_path(name)
+    except ValueError:
+        return None
     if not path.exists():
         return None
     try:
@@ -201,7 +226,7 @@ def validate_skill_source(source: str, known_names: Set[str]) -> SkillValidation
 
 def save_custom_skill(name: str, source: str) -> None:
     _ensure_dir()
-    path = CUSTOM_SKILLS_DIR / f"{name}.py"
+    path = _safe_skill_path(name)
     path.write_text(source, encoding="utf-8")
     try:
         os.chmod(path, 0o600)
@@ -210,7 +235,10 @@ def save_custom_skill(name: str, source: str) -> None:
 
 
 def delete_custom_skill(name: str) -> bool:
-    path = CUSTOM_SKILLS_DIR / f"{name}.py"
+    try:
+        path = _safe_skill_path(name)
+    except ValueError:
+        return False
     if not path.exists():
         return False
     path.unlink()

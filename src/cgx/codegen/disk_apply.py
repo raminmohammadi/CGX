@@ -369,7 +369,13 @@ def rollback_from_backup(
                 restored.append(str(target_rel))
                 logger.info("rollback_from_backup: restored %s", target_rel)
         except OSError as e:
-            failed.append({"file": str(target_rel), "error": str(e)})
+            # Log the underlying OS error (with type) server-side only; the
+            # returned payload is surfaced in the UI, so expose a generic
+            # message rather than a stack-trace-bearing exception string.
+            logger.warning("rollback_from_backup: failed on %s: %s: %s",
+                           target_rel, type(e).__name__, e)
+            failed.append({"file": str(target_rel),
+                           "error": "could not restore file"})
 
     return {"restored_files": restored, "deleted_files": deleted,
             "failed_files": failed}

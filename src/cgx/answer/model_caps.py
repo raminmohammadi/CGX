@@ -118,7 +118,7 @@ def get_model_context_window(model: Optional[str]) -> int:
     base = m.split(":", 1)[0]
     if base in _MODEL_CONTEXT_TOKENS:
         return _MODEL_CONTEXT_TOKENS[base]
-    base2 = re.sub(r"-\d+(?:x\d+)?\.?\d*b$", "", base)
+    base2 = re.sub(r"-\d+(?:x\d+)?(?:\.\d+)?b$", "", base)
     if base2 in _MODEL_CONTEXT_TOKENS:
         return _MODEL_CONTEXT_TOKENS[base2]
     for key, ctx in _MODEL_CONTEXT_TOKENS.items():

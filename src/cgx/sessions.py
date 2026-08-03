@@ -23,6 +23,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
+from cgx.logging_setup import scrub_secrets
+
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +49,14 @@ class SessionMeta:
 
 def _ensure_dir() -> None:
     SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    # Session logs hold free-text chat content the user may consider
+    # sensitive; keep them owner-only on disk (mirrors the 0600/0700
+    # convention used for ~/.cgx/secrets.json).
+    try:
+        os.chmod(SESSIONS_DIR, 0o700)
+    except OSError as e:
+        logger.warning("sessions: chmod on %s failed: %s: %s",
+                       SESSIONS_DIR, type(e).__name__, e)
 
 
 def _load_index() -> Dict[str, Any]:
@@ -101,7 +111,9 @@ def create_session(title: str = "") -> SessionMeta:
     _ensure_dir()
     sid = uuid.uuid4().hex[:12]
     meta = SessionMeta(id=sid, title=(title or "Untitled"))
-    _path_for(sid).touch()
+    # Create the log owner-only from the start (0600) so message content
+    # is never briefly world-readable between touch and first write.
+    os.close(os.open(_path_for(sid), os.O_CREAT | os.O_WRONLY, 0o600))
     data = _load_index()
     data["sessions"].append(meta.to_dict())
     _save_index(data)
@@ -132,8 +144,11 @@ def append_message(session_id: str, role: str, content: str,
         raise FileNotFoundError(f"session {session_id} does not exist")
     record = {"role": str(role), "content": str(content),
               "at": time.time(), "meta": (meta or {})}
+    # Redact any credential-shaped token (Gemini ?key=, api_key=, Bearer)
+    # before it lands on disk so a pasted secret is never persisted verbatim.
+    line = scrub_secrets(json.dumps(record, ensure_ascii=False))
     with _path_for(session_id).open("a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        f.write(line + "\n")
     # Update header.
     data = _load_index()
     for s in data["sessions"]:

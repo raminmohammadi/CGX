@@ -61,7 +61,10 @@ def ping_provider(req: PingRequest) -> PingResponse:
     try:
         if req.kind == "ollama":
             import requests as _req
-            base = (req.base_url or "http://localhost:11434").replace("/v1", "").rstrip("/")
+            # Validate the user-supplied base URL before fetching it
+            # server-side (SSRF guard: http/https + real host only).
+            base = ollama_discovery.validate_base_url(
+                (req.base_url or "http://localhost:11434").replace("/v1", ""))
             r = _req.get(f"{base}/api/tags", timeout=8)
             r.raise_for_status()
             # Verify the selected model is actually installed.
@@ -103,9 +106,11 @@ def ping_provider(req: PingRequest) -> PingResponse:
         else:
             # openai-compat or custom: attempt a GET to the base URL to verify reachability.
             import requests as _req
-            base = (req.base_url or "").rstrip("/")
-            if not base:
-                return PingResponse(ok=False, error="base_url is required")
+            # Validate before issuing the server-side request (SSRF guard).
+            try:
+                base = ollama_discovery.validate_base_url(req.base_url or "")
+            except ValueError as ve:
+                return PingResponse(ok=False, error=str(ve))
             path = req.endpoint_path or "/v1/chat/completions"
             # Lightweight OPTIONS/HEAD is usually enough to confirm the host is up.
             headers = {}

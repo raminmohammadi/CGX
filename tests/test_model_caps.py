@@ -40,6 +40,21 @@ def test_window_strips_param_size_suffix():
     assert get_model_context_window("qwen2.5-coder-7b") == 32_768
     assert get_model_context_window("mixtral-8x7b") == 32_768
     assert get_model_context_window("llama3.1-70b") == 128_000
+    # Fractional sizes (``-1.5b``) still strip after the ReDoS-hardening
+    # rewrite of the suffix regex.
+    assert get_model_context_window("qwen2.5-coder-1.5b") == 32_768
+
+
+def test_window_param_suffix_regex_is_not_polynomial():
+    # The suffix regex runs on a user-provided model id. A pathological
+    # input (leading '-0' then a long run of digits, no trailing 'b') used
+    # to force polynomial backtracking; the deterministic rewrite must
+    # return promptly and fall through to the default window.
+    import time
+    evil = "-0" + "0" * 50_000
+    start = time.monotonic()
+    assert get_model_context_window(evil) == DEFAULT_CONTEXT_TOKENS
+    assert time.monotonic() - start < 1.0
 
 
 def test_window_family_substring_match():

@@ -144,3 +144,46 @@ def test_sort_model_choices_uses_params_lookup_for_e_variants():
         {"gemma4:e2b": 2.0, "gemma4:e4b": 4.0, "gemma4:12b": 12.0},
     )
     assert out == ["gemma4:e2b", "gemma4:e4b", "gemma4:12b"]
+
+
+# --- SSRF guard: validate_base_url -----------------------------------------
+
+
+@pytest.mark.parametrize("raw, expected", [
+    ("http://localhost:11434", "http://localhost:11434"),
+    ("http://localhost:11434/", "http://localhost:11434"),
+    ("https://ollama.example.com:443/base/", "https://ollama.example.com:443/base"),
+    ("HTTP://Host:80", "http://Host:80"),
+])
+def test_validate_base_url_accepts_and_normalizes(raw, expected):
+    assert od.validate_base_url(raw) == expected
+
+
+@pytest.mark.parametrize("raw", [
+    "",
+    "   ",
+    "ftp://localhost:11434",
+    "file:///etc/passwd",
+    "gopher://localhost:11434",
+    "http://user:pass@localhost:11434",  # embedded credentials
+    "://nohost",
+    "http://",  # no host
+])
+def test_validate_base_url_rejects_ssrf_vectors(raw):
+    with pytest.raises(ValueError):
+        od.validate_base_url(raw)
+
+
+def test_list_installed_models_rejects_bad_scheme_without_request(monkeypatch):
+    def boom(*a, **kw):
+        raise AssertionError("requests.get must not run for an invalid URL")
+    monkeypatch.setattr(od.requests, "get", boom)
+    assert od.list_installed_models("file:///etc/passwd") == []
+
+
+def test_health_check_rejects_bad_scheme_without_request(monkeypatch):
+    def boom(*a, **kw):
+        raise AssertionError("requests.get must not run for an invalid URL")
+    monkeypatch.setattr(od.requests, "get", boom)
+    out = od.health_check("gopher://localhost:11434")
+    assert out["ok"] is False and "error" in out
