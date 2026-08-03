@@ -12,14 +12,18 @@ the next router step; APPLY's own backup mirror keeps the rewrite
 recoverable.
 
 Every deterministic classification has a mechanical fix. When
-classification returns ``unknown`` (an ordinary logic/assertion
-failure with no deterministic locator), the executor attempts a
-bounded LLM-driven repair (:func:`_propose_llm_logic_repair`): it
-feeds the captured failure output plus the on-disk source/test files
-to the provider and turns any accepted rewrite into a unified diff.
-That path is a no-op without a provider or once the per-session
-repair budget is spent, in which case the executor falls back to an
-empty plan and the router escalates.
+classification returns ``assertion_drift`` (an ordinary logic /
+status-code / message-string failure with no deterministic locator),
+the executor attempts a bounded LLM-driven repair
+(:func:`_propose_llm_logic_repair`): it feeds the captured failure
+output plus the on-disk source/test files to the provider and turns
+any accepted rewrite into a unified diff. When that path is a no-op --
+no provider, or the per-session repair budget is spent -- the executor
+falls back to a *targeted* regenerate of only the implementation
+file(s) the failure flowed through (aligning the handler to the test's
+asserted contract; see :func:`_assertion_impl_targets`), degrading to
+a whole-tree regenerate when the traceback named no implementation
+file.
 """
 
 from __future__ import annotations
@@ -121,6 +125,7 @@ _REGENERATE_CLASSES = frozenset({
     "missing_fixture",
     "missing_module_pythonpath",
     "undefined_name",
+    "assertion_drift",
     "unknown",
 })
 
@@ -354,6 +359,33 @@ def run_repair(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
                 "Bounded LLM repair proposed a targeted patch for the "
                 "failing test(s) from the captured failure output and the "
                 "current source; applying and re-verifying.")
+        elif classification == "assertion_drift":
+            # No bounded patch was produced (no provider, budget spent, or
+            # the model declined). Rather than a whole-tree regenerate --
+            # which re-rolls both sides of the test<->implementation seam
+            # and reproduces the same divergence (ses_a60d67a2f0164dcb) --
+            # name the *implementation* file(s) the failure flowed through
+            # so the router regenerates only those against the prior
+            # scaffold, aligning the handler to the test's asserted
+            # contract. Test files are excluded: the tests encode the
+            # intended contract and must not be re-rolled.
+            impl_targets = _assertion_impl_targets(
+                content, Path(deps.project_root))
+            if impl_targets:
+                extra_plan_fields["target_files"] = impl_targets
+                rationale = (
+                    "Test assertions failed with no mechanical locator "
+                    "(status-code / message / value drift). Re-authoring "
+                    f"only the implementation file(s) {', '.join(impl_targets)} "
+                    "the failure flowed through to satisfy the asserted "
+                    "contract; the failing test(s) are treated as the "
+                    "source of truth and left unchanged.")
+            else:
+                rationale = (
+                    "Test assertions failed with no mechanical locator and "
+                    "no implementation file was named in the traceback; "
+                    "regenerating the scaffold subtree to reconcile the "
+                    "test<->implementation contract.")
         else:
             rationale = (
                 "No deterministic repair available for this failure class; "
@@ -365,10 +397,17 @@ def run_repair(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         locations_payload=locations_payload,
     )
 
+    # The nearest SCAFFOLD's artifact id (threaded through the VERIFY
+    # content) lets a targeted regenerate re-author only the named
+    # ``target_files`` against the prior scaffold instead of the whole
+    # tree; the router falls back to a whole-tree regenerate when it is
+    # absent (see ``_repair_regenerate_actions``).
+    scaffold_artifact_id = content.get("scaffold_artifact_id")
     plan_content: Dict[str, Any] = {
         "verify_artifact_id": verify_artifact_id,
         "build_artifact_id": content.get("build_artifact_id"),
         "apply_artifact_id": content.get("apply_artifact_id"),
+        "scaffold_artifact_id": scaffold_artifact_id,
         "classification": classification,
         "failure_signature": signature,
         "repair_attempt": attempt,
@@ -396,6 +435,7 @@ def run_repair(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             "can_apply": bool(diffs),
             "strategy": strategy,
             "extra_constraints": extra_constraints,
+            "scaffold_artifact_id": scaffold_artifact_id,
         },
         artifact=artifact,
     )
@@ -1128,6 +1168,17 @@ def _select_repair_strategy(
         # exactly which fixtures the regenerated tests must define.
         constraints["missing_fixtures"] = list(
             extra_plan_fields.get("missing_fixtures") or [])
+    elif classification == "assertion_drift":
+        # A plain assertion failure the bounded patch could not fix. When
+        # the failure named implementation file(s) in its traceback, carry
+        # them as ``target_files`` so the router regenerates only those
+        # against the prior scaffold (aligning the handler to the test's
+        # asserted contract) instead of re-rolling the whole tree. Absent a
+        # named implementation file the marker is omitted and the router
+        # degrades to a whole-tree regenerate.
+        target_files = list(extra_plan_fields.get("target_files") or [])
+        if target_files:
+            constraints["target_files"] = target_files
     if diff_count > _PATCH_DIFF_LIMIT:
         constraints["oversized_patch"] = {
             "diff_count": diff_count,
@@ -1252,6 +1303,44 @@ def _localized_source_files(content: Dict[str, Any], root: Path) -> List[str]:
     for raw in traceback_source_files(content):
         rel = _resolve_repo_relative(root, raw)
         if rel and rel not in out:
+            out.append(rel)
+    return out
+
+
+def _is_test_source(rel: str) -> bool:
+    """True when a repo-relative ``.py`` path is a test module / conftest.
+
+    Mirrors the scaffold-side test-path heuristic: anything under a
+    ``tests/`` directory, a ``test_*.py`` / ``*_test.py`` module, or a
+    ``conftest.py``. Used to keep the tests out of the assertion-drift
+    regenerate target set -- the tests encode the intended contract and
+    must not be re-rolled.
+    """
+    norm = (rel or "").replace("\\", "/").strip("/")
+    base = norm.rsplit("/", 1)[-1]
+    return (base == "conftest.py"
+            or base.startswith("test_")
+            or base.endswith("_test.py")
+            or norm.startswith("tests/")
+            or "/tests/" in norm)
+
+
+def _assertion_impl_targets(content: Dict[str, Any], root: Path) -> List[str]:
+    """Implementation file(s) an assertion failure flowed through.
+
+    Resolves the traceback-named source frames to on-disk repo paths and
+    drops the test modules, so a targeted assertion-drift regenerate
+    re-authors only the implementation the failing assertion reached --
+    aligning it to the test's asserted contract. Order-preserving and
+    de-duplicated; empty when the traceback named no first-party
+    implementation file (the caller then degrades to a whole-tree
+    regenerate).
+    """
+    out: List[str] = []
+    for rel in _localized_source_files(content, root):
+        if _is_test_source(rel):
+            continue
+        if rel not in out:
             out.append(rel)
     return out
 

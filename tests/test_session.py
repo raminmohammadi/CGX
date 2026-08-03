@@ -7943,8 +7943,8 @@ def test_classify_unittest_pytest_mix_from_traceback():
     assert classify_verify_report(content) == "unittest_pytest_mix"
 
 
-def test_classify_unknown_for_plain_assertion_failure():
-    """A regular assert failure has no auto-repair -> unknown."""
+def test_classify_assertion_drift_for_plain_assertion_failure():
+    """A plain assert failure with no locator -> assertion_drift."""
     from cgx.session.repair.classify import classify_verify_report
     content = {
         "outcome": "assertions_failed",
@@ -7952,7 +7952,7 @@ def test_classify_unknown_for_plain_assertion_failure():
         "stdout": "E   assert 1 == 2\nE    +  where 1 = compute()",
         "stderr": "",
     }
-    assert classify_verify_report(content) == "unknown"
+    assert classify_verify_report(content) == "assertion_drift"
 
 
 def test_classify_skipped_outcomes_are_unknown():
@@ -8194,8 +8194,9 @@ def test_repair_executor_emits_repair_plan_artifact(store, tmp_path: Path):
     assert result.outputs["diff_count"] >= 1
 
 
-def test_repair_executor_emits_empty_plan_for_unknown(store, tmp_path: Path):
-    """Unclassifiable failure -> empty diffs + can_apply False (router escalates)."""
+def test_repair_executor_emits_empty_plan_for_assertion_drift(
+        store, tmp_path: Path):
+    """Assertion drift with no locator/provider -> empty diffs + can_apply False."""
     from cgx.session.tasks import repair as _repair_module  # noqa: F401
     session = Session.new("g", mode=SessionMode.GREENFIELD)
     store.save_session(session)
@@ -8218,9 +8219,67 @@ def test_repair_executor_emits_empty_plan_for_unknown(store, tmp_path: Path):
     from cgx.session.tasks.base import _REGISTRY
     result = _REGISTRY[TaskKind.REPAIR](repair_task, deps)
     assert result.failure is None
-    assert result.outputs["classification"] == "unknown"
+    assert result.outputs["classification"] == "assertion_drift"
     assert result.outputs["can_apply"] is False
     assert result.outputs["diff_count"] == 0
+
+
+def test_repair_executor_assertion_drift_targets_impl_file(store, tmp_path: Path):
+    """No patch + traceback naming a source file -> targeted regenerate.
+
+    The failing test asserts a 201 the handler returns 200 for. With no
+    provider the bounded LLM patch is a no-op, so the executor must fall
+    back to a *targeted* regenerate of only the implementation file the
+    traceback flows through (``src/handlers.py``) -- never the test that
+    encodes the contract -- carrying the prior scaffold artifact id so the
+    router can regenerate against it instead of the whole tree.
+    """
+    from cgx.session.tasks import repair as _repair_module  # noqa: F401
+    src_rel = "src/handlers.py"
+    test_rel = "tests/test_backend.py"
+    (tmp_path / "src").mkdir()
+    (tmp_path / "tests").mkdir()
+    (tmp_path / src_rel).write_text(
+        "def login():\n    return '', 200\n", encoding="utf-8")
+    (tmp_path / test_rel).write_text(
+        "from src.handlers import login\n\n\ndef test_login():\n"
+        "    assert login()[1] == 201\n", encoding="utf-8")
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    verify_artifact = Artifact.new(
+        session_id=session.session_id, produced_by_task_id="t_verify",
+        kind=ArtifactKind.VERIFY_REPORT,
+        content={
+            "outcome": "assertions_failed",
+            "returncode": 1,
+            "changed_files": [test_rel],
+            "scaffold_artifact_id": "art_scaffold_1",
+            "stdout": (
+                "tests/test_backend.py:5: in test_login\n"
+                "    assert login()[1] == 201\n"
+                "src/handlers.py:2: in login\n"
+                "    return '', 200\n"
+                "E   assert 200 == 201"),
+            "stderr": "",
+        })
+    store.save_artifact(verify_artifact)
+    repair_task = TaskNode.new(
+        session.session_id, TaskKind.REPAIR, "repair",
+        inputs={"verify_artifact_id": verify_artifact.artifact_id,
+                "mode": SessionMode.GREENFIELD.value,
+                "repair_attempt": 1})
+    deps = ExecutorDeps(project_root=str(tmp_path), store=store)
+    from cgx.session.tasks.base import _REGISTRY
+    result = _REGISTRY[TaskKind.REPAIR](repair_task, deps)
+    assert result.failure is None
+    assert result.outputs["classification"] == "assertion_drift"
+    assert result.outputs["strategy"] == "regenerate"
+    assert result.outputs["can_apply"] is False
+    assert result.outputs["scaffold_artifact_id"] == "art_scaffold_1"
+    ec = result.outputs["extra_constraints"]
+    assert ec["target_files"] == [src_rel]
+    # The test file that encodes the contract is never a regenerate target.
+    assert test_rel not in ec["target_files"]
 
 
 def test_generate_repair_files_returns_validated_rewrites():
@@ -8277,7 +8336,7 @@ def test_generate_repair_files_flags_localized_files():
 
 
 def test_repair_executor_llm_logic_repair_emits_patch(store, tmp_path: Path):
-    """unknown assertion failure + provider -> bounded LLM patch (can_apply)."""
+    """assertion-drift failure + provider -> bounded LLM patch (can_apply)."""
     import json as _json
     from cgx.session.tasks import repair as _repair_module  # noqa: F401
     rel = "src/calc.py"
@@ -8314,7 +8373,7 @@ def test_repair_executor_llm_logic_repair_emits_patch(store, tmp_path: Path):
     from cgx.session.tasks.base import _REGISTRY
     result = _REGISTRY[TaskKind.REPAIR](repair_task, deps)
     assert result.failure is None
-    assert result.outputs["classification"] == "unknown"
+    assert result.outputs["classification"] == "assertion_drift"
     assert result.outputs["can_apply"] is True
     assert result.outputs["diff_count"] == 1
     assert result.outputs["strategy"] == "patch"
@@ -8357,7 +8416,7 @@ def test_repair_executor_llm_logic_repair_respects_attempt_budget(
     from cgx.session.tasks.base import _REGISTRY
     result = _REGISTRY[TaskKind.REPAIR](repair_task, deps)
     assert result.failure is None
-    assert result.outputs["classification"] == "unknown"
+    assert result.outputs["classification"] == "assertion_drift"
     assert result.outputs["can_apply"] is False
     assert result.outputs["diff_count"] == 0
     assert provider.calls == []
@@ -9085,7 +9144,7 @@ def test_classify_unrecognized_collection_error_is_first_class():
 
     Before this fix it fell back to ``unknown`` (-> silent regenerate);
     now it surfaces as ``collection_error`` so the executor can escalate.
-    An assertion failure with no pattern must still stay ``unknown``.
+    An assertion failure with no pattern maps to ``assertion_drift``.
     """
     from cgx.session.repair.classify import classify_verify_report
     cerr = {
@@ -9102,7 +9161,7 @@ def test_classify_unrecognized_collection_error_is_first_class():
         "stdout": "E   assert 1 == 2\n",
         "stderr": "",
     }
-    assert classify_verify_report(assert_fail) == "unknown"
+    assert classify_verify_report(assert_fail) == "assertion_drift"
 
 
 def test_repair_executor_unrecognized_collection_error_escalates(
@@ -10980,6 +11039,49 @@ def test_select_repair_strategy_regenerates_when_no_diffs_and_unknown():
     assert strategy == "regenerate"
     assert constraints["kind"] == "unknown"
     assert constraints["rationale"] == "rationale text"
+
+
+def test_select_repair_strategy_assertion_drift_folds_target_files():
+    """assertion_drift with named impl file(s) -> targeted regenerate."""
+    from cgx.session.tasks.repair import _select_repair_strategy
+    strategy, constraints = _select_repair_strategy(
+        classification="assertion_drift", diffs=[],
+        rationale="align handler to asserted contract",
+        extra_plan_fields={"target_files": ["src/handlers.py"]},
+        locations_payload=[])
+    assert strategy == "regenerate"
+    assert constraints["kind"] == "assertion_drift"
+    assert constraints["target_files"] == ["src/handlers.py"]
+
+
+def test_select_repair_strategy_assertion_drift_without_targets_whole_tree():
+    """assertion_drift with no named impl file -> whole-tree regenerate."""
+    from cgx.session.tasks.repair import _select_repair_strategy
+    strategy, constraints = _select_repair_strategy(
+        classification="assertion_drift", diffs=[], rationale="r",
+        extra_plan_fields={}, locations_payload=[])
+    assert strategy == "regenerate"
+    assert "target_files" not in constraints
+
+
+def test_assertion_impl_targets_excludes_test_files(tmp_path: Path):
+    """Traceback source files minus the test modules -> impl targets."""
+    from cgx.session.tasks.repair import _assertion_impl_targets
+    (tmp_path / "src").mkdir()
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "src" / "handlers.py").write_text("x = 1\n", encoding="utf-8")
+    (tmp_path / "tests" / "test_backend.py").write_text(
+        "x = 1\n", encoding="utf-8")
+    content = {
+        "outcome": "assertions_failed",
+        "returncode": 1,
+        "stdout": (
+            "tests/test_backend.py:5: in test_login\n"
+            "src/handlers.py:2: in login\n"
+            "E   assert 200 == 201"),
+        "stderr": "",
+    }
+    assert _assertion_impl_targets(content, tmp_path) == ["src/handlers.py"]
 
 
 def test_select_repair_strategy_regenerates_missing_fixture_without_diffs():
