@@ -4424,6 +4424,117 @@ def test_reconcile_js_dependencies_noop_without_package_json():
         diffs=diffs, existing_with_content=existing) == []
 
 
+def test_synthesize_missing_frontend_stylesheet_stub():
+    """An entry point importing an ungenerated ./index.css gets a stub."""
+    from cgx.answer.engine import _content_to_new_file_patch
+    from cgx.session.tasks.scaffold import (
+        _content_from_new_file_patch,
+        _synthesize_missing_frontend_stylesheets,
+    )
+    main = "import App from './App.jsx'\nimport './index.css'\n"
+    diffs = [
+        {"file": "src/main.jsx",
+         "patch": _content_to_new_file_patch("src/main.jsx", main)},
+        {"file": "src/App.jsx",
+         "patch": _content_to_new_file_patch(
+             "src/App.jsx", "export default 1\n")},
+    ]
+    generated = [{"file": "src/main.jsx"}, {"file": "src/App.jsx"}]
+    existing = [
+        {"path": "src/main.jsx", "content": main},
+        {"path": "src/App.jsx", "content": "export default 1\n"},
+    ]
+    layers: list = []
+    added = _synthesize_missing_frontend_stylesheets(
+        diffs=diffs, generated=generated, existing_with_content=existing,
+        layers=layers, project_root=None)
+    assert added == ["src/index.css"]
+    # Spliced into diffs + manifest so APPLY writes it and later gates see it.
+    assert any(d["file"] == "src/index.css" for d in diffs)
+    assert any(e["path"] == "src/index.css" for e in existing)
+    stub = _content_from_new_file_patch(
+        next(d["patch"] for d in diffs if d["file"] == "src/index.css"))
+    assert "stylesheet stub" in stub
+
+
+def test_synthesize_frontend_stylesheet_noop_when_present():
+    """A stylesheet already generated is not clobbered with a stub."""
+    from cgx.session.tasks.scaffold import (
+        _synthesize_missing_frontend_stylesheets,
+    )
+    existing = [
+        {"path": "src/main.jsx", "content": "import './index.css'\n"},
+        {"path": "src/index.css", "content": "body{}\n"},
+    ]
+    assert _synthesize_missing_frontend_stylesheets(
+        diffs=[], generated=[], existing_with_content=existing, layers=[],
+        project_root=None) == []
+
+
+def test_js_import_coherence_flags_missing_relative_script():
+    """A relative script import with no generated sibling fails the importer."""
+    from cgx.session.tasks.scaffold import _js_import_coherence_failures
+    existing = [
+        {"path": "src/main.jsx",
+         "content": ("import App from './App.jsx'\n"
+                     "import Missing from './Missing'\n")},
+        {"path": "src/App.jsx", "content": "export default 1\n"},
+    ]
+    failures = _js_import_coherence_failures(existing, None)
+    assert len(failures) == 1
+    assert failures[0]["file"] == "src/main.jsx"
+    assert "./Missing" in failures[0]["error"]
+    # The resolvable sibling is not reported.
+    assert "./App.jsx" not in failures[0]["error"]
+
+
+def test_js_import_coherence_resolves_siblings_and_skips_assets():
+    """Extensionless/index resolution passes; stylesheets and assets skip."""
+    from cgx.session.tasks.scaffold import _js_import_coherence_failures
+    existing = [
+        {"path": "src/main.jsx",
+         "content": ("import './index.css'\n"        # stylesheet -> pass A
+                     "import logo from './logo.svg'\n"  # asset -> skipped
+                     "import {u} from './util'\n"       # -> src/util.js
+                     "import C from './comp'\n")},       # -> src/comp/index.jsx
+        {"path": "src/util.js", "content": "export const u = 1\n"},
+        {"path": "src/comp/index.jsx", "content": "export default 1\n"},
+    ]
+    assert _js_import_coherence_failures(existing, None) == []
+
+
+def test_scaffold_synthesizes_missing_stylesheet_stub(store, monkeypatch):
+    """run_scaffold backfills an omitted stylesheet so the tree builds."""
+    from cgx.session.tasks.scaffold import run_scaffold
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    plan = Artifact.new(
+        session.session_id, "task_x", ArtifactKind.WORK_PLAN, {
+            "plan_md": "", "composed_goal": "g", "prior_goal": "g",
+            "layers": [{"name": "app", "files": [
+                {"path": "src/main.jsx", "description": ""}]}],
+        })
+    store.save_artifact(plan)
+    body = ("import React from 'react'\n"
+            "import './index.css'\n"
+            "console.log(React)\n")
+
+    def fake_generate(path, *a, **kw):
+        return {"file": path, "patch": f"+++ {path}\nx",
+                "content": body, "syntax_ok": True}
+
+    monkeypatch.setattr("cgx.answer.engine.generate_single_scaffold_file",
+                        fake_generate)
+    t = TaskNode.new(session.session_id, TaskKind.SCAFFOLD, "s",
+                     inputs={"work_plan_artifact_id": plan.artifact_id})
+    result = run_scaffold(
+        t, ExecutorDeps(provider=_StubProvider(""), store=store))
+    assert result.failure is None
+    files = [d["file"] for d in result.artifact.content["diffs"]]
+    assert "src/index.css" in files
+    assert result.outputs["failed_count"] == 0
+
+
 def test_circular_import_failures_ignores_one_way_imports():
     """An acyclic first-party import graph produces no failures."""
     from cgx.session.tasks.scaffold import _circular_import_failures
@@ -8072,6 +8183,57 @@ def test_unresolved_entry_paths_parses_rollup_and_vite_wordings():
     assert unresolved_entry_paths("src/App.jsx: TS2345") == ()
 
 
+def test_unresolved_import_sources_parses_rollup_resolution_error():
+    from cgx.session.repair.classify import unresolved_import_sources
+    assert unresolved_import_sources(
+        'Could not resolve "./index.css" from "src/main.jsx"') == (
+            "src/main.jsx",)
+    # De-duplicated across repeats; an unrelated build error is inert.
+    assert unresolved_import_sources(
+        'Could not resolve "./a" from "src/x.jsx"\n'
+        'Could not resolve "./b" from "src/x.jsx"\n') == ("src/x.jsx",)
+    assert unresolved_import_sources("src/App.jsx: TS2345") == ()
+
+
+def test_repair_executor_targets_importer_for_build_resolution_error(
+        store, tmp_path: Path):
+    """A 'Could not resolve X from Y' build break names Y for a targeted regen."""
+    from cgx.session.tasks import repair as _repair_module  # noqa: F401
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "main.jsx").write_text("import './index.css'\n")
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    smoke_task = TaskNode.new(
+        session.session_id, TaskKind.SMOKE, "smoke", inputs={})
+    smoke_artifact = Artifact.new(
+        session_id=session.session_id,
+        produced_by_task_id=smoke_task.task_id,
+        kind=ArtifactKind.SMOKE_REPORT,
+        content={"outcome": "failed", "failed_modules": [],
+                 "failure_signature": "smoke_import|npm run build --silent",
+                 "modules": [], "scaffold_artifact_id": "art_scaf",
+                 "build_smoke": {
+                     "label": "npm run build --silent", "ok": False,
+                     "stderr_tail": ('error during build:\n'
+                                     'Could not resolve "./index.css" '
+                                     'from "src/main.jsx"\n')}})
+    store.save_task(smoke_task)
+    store.save_artifact(smoke_artifact)
+    repair_task = TaskNode.new(
+        session.session_id, TaskKind.REPAIR, "repair",
+        inputs={"smoke_artifact_id": smoke_artifact.artifact_id,
+                "mode": SessionMode.GREENFIELD.value, "repair_attempt": 1})
+    deps = ExecutorDeps(project_root=str(tmp_path), store=store)
+    from cgx.session.tasks.base import _REGISTRY
+    result = _REGISTRY[TaskKind.REPAIR](repair_task, deps)
+    assert result.failure is None
+    assert result.outputs["strategy"] == "regenerate"
+    constraints = result.outputs["extra_constraints"]
+    assert constraints["kind"] == "invalid_build_smoke"
+    assert constraints["target_files"] == ["src/main.jsx"]
+    assert result.outputs["scaffold_artifact_id"] == "art_scaf"
+
+
 def test_classify_missing_module_pythonpath_from_collection_error():
     """ModuleNotFoundError during collection -> missing_module_pythonpath."""
     from cgx.session.repair.classify import classify_verify_report
@@ -10482,6 +10644,27 @@ def test_router_repair_regenerate_threads_missing_files():
     assert len(creates) == 1
     assert creates[0].task.inputs["additional_files"] == [
         {"path": "index.html", "description": "entry html"}]
+
+
+def test_router_repair_regenerate_targets_build_smoke_importer():
+    """A build-resolution verdict regenerates only the named importer."""
+    session, scaffold, tasks, rep = _build_regenerate_chain()
+    rep.outputs = dict(rep.outputs)
+    rep.outputs["classification"] = "smoke_import_failure"
+    rep.outputs["scaffold_artifact_id"] = "art_scaf"
+    rep.outputs["extra_constraints"] = {
+        "kind": "invalid_build_smoke",
+        "rationale": "resolve",
+        "build_error": "Could not resolve './index.css' from 'src/main.jsx'",
+        "target_files": ["src/main.jsx"],
+    }
+    plan = Router().on_task_completed(
+        session=session, completed=rep, tasks=tasks)
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    assert len(creates) == 1
+    new_scaffold = creates[0].task
+    assert new_scaffold.inputs["regenerate_files"] == ["src/main.jsx"]
+    assert new_scaffold.inputs["prior_scaffold_artifact_id"] == "art_scaf"
 
 
 def test_router_repair_regenerate_preserves_failure_signatures():

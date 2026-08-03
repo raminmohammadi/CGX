@@ -4150,6 +4150,26 @@ def _js_external_imports(content: str) -> List[str]:
     return found
 
 
+def _js_relative_imports(content: str) -> List[str]:
+    """Relative import/require specifiers (``./`` / ``../``) in one source.
+
+    The counterpart to :func:`_js_external_imports`: instead of the bare
+    package names that map to package.json dependencies, it returns the
+    first-party specifiers a bundler resolves against sibling files
+    (``./index.css``, ``../App.jsx``). Order-preserving and de-duplicated;
+    absolute (``/``) and alias (``@/``) specifiers are excluded because
+    they are not path-relative to the importer. Callers resolve each one
+    against the importer's directory to check the target was generated.
+    """
+    found: List[str] = []
+    for rx in (_JS_IMPORT_FROM_RE, _JS_BARE_IMPORT_RE, _JS_REQUIRE_RE):
+        for spec in rx.findall(content or ""):
+            s = (spec or "").strip()
+            if s.startswith(".") and s not in found:
+                found.append(s)
+    return found
+
+
 def _deterministic_package_json_repair(
         content: str,
         js_files_with_content: Optional[List[Dict[str, str]]],

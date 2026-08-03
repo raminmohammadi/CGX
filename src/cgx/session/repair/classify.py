@@ -166,6 +166,17 @@ _UNRESOLVED_ENTRY_RE = re.compile(
     re.MULTILINE,
 )
 
+# A bundler (Vite/Rollup) that resolved its entry but could not resolve a
+# relative import *inside* a generated file: ``Could not resolve
+# "./index.css" from "src/main.jsx"``. Unlike the entry-module miss above,
+# the offending file exists -- it just references a sibling that does not --
+# so the fix is a targeted re-author of the importer(s), not a manifest
+# extension. Group 1 is the unresolved specifier, group 2 the importer file.
+_UNRESOLVED_IMPORT_RE = re.compile(
+    r"(?:annot|ould not) resolve\s+[\"']([^\"']+)[\"']\s+from\s+"
+    r"[\"']([^\"']+)[\"']",
+)
+
 # A name a generated module uses but never binds -- ``class
 # Operation(str, enum.Enum)`` with no ``import enum``, a constant
 # referenced in an f-string that was never assigned. The file parses,
@@ -403,6 +414,29 @@ def unresolved_entry_paths(text: str) -> Tuple[str, ...]:
     out: List[str] = []
     for m in _UNRESOLVED_ENTRY_RE.finditer(str(text or "")):
         path = m.group(1).replace("\\", "/").strip().lstrip("./")
+        if path and path not in out:
+            out.append(path)
+    return tuple(out)
+
+
+def unresolved_import_sources(text: str) -> Tuple[str, ...]:
+    """Return the importer files a bundler could not resolve an import in.
+
+    Takes the raw build stderr (the SMOKE build-smoke tail) and matches
+    ``Could not resolve "<spec>" from "<file>"`` -- the failure a generated
+    source ships when it imports a sibling that was never generated. Returns
+    the *importer* paths (the ``from`` side), normalised to forward slashes
+    and stripped of a leading ``./``; order-preserving and de-duplicated.
+    Callers treat these as files to *re-author* (a targeted regenerate),
+    distinct from :func:`unresolved_entry_paths` whose paths must be added.
+    An absolute path is returned verbatim for the caller to relativise
+    against the project root.
+    """
+    out: List[str] = []
+    for m in _UNRESOLVED_IMPORT_RE.finditer(str(text or "")):
+        path = m.group(2).replace("\\", "/").strip()
+        if not path.startswith("/"):
+            path = path.lstrip("./")
         if path and path not in out:
             out.append(path)
     return tuple(out)

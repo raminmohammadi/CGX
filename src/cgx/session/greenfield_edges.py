@@ -219,9 +219,23 @@ def _repair_regenerate_actions(completed: TaskNode,
     missing_files = extra_constraints.get("missing_files")
     if not isinstance(missing_files, list):
         missing_files = None
+    # A classification that named the *existing* offending file(s) under
+    # ``target_files`` (a build-smoke resolution error whose importer was
+    # generated) regenerates only those against the prior scaffold artifact,
+    # reusing every prior-good diff -- a whole-tree regenerate reproduced the
+    # identical miss in ses_aa99f1fb6914488d. Both markers are required for
+    # ``propose_regenerate`` to take the targeted path; a missing artifact id
+    # degrades to the whole-tree regenerate below.
+    target_files = extra_constraints.get("target_files")
+    if not isinstance(target_files, list) or not target_files:
+        target_files = None
+    prior_scaffold_id = str(
+        (completed.outputs or {}).get("scaffold_artifact_id") or "").strip()
     new_scaffold = propose_regenerate(
         scaffold, extra_constraints,
         additional_files=missing_files,
+        regenerate_files=target_files if prior_scaffold_id else None,
+        prior_scaffold_artifact_id=prior_scaffold_id or None,
         prior_failure_signatures=LoopBudget.from_inputs(
             completed.inputs).prior_failure_signatures)
     new_scaffold.inputs["repair_regenerate_attempt"] = (

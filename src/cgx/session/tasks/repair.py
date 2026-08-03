@@ -49,6 +49,7 @@ from cgx.session.repair.classify import (
     traceback_source_files,
     undefined_names,
     unresolved_entry_paths,
+    unresolved_import_sources,
 )
 from cgx.session.repair.locate import (
     MissingFixtureLocation,
@@ -464,6 +465,33 @@ def _run_verify_collection_error_escalation(
     )
 
 
+def _build_smoke_target_files(build_stderr: str,
+                              project_root: str) -> Tuple[str, ...]:
+    """Project-relative importer files a build-smoke resolution error names.
+
+    Parses ``Could not resolve "<spec>" from "<file>"`` errors
+    (:func:`unresolved_import_sources`), relativises any absolute path
+    against ``project_root``, and keeps only the files that actually exist
+    on disk -- so the router can target the regenerate at the offending
+    importer(s) instead of re-authoring the whole tree. Order-preserving
+    and de-duplicated; empty when nothing parseable resolves to a real
+    file.
+    """
+    root = Path(project_root)
+    out: List[str] = []
+    for imp in unresolved_import_sources(build_stderr):
+        rel = imp
+        p = Path(imp)
+        if p.is_absolute():
+            try:
+                rel = str(p.relative_to(root)).replace("\\", "/")
+            except ValueError:
+                continue
+        if (root / rel).exists() and rel not in out:
+            out.append(rel)
+    return tuple(out)
+
+
 def _run_smoke_repair(task: TaskNode, deps: ExecutorDeps,
                       smoke_artifact_id: str) -> ExecutorResult:
     """Emit a REPAIR_PLAN from a SMOKE_REPORT.
@@ -492,6 +520,7 @@ def _run_smoke_repair(task: TaskNode, deps: ExecutorDeps,
     classification = "smoke_import_failure"
     build_stderr = ""
     missing_entries: Tuple[str, ...] = ()
+    target_files: Tuple[str, ...] = ()
     if failed:
         rationale = (
             f"Third-party import(s) {', '.join(failed)} failed under the "
@@ -516,10 +545,26 @@ def _run_smoke_repair(task: TaskNode, deps: ExecutorDeps,
                 f"entry module(s) {', '.join(missing_entries)}: the "
                 "file(s) were never generated. Add them to the tree.")
         else:
-            rationale = (
-                f"The JS/TS build-smoke (`{label}`) failed: the applied "
-                "frontend does not build. Re-author the failing file(s) to "
-                "fix the reported build error.")
+            # ... or the bundler resolved the entry but a *generated* file
+            # imports a sibling that resolves nowhere ("Could not resolve
+            # './x' from 'src/main.jsx'"). The offending importer exists, so
+            # naming it lets the router target the regenerate at that file
+            # instead of re-authoring the whole tree -- which reproduced the
+            # identical miss in ses_aa99f1fb6914488d.
+            target_files = _build_smoke_target_files(
+                build_stderr, deps.project_root)
+            if target_files:
+                rationale = (
+                    f"The JS/TS build-smoke (`{label}`) failed: "
+                    f"{', '.join(target_files)} import a relative sibling "
+                    "that does not resolve. Re-author the named file(s) to "
+                    "import only existing siblings (or author the missing "
+                    "module).")
+            else:
+                rationale = (
+                    f"The JS/TS build-smoke (`{label}`) failed: the applied "
+                    "frontend does not build. Re-author the failing file(s) "
+                    "to fix the reported build error.")
     else:
         rationale = (
             "SMOKE reported a failure but no failed modules were "
@@ -540,6 +585,11 @@ def _run_smoke_repair(task: TaskNode, deps: ExecutorDeps,
         extra_constraints["missing_files"] = [
             {"path": p, "description": stack_entry_description(p)}
             for p in missing_entries]
+    elif target_files:
+        # Targeted build-smoke repair: the importer exists, so name it so
+        # the router regenerates only these files against the prior scaffold
+        # (reusing every prior-good diff) instead of re-authoring the tree.
+        extra_constraints["target_files"] = list(target_files)
     artifact = Artifact.new(
         session_id=task.session_id,
         produced_by_task_id=task.task_id,
@@ -548,6 +598,7 @@ def _run_smoke_repair(task: TaskNode, deps: ExecutorDeps,
             "smoke_artifact_id": smoke_artifact_id,
             "build_artifact_id": content.get("build_artifact_id"),
             "apply_artifact_id": content.get("apply_artifact_id"),
+            "scaffold_artifact_id": content.get("scaffold_artifact_id"),
             "classification": classification,
             "failure_signature": signature,
             "repair_attempt": attempt,
@@ -569,6 +620,7 @@ def _run_smoke_repair(task: TaskNode, deps: ExecutorDeps,
             "can_apply": False,
             "strategy": "regenerate",
             "extra_constraints": extra_constraints,
+            "scaffold_artifact_id": content.get("scaffold_artifact_id"),
         },
         artifact=artifact,
     )
