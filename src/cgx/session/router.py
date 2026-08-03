@@ -47,6 +47,7 @@ from cgx.session.greenfield_edges import (
     _repair_terminal_failure_actions,
     _scaffold_contract_regenerate_actions,
     _scaffold_failed_files_actions,
+    _scaffold_payload_regenerate_actions,
     _scaffold_resume_actions,
     _verify_lesson_actions,
 )
@@ -905,6 +906,7 @@ _COMPLETION_GUARDS: Tuple[Tuple[TaskKind, _CompletionGuard], ...] = (
     (TaskKind.REPAIR,
      lambda completed, tasks: _repair_terminal_failure_actions(completed)),
     (TaskKind.SCAFFOLD, _scaffold_failed_files_actions),
+    (TaskKind.SCAFFOLD, _scaffold_payload_regenerate_actions),
     (TaskKind.SCAFFOLD, _scaffold_contract_regenerate_actions),
     (TaskKind.APPLY, _apply_failed_files_actions),
 )

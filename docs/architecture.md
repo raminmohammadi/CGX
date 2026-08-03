@@ -638,7 +638,7 @@ this subsection first; the six moving parts are:
    source of most cross-file breakage that only surfaced at `VERIFY`).
 
 2. **Contract enforcement gate + coherence pass (`SCAFFOLD`).** After
-   the per-file loop, `run_scaffold` runs two best-effort static gates
+   the per-file loop, `run_scaffold` runs three best-effort static gates
    from `cgx.session.scaffold_validate` before `APPLY` writes anything:
    * `cross_check_first_party_imports` -- parses every generated `.py`
      file and flags each `from <first-party> import <name>` whose target
@@ -651,10 +651,27 @@ this subsection first; the six moving parts are:
      earlier sibling never wrote.
    * `check_contract_compliance` -- verifies the finished tree honours
      the `WORK_PLAN` `contracts` block (declared endpoints appear
-     verbatim, declared schemas/functions/constants are defined). Both
-     record `import_warnings` / `contract_warnings` on the
-     `SCAFFOLD_PATCHES` artifact rather than failing the scaffold; the
-     router can fold a warning into a targeted regenerate constraint.
+     verbatim, declared schemas/functions/constants are defined).
+   * `check_client_server_payload_coherence` (**P0b**) -- the JS↔Python
+     analogue of the import cross-check, closing the cross-language seam
+     the two Python-only gates above are blind to. For every backend
+     Flask/FastAPI route a frontend `fetch` also targets, it compares the
+     JSON body keys the client POSTs against the keys the handler reads
+     (and, when the `WORK_PLAN` declares the endpoint, against its
+     `request` schema). Only a *rename* -- the client sends a key the
+     server never reads while the server reads a key the client never
+     sends (e.g. `operator` vs `operation`, the ses_4cbf963cdc67435a
+     defect) -- fires; a body that merely omits/adds an optional field is
+     left alone. It emits a `payload`-kind entry folded into
+     `contract_warnings`. All three record `import_warnings` /
+     `contract_warnings` on the `SCAFFOLD_PATCHES` artifact rather than
+     failing the scaffold; the router folds a warning into a targeted
+     regenerate constraint. A `payload` warning routes through
+     `_scaffold_payload_regenerate_actions` (registered ahead of the
+     whole-tree contract regenerate in `_COMPLETION_GUARDS`), which
+     re-authors *only* the offending client file(s) against the prior
+     `SCAFFOLD_PATCHES` artifact, bounded by `REGENERATE_BUDGET` and the
+     same flap signature the dropped-file path uses.
 
 3. **`RUNTIME_VERIFY` -- boot the app, not just its tests.** A brand-new
    `TaskKind.RUNTIME_VERIFY` executor

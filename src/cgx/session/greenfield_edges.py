@@ -759,6 +759,96 @@ def _scaffold_contract_regenerate_actions(
     return actions
 
 
+def _actionable_payload_warnings(
+        outputs: Dict[str, object]) -> List[Dict[str, object]]:
+    """Return the cross-language payload warnings a regenerate can act on.
+
+    Keeps only a ``payload`` warning that names a concrete client ``file``
+    -- the offending fetch body is known and re-authoring that file against
+    the backend contract is a satisfiable, targeted goal. Anything without a
+    file is dropped so an unlocatable mismatch never forces a retry.
+    """
+    out: List[Dict[str, object]] = []
+    warnings = outputs.get("contract_warnings")
+    if not isinstance(warnings, (list, tuple)):
+        return out
+    for w in warnings:
+        if (isinstance(w, dict) and w.get("kind") == "payload"
+                and str(w.get("file") or "").strip()):
+            out.append(w)
+    return out
+
+
+def _payload_regenerate_constraint(
+        warnings: List[Dict[str, object]]) -> Dict[str, object]:
+    """Fold client/server payload mismatches into a regenerate constraint."""
+    items = [f"{w.get('file')} -> {w.get('name')}: send exactly "
+             f"{w.get('expected_keys')}" for w in warnings[:6]]
+    rationale = ("the frontend request payload(s) disagree with the backend "
+                 "contract: " + "; ".join(items)
+                 + ". Re-author each client file so its fetch body keys "
+                 "match the endpoint exactly.")
+    return {"kind": "payload_mismatch", "rationale": rationale,
+            "unmet_payloads": items}
+
+
+def _scaffold_payload_regenerate_actions(
+        completed: TaskNode,
+        tasks: List[TaskNode]) -> List[RouterAction]:
+    """Targeted-regenerate the client file(s) behind a payload mismatch.
+
+    Complements :func:`_scaffold_contract_regenerate_actions`: that path
+    handles unmet Python symbol contracts with a whole-tree regenerate;
+    this one owns the JS<->Python seam. When SCAFFOLD flagged a ``payload``
+    warning (a fetch body whose keys disagree with the handler it targets)
+    and the prior scaffold artifact is available, regenerate *only* the
+    named client file(s) against it -- reusing every prior-good diff -- so
+    the mismatch is corrected without rebuilding the tree. Bounded by
+    :data:`~cgx.session.budget.REGENERATE_BUDGET` and the same flap
+    signature the dropped-file paths use, and deliberately non-terminal: on
+    a spent budget, a repeated mismatch, or a missing prior artifact the
+    empty return lets the dispatcher take the normal SCAFFOLD -> APPLY edge.
+    """
+    from cgx.session.repair.propose import propose_regenerate  # dep direction
+
+    outputs = completed.outputs or {}
+    if int(outputs.get("failed_count") or 0) > 0:
+        return []
+    actionable = _actionable_payload_warnings(outputs)
+    if not actionable:
+        return []
+    prior_id = str(outputs.get("scaffold_artifact_id") or "").strip()
+    if not prior_id:
+        return []
+    target_files: List[str] = []
+    seen: set = set()
+    for w in actionable:
+        f = str(w.get("file") or "").strip()
+        if f and f not in seen:
+            seen.add(f)
+            target_files.append(f)
+    budget = LoopBudget.from_inputs(completed.inputs)
+    signature = _scaffold_failure_signature(
+        [{"file": f, "error": "payload_mismatch"} for f in target_files])
+    if budget.regenerate_exhausted or (signature and budget.seen(signature)):
+        return []
+    constraint = _payload_regenerate_constraint(actionable)
+    actions: List[RouterAction] = []
+    skip_states = {TaskNodeStatus.DONE, TaskNodeStatus.FAILED,
+                   TaskNodeStatus.ABANDONED}
+    for t in _collect_descendants(completed.task_id, tasks):
+        if t.status in skip_states:
+            continue
+        actions.append(UpdateTaskStatus(
+            task_id=t.task_id, status=TaskNodeStatus.ABANDONED))
+    actions.append(CreateTask(propose_regenerate(
+        completed, constraint,
+        regenerate_files=target_files,
+        prior_scaffold_artifact_id=prior_id,
+        prior_failure_signatures=_appended_signature(budget, signature))))
+    return actions
+
+
 def _scaffold_resume_actions(
         failed: TaskNode, tasks: List[TaskNode],
         resume_scaffold_artifact_id: Optional[str]) -> List[RouterAction]:

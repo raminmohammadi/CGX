@@ -10008,6 +10008,119 @@ def test_contract_check_constant_import_only_does_not_satisfy():
     assert check_contract_compliance(assigned, contracts) == []
 
 
+# ------------- P0b: client/server payload coherence gate -------------
+
+def test_payload_coherence_flags_rename_mismatch():
+    """The ses_4cbf963cdc67435a bug: client ``operator`` vs server ``operation``.
+
+    The handler reads ``num1/num2/operation`` while the React client POSTs
+    ``num1/num2/operator`` -- a rename in both directions -> one ``payload``
+    warning naming the client file and the divergent keys.
+    """
+    from cgx.session.scaffold_validate import (
+        check_client_server_payload_coherence,
+    )
+    contents = {
+        "backend/app.py": (
+            "@app.route('/calculate', methods=['POST'])\n"
+            "def calc():\n"
+            "    data = request.json\n"
+            "    a = data.get('num1')\n"
+            "    b = data.get('num2')\n"
+            "    op = data.get('operation')\n"
+            "    return {}\n"),
+        "src/components/Calculator.jsx": (
+            "fetch('/calculate', {\n"
+            "  method: 'POST',\n"
+            "  body: JSON.stringify({ num1, num2, operator }),\n"
+            "})\n"),
+    }
+    warnings = check_client_server_payload_coherence(contents)
+    assert len(warnings) == 1
+    w = warnings[0]
+    assert w["kind"] == "payload"
+    assert w["name"] == "/calculate"
+    assert w["file"] == "src/components/Calculator.jsx"
+    assert w["server_file"] == "backend/app.py"
+    assert "operator" in w["reason"] and "operation" in w["reason"]
+
+
+def test_payload_coherence_ignores_subset_and_superset():
+    """A body that merely omits/adds a field (one-directional) never fires."""
+    from cgx.session.scaffold_validate import (
+        check_client_server_payload_coherence,
+    )
+    handler = (
+        "@app.route('/calculate', methods=['POST'])\n"
+        "def calc():\n"
+        "    data = request.json\n"
+        "    a = data.get('num1')\n"
+        "    b = data.get('num2')\n"
+        "    op = data.get('operation')\n"
+        "    return {}\n")
+    # Exact match -> no warning.
+    exact = {
+        "backend/app.py": handler,
+        "src/App.jsx": (
+            "fetch('/calculate', { method: 'POST', body: "
+            "JSON.stringify({ num1, num2, operation }) })\n"),
+    }
+    assert check_client_server_payload_coherence(exact) == []
+    # Client omits an optional field (subset) -> still one-directional.
+    subset = {
+        "backend/app.py": handler,
+        "src/App.jsx": (
+            "fetch('/calculate', { method: 'POST', body: "
+            "JSON.stringify({ num1, num2 }) })\n"),
+    }
+    assert check_client_server_payload_coherence(subset) == []
+
+
+def test_payload_coherence_prefers_declared_contract():
+    """When the WORK_PLAN declares the endpoint, its request schema wins.
+
+    Even if the handler reads nothing the checker can see, the declared
+    ``request`` keys stand in as the authoritative expected shape.
+    """
+    from cgx.session.scaffold_validate import (
+        check_client_server_payload_coherence,
+    )
+    contracts = {"endpoints": [{
+        "method": "POST", "path": "/calculate",
+        "request": {"num1": 0, "num2": 0, "operation": ""}}]}
+    contents = {
+        "backend/app.py": (
+            "@app.route('/calculate', methods=['POST'])\n"
+            "def calc():\n    return {}\n"),
+        "src/App.jsx": (
+            "fetch('http://localhost:5000/calculate', { method: 'POST', "
+            "body: JSON.stringify({ num1, num2, operator }) })\n"),
+    }
+    warnings = check_client_server_payload_coherence(contents, contracts)
+    assert [w["name"] for w in warnings] == ["/calculate"]
+    assert warnings[0]["expected_keys"] == ["num1", "num2", "operation"]
+
+
+def test_payload_coherence_abstains_without_seam():
+    """No backend route or no client fetch body -> nothing to compare."""
+    from cgx.session.scaffold_validate import (
+        check_client_server_payload_coherence,
+    )
+    # A route but no client fetch.
+    assert check_client_server_payload_coherence({
+        "backend/app.py": (
+            "@app.route('/calculate', methods=['POST'])\n"
+            "def calc():\n    return {}\n")}) == []
+    # A fetch but no Python route.
+    assert check_client_server_payload_coherence({
+        "src/App.jsx": (
+            "fetch('/calculate', { method: 'POST', body: "
+            "JSON.stringify({ num1, num2 }) })\n")}) == []
+    # Empty / non-dict input.
+    assert check_client_server_payload_coherence({}) == []
+    assert check_client_server_payload_coherence(None) == []
+
+
 def test_scaffold_executor_surfaces_import_warnings(store, monkeypatch):
     """SCAFFOLD runs the cross-check and surfaces ``import_warnings``."""
     from cgx.session.tasks.scaffold import run_scaffold
@@ -10788,6 +10901,84 @@ def test_router_scaffold_contract_skipped_when_files_dropped():
         [{"kind": "function", "name": "compute", "module": "src/core.py"}],
         failed_count=1)
     assert _scaffold_contract_regenerate_actions(scaffold, [scaffold]) == []
+
+
+# ------------- P0b: payload-mismatch targeted regenerate -------------
+
+def _payload_warning(file="src/components/Calculator.jsx"):
+    return {"kind": "payload", "name": "/calculate", "file": file,
+            "server_file": "backend/app.py",
+            "client_keys": ["num1", "num2", "operator"],
+            "expected_keys": ["num1", "num2", "operation"],
+            "reason": "client sends operator but endpoint expects operation"}
+
+
+def test_actionable_payload_warnings_requires_client_file():
+    from cgx.session.greenfield_edges import _actionable_payload_warnings
+    got = _actionable_payload_warnings({"contract_warnings": [
+        _payload_warning(),
+        {"kind": "payload", "name": "/x"},  # no file -> skip
+        {"kind": "function", "name": "compute", "module": "src/core.py"},
+        "not-a-dict",
+    ]})
+    assert [w["file"] for w in got] == ["src/components/Calculator.jsx"]
+
+
+def test_router_scaffold_payload_mismatch_targeted_regenerate():
+    # A payload rename regenerates ONLY the offending client file against
+    # the prior scaffold artifact, with the mismatch folded in.
+    from cgx.session.greenfield_edges import (
+        _scaffold_payload_regenerate_actions,
+    )
+    _session, scaffold = _make_clean_scaffold_with_contracts(
+        [_payload_warning()])
+    actions = _scaffold_payload_regenerate_actions(scaffold, [scaffold])
+    creates = [a for a in actions if isinstance(a, CreateTask)]
+    assert len(creates) == 1
+    new_scaffold = creates[0].task
+    assert new_scaffold.kind is TaskKind.SCAFFOLD
+    assert new_scaffold.inputs["regenerate_files"] == [
+        "src/components/Calculator.jsx"]
+    assert new_scaffold.inputs["prior_scaffold_artifact_id"] == "art_s"
+    constraint = new_scaffold.inputs["regenerate_constraints"][-1]
+    assert constraint["kind"] == "payload_mismatch"
+    assert "operation" in constraint["rationale"]
+
+
+def test_router_scaffold_payload_skipped_when_files_dropped():
+    # failed_count > 0 belongs to the dropped-files path; the payload path
+    # defers so the two regenerates never race on the same scaffold.
+    from cgx.session.greenfield_edges import (
+        _scaffold_payload_regenerate_actions,
+    )
+    _session, scaffold = _make_clean_scaffold_with_contracts(
+        [_payload_warning()], failed_count=1)
+    assert _scaffold_payload_regenerate_actions(scaffold, [scaffold]) == []
+
+
+def test_router_scaffold_payload_non_terminal_when_budget_spent():
+    from cgx.session.budget import REGENERATE_BUDGET
+    from cgx.session.greenfield_edges import (
+        _scaffold_payload_regenerate_actions,
+    )
+    _session, scaffold = _make_clean_scaffold_with_contracts(
+        [_payload_warning()], prior_regens=REGENERATE_BUDGET)
+    assert _scaffold_payload_regenerate_actions(scaffold, [scaffold]) == []
+
+
+def test_router_scaffold_payload_repeat_is_non_terminal():
+    """The same payload mismatch twice stops the loop (flap backstop)."""
+    from cgx.session.greenfield_edges import (
+        _scaffold_payload_regenerate_actions,
+    )
+    _session, scaffold = _make_clean_scaffold_with_contracts(
+        [_payload_warning()])
+    first = _scaffold_payload_regenerate_actions(scaffold, [scaffold])
+    retry = [a for a in first if isinstance(a, CreateTask)][0].task
+    signatures = retry.inputs["prior_failure_signatures"]
+    assert signatures
+    scaffold.inputs["prior_failure_signatures"] = signatures
+    assert _scaffold_payload_regenerate_actions(scaffold, [scaffold]) == []
 
 
 def test_router_repair_regenerate_budget_exhausted_fails_session():

@@ -544,7 +544,7 @@ Where to look in the repo:
 | PyPI metadata client     | `src/cgx/session/repair/pypi_client.py` (Phase 3.2) |
 | Explore executors        | `src/cgx/session/tasks/{explore,investigate,recommend,plan_change}.py` |
 | Greenfield executors     | `src/cgx/session/tasks/{clarify_requirements,decompose,scaffold,bootstrap_env,api_check,smoke,runtime_verify,repair}.py` |
-| Contract + coherence gates | `src/cgx/session/scaffold_validate.py :: {check_contract_compliance, cross_check_first_party_imports}` |
+| Contract + coherence gates | `src/cgx/session/scaffold_validate.py :: {check_contract_compliance, cross_check_first_party_imports, check_client_server_payload_coherence}` |
 | Frontend coherence passes | `src/cgx/session/tasks/scaffold.py :: {_synthesize_missing_frontend_stylesheets, _js_import_coherence_failures}` |
 | Targeted build-smoke repair | `src/cgx/session/repair/classify.py :: unresolved_import_sources` + `src/cgx/session/tasks/repair.py :: _build_smoke_target_files` |
 | Shared write executors   | `src/cgx/session/tasks/{apply,verify,ask}.py` |

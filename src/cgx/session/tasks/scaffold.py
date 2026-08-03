@@ -32,6 +32,7 @@ from cgx.session.models import (
 )
 from cgx.session.repair.pypi_client import PyPIClient
 from cgx.session.scaffold_validate import (
+    check_client_server_payload_coherence,
     check_contract_compliance,
     cross_check_first_party_imports,
     is_requirements_path,
@@ -643,6 +644,23 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         logger.exception(
             "SCAFFOLD: contract compliance check raised; skipping")
         contract_warnings = []
+
+    # Cross-language payload coherence gate (P0b): a JS ``fetch`` body whose
+    # keys disagree with the backend handler it targets (e.g. ``operator``
+    # vs ``operation``) is invisible to the Python-only contract check above
+    # and to a build smoke, yet it makes the app non-functional at runtime.
+    # Fold any mismatch into ``contract_warnings`` as a ``payload`` kind so
+    # the router regenerates only the offending client file. Best-effort:
+    # a raised checker leaves the existing warnings untouched.
+    try:
+        payload_warnings = check_client_server_payload_coherence(
+            xcheck_contents, contracts)
+    except Exception:  # pragma: no cover - defensive: checker is best-effort
+        logger.exception(
+            "SCAFFOLD: payload coherence check raised; skipping")
+        payload_warnings = []
+    if payload_warnings:
+        contract_warnings = list(contract_warnings) + payload_warnings
 
     # Finalise the checkpoint artifact in place: pin validation reassigns
     # ``diffs`` to a new list, so re-point the content at it, attach the
