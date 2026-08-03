@@ -4648,6 +4648,109 @@ def test_js_import_coherence_resolves_siblings_and_skips_assets():
     assert _js_import_coherence_failures(existing, None) == []
 
 
+# ---------------- P1a: JS test-harness coherence ----------------
+
+def test_js_test_path_detection():
+    from cgx.session.tasks.scaffold import _is_js_test_path
+    assert _is_js_test_path("src/App.test.jsx") is True
+    assert _is_js_test_path("src/util.spec.ts") is True
+    assert _is_js_test_path("src/__tests__/App.jsx") is True
+    assert _is_js_test_path("src/App.jsx") is False
+    assert _is_js_test_path("src/App.test.py") is False
+
+
+def test_synthesize_js_test_harness_backfills_react_project():
+    """A React test file with a bare package.json gets a runnable harness."""
+    import json
+    from cgx.answer.engine import _content_to_new_file_patch  # noqa: F401
+    from cgx.session.tasks.scaffold import (
+        _content_from_new_file_patch,
+        _synthesize_js_test_harness,
+    )
+    existing = [
+        {"path": "package.json",
+         "content": '{"name": "app", "dependencies": {"react": "^18.0.0"}}'},
+        {"path": "src/App.jsx", "content": "export default () => null\n"},
+        {"path": "src/App.test.jsx",
+         "content": ("import { render } from '@testing-library/react'\n"
+                     "import App from './App.jsx'\n")},
+    ]
+    diffs = [{"file": e["path"],
+              "patch": _content_to_new_file_patch(e["path"], e["content"])}
+             for e in existing]
+    generated = [{"file": e["path"], "layer": "core", "bytes": 1}
+                 for e in existing]
+    layers: list = []
+    touched = _synthesize_js_test_harness(
+        diffs=diffs, generated=generated, existing_with_content=existing,
+        layers=layers, project_root=None)
+    assert "package.json" in touched
+    assert "vitest.config.js" in touched
+    assert "vitest.setup.js" in touched
+    # package.json now carries a real test script + harness devDeps.
+    pkg = json.loads(next(e["content"] for e in existing
+                          if e["path"] == "package.json"))
+    assert pkg["scripts"]["test"] == "vitest run"
+    assert "vitest" in pkg["devDependencies"]
+    assert "jsdom" in pkg["devDependencies"]
+    assert "@testing-library/react" in pkg["devDependencies"]
+    assert "@vitejs/plugin-react" in pkg["devDependencies"]
+    # react stays where the model declared it, not duplicated into devDeps.
+    assert "react" not in pkg["devDependencies"]
+    # The config is jsdom + wired to the setup file, and rides the diff bundle.
+    cfg = _content_from_new_file_patch(
+        next(d["patch"] for d in diffs if d["file"] == "vitest.config.js"))
+    assert "jsdom" in cfg and "vitest.setup.js" in cfg
+    assert "plugin-react" in cfg
+    assert any(e["path"] == "vitest.setup.js" for e in existing)
+
+
+def test_synthesize_js_test_harness_noop_without_tests():
+    from cgx.session.tasks.scaffold import _synthesize_js_test_harness
+    existing = [
+        {"path": "package.json", "content": '{"name": "app"}'},
+        {"path": "src/App.jsx", "content": "export default 1\n"},
+    ]
+    assert _synthesize_js_test_harness(
+        diffs=[], generated=[], existing_with_content=existing, layers=[],
+        project_root=None) == []
+
+
+def test_synthesize_js_test_harness_preserves_existing_config_and_script():
+    """A real test script and an existing vitest config are not clobbered."""
+    from cgx.session.tasks.scaffold import _synthesize_js_test_harness
+    existing = [
+        {"path": "package.json",
+         "content": ('{"name": "app", "scripts": {"test": "vitest"}, '
+                     '"devDependencies": {"vitest": "^1.0.0"}}')},
+        {"path": "vitest.config.js", "content": "export default {}\n"},
+        {"path": "src/App.test.jsx", "content": "test('x', () => {})\n"},
+    ]
+    diffs = [{"file": e["path"], "patch": ""} for e in existing]
+    touched = _synthesize_js_test_harness(
+        diffs=diffs, generated=[], existing_with_content=existing,
+        layers=[], project_root=None)
+    # Config already present -> not re-synthesized; only devDeps may grow.
+    assert "vitest.config.js" not in touched
+    assert "vitest.setup.js" not in touched
+    import json
+    pkg = json.loads(next(e["content"] for e in existing
+                          if e["path"] == "package.json"))
+    assert pkg["scripts"]["test"] == "vitest"  # untouched
+
+
+def test_synthesize_js_test_harness_skips_vue():
+    from cgx.session.tasks.scaffold import _synthesize_js_test_harness
+    existing = [
+        {"path": "package.json", "content": '{"name": "app"}'},
+        {"path": "src/App.vue", "content": "<template></template>\n"},
+        {"path": "src/App.spec.js", "content": "test('x', () => {})\n"},
+    ]
+    assert _synthesize_js_test_harness(
+        diffs=[], generated=[], existing_with_content=existing, layers=[],
+        project_root=None) == []
+
+
 def test_scaffold_synthesizes_missing_stylesheet_stub(store, monkeypatch):
     """run_scaffold backfills an omitted stylesheet so the tree builds."""
     from cgx.session.tasks.scaffold import run_scaffold
