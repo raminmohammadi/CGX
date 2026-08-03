@@ -631,12 +631,19 @@ emits a `SCAFFOLD_PATCHES` artifact. As of the contract-first work,
 the `WORK_PLAN` also carries a `contracts` block (the declared
 endpoints / schemas / functions / constants every file must share);
 it is threaded into each `generate_single_scaffold_file` call, and
-after the per-file loop two best-effort gates run before `APPLY`: a
+after the per-file loop four best-effort gates run before `APPLY`: a
 **coherence pass** that regenerates only importer files referencing a
-first-party symbol no sibling defines, and a **contract enforcement
-gate** that flags declared interfaces no generated file satisfies.
-Both attach `import_warnings` / `contract_warnings` to
-`SCAFFOLD_PATCHES` rather than failing the scaffold. The shared `APPLY` executor
+first-party symbol no sibling defines, a **contract enforcement
+gate** that flags declared interfaces no generated file satisfies, a
+**client/server payload-coherence gate** (P0b) that flags a JS `fetch`
+body whose keys disagree with the Python handler it targets (a
+cross-language rename the Python-only gates miss), and a
+**response-contract coherence gate** (P0c) that flags a handler whose
+success HTTP status disagrees with the endpoint's declared status.
+All attach `import_warnings` / `contract_warnings` to
+`SCAFFOLD_PATCHES` rather than failing the scaffold; a payload or
+response mismatch drives a targeted regenerate of only the offending
+client/server file. The shared `APPLY` executor
 accepts either a `CODE_CHANGE_PLAN` (explore) or `SCAFFOLD_PATCHES`
 (greenfield). In greenfield mode a `BOOTSTRAP_ENV` step then
 provisions a project-local `.venv` (via
@@ -750,6 +757,17 @@ come from the crash frames first, then the files `APPLY` wrote) and
 **retrieval-fed** (any remaining candidate slot is filled by hybrid
 retrieval over the project index -- a no-op in greenfield, where there
 is no index).
+
+A plain `assertions_failed` that no mechanical classifier can locate is
+treated as **assertion drift** -- the suite imported and ran, but a
+status code, message, or value the test asserts diverged from what the
+implementation produced. The tests encode the intended contract, so when
+the bounded LLM patch is a no-op (no provider, or the repair budget is
+spent) the loop falls back to a *targeted* regenerate of only the
+implementation file(s) the traceback named -- never the tests -- so the
+handler is realigned to the asserted contract instead of a whole-tree
+regenerate that re-rolls both sides of the seam and reproduces the same
+divergence.
 
 The executor emits a `REPAIR_PLAN` artifact shaped exactly like a
 `CODE_CHANGE_PLAN`. The shared `APPLY` executor consumes it,

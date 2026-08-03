@@ -555,6 +555,18 @@ Five entry points cover every transition:
                                      semantic rewrites of an applied tree
                                      at REPAIR_REGENERATE_BUDGET=2
                                      per ancestor chain)
+  REPAIR (classification=assertion_drift, Part A)
+                       -> APPLY (bounded LLM logic-repair patch) or
+                          SCAFFOLD (targeted regenerate of ONLY the
+                          implementation file(s) named in the failure
+                          traceback -- carried as target_files with test
+                          modules excluded -- so the handler is aligned to
+                          the test's asserted contract instead of a
+                          whole-tree regenerate that re-rolls both sides of
+                          the seam and reproduces the same drift
+                          (ses_a60d67a2f0164dcb); degrades to a whole-tree
+                          regenerate when the traceback named no
+                          implementation file)
   REPAIR (strategy=install_deps)
                        -> BOOTSTRAP_ENV (missing_dependency verdict:
                                      re-provision the venv to install the
@@ -627,7 +639,8 @@ this subsection first; the six moving parts are:
 1. **Contract-first `DECOMPOSE`.** The planner emits a `WORK_PLAN`
    artifact that now carries a `contracts` block alongside `layers`.
    `contracts` is a bounded dict over four categories -- `endpoints`
-   (HTTP method + path), `schemas` (class/model names), `functions`
+   (HTTP method + path, plus an optional success `status` code and
+   `message` string -- P0c), `schemas` (class/model names), `functions`
    (name + owning module) and `constants` (module-level names) -- the
    *shared interfaces* every file must agree on. `_coerce_contracts`
    (`cgx.session.tasks.decompose`) normalises it defensively;
@@ -653,7 +666,7 @@ this subsection first; the six moving parts are:
    pure-backend manifests skip the check entirely.
 
 2. **Contract enforcement gate + coherence pass (`SCAFFOLD`).** After
-   the per-file loop, `run_scaffold` runs three best-effort static gates
+   the per-file loop, `run_scaffold` runs four best-effort static gates
    from `cgx.session.scaffold_validate` before `APPLY` writes anything:
    * `cross_check_first_party_imports` -- parses every generated `.py`
      file and flags each `from <first-party> import <name>` whose target
@@ -678,13 +691,30 @@ this subsection first; the six moving parts are:
      sends (e.g. `operator` vs `operation`, the ses_4cbf963cdc67435a
      defect) -- fires; a body that merely omits/adds an optional field is
      left alone. It emits a `payload`-kind entry folded into
-     `contract_warnings`. All three record `import_warnings` /
+     `contract_warnings`.
+   * `check_response_contract_coherence` (**P0c**) -- the response-side
+     analogue of the P0b payload gate, closing the *return* seam the
+     request-key check is blind to. When the `endpoints` contract carries a
+     success `status` (e.g. `201` for a create) both the paired test and the
+     handler are generated against it, so a handler that returns a
+     *different* 2xx status -- or relies on an implicit 200 where a non-200
+     is declared -- is the same test<->implementation drift REPAIR chases,
+     caught statically here before VERIFY runs the suite.
+     `_python_route_statuses` extracts the explicit status codes each
+     Flask/FastAPI handler sets (a trailing status in a `return` tuple or a
+     `status=` / `status_code=` keyword); enforcement is deliberately narrow
+     -- an implicit 200 is never inferred, so an absent status abstains
+     rather than guesses. It emits a `response`-kind entry naming the
+     offending handler file. (The `endpoints` contract also carries an
+     optional success `message` string; it is declared upfront to steer both
+     sides at generation time but is not statically enforced.)
+     All four record `import_warnings` /
      `contract_warnings` on the `SCAFFOLD_PATCHES` artifact rather than
      failing the scaffold; the router folds a warning into a targeted
-     regenerate constraint. A `payload` warning routes through
+     regenerate constraint. A `payload` or `response` warning routes through
      `_scaffold_payload_regenerate_actions` (registered ahead of the
      whole-tree contract regenerate in `_COMPLETION_GUARDS`), which
-     re-authors *only* the offending client file(s) against the prior
+     re-authors *only* the offending client/server file(s) against the prior
      `SCAFFOLD_PATCHES` artifact, bounded by `REGENERATE_BUDGET` and the
      same flap signature the dropped-file path uses.
 
