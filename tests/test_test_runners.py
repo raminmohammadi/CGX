@@ -15,6 +15,7 @@ from cgx.codegen.test_runners import (
     NpmRunner,
     PytestRunner,
     TestRunner,
+    _has_js_test_files,
     _npm_script_command,
     detect_test_runners,
     run_project_tests,
@@ -123,6 +124,51 @@ def test_npm_runner_real_test_marks_ran_tests_true(tmp_path, monkeypatch):
     outcome = NpmRunner().run(str(tmp_path), [])
     assert outcome.ran is True
     assert outcome.ran_tests is True
+
+
+# --------------------------------------------------------------------------
+# JS test-file presence (P1b coverage signal for P2's fail-closed policy)
+# --------------------------------------------------------------------------
+def test_has_js_test_files_detects_scaffolded_suite(tmp_path):
+    _write(tmp_path, "src/components/Calculator.test.jsx", "test('x', () => {})")
+    assert _has_js_test_files(str(tmp_path)) is True
+
+
+def test_has_js_test_files_ignores_vendored_and_source(tmp_path):
+    # A dependency's bundled test and a plain source file must not count.
+    _write(tmp_path, "node_modules/lib/thing.test.js", "//")
+    _write(tmp_path, "src/App.jsx", "export default () => null")
+    assert _has_js_test_files(str(tmp_path)) is False
+
+
+def test_npm_runner_reports_tests_present_even_without_script(
+        tmp_path, monkeypatch):
+    """Test files present but no test script -> build smoke, tests_present True.
+
+    The ses_4cbf963cdc67435a blind spot: a scaffolded React suite that never
+    ran. NpmRunner surfaces ``tests_present`` so P2 can fail closed.
+    """
+    _write(tmp_path, "package.json", '{"scripts": {"build": "vite build"}}')
+    _write(tmp_path, "src/App.test.jsx", "test('x', () => {})")
+    (tmp_path / "node_modules").mkdir()
+    monkeypatch.setattr(
+        "cgx.codegen.test_runners.shutil.which", lambda _: "/usr/bin/npm")
+    monkeypatch.setattr(
+        "cgx.codegen.test_runners.subprocess.run", lambda *a, **k: _Proc(0))
+    outcome = NpmRunner().run(str(tmp_path), [])
+    assert outcome.ran_tests is False
+    assert outcome.tests_present is True
+
+
+def test_npm_runner_tests_present_on_npm_missing(tmp_path, monkeypatch):
+    """An offline box still reports the scaffolded suite's presence."""
+    _write(tmp_path, "package.json", '{"scripts": {"test": "vitest run"}}')
+    _write(tmp_path, "src/App.test.jsx", "test('x', () => {})")
+    monkeypatch.setattr(
+        "cgx.codegen.test_runners.shutil.which", lambda _: None)
+    outcome = NpmRunner().run(str(tmp_path), [])
+    assert outcome.ran is False
+    assert outcome.tests_present is True
 
 
 # --------------------------------------------------------------------------

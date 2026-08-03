@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -73,6 +74,48 @@ class PytestRunner(TestRunner):
         )
 
 
+# JS/TS unit-test files (mirrors scaffold._is_js_test_path): ``*.test.*`` /
+# ``*.spec.*`` / anything under a ``__tests__`` dir. Kept in sync so the
+# harness SCAFFOLD backfills is the same suite VERIFY looks for.
+_JS_TEST_EXTS = (".js", ".jsx", ".ts", ".tsx")
+# Directories that never hold first-party tests -- skip them so a
+# dependency's bundled ``*.test.js`` never reads as the project's suite.
+_JS_TEST_SKIP_DIRS = frozenset({
+    "node_modules", ".git", ".cgx", ".cgx-backups", "dist", "build",
+    "coverage", ".venv", "venv", "__pycache__", ".next", ".nuxt", "out",
+})
+
+
+def _is_js_test_file(rel_path: str) -> bool:
+    """True for a JS/TS unit-test file (``*.test.jsx`` / ``__tests__/*``)."""
+    p = rel_path.replace("\\", "/").strip().lstrip("./").lower()
+    dot = p.rfind(".")
+    ext = p[dot:] if dot > 0 else ""
+    if ext not in _JS_TEST_EXTS:
+        return False
+    if "/__tests__/" in p or p.startswith("__tests__/"):
+        return True
+    stem = p[: -len(ext)]
+    return stem.endswith(".test") or stem.endswith(".spec")
+
+
+def _has_js_test_files(project_root: str) -> bool:
+    """Whether the working tree carries any first-party JS/TS test file.
+
+    Walks the tree pruning vendored/build dirs so a dependency's bundled
+    ``*.test.js`` never counts. Lets VERIFY tell a genuinely test-free JS
+    project (honest ``no_tests``) apart from one whose scaffolded suite was
+    never wired to run -- the coverage blind spot P2 fails closed on.
+    """
+    root = Path(project_root)
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in _JS_TEST_SKIP_DIRS]
+        for name in filenames:
+            if _is_js_test_file(name):
+                return True
+    return False
+
+
 def _load_package_json(project_root: str) -> Optional[Dict[str, Any]]:
     try:
         with open(Path(project_root) / "package.json", "r", encoding="utf-8") as f:
@@ -114,12 +157,18 @@ class NpmRunner(TestRunner):
         self, project_root: str, changed_files: Sequence[str], *,
         timeout_seconds: float = 180.0, python_exe: Optional[str] = None,
     ) -> TestRunOutcome:
+        # Report JS test-file presence on every outcome (even the early
+        # skips) so P2 can fail closed on a scaffolded-but-never-run suite
+        # regardless of *why* it did not run (npm missing, no test script).
+        tp = _has_js_test_files(project_root)
         if shutil.which("npm") is None:
-            return TestRunOutcome(ran=False, skipped_reason="npm not installed")
+            return TestRunOutcome(
+                ran=False, skipped_reason="npm not installed", tests_present=tp)
         cmd = _npm_script_command(project_root)
         if cmd is None:
             return TestRunOutcome(
-                ran=False, skipped_reason="no npm test or build script")
+                ran=False, skipped_reason="no npm test or build script",
+                tests_present=tp)
         root = Path(project_root).resolve()
         # Best-effort dependency install so the smoke can run; bounded and
         # non-fatal -- an offline box simply runs the script as-is.
@@ -145,13 +194,15 @@ class NpmRunner(TestRunner):
             return TestRunOutcome(
                 ran=True, returncode=124, stdout=e.stdout or "",
                 stderr=(e.stderr or "") + "\n[timeout]", tests_selected=[label],
-                ran_tests=ran_tests)
+                ran_tests=ran_tests, tests_present=tp)
         except Exception as e:
             return TestRunOutcome(
-                ran=False, skipped_reason=f"{type(e).__name__}: {e}")
+                ran=False, skipped_reason=f"{type(e).__name__}: {e}",
+                tests_present=tp)
         return TestRunOutcome(
             ran=True, returncode=proc.returncode, stdout=proc.stdout,
-            stderr=proc.stderr, tests_selected=[label], ran_tests=ran_tests)
+            stderr=proc.stderr, tests_selected=[label], ran_tests=ran_tests,
+            tests_present=tp)
 
 
 # Registry of default runners, checked in order. Append new stacks here.

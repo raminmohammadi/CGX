@@ -2806,6 +2806,92 @@ def test_verify_polyglot_npm_failure_surfaces_over_pytest_pass(
     assert result.outputs["tests_passed"] is False
 
 
+def test_verify_surfaces_js_tests_present_when_masked_by_pytest(
+        tmp_path, store, monkeypatch):
+    """Polyglot: a scaffolded-but-unrun JS suite is exposed, not hidden.
+
+    The ses_4cbf963cdc67435a shape -- pytest passes while the React suite
+    (present on disk) only got a build smoke. The combined token is still
+    ``passed`` (build was green), but VERIFY must surface
+    ``js_tests_present`` True / ``js_tests_ran`` False so P2 can fail closed.
+    """
+    from cgx.codegen.test_runner import TestRunOutcome
+    from cgx.codegen import test_runners
+    from cgx.session.tasks.verify import run_verify
+
+    (tmp_path / "package.json").write_text(
+        '{"name": "app", "scripts": {"build": "vite build"}}',
+        encoding="utf-8")
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "App.test.jsx").write_text(
+        "test('x', () => {})\n", encoding="utf-8")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_x.py").write_text(
+        "def test_x(): assert 1\n", encoding="utf-8")
+
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+
+    monkeypatch.setattr(
+        "cgx.codegen.test_runner.run_tests_on_disk",
+        lambda root, files, **_kw: TestRunOutcome(
+            ran=True, returncode=0, stdout="1 passed", stderr="",
+            tests_selected=[str(tmp_path / "tests" / "test_x.py")]))
+    monkeypatch.setattr(
+        test_runners.NpmRunner, "run",
+        lambda self, root, files, **kw: TestRunOutcome(
+            ran=True, returncode=0, stdout="built ok", stderr="",
+            tests_selected=["npm run build"], ran_tests=False,
+            tests_present=True))
+
+    t = TaskNode.new(session.session_id, TaskKind.VERIFY, "verify",
+                     inputs={"changed_files": ["src/App.jsx"],
+                             "mode": SessionMode.GREENFIELD.value})
+    store.save_task(t)
+    result = run_verify(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    assert result.failure is None
+    assert result.outputs["outcome"] == "passed"
+    assert result.outputs["js_tests_present"] is True
+    assert result.outputs["js_tests_ran"] is False
+    assert result.artifact.content["js_tests_present"] is True
+
+
+def test_verify_js_tests_ran_true_for_real_suite(
+        tmp_path, store, monkeypatch):
+    """A real JS suite that executed records js_tests_ran True."""
+    from cgx.codegen.test_runner import TestRunOutcome
+    from cgx.codegen import test_runners
+    from cgx.session.tasks.verify import run_verify
+
+    (tmp_path / "package.json").write_text(
+        '{"name": "app", "scripts": {"test": "vitest run"}}',
+        encoding="utf-8")
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "App.test.jsx").write_text(
+        "test('x', () => {})\n", encoding="utf-8")
+
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+
+    monkeypatch.setattr(
+        test_runners.NpmRunner, "run",
+        lambda self, root, files, **kw: TestRunOutcome(
+            ran=True, returncode=0, stdout="2 passed", stderr="",
+            tests_selected=["npm test"], ran_tests=True, tests_present=True))
+
+    t = TaskNode.new(session.session_id, TaskKind.VERIFY, "verify",
+                     inputs={"changed_files": ["src/App.jsx"],
+                             "mode": SessionMode.GREENFIELD.value})
+    store.save_task(t)
+    result = run_verify(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    assert result.failure is None
+    assert result.outputs["outcome"] == "passed"
+    assert result.outputs["js_tests_present"] is True
+    assert result.outputs["js_tests_ran"] is True
+
+
 def test_runtime_verify_skipped_without_python_exe(tmp_path, store):
     """No bootstrapped interpreter -> the boot gate is an explicit no-op."""
     from cgx.session.models import SessionMode

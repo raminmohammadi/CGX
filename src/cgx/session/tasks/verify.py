@@ -166,6 +166,8 @@ def run_verify(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         "skipped_reason": combined.skipped_reason,
         "reproduce_cmd": reproduce_cmd,
         "failures": failures,
+        "js_tests_present": combined.js_tests_present,
+        "js_tests_ran": combined.js_tests_ran,
     }
     # Pre-compute the repair-loop signature here (rather than in the
     # router) so the deterministic Router stays IO-free; the value is
@@ -203,6 +205,8 @@ def run_verify(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
                 verify_outcome, failures, combined.pytest_tests_selected),
             "failure_signature": sig,
             "returncode": combined.returncode,
+            "js_tests_present": combined.js_tests_present,
+            "js_tests_ran": combined.js_tests_ran,
         },
         artifact=artifact,
     )
@@ -339,6 +343,14 @@ class _Combined:
     stdout: str = ""
     stderr: str = ""
     skipped_reason: Optional[str] = None
+    # Coverage signal for the non-pytest (JS/TS) half of a polyglot repo:
+    # ``js_tests_present`` is True when the tree carries scaffolded JS test
+    # files, ``js_tests_ran`` when a JS runner actually executed a real
+    # suite. Present-but-not-ran is the ses_4cbf963cdc67435a blind spot --
+    # exposed here so P2 can fail closed rather than let a passing Python
+    # half mask an unrun React suite.
+    js_tests_present: bool = False
+    js_tests_ran: bool = False
 
 
 # Severity ordering among the "hard" (definitively-failed) tokens: when
@@ -459,6 +471,15 @@ def _combine_verify_outcomes(
         if token == outcome and oc.ran:
             returncode = int(oc.returncode)
             break
+    # Non-pytest (JS/TS) coverage signal for P2's fail-closed policy: did
+    # the tree carry scaffolded JS test files, and did any JS runner
+    # actually execute a real suite (a build-only smoke has ran_tests False)?
+    js_present = any(
+        bool(getattr(oc, "tests_present", None))
+        for _name, oc, _token, is_pytest in components if not is_pytest)
+    js_ran = any(
+        oc.ran and bool(getattr(oc, "ran_tests", False))
+        for _name, oc, _token, is_pytest in components if not is_pytest)
     return _Combined(
         ran=ran,
         returncode=returncode,
@@ -469,6 +490,8 @@ def _combine_verify_outcomes(
         stderr="\n\n".join(err_chunks),
         skipped_reason=(
             None if ran else ("; ".join(skips) or "no test runner detected")),
+        js_tests_present=js_present,
+        js_tests_ran=js_ran,
     )
 
 
