@@ -5,13 +5,13 @@ from __future__ import annotations
 import logging
 import os
 import json
-import re
 import time
 from typing import Any, Dict, Iterator, List, Optional
 import requests  # intentionally re-exported; UI imports this to ensure dependency
 
 from cgx.answer.ratelimit import RateLimiter, backoff_seconds, request_with_retry
 from cgx.answer.schemas import to_gemini_schema, to_openai_response_format
+from cgx.logging_setup import scrub_secrets
 
 DEFAULT_TIMEOUT = float(os.environ.get("CGX_HTTP_TIMEOUT", "120"))
 
@@ -401,18 +401,14 @@ class GeminiProvider(LLMProvider):
 
     @staticmethod
     def _scrub_secret(text: str) -> str:
-        """Redact ``key=<value>`` query parameters so the API key never appears
-        in logs or error payloads. Matches Gemini's URL-style key parameter
-        until the next ``&``, whitespace, or end-of-string. Empty values
-        are rewritten to ``<missing>`` so logs disambiguate a redacted key
-        from a request that never carried one."""
-        if not text:
-            return text
+        """Redact the API key from any error/log string.
 
-        def _sub(m: "re.Match[str]") -> str:
-            return m.group(1) + ("<redacted>" if m.group(2) else "<missing>")
-
-        return re.sub(r"([?&]key=)([^&\s]*)", _sub, text)
+        Delegates to :func:`cgx.logging_setup.scrub_secrets`, the single
+        source of truth for credential redaction (Gemini's URL-style
+        ``key=<value>`` parameter plus the other shapes providers emit), so
+        this provider and the shared retry/logging layers can never drift
+        apart on what counts as a secret."""
+        return scrub_secrets(text)
 
     @staticmethod
     def _diagnose_empty_response(data: Any) -> str:

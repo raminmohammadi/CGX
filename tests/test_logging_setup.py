@@ -7,7 +7,13 @@ import os
 
 import pytest
 
-from cgx.logging_setup import get_logger, setup_logging, temp_log_level
+from cgx.logging_setup import (
+    SecretScrubbingFilter,
+    get_logger,
+    scrub_secrets,
+    setup_logging,
+    temp_log_level,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -91,3 +97,62 @@ def test_temp_log_level_restores_level_when_body_raises():
         with temp_log_level(log, logging.DEBUG):
             raise RuntimeError("boom")
     assert log.level == logging.INFO
+
+
+# --- Secret scrubbing -------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("GET https://x/v1/models:generateContent?key=AQ.SECRET&alt=sse",
+         "GET https://x/v1/models:generateContent?key=<redacted>&alt=sse"),
+        ("&api_key=hunter2", "&api_key=<redacted>"),
+        ("api_key=hunter2", "api_key=<redacted>"),
+        ("header Authorization: Bearer tok.en.value here",
+         "header Authorization: Bearer <redacted> here"),
+        ("?key=&next=1", "?key=<missing>&next=1"),
+        # Non-secret text (including deceptive substrings) is untouched.
+        ("the monkey=banana ate turkey=roast", "the monkey=banana ate turkey=roast"),
+        ("plain log line", "plain log line"),
+    ],
+)
+def test_scrub_secrets_redacts_known_shapes(raw, expected):
+    assert scrub_secrets(raw) == expected
+
+
+def test_scrub_secrets_is_idempotent():
+    once = scrub_secrets("?key=AQ.SECRET&x=1")
+    assert scrub_secrets(once) == once
+
+
+def test_scrub_secrets_passes_through_non_str():
+    assert scrub_secrets(None) is None  # type: ignore[arg-type]
+    assert scrub_secrets("") == ""
+
+
+def test_setup_logging_installs_scrubbing_filter_on_handlers():
+    root = setup_logging(level="INFO")
+    assert root.handlers, "expected at least one handler"
+    for h in root.handlers:
+        assert any(isinstance(f, SecretScrubbingFilter) for f in h.filters), (
+            "every handler must carry the secret-scrubbing filter")
+
+
+def test_setup_logging_does_not_duplicate_scrubbing_filter():
+    setup_logging(level="INFO")
+    setup_logging(level="INFO")
+    for h in logging.getLogger().handlers:
+        n = sum(isinstance(f, SecretScrubbingFilter) for f in h.filters)
+        assert n <= 1, "scrubbing filter must not be attached more than once"
+
+
+def test_scrubbing_filter_redacts_emitted_record():
+    rec = logging.LogRecord(
+        name="cgx.tests.leak", level=logging.INFO, pathname=__file__,
+        lineno=1, msg="raised SSLError for %s",
+        args=("https://x?key=AQ.SECRET",), exc_info=None)
+    assert SecretScrubbingFilter().filter(rec) is True
+    # The record now renders scrubbed regardless of the handler formatter.
+    assert "AQ.SECRET" not in rec.getMessage()
+    assert "key=<redacted>" in rec.getMessage()

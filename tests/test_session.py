@@ -8512,6 +8512,10 @@ def test_repair_executor_retrieval_feeds_candidate_files(
     candidates leave slots free. A stubbed hybrid-retrieval result points
     at ``src/helper.py``; the executor must pull that source file into the
     repair context and emit a patch against it.
+
+    Retrieval is gated on the index manifest existing on disk (a
+    greenfield project that was never indexed has none), so materialise a
+    ``meta.json`` under ``index_dir`` to model an indexed project.
     """
     import json as _json
     from cgx.session.tasks import repair as _repair_module  # noqa: F401
@@ -8523,6 +8527,9 @@ def test_repair_executor_retrieval_feeds_candidate_files(
         "def scale(x):\n    return x - 1\n", encoding="utf-8")
     (tmp_path / test_rel).write_text(
         "def test_scale():\n    assert 1 == 3\n", encoding="utf-8")
+    index_dir = tmp_path / "idx"
+    index_dir.mkdir()
+    (index_dir / "meta.json").write_text("{}", encoding="utf-8")
     monkeypatch.setattr(
         "cgx.pipeline.auto.run_query_auto",
         lambda **kwargs: {"top_files": [{"file": src_rel}]})
@@ -8548,7 +8555,7 @@ def test_repair_executor_retrieval_feeds_candidate_files(
                 "repair_attempt": 1})
     deps = ExecutorDeps(
         project_root=str(tmp_path), store=store, provider=provider,
-        index_dir="idx", records_path="rec")
+        index_dir=str(index_dir), records_path="rec")
     from cgx.session.tasks.base import _REGISTRY
     result = _REGISTRY[TaskKind.REPAIR](repair_task, deps)
     assert result.failure is None
@@ -13399,3 +13406,58 @@ def test_runner_full_greenfield_loop_with_recovery(tmp_path, store,
     assert "file:calculator.py" in provider.calls
     assert "file:test_calculator.py" in provider.calls
     assert "unrouted" not in provider.calls
+
+
+# --- REPAIR retrieval-assist: missing-index degradation ---------------------
+
+
+def test_repair_retrieval_skips_when_index_absent(tmp_path, caplog):
+    """A greenfield project is never indexed, so ``index_dir`` points at a
+    manifest that does not exist. Retrieval-assisted candidate fill must
+    degrade to ``[]`` -- not raise / log a FileNotFoundError every round."""
+    from cgx.session.tasks.repair import _retrieval_relevant_files
+
+    index_dir = tmp_path / "cgx_index" / "indices"  # no meta.json on disk
+    deps = ExecutorDeps(
+        project_root=str(tmp_path),
+        index_dir=str(index_dir),
+        records_path=str(tmp_path / "records.jsonl"),
+    )
+    with caplog.at_level("ERROR", logger="cgx.session.tasks.repair"):
+        out = _retrieval_relevant_files(
+            deps, query="fix the failing assertion", root=tmp_path, limit=4)
+    assert out == []
+    # The old behaviour logged a crash at ERROR on every attempt; the
+    # missing-index path is now a quiet debug-level skip.
+    assert not [r for r in caplog.records if r.levelno >= 40]
+
+
+def test_repair_retrieval_calls_query_when_index_present(tmp_path, monkeypatch):
+    """When the manifest exists, retrieval is invoked and its ``top_files``
+    are resolved to existing first-party paths."""
+    from cgx.session.tasks import repair as repair_mod
+
+    index_dir = tmp_path / "idx"
+    index_dir.mkdir()
+    (index_dir / "meta.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "calc.py").write_text("x = 1\n", encoding="utf-8")
+
+    calls = {}
+
+    def _fake_run_query_auto(**kwargs):
+        calls.update(kwargs)
+        return {"top_files": [{"file": "calc.py"}, {"file": "missing.py"}]}
+
+    monkeypatch.setattr(
+        "cgx.pipeline.auto.run_query_auto", _fake_run_query_auto)
+
+    deps = ExecutorDeps(
+        project_root=str(tmp_path),
+        index_dir=str(index_dir),
+        records_path=str(tmp_path / "records.jsonl"),
+    )
+    out = repair_mod._retrieval_relevant_files(
+        deps, query="boom", root=tmp_path, limit=4)
+    assert calls, "run_query_auto should have been called"
+    # Only the existing first-party file survives resolution.
+    assert out == ["calc.py"]

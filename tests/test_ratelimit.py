@@ -124,6 +124,28 @@ def test_request_with_retry_raises_after_persistent_exception():
     assert len(calls) == 3
 
 
+def test_request_with_retry_scrubs_secret_from_logged_exception(caplog):
+    """A provider whose exception string carries the URL key must never
+    leak it through the retry logger (the greenfield Gemini leak)."""
+    secret = "AQ.Ab8RN6-supersecret-key"
+
+    def f():
+        # Mirrors a requests SSLError whose message embeds the request URL.
+        raise RuntimeError(
+            "HTTPSConnectionPool: Max retries exceeded with url: "
+            f"/v1beta/models/gemini:generateContent?key={secret}")
+
+    with caplog.at_level("INFO", logger="cgx.answer.ratelimit"):
+        with pytest.raises(RuntimeError):
+            request_with_retry(f, max_retries=1, sleep=lambda _s: None)
+
+    joined = "\n".join(r.getMessage() for r in caplog.records)
+    assert joined, "expected the retry helper to log the attempt"
+    assert secret not in joined
+    assert "key=<redacted>" in joined
+    # The raised exception itself is untouched (only logs are scrubbed).
+
+
 def test_request_with_retry_skips_non_retryable_exception():
     """A predicate returning False short-circuits the retry budget."""
     calls = []

@@ -29,6 +29,7 @@ file.
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -1408,8 +1409,21 @@ def _retrieval_relevant_files(
     candidates unchanged. Retrieval ``top_files`` are resolved against the
     project root and de-duplicated the same way traceback frames are, so
     only existing first-party files are ever handed to the provider.
+
+    ``deps.index_dir`` defaults to a path (e.g. ``/tmp/cgx_index/indices``)
+    even when nothing was ever indexed -- the truthiness check below is
+    therefore not enough. Confirm the index actually exists on disk (its
+    ``meta.json`` manifest) before calling ``run_query_auto``; a
+    greenfield project that was never indexed is the common case and must
+    degrade to "no retrieval candidates", not a caught ``FileNotFoundError``
+    logged as an error on every repair round.
     """
     if limit <= 0 or not query or not deps.index_dir or not deps.records_path:
+        return []
+    if not os.path.isfile(os.path.join(deps.index_dir, "meta.json")):
+        logger.debug(
+            "REPAIR: no index at %s; skipping retrieval-assisted candidates",
+            deps.index_dir)
         return []
     try:
         from cgx.pipeline.auto import run_query_auto
