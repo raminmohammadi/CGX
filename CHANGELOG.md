@@ -2,6 +2,37 @@
 
 All notable changes are documented here. Versions follow semver-ish.
 
+## Unreleased -- Agent-loop hardening (import classification + polyglot provisioning)
+
+Two residual convergence gaps from the `ses_0408ac4084b04b4c` post-mortem,
+both greenfield-only.
+
+* **First-party symbol mismatch is no longer pinned against PyPI**
+  (Part 3). A pytest `ImportError: cannot import name 'X' from 'Y'` was
+  classified unconditionally as `third_party_import_break` and sent to the
+  dependency-pin proposer -- even when `Y` was a first-party module that
+  imported cleanly but simply never defined `X`. A pin cannot add a
+  first-party symbol, so the proposer produced no diff and the loop flapped
+  until its budget drained. The pure classifier stays disk-free (still
+  reports the raw shape); the REPAIR executor now resolves each
+  imported-from module against disk via `locate._dotted_path_resolves` and,
+  when `Y` is first-party, re-classifies to a new
+  `first_party_symbol_mismatch` token that routes to `strategy=regenerate`
+  -- naming the exact `symbol`/`module` pairs (`classify.import_name_breaks`)
+  and forbidding a dependency pin. A genuinely third-party `Y` stays on the
+  pin path.
+* **Polyglot repos provision both stacks in one BOOTSTRAP_ENV pass**
+  (Part 5). A repo declaring both a Python manifest and a `package.json`
+  resolved to `project_type=python` and only provisioned the venv;
+  `node_modules` was left to VERIFY's best-effort `npm install`, which
+  silently verified the JS half against no dependencies whenever it could
+  not run (offline / bounded timeout). BOOTSTRAP_ENV now also runs
+  `_provision_node_modules` when a `package.json` is present, folding a
+  `node` sub-report (`{outcome, note, log_tail}`) into the `BUILD_REPORT`
+  and surfacing `node_outcome`. Node provisioning is non-fatal and leaves
+  `project_type=python` so the Python-only gates are unaffected; the
+  node-only path is refactored onto the same shared helper.
+
 ## Unreleased -- CLI parity (ask / plan / agent / status)
 
 The `cgx` command now exposes every runtime capability that the

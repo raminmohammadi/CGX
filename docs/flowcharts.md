@@ -342,7 +342,9 @@ flowchart TB
                   +-----------------+  requirements.txt, preflight
                             |          undeclared imports;
                             |          `pip freeze --all` parsed into
-                            |          `installed_packages` (Phase 1.1)
+                            |          `installed_packages` (Phase 1.1);
+                            |          polyglot: also `npm install` ->
+                            |          `node` sub-report (Part 5)
                             v          -> BUILD_REPORT artifact
                   +-----------------+   (outcome=succeeded|failed|
                   |   API_CHECK     |     no_venv|skipped|partial)
@@ -415,6 +417,13 @@ The deterministic classifier registry (`cgx.session.repair.classify`,
 queries `pypi.org/pypi/<pkg>/<ver>/json` via `pypi_client` with an
 on-disk cache under `~/.cgx/pypi-cache/`, and emits a
 `requirements.txt` diff against the peer-dependency table),
+`first_party_symbol_mismatch` (**Part 3**: a `cannot import name
+'<x>' from '<Y>'` where the REPAIR executor finds `Y` resolves to a
+first-party module on disk via `locate._dotted_path_resolves` -- it
+imported cleanly but never bound `<x>`, so no pin can help; the
+executor re-classifies away from `third_party_import_break`, names the
+`symbol`/`module` pairs via `import_name_breaks`, and routes to
+`strategy=regenerate` forbidding a dependency pin),
 `missing_dependency` (a `requires the <pkg> package to be installed`
 guard or a `ModuleNotFoundError` no project file claims →
 `strategy=install_deps`, a BOOTSTRAP_ENV re-run instead of a source

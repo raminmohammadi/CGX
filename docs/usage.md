@@ -723,6 +723,18 @@ The deterministic registry recognises, among others:
   `strategy=install_deps`: the router re-runs `BOOTSTRAP_ENV`,
   which installs the package(s), syncs `requirements.txt`, and
   flows back through `API_CHECK` / `SMOKE` / `VERIFY`.
+* `first_party_symbol_mismatch` -- pytest reports `ImportError:
+  cannot import name '<x>' from '<Y>'` where `Y` is one of the
+  project's *own* modules: it imported cleanly but never defined
+  `<x>` (a symbol the scaffold forgot to author). The same message
+  from a genuinely third-party `Y` is a `third_party_import_break`
+  and gets a PyPI version pin instead, so the REPAIR executor
+  disambiguates by resolving `Y` against disk under the project root
+  (`locate._dotted_path_resolves`); a pin can never add a first-party
+  symbol, so a first-party `Y` routes to a regenerate that names the
+  exact missing `symbol`/`module` pairs and forbids a dependency
+  pin, rather than flapping the loop against a package that does not
+  exist.
 * `circular_import` -- pytest collection dies with `ImportError:
   cannot import name ... from partially initialized module ...
   (most likely due to a circular import)`. No single-file patch can
@@ -1068,6 +1080,15 @@ requirements.txt updated: +bcrypt
 Failures (e.g. a misspelled package name) are logged but never abort
 the run -- pytest still executes and gives the retry loop a real
 `ModuleNotFoundError` to diagnose rather than a false pass.
+
+For a **polyglot** repo (a Python backend beside a JS/TS frontend, i.e.
+a `package.json` alongside the Python manifests) `BOOTSTRAP_ENV`
+provisions both stacks in the same pass: after the venv work it runs a
+bounded `npm install` and records a `node` sub-report on the
+`BUILD_REPORT`. This step is non-fatal (a missing `npm` or an offline
+registry degrades to `skipped`) and keeps `project_type=python`, so the
+Python-only gates are unchanged while VERIFY's JS runner now exercises
+the frontend against real, already-installed dependencies.
 
 ### Granular error context (repair loop)
 
