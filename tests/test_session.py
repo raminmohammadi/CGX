@@ -4936,7 +4936,25 @@ def test_synthesize_js_test_harness_backfills_react_project():
         next(d["patch"] for d in diffs if d["file"] == "vitest.config.js"))
     assert "jsdom" in cfg and "vitest.setup.js" in cfg
     assert "plugin-react" in cfg
-    assert any(e["path"] == "vitest.setup.js" for e in existing)
+    # The synthesized setup wires jest-dom matchers AND a jest->vi alias so
+    # a jest-dialect suite (jest.spyOn/jest.fn) runs under the harness.
+    setup = next(e["content"] for e in existing
+                 if e["path"] == "vitest.setup.js")
+    assert "@testing-library/jest-dom" in setup
+    assert "globalThis.jest = vi" in setup
+    assert "import { vi } from 'vitest'" in setup
+
+
+def test_vitest_setup_content_aliases_jest_to_vi():
+    """The synthesized setup exposes a jest global backed by vi."""
+    from cgx.session.tasks.scaffold import _vitest_setup_content
+    setup = _vitest_setup_content()
+    # jest-dom matchers are still imported for toBeInTheDocument() etc.
+    assert "import '@testing-library/jest-dom';" in setup
+    # vi is imported explicitly (robust even without globals) and aliased
+    # onto the jest global so jest.spyOn/jest.fn resolve under vitest.
+    assert "import { vi } from 'vitest';" in setup
+    assert "globalThis.jest = vi;" in setup
 
 
 def test_synthesize_js_test_harness_noop_without_tests():

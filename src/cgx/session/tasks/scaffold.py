@@ -2327,6 +2327,26 @@ def _vitest_config_content(uses_react: bool) -> str:
         "});\n")
 
 
+def _vitest_setup_content() -> str:
+    """jsdom matchers plus a jest->vi alias so jest-dialect suites run.
+
+    Scaffolded React suites routinely call the ``jest`` global
+    (``jest.spyOn``/``jest.fn``/...), but a vitest harness leaves ``jest``
+    undefined -- the suite dies with ``jest is not defined`` and the whole
+    file fails to collect. Vitest exposes the same mocking surface as
+    ``vi``, so the synthesized setup aliases ``jest`` to it, letting a
+    jest-dialect suite run under the backfilled harness unchanged.
+    Harmless when the tests use ``vi`` directly.
+    """
+    return (
+        "import { vi } from 'vitest';\n"
+        "import '@testing-library/jest-dom';\n"
+        "\n"
+        "// vitest exposes jest's mocking surface as `vi`; alias the jest\n"
+        "// global so jest-dialect suites run under this harness unchanged.\n"
+        "globalThis.jest = vi;\n")
+
+
 def _synthesize_js_test_harness(
         *,
         diffs: List[Dict[str, str]],
@@ -2343,10 +2363,11 @@ def _synthesize_js_test_harness(
     skipped while ``npm run build`` still passes (the ses_4cbf963cdc67435a
     blind spot). Deterministically ensure package.json carries a ``vitest
     run`` test script plus the harness devDeps, and synthesize a jsdom
-    ``vitest.config.js`` + a ``@testing-library/jest-dom`` setup file when
-    none exists. Mutates the passed bundles in place; returns the touched
-    paths. Vue trees are skipped (out of scope). Best-effort: any parse
-    failure abstains, leaving the bundle untouched.
+    ``vitest.config.js`` + a setup file (jest-dom matchers plus a jest->vi
+    alias so jest-dialect suites run) when none exists. Mutates the passed
+    bundles in place; returns the touched paths. Vue trees are skipped (out
+    of scope). Best-effort: any parse failure abstains, leaving the bundle
+    untouched.
     """
     import json as _json
 
@@ -2404,7 +2425,7 @@ def _synthesize_js_test_harness(
             new_files.append(_VITEST_CONFIG_PATH)
         touched.append(_VITEST_CONFIG_PATH)
         if _VITEST_SETUP_PATH not in existing_paths:
-            setup = "import '@testing-library/jest-dom';\n"
+            setup = _vitest_setup_content()
             if _splice_generated_file(
                     _VITEST_SETUP_PATH, setup, diffs=diffs,
                     generated=generated,
