@@ -30,6 +30,7 @@ from cgx.trace import traced
 REPAIR_CLASSIFICATIONS: Tuple[str, ...] = (
     "circular_import",
     "third_party_import_break",
+    "first_party_symbol_mismatch",
     "relative_import_error",
     "unittest_pytest_mix",
     "missing_dependency",
@@ -256,6 +257,28 @@ def classify_verify_report(content: Dict[str, Any]) -> RepairClassification:
     return "unknown"
 
 
+def import_name_breaks(
+        content: Dict[str, Any]) -> Tuple[Tuple[str, str], ...]:
+    """Return ``((symbol, module), ...)`` pairs from "cannot import name".
+
+    Unlike :func:`third_party_import_breaks` the module is the **full**
+    dotted path (e.g. ``werkzeug.urls`` or ``backend.auth``), not the
+    top-level distribution. The full path lets a caller with disk access
+    tell a first-party symbol mismatch (the module is a project file that
+    imported cleanly but never defines the symbol -- a regenerate) apart
+    from a genuine third-party API break (the module is an installed
+    package whose peer version drifted -- a pin). Order-preserving and
+    de-duplicated.
+    """
+    blob = _failure_text(content)
+    out: List[Tuple[str, str]] = []
+    for m in _CANNOT_IMPORT_NAME_RE.finditer(blob):
+        pair = (m.group(1), m.group(2))
+        if pair not in out:
+            out.append(pair)
+    return tuple(out)
+
+
 def third_party_import_breaks(
         content: Dict[str, Any]) -> Tuple[Tuple[str, str], ...]:
     """Return ``((symbol, package), ...)`` pairs from "cannot import name".
@@ -263,17 +286,17 @@ def third_party_import_breaks(
     Used by the dependency-aware proposer to drive the PyPI lookup.
     The package name is the **top-level** distribution (e.g. ``werkzeug``
     for ``werkzeug.urls``) so it can be matched against installed
-    packages in the BUILD_REPORT. Order-preserving and de-duplicated.
+    packages in the BUILD_REPORT. Derived from :func:`import_name_breaks`
+    by collapsing each module to its top-level name. Order-preserving and
+    de-duplicated.
     """
-    blob = _failure_text(content)
     out: List[Tuple[str, str]] = []
-    for m in _CANNOT_IMPORT_NAME_RE.finditer(blob):
-        symbol = m.group(1)
-        pkg = m.group(2).split(".", 1)[0]
-        pair = (symbol, pkg)
+    for symbol, module in import_name_breaks(content):
+        pair = (symbol, module.split(".", 1)[0])
         if pair not in out:
             out.append(pair)
     return tuple(out)
+
 
 
 def missing_module_names(content: Dict[str, Any]) -> Tuple[str, ...]:

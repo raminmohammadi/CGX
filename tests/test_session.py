@@ -9182,6 +9182,103 @@ def test_repair_executor_emits_third_party_pin_plan(
     assert decisions[0]["consumer"] == "flask"
 
 
+def test_import_name_breaks_keeps_full_dotted_module():
+    """import_name_breaks preserves the module; the pin view collapses it."""
+    from cgx.session.repair.classify import (
+        import_name_breaks,
+        third_party_import_breaks,
+    )
+    content = {
+        "outcome": "collection_error",
+        "returncode": 2,
+        "stdout": (
+            "E   ImportError: cannot import name 'login' from 'backend.auth'\n"
+            "E   ImportError: cannot import name 'url_quote' from "
+            "'werkzeug.urls'\n"),
+        "stderr": "",
+    }
+    assert import_name_breaks(content) == (
+        ("login", "backend.auth"), ("url_quote", "werkzeug.urls"))
+    # The legacy top-level view the PyPI-pin path consumes is unchanged.
+    assert third_party_import_breaks(content) == (
+        ("login", "backend"), ("url_quote", "werkzeug"))
+
+
+def test_repair_first_party_symbol_mismatch_regenerates_not_pins(
+        store, tmp_path: Path):
+    """A cannot-import-name from an on-disk module -> regenerate, not a pin.
+
+    Mirrors ses_0408ac4084b04b4c: ``backend/auth.py`` imports cleanly but
+    never defines ``login``. The pure classifier calls this
+    ``third_party_import_break``; REPAIR sees the module resolves on disk and
+    re-classifies it to a ``first_party_symbol_mismatch`` regenerate that
+    names the missing symbol -- rather than a nonsensical PyPI pin against a
+    package called ``backend`` that produces no diff and flaps the loop.
+    """
+    from cgx.session.tasks.repair import run_repair
+    (tmp_path / "backend").mkdir()
+    (tmp_path / "backend" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "backend" / "auth.py").write_text(
+        "def logout():\n    return True\n", encoding="utf-8")
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    verify_content = {
+        "outcome": "collection_error",
+        "returncode": 2,
+        "stdout": (
+            "ImportError while importing test module 'tests/test_auth.py'.\n"
+            "tests/test_auth.py:1: in <module>\n"
+            "    from backend.auth import login\n"
+            "E   ImportError: cannot import name 'login' from "
+            "'backend.auth'\n"),
+        "stderr": "",
+        "mode": SessionMode.GREENFIELD.value,
+    }
+    verify_artifact = Artifact.new(
+        session_id=session.session_id,
+        produced_by_task_id="task-verify",
+        kind=ArtifactKind.VERIFY_REPORT,
+        content=verify_content,
+    )
+    store.save_artifact(verify_artifact)
+    t = TaskNode.new(session.session_id, TaskKind.REPAIR, "repair",
+                     inputs={
+                         "verify_artifact_id": verify_artifact.artifact_id,
+                         "mode": SessionMode.GREENFIELD.value,
+                         "repair_attempt": 1,
+                     })
+    store.save_task(t)
+    result = run_repair(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    assert result.failure is None
+    assert result.outputs["classification"] == "first_party_symbol_mismatch"
+    assert result.outputs["strategy"] == "regenerate"
+    assert result.outputs["can_apply"] is False
+    assert result.artifact.content["diffs"] == []
+    constraints = result.outputs["extra_constraints"]
+    assert constraints["kind"] == "first_party_symbol_mismatch"
+    assert constraints["symbol_mismatches"] == [
+        {"symbol": "login", "module": "backend.auth"}]
+    # The rationale names the symbol + module and forbids a dependency pin.
+    assert "login" in constraints["rationale"]
+    assert "backend.auth" in constraints["rationale"]
+    assert "do not add or pin" in constraints["rationale"].lower()
+
+
+def test_repair_select_strategy_first_party_symbol_mismatch_regenerates():
+    """The token is regenerate-eligible and carries the symbol mismatches."""
+    from cgx.session.tasks.repair import _select_repair_strategy
+    strategy, constraints = _select_repair_strategy(
+        classification="first_party_symbol_mismatch", diffs=[],
+        rationale="define the missing symbol",
+        extra_plan_fields={"symbol_mismatches": [
+            {"symbol": "login", "module": "backend.auth"}]},
+        locations_payload=[])
+    assert strategy == "regenerate"
+    assert constraints["kind"] == "first_party_symbol_mismatch"
+    assert constraints["symbol_mismatches"] == [
+        {"symbol": "login", "module": "backend.auth"}]
+
 
 # --------------------- Phase 4.1: scaffold pin validator ---------------------
 

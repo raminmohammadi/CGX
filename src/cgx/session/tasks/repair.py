@@ -40,6 +40,7 @@ from cgx.session.repair.classify import (
     classify_runtime_report,
     classify_verify_report,
     failure_signature,
+    import_name_breaks,
     missing_fixture_names,
     missing_module_names,
     required_package_names,
@@ -53,6 +54,7 @@ from cgx.session.repair.locate import (
     MissingFixtureLocation,
     MissingPythonpathLocation,
     StyleMixLocation,
+    _dotted_path_resolves,
     locate_missing_fixture,
     locate_missing_module_pythonpath,
     locate_unittest_pytest_mix,
@@ -109,6 +111,7 @@ _LLM_REPAIR_RETRIEVAL_SLACK = 4
 _REGENERATE_CLASSES = frozenset({
     "circular_import",
     "third_party_import_break",
+    "first_party_symbol_mismatch",
     "relative_import_error",
     "smoke_import_failure",
     "api_check_failure",
@@ -242,19 +245,44 @@ def run_repair(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         extra_plan_fields["missing_fixtures"] = list(
             missing_fixture_names(content))
     elif classification == "third_party_import_break":
-        pairs = third_party_import_breaks(content)
-        installed = _installed_packages_from_build(deps, content)
-        pypi_client = _resolve_pypi_client(deps)
-        diffs, decisions = propose_third_party_pin(
-            Path(deps.project_root), content,
-            pairs=pairs, installed_packages=installed,
-            pypi_client=pypi_client,
-        )
-        rationale = _third_party_rationale(pairs, decisions, bool(diffs))
-        extra_plan_fields["import_breaks"] = [
-            {"symbol": s, "package": p} for s, p in pairs
-        ]
-        extra_plan_fields["pin_decisions"] = decisions
+        # ``cannot import name 'X' from 'Y'`` means Y imported cleanly but
+        # never binds X. If Y resolves to a first-party module on disk this
+        # is a symbol the scaffold forgot to author -- a PyPI pin cannot add
+        # it, so re-classify to a regenerate that names the module + symbol.
+        # Only a genuinely third-party Y (no project file claims it) stays on
+        # the dependency-pin path. This split is the ses_0408ac4084b04b4c
+        # root cause: a first-party mismatch was pinned against PyPI, produced
+        # no diff, and flapped the loop.
+        root = Path(deps.project_root)
+        first_party = [
+            (sym, mod) for sym, mod in import_name_breaks(content)
+            if _dotted_path_resolves(root, mod)]
+        if first_party:
+            classification = "first_party_symbol_mismatch"
+            extra_plan_fields["symbol_mismatches"] = [
+                {"symbol": s, "module": m} for s, m in first_party]
+            items = "; ".join(
+                f"{s!r} from module {m!r}" for s, m in first_party)
+            rationale = (
+                "A first-party import failed: the module imported cleanly but "
+                f"does not define the imported name(s): {items}. This is not a "
+                "dependency problem -- do not add or pin any package. "
+                "Re-author the named module(s) to define each missing symbol "
+                "and keep every importer consistent with that definition.")
+        else:
+            pairs = third_party_import_breaks(content)
+            installed = _installed_packages_from_build(deps, content)
+            pypi_client = _resolve_pypi_client(deps)
+            diffs, decisions = propose_third_party_pin(
+                Path(deps.project_root), content,
+                pairs=pairs, installed_packages=installed,
+                pypi_client=pypi_client,
+            )
+            rationale = _third_party_rationale(pairs, decisions, bool(diffs))
+            extra_plan_fields["import_breaks"] = [
+                {"symbol": s, "package": p} for s, p in pairs
+            ]
+            extra_plan_fields["pin_decisions"] = decisions
     elif classification == "empty_test_suite":
         # pytest exit 5: the selected test file(s) exist but collected
         # zero tests -- almost always ``def test_*`` nested inside a
@@ -1024,6 +1052,11 @@ def _select_repair_strategy(
             extra_plan_fields.get("import_breaks") or [])
         constraints["attempted_pins"] = list(
             extra_plan_fields.get("pin_decisions") or [])
+    elif classification == "first_party_symbol_mismatch":
+        # The regenerated SCAFFOLD is told exactly which symbol each
+        # first-party module must define so the importer resolves.
+        constraints["symbol_mismatches"] = list(
+            extra_plan_fields.get("symbol_mismatches") or [])
     elif classification == "circular_import":
         constraints["modules"] = list(
             extra_plan_fields.get("circular_modules") or [])
