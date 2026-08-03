@@ -698,10 +698,18 @@ this subsection first; the six moving parts are:
    references `Flask(` / `FastAPI(` / `create_app`) it runs an
    import-and-call smoke *under the bootstrapped venv* and emits a
    `RUNTIME_REPORT` whose `probes` pair each entry with `ok` / `kind` /
-   `stderr_tail`. The `outcome` token (`passed` / `failed` / `timeout` /
-   `error` / `skipped`) drives the terminal branch; a boot failure never
-   raises `ExecutorResult.failure`, so the structured report is always
-   persisted for the classifier.
+   `stderr_tail`. **Whole-tree entry detection (P1c):** `_entry_candidates`
+   unions the last APPLY's `applied_files` with a bounded whole-tree scan
+   (`_scan_tree_for_entries`, pruning `_TREE_SCAN_SKIP_DIRS` and capped at
+   `_MAX_ENTRY_CANDIDATES=20`), so a nested `backend/app.py` scaffolded in
+   an earlier chain -- and therefore absent from the final applied-files
+   list -- is still probed rather than letting the boot gate skip (the
+   ses_4cbf963cdc67435a blind spot: a real Flask server that never booted
+   because it was not in the last APPLY). Applied files keep probe
+   priority; the scan only backfills. The `outcome` token (`passed` /
+   `failed` / `timeout` / `error` / `skipped`) drives the terminal branch;
+   a boot failure never raises `ExecutorResult.failure`, so the structured
+   report is always persisted for the classifier.
 
 4. **Runtime-failure classification + routing.** `_verify_successors`
    is the new fork: greenfield + `passed` hands off to `RUNTIME_VERIFY`;

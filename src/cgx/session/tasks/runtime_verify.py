@@ -25,6 +25,7 @@ runtime-repair pass (bottleneck #3) has something to classify.
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -56,6 +57,18 @@ _ENTRY_BASENAMES = frozenset({
 
 # Substrings that mark a module as constructing a web app worth booting.
 _APP_MARKERS = ("Flask(", "FastAPI(", "create_app")
+
+# Directories the whole-tree entry scan never descends into -- vendored
+# deps, build output, VCS/tooling caches. Keeps the scan bounded and stops
+# a dependency's own ``app.py`` from being mistaken for the project entry.
+_TREE_SCAN_SKIP_DIRS = frozenset({
+    "node_modules", ".git", ".venv", "venv", "env", "__pycache__",
+    "build", "dist", ".cgx", ".cgx-backups", ".next", ".nuxt", "out",
+    "coverage", "site-packages", ".tox", ".mypy_cache", ".pytest_cache",
+})
+# Cap on entry files probed, so a pathological tree cannot make the boot
+# gate run unboundedly many subprocesses.
+_MAX_ENTRY_CANDIDATES = 20
 
 # The subprocess probe: put the project root, its ``src`` dir, and the
 # entry file's own directory on ``sys.path`` (so both ``src`` layouts and
@@ -199,19 +212,26 @@ def _resolve_python_exe(task: TaskNode,
 
 
 def _entry_candidates(root: Path, applied_files: List[str]) -> List[str]:
-    """Return applied ``.py`` files that look like an application entry.
+    """Return ``.py`` files across the tree that look like an app entry.
 
     A file qualifies when its basename is a conventional entry point
     (``app.py`` / ``main.py`` / ...) or its source statically references
-    a web-app marker (``Flask(`` / ``FastAPI(`` / ``create_app``). The
-    result is de-duplicated and order-stable so the report reads the same
-    across re-runs.
+    a web-app marker (``Flask(`` / ``FastAPI(`` / ``create_app``). Files
+    named in the last APPLY come first (fast path, order-stable), then a
+    bounded whole-tree scan backfills any qualifying module the last APPLY
+    did not touch -- so a nested ``backend/app.py`` scaffolded in an
+    earlier chain is still probed rather than letting the boot gate skip
+    (the ses_4cbf963cdc67435a blind spot: a real server never booted
+    because it was not in the final applied-files list). The result is
+    de-duplicated, order-stable, and capped at ``_MAX_ENTRY_CANDIDATES``.
     """
     out: List[str] = []
     seen: set[str] = set()
-    for rel in applied_files:
+
+    def _consider(rel: str) -> None:
+        rel = rel.replace("\\", "/")
         if not rel.endswith(".py") or rel in seen:
-            continue
+            return
         base = Path(rel).name
         qualifies = base in _ENTRY_BASENAMES
         if not qualifies:
@@ -220,12 +240,52 @@ def _entry_candidates(root: Path, applied_files: List[str]) -> List[str]:
             try:
                 src = abs_path.read_text(encoding="utf-8")
             except (OSError, UnicodeDecodeError):
-                continue
+                return
             qualifies = any(marker in src for marker in _APP_MARKERS)
         if qualifies:
             seen.add(rel)
             out.append(rel)
-    return out
+
+    for rel in applied_files:
+        _consider(rel)
+    # Whole-tree backfill: qualifying modules the last APPLY did not list.
+    for rel in _scan_tree_for_entries(root):
+        if len(out) >= _MAX_ENTRY_CANDIDATES:
+            break
+        _consider(rel)
+    return out[:_MAX_ENTRY_CANDIDATES]
+
+
+def _scan_tree_for_entries(root: Path) -> List[str]:
+    """Walk the project tree for ``.py`` files that look like an app entry.
+
+    Prunes vendored/build/cache dirs (``_TREE_SCAN_SKIP_DIRS``) so the
+    scan is bounded and a dependency's own ``app.py`` is never mistaken
+    for the project's. Returns root-relative, forward-slash paths sorted
+    for a stable probe order; qualification (basename / marker) is decided
+    by the caller so the two candidate sources share one rule.
+    """
+    hits: List[str] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in _TREE_SCAN_SKIP_DIRS]
+        for name in filenames:
+            if not name.endswith(".py"):
+                continue
+            abs_path = Path(dirpath) / name
+            try:
+                rel = abs_path.relative_to(root).as_posix()
+            except ValueError:
+                continue
+            if name in _ENTRY_BASENAMES:
+                hits.append(rel)
+                continue
+            try:
+                src = abs_path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            if any(marker in src for marker in _APP_MARKERS):
+                hits.append(rel)
+    return sorted(hits)
 
 
 def _probe_boot(python_exe: str, root: str, file_abs: Path,

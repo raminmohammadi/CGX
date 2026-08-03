@@ -2984,6 +2984,62 @@ def test_runtime_verify_failed_on_import_time_error(tmp_path, store):
     assert "boot boom" in probe["stderr_tail"]
 
 
+def test_runtime_verify_probes_nested_entry_absent_from_applied_files(
+        tmp_path, store):
+    """P1c: a nested backend entry not in the last APPLY is still booted.
+
+    The ses_4cbf963cdc67435a blind spot -- ``backend/app.py`` existed on
+    disk but was absent from the final applied-files list, so the boot
+    gate skipped and a broken server shipped green. The whole-tree scan
+    must find and probe it regardless.
+    """
+    import sys
+    from cgx.session.models import SessionMode
+    from cgx.session.tasks.runtime_verify import run_runtime_verify
+    (tmp_path / "backend").mkdir()
+    (tmp_path / "backend" / "app.py").write_text(
+        "from flask import Flask\napp = Flask(__name__)\n", encoding="utf-8")
+    # The last APPLY only touched a frontend file (no .py entry).
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "App.jsx").write_text(
+        "export default () => null\n", encoding="utf-8")
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    t = TaskNode.new(session.session_id, TaskKind.RUNTIME_VERIFY, "runtime",
+                     inputs={"applied_files": ["src/App.jsx"],
+                             "python_exe": sys.executable,
+                             "mode": SessionMode.GREENFIELD.value})
+    store.save_task(t)
+    result = run_runtime_verify(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    assert result.failure is None
+    assert "backend/app.py" in result.artifact.content["entry_files"]
+    assert result.outputs["tested_count"] == 1
+
+
+def test_runtime_verify_tree_scan_skips_vendored_dirs(tmp_path, store):
+    """A dependency's own app.py under node_modules is never probed."""
+    import sys
+    from cgx.session.models import SessionMode
+    from cgx.session.tasks.runtime_verify import run_runtime_verify
+    (tmp_path / "node_modules" / "dep").mkdir(parents=True)
+    (tmp_path / "node_modules" / "dep" / "app.py").write_text(
+        "raise RuntimeError('should never boot')\n", encoding="utf-8")
+    (tmp_path / "helpers.py").write_text("VALUE = 1\n", encoding="utf-8")
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    t = TaskNode.new(session.session_id, TaskKind.RUNTIME_VERIFY, "runtime",
+                     inputs={"applied_files": ["helpers.py"],
+                             "python_exe": sys.executable,
+                             "mode": SessionMode.GREENFIELD.value})
+    store.save_task(t)
+    result = run_runtime_verify(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    assert result.failure is None
+    assert result.outputs["outcome"] == "skipped"
+    assert result.outputs["tested_count"] == 0
+
+
 def test_plan_change_executor_needs_provider():
     from cgx.session.tasks.plan_change import run_plan_change
     session = Session.new("g")
