@@ -799,7 +799,11 @@ def _preverify_gate_terminal_actions(
     loop would exit with the session still ``active`` -- idle, with no
     terminal status the UI can settle on. Mirroring
     :func:`_verify_terminal_session_actions`, end the session ``FAILED``
-    so the run resolves instead of hanging. A non-``failed`` gate that
+    so the run resolves instead of hanging. The gate task stays ``DONE``
+    (it ran fine; its *report* is what failed) but records a concrete
+    ``error`` -- which gate, why it could not be repaired, and the failure
+    signature -- so the CLI epilogue surfaces the real reason instead of a
+    bare "session failed (N done, 0 failed)". A non-``failed`` gate that
     somehow produced no successor is left untouched (empty list) so the
     normal edge is not overridden. Explore-mode keeps its own lifecycle.
     """
@@ -810,8 +814,20 @@ def _preverify_gate_terminal_actions(
     outcome = str(outputs.get("outcome") or "").strip()
     if outcome != "failed":
         return []
-    return [UpdateSessionStatus(session_id=completed.session_id,
-                                status=SessionStatus.FAILED)]
+    gate = completed.kind.value
+    signature = str(outputs.get("failure_signature") or "").strip()
+    budget = LoopBudget.from_inputs(completed.inputs)
+    why = ("the automated repair budget is exhausted" if budget.repair_exhausted
+           else "the same failure keeps recurring (no further progress)")
+    reason = f"{gate} failed and could not be repaired: {why}"
+    if signature:
+        reason = f"{reason} [{signature}]"
+    return [
+        UpdateTaskStatus(task_id=completed.task_id,
+                         status=completed.status, error=reason),
+        UpdateSessionStatus(session_id=completed.session_id,
+                            status=SessionStatus.FAILED),
+    ]
 
 
 def _scaffold_to_apply(parent: TaskNode) -> List[TaskNode]:

@@ -1308,6 +1308,51 @@ def test_router_api_check_failed_budget_exhausted_terminates_session():
     assert status[0].status is SessionStatus.FAILED
 
 
+def test_router_api_check_terminal_records_honest_gate_reason():
+    """H-B: a terminal gate failure attaches a concrete reason to the task.
+
+    Without this the CLI epilogue only shows a bare "session failed
+    (N done, 0 failed)". The router keeps the gate task DONE (it ran fine;
+    its report is what failed) but records an ``error`` naming the gate,
+    why it could not be repaired, and the failure signature so the reason
+    is surfaced to the user.
+    """
+    from cgx.session.models import SessionMode
+    from cgx.session.budget import REPAIR_BUDGET
+    sig = "api_check|werkzeug.urls.url_quote"
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    api = TaskNode.new(
+        session.session_id, TaskKind.API_CHECK, "api",
+        inputs={"build_artifact_id": "art_build",
+                "mode": SessionMode.GREENFIELD.value,
+                "repair_attempt": REPAIR_BUDGET,
+                "prior_failure_signatures": []})
+    api.produced_artifact_id = "art_api"
+    api.outputs = {"outcome": "failed", "failed_count": 1,
+                   "failure_signature": sig}
+    api.status = TaskNodeStatus.DONE
+    plan = Router().on_task_completed(
+        session=session, completed=api, tasks=[api])
+    task_updates = [a for a in plan.actions
+                    if isinstance(a, UpdateTaskStatus)
+                    and a.task_id == api.task_id]
+    assert len(task_updates) == 1
+    update = task_updates[0]
+    # The gate task stays DONE -- it ran; its report is what failed.
+    assert update.status is TaskNodeStatus.DONE
+    assert update.error
+    assert "api_check" in update.error
+    assert "budget" in update.error
+    assert sig in update.error
+    # The honest reason precedes the terminal session status.
+    session_status = [a for a in plan.actions
+                      if isinstance(a, UpdateSessionStatus)]
+    assert len(session_status) == 1
+    assert session_status[0].status is SessionStatus.FAILED
+    assert (plan.actions.index(update)
+            < plan.actions.index(session_status[0]))
+
+
 def test_router_api_check_passed_does_not_terminate_session():
     """C guard is scoped to failures: a passed gate spawns SMOKE, no status."""
     from cgx.session.models import SessionMode
@@ -4379,6 +4424,117 @@ def test_reconcile_js_dependencies_noop_without_package_json():
         diffs=diffs, existing_with_content=existing) == []
 
 
+def test_synthesize_missing_frontend_stylesheet_stub():
+    """An entry point importing an ungenerated ./index.css gets a stub."""
+    from cgx.answer.engine import _content_to_new_file_patch
+    from cgx.session.tasks.scaffold import (
+        _content_from_new_file_patch,
+        _synthesize_missing_frontend_stylesheets,
+    )
+    main = "import App from './App.jsx'\nimport './index.css'\n"
+    diffs = [
+        {"file": "src/main.jsx",
+         "patch": _content_to_new_file_patch("src/main.jsx", main)},
+        {"file": "src/App.jsx",
+         "patch": _content_to_new_file_patch(
+             "src/App.jsx", "export default 1\n")},
+    ]
+    generated = [{"file": "src/main.jsx"}, {"file": "src/App.jsx"}]
+    existing = [
+        {"path": "src/main.jsx", "content": main},
+        {"path": "src/App.jsx", "content": "export default 1\n"},
+    ]
+    layers: list = []
+    added = _synthesize_missing_frontend_stylesheets(
+        diffs=diffs, generated=generated, existing_with_content=existing,
+        layers=layers, project_root=None)
+    assert added == ["src/index.css"]
+    # Spliced into diffs + manifest so APPLY writes it and later gates see it.
+    assert any(d["file"] == "src/index.css" for d in diffs)
+    assert any(e["path"] == "src/index.css" for e in existing)
+    stub = _content_from_new_file_patch(
+        next(d["patch"] for d in diffs if d["file"] == "src/index.css"))
+    assert "stylesheet stub" in stub
+
+
+def test_synthesize_frontend_stylesheet_noop_when_present():
+    """A stylesheet already generated is not clobbered with a stub."""
+    from cgx.session.tasks.scaffold import (
+        _synthesize_missing_frontend_stylesheets,
+    )
+    existing = [
+        {"path": "src/main.jsx", "content": "import './index.css'\n"},
+        {"path": "src/index.css", "content": "body{}\n"},
+    ]
+    assert _synthesize_missing_frontend_stylesheets(
+        diffs=[], generated=[], existing_with_content=existing, layers=[],
+        project_root=None) == []
+
+
+def test_js_import_coherence_flags_missing_relative_script():
+    """A relative script import with no generated sibling fails the importer."""
+    from cgx.session.tasks.scaffold import _js_import_coherence_failures
+    existing = [
+        {"path": "src/main.jsx",
+         "content": ("import App from './App.jsx'\n"
+                     "import Missing from './Missing'\n")},
+        {"path": "src/App.jsx", "content": "export default 1\n"},
+    ]
+    failures = _js_import_coherence_failures(existing, None)
+    assert len(failures) == 1
+    assert failures[0]["file"] == "src/main.jsx"
+    assert "./Missing" in failures[0]["error"]
+    # The resolvable sibling is not reported.
+    assert "./App.jsx" not in failures[0]["error"]
+
+
+def test_js_import_coherence_resolves_siblings_and_skips_assets():
+    """Extensionless/index resolution passes; stylesheets and assets skip."""
+    from cgx.session.tasks.scaffold import _js_import_coherence_failures
+    existing = [
+        {"path": "src/main.jsx",
+         "content": ("import './index.css'\n"        # stylesheet -> pass A
+                     "import logo from './logo.svg'\n"  # asset -> skipped
+                     "import {u} from './util'\n"       # -> src/util.js
+                     "import C from './comp'\n")},       # -> src/comp/index.jsx
+        {"path": "src/util.js", "content": "export const u = 1\n"},
+        {"path": "src/comp/index.jsx", "content": "export default 1\n"},
+    ]
+    assert _js_import_coherence_failures(existing, None) == []
+
+
+def test_scaffold_synthesizes_missing_stylesheet_stub(store, monkeypatch):
+    """run_scaffold backfills an omitted stylesheet so the tree builds."""
+    from cgx.session.tasks.scaffold import run_scaffold
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    plan = Artifact.new(
+        session.session_id, "task_x", ArtifactKind.WORK_PLAN, {
+            "plan_md": "", "composed_goal": "g", "prior_goal": "g",
+            "layers": [{"name": "app", "files": [
+                {"path": "src/main.jsx", "description": ""}]}],
+        })
+    store.save_artifact(plan)
+    body = ("import React from 'react'\n"
+            "import './index.css'\n"
+            "console.log(React)\n")
+
+    def fake_generate(path, *a, **kw):
+        return {"file": path, "patch": f"+++ {path}\nx",
+                "content": body, "syntax_ok": True}
+
+    monkeypatch.setattr("cgx.answer.engine.generate_single_scaffold_file",
+                        fake_generate)
+    t = TaskNode.new(session.session_id, TaskKind.SCAFFOLD, "s",
+                     inputs={"work_plan_artifact_id": plan.artifact_id})
+    result = run_scaffold(
+        t, ExecutorDeps(provider=_StubProvider(""), store=store))
+    assert result.failure is None
+    files = [d["file"] for d in result.artifact.content["diffs"]]
+    assert "src/index.css" in files
+    assert result.outputs["failed_count"] == 0
+
+
 def test_circular_import_failures_ignores_one_way_imports():
     """An acyclic first-party import graph produces no failures."""
     from cgx.session.tasks.scaffold import _circular_import_failures
@@ -4791,6 +4947,102 @@ def test_scaffold_targeted_regenerate_falls_back_without_prior(store, monkeypatc
     assert result.failure is None
     # Prior artifact unresolvable -> every manifest file is regenerated.
     assert seen == ["a.py", "b.py"]
+
+
+def _carry_forward_plan(session):
+    """A work plan whose manifest includes requirements.txt + one source."""
+    return Artifact.new(
+        session.session_id, "task_x", ArtifactKind.WORK_PLAN, {
+            "prior_goal": "g", "composed_goal": "build a flask api",
+            "answers": {}, "plan_md": "",
+            "layers": [{"name": "app", "files": [
+                {"path": "requirements.txt", "description": "deps"},
+                {"path": "backend/app.py", "description": "flask app"}]}],
+        })
+
+
+def test_scaffold_carries_forward_locked_requirements_on_regenerate(
+        tmp_path, store, monkeypatch):
+    """A repair-locked requirements.txt survives a whole-tree regenerate.
+
+    env_manager re-pinned requirements.txt to a conflict-free set and
+    marked it locked; the regenerate must reuse that on-disk file verbatim
+    (never re-emit the model's stale manifest) so the dependency fix holds.
+    """
+    from cgx.answer.engine import _content_to_new_file_patch
+    from cgx.codegen.env_manager import mark_requirements_locked
+    from cgx.session.tasks.scaffold import run_scaffold
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    plan = _carry_forward_plan(session)
+    store.save_artifact(plan)
+    # The resolved, conflict-free requirements.txt already on disk, marked
+    # env-locked by the repair that re-pinned it.
+    resolved = "flask==3.1.3\nwerkzeug==3.1.8\n"
+    (tmp_path / "requirements.txt").write_text(resolved, encoding="utf-8")
+    mark_requirements_locked(str(tmp_path))
+
+    seen: list = []
+
+    def fake_generate(path, *a, **kw):
+        seen.append(path)
+        body = "from flask import Flask\napp = Flask(__name__)\n"
+        return {"file": path,
+                "patch": _content_to_new_file_patch(path, body),
+                "content": body, "syntax_ok": True, "confidence": 0.9}
+
+    monkeypatch.setattr("cgx.answer.engine.generate_single_scaffold_file",
+                        fake_generate)
+    t = TaskNode.new(
+        session.session_id, TaskKind.SCAFFOLD, "s",
+        inputs={"work_plan_artifact_id": plan.artifact_id,
+                "regenerated_from_task_id": "task_sc0"})
+    result = run_scaffold(t, ExecutorDeps(
+        provider=_StubProvider(""), store=store, project_root=str(tmp_path)))
+    assert result.failure is None
+    # requirements.txt was carried forward -- never handed to the model.
+    assert "requirements.txt" in {d["file"]
+                                  for d in result.artifact.content["diffs"]}
+    assert seen == ["backend/app.py"]
+    req_diff = next(d for d in result.artifact.content["diffs"]
+                    if d["file"] == "requirements.txt")
+    assert "flask==3.1.3" in req_diff["patch"]
+    gen = {g["file"]: g for g in result.artifact.content["generated"]}
+    assert gen["requirements.txt"].get("carried") is True
+
+
+def test_scaffold_regenerates_requirements_without_lock_marker(
+        tmp_path, store, monkeypatch):
+    """No lock marker -> requirements.txt is regenerated normally (no carry)."""
+    from cgx.answer.engine import _content_to_new_file_patch
+    from cgx.session.tasks.scaffold import run_scaffold
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    plan = _carry_forward_plan(session)
+    store.save_artifact(plan)
+    # An on-disk requirements.txt but NO lock marker -> not env-managed.
+    (tmp_path / "requirements.txt").write_text(
+        "flask==2.0.1\n", encoding="utf-8")
+
+    seen: list = []
+
+    def fake_generate(path, *a, **kw):
+        seen.append(path)
+        return {"file": path,
+                "patch": _content_to_new_file_patch(path, "x\n"),
+                "content": "x\n", "syntax_ok": True, "confidence": 0.9}
+
+    monkeypatch.setattr("cgx.answer.engine.generate_single_scaffold_file",
+                        fake_generate)
+    t = TaskNode.new(
+        session.session_id, TaskKind.SCAFFOLD, "s",
+        inputs={"work_plan_artifact_id": plan.artifact_id,
+                "regenerated_from_task_id": "task_sc0"})
+    result = run_scaffold(t, ExecutorDeps(
+        provider=_StubProvider(""), store=store, project_root=str(tmp_path)))
+    assert result.failure is None
+    # Without the marker both manifest files are regenerated from the model.
+    assert set(seen) == {"requirements.txt", "backend/app.py"}
 
 
 def test_scaffold_checkpoints_progress_after_each_layer(store, monkeypatch):
@@ -5253,6 +5505,115 @@ def test_bootstrap_env_node_install_failure_is_nonfatal(
     assert result.outputs["outcome"] == "skipped"
     assert "rc=1" in result.artifact.content["note"]
     assert "ENOTFOUND" in result.artifact.content["pip_log_tail"]
+
+
+def test_bootstrap_env_polyglot_provisions_python_and_node(
+        tmp_path, store, monkeypatch):
+    """A repo with both requirements.txt and package.json provisions BOTH.
+
+    Part 5: previously ``python`` took priority and ``node_modules`` was
+    left to VERIFY's best-effort install. Now BOOTSTRAP_ENV provisions the
+    venv *and* runs ``npm install`` in the same pass, folding a ``node``
+    sub-report into the BUILD_REPORT while keeping ``project_type=python``
+    so the Python-only gates still key off it.
+    """
+    from cgx.session.tasks import bootstrap_env as bs
+    (tmp_path / "requirements.txt").write_text("flask\n", encoding="utf-8")
+    (tmp_path / "package.json").write_text(
+        '{"name": "app", "scripts": {"build": "vite build"}}',
+        encoding="utf-8")
+    (tmp_path / ".venv" / "bin").mkdir(parents=True)
+    venv_python = tmp_path / ".venv" / "bin" / "python"
+    venv_python.write_text("")
+    venv_python.chmod(0o755)
+
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+
+    monkeypatch.setattr("cgx.codegen.test_runner.ensure_project_venv",
+                        lambda root, timeout=300.0: str(venv_python))
+    monkeypatch.setattr(
+        "cgx.codegen.env_manager.preflight_install",
+        lambda files, root, python=None: ([], {}))
+    monkeypatch.setattr(
+        "cgx.codegen.env_manager.update_requirements",
+        lambda root, pkgs: None)
+    monkeypatch.setattr(
+        "cgx.session.tasks.bootstrap_env._capture_pip_freeze",
+        lambda exe, timeout=30.0: ([], ""))
+
+    npm_calls: dict = {}
+
+    def _fake_run(cmd, **kw):
+        npm_calls["cmd"] = list(cmd)
+        (tmp_path / "node_modules").mkdir()
+
+        class _P:
+            returncode = 0
+            stdout = "added 1 package"
+            stderr = ""
+
+        return _P()
+
+    monkeypatch.setattr(bs.shutil, "which", lambda name: "/usr/bin/npm")
+    monkeypatch.setattr(bs.subprocess, "run", _fake_run)
+
+    t = TaskNode.new(session.session_id, TaskKind.BOOTSTRAP_ENV, "boot",
+                     inputs={"applied_files": ["app.py"],
+                             "mode": SessionMode.GREENFIELD.value})
+    result = bs.run_bootstrap_env(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    assert result.failure is None
+    # Python remains the primary type/outcome so the downstream gates fire.
+    assert result.outputs["project_type"] == "python"
+    assert result.outputs["outcome"] == "succeeded"
+    assert result.outputs["venv_path"] == str(tmp_path / ".venv")
+    # Node was provisioned in the same pass.
+    assert result.outputs["node_outcome"] == "succeeded"
+    assert npm_calls["cmd"][:2] == ["npm", "install"]
+    assert (tmp_path / "node_modules").is_dir()
+    node = result.artifact.content["node"]
+    assert node["outcome"] == "succeeded"
+    assert node["note"] is None
+
+
+def test_bootstrap_env_polyglot_node_failure_is_nonfatal(
+        tmp_path, store, monkeypatch):
+    """Node provisioning failure must not fail the Python bootstrap."""
+    from cgx.session.tasks import bootstrap_env as bs
+    (tmp_path / "requirements.txt").write_text("flask\n", encoding="utf-8")
+    (tmp_path / "package.json").write_text('{"name": "app"}', encoding="utf-8")
+    (tmp_path / ".venv" / "bin").mkdir(parents=True)
+    venv_python = tmp_path / ".venv" / "bin" / "python"
+    venv_python.write_text("")
+    venv_python.chmod(0o755)
+
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+
+    monkeypatch.setattr("cgx.codegen.test_runner.ensure_project_venv",
+                        lambda root, timeout=300.0: str(venv_python))
+    monkeypatch.setattr(
+        "cgx.codegen.env_manager.preflight_install",
+        lambda files, root, python=None: ([], {}))
+    monkeypatch.setattr(
+        "cgx.codegen.env_manager.update_requirements",
+        lambda root, pkgs: None)
+    monkeypatch.setattr(
+        "cgx.session.tasks.bootstrap_env._capture_pip_freeze",
+        lambda exe, timeout=30.0: ([], ""))
+    # npm absent -> node provisioning degrades to skipped, non-fatal.
+    monkeypatch.setattr(bs.shutil, "which", lambda name: None)
+
+    t = TaskNode.new(session.session_id, TaskKind.BOOTSTRAP_ENV, "boot",
+                     inputs={"applied_files": ["app.py"],
+                             "mode": SessionMode.GREENFIELD.value})
+    result = bs.run_bootstrap_env(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    assert result.failure is None
+    assert result.outputs["outcome"] == "succeeded"
+    assert result.outputs["node_outcome"] == "skipped"
+    assert result.artifact.content["node"]["note"] == "npm not installed"
 
 
 def test_bootstrap_env_provisions_venv_and_records_preflight(
@@ -7822,6 +8183,57 @@ def test_unresolved_entry_paths_parses_rollup_and_vite_wordings():
     assert unresolved_entry_paths("src/App.jsx: TS2345") == ()
 
 
+def test_unresolved_import_sources_parses_rollup_resolution_error():
+    from cgx.session.repair.classify import unresolved_import_sources
+    assert unresolved_import_sources(
+        'Could not resolve "./index.css" from "src/main.jsx"') == (
+            "src/main.jsx",)
+    # De-duplicated across repeats; an unrelated build error is inert.
+    assert unresolved_import_sources(
+        'Could not resolve "./a" from "src/x.jsx"\n'
+        'Could not resolve "./b" from "src/x.jsx"\n') == ("src/x.jsx",)
+    assert unresolved_import_sources("src/App.jsx: TS2345") == ()
+
+
+def test_repair_executor_targets_importer_for_build_resolution_error(
+        store, tmp_path: Path):
+    """A 'Could not resolve X from Y' build break names Y for a targeted regen."""
+    from cgx.session.tasks import repair as _repair_module  # noqa: F401
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "main.jsx").write_text("import './index.css'\n")
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    smoke_task = TaskNode.new(
+        session.session_id, TaskKind.SMOKE, "smoke", inputs={})
+    smoke_artifact = Artifact.new(
+        session_id=session.session_id,
+        produced_by_task_id=smoke_task.task_id,
+        kind=ArtifactKind.SMOKE_REPORT,
+        content={"outcome": "failed", "failed_modules": [],
+                 "failure_signature": "smoke_import|npm run build --silent",
+                 "modules": [], "scaffold_artifact_id": "art_scaf",
+                 "build_smoke": {
+                     "label": "npm run build --silent", "ok": False,
+                     "stderr_tail": ('error during build:\n'
+                                     'Could not resolve "./index.css" '
+                                     'from "src/main.jsx"\n')}})
+    store.save_task(smoke_task)
+    store.save_artifact(smoke_artifact)
+    repair_task = TaskNode.new(
+        session.session_id, TaskKind.REPAIR, "repair",
+        inputs={"smoke_artifact_id": smoke_artifact.artifact_id,
+                "mode": SessionMode.GREENFIELD.value, "repair_attempt": 1})
+    deps = ExecutorDeps(project_root=str(tmp_path), store=store)
+    from cgx.session.tasks.base import _REGISTRY
+    result = _REGISTRY[TaskKind.REPAIR](repair_task, deps)
+    assert result.failure is None
+    assert result.outputs["strategy"] == "regenerate"
+    constraints = result.outputs["extra_constraints"]
+    assert constraints["kind"] == "invalid_build_smoke"
+    assert constraints["target_files"] == ["src/main.jsx"]
+    assert result.outputs["scaffold_artifact_id"] == "art_scaf"
+
+
 def test_classify_missing_module_pythonpath_from_collection_error():
     """ModuleNotFoundError during collection -> missing_module_pythonpath."""
     from cgx.session.repair.classify import classify_verify_report
@@ -9041,6 +9453,103 @@ def test_repair_executor_emits_third_party_pin_plan(
     assert decisions[0]["consumer"] == "flask"
 
 
+def test_import_name_breaks_keeps_full_dotted_module():
+    """import_name_breaks preserves the module; the pin view collapses it."""
+    from cgx.session.repair.classify import (
+        import_name_breaks,
+        third_party_import_breaks,
+    )
+    content = {
+        "outcome": "collection_error",
+        "returncode": 2,
+        "stdout": (
+            "E   ImportError: cannot import name 'login' from 'backend.auth'\n"
+            "E   ImportError: cannot import name 'url_quote' from "
+            "'werkzeug.urls'\n"),
+        "stderr": "",
+    }
+    assert import_name_breaks(content) == (
+        ("login", "backend.auth"), ("url_quote", "werkzeug.urls"))
+    # The legacy top-level view the PyPI-pin path consumes is unchanged.
+    assert third_party_import_breaks(content) == (
+        ("login", "backend"), ("url_quote", "werkzeug"))
+
+
+def test_repair_first_party_symbol_mismatch_regenerates_not_pins(
+        store, tmp_path: Path):
+    """A cannot-import-name from an on-disk module -> regenerate, not a pin.
+
+    Mirrors ses_0408ac4084b04b4c: ``backend/auth.py`` imports cleanly but
+    never defines ``login``. The pure classifier calls this
+    ``third_party_import_break``; REPAIR sees the module resolves on disk and
+    re-classifies it to a ``first_party_symbol_mismatch`` regenerate that
+    names the missing symbol -- rather than a nonsensical PyPI pin against a
+    package called ``backend`` that produces no diff and flaps the loop.
+    """
+    from cgx.session.tasks.repair import run_repair
+    (tmp_path / "backend").mkdir()
+    (tmp_path / "backend" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "backend" / "auth.py").write_text(
+        "def logout():\n    return True\n", encoding="utf-8")
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    verify_content = {
+        "outcome": "collection_error",
+        "returncode": 2,
+        "stdout": (
+            "ImportError while importing test module 'tests/test_auth.py'.\n"
+            "tests/test_auth.py:1: in <module>\n"
+            "    from backend.auth import login\n"
+            "E   ImportError: cannot import name 'login' from "
+            "'backend.auth'\n"),
+        "stderr": "",
+        "mode": SessionMode.GREENFIELD.value,
+    }
+    verify_artifact = Artifact.new(
+        session_id=session.session_id,
+        produced_by_task_id="task-verify",
+        kind=ArtifactKind.VERIFY_REPORT,
+        content=verify_content,
+    )
+    store.save_artifact(verify_artifact)
+    t = TaskNode.new(session.session_id, TaskKind.REPAIR, "repair",
+                     inputs={
+                         "verify_artifact_id": verify_artifact.artifact_id,
+                         "mode": SessionMode.GREENFIELD.value,
+                         "repair_attempt": 1,
+                     })
+    store.save_task(t)
+    result = run_repair(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    assert result.failure is None
+    assert result.outputs["classification"] == "first_party_symbol_mismatch"
+    assert result.outputs["strategy"] == "regenerate"
+    assert result.outputs["can_apply"] is False
+    assert result.artifact.content["diffs"] == []
+    constraints = result.outputs["extra_constraints"]
+    assert constraints["kind"] == "first_party_symbol_mismatch"
+    assert constraints["symbol_mismatches"] == [
+        {"symbol": "login", "module": "backend.auth"}]
+    # The rationale names the symbol + module and forbids a dependency pin.
+    assert "login" in constraints["rationale"]
+    assert "backend.auth" in constraints["rationale"]
+    assert "do not add or pin" in constraints["rationale"].lower()
+
+
+def test_repair_select_strategy_first_party_symbol_mismatch_regenerates():
+    """The token is regenerate-eligible and carries the symbol mismatches."""
+    from cgx.session.tasks.repair import _select_repair_strategy
+    strategy, constraints = _select_repair_strategy(
+        classification="first_party_symbol_mismatch", diffs=[],
+        rationale="define the missing symbol",
+        extra_plan_fields={"symbol_mismatches": [
+            {"symbol": "login", "module": "backend.auth"}]},
+        locations_payload=[])
+    assert strategy == "regenerate"
+    assert constraints["kind"] == "first_party_symbol_mismatch"
+    assert constraints["symbol_mismatches"] == [
+        {"symbol": "login", "module": "backend.auth"}]
+
 
 # --------------------- Phase 4.1: scaffold pin validator ---------------------
 
@@ -9871,9 +10380,33 @@ def test_select_repair_strategy_regenerates_missing_fixture_without_diffs():
     strategy, constraints = _select_repair_strategy(
         classification="missing_fixture", diffs=[],
         rationale="fixture 'username' is never defined",
-        extra_plan_fields={}, locations_payload=[])
+        extra_plan_fields={"missing_fixtures": ["client", "db"]},
+        locations_payload=[])
     assert strategy == "regenerate"
     assert constraints["kind"] == "missing_fixture"
+    # The names pytest reported ride along as a structured field so the
+    # regenerated SCAFFOLD is told exactly which fixtures to author.
+    assert constraints["missing_fixtures"] == ["client", "db"]
+
+
+def test_fixture_rationale_instructs_authoring_when_no_definition():
+    """No on-disk fixture -> the rationale is an actionable authoring order.
+
+    Regression for the E2E halt where a model-authored Flask test requested
+    a ``client`` fixture that no @pytest.fixture defined. The old rationale
+    only *described* the gap, so the weak model re-emitted the same test.
+    The rationale must now instruct the regenerate to author the fixture,
+    add a conftest.py for shared fixtures, and build a web client fixture
+    from the app's test client -- naming the missing fixture.
+    """
+    from cgx.session.tasks.repair import _fixture_rationale
+    content = {"stdout": "E       fixture 'client' not found\n"}
+    text = _fixture_rationale(content, [], has_diff=False).lower()
+    assert "client" in text
+    assert "conftest" in text
+    assert "test_client" in text
+    # It is an instruction to author, not merely a diagnosis.
+    assert "author" in text
 
 
 def test_select_repair_strategy_regenerates_when_patch_oversized():
@@ -10111,6 +10644,27 @@ def test_router_repair_regenerate_threads_missing_files():
     assert len(creates) == 1
     assert creates[0].task.inputs["additional_files"] == [
         {"path": "index.html", "description": "entry html"}]
+
+
+def test_router_repair_regenerate_targets_build_smoke_importer():
+    """A build-resolution verdict regenerates only the named importer."""
+    session, scaffold, tasks, rep = _build_regenerate_chain()
+    rep.outputs = dict(rep.outputs)
+    rep.outputs["classification"] = "smoke_import_failure"
+    rep.outputs["scaffold_artifact_id"] = "art_scaf"
+    rep.outputs["extra_constraints"] = {
+        "kind": "invalid_build_smoke",
+        "rationale": "resolve",
+        "build_error": "Could not resolve './index.css' from 'src/main.jsx'",
+        "target_files": ["src/main.jsx"],
+    }
+    plan = Router().on_task_completed(
+        session=session, completed=rep, tasks=tasks)
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    assert len(creates) == 1
+    new_scaffold = creates[0].task
+    assert new_scaffold.inputs["regenerate_files"] == ["src/main.jsx"]
+    assert new_scaffold.inputs["prior_scaffold_artifact_id"] == "art_scaf"
 
 
 def test_router_repair_regenerate_preserves_failure_signatures():
@@ -10454,6 +11008,40 @@ def test_router_scaffold_dropped_foundational_file_escalates_to_replan():
     dec = creates[0].task
     assert dec.kind is TaskKind.DECOMPOSE
     assert "requirements.txt" in dec.inputs["prior_goal"]
+    assert not [a for a in plan.actions if isinstance(a, UpdateSessionStatus)]
+
+
+def test_router_scaffold_foundational_empty_patch_regenerates_not_replan():
+    """An empty-patch drop of a foundational manifest is a transient miss:
+    it takes the targeted regenerate, NOT the heavy DECOMPOSE re-plan."""
+    session, parent, scaffold, tasks = _build_scaffold_failed_chain(
+        scaffold_failed_files=[
+            {"file": "package.json",
+             "error": "generator returned empty patch"}])
+    plan = Router().on_task_completed(
+        session=session, completed=scaffold, tasks=tasks)
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    assert len(creates) == 1
+    new_scaffold = creates[0].task
+    # A targeted regenerate SCAFFOLD, not a re-plan.
+    assert new_scaffold.kind is TaskKind.SCAFFOLD
+    assert "package.json" in new_scaffold.inputs["regenerate_files"]
+    assert not [a for a in plan.actions if isinstance(a, UpdateSessionStatus)]
+
+
+def test_router_apply_foundational_empty_patch_regenerates_not_replan():
+    """Mirror of the SCAFFOLD carve-out on the APPLY dropped-file edge."""
+    session, scaffold, apply_t, tasks = _build_apply_failed_chain(
+        apply_failed_files=[
+            {"file": "package.json",
+             "error": "generator returned empty patch"}])
+    plan = Router().on_task_completed(
+        session=session, completed=apply_t, tasks=tasks)
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    assert len(creates) == 1
+    new_scaffold = creates[0].task
+    assert new_scaffold.kind is TaskKind.SCAFFOLD
+    assert "package.json" in new_scaffold.inputs["regenerate_files"]
     assert not [a for a in plan.actions if isinstance(a, UpdateSessionStatus)]
 
 

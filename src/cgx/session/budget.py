@@ -81,7 +81,7 @@ DECOMPOSE_RETRY_BUDGET = 1
 # needs clarification is never charged for the pause. Explore mode stays
 # unbounded by default -- its loops are user-gated, not autonomous.
 GREENFIELD_MAX_TASK_RUNS = 60
-GREENFIELD_MAX_WALL_SECONDS = 1800.0
+GREENFIELD_MAX_WALL_SECONDS = 3600.0
 
 
 def _coerce_int(value: Any) -> Optional[int]:

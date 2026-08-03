@@ -219,9 +219,23 @@ def _repair_regenerate_actions(completed: TaskNode,
     missing_files = extra_constraints.get("missing_files")
     if not isinstance(missing_files, list):
         missing_files = None
+    # A classification that named the *existing* offending file(s) under
+    # ``target_files`` (a build-smoke resolution error whose importer was
+    # generated) regenerates only those against the prior scaffold artifact,
+    # reusing every prior-good diff -- a whole-tree regenerate reproduced the
+    # identical miss in ses_aa99f1fb6914488d. Both markers are required for
+    # ``propose_regenerate`` to take the targeted path; a missing artifact id
+    # degrades to the whole-tree regenerate below.
+    target_files = extra_constraints.get("target_files")
+    if not isinstance(target_files, list) or not target_files:
+        target_files = None
+    prior_scaffold_id = str(
+        (completed.outputs or {}).get("scaffold_artifact_id") or "").strip()
     new_scaffold = propose_regenerate(
         scaffold, extra_constraints,
         additional_files=missing_files,
+        regenerate_files=target_files if prior_scaffold_id else None,
+        prior_scaffold_artifact_id=prior_scaffold_id or None,
         prior_failure_signatures=LoopBudget.from_inputs(
             completed.inputs).prior_failure_signatures)
     new_scaffold.inputs["repair_regenerate_attempt"] = (
@@ -307,11 +321,13 @@ def _apply_failed_files_actions(completed: TaskNode,
         failed_count,
         apply_failed=outputs.get("failed_files"),
         scaffold_failed=scaffold_outputs.get("failed"))
-    # Foundational-file guard: a dropped environment manifest is never
-    # fixable by the per-file regenerate loop (re-asking the same model
-    # reproduces the drop), so skip that budget and escalate straight to a
-    # re-plan that can restructure the manifest.
-    foundational = _dropped_foundational_files(
+    # Foundational-file guard: a dropped environment manifest that failed a
+    # structural gate is never fixable by the per-file regenerate loop
+    # (re-asking the same model reproduces the drop), so skip that budget
+    # and escalate straight to a re-plan that can restructure the manifest.
+    # A manifest dropped for a bare empty patch is excluded -- that is a
+    # transient generation miss the targeted regenerate below recovers.
+    foundational = _structural_foundational_failures(
         scaffold_outputs.get("failed"), outputs.get("failed_files"))
     if foundational:
         return _replan_or_fail(
@@ -546,10 +562,13 @@ def _scaffold_failed_files_actions(completed: TaskNode,
         failed_count, apply_failed=None,
         scaffold_failed=outputs.get("failed"))
     # Foundational-file guard (mirrors _apply_failed_files_actions): a
-    # dropped environment manifest escalates straight to a re-plan rather
-    # than burning the per-file regenerate budget on a file the same model
-    # just failed to produce.
-    foundational = _dropped_foundational_files(outputs.get("failed"), None)
+    # dropped environment manifest that failed a structural gate escalates
+    # straight to a re-plan rather than burning the per-file regenerate
+    # budget on a file the same model just failed to produce. A manifest
+    # dropped for a bare empty patch is excluded -- that transient miss
+    # falls through to the targeted regenerate below.
+    foundational = _structural_foundational_failures(
+        outputs.get("failed"), None)
     if foundational:
         return _replan_or_fail(
             completed, tasks, scaffold=completed,
@@ -891,6 +910,44 @@ def _dropped_foundational_files(scaffold_failed: object,
     """Return the dropped file paths that are environment manifests."""
     return [p for p in _failed_scaffold_paths(scaffold_failed, apply_failed)
             if _is_foundational_path(p)]
+
+
+# The bare sentinel scaffold.py emits when a single-file generation
+# returned no content and no gate reason (see ``cgx.session.tasks.scaffold``
+# -> "generator returned empty patch"). Unlike a structural rejection (a
+# manifest that failed a syntax/content gate), an empty body is a transient
+# generation miss: the same model regenerates the file fine on the next
+# attempt (observed live on package.json). So an empty-patch drop of a
+# foundational manifest must NOT escalate to a full re-plan -- it falls
+# through to the proportionate per-file regenerate the non-foundational
+# drops already take.
+_EMPTY_PATCH_SENTINEL = "generator returned empty patch"
+
+
+def _structural_foundational_failures(scaffold_failed: object,
+                                      apply_failed: object) -> List[str]:
+    """Return dropped foundational manifests that failed for a real reason.
+
+    A foundational drop escalates to a re-plan only when regenerating the
+    manifest in place cannot help -- i.e. it failed a structural
+    syntax/content gate. Entries whose sole error is the bare empty-patch
+    sentinel (:data:`_EMPTY_PATCH_SENTINEL`) are excluded: those are
+    transient generation misses a targeted regenerate recovers, so they
+    must not trigger the heavier DECOMPOSE + re-approval path. Draws from
+    the same two ``{"file", "error"}`` sources as
+    :func:`_dropped_foundational_files`.
+    """
+    out: List[str] = []
+    seen: set = set()
+    for entry in _dropped_file_entries(scaffold_failed, apply_failed):
+        path = str(entry.get("file") or "").strip()
+        if not path or path in seen or not _is_foundational_path(path):
+            continue
+        seen.add(path)
+        if str(entry.get("error") or "").strip() == _EMPTY_PATCH_SENTINEL:
+            continue
+        out.append(path)
+    return out
 
 
 def _foundational_failure_note(foundational: List[str]) -> str:

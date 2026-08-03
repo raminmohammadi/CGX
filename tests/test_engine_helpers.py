@@ -1011,6 +1011,71 @@ def test_scaffold_freeform_fallback_recovers_body_not_diff_header():
     assert 'id="root"' in out["content"]
 
 
+def test_first_fenced_block_body_recovers_pathless_fence():
+    from cgx.answer.engine import _first_fenced_block_body
+    text = ('Here is the file:\n```json\n{"name": "calc"}\n```\ndone')
+    assert _first_fenced_block_body(text) == '{"name": "calc"}'
+    # No fence at all -> empty.
+    assert _first_fenced_block_body("no fence here") == ""
+    assert _first_fenced_block_body("") == ""
+
+
+def test_scaffold_freeform_fallback_accepts_pathless_fence():
+    """A single-file freeform fallback whose fence omits ``path=`` must still
+    recover the body -- otherwise the strict parser drops the only block and
+    the file falls out with a bare empty patch (the package.json failure)."""
+    from cgx.answer.engine import generate_single_scaffold_file
+    # Fence carries no ``path=`` label, so _CODE_FENCE_RE yields no diffs.
+    freeform = '```json\n{\n  "name": "calc",\n  "version": "1.0.0"\n}\n```'
+    provider = _FreeformFallbackProvider(freeform)
+    out = generate_single_scaffold_file(
+        "package.json", "node manifest", provider,
+        layer="frontend", goal="build a react app",
+    )
+    assert provider.calls == 2, "primary (empty) then freeform fallback"
+    assert out["syntax_ok"] is True
+    assert out["patch"], "a path-less fence must still yield a patch"
+    assert '"name": "calc"' in out["content"]
+
+
+class _EmptyThenGoodProvider:
+    """Every parse path returns empty until the hardened retry, which yields
+    a usable body -- exercises the generic empty-body one-shot retry."""
+
+    stream_json_capable = False
+
+    def __init__(self, good: str, retry_marker: str = "CRITICAL RETRY"):
+        self._good = good
+        self._marker = retry_marker
+        self.calls = 0
+
+    def chat(self, messages=None, **kw):  # noqa: ANN001 -- duck type
+        self.calls += 1
+        sys_msg = ""
+        if messages:
+            sys_msg = str(messages[0].get("content") or "")
+        # The empty-body retry appends the hardened instruction to the
+        # system prompt; only then return real content.
+        if self._marker in sys_msg:
+            return {"content": json.dumps({"content": self._good})}
+        return {"content": "{}"}
+
+
+def test_scaffold_generic_empty_body_retry_recovers_file():
+    """When primary + freeform both come back empty, one hardened retry
+    recovers the file instead of dropping it with an empty patch."""
+    from cgx.answer.engine import generate_single_scaffold_file
+    good = '{\n  "name": "calc"\n}\n'
+    provider = _EmptyThenGoodProvider(good)
+    out = generate_single_scaffold_file(
+        "package.json", "node manifest", provider,
+        layer="frontend", goal="build a react app",
+    )
+    assert '"name": "calc"' in out["content"]
+    assert out["patch"], "empty-body retry must yield a non-empty patch"
+    assert out["syntax_ok"] is True
+
+
 def test_unwrap_wrapping_code_fence_variants():
     from cgx.answer.engine import _unwrap_wrapping_code_fence as unwrap
     # Whole-wrap with trailing prose after the closing fence.

@@ -1773,6 +1773,35 @@ _CODE_FENCE_RE = re.compile(
     re.DOTALL | re.IGNORECASE,
 )
 
+# A fenced code block carrying no ``path=`` label. :data:`_CODE_FENCE_RE`
+# requires the label, so a small model that emits a bare ```json``` fence
+# has its only block discarded and the file drops with an empty patch.
+# For a single-file request the lone block is unambiguously that file, so
+# this looser pattern recovers its body as a last resort.
+_ANY_CODE_FENCE_RE = re.compile(
+    r"```[a-zA-Z0-9_+.\-]*[ \t]*\n(?P<body>.*?)```",
+    re.DOTALL,
+)
+
+
+def _first_fenced_block_body(text: str) -> str:
+    """Return the body of the first fenced code block, ignoring any path=.
+
+    The single-file freeform fallback asks for exactly one file inside one
+    fenced block, but a small model routinely omits the ``path=<...>``
+    label the strict parser (:data:`_CODE_FENCE_RE`) requires, so the block
+    is discarded and the file drops with a bare empty patch. Since the
+    request is for a single file, any lone fenced block is unambiguously
+    that file -- recover its body directly. Returns ``""`` when no fenced
+    block is present.
+    """
+    if not isinstance(text, str) or "```" not in text:
+        return ""
+    m = _ANY_CODE_FENCE_RE.search(text)
+    if not m:
+        return ""
+    return (m.group("body") or "").rstrip("\n")
+
 
 def _content_to_new_file_patch(path: str, content: str) -> str:
     """Convert complete file content into a new-file unified diff (--- /dev/null style)."""
@@ -3635,10 +3664,33 @@ def generate_single_scaffold_file(
                 break
         if not ff_body and parsed_ff.get("diffs"):
             ff_body = _patch_to_body(parsed_ff["diffs"][0])
+        if not ff_body:
+            # The strict fence parser needs a ``path=`` label; a small model
+            # often omits it, so the block is dropped and no diff is
+            # produced at all. For this single-file request the lone block
+            # is unambiguously the file -- recover its body directly rather
+            # than losing the whole generation to an empty patch.
+            ff_body = _first_fenced_block_body(ff_raw)
         # A collapsed body is real content, just unusable: only replace it
         # when the fallback actually came back with line structure.
         if not collapsed or (ff_body and not _looks_newline_collapsed(ff_body)):
             content = ff_body or content
+
+    # Generic empty-body retry: when both the primary call and the freeform
+    # fallback came back with no usable content, the file would otherwise
+    # drop with a bare "generator returned empty patch". This is a transient
+    # generation miss (observed live on manifests such as package.json that
+    # then generate fine on the very next attempt), not a content defect, so
+    # one hardened JSON-mode retry recovers it in place instead of letting
+    # the drop escalate to a re-plan.
+    if not content:
+        logger.debug(
+            "scaffold empty body after primary+freeform; "
+            "retrying once: %s", path)
+        retry = _regenerate_scaffold_file(
+            provider, system, context, budget, _EMPTY_BODY_RETRY_INSTR)
+        if retry:
+            content = retry
 
     # Inline syntax validation.
     syntax_ok = True
@@ -4098,6 +4150,26 @@ def _js_external_imports(content: str) -> List[str]:
     return found
 
 
+def _js_relative_imports(content: str) -> List[str]:
+    """Relative import/require specifiers (``./`` / ``../``) in one source.
+
+    The counterpart to :func:`_js_external_imports`: instead of the bare
+    package names that map to package.json dependencies, it returns the
+    first-party specifiers a bundler resolves against sibling files
+    (``./index.css``, ``../App.jsx``). Order-preserving and de-duplicated;
+    absolute (``/``) and alias (``@/``) specifiers are excluded because
+    they are not path-relative to the importer. Callers resolve each one
+    against the importer's directory to check the target was generated.
+    """
+    found: List[str] = []
+    for rx in (_JS_IMPORT_FROM_RE, _JS_BARE_IMPORT_RE, _JS_REQUIRE_RE):
+        for spec in rx.findall(content or ""):
+            s = (spec or "").strip()
+            if s.startswith(".") and s not in found:
+                found.append(s)
+    return found
+
+
 def _deterministic_package_json_repair(
         content: str,
         js_files_with_content: Optional[List[Dict[str, str]]],
@@ -4191,6 +4263,15 @@ _TEST_RETRY_INSTR = (
     "each with real `assert` statements exercising a distinct behaviour.\n"
     "- Do NOT add an `if __name__ == '__main__'` block or any "
     "application logic."
+)
+
+
+_EMPTY_BODY_RETRY_INSTR = (
+    "\n\nCRITICAL RETRY -- YOUR PREVIOUS ATTEMPT RETURNED NO FILE CONTENT:\n"
+    "The prior response contained no usable file body (empty or "
+    "unparseable). Return the COMPLETE content of this one file as the "
+    "JSON `content` string -- real newlines between every line, no "
+    "markdown fences, no prose, no empty result."
 )
 
 
@@ -4680,6 +4761,12 @@ def _scaffold_primary_call(
         # looks exactly like this) -- fall back to the reliable blocking
         # call, which additionally grows its budget on a length-cap stop so
         # a truncated body is regenerated to completion instead of dropped.
+        # Trace the empty-stream outcome: a streamed call leaves no
+        # prompt/response preview in agent.log, so without this an empty
+        # body is invisible and cannot be told apart from a parse miss.
+        logger.debug(
+            "scaffold stream produced no usable content "
+            "(raw_chars=%d); falling back to blocking call", len(raw))
     return _blocking_scaffold_call(provider, messages, max_tokens)
 
 

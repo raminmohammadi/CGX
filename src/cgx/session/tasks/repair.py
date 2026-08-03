@@ -40,6 +40,8 @@ from cgx.session.repair.classify import (
     classify_runtime_report,
     classify_verify_report,
     failure_signature,
+    import_name_breaks,
+    missing_fixture_names,
     missing_module_names,
     required_package_names,
     runtime_failure_text,
@@ -47,11 +49,13 @@ from cgx.session.repair.classify import (
     traceback_source_files,
     undefined_names,
     unresolved_entry_paths,
+    unresolved_import_sources,
 )
 from cgx.session.repair.locate import (
     MissingFixtureLocation,
     MissingPythonpathLocation,
     StyleMixLocation,
+    _dotted_path_resolves,
     locate_missing_fixture,
     locate_missing_module_pythonpath,
     locate_unittest_pytest_mix,
@@ -108,6 +112,7 @@ _LLM_REPAIR_RETRIEVAL_SLACK = 4
 _REGENERATE_CLASSES = frozenset({
     "circular_import",
     "third_party_import_break",
+    "first_party_symbol_mismatch",
     "relative_import_error",
     "smoke_import_failure",
     "api_check_failure",
@@ -234,20 +239,51 @@ def run_repair(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             Path(deps.project_root), fx_locations)
         rationale = _fixture_rationale(content, fx_locations, bool(diffs))
         locations_payload = [_fx_loc_to_dict(loc) for loc in fx_locations]
+        # The names pytest reported live in the VERIFY content, not the
+        # located-on-disk set (empty when nothing was found to hoist -- the
+        # exact case the regenerate must author). Carry them so the
+        # regenerate constraint names the fixtures to define.
+        extra_plan_fields["missing_fixtures"] = list(
+            missing_fixture_names(content))
     elif classification == "third_party_import_break":
-        pairs = third_party_import_breaks(content)
-        installed = _installed_packages_from_build(deps, content)
-        pypi_client = _resolve_pypi_client(deps)
-        diffs, decisions = propose_third_party_pin(
-            Path(deps.project_root), content,
-            pairs=pairs, installed_packages=installed,
-            pypi_client=pypi_client,
-        )
-        rationale = _third_party_rationale(pairs, decisions, bool(diffs))
-        extra_plan_fields["import_breaks"] = [
-            {"symbol": s, "package": p} for s, p in pairs
-        ]
-        extra_plan_fields["pin_decisions"] = decisions
+        # ``cannot import name 'X' from 'Y'`` means Y imported cleanly but
+        # never binds X. If Y resolves to a first-party module on disk this
+        # is a symbol the scaffold forgot to author -- a PyPI pin cannot add
+        # it, so re-classify to a regenerate that names the module + symbol.
+        # Only a genuinely third-party Y (no project file claims it) stays on
+        # the dependency-pin path. This split is the ses_0408ac4084b04b4c
+        # root cause: a first-party mismatch was pinned against PyPI, produced
+        # no diff, and flapped the loop.
+        root = Path(deps.project_root)
+        first_party = [
+            (sym, mod) for sym, mod in import_name_breaks(content)
+            if _dotted_path_resolves(root, mod)]
+        if first_party:
+            classification = "first_party_symbol_mismatch"
+            extra_plan_fields["symbol_mismatches"] = [
+                {"symbol": s, "module": m} for s, m in first_party]
+            items = "; ".join(
+                f"{s!r} from module {m!r}" for s, m in first_party)
+            rationale = (
+                "A first-party import failed: the module imported cleanly but "
+                f"does not define the imported name(s): {items}. This is not a "
+                "dependency problem -- do not add or pin any package. "
+                "Re-author the named module(s) to define each missing symbol "
+                "and keep every importer consistent with that definition.")
+        else:
+            pairs = third_party_import_breaks(content)
+            installed = _installed_packages_from_build(deps, content)
+            pypi_client = _resolve_pypi_client(deps)
+            diffs, decisions = propose_third_party_pin(
+                Path(deps.project_root), content,
+                pairs=pairs, installed_packages=installed,
+                pypi_client=pypi_client,
+            )
+            rationale = _third_party_rationale(pairs, decisions, bool(diffs))
+            extra_plan_fields["import_breaks"] = [
+                {"symbol": s, "package": p} for s, p in pairs
+            ]
+            extra_plan_fields["pin_decisions"] = decisions
     elif classification == "empty_test_suite":
         # pytest exit 5: the selected test file(s) exist but collected
         # zero tests -- almost always ``def test_*`` nested inside a
@@ -429,6 +465,33 @@ def _run_verify_collection_error_escalation(
     )
 
 
+def _build_smoke_target_files(build_stderr: str,
+                              project_root: str) -> Tuple[str, ...]:
+    """Project-relative importer files a build-smoke resolution error names.
+
+    Parses ``Could not resolve "<spec>" from "<file>"`` errors
+    (:func:`unresolved_import_sources`), relativises any absolute path
+    against ``project_root``, and keeps only the files that actually exist
+    on disk -- so the router can target the regenerate at the offending
+    importer(s) instead of re-authoring the whole tree. Order-preserving
+    and de-duplicated; empty when nothing parseable resolves to a real
+    file.
+    """
+    root = Path(project_root)
+    out: List[str] = []
+    for imp in unresolved_import_sources(build_stderr):
+        rel = imp
+        p = Path(imp)
+        if p.is_absolute():
+            try:
+                rel = str(p.relative_to(root)).replace("\\", "/")
+            except ValueError:
+                continue
+        if (root / rel).exists() and rel not in out:
+            out.append(rel)
+    return tuple(out)
+
+
 def _run_smoke_repair(task: TaskNode, deps: ExecutorDeps,
                       smoke_artifact_id: str) -> ExecutorResult:
     """Emit a REPAIR_PLAN from a SMOKE_REPORT.
@@ -457,6 +520,7 @@ def _run_smoke_repair(task: TaskNode, deps: ExecutorDeps,
     classification = "smoke_import_failure"
     build_stderr = ""
     missing_entries: Tuple[str, ...] = ()
+    target_files: Tuple[str, ...] = ()
     if failed:
         rationale = (
             f"Third-party import(s) {', '.join(failed)} failed under the "
@@ -481,10 +545,26 @@ def _run_smoke_repair(task: TaskNode, deps: ExecutorDeps,
                 f"entry module(s) {', '.join(missing_entries)}: the "
                 "file(s) were never generated. Add them to the tree.")
         else:
-            rationale = (
-                f"The JS/TS build-smoke (`{label}`) failed: the applied "
-                "frontend does not build. Re-author the failing file(s) to "
-                "fix the reported build error.")
+            # ... or the bundler resolved the entry but a *generated* file
+            # imports a sibling that resolves nowhere ("Could not resolve
+            # './x' from 'src/main.jsx'"). The offending importer exists, so
+            # naming it lets the router target the regenerate at that file
+            # instead of re-authoring the whole tree -- which reproduced the
+            # identical miss in ses_aa99f1fb6914488d.
+            target_files = _build_smoke_target_files(
+                build_stderr, deps.project_root)
+            if target_files:
+                rationale = (
+                    f"The JS/TS build-smoke (`{label}`) failed: "
+                    f"{', '.join(target_files)} import a relative sibling "
+                    "that does not resolve. Re-author the named file(s) to "
+                    "import only existing siblings (or author the missing "
+                    "module).")
+            else:
+                rationale = (
+                    f"The JS/TS build-smoke (`{label}`) failed: the applied "
+                    "frontend does not build. Re-author the failing file(s) "
+                    "to fix the reported build error.")
     else:
         rationale = (
             "SMOKE reported a failure but no failed modules were "
@@ -505,6 +585,11 @@ def _run_smoke_repair(task: TaskNode, deps: ExecutorDeps,
         extra_constraints["missing_files"] = [
             {"path": p, "description": stack_entry_description(p)}
             for p in missing_entries]
+    elif target_files:
+        # Targeted build-smoke repair: the importer exists, so name it so
+        # the router regenerates only these files against the prior scaffold
+        # (reusing every prior-good diff) instead of re-authoring the tree.
+        extra_constraints["target_files"] = list(target_files)
     artifact = Artifact.new(
         session_id=task.session_id,
         produced_by_task_id=task.task_id,
@@ -513,6 +598,7 @@ def _run_smoke_repair(task: TaskNode, deps: ExecutorDeps,
             "smoke_artifact_id": smoke_artifact_id,
             "build_artifact_id": content.get("build_artifact_id"),
             "apply_artifact_id": content.get("apply_artifact_id"),
+            "scaffold_artifact_id": content.get("scaffold_artifact_id"),
             "classification": classification,
             "failure_signature": signature,
             "repair_attempt": attempt,
@@ -534,6 +620,7 @@ def _run_smoke_repair(task: TaskNode, deps: ExecutorDeps,
             "can_apply": False,
             "strategy": "regenerate",
             "extra_constraints": extra_constraints,
+            "scaffold_artifact_id": content.get("scaffold_artifact_id"),
         },
         artifact=artifact,
     )
@@ -1017,6 +1104,11 @@ def _select_repair_strategy(
             extra_plan_fields.get("import_breaks") or [])
         constraints["attempted_pins"] = list(
             extra_plan_fields.get("pin_decisions") or [])
+    elif classification == "first_party_symbol_mismatch":
+        # The regenerated SCAFFOLD is told exactly which symbol each
+        # first-party module must define so the importer resolves.
+        constraints["symbol_mismatches"] = list(
+            extra_plan_fields.get("symbol_mismatches") or [])
     elif classification == "circular_import":
         constraints["modules"] = list(
             extra_plan_fields.get("circular_modules") or [])
@@ -1028,6 +1120,14 @@ def _select_repair_strategy(
             entry.get("class_name")
             for entry in locations_payload
             if entry.get("class_name")})
+    elif classification == "missing_fixture":
+        # No fixture was located to hoist, so the regenerate must author the
+        # fixtures itself. Carry the names pytest reported (threaded through
+        # extra_plan_fields from the VERIFY content) alongside the
+        # actionable rationale so SCAFFOLD's prompt builder can surface
+        # exactly which fixtures the regenerated tests must define.
+        constraints["missing_fixtures"] = list(
+            extra_plan_fields.get("missing_fixtures") or [])
     if diff_count > _PATCH_DIFF_LIMIT:
         constraints["oversized_patch"] = {
             "diff_count": diff_count,
@@ -1308,11 +1408,26 @@ def _fixture_rationale(
     from cgx.session.repair.classify import missing_fixture_names
     wanted = missing_fixture_names(content)
     if not locations:
-        names = ", ".join(wanted) if wanted else "(unknown)"
-        return (f"Pytest reported missing fixture(s) {names}, but no "
-                "matching @pytest.fixture definition was found anywhere "
-                "in the project; the fixture must be authored before "
-                "the failure can be auto-repaired.")
+        names = ", ".join(wanted) if wanted else "the reported fixture(s)"
+        # No on-disk @pytest.fixture matches, so there is nothing to hoist:
+        # the fixture was never authored. A diagnostic-only rationale left
+        # the regenerate loop churning (a weak model re-emitted the same
+        # test with the same undefined fixture). Emit an explicit authoring
+        # instruction instead so the bounded regenerate directs the model
+        # to define what it uses -- covering the common web-app ``client``
+        # fixture without hard-coding any single framework.
+        return (f"Pytest could not find the fixture(s) {names}: the test(s) "
+                "request them as arguments but no @pytest.fixture defines "
+                "them anywhere in the project. Author each missing fixture. "
+                "Put a fixture shared across test modules in a "
+                "tests/conftest.py (or the project-root conftest.py) so "
+                "pytest discovers it during collection. If a fixture is a "
+                "web-app test client (commonly named 'client'), build it "
+                "from the application object's test client -- e.g. a Flask "
+                "app's app.test_client() with app.config['TESTING']=True, or "
+                "the equivalent for the framework in use -- and never leave "
+                "a test depending on a fixture that no @pytest.fixture "
+                "provides.")
     targets = sorted({loc.target_rel_path for loc in locations})
     names = ", ".join(loc.fixture_name for loc in locations)
     if not has_diff:

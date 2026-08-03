@@ -30,6 +30,7 @@ from cgx.trace import traced
 REPAIR_CLASSIFICATIONS: Tuple[str, ...] = (
     "circular_import",
     "third_party_import_break",
+    "first_party_symbol_mismatch",
     "relative_import_error",
     "unittest_pytest_mix",
     "missing_dependency",
@@ -165,6 +166,17 @@ _UNRESOLVED_ENTRY_RE = re.compile(
     re.MULTILINE,
 )
 
+# A bundler (Vite/Rollup) that resolved its entry but could not resolve a
+# relative import *inside* a generated file: ``Could not resolve
+# "./index.css" from "src/main.jsx"``. Unlike the entry-module miss above,
+# the offending file exists -- it just references a sibling that does not --
+# so the fix is a targeted re-author of the importer(s), not a manifest
+# extension. Group 1 is the unresolved specifier, group 2 the importer file.
+_UNRESOLVED_IMPORT_RE = re.compile(
+    r"(?:annot|ould not) resolve\s+[\"']([^\"']+)[\"']\s+from\s+"
+    r"[\"']([^\"']+)[\"']",
+)
+
 # A name a generated module uses but never binds -- ``class
 # Operation(str, enum.Enum)`` with no ``import enum``, a constant
 # referenced in an f-string that was never assigned. The file parses,
@@ -256,6 +268,28 @@ def classify_verify_report(content: Dict[str, Any]) -> RepairClassification:
     return "unknown"
 
 
+def import_name_breaks(
+        content: Dict[str, Any]) -> Tuple[Tuple[str, str], ...]:
+    """Return ``((symbol, module), ...)`` pairs from "cannot import name".
+
+    Unlike :func:`third_party_import_breaks` the module is the **full**
+    dotted path (e.g. ``werkzeug.urls`` or ``backend.auth``), not the
+    top-level distribution. The full path lets a caller with disk access
+    tell a first-party symbol mismatch (the module is a project file that
+    imported cleanly but never defines the symbol -- a regenerate) apart
+    from a genuine third-party API break (the module is an installed
+    package whose peer version drifted -- a pin). Order-preserving and
+    de-duplicated.
+    """
+    blob = _failure_text(content)
+    out: List[Tuple[str, str]] = []
+    for m in _CANNOT_IMPORT_NAME_RE.finditer(blob):
+        pair = (m.group(1), m.group(2))
+        if pair not in out:
+            out.append(pair)
+    return tuple(out)
+
+
 def third_party_import_breaks(
         content: Dict[str, Any]) -> Tuple[Tuple[str, str], ...]:
     """Return ``((symbol, package), ...)`` pairs from "cannot import name".
@@ -263,17 +297,17 @@ def third_party_import_breaks(
     Used by the dependency-aware proposer to drive the PyPI lookup.
     The package name is the **top-level** distribution (e.g. ``werkzeug``
     for ``werkzeug.urls``) so it can be matched against installed
-    packages in the BUILD_REPORT. Order-preserving and de-duplicated.
+    packages in the BUILD_REPORT. Derived from :func:`import_name_breaks`
+    by collapsing each module to its top-level name. Order-preserving and
+    de-duplicated.
     """
-    blob = _failure_text(content)
     out: List[Tuple[str, str]] = []
-    for m in _CANNOT_IMPORT_NAME_RE.finditer(blob):
-        symbol = m.group(1)
-        pkg = m.group(2).split(".", 1)[0]
-        pair = (symbol, pkg)
+    for symbol, module in import_name_breaks(content):
+        pair = (symbol, module.split(".", 1)[0])
         if pair not in out:
             out.append(pair)
     return tuple(out)
+
 
 
 def missing_module_names(content: Dict[str, Any]) -> Tuple[str, ...]:
@@ -380,6 +414,29 @@ def unresolved_entry_paths(text: str) -> Tuple[str, ...]:
     out: List[str] = []
     for m in _UNRESOLVED_ENTRY_RE.finditer(str(text or "")):
         path = m.group(1).replace("\\", "/").strip().lstrip("./")
+        if path and path not in out:
+            out.append(path)
+    return tuple(out)
+
+
+def unresolved_import_sources(text: str) -> Tuple[str, ...]:
+    """Return the importer files a bundler could not resolve an import in.
+
+    Takes the raw build stderr (the SMOKE build-smoke tail) and matches
+    ``Could not resolve "<spec>" from "<file>"`` -- the failure a generated
+    source ships when it imports a sibling that was never generated. Returns
+    the *importer* paths (the ``from`` side), normalised to forward slashes
+    and stripped of a leading ``./``; order-preserving and de-duplicated.
+    Callers treat these as files to *re-author* (a targeted regenerate),
+    distinct from :func:`unresolved_entry_paths` whose paths must be added.
+    An absolute path is returned verbatim for the caller to relativise
+    against the project root.
+    """
+    out: List[str] = []
+    for m in _UNRESOLVED_IMPORT_RE.finditer(str(text or "")):
+        path = m.group(2).replace("\\", "/").strip()
+        if not path.startswith("/"):
+            path = path.lstrip("./")
         if path and path not in out:
             out.append(path)
     return tuple(out)

@@ -256,6 +256,17 @@ def run_bootstrap_env(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     if venv_path is not None and python_exe:
         resolved_packages, pip_freeze_text = _capture_pip_freeze(python_exe)
 
+    # Polyglot provisioning: a Python repo that *also* declares a
+    # ``package.json`` (a Python backend beside a JS/TS frontend) needs its
+    # ``node_modules`` provisioned in the same pass so VERIFY's NpmRunner
+    # exercises the JS stack against real dependencies rather than relying
+    # on its own best-effort install. Non-fatal, mirroring the node-only
+    # path: a missing npm / offline registry degrades to ``skipped`` and
+    # never fails the Python bootstrap or its outcome.
+    node_report: Optional[Dict[str, Any]] = None
+    if (root / "package.json").is_file():
+        node_report = _provision_node_modules(root, timeout)
+
     outcome = _classify_outcome(
         venv_path=venv_path, failed_installs=fatal_installs)
     # Honesty gate: even when nothing failed to *install*, the scaffold's
@@ -283,6 +294,7 @@ def run_bootstrap_env(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         pip_freeze_text=pip_freeze_text,
         missing_imports=missing_runtime,
         uninstallable=uninstallable,
+        node_report=node_report,
         note=None,
     )
     failure: Optional[str] = None
@@ -302,6 +314,7 @@ def run_bootstrap_env(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             "build_artifact_id": artifact.artifact_id,
             "outcome": outcome,
             "project_type": project_type,
+            "node_outcome": (node_report or {}).get("outcome"),
             "venv_path": venv_path,
             "python_exe": python_exe,
             "installed_count": len(installed_packages),
@@ -321,12 +334,17 @@ def _detect_project_type(root: Path) -> str:
     """Return ``python`` / ``node`` for a known stack, else ``unknown``.
 
     Python markers (``requirements.txt`` / ``pyproject.toml`` /
-    ``setup.py`` / ``setup.cfg``) take priority over ``package.json``:
-    a polyglot repo still gets its richer venv provisioning + preflight
-    path, and VERIFY's ``NpmRunner`` best-effort installs ``node_modules``
-    on its own. A ``package.json``-only project resolves to ``node`` so
-    BOOTSTRAP_ENV can provision ``node_modules`` before VERIFY runs the
-    build/test smoke -- otherwise the JS signal would be a false success.
+    ``setup.py`` / ``setup.cfg``) take priority over ``package.json`` for
+    the *primary* type, so a polyglot repo keeps its richer venv
+    provisioning + preflight path and the Python-only gates (API_CHECK /
+    SMOKE / RUNTIME_VERIFY) still key off ``project_type == "python"``.
+    :func:`run_bootstrap_env` additionally provisions ``node_modules`` in
+    the same pass whenever a ``package.json`` is present (see
+    :func:`_provision_node_modules`), so the JS stack is verified against
+    real dependencies rather than left to VERIFY's best-effort install. A
+    ``package.json``-only project resolves to ``node`` so BOOTSTRAP_ENV can
+    provision ``node_modules`` before VERIFY runs the build/test smoke --
+    otherwise the JS signal would be a false success.
     """
     for name in ("requirements.txt", "pyproject.toml",
                  "setup.py", "setup.cfg"):
@@ -419,29 +437,14 @@ def _bootstrap_node(task: TaskNode, root: Path,
     ``BUILD_REPORT`` with ``project_type=node`` and no ``python_exe`` so
     the Python-only API_CHECK / SMOKE gates skip cleanly.
     """
-    node_modules = root / "node_modules"
-    pip_log_tail = ""
-    note: Optional[str]
-    if shutil.which("npm") is None:
-        outcome = "skipped"
-        note = "npm not installed"
-    elif node_modules.is_dir():
-        outcome = "succeeded"
-        note = "node_modules already present"
-    else:
-        rc, pip_log_tail = _run_npm_install(root, timeout)
-        if node_modules.is_dir():
-            outcome = "succeeded"
-            note = None
-        else:
-            outcome = "skipped"
-            note = f"npm install did not provision node_modules (rc={rc})"
+    report = _provision_node_modules(root, timeout)
+    outcome = report["outcome"]
     artifact = _build_artifact(
         task, project_type="node", venv_path=None, python_exe=None,
         installed_from=[], installed_packages=[], failed_installs={},
-        outcome=outcome, pip_log_tail=pip_log_tail,
+        outcome=outcome, pip_log_tail=report["log_tail"],
         applied_files=applied_files, style_issues=[],
-        resolved_packages=[], pip_freeze_text="", note=note,
+        resolved_packages=[], pip_freeze_text="", note=report["note"],
     )
     return ExecutorResult(
         outputs={
@@ -477,6 +480,38 @@ def _run_npm_install(root: Path, timeout: float) -> Tuple[int, str]:
     except Exception as exc:
         return -1, f"{type(exc).__name__}: {exc}"
     return proc.returncode, (proc.stderr or proc.stdout or "")[-800:]
+
+
+def _provision_node_modules(root: Path, timeout: float) -> Dict[str, Any]:
+    """Provision ``node_modules`` (best-effort); return a node sub-report.
+
+    Shared by the node-only path (:func:`_bootstrap_node`) and the polyglot
+    Python path so both agree on what "provisioned" means. Deliberately
+    non-fatal: a missing ``npm`` binary or an install that cannot
+    materialise ``node_modules`` (offline registry) degrades to ``skipped``
+    rather than raising -- VERIFY's ``NpmRunner`` still produces the real
+    build/test signal, and hard-failing here would deny the loop that
+    signal entirely.
+
+    Returns ``{"outcome", "note", "log_tail"}`` where ``outcome`` is one of
+    ``succeeded`` / ``skipped`` and ``note`` is a human-readable reason (or
+    ``None`` on a clean install).
+    """
+    node_modules = root / "node_modules"
+    if shutil.which("npm") is None:
+        return {"outcome": "skipped", "note": "npm not installed",
+                "log_tail": ""}
+    if node_modules.is_dir():
+        return {"outcome": "succeeded",
+                "note": "node_modules already present", "log_tail": ""}
+    rc, log_tail = _run_npm_install(root, timeout)
+    if node_modules.is_dir():
+        return {"outcome": "succeeded", "note": None, "log_tail": log_tail}
+    return {
+        "outcome": "skipped",
+        "note": f"npm install did not provision node_modules (rc={rc})",
+        "log_tail": log_tail,
+    }
 
 
 def _resolve_applied_files(task: TaskNode,
@@ -665,6 +700,7 @@ def _build_artifact(
     note: Optional[str],
     missing_imports: Optional[List[str]] = None,
     uninstallable: Optional[List[str]] = None,
+    node_report: Optional[Dict[str, Any]] = None,
 ) -> Artifact:
     """Construct the ``BUILD_REPORT`` artifact for this bootstrap run.
 
@@ -693,6 +729,9 @@ def _build_artifact(
     }
     if note:
         content["note"] = note
+    if node_report is not None:
+        # Polyglot: the JS provisioning sub-report from the same pass.
+        content["node"] = dict(node_report)
     return Artifact.new(
         session_id=task.session_id,
         produced_by_task_id=task.task_id,
