@@ -438,12 +438,24 @@ guard or a `ModuleNotFoundError` no project file claims →
 rewrite), `circular_import` / `relative_import_error`
 (regenerate-only: the offending modules are re-authored with the
 cycle folded into the constraint), and `empty_test_suite` (pytest
-exit 5 with test files selected → re-scaffold). When no
-classifier matches, the bounded LLM repair is **traceback-localized**
+exit 5 with test files selected → re-scaffold). A genuine
+`assertions_failed` that no mechanical classifier locates falls back to
+`assertion_drift` (**Part A**: the suite imported and ran and a plain
+`assert` / status-code / message-string comparison tripped), while an
+*unrecognized* `collection_error` (pytest could not import the suite at
+all) escalates instead. When no classifier matches, the bounded LLM
+repair is **traceback-localized**
 (crash-frame files first), **retrieval-fed** (remaining candidate
 slots filled from the project index; a no-op in greenfield), and
 **schema-constrained** (**Phase 3.1**: `REPAIR_FILES_SCHEMA` rides as
-`json_schema` on the call, with one `validate_json_schema` re-ask):
+`json_schema` on the call, with one `validate_json_schema` re-ask). On
+`assertion_drift`, when that bounded patch is a no-op (no provider or the
+repair budget is spent) the executor falls back to a *targeted* regenerate
+of only the implementation file(s) the traceback named
+(`_assertion_impl_targets`, carried as `target_files` with test modules
+excluded) so the handler is aligned to the test's asserted contract -- not
+a whole-tree regenerate that re-rolls both sides of the seam and reproduces
+the divergence (ses_a60d67a2f0164dcb):
 
 ```mermaid
 flowchart TB

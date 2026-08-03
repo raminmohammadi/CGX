@@ -4023,15 +4023,36 @@ def test_extract_endpoint_contracts_parses_provider_reply():
     from cgx.answer.engine import extract_endpoint_contracts
     reply = ('{"endpoints": [{"method": "post", "path": "/calculate", '
              '"request": {"num1": "number", "num2": "number", '
-             '"operation": "str"}}]}')
+             '"operation": "str"}, "status": 201}]}')
     prov = _StubProvider(reply)
     eps = extract_endpoint_contracts("calc", [{"name": "a", "files": [
         {"path": "backend/app.py", "description": "flask"}]}], prov)
     assert len(eps) == 1 and eps[0]["path"] == "/calculate"
+    # The success status survives contract normalization as an int.
+    assert eps[0]["status"] == 201
     # No files -> nothing to extract; no provider -> abstain.
     assert extract_endpoint_contracts("calc", [], prov) == []
     assert extract_endpoint_contracts("calc", [{"name": "a", "files": [
         {"path": "backend/app.py"}]}], None) == []
+
+
+def test_render_contracts_declares_success_status_and_message():
+    """The endpoint contract prompt states the success status and message.
+
+    Both the handler and the paired test are generated from this fragment,
+    so the response contract (status + message) must appear verbatim.
+    """
+    from cgx.answer.engine import _render_contracts_for_prompt
+    rendered = _render_contracts_for_prompt({"endpoints": [{
+        "method": "POST", "path": "/register", "status": 201,
+        "message": "user created"}]})
+    assert "POST /register" in rendered
+    assert "success_status=201" in rendered
+    assert "user created" in rendered
+    # A boolean/garbage status is dropped rather than rendered as 1/0.
+    no_status = _render_contracts_for_prompt({"endpoints": [{
+        "method": "GET", "path": "/health", "status": True}]})
+    assert "success_status" not in no_status
 
 
 def _cross_seam_manifest():
@@ -4936,7 +4957,25 @@ def test_synthesize_js_test_harness_backfills_react_project():
         next(d["patch"] for d in diffs if d["file"] == "vitest.config.js"))
     assert "jsdom" in cfg and "vitest.setup.js" in cfg
     assert "plugin-react" in cfg
-    assert any(e["path"] == "vitest.setup.js" for e in existing)
+    # The synthesized setup wires jest-dom matchers AND a jest->vi alias so
+    # a jest-dialect suite (jest.spyOn/jest.fn) runs under the harness.
+    setup = next(e["content"] for e in existing
+                 if e["path"] == "vitest.setup.js")
+    assert "@testing-library/jest-dom" in setup
+    assert "globalThis.jest = vi" in setup
+    assert "import { vi } from 'vitest'" in setup
+
+
+def test_vitest_setup_content_aliases_jest_to_vi():
+    """The synthesized setup exposes a jest global backed by vi."""
+    from cgx.session.tasks.scaffold import _vitest_setup_content
+    setup = _vitest_setup_content()
+    # jest-dom matchers are still imported for toBeInTheDocument() etc.
+    assert "import '@testing-library/jest-dom';" in setup
+    # vi is imported explicitly (robust even without globals) and aliased
+    # onto the jest global so jest.spyOn/jest.fn resolve under vitest.
+    assert "import { vi } from 'vitest';" in setup
+    assert "globalThis.jest = vi;" in setup
 
 
 def test_synthesize_js_test_harness_noop_without_tests():
@@ -7925,8 +7964,8 @@ def test_classify_unittest_pytest_mix_from_traceback():
     assert classify_verify_report(content) == "unittest_pytest_mix"
 
 
-def test_classify_unknown_for_plain_assertion_failure():
-    """A regular assert failure has no auto-repair -> unknown."""
+def test_classify_assertion_drift_for_plain_assertion_failure():
+    """A plain assert failure with no locator -> assertion_drift."""
     from cgx.session.repair.classify import classify_verify_report
     content = {
         "outcome": "assertions_failed",
@@ -7934,7 +7973,7 @@ def test_classify_unknown_for_plain_assertion_failure():
         "stdout": "E   assert 1 == 2\nE    +  where 1 = compute()",
         "stderr": "",
     }
-    assert classify_verify_report(content) == "unknown"
+    assert classify_verify_report(content) == "assertion_drift"
 
 
 def test_classify_skipped_outcomes_are_unknown():
@@ -8176,8 +8215,9 @@ def test_repair_executor_emits_repair_plan_artifact(store, tmp_path: Path):
     assert result.outputs["diff_count"] >= 1
 
 
-def test_repair_executor_emits_empty_plan_for_unknown(store, tmp_path: Path):
-    """Unclassifiable failure -> empty diffs + can_apply False (router escalates)."""
+def test_repair_executor_emits_empty_plan_for_assertion_drift(
+        store, tmp_path: Path):
+    """Assertion drift with no locator/provider -> empty diffs + can_apply False."""
     from cgx.session.tasks import repair as _repair_module  # noqa: F401
     session = Session.new("g", mode=SessionMode.GREENFIELD)
     store.save_session(session)
@@ -8200,9 +8240,67 @@ def test_repair_executor_emits_empty_plan_for_unknown(store, tmp_path: Path):
     from cgx.session.tasks.base import _REGISTRY
     result = _REGISTRY[TaskKind.REPAIR](repair_task, deps)
     assert result.failure is None
-    assert result.outputs["classification"] == "unknown"
+    assert result.outputs["classification"] == "assertion_drift"
     assert result.outputs["can_apply"] is False
     assert result.outputs["diff_count"] == 0
+
+
+def test_repair_executor_assertion_drift_targets_impl_file(store, tmp_path: Path):
+    """No patch + traceback naming a source file -> targeted regenerate.
+
+    The failing test asserts a 201 the handler returns 200 for. With no
+    provider the bounded LLM patch is a no-op, so the executor must fall
+    back to a *targeted* regenerate of only the implementation file the
+    traceback flows through (``src/handlers.py``) -- never the test that
+    encodes the contract -- carrying the prior scaffold artifact id so the
+    router can regenerate against it instead of the whole tree.
+    """
+    from cgx.session.tasks import repair as _repair_module  # noqa: F401
+    src_rel = "src/handlers.py"
+    test_rel = "tests/test_backend.py"
+    (tmp_path / "src").mkdir()
+    (tmp_path / "tests").mkdir()
+    (tmp_path / src_rel).write_text(
+        "def login():\n    return '', 200\n", encoding="utf-8")
+    (tmp_path / test_rel).write_text(
+        "from src.handlers import login\n\n\ndef test_login():\n"
+        "    assert login()[1] == 201\n", encoding="utf-8")
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    verify_artifact = Artifact.new(
+        session_id=session.session_id, produced_by_task_id="t_verify",
+        kind=ArtifactKind.VERIFY_REPORT,
+        content={
+            "outcome": "assertions_failed",
+            "returncode": 1,
+            "changed_files": [test_rel],
+            "scaffold_artifact_id": "art_scaffold_1",
+            "stdout": (
+                "tests/test_backend.py:5: in test_login\n"
+                "    assert login()[1] == 201\n"
+                "src/handlers.py:2: in login\n"
+                "    return '', 200\n"
+                "E   assert 200 == 201"),
+            "stderr": "",
+        })
+    store.save_artifact(verify_artifact)
+    repair_task = TaskNode.new(
+        session.session_id, TaskKind.REPAIR, "repair",
+        inputs={"verify_artifact_id": verify_artifact.artifact_id,
+                "mode": SessionMode.GREENFIELD.value,
+                "repair_attempt": 1})
+    deps = ExecutorDeps(project_root=str(tmp_path), store=store)
+    from cgx.session.tasks.base import _REGISTRY
+    result = _REGISTRY[TaskKind.REPAIR](repair_task, deps)
+    assert result.failure is None
+    assert result.outputs["classification"] == "assertion_drift"
+    assert result.outputs["strategy"] == "regenerate"
+    assert result.outputs["can_apply"] is False
+    assert result.outputs["scaffold_artifact_id"] == "art_scaffold_1"
+    ec = result.outputs["extra_constraints"]
+    assert ec["target_files"] == [src_rel]
+    # The test file that encodes the contract is never a regenerate target.
+    assert test_rel not in ec["target_files"]
 
 
 def test_generate_repair_files_returns_validated_rewrites():
@@ -8259,7 +8357,7 @@ def test_generate_repair_files_flags_localized_files():
 
 
 def test_repair_executor_llm_logic_repair_emits_patch(store, tmp_path: Path):
-    """unknown assertion failure + provider -> bounded LLM patch (can_apply)."""
+    """assertion-drift failure + provider -> bounded LLM patch (can_apply)."""
     import json as _json
     from cgx.session.tasks import repair as _repair_module  # noqa: F401
     rel = "src/calc.py"
@@ -8296,7 +8394,7 @@ def test_repair_executor_llm_logic_repair_emits_patch(store, tmp_path: Path):
     from cgx.session.tasks.base import _REGISTRY
     result = _REGISTRY[TaskKind.REPAIR](repair_task, deps)
     assert result.failure is None
-    assert result.outputs["classification"] == "unknown"
+    assert result.outputs["classification"] == "assertion_drift"
     assert result.outputs["can_apply"] is True
     assert result.outputs["diff_count"] == 1
     assert result.outputs["strategy"] == "patch"
@@ -8339,7 +8437,7 @@ def test_repair_executor_llm_logic_repair_respects_attempt_budget(
     from cgx.session.tasks.base import _REGISTRY
     result = _REGISTRY[TaskKind.REPAIR](repair_task, deps)
     assert result.failure is None
-    assert result.outputs["classification"] == "unknown"
+    assert result.outputs["classification"] == "assertion_drift"
     assert result.outputs["can_apply"] is False
     assert result.outputs["diff_count"] == 0
     assert provider.calls == []
@@ -8414,6 +8512,10 @@ def test_repair_executor_retrieval_feeds_candidate_files(
     candidates leave slots free. A stubbed hybrid-retrieval result points
     at ``src/helper.py``; the executor must pull that source file into the
     repair context and emit a patch against it.
+
+    Retrieval is gated on the index manifest existing on disk (a
+    greenfield project that was never indexed has none), so materialise a
+    ``meta.json`` under ``index_dir`` to model an indexed project.
     """
     import json as _json
     from cgx.session.tasks import repair as _repair_module  # noqa: F401
@@ -8425,6 +8527,9 @@ def test_repair_executor_retrieval_feeds_candidate_files(
         "def scale(x):\n    return x - 1\n", encoding="utf-8")
     (tmp_path / test_rel).write_text(
         "def test_scale():\n    assert 1 == 3\n", encoding="utf-8")
+    index_dir = tmp_path / "idx"
+    index_dir.mkdir()
+    (index_dir / "meta.json").write_text("{}", encoding="utf-8")
     monkeypatch.setattr(
         "cgx.pipeline.auto.run_query_auto",
         lambda **kwargs: {"top_files": [{"file": src_rel}]})
@@ -8450,7 +8555,7 @@ def test_repair_executor_retrieval_feeds_candidate_files(
                 "repair_attempt": 1})
     deps = ExecutorDeps(
         project_root=str(tmp_path), store=store, provider=provider,
-        index_dir="idx", records_path="rec")
+        index_dir=str(index_dir), records_path="rec")
     from cgx.session.tasks.base import _REGISTRY
     result = _REGISTRY[TaskKind.REPAIR](repair_task, deps)
     assert result.failure is None
@@ -9067,7 +9172,7 @@ def test_classify_unrecognized_collection_error_is_first_class():
 
     Before this fix it fell back to ``unknown`` (-> silent regenerate);
     now it surfaces as ``collection_error`` so the executor can escalate.
-    An assertion failure with no pattern must still stay ``unknown``.
+    An assertion failure with no pattern maps to ``assertion_drift``.
     """
     from cgx.session.repair.classify import classify_verify_report
     cerr = {
@@ -9084,7 +9189,7 @@ def test_classify_unrecognized_collection_error_is_first_class():
         "stdout": "E   assert 1 == 2\n",
         "stderr": "",
     }
-    assert classify_verify_report(assert_fail) == "unknown"
+    assert classify_verify_report(assert_fail) == "assertion_drift"
 
 
 def test_repair_executor_unrecognized_collection_error_escalates(
@@ -10603,6 +10708,88 @@ def test_payload_coherence_abstains_without_seam():
     assert check_client_server_payload_coherence(None) == []
 
 
+# ------------- P0c: response-contract status coherence ---------------
+
+def test_response_coherence_flags_status_drift():
+    """Contract declares 201 but the handler returns an explicit 200."""
+    from cgx.session.scaffold_validate import (
+        check_response_contract_coherence,
+    )
+    contracts = {"endpoints": [
+        {"method": "POST", "path": "/register", "status": 201}]}
+    contents = {
+        "backend/app.py": (
+            "@app.route('/register', methods=['POST'])\n"
+            "def register():\n"
+            "    data = request.json\n"
+            "    return jsonify({'ok': True}), 200\n"),
+    }
+    warnings = check_response_contract_coherence(contents, contracts)
+    assert len(warnings) == 1
+    w = warnings[0]
+    assert w["kind"] == "response"
+    assert w["name"] == "/register"
+    assert w["file"] == "backend/app.py"
+    assert w["expected_status"] == 201
+    assert w["found_statuses"] == [200]
+    assert "201" in w["reason"]
+
+
+def test_response_coherence_flags_implicit_200_vs_declared_201():
+    """A handler with an implicit-200 success path but a declared 201."""
+    from cgx.session.scaffold_validate import (
+        check_response_contract_coherence,
+    )
+    contracts = {"endpoints": [
+        {"method": "POST", "path": "/register", "status": 201}]}
+    contents = {
+        "backend/app.py": (
+            "@app.route('/register', methods=['POST'])\n"
+            "def register():\n"
+            "    return jsonify({'ok': True})\n"),
+    }
+    warnings = check_response_contract_coherence(contents, contracts)
+    assert len(warnings) == 1
+    assert warnings[0]["expected_status"] == 201
+    assert warnings[0]["found_statuses"] == []
+
+
+def test_response_coherence_abstains_on_match_and_error_only():
+    """No warning when the success status matches or cannot be judged."""
+    from cgx.session.scaffold_validate import (
+        check_response_contract_coherence,
+    )
+    # Handler returns the declared 201 explicitly -> coherent.
+    match = {
+        "backend/app.py": (
+            "@app.route('/register', methods=['POST'])\n"
+            "def register():\n"
+            "    return jsonify({'ok': True}), 201\n"),
+    }
+    contracts_201 = {"endpoints": [
+        {"method": "POST", "path": "/register", "status": 201}]}
+    assert check_response_contract_coherence(match, contracts_201) == []
+    # Implicit-200 success with an error branch, contract declares 200 ->
+    # the explicit 400 is not a success code, so nothing to flag.
+    implicit = {
+        "backend/app.py": (
+            "@app.route('/login', methods=['POST'])\n"
+            "def login():\n"
+            "    if not ok:\n"
+            "        return jsonify({'error': 'bad'}), 400\n"
+            "    return jsonify({'token': t})\n"),
+    }
+    contracts_200 = {"endpoints": [
+        {"method": "POST", "path": "/login", "status": 200}]}
+    assert check_response_contract_coherence(implicit, contracts_200) == []
+    # No contract, no status, or no Python route -> abstain.
+    assert check_response_contract_coherence(match, None) == []
+    assert check_response_contract_coherence(match, {"endpoints": [
+        {"method": "POST", "path": "/register"}]}) == []
+    assert check_response_contract_coherence(
+        {"src/App.jsx": "fetch('/register')\n"}, contracts_201) == []
+
+
 def test_scaffold_executor_surfaces_import_warnings(store, monkeypatch):
     """SCAFFOLD runs the cross-check and surfaces ``import_warnings``."""
     from cgx.session.tasks.scaffold import run_scaffold
@@ -10962,6 +11149,49 @@ def test_select_repair_strategy_regenerates_when_no_diffs_and_unknown():
     assert strategy == "regenerate"
     assert constraints["kind"] == "unknown"
     assert constraints["rationale"] == "rationale text"
+
+
+def test_select_repair_strategy_assertion_drift_folds_target_files():
+    """assertion_drift with named impl file(s) -> targeted regenerate."""
+    from cgx.session.tasks.repair import _select_repair_strategy
+    strategy, constraints = _select_repair_strategy(
+        classification="assertion_drift", diffs=[],
+        rationale="align handler to asserted contract",
+        extra_plan_fields={"target_files": ["src/handlers.py"]},
+        locations_payload=[])
+    assert strategy == "regenerate"
+    assert constraints["kind"] == "assertion_drift"
+    assert constraints["target_files"] == ["src/handlers.py"]
+
+
+def test_select_repair_strategy_assertion_drift_without_targets_whole_tree():
+    """assertion_drift with no named impl file -> whole-tree regenerate."""
+    from cgx.session.tasks.repair import _select_repair_strategy
+    strategy, constraints = _select_repair_strategy(
+        classification="assertion_drift", diffs=[], rationale="r",
+        extra_plan_fields={}, locations_payload=[])
+    assert strategy == "regenerate"
+    assert "target_files" not in constraints
+
+
+def test_assertion_impl_targets_excludes_test_files(tmp_path: Path):
+    """Traceback source files minus the test modules -> impl targets."""
+    from cgx.session.tasks.repair import _assertion_impl_targets
+    (tmp_path / "src").mkdir()
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "src" / "handlers.py").write_text("x = 1\n", encoding="utf-8")
+    (tmp_path / "tests" / "test_backend.py").write_text(
+        "x = 1\n", encoding="utf-8")
+    content = {
+        "outcome": "assertions_failed",
+        "returncode": 1,
+        "stdout": (
+            "tests/test_backend.py:5: in test_login\n"
+            "src/handlers.py:2: in login\n"
+            "E   assert 200 == 201"),
+        "stderr": "",
+    }
+    assert _assertion_impl_targets(content, tmp_path) == ["src/handlers.py"]
 
 
 def test_select_repair_strategy_regenerates_missing_fixture_without_diffs():
@@ -11461,6 +11691,44 @@ def test_router_scaffold_payload_repeat_is_non_terminal():
     assert signatures
     scaffold.inputs["prior_failure_signatures"] = signatures
     assert _scaffold_payload_regenerate_actions(scaffold, [scaffold]) == []
+
+
+def _response_warning(file="backend/app.py"):
+    return {"kind": "response", "name": "/register", "file": file,
+            "expected_status": 201, "found_statuses": [200],
+            "reason": "handler returns 200 but the contract declares 201"}
+
+
+def test_actionable_payload_warnings_accepts_response_kind():
+    """The seam edge acts on both payload (client) and response (server)."""
+    from cgx.session.greenfield_edges import _actionable_payload_warnings
+    got = _actionable_payload_warnings({"contract_warnings": [
+        _payload_warning(),
+        _response_warning(),
+        {"kind": "response", "name": "/x"},  # no file -> skip
+    ]})
+    assert [w["file"] for w in got] == [
+        "src/components/Calculator.jsx", "backend/app.py"]
+
+
+def test_router_scaffold_response_mismatch_targeted_regenerate():
+    # A response-status drift regenerates ONLY the offending handler file
+    # against the prior scaffold artifact, with the mismatch folded in.
+    from cgx.session.greenfield_edges import (
+        _scaffold_payload_regenerate_actions,
+    )
+    _session, scaffold = _make_clean_scaffold_with_contracts(
+        [_response_warning()])
+    actions = _scaffold_payload_regenerate_actions(scaffold, [scaffold])
+    creates = [a for a in actions if isinstance(a, CreateTask)]
+    assert len(creates) == 1
+    new_scaffold = creates[0].task
+    assert new_scaffold.kind is TaskKind.SCAFFOLD
+    assert new_scaffold.inputs["regenerate_files"] == ["backend/app.py"]
+    assert new_scaffold.inputs["prior_scaffold_artifact_id"] == "art_s"
+    constraint = new_scaffold.inputs["regenerate_constraints"][-1]
+    assert constraint["kind"] == "payload_mismatch"
+    assert "201" in constraint["rationale"]
 
 
 def test_router_repair_regenerate_budget_exhausted_fails_session():
@@ -13138,3 +13406,58 @@ def test_runner_full_greenfield_loop_with_recovery(tmp_path, store,
     assert "file:calculator.py" in provider.calls
     assert "file:test_calculator.py" in provider.calls
     assert "unrouted" not in provider.calls
+
+
+# --- REPAIR retrieval-assist: missing-index degradation ---------------------
+
+
+def test_repair_retrieval_skips_when_index_absent(tmp_path, caplog):
+    """A greenfield project is never indexed, so ``index_dir`` points at a
+    manifest that does not exist. Retrieval-assisted candidate fill must
+    degrade to ``[]`` -- not raise / log a FileNotFoundError every round."""
+    from cgx.session.tasks.repair import _retrieval_relevant_files
+
+    index_dir = tmp_path / "cgx_index" / "indices"  # no meta.json on disk
+    deps = ExecutorDeps(
+        project_root=str(tmp_path),
+        index_dir=str(index_dir),
+        records_path=str(tmp_path / "records.jsonl"),
+    )
+    with caplog.at_level("ERROR", logger="cgx.session.tasks.repair"):
+        out = _retrieval_relevant_files(
+            deps, query="fix the failing assertion", root=tmp_path, limit=4)
+    assert out == []
+    # The old behaviour logged a crash at ERROR on every attempt; the
+    # missing-index path is now a quiet debug-level skip.
+    assert not [r for r in caplog.records if r.levelno >= 40]
+
+
+def test_repair_retrieval_calls_query_when_index_present(tmp_path, monkeypatch):
+    """When the manifest exists, retrieval is invoked and its ``top_files``
+    are resolved to existing first-party paths."""
+    from cgx.session.tasks import repair as repair_mod
+
+    index_dir = tmp_path / "idx"
+    index_dir.mkdir()
+    (index_dir / "meta.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "calc.py").write_text("x = 1\n", encoding="utf-8")
+
+    calls = {}
+
+    def _fake_run_query_auto(**kwargs):
+        calls.update(kwargs)
+        return {"top_files": [{"file": "calc.py"}, {"file": "missing.py"}]}
+
+    monkeypatch.setattr(
+        "cgx.pipeline.auto.run_query_auto", _fake_run_query_auto)
+
+    deps = ExecutorDeps(
+        project_root=str(tmp_path),
+        index_dir=str(index_dir),
+        records_path=str(tmp_path / "records.jsonl"),
+    )
+    out = repair_mod._retrieval_relevant_files(
+        deps, query="boom", root=tmp_path, limit=4)
+    assert calls, "run_query_auto should have been called"
+    # Only the existing first-party file survives resolution.
+    assert out == ["calc.py"]

@@ -844,6 +844,136 @@ def check_client_server_payload_coherence(
     return warnings
 
 
+# ------------------ response-contract status coherence -----------------
+
+# Explicit HTTP status codes a Python handler sets: a trailing status in a
+# return tuple (``return jsonify(...), 201``) or a keyword form
+# (``status_code=201`` / ``status=201``, covering both FastAPI decorators
+# and Flask ``Response(..., status=201)``). Deliberately narrow: an implicit
+# 200 (a bare ``return``) is never inferred, so an absent status abstains
+# rather than guesses.
+_PY_RETURN_STATUS_RE = re.compile(r"return\b[^\n]*?,\s*(\d{3})\b")
+_PY_STATUS_KW_RE = re.compile(r"status(?:_code)?\s*=\s*(\d{3})")
+
+
+def _python_route_statuses(
+        file_contents: Dict[str, str]) -> List[Dict[str, Any]]:
+    """Map each Flask/FastAPI route to the explicit status codes it sets.
+
+    Returns one ``{path, file, statuses}`` record per route decorator, where
+    ``statuses`` is the set of integer HTTP status codes the handler
+    explicitly returns within its window (a trailing status in a return
+    tuple or a ``status_code=`` / ``status=`` keyword). A handler that sets
+    none contributes an empty set -- an implicit 200 is never inferred.
+    Best-effort and regex-based, mirroring :func:`_python_route_reads`.
+    """
+    out: List[Dict[str, Any]] = []
+    for path, content in file_contents.items():
+        if not isinstance(content, str) or not path.endswith(".py"):
+            continue
+        matches = list(_ROUTE_DECORATOR_RE.finditer(content))
+        for i, m in enumerate(matches):
+            route = m.group(1).strip()
+            if len(route) < 2:
+                continue
+            end = (matches[i + 1].start() if i + 1 < len(matches)
+                   else len(content))
+            window = content[m.start():end]
+            statuses: Set[int] = set()
+            for rx in (_PY_RETURN_STATUS_RE, _PY_STATUS_KW_RE):
+                for s in rx.findall(window):
+                    try:
+                        statuses.add(int(s))
+                    except ValueError:  # pragma: no cover - regex is \d{3}
+                        continue
+            out.append({"path": route, "file": path, "statuses": statuses})
+    return out
+
+
+def check_response_contract_coherence(
+        file_contents: Dict[str, str],
+        contracts: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    """Flag a handler whose success status disagrees with the declared one.
+
+    Response-contract coherence (P0c): the ``endpoints`` contract may carry
+    a success ``status`` (e.g. ``201`` for a create). Both the paired test
+    and the handler are generated against it, so a handler that returns a
+    *different* 2xx status is the same test<->implementation drift the
+    assertion-repair path chases -- but caught statically here, before
+    VERIFY runs the suite. For each declared endpoint carrying a 2xx
+    ``status`` that matches a generated Python route:
+
+    * the handler declares explicit 2xx status(es) and the declared one is
+      not among them (contract 201, handler returns 200) -> mismatch;
+    * the handler sets no explicit 2xx status (its success path is an
+      implicit 200) and the declared status is not 200 -> mismatch.
+
+    Otherwise it abstains. Emits ``{kind: "response", file, name,
+    expected_status, found_statuses, reason}`` warnings the router folds
+    into a targeted regenerate of the offending handler file. Returns an
+    empty list when there is no contract, no Python route, or nothing to
+    confidently compare.
+    """
+    if not isinstance(contracts, dict) or not contracts:
+        return []
+    if not isinstance(file_contents, dict) or not file_contents:
+        return []
+    declared: Dict[str, int] = {}
+    for ep in contracts.get("endpoints") or []:
+        if not isinstance(ep, dict):
+            continue
+        p = str(ep.get("path") or "").strip()
+        raw = ep.get("status")
+        if not p or isinstance(raw, bool):
+            continue
+        try:
+            code = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if 200 <= code < 300:
+            declared[p] = code
+    if not declared:
+        return []
+    routes = _python_route_statuses(file_contents)
+    if not routes:
+        return []
+    warnings: List[Dict[str, Any]] = []
+    seen: Set[Tuple[str, str]] = set()
+    for route in routes:
+        rpath = route["path"]
+        code = declared.get(rpath)
+        if code is None:
+            continue
+        handler_2xx = {s for s in route["statuses"] if 200 <= s < 300}
+        if handler_2xx:
+            if code in handler_2xx:
+                continue
+            reason = (f"handler {route['file']} returns HTTP "
+                      f"{sorted(handler_2xx)} for {rpath} but the endpoint "
+                      f"contract declares success status {code} -- align the "
+                      "handler's success response to the declared status")
+        else:
+            if code == 200:
+                continue
+            reason = (f"handler {route['file']} sets no explicit success "
+                      f"status for {rpath} (implicit 200) but the endpoint "
+                      f"contract declares {code} -- return the declared "
+                      "status explicitly")
+        key = (route["file"], rpath)
+        if key in seen:
+            continue
+        seen.add(key)
+        warnings.append({
+            "kind": "response",
+            "name": rpath,
+            "file": route["file"],
+            "expected_status": code,
+            "found_statuses": sorted(handler_2xx),
+            "reason": reason,
+        })
+    return warnings
+
+
 # --------------------- manifest stack requirements ---------------------
 
 # Entry files a toolchain requires but a planner routinely forgets, keyed

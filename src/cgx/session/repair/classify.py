@@ -39,6 +39,7 @@ REPAIR_CLASSIFICATIONS: Tuple[str, ...] = (
     "empty_test_suite",
     "undefined_name",
     "collection_error",
+    "assertion_drift",
     "unknown",
 )
 
@@ -233,8 +234,12 @@ def classify_verify_report(content: Dict[str, Any]) -> RepairClassification:
     not auto-repairable -- they're environment problems that
     BOOTSTRAP_ENV (or the user) owns. Walks the
     :data:`_CLASSIFIER_REGISTRY` in declared order and returns the first
-    matching token; falls back to ``unknown`` so the executor emits an
-    empty plan and the router escalates to ASK_USER.
+    matching token. A genuinely-failed report that no classifier matched
+    falls back to ``assertion_drift`` (a plain assertion / status / message
+    mismatch the targeted repair path owns) or ``collection_error`` (pytest
+    could not import the suite at all -- the executor escalates). Skipped /
+    passed / ``pytest_missing`` reports are not auto-repairable and map to
+    ``unknown``.
 
     ``no_tests_collected`` (pytest exit 5) is a special case: pytest
     found the selected test file(s) but collected zero test functions --
@@ -254,18 +259,23 @@ def classify_verify_report(content: Dict[str, Any]) -> RepairClassification:
     for token, predicate in _CLASSIFIER_REGISTRY:
         if predicate(content):
             return token
-    # No mechanical classifier matched. An assertion failure is an
-    # ordinary logic defect the bounded LLM-repair / regenerate path can
-    # still attempt, so it stays ``unknown``. An *unrecognized* collection
-    # error is different: pytest could not even import the suite for a
-    # reason none of the classifiers understand (a broken conftest, a
-    # pytest CLI/setup error, an import break outside the generated
-    # first-party modules), and a blind re-scaffold structurally cannot
-    # fix it. Surface it as its own first-class token so the executor
-    # escalates instead of burning the regenerate budget looping.
+    # No mechanical classifier matched. An *unrecognized* collection error
+    # is one pytest could not even import the suite for -- a broken
+    # conftest, a pytest CLI/setup error, or an import break outside the
+    # generated first-party modules -- and a blind re-scaffold structurally
+    # cannot fix it, so it surfaces as its own first-class token and the
+    # executor escalates instead of burning the regenerate budget looping.
     if outcome == "collection_error":
         return "collection_error"
-    return "unknown"
+    # A plain assertion failure with no mechanical locator is ordinary
+    # test<->implementation contract drift: the suite imported and ran and
+    # an ``assert`` (or a status-code / message-string mismatch) tripped.
+    # The tests encode the intended contract, so this routes to the bounded
+    # LLM-repair / *targeted* regenerate path that aligns the implementation
+    # file(s) the failure flowed through to the asserted contract -- not a
+    # whole-tree regenerate that re-rolls both sides of the seam and
+    # reproduces the same divergence.
+    return "assertion_drift"
 
 
 def import_name_breaks(

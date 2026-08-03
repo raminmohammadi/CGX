@@ -31,6 +31,8 @@ import threading
 import time
 from typing import Any, Callable, Optional
 
+from cgx.logging_setup import scrub_secrets
+
 logger = logging.getLogger(__name__)
 
 
@@ -140,17 +142,23 @@ def request_with_retry(
             resp = func()
         except Exception as e:
             last_exc = e
+            # ``requests`` embeds the full request URL in connection / SSL /
+            # timeout exception strings; for providers that carry the secret
+            # in the URL (Gemini's ``?key=``) that would leak the key into
+            # the logs. This retry helper is provider-agnostic, so scrub the
+            # rendered message here rather than relying on each provider.
+            msg = scrub_secrets(str(e))
             if retryable is not None and not retryable(e):
                 logger.warning("ratelimit: non-retryable exception %s: %s",
-                               type(e).__name__, e)
+                               type(e).__name__, msg)
                 raise
             if attempt > max_retries:
                 logger.warning("ratelimit: giving up after %d attempt(s); last exception %s: %s",
-                               attempt, type(e).__name__, e)
+                               attempt, type(e).__name__, msg)
                 raise
             delay = backoff_seconds(attempt)
             logger.info("ratelimit: attempt %d raised %s: %s -- retrying in %.2fs",
-                        attempt, type(e).__name__, e, delay)
+                        attempt, type(e).__name__, msg, delay)
             sleep(delay)
             continue
         sc = getattr(resp, "status_code", 200)

@@ -34,6 +34,7 @@ from cgx.session.repair.pypi_client import PyPIClient
 from cgx.session.scaffold_validate import (
     check_client_server_payload_coherence,
     check_contract_compliance,
+    check_response_contract_coherence,
     cross_check_first_party_imports,
     is_requirements_path,
     validate_scaffold_diffs,
@@ -683,6 +684,22 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         payload_warnings = []
     if payload_warnings:
         contract_warnings = list(contract_warnings) + payload_warnings
+
+    # Response-contract coherence gate (P0c): a handler whose success status
+    # disagrees with the declared endpoint status (returns 200 where the
+    # contract -- and the paired test -- expect 201) is the same
+    # test<->implementation drift REPAIR chases, caught statically here. Fold
+    # any mismatch in as a ``response`` warning so the router regenerates only
+    # the offending handler file. Best-effort: a raised checker is ignored.
+    try:
+        response_warnings = check_response_contract_coherence(
+            xcheck_contents, contracts)
+    except Exception:  # pragma: no cover - defensive: checker is best-effort
+        logger.exception(
+            "SCAFFOLD: response coherence check raised; skipping")
+        response_warnings = []
+    if response_warnings:
+        contract_warnings = list(contract_warnings) + response_warnings
 
     # Finalise the checkpoint artifact in place: pin validation reassigns
     # ``diffs`` to a new list, so re-point the content at it, attach the
@@ -2327,6 +2344,26 @@ def _vitest_config_content(uses_react: bool) -> str:
         "});\n")
 
 
+def _vitest_setup_content() -> str:
+    """jsdom matchers plus a jest->vi alias so jest-dialect suites run.
+
+    Scaffolded React suites routinely call the ``jest`` global
+    (``jest.spyOn``/``jest.fn``/...), but a vitest harness leaves ``jest``
+    undefined -- the suite dies with ``jest is not defined`` and the whole
+    file fails to collect. Vitest exposes the same mocking surface as
+    ``vi``, so the synthesized setup aliases ``jest`` to it, letting a
+    jest-dialect suite run under the backfilled harness unchanged.
+    Harmless when the tests use ``vi`` directly.
+    """
+    return (
+        "import { vi } from 'vitest';\n"
+        "import '@testing-library/jest-dom';\n"
+        "\n"
+        "// vitest exposes jest's mocking surface as `vi`; alias the jest\n"
+        "// global so jest-dialect suites run under this harness unchanged.\n"
+        "globalThis.jest = vi;\n")
+
+
 def _synthesize_js_test_harness(
         *,
         diffs: List[Dict[str, str]],
@@ -2343,10 +2380,11 @@ def _synthesize_js_test_harness(
     skipped while ``npm run build`` still passes (the ses_4cbf963cdc67435a
     blind spot). Deterministically ensure package.json carries a ``vitest
     run`` test script plus the harness devDeps, and synthesize a jsdom
-    ``vitest.config.js`` + a ``@testing-library/jest-dom`` setup file when
-    none exists. Mutates the passed bundles in place; returns the touched
-    paths. Vue trees are skipped (out of scope). Best-effort: any parse
-    failure abstains, leaving the bundle untouched.
+    ``vitest.config.js`` + a setup file (jest-dom matchers plus a jest->vi
+    alias so jest-dialect suites run) when none exists. Mutates the passed
+    bundles in place; returns the touched paths. Vue trees are skipped (out
+    of scope). Best-effort: any parse failure abstains, leaving the bundle
+    untouched.
     """
     import json as _json
 
@@ -2404,7 +2442,7 @@ def _synthesize_js_test_harness(
             new_files.append(_VITEST_CONFIG_PATH)
         touched.append(_VITEST_CONFIG_PATH)
         if _VITEST_SETUP_PATH not in existing_paths:
-            setup = "import '@testing-library/jest-dom';\n"
+            setup = _vitest_setup_content()
             if _splice_generated_file(
                     _VITEST_SETUP_PATH, setup, diffs=diffs,
                     generated=generated,
