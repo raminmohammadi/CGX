@@ -7,7 +7,35 @@ scales cleanly, and renders inline on GitHub.
 
 ## For users
 
-![CGX user flow](diagrams/flow_user.svg)
+```mermaid
+flowchart TD
+    subgraph Setup[1. Setup & Index]
+        direction LR
+        I[1. Install<br/>pip install + pull local model] --> N[2. Index your repo<br/>reads files, respects .gitignore]
+    end
+
+    subgraph Usage[2. Choose your mode]
+        direction TB
+        A[💬 Ask<br/>Streaming explanation<br/>with citations]
+        P[🛠️ Plan<br/>Code-change diff,<br/>auto-tested]
+        AG[🤖 Agent<br/>Multi-step plan,<br/>live progress]
+    end
+
+    N --> A
+    N --> P
+    N --> AG
+
+    A --> G[Grounded answer<br/>With citations to exact files/lines]
+    P --> G
+    AG --> G
+
+    style Setup fill:#0f172a,stroke:#38bdf8,color:#fff
+    style Usage fill:#0f172a,stroke:#a78bfa,color:#fff
+    style G fill:#0b1220,stroke:#f59e0b,color:#fff
+    style A fill:#0b1220,stroke:#34d399,color:#fff
+    style P fill:#0b1220,stroke:#f59e0b,color:#fff
+    style AG fill:#0b1220,stroke:#a78bfa,color:#fff
+```
 
 Install once, point CGX at a repo, then ask questions or request changes in
 plain English. The **Ask** tab returns a streaming, cited explanation; the
@@ -28,7 +56,44 @@ LLMs are strictly opt-in.
 
 ## For developers
 
-![CGX developer flow](diagrams/flow_developer.svg)
+```mermaid
+flowchart TD
+    subgraph Surfaces
+        UI[AgentPage.tsx<br/>POST /api/agent-session<br/>EventSource /events]
+        Web[cgx.webui.routes.agent_session<br/>REST + SSE]
+        CLI[cgx.cli terminal<br/>TUI dashboard]
+    end
+
+    subgraph Core[Session Loop Core]
+        Runner[SessionRunner<br/>_pick_ready → _execute → _apply_plan]
+        Execs[Executors cgx.session.tasks.*<br/>explore, clarify, scaffold, apply...]
+        Router[Router cgx.session.router<br/>TASK_SUCCESSOR edges]
+    end
+
+    subgraph Data[Persistence & Events]
+        Store[SessionStore<br/>SQLite .cgx/sessions.db]
+        Events[Event Bus<br/>SSE, TUI stream, agent.log]
+    end
+
+    Providers[cgx.answer.providers<br/>Ollama, OpenAI, Gemini]
+
+    UI --> Web
+    CLI --> Runner
+    Web --> Runner
+
+    Runner --> Execs
+    Execs --> Router
+    Execs --> Providers
+
+    Router --> Store
+    Store --> Events
+    Events -.-> UI
+
+    style Surfaces fill:#0f172a,stroke:#38bdf8,color:#fff
+    style Core fill:#0f172a,stroke:#a78bfa,color:#fff
+    style Data fill:#0f172a,stroke:#94a3b8,color:#fff
+    style Providers fill:#0b1220,stroke:#f59e0b,color:#fff
+```
 
 `cgx.session` is the loop behind the `/agent` UI, the TUI dashboard,
 and the `cgx agent` CLI -- one loop, three surfaces, all sharing the
@@ -579,7 +644,41 @@ Where to look in the repo:
 
 ## For companies
 
-![CGX trust boundaries](diagrams/flow_company.svg)
+```mermaid
+flowchart TB
+    subgraph LocalMachine[🔒 LOCAL MACHINE - no network required]
+        Repo[📁 Your repository<br/>read-only ingest]
+        Indexer[⚙️ Indexer<br/>chunks, graph, embeddings]
+        Artifacts[💾 On-disk artefacts<br/>indices/, records.jsonl]
+        Agent[🤖 Agent loop<br/>session-shaped]
+        State[💬 Sessions & Cache<br/>.cgx/sessions.db]
+        Creds[🔑 Credentials<br/>OS keyring]
+
+        Repo --> Indexer
+        Indexer --> Artifacts
+        Agent <--> Artifacts
+        Agent <--> State
+    end
+
+    subgraph Cloud[☁️ OPTIONAL CLOUD]
+        LocalLLM[🧠 Local LLM default<br/>Ollama fully offline]
+        RemoteLLM[🌐 Remote LLM opt-in<br/>OpenAI-compat, Gemini]
+    end
+
+    Agent --> LocalLLM
+    Agent -.->|opt-in egress: prompt + snippets| RemoteLLM
+
+    style LocalMachine fill:#022c22,stroke:#10b981,color:#a7f3d0
+    style Cloud fill:#1e1b4b,stroke:#a78bfa,color:#c4b5fd
+    style Repo fill:#0b1220,stroke:#10b981,color:#fff
+    style Indexer fill:#0b1220,stroke:#10b981,color:#fff
+    style Artifacts fill:#0b1220,stroke:#10b981,color:#fff
+    style Agent fill:#0b1220,stroke:#10b981,color:#fff
+    style State fill:#0b1220,stroke:#10b981,color:#fff
+    style Creds fill:#0b1220,stroke:#10b981,color:#fff
+    style LocalLLM fill:#0b1220,stroke:#a78bfa,color:#fff
+    style RemoteLLM fill:#0b1220,stroke:#a78bfa,color:#fff
+```
 
 Source code, embeddings, FAISS indices, chat sessions, the SQLite
 task registry (`~/.cgx/tasks.db`), the session-based agent's

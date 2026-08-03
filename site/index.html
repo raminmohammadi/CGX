@@ -251,14 +251,36 @@
             </div>
           </div>
 
-          <figure class="reveal" style="margin-top: 2.5rem">
-            <img
-              src="assets/flow_user.svg"
-              width="960"
-              height="540"
-              alt="Install, index your repo, ask a question, receive a grounded answer with file and line citations."
-              loading="lazy"
-            />
+          <figure class="reveal" style="margin-top: 2.5rem; text-align: center;">
+            <div class="mermaid">
+flowchart TD
+    subgraph Setup[1. Setup & Index]
+        direction LR
+        I[1. Install<br/>pip install + pull local model] --> N[2. Index your repo<br/>reads files, respects .gitignore]
+    end
+
+    subgraph Usage[2. Choose your mode]
+        direction TB
+        A[💬 Ask<br/>Streaming explanation<br/>with citations]
+        P[🛠️ Plan<br/>Code-change diff,<br/>auto-tested]
+        AG[🤖 Agent<br/>Multi-step plan,<br/>live progress]
+    end
+
+    N --> A
+    N --> P
+    N --> AG
+
+    A --> G[Grounded answer<br/>With citations to exact files/lines]
+    P --> G
+    AG --> G
+
+    style Setup fill:#0f172a,stroke:#38bdf8,color:#fff
+    style Usage fill:#0f172a,stroke:#a78bfa,color:#fff
+    style G fill:#0b1220,stroke:#f59e0b,color:#fff
+    style A fill:#0b1220,stroke:#34d399,color:#fff
+    style P fill:#0b1220,stroke:#f59e0b,color:#fff
+    style AG fill:#0b1220,stroke:#a78bfa,color:#fff
+            </div>
             <figcaption>The user journey — install → index → ask / plan / agent → grounded answer.</figcaption>
           </figure>
         </div>
@@ -435,14 +457,45 @@
             </article>
           </div>
 
-          <figure class="reveal" style="margin-top: 2.5rem">
-            <img
-              src="assets/flow_developer.svg"
-              width="960"
-              height="540"
-              alt="A surface posts an objective; the router seeds the task DAG; the runner claims one ready task per call and dispatches it to a registered executor; store writes fan out as events."
-              loading="lazy"
-            />
+          <figure class="reveal" style="margin-top: 2.5rem; text-align: center;">
+            <div class="mermaid">
+flowchart TD
+    subgraph Surfaces
+        UI[AgentPage.tsx<br/>POST /api/agent-session<br/>EventSource /events]
+        Web[cgx.webui.routes.agent_session<br/>REST + SSE]
+        CLI[cgx.cli terminal<br/>TUI dashboard]
+    end
+
+    subgraph Core[Session Loop Core]
+        Runner[SessionRunner<br/>_pick_ready → _execute → _apply_plan]
+        Execs[Executors cgx.session.tasks.*<br/>explore, clarify, scaffold, apply...]
+        Router[Router cgx.session.router<br/>TASK_SUCCESSOR edges]
+    end
+
+    subgraph Data[Persistence & Events]
+        Store[SessionStore<br/>SQLite .cgx/sessions.db]
+        Events[Event Bus<br/>SSE, TUI stream, agent.log]
+    end
+
+    Providers[cgx.answer.providers<br/>Ollama, OpenAI, Gemini]
+
+    UI --> Web
+    CLI --> Runner
+    Web --> Runner
+
+    Runner --> Execs
+    Execs --> Router
+    Execs --> Providers
+
+    Router --> Store
+    Store --> Events
+    Events -.-> UI
+
+    style Surfaces fill:#0f172a,stroke:#38bdf8,color:#fff
+    style Core fill:#0f172a,stroke:#a78bfa,color:#fff
+    style Data fill:#0f172a,stroke:#94a3b8,color:#fff
+    style Providers fill:#0b1220,stroke:#f59e0b,color:#fff
+            </div>
             <figcaption>
               One loop, three surfaces — the web UI, the terminal dashboard, and
               <code class="inline">cgx agent</code> all drive the same runner over the same store.
@@ -680,14 +733,42 @@ ans = <span class="f">answer_with_llm</span>(
             </ul>
           </div>
 
-          <figure class="reveal" style="margin-top: 2.5rem">
-            <img
-              src="assets/flow_company.svg"
-              width="960"
-              height="540"
-              alt="Trust boundary diagram: what stays on the local machine, where credentials live, and the single opt-in egress path to a remote LLM."
-              loading="lazy"
-            />
+          <figure class="reveal" style="margin-top: 2.5rem; text-align: center;">
+            <div class="mermaid">
+flowchart TB
+    subgraph LocalMachine[🔒 LOCAL MACHINE - no network required]
+        Repo[📁 Your repository<br/>read-only ingest]
+        Indexer[⚙️ Indexer<br/>chunks, graph, embeddings]
+        Artifacts[💾 On-disk artefacts<br/>indices/, records.jsonl]
+        Agent[🤖 Agent loop<br/>session-shaped]
+        State[💬 Sessions & Cache<br/>.cgx/sessions.db]
+        Creds[🔑 Credentials<br/>OS keyring]
+
+        Repo --> Indexer
+        Indexer --> Artifacts
+        Agent <--> Artifacts
+        Agent <--> State
+    end
+
+    subgraph Cloud[☁️ OPTIONAL CLOUD]
+        LocalLLM[🧠 Local LLM default<br/>Ollama fully offline]
+        RemoteLLM[🌐 Remote LLM opt-in<br/>OpenAI-compat, Gemini]
+    end
+
+    Agent --> LocalLLM
+    Agent -.->|opt-in egress: prompt + snippets| RemoteLLM
+
+    style LocalMachine fill:#022c22,stroke:#10b981,color:#a7f3d0
+    style Cloud fill:#1e1b4b,stroke:#a78bfa,color:#c4b5fd
+    style Repo fill:#0b1220,stroke:#10b981,color:#fff
+    style Indexer fill:#0b1220,stroke:#10b981,color:#fff
+    style Artifacts fill:#0b1220,stroke:#10b981,color:#fff
+    style Agent fill:#0b1220,stroke:#10b981,color:#fff
+    style State fill:#0b1220,stroke:#10b981,color:#fff
+    style Creds fill:#0b1220,stroke:#10b981,color:#fff
+    style LocalLLM fill:#0b1220,stroke:#a78bfa,color:#fff
+    style RemoteLLM fill:#0b1220,stroke:#a78bfa,color:#fff
+            </div>
             <figcaption>Trust boundaries — for the person who has to sign off on this.</figcaption>
           </figure>
         </div>
@@ -807,5 +888,9 @@ ans = <span class="f">answer_with_llm</span>(
     </footer>
 
     <script src="assets/site.js" defer></script>
+    <script type="module">
+      import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
+      mermaid.initialize({ startOnLoad: true, theme: 'dark', background: 'transparent' });
+    </script>
   </body>
 </html>
