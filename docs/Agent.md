@@ -218,7 +218,7 @@ Five entry points cover every transition:
   that slip past the per-loop regenerate/repair caps. The `Session`
   carries a budget (`max_task_runs`, `max_wall_seconds`, `headless`;
   explore defaults to unlimited/off, but a greenfield session seeds a
-  finite `GREENFIELD_MAX_TASK_RUNS=60` / `GREENFIELD_MAX_WALL_SECONDS=1800`
+  finite `GREENFIELD_MAX_TASK_RUNS=60` / `GREENFIELD_MAX_WALL_SECONDS=3600`
   backstop in `SessionRunner.start_session` unless the caller passes an
   explicit cap) plus live counters (`task_runs`,
   `first_task_started_at`) that only compute-bearing tasks charge --
@@ -260,7 +260,7 @@ Two further caps live on the `Session` (not `LoopBudget`) and bound the
 | Session budget | Default | Bounds |
 |----------------|---------|--------|
 | `GREENFIELD_MAX_TASK_RUNS` | 60 | Outer circuit breaker on compute-bearing task runs per greenfield session (`ASK_USER` waits are free). |
-| `GREENFIELD_MAX_WALL_SECONDS` | 1800 | Wall-clock ceiling measured from the first work task. |
+| `GREENFIELD_MAX_WALL_SECONDS` | 3600 | Wall-clock ceiling measured from the first work task. |
 
 `SessionRunner.start_session` seeds both on a greenfield session when the
 caller leaves them unset; an explicit value (including an opt-back-in to
