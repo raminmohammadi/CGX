@@ -337,6 +337,12 @@ def find_missing_python_packages(
     candidates: List[Tuple[str, str]] = []
     for name in sorted(pruned):
         root = name.split(".")[0]
+        # npm/JS package names are never Python import roots -- a scoped
+        # name (``@scope/pkg``) or any name containing ``/`` cannot be a
+        # PyPI distribution and must never reach ``pip install``. Guards
+        # callers that scan a mixed-language tree and pass JS roots here.
+        if name.startswith("@") or "/" in name:
+            continue
         # stdlib check operates on the root regardless of dotted form.
         if root.lower().replace("-", "_") in _STDLIB_TOP:
             continue
@@ -474,8 +480,14 @@ def preflight_install(
 
     Returns ``(missing_found, install_results)`` so the caller can decide
     whether to update requirements.txt after tests pass.
+
+    Only Python sources are scanned: this step installs into the project
+    venv via ``pip``, so JS/TS files are excluded to keep npm package
+    names (which ``pip`` cannot satisfy) out of the installer entirely.
     """
-    imports = scan_imports(generated_files)
+    py_files = [f for f in generated_files
+                if str(f).lower().endswith(".py")]
+    imports = scan_imports(py_files)
     missing = find_missing_python_packages(imports, project_root, python=python)
     if not missing:
         return [], {}

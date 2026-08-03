@@ -448,6 +448,48 @@ def test_find_missing_packages_reports_declared_but_uninstalled(
     assert "flask" in missing
 
 
+def test_find_missing_packages_drops_npm_scoped_and_pathlike(
+        tmp_path, monkeypatch):
+    from cgx.codegen.env_manager import find_missing_python_packages
+
+    _force_import_miss(monkeypatch)
+    (tmp_path / "requirements.txt").write_text("", encoding="utf-8")
+    # JS import roots (scoped ``@scope/pkg`` and path-like ``a/b``) are not
+    # valid PyPI distributions -- they must never reach ``pip install``,
+    # while a genuine Python import alongside them is still reported.
+    imports = {"@testing-library/jest-dom", "react-dom/client", "flask"}
+    missing = find_missing_python_packages(imports, str(tmp_path))
+    assert "@testing-library/jest-dom" not in missing
+    assert "react-dom/client" not in missing
+    assert "flask" in missing
+
+
+def test_preflight_install_scans_only_python_files(tmp_path, monkeypatch):
+    from cgx.codegen import env_manager
+
+    # A JS file declaring an npm devDep and a Python file importing a real
+    # PyPI package sit side by side. Preflight installs into the venv via
+    # pip, so it must scan only the Python source and hand pip a single,
+    # installable name -- never the npm package.
+    (tmp_path / "app.py").write_text("import flask\n", encoding="utf-8")
+    (tmp_path / "setup.js").write_text(
+        "import '@testing-library/jest-dom';\n", encoding="utf-8")
+    (tmp_path / "requirements.txt").write_text("", encoding="utf-8")
+    monkeypatch.setattr(
+        env_manager, "_probe_importable",
+        lambda names, python=None: set())
+    seen = {}
+    monkeypatch.setattr(
+        env_manager, "install_packages",
+        lambda packages, python=None: seen.update({"pkgs": list(packages)})
+        or {p: True for p in packages})
+    missing, _ = env_manager.preflight_install(
+        [str(tmp_path / "app.py"), str(tmp_path / "setup.js")], str(tmp_path))
+    assert missing == ["flask"]
+    assert seen["pkgs"] == ["flask"]
+    assert "@testing-library/jest-dom" not in seen["pkgs"]
+
+
 def test_requirement_name_parses_specifiers_and_skips_flags():
     from cgx.codegen.env_manager import _requirement_name
     assert _requirement_name("flask==2.0.1") == "flask"
