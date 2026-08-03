@@ -1,0 +1,147 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 900" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace">
+  <!-- CGX · Developer Architecture: session loop (Runner → Executor → Router → Store) -->
+  <defs>
+    <linearGradient id="dbg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#0f172a"/>
+      <stop offset="100%" stop-color="#020617"/>
+    </linearGradient>
+    <linearGradient id="moduleFill" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1e293b"/>
+      <stop offset="100%" stop-color="#0f172a"/>
+    </linearGradient>
+    <linearGradient id="retryFill" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1c1917"/>
+      <stop offset="100%" stop-color="#0c0a09"/>
+    </linearGradient>
+    <marker id="darrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#34d399"/>
+    </marker>
+    <marker id="darrowAmber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#f59e0b"/>
+    </marker>
+    <marker id="darrowPurple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#a78bfa"/>
+    </marker>
+    <marker id="darrowMuted" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/>
+    </marker>
+  </defs>
+  <rect width="1280" height="900" fill="url(#dbg)"/>
+
+  <text x="40" y="44" font-family="Inter, sans-serif" font-size="22" font-weight="700" fill="#f1f5f9">CGX Session Loop -- Developer View</text>
+  <text x="40" y="66" font-family="Inter, sans-serif" font-size="12" fill="#94a3b8">cgx.session  ·  objective → Router seeds root task → Runner claims READY task → Executor → Router routes success / failure → SessionStore persists · events stream to every UI</text>
+
+  <!-- Row 1: surfaces -->
+  <g>
+    <rect x="40" y="100" width="230" height="104" rx="12" fill="url(#moduleFill)" stroke="#38bdf8" stroke-width="2"/>
+    <text x="60" y="124" font-size="13" font-weight="700" fill="#38bdf8">AgentPage.tsx</text>
+    <text x="60" y="146" font-size="11" fill="#cbd5e1">POST /api/agent-session</text>
+    <text x="60" y="164" font-size="11" fill="#cbd5e1">/message · /decision · DELETE</text>
+    <text x="60" y="188" font-size="10" fill="#64748b">EventSource /{sid}/events · snapshot replay</text>
+  </g>
+  <g>
+    <rect x="310" y="100" width="230" height="104" rx="12" fill="url(#moduleFill)" stroke="#94a3b8" stroke-width="2"/>
+    <text x="330" y="124" font-size="13" font-weight="700" fill="#cbd5e1">cgx.webui.routes.agent_session</text>
+    <text x="330" y="146" font-size="11" fill="#cbd5e1">REST + SSE (text/event-stream)</text>
+    <text x="330" y="164" font-size="11" fill="#cbd5e1">_schedule_drain · cancel_event</text>
+    <text x="330" y="188" font-size="10" fill="#64748b">one SessionRunner per project_root</text>
+  </g>
+  <g>
+    <rect x="580" y="100" width="230" height="104" rx="12" fill="url(#moduleFill)" stroke="#38bdf8" stroke-width="2"/>
+    <text x="600" y="124" font-size="13" font-weight="700" fill="#38bdf8">cgx.cli  ·  terminal</text>
+    <text x="600" y="146" font-size="11" fill="#cbd5e1">cgx agent &lt;goal&gt; -- one auto turn</text>
+    <text x="600" y="164" font-size="11" fill="#cbd5e1">TUI dashboard · ops.agent_events()</text>
+    <text x="600" y="188" font-size="10" fill="#64748b">auto=True answers checkpoints itself</text>
+  </g>
+  <g>
+    <rect x="850" y="100" width="390" height="104" rx="12" fill="url(#moduleFill)" stroke="#94a3b8" stroke-width="2"/>
+    <text x="870" y="124" font-size="13" font-weight="700" fill="#cbd5e1">cgx.answer.providers  ·  uniform chat() / chat_stream()</text>
+    <text x="870" y="146" font-size="11" fill="#cbd5e1">OllamaProvider · OpenAICompatProvider · GeminiProvider</text>
+    <text x="870" y="164" font-size="11" fill="#cbd5e1">rate_limit + backoff · profile-resolved model/temperature</text>
+    <text x="870" y="188" font-size="10" fill="#64748b">every executor LLM call goes through here</text>
+  </g>
+
+  <!-- Row 2: runner / executors / router -->
+  <g>
+    <rect x="40" y="270" width="340" height="150" rx="12" fill="url(#moduleFill)" stroke="#a78bfa" stroke-width="2"/>
+    <text x="60" y="294" font-size="13" font-weight="700" fill="#a78bfa">SessionRunner  ·  cgx.session.runner</text>
+    <text x="60" y="316" font-size="11" fill="#cbd5e1">start_session · post_message · post_decision</text>
+    <text x="60" y="334" font-size="11" fill="#cbd5e1">run_next: _pick_ready → _execute → _apply_plan</text>
+    <text x="60" y="352" font-size="11" fill="#cbd5e1">per-session lock · one task per call</text>
+    <text x="60" y="370" font-size="11" fill="#cbd5e1">budget guard → escalates to a budget ASK_USER</text>
+    <text x="60" y="394" font-size="10" fill="#64748b">no thread pool: caller drives the loop (UI drain / CLI)</text>
+  </g>
+  <g>
+    <rect x="420" y="270" width="420" height="150" rx="12" fill="url(#moduleFill)" stroke="#34d399" stroke-width="2"/>
+    <text x="440" y="294" font-size="13" font-weight="700" fill="#34d399">Executors  ·  cgx.session.tasks.*  (@register_executor)</text>
+    <text x="440" y="316" font-size="11" fill="#cbd5e1">explore · investigate · recommend · plan_change · apply · verify</text>
+    <text x="440" y="334" font-size="11" fill="#cbd5e1">clarify_requirements · decompose · scaffold · bootstrap_env</text>
+    <text x="440" y="352" font-size="11" fill="#cbd5e1">api_check · smoke · runtime_verify · repair · ask</text>
+    <text x="440" y="376" font-size="11" fill="#f1f5f9">ExecutorResult {status, facts, artifacts, retryable}</text>
+    <text x="440" y="394" font-size="10" fill="#64748b">retryable=True marks failures the Router may re-run with folded feedback</text>
+  </g>
+  <g>
+    <rect x="880" y="270" width="360" height="150" rx="12" fill="url(#moduleFill)" stroke="#f59e0b" stroke-width="2"/>
+    <text x="900" y="294" font-size="13" font-weight="700" fill="#f59e0b">Router  ·  cgx.session.router</text>
+    <text x="900" y="316" font-size="11" fill="#cbd5e1">TASK_SUCCESSOR: 14 deterministic edges</text>
+    <text x="900" y="334" font-size="11" fill="#cbd5e1">on_task_done → spawn successors (RouterPlan)</text>
+    <text x="900" y="352" font-size="11" fill="#cbd5e1">on_task_failed → bounded retry when retryable,</text>
+    <text x="900" y="370" font-size="11" fill="#cbd5e1">checkpoint re-plan, else terminal FAILED</text>
+    <text x="900" y="394" font-size="10" fill="#64748b">RouterPlan = CreateTask · UpdateStatus · RecordDecision · RecordLesson</text>
+  </g>
+
+  <!-- Row 3: store / events / mode chains -->
+  <g>
+    <rect x="40" y="486" width="340" height="140" rx="12" fill="url(#moduleFill)" stroke="#94a3b8" stroke-width="2"/>
+    <text x="60" y="510" font-size="13" font-weight="700" fill="#cbd5e1">SessionStore  ·  cgx.session.store</text>
+    <text x="60" y="532" font-size="11" fill="#cbd5e1">SQLite  ·  &lt;project&gt;/.cgx/sessions.db</text>
+    <text x="60" y="550" font-size="11" fill="#cbd5e1">sessions · tasks · facts · decisions · artifacts</text>
+    <text x="60" y="568" font-size="11" fill="#cbd5e1">every write _emits a typed Event</text>
+    <text x="60" y="592" font-size="10" fill="#64748b">restart-safe: web UI, TUI and CLI share one store</text>
+  </g>
+  <g>
+    <rect x="420" y="486" width="420" height="140" rx="12" fill="url(#moduleFill)" stroke="#38bdf8" stroke-width="2"/>
+    <text x="440" y="510" font-size="13" font-weight="700" fill="#38bdf8">Event bus  ·  cgx.session.events</text>
+    <text x="440" y="532" font-size="11" fill="#cbd5e1">store subscribers → SSE  GET /api/agent-session/{sid}/events</text>
+    <text x="440" y="550" font-size="11" fill="#cbd5e1">task_started · task_progress · task_done · decision_needed ...</text>
+    <text x="440" y="568" font-size="11" fill="#cbd5e1">TUI stream + agent.log trace consume the same feed</text>
+    <text x="440" y="592" font-size="10" fill="#64748b">~/.cgx/agent-sessions/&lt;sid&gt;/agent.log · llm_trace per call</text>
+  </g>
+  <g>
+    <rect x="880" y="486" width="360" height="140" rx="12" fill="url(#moduleFill)" stroke="#a78bfa" stroke-width="2"/>
+    <text x="900" y="510" font-size="13" font-weight="700" fill="#a78bfa">Two mode chains  ·  SessionMode</text>
+    <text x="900" y="532" font-size="11" fill="#cbd5e1">explore: EXPLORE → ASK → INVESTIGATE → RECOMMEND</text>
+    <text x="900" y="550" font-size="11" fill="#cbd5e1">  → ASK → PLAN_CHANGE → ASK → APPLY → VERIFY</text>
+    <text x="900" y="568" font-size="11" fill="#cbd5e1">greenfield: CLARIFY → ASK → DECOMPOSE → ASK →</text>
+    <text x="900" y="586" font-size="11" fill="#cbd5e1">  SCAFFOLD → APPLY → BOOTSTRAP_ENV → API_CHECK →</text>
+    <text x="900" y="604" font-size="11" fill="#cbd5e1">  SMOKE → VERIFY → RUNTIME_VERIFY</text>
+  </g>
+
+  <!-- Row 4: failure recovery band -->
+  <g>
+    <rect x="40" y="692" width="1200" height="120" rx="12" fill="url(#retryFill)" stroke="#f87171" stroke-width="2"/>
+    <text x="60" y="716" font-size="13" font-weight="700" fill="#f87171">Failure recovery  ·  bounded, evidence-driven</text>
+    <text x="60" y="738" font-size="11" fill="#cbd5e1">VERIFY / RUNTIME_VERIFY / SMOKE / API_CHECK fail → REPAIR (cgx.session.repair classifies: import_error · syntax_error · logic_error) → targeted APPLY → re-verify</text>
+    <text x="60" y="756" font-size="11" fill="#cbd5e1">retryable executor failures (DECOMPOSE cycle, invalid JSON, syntax) → Router folds the failure note into the goal and re-runs the same task, bounded per kind</text>
+    <text x="60" y="774" font-size="11" fill="#cbd5e1">repair-progress stall detection · loop budgets → budget ASK_USER checkpoint instead of silent spin · anything unrecoverable ends the session as FAILED with a lesson recorded</text>
+    <text x="60" y="798" font-size="10" fill="#64748b">every branch pauses at a typed ASK_USER decision in the UI; `cgx agent` auto-mode answers them with defaults</text>
+  </g>
+
+  <!-- Arrows: surfaces → runner -->
+  <path d="M 155 204 L 155 240 L 210 240 L 210 268" fill="none" stroke="#38bdf8" stroke-width="2" marker-end="url(#darrow)"/>
+  <path d="M 425 204 L 425 232 L 300 232 L 300 268" fill="none" stroke="#475569" stroke-width="2" marker-end="url(#darrowMuted)"/>
+  <path d="M 695 204 L 695 248 L 340 248 L 340 268" fill="none" stroke="#475569" stroke-width="2" marker-end="url(#darrowMuted)"/>
+  <!-- runner → executors → router -->
+  <path d="M 380 345 L 418 345" fill="none" stroke="#34d399" stroke-width="2" marker-end="url(#darrow)"/>
+  <path d="M 840 345 L 878 345" fill="none" stroke="#f59e0b" stroke-width="2" marker-end="url(#darrowAmber)"/>
+  <!-- executors → providers -->
+  <path d="M 700 268 L 700 240 L 1045 240 L 1045 206" fill="none" stroke="#a78bfa" stroke-width="2" marker-end="url(#darrowPurple)"/>
+  <!-- router → store (via runner _apply_plan) -->
+  <path d="M 1060 420 L 1060 452 L 210 452 L 210 484" fill="none" stroke="#f59e0b" stroke-width="2" marker-end="url(#darrowAmber)"/>
+  <!-- store → event bus → surfaces -->
+  <path d="M 380 556 L 418 556" fill="none" stroke="#38bdf8" stroke-width="2" marker-end="url(#darrow)"/>
+  <path d="M 630 486 L 630 424" fill="none" stroke="#38bdf8" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#darrow)"/>
+  <!-- repair band feedback into the chains -->
+  <path d="M 1060 692 L 1060 628" fill="none" stroke="#f87171" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#darrowAmber)"/>
+</svg>
