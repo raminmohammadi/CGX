@@ -190,7 +190,7 @@ once the load stops getting lighter.
 
 ```mermaid
 flowchart LR
-    U([goal]) --> CQ(["CLARIFY_REQUIREMENTS"]) --> DEC(["DECOMPOSE<br/>contracts + layers"])
+    U([goal]) --> CQ(["CLARIFY_REQUIREMENTS"]) --> DEC(["DECOMPOSE<br/>contracts + layers<br/>(P0a: mandatory cross-seam endpoints)"])
     DEC --> SCA(["SCAFFOLD<br/>coherence + contract gates"]) --> APP(["APPLY"])
     APP --> BS(["BOOTSTRAP_ENV"]) --> AC(["API_CHECK"]) --> SM(["SMOKE"]) --> VER(["VERIFY"])
     VER --> IC{"router"}
@@ -318,7 +318,10 @@ flowchart TB
                   +-------------------+
                   |    DECOMPOSE      |  plan_scaffold_manifest ->
                   +-------------------+   WORK_PLAN artifact
-                            |              (plan_md + layered file list)
+                            |              (plan_md + layered file list
+                            |               + contracts; P0a fails closed
+                            |               if a client/server seam has
+                            |               no endpoints contract)
                             v
               +------------------------------+
               |  ASK_USER(approve_plan)      |  <-- [Approve & Scaffold |

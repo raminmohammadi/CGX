@@ -3752,6 +3752,151 @@ def test_decompose_executor_defaults_contracts_to_empty(store, monkeypatch):
     assert result.outputs["contract_count"] == 0
 
 
+# ------------- P0a: mandatory cross-seam endpoint contracts -------------
+
+def test_is_client_server_manifest_detects_and_abstains():
+    from cgx.session.tasks.decompose import _is_client_server_manifest
+    seam = [{"name": "app", "files": [
+        {"path": "backend/app.py", "description": "Flask API with /calc route"},
+        {"path": "src/App.jsx", "description": "React UI"}]}]
+    assert _is_client_server_manifest(seam, None, "calc app") is True
+    # Pure frontend -> no backend route.
+    fe = [{"name": "ui", "files": [
+        {"path": "src/App.jsx", "description": "React UI"}]}]
+    assert _is_client_server_manifest(fe, None, "react app") is False
+    # Pure backend -> no frontend caller.
+    be = [{"name": "core", "files": [
+        {"path": "backend/app.py", "description": "Flask API"}]}]
+    assert _is_client_server_manifest(be, None, "flask api") is False
+
+
+def test_backend_route_detected_via_skill_and_signal():
+    from cgx.session.tasks.decompose import _has_backend_route
+    files = [{"name": "x", "files": [
+        {"path": "server/core.py", "description": "logic"}]}]
+    # A framework skill promotes any .py file to a backend route.
+    assert _has_backend_route(files, ["flask"], "") is True
+    # No skill, no basename/description signal -> not a route.
+    assert _has_backend_route(files, None, "") is False
+    # A description signal alone qualifies.
+    sig = [{"name": "x", "files": [
+        {"path": "server/core.py",
+         "description": "defines the REST API routes"}]}]
+    assert _has_backend_route(sig, None, "") is True
+
+
+def test_extract_endpoint_contracts_parses_provider_reply():
+    from cgx.answer.engine import extract_endpoint_contracts
+    reply = ('{"endpoints": [{"method": "post", "path": "/calculate", '
+             '"request": {"num1": "number", "num2": "number", '
+             '"operation": "str"}}]}')
+    prov = _StubProvider(reply)
+    eps = extract_endpoint_contracts("calc", [{"name": "a", "files": [
+        {"path": "backend/app.py", "description": "flask"}]}], prov)
+    assert len(eps) == 1 and eps[0]["path"] == "/calculate"
+    # No files -> nothing to extract; no provider -> abstain.
+    assert extract_endpoint_contracts("calc", [], prov) == []
+    assert extract_endpoint_contracts("calc", [{"name": "a", "files": [
+        {"path": "backend/app.py"}]}], None) == []
+
+
+def _cross_seam_manifest():
+    return {"plan_md": "p", "layers": [{"name": "app", "files": [
+        {"path": "backend/app.py",
+         "description": "Flask API with /calculate route"},
+        {"path": "src/App.jsx", "description": "React UI fetches /calculate"},
+        {"path": "index.html", "description": "vite entry"},
+        {"path": "vite.config.js", "description": "vite config"}]}]}
+
+
+def test_decompose_cross_seam_requires_endpoints_fail_closed(store, monkeypatch):
+    """A JSX+backend manifest with no endpoints contract fails closed."""
+    from cgx.session.tasks.decompose import run_decompose
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    monkeypatch.setattr("cgx.answer.engine.plan_scaffold_manifest",
+                        lambda *a, **kw: _cross_seam_manifest())
+    monkeypatch.setattr("cgx.answer.engine.extract_endpoint_contracts",
+                        lambda *a, **kw: [])
+    t = TaskNode.new(session.session_id, TaskKind.DECOMPOSE, "d",
+                     inputs={"prior_goal": "calc app", "answers": {}})
+    result = run_decompose(
+        t, ExecutorDeps(provider=_StubProvider(""), store=store))
+    assert result.failure and "endpoints contract" in result.failure
+    # Fail-closed is terminal, not a retry loop.
+    assert result.retryable is False
+
+
+def test_decompose_cross_seam_recovers_endpoints_via_extract(store, monkeypatch):
+    """The bounded extract pass supplies the endpoints the planner omitted."""
+    from cgx.session.tasks.decompose import run_decompose
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    monkeypatch.setattr("cgx.answer.engine.plan_scaffold_manifest",
+                        lambda *a, **kw: _cross_seam_manifest())
+    monkeypatch.setattr(
+        "cgx.answer.engine.extract_endpoint_contracts",
+        lambda goal, layers, provider: [
+            {"method": "POST", "path": "/calculate",
+             "request": {"num1": "number", "num2": "number",
+                         "operation": "str"}}])
+    t = TaskNode.new(session.session_id, TaskKind.DECOMPOSE, "d",
+                     inputs={"prior_goal": "calc app", "answers": {}})
+    result = run_decompose(
+        t, ExecutorDeps(provider=_StubProvider(""), store=store))
+    assert result.failure is None
+    eps = result.artifact.content["contracts"]["endpoints"]
+    assert eps[0]["path"] == "/calculate"
+    assert result.outputs["contract_count"] == 1
+
+
+def test_decompose_cross_seam_keeps_declared_endpoints(store, monkeypatch):
+    """A planner that already declared endpoints skips the extract pass."""
+    from cgx.session.tasks.decompose import run_decompose
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    manifest = _cross_seam_manifest()
+    manifest["contracts"] = {
+        "endpoints": [{"method": "POST", "path": "/calculate"}]}
+    monkeypatch.setattr("cgx.answer.engine.plan_scaffold_manifest",
+                        lambda *a, **kw: manifest)
+
+    def _boom(*a, **kw):
+        raise AssertionError("extract pass must not run when endpoints exist")
+    monkeypatch.setattr(
+        "cgx.answer.engine.extract_endpoint_contracts", _boom)
+    t = TaskNode.new(session.session_id, TaskKind.DECOMPOSE, "d",
+                     inputs={"prior_goal": "calc app", "answers": {}})
+    result = run_decompose(
+        t, ExecutorDeps(provider=_StubProvider(""), store=store))
+    assert result.failure is None
+    eps = result.artifact.content["contracts"]["endpoints"]
+    assert eps[0]["path"] == "/calculate"
+
+
+def test_decompose_python_only_manifest_not_cross_seam(store, monkeypatch):
+    """A pure-Python manifest with no endpoints is NOT forced to fail."""
+    from cgx.session.tasks.decompose import run_decompose
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    monkeypatch.setattr(
+        "cgx.answer.engine.plan_scaffold_manifest",
+        lambda *a, **kw: {"plan_md": "p", "layers": [{"name": "core", "files": [
+            {"path": "app.py", "description": "Flask API"},
+            {"path": "tests/test_app.py", "description": "tests"}]}]})
+
+    def _boom(*a, **kw):
+        raise AssertionError("extract must not run for a non-seam manifest")
+    monkeypatch.setattr(
+        "cgx.answer.engine.extract_endpoint_contracts", _boom)
+    t = TaskNode.new(session.session_id, TaskKind.DECOMPOSE, "d",
+                     inputs={"prior_goal": "flask api", "answers": {}})
+    result = run_decompose(
+        t, ExecutorDeps(provider=_StubProvider(""), store=store))
+    assert result.failure is None
+    assert result.artifact.content["contracts"] == {}
+
+
 def test_decompose_executor_empty_manifest_is_failure(store, monkeypatch):
     from cgx.session.tasks.decompose import run_decompose
     session = Session.new("g", mode=SessionMode.GREENFIELD)
