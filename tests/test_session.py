@@ -10828,6 +10828,40 @@ def test_router_scaffold_dropped_foundational_file_escalates_to_replan():
     assert not [a for a in plan.actions if isinstance(a, UpdateSessionStatus)]
 
 
+def test_router_scaffold_foundational_empty_patch_regenerates_not_replan():
+    """An empty-patch drop of a foundational manifest is a transient miss:
+    it takes the targeted regenerate, NOT the heavy DECOMPOSE re-plan."""
+    session, parent, scaffold, tasks = _build_scaffold_failed_chain(
+        scaffold_failed_files=[
+            {"file": "package.json",
+             "error": "generator returned empty patch"}])
+    plan = Router().on_task_completed(
+        session=session, completed=scaffold, tasks=tasks)
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    assert len(creates) == 1
+    new_scaffold = creates[0].task
+    # A targeted regenerate SCAFFOLD, not a re-plan.
+    assert new_scaffold.kind is TaskKind.SCAFFOLD
+    assert "package.json" in new_scaffold.inputs["regenerate_files"]
+    assert not [a for a in plan.actions if isinstance(a, UpdateSessionStatus)]
+
+
+def test_router_apply_foundational_empty_patch_regenerates_not_replan():
+    """Mirror of the SCAFFOLD carve-out on the APPLY dropped-file edge."""
+    session, scaffold, apply_t, tasks = _build_apply_failed_chain(
+        apply_failed_files=[
+            {"file": "package.json",
+             "error": "generator returned empty patch"}])
+    plan = Router().on_task_completed(
+        session=session, completed=apply_t, tasks=tasks)
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    assert len(creates) == 1
+    new_scaffold = creates[0].task
+    assert new_scaffold.kind is TaskKind.SCAFFOLD
+    assert "package.json" in new_scaffold.inputs["regenerate_files"]
+    assert not [a for a in plan.actions if isinstance(a, UpdateSessionStatus)]
+
+
 def test_router_apply_failed_files_repeat_failure_skips_regenerate():
     """The same files dropped for the same reasons -> re-plan, not retry."""
     session, scaffold, apply_t, tasks = _build_apply_failed_chain()
