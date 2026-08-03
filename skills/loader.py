@@ -51,8 +51,10 @@ def _safe_skill_path(name: str) -> Path:
     if not _SKILL_NAME_RE.match(name or ""):
         raise ValueError(f"invalid skill name: {name!r}")
     base = CUSTOM_SKILLS_DIR.resolve()
-    path = (base / f"{name}.py").resolve()
-    if path.parent != base:
+    path = (CUSTOM_SKILLS_DIR / f"{name}.py").resolve()
+    try:
+        path.relative_to(base)
+    except ValueError:
         raise ValueError(f"invalid skill name: {name!r}")
     return path
 
