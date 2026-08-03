@@ -5396,6 +5396,115 @@ def test_bootstrap_env_node_install_failure_is_nonfatal(
     assert "ENOTFOUND" in result.artifact.content["pip_log_tail"]
 
 
+def test_bootstrap_env_polyglot_provisions_python_and_node(
+        tmp_path, store, monkeypatch):
+    """A repo with both requirements.txt and package.json provisions BOTH.
+
+    Part 5: previously ``python`` took priority and ``node_modules`` was
+    left to VERIFY's best-effort install. Now BOOTSTRAP_ENV provisions the
+    venv *and* runs ``npm install`` in the same pass, folding a ``node``
+    sub-report into the BUILD_REPORT while keeping ``project_type=python``
+    so the Python-only gates still key off it.
+    """
+    from cgx.session.tasks import bootstrap_env as bs
+    (tmp_path / "requirements.txt").write_text("flask\n", encoding="utf-8")
+    (tmp_path / "package.json").write_text(
+        '{"name": "app", "scripts": {"build": "vite build"}}',
+        encoding="utf-8")
+    (tmp_path / ".venv" / "bin").mkdir(parents=True)
+    venv_python = tmp_path / ".venv" / "bin" / "python"
+    venv_python.write_text("")
+    venv_python.chmod(0o755)
+
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+
+    monkeypatch.setattr("cgx.codegen.test_runner.ensure_project_venv",
+                        lambda root, timeout=300.0: str(venv_python))
+    monkeypatch.setattr(
+        "cgx.codegen.env_manager.preflight_install",
+        lambda files, root, python=None: ([], {}))
+    monkeypatch.setattr(
+        "cgx.codegen.env_manager.update_requirements",
+        lambda root, pkgs: None)
+    monkeypatch.setattr(
+        "cgx.session.tasks.bootstrap_env._capture_pip_freeze",
+        lambda exe, timeout=30.0: ([], ""))
+
+    npm_calls: dict = {}
+
+    def _fake_run(cmd, **kw):
+        npm_calls["cmd"] = list(cmd)
+        (tmp_path / "node_modules").mkdir()
+
+        class _P:
+            returncode = 0
+            stdout = "added 1 package"
+            stderr = ""
+
+        return _P()
+
+    monkeypatch.setattr(bs.shutil, "which", lambda name: "/usr/bin/npm")
+    monkeypatch.setattr(bs.subprocess, "run", _fake_run)
+
+    t = TaskNode.new(session.session_id, TaskKind.BOOTSTRAP_ENV, "boot",
+                     inputs={"applied_files": ["app.py"],
+                             "mode": SessionMode.GREENFIELD.value})
+    result = bs.run_bootstrap_env(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    assert result.failure is None
+    # Python remains the primary type/outcome so the downstream gates fire.
+    assert result.outputs["project_type"] == "python"
+    assert result.outputs["outcome"] == "succeeded"
+    assert result.outputs["venv_path"] == str(tmp_path / ".venv")
+    # Node was provisioned in the same pass.
+    assert result.outputs["node_outcome"] == "succeeded"
+    assert npm_calls["cmd"][:2] == ["npm", "install"]
+    assert (tmp_path / "node_modules").is_dir()
+    node = result.artifact.content["node"]
+    assert node["outcome"] == "succeeded"
+    assert node["note"] is None
+
+
+def test_bootstrap_env_polyglot_node_failure_is_nonfatal(
+        tmp_path, store, monkeypatch):
+    """Node provisioning failure must not fail the Python bootstrap."""
+    from cgx.session.tasks import bootstrap_env as bs
+    (tmp_path / "requirements.txt").write_text("flask\n", encoding="utf-8")
+    (tmp_path / "package.json").write_text('{"name": "app"}', encoding="utf-8")
+    (tmp_path / ".venv" / "bin").mkdir(parents=True)
+    venv_python = tmp_path / ".venv" / "bin" / "python"
+    venv_python.write_text("")
+    venv_python.chmod(0o755)
+
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+
+    monkeypatch.setattr("cgx.codegen.test_runner.ensure_project_venv",
+                        lambda root, timeout=300.0: str(venv_python))
+    monkeypatch.setattr(
+        "cgx.codegen.env_manager.preflight_install",
+        lambda files, root, python=None: ([], {}))
+    monkeypatch.setattr(
+        "cgx.codegen.env_manager.update_requirements",
+        lambda root, pkgs: None)
+    monkeypatch.setattr(
+        "cgx.session.tasks.bootstrap_env._capture_pip_freeze",
+        lambda exe, timeout=30.0: ([], ""))
+    # npm absent -> node provisioning degrades to skipped, non-fatal.
+    monkeypatch.setattr(bs.shutil, "which", lambda name: None)
+
+    t = TaskNode.new(session.session_id, TaskKind.BOOTSTRAP_ENV, "boot",
+                     inputs={"applied_files": ["app.py"],
+                             "mode": SessionMode.GREENFIELD.value})
+    result = bs.run_bootstrap_env(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    assert result.failure is None
+    assert result.outputs["outcome"] == "succeeded"
+    assert result.outputs["node_outcome"] == "skipped"
+    assert result.artifact.content["node"]["note"] == "npm not installed"
+
+
 def test_bootstrap_env_provisions_venv_and_records_preflight(
         tmp_path, store, monkeypatch):
     """Happy path: requirements.txt present -> venv ready, preflight clean."""
