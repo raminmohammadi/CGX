@@ -659,6 +659,191 @@ def check_contract_compliance(
     return warnings
 
 
+# ------------------- client/server payload coherence -------------------
+
+# Frontend source extensions whose ``fetch(...)`` calls we scan for the
+# JSON body they POST to a backend route.
+_CLIENT_EXTS: Tuple[str, ...] = (
+    ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".vue")
+
+# A Flask/FastAPI route decorator: captures the literal path so the same
+# endpoint can be matched on the client side.
+_ROUTE_DECORATOR_RE = re.compile(
+    r"@\s*[\w.]+\.(?:route|get|post|put|patch|delete)\(\s*"
+    r"['\"]([^'\"]+)['\"]")
+
+# Request-body key reads inside a handler window: ``data.get('k')`` /
+# ``request.json['k']`` / ``body.get(\"k\")`` and friends. Broad enough for
+# the dict-access style weak models emit, scoped to the handler window so a
+# stray ``.get`` elsewhere is not mistaken for a payload key.
+_PY_GET_READ_RE = re.compile(r"\.get\(\s*['\"]([A-Za-z_][\w-]*)['\"]")
+_PY_SUBSCRIPT_READ_RE = re.compile(
+    r"(?:data|body|payload|json|args|form|values|params)"
+    r"\s*\[\s*['\"]([A-Za-z_][\w-]*)['\"]\s*\]")
+
+# A ``fetch(URL`` call and the JSON body it stringifies. The body regex is
+# deliberately flat (no nested braces) so only simple, confidently-parsed
+# payloads are compared; anything richer abstains rather than risk a false
+# positive.
+_FETCH_URL_RE = re.compile(r"fetch\(\s*[`'\"]([^`'\"]+)[`'\"]")
+_STRINGIFY_BODY_RE = re.compile(r"JSON\.stringify\(\s*\{([^{}]*)\}")
+_FETCH_BODY_WINDOW = 600
+_JS_KEY_RE = re.compile(r"^['\"]?([A-Za-z_$][\w$]*)['\"]?\s*(?::|$)")
+
+
+def _js_object_keys(inner: str) -> Set[str]:
+    """Keys of a flat JS object literal body (``{a, b: 1, 'c': x}``)."""
+    keys: Set[str] = set()
+    for part in inner.split(","):
+        part = part.strip()
+        if not part or part.startswith("."):  # spread ``...rest``
+            continue
+        m = _JS_KEY_RE.match(part)
+        if m:
+            keys.add(m.group(1))
+    return keys
+
+
+def _python_route_reads(
+        file_contents: Dict[str, str]) -> List[Dict[str, Any]]:
+    """Map each Flask/FastAPI route to the request-body keys its handler reads.
+
+    Returns one ``{path, file, reads}`` record per route decorator, where
+    ``reads`` is the set of literal keys the handler pulls out of the
+    request body within its window (up to the next route decorator or EOF).
+    Best-effort and regex-based -- a file that yields nothing simply
+    contributes no records.
+    """
+    out: List[Dict[str, Any]] = []
+    for path, content in file_contents.items():
+        if not isinstance(content, str) or not path.endswith(".py"):
+            continue
+        matches = list(_ROUTE_DECORATOR_RE.finditer(content))
+        for i, m in enumerate(matches):
+            route = m.group(1).strip()
+            if len(route) < 2:
+                continue
+            end = (matches[i + 1].start() if i + 1 < len(matches)
+                   else len(content))
+            window = content[m.start():end]
+            reads = set(_PY_GET_READ_RE.findall(window))
+            reads |= set(_PY_SUBSCRIPT_READ_RE.findall(window))
+            out.append({"path": route, "file": path, "reads": reads})
+    return out
+
+
+def _js_fetch_sends(
+        file_contents: Dict[str, str]) -> List[Dict[str, Any]]:
+    """Map each ``fetch(URL, {body: JSON.stringify({...})})`` to its keys.
+
+    Returns one ``{url, file, sends}`` record per fetch call that carries a
+    flat JSON body; calls without a confidently-parsed body are skipped.
+    """
+    out: List[Dict[str, Any]] = []
+    for path, content in file_contents.items():
+        if not isinstance(content, str):
+            continue
+        if not any(path.endswith(ext) for ext in _CLIENT_EXTS):
+            continue
+        for m in _FETCH_URL_RE.finditer(content):
+            url = m.group(1).strip()
+            window = content[m.start():m.start() + _FETCH_BODY_WINDOW]
+            body = _STRINGIFY_BODY_RE.search(window)
+            if not body:
+                continue
+            sends = _js_object_keys(body.group(1))
+            if sends:
+                out.append({"url": url, "file": path, "sends": sends})
+    return out
+
+
+def _url_matches_route(url: str, route: str) -> bool:
+    """True when a client fetch ``url`` targets backend ``route``.
+
+    A route path (``/calculate``) matches any URL that contains it as a
+    substring -- covering bare paths, ``/api``-prefixed proxies and
+    absolute ``http://host:port/calculate`` forms alike.
+    """
+    return bool(route) and route in url
+
+
+def check_client_server_payload_coherence(
+        file_contents: Dict[str, str],
+        contracts: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    """Flag a JS ``fetch`` body whose keys disagree with the backend handler.
+
+    The JS<->Python analogue of :func:`cross_check_first_party_imports`:
+    for every backend route that a frontend ``fetch`` also targets, compare
+    the keys the client POSTs against the keys the handler reads (and, when
+    the WORK_PLAN declares the endpoint, against its ``request`` schema).
+    A *rename* disagreement -- the client sends a key the server never
+    reads while the server reads a key the client never sends -- is the
+    high-precision signal (e.g. ``operator`` vs ``operation``); a body that
+    is merely a superset/subset is left alone so the gate does not fire on
+    an optional field. Returns ``{kind: 'payload', name, file, reason, ...}``
+    warnings the router can turn into a targeted regenerate of the client
+    file; never raises (callers still wrap defensively).
+    """
+    if not isinstance(file_contents, dict) or not file_contents:
+        return []
+    routes = _python_route_reads(file_contents)
+    if not routes:
+        return []
+    sends = _js_fetch_sends(file_contents)
+    if not sends:
+        return []
+
+    # Declared request keys per endpoint path (authoritative when present).
+    declared: Dict[str, Set[str]] = {}
+    if isinstance(contracts, dict):
+        for ep in contracts.get("endpoints") or []:
+            if not isinstance(ep, dict):
+                continue
+            p = str(ep.get("path") or "").strip()
+            req = ep.get("request")
+            if p and isinstance(req, dict) and req:
+                declared[p] = {str(k) for k in req.keys()}
+
+    warnings: List[Dict[str, Any]] = []
+    seen: Set[Tuple[str, str]] = set()
+    for route in routes:
+        rpath = route["path"]
+        reads = route["reads"]
+        # The declared contract is authoritative when present; otherwise the
+        # keys the handler actually reads stand in as the expected shape.
+        expected = declared.get(rpath) or reads
+        if not expected:
+            continue
+        for call in sends:
+            if not _url_matches_route(call["url"], rpath):
+                continue
+            client = call["sends"]
+            client_only = client - expected
+            server_only = expected - client
+            # Require divergence in *both* directions: a rename (the actual
+            # bug), not a client that merely omits or adds an optional field.
+            if not (client_only and server_only):
+                continue
+            key = (call["file"], rpath)
+            if key in seen:
+                continue
+            seen.add(key)
+            warnings.append({
+                "kind": "payload",
+                "name": rpath,
+                "file": call["file"],
+                "server_file": route["file"],
+                "client_keys": sorted(client),
+                "expected_keys": sorted(expected),
+                "reason": (
+                    f"client {call['file']} POSTs {sorted(client_only)} to "
+                    f"{rpath} but the endpoint expects {sorted(server_only)} "
+                    "-- align the request body keys with the backend "
+                    "contract"),
+            })
+    return warnings
+
+
 # --------------------- manifest stack requirements ---------------------
 
 # Entry files a toolchain requires but a planner routinely forgets, keyed

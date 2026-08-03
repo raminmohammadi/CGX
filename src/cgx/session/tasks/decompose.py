@@ -15,6 +15,7 @@ tech-stack / scope decisions in its prompt.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 from cgx.session.models import (
@@ -57,10 +58,10 @@ def run_decompose(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     # Lazy import: the answer engine drags retrieval + prompt builders.
     from cgx.answer.engine import plan_scaffold_manifest
 
+    skills = session_skills(task, deps)
     try:
         result = plan_scaffold_manifest(
-            composed_goal, deps.provider, goal=composed_goal,
-            skills=session_skills(task, deps))
+            composed_goal, deps.provider, goal=composed_goal, skills=skills)
     except Exception as exc:
         logger.exception("DECOMPOSE: plan_scaffold_manifest crashed")
         return ExecutorResult(
@@ -85,6 +86,19 @@ def run_decompose(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     if coherence_error:
         return ExecutorResult(failure=coherence_error, retryable=True)
     layers = _order_manifest_layers(layers)
+
+    # Mandatory endpoint contracts for a cross-language client/server manifest
+    # (P0a). A JSX/TSX/Vue client beside a Python backend route talks over
+    # HTTP, so a request-key rename (client sends ``operator`` while the
+    # handler reads ``operation``) is invisible to every Python-only gate --
+    # exactly how ses_4cbf963cdc67435a shipped green with a broken seam. When
+    # the planner omitted the ``endpoints`` contract for such a manifest, run
+    # one bounded extract pass; fail-closed if it still cannot be produced so
+    # the seam is never scaffolded contract-free.
+    contract_error = _ensure_cross_seam_endpoints(
+        contracts, layers, composed_goal, skills, deps)
+    if contract_error:
+        return ExecutorResult(failure=contract_error)
 
     artifact = Artifact.new(
         session_id=task.session_id,
@@ -221,6 +235,97 @@ def _coerce_contracts(raw: Any) -> Dict[str, Any]:
 def _contract_entry_count(contracts: Dict[str, Any]) -> int:
     """Total number of declared contract entries across all categories."""
     return sum(len(v) for v in contracts.values() if isinstance(v, list))
+
+
+# Cross-seam detection (P0a): a client/server manifest is a JSX/TSX/Vue
+# frontend beside a Python backend route -- the two halves talk over HTTP,
+# so their shared request/response shape MUST be pinned by an endpoints
+# contract or a key rename slips through every Python-only gate.
+_FRONTEND_EXTS = (".jsx", ".tsx", ".vue")
+_SERVER_BASENAMES = frozenset(
+    {"app.py", "main.py", "server.py", "wsgi.py", "asgi.py", "api.py"})
+_BACKEND_FRAMEWORKS = ("flask", "fastapi", "django", "express")
+_SERVER_SIGNAL_RE = re.compile(
+    r"flask|fastapi|django|express|@app\.route|@router|endpoint|"
+    r"\bapi\b|\broute", re.IGNORECASE)
+
+
+def _has_frontend_caller(layers: List[Dict[str, Any]]) -> bool:
+    """True when the manifest declares a JS/TS/Vue frontend source file."""
+    for layer in (layers or []):
+        for f in (layer.get("files") or []):
+            path = str(f.get("path") or "").strip().lower()
+            if path.endswith(_FRONTEND_EXTS):
+                return True
+    return False
+
+
+def _has_backend_route(layers: List[Dict[str, Any]],
+                       skills: Optional[List[str]], goal: str) -> bool:
+    """True when a Python file looks like a web-framework route handler.
+
+    A canonical entry basename (``app.py`` / ``main.py`` / ...), a
+    server-framework signal in the file's description, or a backend skill /
+    goal keyword paired with any generated ``.py`` file each qualify.
+    """
+    text = (" ".join(str(s) for s in (skills or []))
+            + " " + (goal or "")).lower()
+    skill_fw = any(fw in text for fw in _BACKEND_FRAMEWORKS)
+    for layer in (layers or []):
+        for f in (layer.get("files") or []):
+            path = str(f.get("path") or "").strip()
+            if not path.endswith(".py"):
+                continue
+            base = path.rsplit("/", 1)[-1].lower()
+            if base in _SERVER_BASENAMES or skill_fw:
+                return True
+            if _SERVER_SIGNAL_RE.search(str(f.get("description") or "")):
+                return True
+    return False
+
+
+def _is_client_server_manifest(layers: List[Dict[str, Any]],
+                               skills: Optional[List[str]],
+                               goal: str) -> bool:
+    """True for a cross-language frontend<->backend manifest (P0a)."""
+    return (_has_frontend_caller(layers)
+            and _has_backend_route(layers, skills, goal))
+
+
+def _ensure_cross_seam_endpoints(
+        contracts: Dict[str, Any],
+        layers: List[Dict[str, Any]],
+        goal: str,
+        skills: Optional[List[str]],
+        deps: ExecutorDeps) -> Optional[str]:
+    """Guarantee a cross-seam manifest carries an ``endpoints`` contract.
+
+    Mutates ``contracts`` in place, adding an ``endpoints`` list recovered by
+    a bounded extract pass when the planner omitted it for a client/server
+    manifest. Returns ``None`` when the contract is present (or the manifest
+    is not cross-seam), or a fail-closed error string when the seam exists
+    but no endpoints could be produced -- the caller turns that into a
+    terminal DECOMPOSE failure so a contract-free seam is never scaffolded.
+    """
+    if contracts.get("endpoints"):
+        return None
+    if not _is_client_server_manifest(layers, skills, goal):
+        return None
+    try:
+        from cgx.answer.engine import extract_endpoint_contracts
+        endpoints = extract_endpoint_contracts(goal, layers, deps.provider)
+    except Exception:  # pragma: no cover - defensive: extractor is best-effort
+        logger.exception("DECOMPOSE: endpoint extraction pass crashed")
+        endpoints = []
+    if endpoints:
+        contracts["endpoints"] = endpoints
+        logger.info("DECOMPOSE: recovered %d endpoint contract(s) via the "
+                    "extract pass for a cross-seam manifest", len(endpoints))
+        return None
+    return ("DECOMPOSE: cross-language client/server project requires an "
+            "endpoints contract (frontend fetch <-> backend route), but the "
+            "planner omitted it and the bounded extraction pass produced "
+            "none -- refusing to scaffold the seam contract-free")
 
 
 def _coerce_depends_on(raw: Any) -> List[str]:

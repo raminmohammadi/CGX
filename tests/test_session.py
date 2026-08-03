@@ -1726,7 +1726,8 @@ def test_router_verify_passed_spawns_runtime_verify():
                 "scaffold_artifact_id": "art_scaffold"})
     ver.produced_artifact_id = "art_verify"
     ver.outputs = {"outcome": "passed", "failure_signature": "p",
-                   "returncode": 0}
+                   "returncode": 0,
+                   "js_tests_present": True, "js_tests_ran": False}
     ver.status = TaskNodeStatus.DONE
     plan = Router().on_task_completed(
         session=session, completed=ver, tasks=[ver])
@@ -1737,6 +1738,10 @@ def test_router_verify_passed_spawns_runtime_verify():
     assert rv.inputs["verify_artifact_id"] == "art_verify"
     assert rv.inputs["build_artifact_id"] == "art_build"
     assert rv.inputs["apply_artifact_id"] == "art_apply"
+    # P2: VERIFY's JS coverage signal is threaded forward so the runtime
+    # gate's terminal action can fail closed on an unrun scaffolded suite.
+    assert rv.inputs["js_tests_present"] is True
+    assert rv.inputs["js_tests_ran"] is False
     # The session status is deferred to the runtime gate, not set here.
     assert not any(isinstance(a, UpdateSessionStatus) for a in plan.actions)
 
@@ -1854,6 +1859,93 @@ def test_router_runtime_verify_explore_is_noop():
     plan = Router().on_task_completed(
         session=session, completed=rv, tasks=[rv])
     assert not any(isinstance(a, UpdateSessionStatus) for a in plan.actions)
+
+
+def test_router_runtime_verify_passed_but_js_unrun_fails_closed():
+    """P2: a booting app with an unrun scaffolded JS suite is not green.
+
+    The ses_4cbf963cdc67435a hole -- the Python half passed and the app
+    booted, but the scaffolded React suite never executed, so "completed"
+    would have been a false green. The terminal fails closed to FAILED.
+    """
+    from cgx.session.models import SessionMode
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    rv = TaskNode.new(
+        session.session_id, TaskKind.RUNTIME_VERIFY, "runtime",
+        inputs={"mode": SessionMode.GREENFIELD.value,
+                "js_tests_present": True, "js_tests_ran": False})
+    rv.outputs = {"outcome": "passed", "failure_signature": ""}
+    rv.status = TaskNodeStatus.DONE
+    plan = Router().on_task_completed(
+        session=session, completed=rv, tasks=[rv])
+    assert [a for a in plan.actions if isinstance(a, CreateTask)] == []
+    status = [a for a in plan.actions if isinstance(a, UpdateSessionStatus)]
+    assert len(status) == 1
+    assert status[0].status is SessionStatus.FAILED
+
+
+def test_router_runtime_verify_passed_with_js_ran_completes():
+    """A booting app whose scaffolded JS suite actually ran is green."""
+    from cgx.session.models import SessionMode
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    rv = TaskNode.new(
+        session.session_id, TaskKind.RUNTIME_VERIFY, "runtime",
+        inputs={"mode": SessionMode.GREENFIELD.value,
+                "js_tests_present": True, "js_tests_ran": True})
+    rv.outputs = {"outcome": "passed", "failure_signature": ""}
+    rv.status = TaskNodeStatus.DONE
+    plan = Router().on_task_completed(
+        session=session, completed=rv, tasks=[rv])
+    status = [a for a in plan.actions if isinstance(a, UpdateSessionStatus)]
+    assert len(status) == 1
+    assert status[0].status is SessionStatus.COMPLETED
+
+
+def test_router_runtime_verify_skipped_with_server_entry_fails_closed():
+    """P2: a boot that skipped while a server entry was on disk is not green.
+
+    The whole-tree scan (P1c) surfaced a bootable ``backend/app.py``, but
+    the gate skipped (e.g. no bootstrapped interpreter) so the server was
+    never actually exercised. Completing green would repeat the
+    ses_4cbf963cdc67435a blind spot, so the terminal fails closed.
+    """
+    from cgx.session.models import SessionMode
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    rv = TaskNode.new(
+        session.session_id, TaskKind.RUNTIME_VERIFY, "runtime",
+        inputs={"mode": SessionMode.GREENFIELD.value})
+    rv.outputs = {"outcome": "skipped", "entry_files": ["backend/app.py"]}
+    rv.status = TaskNodeStatus.DONE
+    plan = Router().on_task_completed(
+        session=session, completed=rv, tasks=[rv])
+    status = [a for a in plan.actions if isinstance(a, UpdateSessionStatus)]
+    assert len(status) == 1
+    assert status[0].status is SessionStatus.FAILED
+
+
+def test_router_verify_skipped_but_js_unrun_fails_closed():
+    """P2: a test-free VERIFY that still carries an unrun JS suite is not green.
+
+    A polyglot repo whose Python half is test-free (combined ``skipped``)
+    but whose scaffolded JS suite was never executed reaches the VERIFY
+    terminal directly (no boot gate). It must fail closed rather than
+    report the write loop delivered a verified app.
+    """
+    from cgx.session.models import SessionMode
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    ver = TaskNode.new(
+        session.session_id, TaskKind.VERIFY, "verify",
+        inputs={"mode": SessionMode.GREENFIELD.value})
+    ver.outputs = {"outcome": "skipped", "failure_signature": "",
+                   "returncode": 5,
+                   "js_tests_present": True, "js_tests_ran": False}
+    ver.status = TaskNodeStatus.DONE
+    plan = Router().on_task_completed(
+        session=session, completed=ver, tasks=[ver])
+    assert [a for a in plan.actions if isinstance(a, CreateTask)] == []
+    status = [a for a in plan.actions if isinstance(a, UpdateSessionStatus)]
+    assert len(status) == 1
+    assert status[0].status is SessionStatus.FAILED
 
 
 def test_router_on_task_failed_greenfield_marks_session_failed():
@@ -2806,6 +2898,92 @@ def test_verify_polyglot_npm_failure_surfaces_over_pytest_pass(
     assert result.outputs["tests_passed"] is False
 
 
+def test_verify_surfaces_js_tests_present_when_masked_by_pytest(
+        tmp_path, store, monkeypatch):
+    """Polyglot: a scaffolded-but-unrun JS suite is exposed, not hidden.
+
+    The ses_4cbf963cdc67435a shape -- pytest passes while the React suite
+    (present on disk) only got a build smoke. The combined token is still
+    ``passed`` (build was green), but VERIFY must surface
+    ``js_tests_present`` True / ``js_tests_ran`` False so P2 can fail closed.
+    """
+    from cgx.codegen.test_runner import TestRunOutcome
+    from cgx.codegen import test_runners
+    from cgx.session.tasks.verify import run_verify
+
+    (tmp_path / "package.json").write_text(
+        '{"name": "app", "scripts": {"build": "vite build"}}',
+        encoding="utf-8")
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "App.test.jsx").write_text(
+        "test('x', () => {})\n", encoding="utf-8")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_x.py").write_text(
+        "def test_x(): assert 1\n", encoding="utf-8")
+
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+
+    monkeypatch.setattr(
+        "cgx.codegen.test_runner.run_tests_on_disk",
+        lambda root, files, **_kw: TestRunOutcome(
+            ran=True, returncode=0, stdout="1 passed", stderr="",
+            tests_selected=[str(tmp_path / "tests" / "test_x.py")]))
+    monkeypatch.setattr(
+        test_runners.NpmRunner, "run",
+        lambda self, root, files, **kw: TestRunOutcome(
+            ran=True, returncode=0, stdout="built ok", stderr="",
+            tests_selected=["npm run build"], ran_tests=False,
+            tests_present=True))
+
+    t = TaskNode.new(session.session_id, TaskKind.VERIFY, "verify",
+                     inputs={"changed_files": ["src/App.jsx"],
+                             "mode": SessionMode.GREENFIELD.value})
+    store.save_task(t)
+    result = run_verify(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    assert result.failure is None
+    assert result.outputs["outcome"] == "passed"
+    assert result.outputs["js_tests_present"] is True
+    assert result.outputs["js_tests_ran"] is False
+    assert result.artifact.content["js_tests_present"] is True
+
+
+def test_verify_js_tests_ran_true_for_real_suite(
+        tmp_path, store, monkeypatch):
+    """A real JS suite that executed records js_tests_ran True."""
+    from cgx.codegen.test_runner import TestRunOutcome
+    from cgx.codegen import test_runners
+    from cgx.session.tasks.verify import run_verify
+
+    (tmp_path / "package.json").write_text(
+        '{"name": "app", "scripts": {"test": "vitest run"}}',
+        encoding="utf-8")
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "App.test.jsx").write_text(
+        "test('x', () => {})\n", encoding="utf-8")
+
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+
+    monkeypatch.setattr(
+        test_runners.NpmRunner, "run",
+        lambda self, root, files, **kw: TestRunOutcome(
+            ran=True, returncode=0, stdout="2 passed", stderr="",
+            tests_selected=["npm test"], ran_tests=True, tests_present=True))
+
+    t = TaskNode.new(session.session_id, TaskKind.VERIFY, "verify",
+                     inputs={"changed_files": ["src/App.jsx"],
+                             "mode": SessionMode.GREENFIELD.value})
+    store.save_task(t)
+    result = run_verify(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    assert result.failure is None
+    assert result.outputs["outcome"] == "passed"
+    assert result.outputs["js_tests_present"] is True
+    assert result.outputs["js_tests_ran"] is True
+
+
 def test_runtime_verify_skipped_without_python_exe(tmp_path, store):
     """No bootstrapped interpreter -> the boot gate is an explicit no-op."""
     from cgx.session.models import SessionMode
@@ -2896,6 +3074,62 @@ def test_runtime_verify_failed_on_import_time_error(tmp_path, store):
     assert probe["ok"] is False
     assert probe["kind"] == "import_error"
     assert "boot boom" in probe["stderr_tail"]
+
+
+def test_runtime_verify_probes_nested_entry_absent_from_applied_files(
+        tmp_path, store):
+    """P1c: a nested backend entry not in the last APPLY is still booted.
+
+    The ses_4cbf963cdc67435a blind spot -- ``backend/app.py`` existed on
+    disk but was absent from the final applied-files list, so the boot
+    gate skipped and a broken server shipped green. The whole-tree scan
+    must find and probe it regardless.
+    """
+    import sys
+    from cgx.session.models import SessionMode
+    from cgx.session.tasks.runtime_verify import run_runtime_verify
+    (tmp_path / "backend").mkdir()
+    (tmp_path / "backend" / "app.py").write_text(
+        "from flask import Flask\napp = Flask(__name__)\n", encoding="utf-8")
+    # The last APPLY only touched a frontend file (no .py entry).
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "App.jsx").write_text(
+        "export default () => null\n", encoding="utf-8")
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    t = TaskNode.new(session.session_id, TaskKind.RUNTIME_VERIFY, "runtime",
+                     inputs={"applied_files": ["src/App.jsx"],
+                             "python_exe": sys.executable,
+                             "mode": SessionMode.GREENFIELD.value})
+    store.save_task(t)
+    result = run_runtime_verify(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    assert result.failure is None
+    assert "backend/app.py" in result.artifact.content["entry_files"]
+    assert result.outputs["tested_count"] == 1
+
+
+def test_runtime_verify_tree_scan_skips_vendored_dirs(tmp_path, store):
+    """A dependency's own app.py under node_modules is never probed."""
+    import sys
+    from cgx.session.models import SessionMode
+    from cgx.session.tasks.runtime_verify import run_runtime_verify
+    (tmp_path / "node_modules" / "dep").mkdir(parents=True)
+    (tmp_path / "node_modules" / "dep" / "app.py").write_text(
+        "raise RuntimeError('should never boot')\n", encoding="utf-8")
+    (tmp_path / "helpers.py").write_text("VALUE = 1\n", encoding="utf-8")
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    t = TaskNode.new(session.session_id, TaskKind.RUNTIME_VERIFY, "runtime",
+                     inputs={"applied_files": ["helpers.py"],
+                             "python_exe": sys.executable,
+                             "mode": SessionMode.GREENFIELD.value})
+    store.save_task(t)
+    result = run_runtime_verify(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    assert result.failure is None
+    assert result.outputs["outcome"] == "skipped"
+    assert result.outputs["tested_count"] == 0
 
 
 def test_plan_change_executor_needs_provider():
@@ -3752,6 +3986,151 @@ def test_decompose_executor_defaults_contracts_to_empty(store, monkeypatch):
     assert result.outputs["contract_count"] == 0
 
 
+# ------------- P0a: mandatory cross-seam endpoint contracts -------------
+
+def test_is_client_server_manifest_detects_and_abstains():
+    from cgx.session.tasks.decompose import _is_client_server_manifest
+    seam = [{"name": "app", "files": [
+        {"path": "backend/app.py", "description": "Flask API with /calc route"},
+        {"path": "src/App.jsx", "description": "React UI"}]}]
+    assert _is_client_server_manifest(seam, None, "calc app") is True
+    # Pure frontend -> no backend route.
+    fe = [{"name": "ui", "files": [
+        {"path": "src/App.jsx", "description": "React UI"}]}]
+    assert _is_client_server_manifest(fe, None, "react app") is False
+    # Pure backend -> no frontend caller.
+    be = [{"name": "core", "files": [
+        {"path": "backend/app.py", "description": "Flask API"}]}]
+    assert _is_client_server_manifest(be, None, "flask api") is False
+
+
+def test_backend_route_detected_via_skill_and_signal():
+    from cgx.session.tasks.decompose import _has_backend_route
+    files = [{"name": "x", "files": [
+        {"path": "server/core.py", "description": "logic"}]}]
+    # A framework skill promotes any .py file to a backend route.
+    assert _has_backend_route(files, ["flask"], "") is True
+    # No skill, no basename/description signal -> not a route.
+    assert _has_backend_route(files, None, "") is False
+    # A description signal alone qualifies.
+    sig = [{"name": "x", "files": [
+        {"path": "server/core.py",
+         "description": "defines the REST API routes"}]}]
+    assert _has_backend_route(sig, None, "") is True
+
+
+def test_extract_endpoint_contracts_parses_provider_reply():
+    from cgx.answer.engine import extract_endpoint_contracts
+    reply = ('{"endpoints": [{"method": "post", "path": "/calculate", '
+             '"request": {"num1": "number", "num2": "number", '
+             '"operation": "str"}}]}')
+    prov = _StubProvider(reply)
+    eps = extract_endpoint_contracts("calc", [{"name": "a", "files": [
+        {"path": "backend/app.py", "description": "flask"}]}], prov)
+    assert len(eps) == 1 and eps[0]["path"] == "/calculate"
+    # No files -> nothing to extract; no provider -> abstain.
+    assert extract_endpoint_contracts("calc", [], prov) == []
+    assert extract_endpoint_contracts("calc", [{"name": "a", "files": [
+        {"path": "backend/app.py"}]}], None) == []
+
+
+def _cross_seam_manifest():
+    return {"plan_md": "p", "layers": [{"name": "app", "files": [
+        {"path": "backend/app.py",
+         "description": "Flask API with /calculate route"},
+        {"path": "src/App.jsx", "description": "React UI fetches /calculate"},
+        {"path": "index.html", "description": "vite entry"},
+        {"path": "vite.config.js", "description": "vite config"}]}]}
+
+
+def test_decompose_cross_seam_requires_endpoints_fail_closed(store, monkeypatch):
+    """A JSX+backend manifest with no endpoints contract fails closed."""
+    from cgx.session.tasks.decompose import run_decompose
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    monkeypatch.setattr("cgx.answer.engine.plan_scaffold_manifest",
+                        lambda *a, **kw: _cross_seam_manifest())
+    monkeypatch.setattr("cgx.answer.engine.extract_endpoint_contracts",
+                        lambda *a, **kw: [])
+    t = TaskNode.new(session.session_id, TaskKind.DECOMPOSE, "d",
+                     inputs={"prior_goal": "calc app", "answers": {}})
+    result = run_decompose(
+        t, ExecutorDeps(provider=_StubProvider(""), store=store))
+    assert result.failure and "endpoints contract" in result.failure
+    # Fail-closed is terminal, not a retry loop.
+    assert result.retryable is False
+
+
+def test_decompose_cross_seam_recovers_endpoints_via_extract(store, monkeypatch):
+    """The bounded extract pass supplies the endpoints the planner omitted."""
+    from cgx.session.tasks.decompose import run_decompose
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    monkeypatch.setattr("cgx.answer.engine.plan_scaffold_manifest",
+                        lambda *a, **kw: _cross_seam_manifest())
+    monkeypatch.setattr(
+        "cgx.answer.engine.extract_endpoint_contracts",
+        lambda goal, layers, provider: [
+            {"method": "POST", "path": "/calculate",
+             "request": {"num1": "number", "num2": "number",
+                         "operation": "str"}}])
+    t = TaskNode.new(session.session_id, TaskKind.DECOMPOSE, "d",
+                     inputs={"prior_goal": "calc app", "answers": {}})
+    result = run_decompose(
+        t, ExecutorDeps(provider=_StubProvider(""), store=store))
+    assert result.failure is None
+    eps = result.artifact.content["contracts"]["endpoints"]
+    assert eps[0]["path"] == "/calculate"
+    assert result.outputs["contract_count"] == 1
+
+
+def test_decompose_cross_seam_keeps_declared_endpoints(store, monkeypatch):
+    """A planner that already declared endpoints skips the extract pass."""
+    from cgx.session.tasks.decompose import run_decompose
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    manifest = _cross_seam_manifest()
+    manifest["contracts"] = {
+        "endpoints": [{"method": "POST", "path": "/calculate"}]}
+    monkeypatch.setattr("cgx.answer.engine.plan_scaffold_manifest",
+                        lambda *a, **kw: manifest)
+
+    def _boom(*a, **kw):
+        raise AssertionError("extract pass must not run when endpoints exist")
+    monkeypatch.setattr(
+        "cgx.answer.engine.extract_endpoint_contracts", _boom)
+    t = TaskNode.new(session.session_id, TaskKind.DECOMPOSE, "d",
+                     inputs={"prior_goal": "calc app", "answers": {}})
+    result = run_decompose(
+        t, ExecutorDeps(provider=_StubProvider(""), store=store))
+    assert result.failure is None
+    eps = result.artifact.content["contracts"]["endpoints"]
+    assert eps[0]["path"] == "/calculate"
+
+
+def test_decompose_python_only_manifest_not_cross_seam(store, monkeypatch):
+    """A pure-Python manifest with no endpoints is NOT forced to fail."""
+    from cgx.session.tasks.decompose import run_decompose
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    monkeypatch.setattr(
+        "cgx.answer.engine.plan_scaffold_manifest",
+        lambda *a, **kw: {"plan_md": "p", "layers": [{"name": "core", "files": [
+            {"path": "app.py", "description": "Flask API"},
+            {"path": "tests/test_app.py", "description": "tests"}]}]})
+
+    def _boom(*a, **kw):
+        raise AssertionError("extract must not run for a non-seam manifest")
+    monkeypatch.setattr(
+        "cgx.answer.engine.extract_endpoint_contracts", _boom)
+    t = TaskNode.new(session.session_id, TaskKind.DECOMPOSE, "d",
+                     inputs={"prior_goal": "flask api", "answers": {}})
+    result = run_decompose(
+        t, ExecutorDeps(provider=_StubProvider(""), store=store))
+    assert result.failure is None
+    assert result.artifact.content["contracts"] == {}
+
+
 def test_decompose_executor_empty_manifest_is_failure(store, monkeypatch):
     from cgx.session.tasks.decompose import run_decompose
     session = Session.new("g", mode=SessionMode.GREENFIELD)
@@ -4501,6 +4880,109 @@ def test_js_import_coherence_resolves_siblings_and_skips_assets():
         {"path": "src/comp/index.jsx", "content": "export default 1\n"},
     ]
     assert _js_import_coherence_failures(existing, None) == []
+
+
+# ---------------- P1a: JS test-harness coherence ----------------
+
+def test_js_test_path_detection():
+    from cgx.session.tasks.scaffold import _is_js_test_path
+    assert _is_js_test_path("src/App.test.jsx") is True
+    assert _is_js_test_path("src/util.spec.ts") is True
+    assert _is_js_test_path("src/__tests__/App.jsx") is True
+    assert _is_js_test_path("src/App.jsx") is False
+    assert _is_js_test_path("src/App.test.py") is False
+
+
+def test_synthesize_js_test_harness_backfills_react_project():
+    """A React test file with a bare package.json gets a runnable harness."""
+    import json
+    from cgx.answer.engine import _content_to_new_file_patch  # noqa: F401
+    from cgx.session.tasks.scaffold import (
+        _content_from_new_file_patch,
+        _synthesize_js_test_harness,
+    )
+    existing = [
+        {"path": "package.json",
+         "content": '{"name": "app", "dependencies": {"react": "^18.0.0"}}'},
+        {"path": "src/App.jsx", "content": "export default () => null\n"},
+        {"path": "src/App.test.jsx",
+         "content": ("import { render } from '@testing-library/react'\n"
+                     "import App from './App.jsx'\n")},
+    ]
+    diffs = [{"file": e["path"],
+              "patch": _content_to_new_file_patch(e["path"], e["content"])}
+             for e in existing]
+    generated = [{"file": e["path"], "layer": "core", "bytes": 1}
+                 for e in existing]
+    layers: list = []
+    touched = _synthesize_js_test_harness(
+        diffs=diffs, generated=generated, existing_with_content=existing,
+        layers=layers, project_root=None)
+    assert "package.json" in touched
+    assert "vitest.config.js" in touched
+    assert "vitest.setup.js" in touched
+    # package.json now carries a real test script + harness devDeps.
+    pkg = json.loads(next(e["content"] for e in existing
+                          if e["path"] == "package.json"))
+    assert pkg["scripts"]["test"] == "vitest run"
+    assert "vitest" in pkg["devDependencies"]
+    assert "jsdom" in pkg["devDependencies"]
+    assert "@testing-library/react" in pkg["devDependencies"]
+    assert "@vitejs/plugin-react" in pkg["devDependencies"]
+    # react stays where the model declared it, not duplicated into devDeps.
+    assert "react" not in pkg["devDependencies"]
+    # The config is jsdom + wired to the setup file, and rides the diff bundle.
+    cfg = _content_from_new_file_patch(
+        next(d["patch"] for d in diffs if d["file"] == "vitest.config.js"))
+    assert "jsdom" in cfg and "vitest.setup.js" in cfg
+    assert "plugin-react" in cfg
+    assert any(e["path"] == "vitest.setup.js" for e in existing)
+
+
+def test_synthesize_js_test_harness_noop_without_tests():
+    from cgx.session.tasks.scaffold import _synthesize_js_test_harness
+    existing = [
+        {"path": "package.json", "content": '{"name": "app"}'},
+        {"path": "src/App.jsx", "content": "export default 1\n"},
+    ]
+    assert _synthesize_js_test_harness(
+        diffs=[], generated=[], existing_with_content=existing, layers=[],
+        project_root=None) == []
+
+
+def test_synthesize_js_test_harness_preserves_existing_config_and_script():
+    """A real test script and an existing vitest config are not clobbered."""
+    from cgx.session.tasks.scaffold import _synthesize_js_test_harness
+    existing = [
+        {"path": "package.json",
+         "content": ('{"name": "app", "scripts": {"test": "vitest"}, '
+                     '"devDependencies": {"vitest": "^1.0.0"}}')},
+        {"path": "vitest.config.js", "content": "export default {}\n"},
+        {"path": "src/App.test.jsx", "content": "test('x', () => {})\n"},
+    ]
+    diffs = [{"file": e["path"], "patch": ""} for e in existing]
+    touched = _synthesize_js_test_harness(
+        diffs=diffs, generated=[], existing_with_content=existing,
+        layers=[], project_root=None)
+    # Config already present -> not re-synthesized; only devDeps may grow.
+    assert "vitest.config.js" not in touched
+    assert "vitest.setup.js" not in touched
+    import json
+    pkg = json.loads(next(e["content"] for e in existing
+                          if e["path"] == "package.json"))
+    assert pkg["scripts"]["test"] == "vitest"  # untouched
+
+
+def test_synthesize_js_test_harness_skips_vue():
+    from cgx.session.tasks.scaffold import _synthesize_js_test_harness
+    existing = [
+        {"path": "package.json", "content": '{"name": "app"}'},
+        {"path": "src/App.vue", "content": "<template></template>\n"},
+        {"path": "src/App.spec.js", "content": "test('x', () => {})\n"},
+    ]
+    assert _synthesize_js_test_harness(
+        diffs=[], generated=[], existing_with_content=existing, layers=[],
+        project_root=None) == []
 
 
 def test_scaffold_synthesizes_missing_stylesheet_stub(store, monkeypatch):
@@ -10008,6 +10490,119 @@ def test_contract_check_constant_import_only_does_not_satisfy():
     assert check_contract_compliance(assigned, contracts) == []
 
 
+# ------------- P0b: client/server payload coherence gate -------------
+
+def test_payload_coherence_flags_rename_mismatch():
+    """The ses_4cbf963cdc67435a bug: client ``operator`` vs server ``operation``.
+
+    The handler reads ``num1/num2/operation`` while the React client POSTs
+    ``num1/num2/operator`` -- a rename in both directions -> one ``payload``
+    warning naming the client file and the divergent keys.
+    """
+    from cgx.session.scaffold_validate import (
+        check_client_server_payload_coherence,
+    )
+    contents = {
+        "backend/app.py": (
+            "@app.route('/calculate', methods=['POST'])\n"
+            "def calc():\n"
+            "    data = request.json\n"
+            "    a = data.get('num1')\n"
+            "    b = data.get('num2')\n"
+            "    op = data.get('operation')\n"
+            "    return {}\n"),
+        "src/components/Calculator.jsx": (
+            "fetch('/calculate', {\n"
+            "  method: 'POST',\n"
+            "  body: JSON.stringify({ num1, num2, operator }),\n"
+            "})\n"),
+    }
+    warnings = check_client_server_payload_coherence(contents)
+    assert len(warnings) == 1
+    w = warnings[0]
+    assert w["kind"] == "payload"
+    assert w["name"] == "/calculate"
+    assert w["file"] == "src/components/Calculator.jsx"
+    assert w["server_file"] == "backend/app.py"
+    assert "operator" in w["reason"] and "operation" in w["reason"]
+
+
+def test_payload_coherence_ignores_subset_and_superset():
+    """A body that merely omits/adds a field (one-directional) never fires."""
+    from cgx.session.scaffold_validate import (
+        check_client_server_payload_coherence,
+    )
+    handler = (
+        "@app.route('/calculate', methods=['POST'])\n"
+        "def calc():\n"
+        "    data = request.json\n"
+        "    a = data.get('num1')\n"
+        "    b = data.get('num2')\n"
+        "    op = data.get('operation')\n"
+        "    return {}\n")
+    # Exact match -> no warning.
+    exact = {
+        "backend/app.py": handler,
+        "src/App.jsx": (
+            "fetch('/calculate', { method: 'POST', body: "
+            "JSON.stringify({ num1, num2, operation }) })\n"),
+    }
+    assert check_client_server_payload_coherence(exact) == []
+    # Client omits an optional field (subset) -> still one-directional.
+    subset = {
+        "backend/app.py": handler,
+        "src/App.jsx": (
+            "fetch('/calculate', { method: 'POST', body: "
+            "JSON.stringify({ num1, num2 }) })\n"),
+    }
+    assert check_client_server_payload_coherence(subset) == []
+
+
+def test_payload_coherence_prefers_declared_contract():
+    """When the WORK_PLAN declares the endpoint, its request schema wins.
+
+    Even if the handler reads nothing the checker can see, the declared
+    ``request`` keys stand in as the authoritative expected shape.
+    """
+    from cgx.session.scaffold_validate import (
+        check_client_server_payload_coherence,
+    )
+    contracts = {"endpoints": [{
+        "method": "POST", "path": "/calculate",
+        "request": {"num1": 0, "num2": 0, "operation": ""}}]}
+    contents = {
+        "backend/app.py": (
+            "@app.route('/calculate', methods=['POST'])\n"
+            "def calc():\n    return {}\n"),
+        "src/App.jsx": (
+            "fetch('http://localhost:5000/calculate', { method: 'POST', "
+            "body: JSON.stringify({ num1, num2, operator }) })\n"),
+    }
+    warnings = check_client_server_payload_coherence(contents, contracts)
+    assert [w["name"] for w in warnings] == ["/calculate"]
+    assert warnings[0]["expected_keys"] == ["num1", "num2", "operation"]
+
+
+def test_payload_coherence_abstains_without_seam():
+    """No backend route or no client fetch body -> nothing to compare."""
+    from cgx.session.scaffold_validate import (
+        check_client_server_payload_coherence,
+    )
+    # A route but no client fetch.
+    assert check_client_server_payload_coherence({
+        "backend/app.py": (
+            "@app.route('/calculate', methods=['POST'])\n"
+            "def calc():\n    return {}\n")}) == []
+    # A fetch but no Python route.
+    assert check_client_server_payload_coherence({
+        "src/App.jsx": (
+            "fetch('/calculate', { method: 'POST', body: "
+            "JSON.stringify({ num1, num2 }) })\n")}) == []
+    # Empty / non-dict input.
+    assert check_client_server_payload_coherence({}) == []
+    assert check_client_server_payload_coherence(None) == []
+
+
 def test_scaffold_executor_surfaces_import_warnings(store, monkeypatch):
     """SCAFFOLD runs the cross-check and surfaces ``import_warnings``."""
     from cgx.session.tasks.scaffold import run_scaffold
@@ -10788,6 +11383,84 @@ def test_router_scaffold_contract_skipped_when_files_dropped():
         [{"kind": "function", "name": "compute", "module": "src/core.py"}],
         failed_count=1)
     assert _scaffold_contract_regenerate_actions(scaffold, [scaffold]) == []
+
+
+# ------------- P0b: payload-mismatch targeted regenerate -------------
+
+def _payload_warning(file="src/components/Calculator.jsx"):
+    return {"kind": "payload", "name": "/calculate", "file": file,
+            "server_file": "backend/app.py",
+            "client_keys": ["num1", "num2", "operator"],
+            "expected_keys": ["num1", "num2", "operation"],
+            "reason": "client sends operator but endpoint expects operation"}
+
+
+def test_actionable_payload_warnings_requires_client_file():
+    from cgx.session.greenfield_edges import _actionable_payload_warnings
+    got = _actionable_payload_warnings({"contract_warnings": [
+        _payload_warning(),
+        {"kind": "payload", "name": "/x"},  # no file -> skip
+        {"kind": "function", "name": "compute", "module": "src/core.py"},
+        "not-a-dict",
+    ]})
+    assert [w["file"] for w in got] == ["src/components/Calculator.jsx"]
+
+
+def test_router_scaffold_payload_mismatch_targeted_regenerate():
+    # A payload rename regenerates ONLY the offending client file against
+    # the prior scaffold artifact, with the mismatch folded in.
+    from cgx.session.greenfield_edges import (
+        _scaffold_payload_regenerate_actions,
+    )
+    _session, scaffold = _make_clean_scaffold_with_contracts(
+        [_payload_warning()])
+    actions = _scaffold_payload_regenerate_actions(scaffold, [scaffold])
+    creates = [a for a in actions if isinstance(a, CreateTask)]
+    assert len(creates) == 1
+    new_scaffold = creates[0].task
+    assert new_scaffold.kind is TaskKind.SCAFFOLD
+    assert new_scaffold.inputs["regenerate_files"] == [
+        "src/components/Calculator.jsx"]
+    assert new_scaffold.inputs["prior_scaffold_artifact_id"] == "art_s"
+    constraint = new_scaffold.inputs["regenerate_constraints"][-1]
+    assert constraint["kind"] == "payload_mismatch"
+    assert "operation" in constraint["rationale"]
+
+
+def test_router_scaffold_payload_skipped_when_files_dropped():
+    # failed_count > 0 belongs to the dropped-files path; the payload path
+    # defers so the two regenerates never race on the same scaffold.
+    from cgx.session.greenfield_edges import (
+        _scaffold_payload_regenerate_actions,
+    )
+    _session, scaffold = _make_clean_scaffold_with_contracts(
+        [_payload_warning()], failed_count=1)
+    assert _scaffold_payload_regenerate_actions(scaffold, [scaffold]) == []
+
+
+def test_router_scaffold_payload_non_terminal_when_budget_spent():
+    from cgx.session.budget import REGENERATE_BUDGET
+    from cgx.session.greenfield_edges import (
+        _scaffold_payload_regenerate_actions,
+    )
+    _session, scaffold = _make_clean_scaffold_with_contracts(
+        [_payload_warning()], prior_regens=REGENERATE_BUDGET)
+    assert _scaffold_payload_regenerate_actions(scaffold, [scaffold]) == []
+
+
+def test_router_scaffold_payload_repeat_is_non_terminal():
+    """The same payload mismatch twice stops the loop (flap backstop)."""
+    from cgx.session.greenfield_edges import (
+        _scaffold_payload_regenerate_actions,
+    )
+    _session, scaffold = _make_clean_scaffold_with_contracts(
+        [_payload_warning()])
+    first = _scaffold_payload_regenerate_actions(scaffold, [scaffold])
+    retry = [a for a in first if isinstance(a, CreateTask)][0].task
+    signatures = retry.inputs["prior_failure_signatures"]
+    assert signatures
+    scaffold.inputs["prior_failure_signatures"] = signatures
+    assert _scaffold_payload_regenerate_actions(scaffold, [scaffold]) == []
 
 
 def test_router_repair_regenerate_budget_exhausted_fails_session():

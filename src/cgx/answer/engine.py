@@ -2545,6 +2545,79 @@ def _normalize_contracts(raw: Any) -> Dict[str, Any]:
     return out
 
 
+_ENDPOINT_EXTRACT_SYSTEM = (
+    "You are an API contract extractor. Given a project goal and its file "
+    "manifest (paths + one-line descriptions), OUTPUT ONLY the HTTP endpoints "
+    "the frontend client and the backend server must agree on. Do NOT write "
+    "file contents and do NOT add files.\n\n"
+    "Return strict JSON only:\n"
+    "{\n"
+    '  "endpoints": [{"method": "POST", "path": "/api/x",\n'
+    '    "request": {"a": "number"}, "response": {"result": "number"},\n'
+    '    "description": "one-line purpose"}]\n'
+    "}\n\n"
+    "Rules:\n"
+    "- request/response keys are the EXACT JSON field names the client sends "
+    "and the server reads -- choose one spelling per field and keep it "
+    "identical on both sides (do not offer synonyms).\n"
+    "- Cover every endpoint the client calls and the server routes; nothing "
+    "more.\n"
+    "- Use the paths the manifest declares or clearly implies. No prose "
+    "outside the JSON object.\n"
+)
+
+
+@traced("llm")
+def extract_endpoint_contracts(
+    goal: str,
+    layers: List[Dict[str, Any]],
+    provider: Any,
+) -> List[Dict[str, Any]]:
+    """Second-pass extractor: derive the HTTP endpoint contracts for a manifest.
+
+    Used when DECOMPOSE detects a cross-language client/server manifest whose
+    planner reply omitted the ``endpoints`` contract -- the exact blind spot
+    that let ses_4cbf963cdc67435a ship a frontend/backend request-key
+    mismatch. One bounded, temperature-0 call over the goal + file manifest;
+    returns a normalized list of endpoint dicts (possibly empty). Never
+    raises: any provider or parse failure degrades to ``[]`` so the caller
+    decides how to fail-close.
+    """
+    if provider is None:
+        return []
+    listed: List[str] = []
+    for layer in (layers or []):
+        for f in (layer.get("files") or []):
+            path = str(f.get("path") or "").strip()
+            if not path:
+                continue
+            desc = str(f.get("description") or "").strip()
+            listed.append(f"- {path}: {desc}" if desc else f"- {path}")
+    if not listed:
+        return []
+    manifest_txt = "\n".join(listed[:60])
+    user = (f"PROJECT GOAL:\n{(goal or '').strip()}\n\n"
+            f"FILE MANIFEST:\n{manifest_txt}\n\n"
+            "Extract the HTTP endpoint contracts as strict JSON.")
+    try:
+        resp = provider.chat(
+            messages=[
+                {"role": "system", "content": _ENDPOINT_EXTRACT_SYSTEM},
+                {"role": "user", "content": user},
+            ],
+            temperature=0.0,
+            max_tokens=1500,
+            force_json=True,
+        )
+        raw = (resp or {}).get("content", "") if isinstance(resp, dict) else ""
+    except Exception:  # pragma: no cover - defensive: extractor is best-effort
+        logger.exception("extract_endpoint_contracts: provider call failed")
+        return []
+    parsed = _extract_json_object(raw) or {}
+    normalized = _normalize_contracts({"endpoints": parsed.get("endpoints")})
+    return normalized.get("endpoints") or []
+
+
 def _compact_json_fragment(value: Any, max_chars: int = 300) -> str:
     """Render a contract sub-value (schema fields, request body) compactly.
 

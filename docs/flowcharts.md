@@ -190,17 +190,18 @@ once the load stops getting lighter.
 
 ```mermaid
 flowchart LR
-    U([goal]) --> CQ(["CLARIFY_REQUIREMENTS"]) --> DEC(["DECOMPOSE<br/>contracts + layers"])
+    U([goal]) --> CQ(["CLARIFY_REQUIREMENTS"]) --> DEC(["DECOMPOSE<br/>contracts + layers<br/>(P0a: mandatory cross-seam endpoints)"])
     DEC --> SCA(["SCAFFOLD<br/>coherence + contract gates"]) --> APP(["APPLY"])
     APP --> BS(["BOOTSTRAP_ENV"]) --> AC(["API_CHECK"]) --> SM(["SMOKE"]) --> VER(["VERIFY"])
     VER --> IC{"router"}
     IC -- "passed" --> RUN(["RUNTIME_VERIFY"])
     IC -- "fixable failure" --> REP(["REPAIR"])
     RUN --> IC2{"router"}
-    IC2 -- "boots / no entry" --> DONE((COMPLETED))
+    IC2 -- "boots / no entry (no coverage gap)" --> DONE((COMPLETED))
     IC2 -- "boot fails" --> REP
+    IC2 -- "coverage gap: JS suite unrun / server entry not booted" --> FAIL((FAILED))
     REP --> APP
-    IC -- "budget spent / flap" --> FAIL((FAILED))
+    IC -- "budget spent / flap" --> FAIL
     IC2 -- "budget spent" --> FAIL
 
     classDef road fill:#3b6ea5,stroke:#274c73,color:#fff;
@@ -318,7 +319,10 @@ flowchart TB
                   +-------------------+
                   |    DECOMPOSE      |  plan_scaffold_manifest ->
                   +-------------------+   WORK_PLAN artifact
-                            |              (plan_md + layered file list)
+                            |              (plan_md + layered file list
+                            |               + contracts; P0a fails closed
+                            |               if a client/server seam has
+                            |               no endpoints contract)
                             v
               +------------------------------+
               |  ASK_USER(approve_plan)      |  <-- [Approve & Scaffold |
@@ -389,7 +393,11 @@ flowchart TB
                                        create_app) under the venv -> a
                                        RUNTIME_REPORT (P1; outcome=passed|
                                        failed|timeout|error|skipped).
-                                       passed/skipped -> COMPLETED;
+                                       passed/skipped -> COMPLETED, unless
+                                       the fail-closed policy finds a
+                                       coverage gap (unrun scaffolded JS
+                                       suite, or skipped boot with a
+                                       server entry on disk) -> FAILED;
                                        a hard boot failure -> REPAIR (#3)
 ```
 
@@ -544,9 +552,10 @@ Where to look in the repo:
 | PyPI metadata client     | `src/cgx/session/repair/pypi_client.py` (Phase 3.2) |
 | Explore executors        | `src/cgx/session/tasks/{explore,investigate,recommend,plan_change}.py` |
 | Greenfield executors     | `src/cgx/session/tasks/{clarify_requirements,decompose,scaffold,bootstrap_env,api_check,smoke,runtime_verify,repair}.py` |
-| Contract + coherence gates | `src/cgx/session/scaffold_validate.py :: {check_contract_compliance, cross_check_first_party_imports}` |
+| Contract + coherence gates | `src/cgx/session/scaffold_validate.py :: {check_contract_compliance, cross_check_first_party_imports, check_client_server_payload_coherence}` |
 | Frontend coherence passes | `src/cgx/session/tasks/scaffold.py :: {_synthesize_missing_frontend_stylesheets, _js_import_coherence_failures}` |
 | Targeted build-smoke repair | `src/cgx/session/repair/classify.py :: unresolved_import_sources` + `src/cgx/session/tasks/repair.py :: _build_smoke_target_files` |
+| Terminal fail-closed policy | `src/cgx/session/router.py :: {_coverage_gap, _verify_terminal_session_actions, _runtime_verify_terminal_session_actions}` |
 | Shared write executors   | `src/cgx/session/tasks/{apply,verify,ask}.py` |
 | Decision validation      | `src/cgx/session/tasks/ask.py :: build_decision` |
 | HTTP routes              | `src/cgx/webui/routes/agent_session.py` |

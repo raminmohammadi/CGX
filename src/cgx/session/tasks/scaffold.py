@@ -32,6 +32,7 @@ from cgx.session.models import (
 )
 from cgx.session.repair.pypi_client import PyPIClient
 from cgx.session.scaffold_validate import (
+    check_client_server_payload_coherence,
     check_contract_compliance,
     cross_check_first_party_imports,
     is_requirements_path,
@@ -422,6 +423,28 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     if stylesheets_synthesized:
         _checkpoint_progress(deps, artifact)
 
+    # JS test-harness coherence (P1a): the scaffold routinely authors React
+    # unit tests (``*.test.jsx``) without the toolchain to run them, so
+    # VERIFY's NpmRunner finds no ``test`` script and the suite is silently
+    # skipped while ``npm run build`` still reports green -- the blind spot
+    # that let ses_4cbf963cdc67435a ship a broken app with unrun tests.
+    # Deterministically backfill the vite/vitest harness (test script +
+    # devDeps + jsdom config + setup) so the tests the model wrote are
+    # actually exercised. Best-effort and bounded; a failure leaves the
+    # bundle untouched.
+    js_harness_synthesized: List[str] = []
+    try:
+        js_harness_synthesized = _synthesize_js_test_harness(
+            diffs=diffs, generated=generated,
+            existing_with_content=existing_with_content, layers=layers,
+            project_root=deps.project_root)
+    except Exception:  # pragma: no cover - defensive: pass is best-effort
+        logger.exception(
+            "SCAFFOLD: JS test-harness synthesis raised; skipping")
+        js_harness_synthesized = []
+    if js_harness_synthesized:
+        _checkpoint_progress(deps, artifact)
+
     # Global coherence pass (#2): the per-file loop resolves imports
     # against whichever siblings existed when each file was generated (and
     # the parallel path freezes a per-layer snapshot), so a file can still
@@ -643,6 +666,23 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         logger.exception(
             "SCAFFOLD: contract compliance check raised; skipping")
         contract_warnings = []
+
+    # Cross-language payload coherence gate (P0b): a JS ``fetch`` body whose
+    # keys disagree with the backend handler it targets (e.g. ``operator``
+    # vs ``operation``) is invisible to the Python-only contract check above
+    # and to a build smoke, yet it makes the app non-functional at runtime.
+    # Fold any mismatch into ``contract_warnings`` as a ``payload`` kind so
+    # the router regenerates only the offending client file. Best-effort:
+    # a raised checker leaves the existing warnings untouched.
+    try:
+        payload_warnings = check_client_server_payload_coherence(
+            xcheck_contents, contracts)
+    except Exception:  # pragma: no cover - defensive: checker is best-effort
+        logger.exception(
+            "SCAFFOLD: payload coherence check raised; skipping")
+        payload_warnings = []
+    if payload_warnings:
+        contract_warnings = list(contract_warnings) + payload_warnings
 
     # Finalise the checkpoint artifact in place: pin validation reassigns
     # ``diffs`` to a new list, so re-point the content at it, attach the
@@ -1993,6 +2033,30 @@ _JS_ASSET_EXTS = (
 # cannot fan the bundle out unboundedly (mirrors _SYNTH_MODULE_BUDGET).
 _SYNTH_STYLESHEET_BUDGET = 16
 
+# JS test-harness synthesis (P1a). When the scaffold authored JS/TS test
+# files but omitted the toolchain that runs them, VERIFY's NpmRunner has no
+# runnable ``test`` script to invoke, so the suite is silently never
+# exercised while ``npm run build`` still reports green -- the exact blind
+# spot that let ses_4cbf963cdc67435a ship a broken app with unrun React
+# tests. Deterministically backfill the vite/vitest harness (test script,
+# devDeps, jsdom config, setup) so the tests the model wrote are actually
+# runnable. Pinned to the vite/vitest React ecosystem the scaffolder
+# targets; caret ranges let npm resolve a compatible release at install
+# time. A Vue tree is out of scope -- a react-shaped harness there would be
+# wrong -- so it is left untouched.
+_JS_TEST_EXTS = (".js", ".jsx", ".ts", ".tsx")
+_VITEST_CONFIG_PATH = "vitest.config.js"
+_VITEST_SETUP_PATH = "vitest.setup.js"
+_JS_TEST_SCRIPT = "vitest run"
+_JS_TEST_DEVDEPS = {
+    "vitest": "^1.6.0",
+    "jsdom": "^24.1.0",
+    "@testing-library/react": "^15.0.7",
+    "@testing-library/jest-dom": "^6.4.6",
+    "@testing-library/user-event": "^14.5.2",
+}
+_JS_REACT_PLUGIN = ("@vitejs/plugin-react", "^4.3.1")
+
 
 def _norm_rel_path(path: str) -> str:
     """Forward-slash, ``./``-stripped project-relative form of ``path``."""
@@ -2118,6 +2182,244 @@ def _synthesize_missing_frontend_stylesheets(
         "work plan omitted; synthesized empty stub(s) %s so the build "
         "resolves", added)
     return added
+
+
+def _is_js_test_path(path: str) -> bool:
+    """True for a JS/TS unit-test file (``*.test.jsx`` / ``__tests__/*``)."""
+    p = _norm_rel_path(path).lower()
+    ext = _specifier_extension(p)
+    if ext not in _JS_TEST_EXTS:
+        return False
+    if "/__tests__/" in p or p.startswith("__tests__/"):
+        return True
+    stem = p[: -len(ext)]
+    return stem.endswith(".test") or stem.endswith(".spec")
+
+
+def _project_uses_react(
+        existing_with_content: List[Dict[str, str]]) -> bool:
+    """True when any generated JS source is JSX/TSX or imports ``react``."""
+    for path, content in _generated_js_sources(existing_with_content):
+        if path.lower().endswith((".jsx", ".tsx")):
+            return True
+        if "from 'react'" in content or 'from "react"' in content:
+            return True
+    return False
+
+
+def _project_uses_vue(
+        existing_with_content: List[Dict[str, str]]) -> bool:
+    """True when the generated tree contains a ``.vue`` single-file component."""
+    return any(
+        _norm_rel_path(str(e.get("path") or "")).lower().endswith(".vue")
+        for e in existing_with_content)
+
+
+def _js_test_config_present(
+        existing_with_content: List[Dict[str, str]]) -> bool:
+    """True when a vitest config already exists (standalone or in vite config)."""
+    for e in existing_with_content:
+        base = _norm_rel_path(str(e.get("path") or "")).lower().rsplit(
+            "/", 1)[-1]
+        content = str(e.get("content") or "")
+        if base.startswith("vitest.config."):
+            return True
+        if base.startswith("vite.config.") and (
+                "test:" in content or "test :" in content):
+            return True
+    return False
+
+
+def _splice_generated_file(
+        path: str, content: str, *,
+        diffs: List[Dict[str, str]], generated: List[Dict[str, Any]],
+        existing_with_content: List[Dict[str, str]]) -> bool:
+    """Insert or replace a synthesized file across the scaffold bundles.
+
+    Rewrites the new-file diff, generated-metadata row and content mirror
+    for ``path`` in place (adding them when the file is new) so a
+    deterministically authored/edited file rides the same APPLY path as a
+    model-generated one. Returns ``True`` when ``path`` was newly added
+    (so the caller can fold it into the synthesized manifest layer),
+    ``False`` when an existing entry was rewritten.
+    """
+    from cgx.answer.engine import _content_to_new_file_patch
+    norm = _norm_rel_path(path)
+    patch = _content_to_new_file_patch(path, content)
+    for d in diffs:
+        if _norm_rel_path(str(d.get("file") or "")) == norm:
+            d["patch"] = patch
+            break
+    else:
+        diffs.append({"file": path, "patch": patch})
+    for g in generated:
+        if _norm_rel_path(str(g.get("file") or "")) == norm:
+            g["bytes"] = len(content)
+            g["syntax_ok"] = True
+            g["synthesized"] = True
+            break
+    else:
+        generated.append({
+            "file": path, "layer": "synthesized", "syntax_ok": True,
+            "confidence": None, "bytes": len(content), "synthesized": True})
+    is_new = True
+    for e in existing_with_content:
+        if _norm_rel_path(str(e.get("path") or "")) == norm:
+            e["content"] = content
+            is_new = False
+            break
+    if is_new:
+        existing_with_content.append({"path": path, "content": content})
+    return is_new
+
+
+def _ensure_pkg_test_harness(pkg_data: Dict[str, Any],
+                             uses_react: bool) -> bool:
+    """Fold a real ``test`` script + harness devDeps into a package.json dict.
+
+    Sets ``scripts.test`` to ``vitest run`` only when absent or the npm
+    ``no test specified`` placeholder (never clobbering a real script), and
+    adds every missing harness devDependency (skipping any already declared
+    in ``dependencies`` or ``devDependencies``). Mutates ``pkg_data`` in
+    place; returns ``True`` when anything changed.
+    """
+    changed = False
+    scripts = pkg_data.get("scripts")
+    if not isinstance(scripts, dict):
+        scripts = {}
+        pkg_data["scripts"] = scripts
+    cur = str(scripts.get("test") or "")
+    if (not cur) or ("no test specified" in cur):
+        scripts["test"] = _JS_TEST_SCRIPT
+        changed = True
+    dev = pkg_data.get("devDependencies")
+    if not isinstance(dev, dict):
+        dev = {}
+        pkg_data["devDependencies"] = dev
+    deps = (pkg_data.get("dependencies")
+            if isinstance(pkg_data.get("dependencies"), dict) else {})
+    wanted = dict(_JS_TEST_DEVDEPS)
+    if uses_react:
+        wanted[_JS_REACT_PLUGIN[0]] = _JS_REACT_PLUGIN[1]
+    for name, ver in wanted.items():
+        if name not in dev and name not in deps:
+            dev[name] = ver
+            changed = True
+    return changed
+
+
+def _vitest_config_content(uses_react: bool) -> str:
+    """A minimal jsdom vitest config wired to the setup file (react-aware)."""
+    react_import = ("import react from '@vitejs/plugin-react';\n"
+                    if uses_react else "")
+    plugins = "  plugins: [react()],\n" if uses_react else ""
+    return (
+        "import { defineConfig } from 'vitest/config';\n"
+        f"{react_import}"
+        "\n"
+        "export default defineConfig({\n"
+        f"{plugins}"
+        "  test: {\n"
+        "    environment: 'jsdom',\n"
+        "    globals: true,\n"
+        f"    setupFiles: './{_VITEST_SETUP_PATH}',\n"
+        "  },\n"
+        "});\n")
+
+
+def _synthesize_js_test_harness(
+        *,
+        diffs: List[Dict[str, str]],
+        generated: List[Dict[str, Any]],
+        existing_with_content: List[Dict[str, str]],
+        layers: List[Any],
+        project_root: Optional[str],
+) -> List[str]:
+    """Backfill the vite/vitest harness so scaffolded JS tests are runnable.
+
+    When the scaffold authored ``*.test.jsx`` / ``*.spec.ts`` files (or a
+    ``__tests__`` module) but the plan omitted the toolchain to run them,
+    VERIFY's NpmRunner finds no ``test`` script and the suite is silently
+    skipped while ``npm run build`` still passes (the ses_4cbf963cdc67435a
+    blind spot). Deterministically ensure package.json carries a ``vitest
+    run`` test script plus the harness devDeps, and synthesize a jsdom
+    ``vitest.config.js`` + a ``@testing-library/jest-dom`` setup file when
+    none exists. Mutates the passed bundles in place; returns the touched
+    paths. Vue trees are skipped (out of scope). Best-effort: any parse
+    failure abstains, leaving the bundle untouched.
+    """
+    import json as _json
+
+    test_files = [p for p, _ in _generated_js_sources(existing_with_content)
+                  if _is_js_test_path(p)]
+    if not test_files:
+        return []
+    if _project_uses_vue(existing_with_content):
+        logger.debug("SCAFFOLD: JS test-harness synthesis skipped "
+                     "(Vue tree out of scope)")
+        return []
+
+    uses_react = _project_uses_react(existing_with_content)
+    existing_paths = {
+        _norm_rel_path(str(e.get("path") or "")): e
+        for e in existing_with_content}
+    touched: List[str] = []
+    new_files: List[str] = []
+
+    # 1) package.json: ensure a runnable test script + harness devDeps.
+    pkg_entry = existing_paths.get("package.json")
+    if pkg_entry is not None:
+        try:
+            pkg_data = _json.loads(str(pkg_entry.get("content") or "{}"))
+        except Exception:
+            logger.debug("SCAFFOLD: package.json is not valid JSON; skipping "
+                         "test-harness backfill")
+            pkg_data = None
+        if isinstance(pkg_data, dict):
+            if _ensure_pkg_test_harness(pkg_data, uses_react):
+                content = _json.dumps(pkg_data, indent=2) + "\n"
+                _splice_generated_file(
+                    "package.json", content, diffs=diffs,
+                    generated=generated,
+                    existing_with_content=existing_with_content)
+                touched.append("package.json")
+    else:
+        pkg_data = {"name": "app", "private": True, "version": "0.0.0",
+                    "type": "module", "scripts": {}, "devDependencies": {}}
+        _ensure_pkg_test_harness(pkg_data, uses_react)
+        content = _json.dumps(pkg_data, indent=2) + "\n"
+        if _splice_generated_file(
+                "package.json", content, diffs=diffs, generated=generated,
+                existing_with_content=existing_with_content):
+            new_files.append("package.json")
+        touched.append("package.json")
+
+    # 2) vitest config + setup: only when the plan wired neither, so a
+    # model-authored config (or a vite.config test block) is never clobbered.
+    if not _js_test_config_present(existing_with_content):
+        cfg = _vitest_config_content(uses_react)
+        if _splice_generated_file(
+                _VITEST_CONFIG_PATH, cfg, diffs=diffs, generated=generated,
+                existing_with_content=existing_with_content):
+            new_files.append(_VITEST_CONFIG_PATH)
+        touched.append(_VITEST_CONFIG_PATH)
+        if _VITEST_SETUP_PATH not in existing_paths:
+            setup = "import '@testing-library/jest-dom';\n"
+            if _splice_generated_file(
+                    _VITEST_SETUP_PATH, setup, diffs=diffs,
+                    generated=generated,
+                    existing_with_content=existing_with_content):
+                new_files.append(_VITEST_SETUP_PATH)
+            touched.append(_VITEST_SETUP_PATH)
+
+    if new_files:
+        layers.append({"name": "synthesized",
+                       "files": [{"path": p} for p in new_files]})
+    if touched:
+        logger.warning(
+            "SCAFFOLD: scaffolded JS test file(s) but no runnable harness; "
+            "backfilled %s so VERIFY can actually run the suite", touched)
+    return touched
 
 
 def _js_import_coherence_failures(

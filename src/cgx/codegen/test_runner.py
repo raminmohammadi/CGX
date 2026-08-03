@@ -53,6 +53,12 @@ class TestRunOutcome:
     # VERIFY tell a passing *build* apart from a passing *test suite* so a
     # test-free scaffold is not reported as green.
     ran_tests: bool = True
+    # Whether the runner's stack has test *files* on disk, independent of
+    # whether they ran (``None`` = the runner does not report presence).
+    # Lets VERIFY/P2 tell "no tests exist" (honest terminal) apart from
+    # "test files were scaffolded but none ran" (the ses_4cbf963cdc67435a
+    # blind spot: React tests present, silently never executed).
+    tests_present: Optional[bool] = None
 
 
 _IMPORT_RE = re.compile(r"^\s*(?:from\s+([\w.]+)\s+import|import\s+([\w.]+))", re.MULTILINE)
