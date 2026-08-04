@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=83.0.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -32,14 +32,14 @@ dependencies = [
 embeddings = [
   "sentence-transformers>=2.7",
   "transformers>=4.40,<6",
-  "torch>=2.1",
+  "torch>=2.13.0",
 ]
 faiss = ["faiss-cpu>=1.7"]
 ui = [
   "fastapi>=0.115",
   "uvicorn[standard]>=0.30",
   "sse-starlette>=2.1",
-  "python-multipart>=0.0.9",
+  "python-multipart>=0.0.31",
 ]
 codegen = ["unidiff>=0.7"]
 keyring = ["keyring>=24"]
@@ -60,12 +60,12 @@ dev = [
 all = [
   "sentence-transformers>=2.7",
   "transformers>=4.40,<6",
-  "torch>=2.1",
+  "torch>=2.13.0",
   "faiss-cpu>=1.7",
   "fastapi>=0.115",
   "uvicorn[standard]>=0.30",
   "sse-starlette>=2.1",
-  "python-multipart>=0.0.9",
+  "python-multipart>=0.0.31",
   "unidiff>=0.7",
   "keyring>=24",
   "matplotlib>=3.7",
