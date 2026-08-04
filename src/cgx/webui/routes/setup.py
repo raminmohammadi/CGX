@@ -20,6 +20,7 @@ import ipaddress
 import json as _json
 import logging
 import socket
+import re
 import threading
 from urllib.parse import urlparse
 
@@ -95,15 +96,17 @@ def ping_provider(req: PingRequest) -> PingResponse:
             if not api_key:
                 return PingResponse(ok=False, error="Gemini requires an API key")
             model = req.model or "gemini-2.5-flash"
+            if not re.fullmatch(r"[A-Za-z0-9._-]+", model):
+                return PingResponse(ok=False, error="Invalid Gemini model name")
             url = (
-                f"https://generativelanguage.googleapis.com/v1beta/models/"
-                f"{model}:generateContent?key={api_key}"
+                "https://generativelanguage.googleapis.com/v1beta/models/"
+                f"{model}:generateContent"
             )
             body = {
                 "contents": [{"role": "user", "parts": [{"text": "ping"}]}],
                 "generationConfig": {"maxOutputTokens": 1},
             }
-            r = _req.post(url, json=body, timeout=15)
+            r = _req.post(url, params={"key": api_key}, json=body, timeout=15)
             r.raise_for_status()
 
         else:
