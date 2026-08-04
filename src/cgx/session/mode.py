@@ -39,7 +39,8 @@ _IGNORE_DIRS = frozenset({
 
 
 def _has_usable_index(index_dir: Optional[str],
-                      records_path: Optional[str]) -> bool:
+                      records_path: Optional[str],
+                      project_root: Optional[str] = None) -> bool:
     """True iff ``index_dir`` + ``records_path`` look like a real index.
 
     A "usable" index has both the FAISS meta + the records file. We
@@ -49,10 +50,20 @@ def _has_usable_index(index_dir: Optional[str],
     if not index_dir or not records_path:
         return False
     try:
-        # Normalize both paths first.
+        # Normalize paths first.
         base = os.path.realpath(index_dir)
         meta = os.path.join(base, "meta.json")
         rec = os.path.realpath(records_path)
+
+        # If a project root is known, constrain both index artifacts to it.
+        # This prevents request-controlled absolute/relative paths from
+        # probing arbitrary filesystem locations.
+        if project_root:
+            project = os.path.realpath(project_root)
+            if os.path.commonpath([project, base]) != project:
+                return False
+            if os.path.commonpath([project, rec]) != project:
+                return False
 
         # Constrain ``records_path`` to the same index workspace as
         # ``index_dir`` (default sibling layout under one root, e.g.
@@ -116,6 +127,6 @@ def detect_mode(*, project_root: Optional[str] = None,
     """
     if _project_is_empty(project_root):
         return SessionMode.GREENFIELD
-    if not _has_usable_index(index_dir, records_path):
+    if not _has_usable_index(index_dir, records_path, project_root):
         return SessionMode.GREENFIELD
     return SessionMode.EXPLORE
