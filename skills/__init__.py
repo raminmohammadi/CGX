@@ -4,13 +4,17 @@ A *skill* encapsulates everything CGX knows about one technology
 (framework, language runtime, library, build tool). Skills are
 consulted by:
 
-* :mod:`cgx.agents.planner` -- to decide whether a goal describes a
-  scaffold/change involving a known technology (the new
-  scaffold-detection signal).
-* :mod:`cgx.answer.engine` -- to compose technology-specific
-  instructions into the LLM system prompt for scaffold + plan tasks.
-* :mod:`cgx.agents.judge` -- to run technology-specific structural
-  checks on produced diffs.
+* :mod:`cgx.answer.engine` -- to detect which technologies a goal
+  involves (``detect_skills``) and to compose technology-specific
+  instructions into the LLM system prompt for scaffold + plan tasks
+  (``compose_scaffold_prompt`` / ``compose_plan_prompt``).
+* :mod:`cgx.session.tasks.scaffold` -- to run technology-specific
+  structural checks on the produced diffs (``validate_scaffold`` /
+  ``collect_scaffold_warnings``); a fatal verdict drives the router's
+  whole-tree scaffold regenerate.
+* :mod:`cgx.session.tasks.plan_change` -- to run ``validate_plan``
+  over a proposed code-change plan and surface the verdict at the
+  approval gate.
 
 Skills are listed explicitly in :data:`SKILLS` so the surface is
 auditable and import order is deterministic. To add a new built-in

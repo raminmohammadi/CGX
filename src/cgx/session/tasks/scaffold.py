@@ -102,6 +102,12 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     # auto-detecting from ``goal`` exactly as before.
     skills = session_skills(task, deps)
 
+    # Capture the base objective for the post-generation skill gate before
+    # the regenerate/lesson augmentation below rewrites ``goal``; skill
+    # detection keys on the original objective, not the folded-in
+    # prior-failure constraints.
+    skill_detect_goal = goal
+
     # Phase 6.1: when REPAIR routed a regenerate verdict here, fold the
     # accumulated constraint payloads into the goal so the per-file
     # generator sees the prior-failure context. Each entry is a small
@@ -701,6 +707,43 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     if response_warnings:
         contract_warnings = list(contract_warnings) + response_warnings
 
+    # Skill-structural gate: run the active technology skills' structural
+    # validators over the produced diffs. A fatal verdict (e.g. a React
+    # goal that emitted no JS/TS source, or a FastAPI goal with no Python
+    # app module) is recorded as ``skill_verdict`` the router turns into a
+    # whole-tree regenerate; advisory verdicts (missing tests, etc.) ride
+    # along as ``skill_warnings``. Active skills are resolved exactly as
+    # the generator resolved them -- an explicit pinned list, else
+    # detection over the base objective. Best-effort and non-fatal: any
+    # failure in the skills layer degrades to no verdict so the scaffold
+    # is never blocked by the checker itself.
+    skill_verdict: Optional[Dict[str, Any]] = None
+    skill_warnings: List[Dict[str, Any]] = []
+    try:
+        import skills as _sk
+        active_skills = (_sk.skills_by_names(skills) if skills
+                         else _sk.detect_skills(skill_detect_goal))
+        fatal = _sk.validate_scaffold(active_skills, diffs,
+                                      goal=skill_detect_goal)
+        if fatal is not None:
+            skill_verdict = {
+                "skill": fatal.skill,
+                "confidence": fatal.confidence,
+                "rationale": fatal.rationale,
+            }
+        for w in _sk.collect_scaffold_warnings(active_skills, diffs,
+                                               goal=skill_detect_goal):
+            skill_warnings.append({
+                "skill": w.skill,
+                "confidence": w.confidence,
+                "rationale": w.rationale,
+                "severity": w.severity,
+            })
+    except Exception:  # pragma: no cover - defensive: gate is best-effort
+        logger.exception("SCAFFOLD: skill validation raised; skipping")
+        skill_verdict = None
+        skill_warnings = []
+
     # Finalise the checkpoint artifact in place: pin validation reassigns
     # ``diffs`` to a new list, so re-point the content at it, attach the
     # adjustment log, and flip ``complete``. Same artifact_id, so the
@@ -711,6 +754,8 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     artifact.content["pin_adjustments"] = pin_adjustments
     artifact.content["import_warnings"] = import_warnings
     artifact.content["contract_warnings"] = contract_warnings
+    artifact.content["skill_verdict"] = skill_verdict
+    artifact.content["skill_warnings"] = skill_warnings
     artifact.content["reconciled_count"] = reconciled_count
     artifact.content["js_deps_added"] = js_deps_added
     artifact.content["synthesized_modules"] = synthesized_modules
@@ -726,6 +771,9 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             "import_warnings_count": len(import_warnings),
             "contract_warnings_count": len(contract_warnings),
             "contract_warnings": contract_warnings,
+            "skill_verdict": skill_verdict,
+            "skill_warnings": skill_warnings,
+            "skill_warnings_count": len(skill_warnings),
             "reconciled_count": reconciled_count,
             "js_deps_added": js_deps_added,
             "synthesized_modules": synthesized_modules,

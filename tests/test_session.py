@@ -11615,6 +11615,117 @@ def test_router_scaffold_contract_skipped_when_files_dropped():
     assert _scaffold_contract_regenerate_actions(scaffold, [scaffold]) == []
 
 
+# ------------- skill-structural regenerate gate -------------
+
+def _make_clean_scaffold_with_skill_verdict(verdict, *, prior_regens=0,
+                                            failed_count=0):
+    from cgx.session.models import SessionMode
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    scaffold = TaskNode.new(
+        session.session_id, TaskKind.SCAFFOLD, "scaffold",
+        inputs={"work_plan_artifact_id": "art_plan",
+                "regenerate_attempt": prior_regens})
+    scaffold.status = TaskNodeStatus.DONE
+    scaffold.outputs = {"scaffold_artifact_id": "art_s",
+                        "generated_count": 5, "failed_count": failed_count,
+                        "skill_verdict": verdict}
+    return session, scaffold
+
+
+def test_router_scaffold_skill_verdict_regenerates_within_budget():
+    # A clean scaffold that recorded a fatal skill verdict regenerates with
+    # the unmet-skill rationale folded in (early return, so the only created
+    # task is the fresh SCAFFOLD -- not the APPLY successor).
+    session, scaffold = _make_clean_scaffold_with_skill_verdict(
+        {"skill": "react", "confidence": 0.9,
+         "rationale": "scaffold has no .jsx/.tsx/.js/.ts files."})
+    plan = Router().on_task_completed(
+        session=session, completed=scaffold, tasks=[scaffold])
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    assert len(creates) == 1
+    new_scaffold = creates[0].task
+    assert new_scaffold.kind is TaskKind.SCAFFOLD
+    assert new_scaffold.inputs["regenerate_attempt"] == 1
+    payloads = new_scaffold.inputs["regenerate_constraints"]
+    assert payloads and payloads[-1]["kind"] == "unmet_skill"
+    assert payloads[-1]["skill"] == "react"
+    assert ".jsx" in payloads[-1]["rationale"]
+
+
+def test_react_skill_python_only_scaffold_regenerates_via_router():
+    # End-to-end: the real react skill judges a Python-only scaffold fatal,
+    # and that verdict drives the router's whole-tree regenerate -- the
+    # promise that a React goal never silently passes a Python-only output.
+    from skills import detect_skills, validate_scaffold
+    active = detect_skills("build a react app for tracking tasks")
+    assert any(s.name == "react" for s in active)
+    diffs = [{"file": "app.py", "patch": "print('hello')"},
+             {"file": "requirements.txt", "patch": "flask\n"}]
+    verdict = validate_scaffold(active, diffs, goal="build a react app")
+    assert verdict is not None and verdict.skill == "react"
+
+    session, scaffold = _make_clean_scaffold_with_skill_verdict(
+        {"skill": verdict.skill, "confidence": verdict.confidence,
+         "rationale": verdict.rationale})
+    plan = Router().on_task_completed(
+        session=session, completed=scaffold, tasks=[scaffold])
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    assert len(creates) == 1
+    assert creates[0].task.kind is TaskKind.SCAFFOLD
+    payloads = creates[0].task.inputs["regenerate_constraints"]
+    assert payloads[-1]["kind"] == "unmet_skill"
+
+
+def test_router_scaffold_skill_skipped_when_files_dropped():
+    # failed_count > 0 belongs to the dropped-files path; the skill gate
+    # defers so the two regenerates never race on the same scaffold.
+    from cgx.session.greenfield_edges import (
+        _scaffold_skill_regenerate_actions,
+    )
+    _session, scaffold = _make_clean_scaffold_with_skill_verdict(
+        {"skill": "react", "confidence": 0.9, "rationale": "no js"},
+        failed_count=1)
+    assert _scaffold_skill_regenerate_actions(scaffold, [scaffold]) == []
+
+
+def test_router_scaffold_skill_non_terminal_when_budget_spent():
+    # Budget spent -> helper returns nothing (non-terminal): the caller then
+    # takes the normal SCAFFOLD -> APPLY edge instead of failing the session.
+    from cgx.session.budget import REGENERATE_BUDGET
+    from cgx.session.greenfield_edges import (
+        _scaffold_skill_regenerate_actions,
+    )
+    _session, scaffold = _make_clean_scaffold_with_skill_verdict(
+        {"skill": "react", "confidence": 0.9, "rationale": "no js"},
+        prior_regens=REGENERATE_BUDGET)
+    assert _scaffold_skill_regenerate_actions(scaffold, [scaffold]) == []
+
+
+def test_router_scaffold_skill_repeat_is_non_terminal():
+    """The same skill verdict twice stops the loop (flap backstop)."""
+    from cgx.session.greenfield_edges import (
+        _scaffold_skill_regenerate_actions,
+    )
+    _session, scaffold = _make_clean_scaffold_with_skill_verdict(
+        {"skill": "react", "confidence": 0.9, "rationale": "no js"})
+    first = _scaffold_skill_regenerate_actions(scaffold, [scaffold])
+    retry = [a for a in first if isinstance(a, CreateTask)][0].task
+    signatures = retry.inputs["prior_failure_signatures"]
+    assert signatures
+    scaffold.inputs["prior_failure_signatures"] = signatures
+    assert _scaffold_skill_regenerate_actions(scaffold, [scaffold]) == []
+
+
+def test_router_scaffold_no_skill_verdict_takes_normal_edge():
+    # No verdict recorded -> the skill gate declines (empty), so the caller
+    # falls through to the normal SCAFFOLD -> APPLY successor.
+    from cgx.session.greenfield_edges import (
+        _scaffold_skill_regenerate_actions,
+    )
+    _session, scaffold = _make_clean_scaffold_with_skill_verdict(None)
+    assert _scaffold_skill_regenerate_actions(scaffold, [scaffold]) == []
+
+
 # ------------- P0b: payload-mismatch targeted regenerate -------------
 
 def _payload_warning(file="src/components/Calculator.jsx"):

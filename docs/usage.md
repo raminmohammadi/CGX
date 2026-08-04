@@ -1240,9 +1240,15 @@ CGX ships with a registry of per-technology *skills* (`skills/<name>/`)
 that activate automatically when the objective mentions them. Each
 active skill injects technology-specific instructions into the
 scaffold / plan prompts composed by `cgx.answer.engine`, and defines a
-structural validator (`skills.validate_scaffold` / `validate_plan`)
-callers can run against the produced diffs, so a goal asking for React
-never silently passes a Python-only output.
+structural validator that runs on the produced diffs. The SCAFFOLD
+executor calls `skills.validate_scaffold` after each generation: a fatal
+verdict is recorded on the scaffold artifact and the session router
+turns it into a whole-tree regenerate (bounded by the shared regenerate
+budget), so a goal asking for React never silently passes a Python-only
+output. Advisory verdicts (`skills.collect_scaffold_warnings`, e.g. a
+missing test file) ride along without failing the task, and
+PLAN_CHANGE runs `skills.validate_plan` to surface a verdict at the
+approval gate.
 
 | Skill        | Activates on (examples)                                  | Structural check            |
 |--------------|----------------------------------------------------------|-----------------------------|

@@ -1434,6 +1434,19 @@ Django, Express, Python CLI, and SQLite.
   provided names back to instances (or re-detect from the goal via
   `detect_skills`), then concatenate `compose_*_prompt(active)` onto
   the base system prompt with an `ACTIVE SKILLS:` header.
+- **Structural gate**: after generation, `cgx.session.tasks.scaffold`
+  runs `validate_scaffold(active, diffs, goal)` over the produced
+  diffs. A fatal `SkillVerdict` is recorded on the `SCAFFOLD_PATCHES`
+  artifact (and mirrored into the task `outputs` as `skill_verdict`),
+  which the router guard `_scaffold_skill_regenerate_actions` turns
+  into a whole-tree regenerate -- bounded by the shared
+  `REGENERATE_BUDGET` and a per-skill flap signature, and non-terminal
+  (a spent budget or a repeated verdict falls through to `APPLY` so
+  `VERIFY` makes the final call). Advisory verdicts from
+  `collect_scaffold_warnings` ride along as `skill_warnings` without
+  failing the task. `cgx.session.tasks.plan_change` runs
+  `validate_plan` and surfaces the verdict at the approval gate
+  (advisory, since plans are user-approved rather than auto-looped).
 
 Adding a new skill: create `skills/<name>/__init__.py` with a single
 `Skill` subclass, import it from `skills/__init__.py`, and append an
