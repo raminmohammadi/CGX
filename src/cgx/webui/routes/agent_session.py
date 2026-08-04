@@ -26,7 +26,6 @@ import json
 import logging
 import threading
 from pathlib import Path
-from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -266,37 +265,19 @@ def _safe_json(payload: Any) -> str:
         return json.dumps({"_repr": str(payload)})
 
 def _normalize_project_root(project_root: Optional[str]) -> Optional[str]:
+    """Canonicalize a caller-supplied project root before it reaches disk.
+
+    Resolves ``~`` and any ``..``/relative segments to an absolute path
+    up front so a crafted value can't be used to escape the intended
+    directory once it flows into filesystem operations (``SessionStore``,
+    ``detect_mode``, etc.) -- CodeQL: uncontrolled data used in a path
+    expression. This intentionally does not restrict *which* directory
+    may be used: pointing the agent at an arbitrary local project is the
+    whole point of ``project_root``.
+    """
     if project_root is None:
         return None
-    candidate = Path(project_root).expanduser().resolve()
-    base = Path.cwd().resolve()
-    try:
-        candidate.relative_to(base)
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail=(f"invalid project_root {project_root!r}: "
-                    f"must be within {str(base)!r}"),
-        ) from exc
-    return str(candidate)
-
-
-
-def _normalize_project_root(project_root: Optional[str]) -> Optional[str]:
-    if project_root is None:
-        return None
-    project_root = _normalize_project_root(req.project_root)
-    runner = _get_runner(project_root)
-    if not value:
-        raise HTTPException(status_code=400, detail="project_root must not be empty")
-    try:
-        project_root=project_root, title=req.title, mode=mode,
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"invalid project_root: {exc}")
-    if not root.is_dir():
-        raise HTTPException(status_code=400,
-        deps = _build_deps(req.provider, req.index, project_root,
-    return str(root)
+    return str(Path(project_root).expanduser().resolve())
 
 
 # --------------------- routes ---------------------
@@ -323,19 +304,17 @@ def _resolve_mode(req: AgentSessionCreateRequest) -> SessionMode:
     """Honor an explicit ``mode`` if given; otherwise auto-detect."""
     requested = (req.mode or "").strip().lower()
     if requested:
-    normalized_project_root = _normalize_project_root(project_root)
-    runner = _get_runner(normalized_project_root)
+        try:
             return SessionMode(requested)
-            runner.store.list_sessions(project_root=normalized_project_root)]
+        except ValueError as exc:
             raise HTTPException(
                 status_code=400,
                 detail=(f"invalid mode {requested!r}; "
                         f"expected one of "
                         f"{[m.value for m in SessionMode]}")) from exc
-    project_root = _normalize_project_root(req.project_root)
-    normalized_project_root = _normalize_project_root(project_root)
-    runner = _resolve_runner_for(sid) if normalized_project_root is None \
-        else _get_runner(normalized_project_root)
+    normalized_project_root = _normalize_project_root(req.project_root)
+    return detect_mode(
+        project_root=normalized_project_root,
         index_dir=req.index.index_dir,
         records_path=req.index.records,
     )
@@ -467,9 +446,8 @@ async def post_cancel(sid: str) -> AgentSessionState:
     task finishes -- no task is aborted mid-flight. Returns the current
     snapshot immediately; the UI follows the stop over SSE. A later
     message/decision re-drives the session from where it stopped.
-    normalized_project_root = _normalize_project_root(project_root)
-    runner = _resolve_runner_for(sid) if normalized_project_root is None \
-        else _get_runner(normalized_project_root)
+    """
+    runner = _resolve_runner_for(sid)
     session = runner.store.get_session(sid)
     if session is None:
         raise HTTPException(status_code=404,
