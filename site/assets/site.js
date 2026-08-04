@@ -5,17 +5,27 @@
   "use strict";
 
   // ------------------------------------------------------------ surface tabs
-  var tablist = document.querySelector('[role="tablist"]');
+  var tablist = document.querySelector(".tabs[role='tablist']");
   if (tablist) {
     var tabs = Array.prototype.slice.call(tablist.querySelectorAll('[role="tab"]'));
+    var ink = tablist.querySelector(".tab-ink");
+    if (ink) tablist.setAttribute("data-ink", "1");
+
+    function moveInk(tab) {
+      if (!ink || !tab) return;
+      ink.style.width = tab.offsetWidth + "px";
+      ink.style.transform = "translateX(" + tab.offsetLeft + "px)";
+    }
 
     function select(tab) {
       tabs.forEach(function (t) {
         var on = t === tab;
         t.setAttribute("aria-selected", on ? "true" : "false");
+        t.tabIndex = on ? 0 : -1;
         var panel = document.getElementById(t.getAttribute("aria-controls"));
         if (panel) panel.hidden = !on;
       });
+      moveInk(tab);
     }
 
     tabs.forEach(function (tab, i) {
@@ -28,6 +38,64 @@
         e.preventDefault();
         var next = tabs[(i + delta + tabs.length) % tabs.length];
         select(next);
+        next.focus();
+      });
+    });
+
+    var initial = tabs.filter(function (t) {
+      return t.getAttribute("aria-selected") === "true";
+    })[0] || tabs[0];
+    moveInk(initial);
+    window.addEventListener("load", function () {
+      moveInk(
+        tabs.filter(function (t) {
+          return t.getAttribute("aria-selected") === "true";
+        })[0] || tabs[0],
+      );
+    });
+    window.addEventListener(
+      "resize",
+      function () {
+        moveInk(
+          tabs.filter(function (t) {
+            return t.getAttribute("aria-selected") === "true";
+          })[0] || tabs[0],
+        );
+      },
+      { passive: true },
+    );
+  }
+
+  // ------------------------------------------------------- agent mode toggle
+  var modeSwitch = document.querySelector(".mode-switch");
+  if (modeSwitch) {
+    var modeBtns = Array.prototype.slice.call(modeSwitch.querySelectorAll(".mode-btn"));
+
+    function selectMode(btn) {
+      modeBtns.forEach(function (b) {
+        var on = b === btn;
+        b.classList.toggle("is-active", on);
+        b.setAttribute("aria-selected", on ? "true" : "false");
+        b.tabIndex = on ? 0 : -1;
+        var panel = document.getElementById(b.getAttribute("aria-controls"));
+        if (panel) panel.hidden = !on;
+      });
+      modeSwitch.setAttribute(
+        "data-active",
+        btn.id === "mode-greenfield" ? "greenfield" : "explore",
+      );
+    }
+
+    modeBtns.forEach(function (btn, i) {
+      btn.addEventListener("click", function () {
+        selectMode(btn);
+      });
+      btn.addEventListener("keydown", function (e) {
+        var delta = e.key === "ArrowRight" ? 1 : e.key === "ArrowLeft" ? -1 : 0;
+        if (!delta) return;
+        e.preventDefault();
+        var next = modeBtns[(i + delta + modeBtns.length) % modeBtns.length];
+        selectMode(next);
         next.focus();
       });
     });
