@@ -31,7 +31,7 @@ import threading
 import time
 from typing import Any, Callable, Optional
 
-from cgx.logging_setup import scrub_secrets
+from cgx.logging_setup import redact_secrets
 
 logger = logging.getLogger(__name__)
 
@@ -147,7 +147,7 @@ def request_with_retry(
             # in the URL (Gemini's ``?key=``) that would leak the key into
             # the logs. This retry helper is provider-agnostic, so scrub the
             # rendered message here rather than relying on each provider.
-            msg = scrub_secrets(str(e))
+            msg = redact_secrets(str(e))
             if retryable is not None and not retryable(e):
                 logger.warning("ratelimit: non-retryable exception %s: %s",
                                type(e).__name__, msg)

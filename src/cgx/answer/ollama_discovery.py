@@ -103,10 +103,19 @@ def list_installed_models(base_url: str = DEFAULT_BASE_URL) -> List[Dict[str, An
 
 def health_check(base_url: str = DEFAULT_BASE_URL) -> Dict[str, Any]:
     """Return a small status dict suitable for surfacing in the UI."""
+    # The error strings below deliberately omit the raw exception text: this
+    # dict is returned straight to the Web UI (``/health/ollama``), so echoing
+    # ``str(e)`` would surface internal detail (py/stack-trace-exposure). The
+    # full exception is logged server-side for diagnostics instead.
     try:
         url = validate_base_url(base_url)
     except ValueError as e:
-        return {"ok": False, "base_url": base_url, "error": str(e)}
+        # ``base_url`` is untrusted (typed on the Settings page), so strip any
+        # CR/LF before logging: unescaped line breaks would let a caller forge
+        # extra log records (py/log-injection, CWE-117).
+        safe_base_url = base_url.replace("\n", " ").replace("\r", " ")
+        logger.warning("ollama health_check: invalid base_url %r", safe_base_url)
+        return {"ok": False, "base_url": base_url, "error": "invalid base_url"}
     try:
         r = requests.get(url + "/api/tags", timeout=DEFAULT_TIMEOUT)
         ok = r.ok
@@ -117,7 +126,9 @@ def health_check(base_url: str = DEFAULT_BASE_URL) -> Dict[str, Any]:
             "models_count": len((r.json() or {}).get("models", [])) if ok else 0,
         }
     except Exception as e:
-        return {"ok": False, "base_url": url, "error": f"{type(e).__name__}: {e}"}
+        logger.warning("ollama health_check: request to %r failed: %s",
+                       url, type(e).__name__)
+        return {"ok": False, "base_url": url, "error": type(e).__name__}
 
 
 def list_running_models(base_url: str = DEFAULT_BASE_URL) -> List[Dict[str, Any]]:

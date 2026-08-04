@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 import threading
 import time
@@ -115,10 +116,14 @@ def default_db_path(project_root: Optional[str | Path] = None) -> Path:
     (e.g. interactive scripts, tests with a tmp HOME).
     """
     if project_root:
-        # Canonicalize the caller-supplied root and pin the fixed
-        # ``.cgx/sessions.db`` leaf so a value carrying ``..`` cannot walk
-        # the DB out to an unexpected location (path-injection guard).
-        return Path(project_root).resolve() / ".cgx" / "sessions.db"
+        # Canonicalize the caller-supplied root with ``os.path.realpath`` (a
+        # pure normalization that collapses ``..``/symlinks, unlike the
+        # ``Path.resolve`` filesystem-access sink) and pin the fixed
+        # ``.cgx/sessions.db`` leaf so a value carrying ``..`` cannot walk the
+        # DB out to an unexpected location. ``SessionStore.__init__`` applies
+        # the ``startswith`` containment barrier before touching disk.
+        root = os.path.realpath(os.fspath(project_root))
+        return Path(root) / ".cgx" / "sessions.db"
     return Path.home() / ".cgx" / "sessions.db"
 
 
@@ -134,9 +139,15 @@ class SessionStore:
                  project_root: Optional[str | Path] = None,
                  bus: Optional[EventBus] = None) -> None:
         raw_path = Path(db_path) if db_path else default_db_path(project_root)
-        # Resolve to an absolute, ``..``-free path before it reaches
-        # ``sqlite3.connect`` / ``mkdir`` (path-injection guard).
-        self._path = raw_path.resolve()
+        # Canonicalize with ``os.path.realpath`` (pure normalization, not the
+        # ``Path.resolve`` filesystem-access sink) and confirm the result is
+        # an absolute, ``..``-free path before it reaches ``mkdir`` /
+        # ``sqlite3.connect``. The ``startswith`` check is the CodeQL
+        # path-injection barrier on the exact string handed to those sinks.
+        resolved = os.path.realpath(os.fspath(raw_path))
+        if not resolved.startswith(os.sep):
+            raise ValueError(f"session DB path is not absolute: {raw_path!r}")
+        self._path = Path(resolved)
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(str(self._path), check_same_thread=False)

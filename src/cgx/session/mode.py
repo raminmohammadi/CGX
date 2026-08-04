@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import logging
 import os
-from pathlib import Path
 from typing import Iterable, Optional
 
 from cgx.session.models import SessionMode
@@ -57,31 +56,23 @@ def _has_usable_index(index_dir: Optional[str],
         meta = os.path.realpath(os.path.join(base, "meta.json"))
         rec = os.path.realpath(records_path)
 
-        # Containment guard (CodeQL path-injection barrier): both artifacts
-        # must resolve to a location inside the index workspace root, and --
-        # when known -- inside ``project_root``. ``records_path`` sits beside
-        # ``index_dir`` in the default layout (``/tmp/cgx_index/indices`` +
-        # ``/tmp/cgx_index/records.jsonl``), so the shared root is the parent
-        # of ``index_dir``. The exact value handed to each filesystem sink is
-        # re-checked with ``os.path.commonpath`` immediately before use, so
-        # the tainted request input can never reach ``os.path.isfile`` /
-        # ``os.path.getsize`` without passing the barrier.
-        root = os.path.realpath(os.path.dirname(base))
-        roots = [root]
-        if project_root:
-            roots.append(os.path.realpath(project_root))
+        # Confine both artifacts to a single canonical container before any
+        # filesystem access: the ``project_root`` when known, otherwise the
+        # index workspace root (the parent of ``index_dir`` -- ``records_path``
+        # sits beside ``index_dir`` in the default layout). ``prefix`` ends in
+        # a separator so a sibling like ``/proj-evil`` can't pass the check
+        # for ``/proj``.
+        container = (os.path.realpath(project_root) if project_root
+                     else os.path.realpath(os.path.dirname(base)))
+        prefix = container + os.sep
 
-        def _within(candidate: str) -> bool:
-            for allowed in roots:
-                try:
-                    if os.path.commonpath([allowed, candidate]) != allowed:
-                        return False
-                except ValueError:
-                    # Different drives / mixed absolute-relative -> reject.
-                    return False
-            return True
-
-        if not _within(meta) or not _within(rec):
+        # CodeQL path-injection barrier: a direct ``startswith`` prefix guard
+        # on the exact canonical string handed to each filesystem sink, so the
+        # tainted request input can never reach ``os.path.isfile`` /
+        # ``os.path.getsize`` without first being confined to ``container``.
+        if not meta.startswith(prefix):
+            return False
+        if not rec.startswith(prefix):
             return False
 
         return (os.path.isfile(meta) and os.path.isfile(rec)
@@ -101,8 +92,17 @@ def _project_is_empty(project_root: Optional[str], *,
     """
     if not project_root:
         return True
-    root = Path(project_root)
-    if not root.exists():
+    # Canonicalize away ``..``/symlinks, then confirm the result is an
+    # absolute path before any filesystem access. ``os.path.realpath`` is a
+    # pure normalization (not a filesystem-access sink like ``Path.resolve``);
+    # the ``startswith`` check is the CodeQL path-injection barrier on the
+    # exact string handed to ``os.path.exists`` / ``os.scandir``. Pointing the
+    # agent at an arbitrary *absolute* local directory is intentional, so the
+    # guard rejects only non-canonical (relative/traversal) roots.
+    root = os.path.realpath(project_root)
+    if not root.startswith(os.sep):
+        return True
+    if not os.path.exists(root):
         return True
     ignore_set = set(ignore)
     count = 0

@@ -23,7 +23,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
-from cgx.logging_setup import scrub_secrets
+from cgx.logging_setup import redact_secrets
 
 
 logger = logging.getLogger(__name__)
@@ -154,7 +154,7 @@ def append_message(session_id: str, role: str, content: str,
               "at": time.time(), "meta": (meta or {})}
     # Redact any credential-shaped token (Gemini ?key=, api_key=, Bearer)
     # before it lands on disk so a pasted secret is never persisted verbatim.
-    line = scrub_secrets(json.dumps(record, ensure_ascii=False))
+    line = redact_secrets(json.dumps(record, ensure_ascii=False))
     with _path_for(session_id).open("a", encoding="utf-8") as f:
         f.write(line + "\n")
     # Update header.

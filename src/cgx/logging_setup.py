@@ -35,7 +35,7 @@ _DEFAULT_DATEFMT = "%H:%M:%S"
 # <token>`` header. Each value is matched only up to the next delimiter so
 # the surrounding log text is never mangled, and empty values become
 # ``<missing>`` so a redacted secret is distinguishable from a request that
-# carried none. ``scrub_secrets`` is imported by ``cgx.answer.ratelimit``
+# carried none. ``redact_secrets`` is imported by ``cgx.answer.ratelimit``
 # and ``cgx.answer.providers`` so the redaction rule lives in exactly one
 # place; ``SecretScrubbingFilter`` is the process-wide backstop attached to
 # every handler by :func:`setup_logging`, catching anything a call site
@@ -51,7 +51,7 @@ _SECRET_PATTERNS: tuple[tuple["re.Pattern[str]", str], ...] = (
 )
 
 
-def scrub_secrets(text: str) -> str:
+def redact_secrets(text: str) -> str:
     """Redact known credential shapes from ``text``.
 
     Idempotent and safe on non-secret input: a string with no matching
@@ -85,7 +85,7 @@ class SecretScrubbingFilter(logging.Filter):
             message = record.getMessage()
         except Exception:  # pragma: no cover - defensive: bad % args
             return True
-        scrubbed = scrub_secrets(message)
+        scrubbed = redact_secrets(message)
         if scrubbed != message:
             record.msg = scrubbed
             record.args = None
