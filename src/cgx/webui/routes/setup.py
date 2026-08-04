@@ -16,10 +16,8 @@ import time
 from typing import List, Optional
 
 import asyncio
-import ipaddress
 import json as _json
 import logging
-import socket
 import re
 import threading
 from urllib.parse import urlparse
@@ -267,7 +265,11 @@ _GEMINI_NONCHAT_SUBSTR = (
 def _gemini_list(api_key: str) -> List[str]:
     import requests as _req
     url = "https://generativelanguage.googleapis.com/v1beta/models"
-    r = _req.get(url, params={"key": api_key}, timeout=15)
+    # The API key travels in the x-goog-api-key header, never the query
+    # string, so it can't leak into request logs/proxies or taint the URL
+    # (matches GeminiProvider._auth_headers).
+    headers = {"x-goog-api-key": api_key} if api_key else {}
+    r = _req.get(url, headers=headers, timeout=15)
     try:
         r.raise_for_status()
     except Exception as exc:
@@ -303,40 +305,6 @@ def _validate_openai_base_url(base_url: str) -> str:
     if not parsed.hostname:
         raise ValueError("Invalid base_url host")
 
-    host = parsed.hostname.strip().lower()
-    if host == "localhost" or host.endswith(".localhost"):
-        raise ValueError("Localhost is not allowed in base_url")
-
-    # Resolve and block private/internal targets to reduce SSRF risk.
-    try:
-        addrinfos = socket.getaddrinfo(parsed.hostname, parsed.port or None, type=socket.SOCK_STREAM)
-    except socket.gaierror as exc:
-        raise ValueError(f"Unable to resolve base_url host: {exc}") from exc
-
-    if not addrinfos:
-        raise ValueError("Unable to resolve base_url host")
-
-    for info in addrinfos:
-        sockaddr = info[4]
-        if not sockaddr:
-            continue
-        ip_txt = sockaddr[0]
-        try:
-            ip_obj = ipaddress.ip_address(ip_txt)
-        except ValueError:
-            raise ValueError("Resolved base_url host to an invalid IP address")
-
-        if (
-            ip_obj.is_private
-            or ip_obj.is_loopback
-            or ip_obj.is_link_local
-            or ip_obj.is_multicast
-            or ip_obj.is_reserved
-            or ip_obj.is_unspecified
-            or getattr(ip_obj, "is_site_local", False)
-        ):
-            raise ValueError("base_url resolves to a non-public IP address")
-
     # Disallow URL components that can alter request routing/semantics.
     if parsed.username or parsed.password:
         raise ValueError("Userinfo is not allowed in base_url")
@@ -347,38 +315,13 @@ def _validate_openai_base_url(base_url: str) -> str:
     if path not in ("", "/v1"):
         raise ValueError("Only empty path or /v1 is allowed in base_url")
 
-    host = parsed.hostname
-    host_l = host.lower()
-    if host_l == "localhost":
-        raise ValueError("Localhost is not allowed")
+    # The host allowlist is the SSRF barrier: model discovery can only ever
+    # reach an explicitly approved, public provider, so a user-supplied
+    # base_url can never be pointed at an internal/private service. The URL
+    # is then rebuilt from these validated, constant components.
+    host_l = parsed.hostname.lower()
     if host_l not in _OPENAI_ALLOWED_HOSTS:
         raise ValueError("Host is not in the allowed list")
-
-    def _reject_ip(ip_text: str) -> None:
-        ip = ipaddress.ip_address(ip_text)
-        if (
-            ip.is_private
-            or ip.is_loopback
-            or ip.is_link_local
-            or ip.is_multicast
-            or ip.is_reserved
-            or ip.is_unspecified
-        ):
-            raise ValueError("Non-public IP is not allowed")
-
-    try:
-        _reject_ip(host)
-    except ValueError:
-        raise
-    except Exception:
-        infos = socket.getaddrinfo(host, None)
-        if not infos:
-            raise ValueError("Unable to resolve host")
-        for info in infos:
-            sockaddr = info[4]
-            if not sockaddr:
-                continue
-            _reject_ip(sockaddr[0])
 
     netloc = host_l
     if parsed.port:
