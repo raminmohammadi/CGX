@@ -259,8 +259,8 @@ _GEMINI_NONCHAT_SUBSTR = (
 
 def _gemini_list(api_key: str) -> List[str]:
     import requests as _req
-    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
-    r = _req.get(url, timeout=15)
+    url = "https://generativelanguage.googleapis.com/v1beta/models"
+    r = _req.get(url, params={"key": api_key}, timeout=15)
     try:
         r.raise_for_status()
     except Exception as exc:
