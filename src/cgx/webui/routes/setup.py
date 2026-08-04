@@ -289,12 +289,22 @@ def _gemini_list(api_key: str) -> List[str]:
 
 
 def _validate_openai_base_url(base_url: str) -> str:
-    base = (base_url or "https://api.openai.com").strip().rstrip("/")
-    parsed = urlparse(base)
+    raw = (base_url or "https://api.openai.com").strip()
+    parsed = urlparse(raw)
     if parsed.scheme not in ("http", "https"):
         raise ValueError("Invalid base_url scheme")
     if not parsed.hostname:
         raise ValueError("Invalid base_url host")
+
+    # Disallow URL components that can alter request routing/semantics.
+    if parsed.username or parsed.password:
+        raise ValueError("Userinfo is not allowed in base_url")
+    if parsed.params or parsed.query or parsed.fragment:
+        raise ValueError("Params/query/fragment are not allowed in base_url")
+
+    path = (parsed.path or "").rstrip("/")
+    if path not in ("", "/v1"):
+        raise ValueError("Only empty path or /v1 is allowed in base_url")
 
     host = parsed.hostname
     host_l = host.lower()
@@ -329,7 +339,13 @@ def _validate_openai_base_url(base_url: str) -> str:
                 continue
             _reject_ip(sockaddr[0])
 
-    return base
+    netloc = host_l
+    if parsed.port:
+        netloc = f"{netloc}:{parsed.port}"
+    canonical = f"{parsed.scheme}://{netloc}"
+    if path == "/v1":
+        canonical += "/v1"
+    return canonical
 
 
 def _openai_list(base_url: str, api_key: str) -> List[str]:
