@@ -321,12 +321,9 @@ def _resolve_mode(req: AgentSessionCreateRequest) -> SessionMode:
     normalized_project_root = _normalize_project_root(req.project_root)
     normalized_index_dir = _normalize_project_root(req.index.index_dir)
     normalized_records_path = _normalize_project_root(req.index.records)
-    if normalized_index_dir and normalized_records_path:
-        index_root = os.path.realpath(os.path.dirname(
-            os.path.realpath(normalized_index_dir)))
-        candidate_records = os.path.realpath(normalized_records_path)
-        if os.path.commonpath([index_root, candidate_records]) != index_root:
-            normalized_records_path = None
+    # Containment of ``index_dir`` / ``records_path`` (and their relation to
+    # ``project_root``) is enforced inside ``_has_usable_index`` via the
+    # CodeQL-recognized ``startswith`` prefix guard, so no pre-check here.
     return detect_mode(
         project_root=normalized_project_root,
         index_dir=normalized_index_dir,
