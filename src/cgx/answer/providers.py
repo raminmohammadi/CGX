@@ -204,6 +204,10 @@ class OllamaProvider(LLMProvider):
         # Graceful degradation: an older Ollama (or a model without grammar
         # support) rejects a schema `format`. Retry once in plain JSON mode.
         if force_json and json_schema and getattr(resp, "status_code", 200) >= 400:
+            logger.warning(
+                "Ollama rejected schema format (status=%s); falling back to format='json'",
+                getattr(resp, "status_code", "?"),
+            )
             payload["format"] = "json"
             resp = _post()
         try:
@@ -383,6 +387,10 @@ class GeminiProvider(LLMProvider):
         # Graceful degradation: a rejected schema (400) drops back to plain
         # JSON mode, which every current Gemini model honours.
         if force_json and json_schema and getattr(resp, "status_code", 200) >= 400:
+            logger.warning(
+                "Gemini rejected responseSchema (status=%s); falling back to plain JSON mode",
+                getattr(resp, "status_code", "?"),
+            )
             body["generationConfig"].pop("responseSchema", None)
             resp = _post()
         try:

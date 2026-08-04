@@ -285,6 +285,12 @@ def _fmt_source(s: Dict[str, Any]) -> str:
     return head + "\n  " + body
 
 
+def _clean_json_candidate(candidate: str) -> str:
+    """Clean common local LLM formatting errors in a JSON string."""
+    # Strip trailing commas before closing braces/brackets
+    return re.sub(r",\s*([\]}])", r"\1", candidate)
+
+
 def _extract_json_object(text: str) -> Dict[str, Any]:
     """
     Extract the first top-level JSON object from `text`.
@@ -297,15 +303,19 @@ def _extract_json_object(text: str) -> Dict[str, Any]:
     """
     if not isinstance(text, str) or not text:
         return {}
-    # Fast path: the whole payload is already JSON (Ollama JSON mode).
+    # Fast path: the whole payload is already JSON (Ollama JSON mode or markdown-wrapped).
     s = text.strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```(?:json|JSON)?\s*", "", s)
+        s = re.sub(r"\s*```$", "", s).strip()
     if s.startswith("{") and s.endswith("}"):
-        try:
-            obj = json.loads(s)
-            if isinstance(obj, dict):
-                return obj
-        except Exception:
-            pass
+        for c_str in (s, _clean_json_candidate(s)):
+            try:
+                obj = json.loads(c_str)
+                if isinstance(obj, dict):
+                    return obj
+            except Exception:
+                pass
 
     n = len(text)
     i = 0
@@ -335,12 +345,13 @@ def _extract_json_object(text: str) -> Dict[str, Any]:
                     depth -= 1
                     if depth == 0:
                         candidate = text[i:j + 1]
-                        try:
-                            obj = json.loads(candidate)
-                            if isinstance(obj, dict):
-                                return obj
-                        except Exception:
-                            pass
+                        for c_str in (candidate, _clean_json_candidate(candidate)):
+                            try:
+                                obj = json.loads(c_str)
+                                if isinstance(obj, dict):
+                                    return obj
+                            except Exception:
+                                pass
                         break
             j += 1
         i = j + 1 if j > i else i + 1
@@ -2436,13 +2447,22 @@ def plan_scaffold_manifest(
                            resp.get("error"))
         return (resp or {}).get("content", "") if isinstance(resp, dict) else ""
 
+    def _coerce_manifest_layers(p: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(p, dict):
+            return p
+        if not p.get("layers") and isinstance(p.get("files"), list) and p["files"]:
+            p["layers"] = [{"name": "project", "files": p["files"]}]
+        elif isinstance(p.get("layers"), dict) and ("files" in p["layers"] or "name" in p["layers"]):
+            p["layers"] = [p["layers"]]
+        return p
+
     def _call(user_msg: str) -> Dict[str, Any]:
         messages = [
             {"role": "system", "content": system},
             {"role": "user", "content": user_msg},
         ]
         raw = _chat(messages)
-        parsed = _extract_json_object(raw) or {}
+        parsed = _coerce_manifest_layers(_extract_json_object(raw) or {})
         violations = validate_json_schema(parsed, MANIFEST_SCHEMA)
         if violations and reask_left[0]:
             reask_left[0] = 0
@@ -2457,7 +2477,7 @@ def plan_scaffold_manifest(
                   'optional "contracts" (object), and a non-empty "layers" '
                   'array of {"name", "files": [{"path", "description"}]}. '
                   "No prose outside JSON.")})
-            reparsed = _extract_json_object(_chat(messages)) or {}
+            reparsed = _coerce_manifest_layers(_extract_json_object(_chat(messages)) or {})
             if not validate_json_schema(reparsed, MANIFEST_SCHEMA):
                 return reparsed
         return parsed
@@ -3721,6 +3741,10 @@ def generate_single_scaffold_file(
         provider, system, context, budget, on_token)
     parsed = _extract_json_object(raw)
     content = str(parsed.get("content") or "") if parsed else ""
+    if not content and raw:
+        recovered = _first_fenced_block_body(raw)
+        if recovered and not (recovered.strip().startswith("{") and recovered.strip().endswith("}")):
+            content = recovered
 
     # The freeform path is also the escape hatch for a body whose newlines
     # the JSON encoder dropped: a fenced block carries real line breaks, so
@@ -4954,6 +4978,62 @@ def _validate_repair_source(path: str, content: str) -> Optional[str]:
     return None
 
 
+def _extract_repair_files_from_fences(
+    raw: str, known: Dict[str, str]
+) -> List[Dict[str, str]]:
+    """Recover repaired files from markdown fences when JSON parsing fails."""
+    if not isinstance(raw, str) or "```" not in raw or not known:
+        return []
+
+    entries: List[Dict[str, str]] = []
+    seen_paths: set = set()
+
+    # 1. Match code blocks with explicit path= header
+    for m in _CODE_FENCE_RE.finditer(raw):
+        path = m.group("path").strip()
+        body = (m.group("body") or "").rstrip("\n")
+        for kp in known:
+            if kp not in seen_paths and (kp == path or kp.endswith("/" + path) or path.endswith("/" + kp)):
+                entries.append({"path": kp, "content": body})
+                seen_paths.add(kp)
+                break
+
+    if entries:
+        return entries
+
+    # 2. Match code blocks with filename comment on first line
+    all_blocks = [
+        (m.group("body") or "").rstrip("\n")
+        for m in _ANY_CODE_FENCE_RE.finditer(raw)
+    ]
+    for body in all_blocks:
+        if not body:
+            continue
+        first_line = body.splitlines()[0].strip()
+        for kp in known:
+            if kp in seen_paths:
+                continue
+            base = kp.split("/")[-1]
+            if (
+                kp in first_line or base in first_line
+            ) and any(first_line.startswith(pfx) for pfx in ("#", "//", "/*", "*-", "--")):
+                entries.append({"path": kp, "content": body})
+                seen_paths.add(kp)
+                break
+
+    if entries:
+        return entries
+
+    # 3. Unambiguous single-file fallback
+    if len(known) == 1 and len(all_blocks) == 1:
+        body = all_blocks[0]
+        kp = list(known.keys())[0]
+        if body and not (body.strip().startswith("{") and "files" in body):
+            return [{"path": kp, "content": body}]
+
+    return []
+
+
 def generate_repair_files(
         provider: Any, *,
         goal: str,
@@ -5018,6 +5098,12 @@ def generate_repair_files(
     except Exception:  # pragma: no cover - defensive: provider hiccup
         return {}
     parsed = _extract_json_object(raw)
+    entries = parsed.get("files") if parsed else None
+    if not isinstance(entries, list) or not entries:
+        fence_entries = _extract_repair_files_from_fences(raw, known)
+        if fence_entries:
+            entries = fence_entries
+            parsed = {"files": fence_entries}
     violations = validate_json_schema(parsed or {}, REPAIR_FILES_SCHEMA)
     if violations:
         # One bounded re-ask: fold the concrete violations back so the model
@@ -5044,6 +5130,12 @@ def generate_repair_files(
         except Exception:  # pragma: no cover - defensive: provider hiccup
             return {}
         parsed = _extract_json_object(raw)
+        entries = parsed.get("files") if parsed else None
+        if not isinstance(entries, list) or not entries:
+            fence_entries = _extract_repair_files_from_fences(raw, known)
+            if fence_entries:
+                entries = fence_entries
+                parsed = {"files": fence_entries}
     entries = parsed.get("files") if parsed else None
     if not isinstance(entries, list):
         return {}

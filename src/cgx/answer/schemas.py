@@ -227,4 +227,46 @@ def to_gemini_schema(schema: Dict[str, Any]) -> Dict[str, Any]:
             out[key] = to_gemini_schema(val)
         else:
             out[key] = val
+    if out.get("type") == "OBJECT" and not out.get("properties"):
+        # Gemini API rejects OBJECT schemas that lack properties.
+        # Inject optional known schema properties (e.g., for contracts)
+        # plus a nullable fallback so OpenAPI schema validation succeeds.
+        out["properties"] = {
+            "endpoints": {
+                "type": "ARRAY",
+                "items": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "path": {"type": "STRING"},
+                        "method": {"type": "STRING"},
+                        "description": {"type": "STRING"},
+                    },
+                },
+            },
+            "schemas": {
+                "type": "ARRAY",
+                "items": {
+                    "type": "OBJECT",
+                    "properties": {"name": {"type": "STRING"}},
+                },
+            },
+            "functions": {
+                "type": "ARRAY",
+                "items": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "name": {"type": "STRING"},
+                        "signature": {"type": "STRING"},
+                    },
+                },
+            },
+            "constants": {
+                "type": "ARRAY",
+                "items": {
+                    "type": "OBJECT",
+                    "properties": {"name": {"type": "STRING"}},
+                },
+            },
+            "_extra": {"type": "STRING", "nullable": True},
+        }
     return out
