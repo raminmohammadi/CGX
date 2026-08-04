@@ -1,0 +1,62 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  schedule:
+    - cron: "24 5 * * 1"
+
+# Least privilege at the workflow level; the analyze job additionally needs
+# security-events: write to upload the SARIF results.
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: python
+            build-mode: none
+          - language: javascript-typescript
+            build-mode: none
+          # Scan the GitHub Actions workflows themselves, matching what
+          # default setup covers for this repo.
+          - language: actions
+            build-mode: none
+    steps:
+      - uses: actions/checkout@v7
+
+      # Pin Python 3.12 so the CodeQL extractor parses the codebase as
+      # Python 3. Without an explicit interpreter the extractor can fall back
+      # to a Python 2 parse that rejects legitimate Python-3 syntax (f-strings
+      # etc.), which surfaces as "Could not process some files due to syntax
+      # errors" (e.g. tests/test_constrained_decoding.py).
+      - name: Set up Python
+        if: matrix.language == 'python'
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          # Superset of the default suite: adds the extra security rules from
+          # the extended pack. Drop this line to fall back to default-only.
+          queries: security-extended
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"
