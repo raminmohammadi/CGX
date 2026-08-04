@@ -84,4 +84,16 @@ describe("useWorkspace", () => {
     useWorkspace.getState().setSelectedSession(null);
     expect(useWorkspace.getState().selectedSessionId).toBeNull();
   });
+
+  it("never persists the raw api_key to localStorage (clear-text storage hardening)", () => {
+    useWorkspace.getState().setProvider({ api_key: "sk-super-secret-value" });
+    // In-memory state still has it -- the running app needs it to call the API.
+    expect(useWorkspace.getState().provider.api_key).toBe("sk-super-secret-value");
+
+    const raw = globalThis.localStorage?.getItem("cgx-workspace");
+    expect(raw).toBeTruthy();
+    expect(raw).not.toContain("sk-super-secret-value");
+    const persisted = JSON.parse(raw!);
+    expect(persisted.state.provider.api_key).toBeNull();
+  });
 });

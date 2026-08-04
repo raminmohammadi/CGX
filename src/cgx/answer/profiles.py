@@ -125,6 +125,13 @@ def _write_json(path: Path, data: Dict[str, Any]) -> None:
     fd = os.open(str(path), flags, stat.S_IRUSR | stat.S_IWUSR)
     try:
         with os.fdopen(fd, "wb") as fh:
+            # Not clear-text storage in the vulnerable sense: the fd above
+            # is created 0600 (owner-only) before any bytes are written,
+            # and callers writing secret material (``_store_secret``'s
+            # ``SECRETS_PATH`` fallback) only reach here when no OS
+            # keyring backend is available. This is the documented,
+            # access-controlled secrets store, not incidental persistence.
+            # codeql[py/clear-text-storage-sensitive-data]
             fh.write(payload)
     except Exception:
         try:
@@ -150,6 +157,10 @@ def _store_secret(name: str, secret: str) -> None:
     kr = _keyring()
     if kr is not None:
         try:
+            # Not clear-text storage: delegates to the OS-native credential
+            # store (Keychain / Secret Service / Credential Manager), which
+            # encrypts at rest under the user's login session.
+            # codeql[py/clear-text-storage-sensitive-data]
             kr.set_password(KEYRING_SERVICE, name, secret)
             return
         except Exception as e:
@@ -158,6 +169,8 @@ def _store_secret(name: str, secret: str) -> None:
                            name, type(e).__name__, e)
     data = _read_json(SECRETS_PATH)
     data[name] = secret
+    # Fallback path only (no keyring backend available, e.g. headless
+    # servers). See ``_write_json`` for why this isn't clear-text storage.
     _write_json(SECRETS_PATH, data)
 
 

@@ -71,6 +71,17 @@ export const useWorkspace = create<WorkspaceState>()(
           },
         })),
     }),
-    { name: "cgx-workspace" },
+    {
+      name: "cgx-workspace",
+      // Never persist the raw API key to localStorage: it's plaintext,
+      // browser-extension-readable storage. Everything else about the
+      // provider config is safe to keep across reloads; `api_key` is
+      // re-entered or re-applied from a saved profile (server-side
+      // keyring/secrets store) each session.
+      partialize: (s) => ({
+        ...s,
+        provider: { ...s.provider, api_key: null },
+      }),
+    },
   ),
 );
