@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import stat
 from pathlib import Path
 
 import pytest
@@ -87,6 +88,28 @@ def test_load_messages_tolerates_corrupt_lines(fresh_sessions):
     fresh_sessions.append_message(s.id, "assistant", "after")
     msgs = fresh_sessions.load_messages(s.id)
     assert [m["content"] for m in msgs] == ["real", "after"]
+
+
+def test_session_files_are_owner_only(fresh_sessions):
+    # Chat content may be sensitive; the dir + log must be owner-only on
+    # disk (clear-text-storage hardening, mirroring ~/.cgx/secrets.json).
+    s = fresh_sessions.create_session("perm")
+    dir_mode = stat.S_IMODE(fresh_sessions.SESSIONS_DIR.stat().st_mode)
+    file_mode = stat.S_IMODE(
+        (fresh_sessions.SESSIONS_DIR / f"{s.id}.jsonl").stat().st_mode)
+    assert dir_mode == 0o700
+    # No group/other bits on the log file.
+    assert file_mode & 0o077 == 0
+
+
+def test_append_message_scrubs_credentials_before_disk(fresh_sessions):
+    s = fresh_sessions.create_session()
+    fresh_sessions.append_message(
+        s.id, "user", "here is my token ?key=AQ.ShouldNeverPersist end")
+    raw = (fresh_sessions.SESSIONS_DIR / f"{s.id}.jsonl").read_text(
+        encoding="utf-8")
+    assert "AQ.ShouldNeverPersist" not in raw
+    assert "<redacted>" in raw
 
 
 def test_atomic_index_write_uses_rename(fresh_sessions, tmp_path):

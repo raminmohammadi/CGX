@@ -319,3 +319,46 @@ def test_read_skill_source_returns_custom_file_contents(custom_skills_dir):
 
 def test_read_skill_source_returns_none_for_unknown():
     assert skills.read_skill_source("does-not-exist") is None
+
+
+# ---------------------------------------------------------------------------
+# Custom-skill name allowlist (path-injection guard)
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("name", [
+    "../evil",
+    "../../etc/passwd",
+    "foo/bar",
+    "foo\\bar",
+    "with space",
+    "",
+    ".",
+    "..",
+    "a" * 65,  # over the length cap
+])
+def test_safe_skill_path_rejects_traversal(custom_skills_dir, name):
+    with pytest.raises(ValueError):
+        skill_loader._safe_skill_path(name)
+
+
+def test_safe_skill_path_accepts_plain_identifier(custom_skills_dir):
+    path = skill_loader._safe_skill_path("graph_ql-2")
+    assert path.parent == custom_skills_dir.resolve()
+    assert path.name == "graph_ql-2.py"
+
+
+def test_delete_custom_skill_rejects_traversal_name(custom_skills_dir):
+    # A sibling file outside the custom-skills dir must never be reachable.
+    victim = custom_skills_dir.parent / "victim.py"
+    victim.write_text("secret\n", encoding="utf-8")
+    assert skill_loader.delete_custom_skill("../victim") is False
+    assert victim.exists()
+
+
+def test_read_custom_skill_source_rejects_traversal_name(custom_skills_dir):
+    assert skill_loader.read_custom_skill_source("../../etc/passwd") is None
+
+
+def test_save_custom_skill_rejects_traversal_name(custom_skills_dir):
+    with pytest.raises(ValueError):
+        skill_loader.save_custom_skill("../evil", "x = 1\n")
+    assert not (custom_skills_dir.parent / "evil.py").exists()

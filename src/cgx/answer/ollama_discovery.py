@@ -15,6 +15,7 @@ import os
 import re
 import shutil
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlsplit, urlunsplit
 
 import requests
 
@@ -22,6 +23,37 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_BASE_URL = "http://localhost:11434"
 DEFAULT_TIMEOUT = float(os.environ.get("CGX_OLLAMA_DISCOVERY_TIMEOUT", "3.0"))
+
+# Only these schemes may ever reach ``requests`` from a user-supplied base
+# URL -- blocks ``file:``/``gopher:``/``dict:`` and other SSRF vectors.
+_ALLOWED_URL_SCHEMES = frozenset({"http", "https"})
+
+
+def validate_base_url(base_url: str) -> str:
+    """Validate and normalize a user-provided provider base URL.
+
+    The Settings page lets the user type an arbitrary Ollama / OpenAI-compat
+    base URL that this process then fetches server-side, so an unvalidated
+    value is a server-side request forgery (SSRF) vector. Only ``http`` /
+    ``https`` URLs that carry a real host are accepted; embedded credentials
+    are rejected, and the result is rebuilt from the validated components so
+    no unexpected scheme or query/fragment can ride along into ``requests``.
+
+    Returns the normalized ``scheme://authority[/path]`` string (no trailing
+    slash) and raises :class:`ValueError` on anything else.
+    """
+    raw = (base_url or "").strip()
+    if not raw:
+        raise ValueError("base_url is required")
+    parts = urlsplit(raw)
+    scheme = parts.scheme.lower()
+    if scheme not in _ALLOWED_URL_SCHEMES:
+        raise ValueError(f"unsupported URL scheme: {parts.scheme or '(none)'!r}")
+    if parts.username or parts.password:
+        raise ValueError("base_url must not embed credentials")
+    if not parts.hostname:
+        raise ValueError("base_url is missing a host")
+    return urlunsplit((scheme, parts.netloc, parts.path.rstrip("/"), "", ""))
 
 
 # Recommended ladder. Each entry: (tag, approx_params_b, min_ram_gb, role).
@@ -39,7 +71,11 @@ RECOMMENDED_LADDER: List[Tuple[str, float, float, str]] = [
 
 def list_installed_models(base_url: str = DEFAULT_BASE_URL) -> List[Dict[str, Any]]:
     """Return installed Ollama models, or [] if the server is unreachable."""
-    url = base_url.rstrip("/") + "/api/tags"
+    try:
+        url = validate_base_url(base_url) + "/api/tags"
+    except ValueError as e:
+        logger.info("ollama_discovery: rejected base_url %r: %s", base_url, e)
+        return []
     try:
         r = requests.get(url, timeout=DEFAULT_TIMEOUT)
         r.raise_for_status()
@@ -67,7 +103,10 @@ def list_installed_models(base_url: str = DEFAULT_BASE_URL) -> List[Dict[str, An
 
 def health_check(base_url: str = DEFAULT_BASE_URL) -> Dict[str, Any]:
     """Return a small status dict suitable for surfacing in the UI."""
-    url = base_url.rstrip("/")
+    try:
+        url = validate_base_url(base_url)
+    except ValueError as e:
+        return {"ok": False, "base_url": base_url, "error": str(e)}
     try:
         r = requests.get(url + "/api/tags", timeout=DEFAULT_TIMEOUT)
         ok = r.ok
@@ -90,7 +129,11 @@ def list_running_models(base_url: str = DEFAULT_BASE_URL) -> List[Dict[str, Any]
     split), and the keep-alive ``expires_at`` timestamp. Returns ``[]`` if
     the server is unreachable -- the SPA treats absence as "nothing loaded".
     """
-    url = base_url.rstrip("/") + "/api/ps"
+    try:
+        url = validate_base_url(base_url) + "/api/ps"
+    except ValueError as e:
+        logger.info("ollama_discovery: rejected base_url %r: %s", base_url, e)
+        return []
     try:
         r = requests.get(url, timeout=DEFAULT_TIMEOUT)
         r.raise_for_status()

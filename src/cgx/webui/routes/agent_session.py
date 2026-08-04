@@ -25,6 +25,7 @@ import asyncio
 import json
 import logging
 import threading
+from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -263,21 +264,37 @@ def _safe_json(payload: Any) -> str:
     except Exception:  # pragma: no cover - defensive
         return json.dumps({"_repr": str(payload)})
 
+def _normalize_project_root(project_root: Optional[str]) -> Optional[str]:
+    """Canonicalize a caller-supplied project root before it reaches disk.
+
+    Resolves ``~`` and any ``..``/relative segments to an absolute path
+    up front so a crafted value can't be used to escape the intended
+    directory once it flows into filesystem operations (``SessionStore``,
+    ``detect_mode``, etc.) -- CodeQL: uncontrolled data used in a path
+    expression. This intentionally does not restrict *which* directory
+    may be used: pointing the agent at an arbitrary local project is the
+    whole point of ``project_root``.
+    """
+    if project_root is None:
+        return None
+    return str(Path(project_root).expanduser().resolve())
+
 
 # --------------------- routes ---------------------
 
 @router.post("", response_model=AgentSessionState)
 async def create_session(req: AgentSessionCreateRequest) -> AgentSessionState:
-    runner = _get_runner(req.project_root)
+    project_root = _normalize_project_root(req.project_root)
+    runner = _get_runner(project_root)
     mode = _resolve_mode(req)
     session = await asyncio.to_thread(
         runner.start_session, objective=req.objective,
-        project_root=req.project_root, title=req.title, mode=mode,
+        project_root=project_root, title=req.title, mode=mode,
         skills=req.skills or None)
     with _RUNNERS_LOCK:
         _SESSION_TO_RUNNER[session.session_id] = runner
     if req.run_initial_task:
-        deps = _build_deps(req.provider, req.index, req.project_root,
+        deps = _build_deps(req.provider, req.index, project_root,
                            store=runner.store)
         await _schedule_drain(runner, session.session_id, deps)
     return _snapshot(runner, session.session_id)
@@ -295,8 +312,9 @@ def _resolve_mode(req: AgentSessionCreateRequest) -> SessionMode:
                 detail=(f"invalid mode {requested!r}; "
                         f"expected one of "
                         f"{[m.value for m in SessionMode]}")) from exc
+    normalized_project_root = _normalize_project_root(req.project_root)
     return detect_mode(
-        project_root=req.project_root,
+        project_root=normalized_project_root,
         index_dir=req.index.index_dir,
         records_path=req.index.records,
     )
@@ -305,17 +323,19 @@ def _resolve_mode(req: AgentSessionCreateRequest) -> SessionMode:
 @router.get("", response_model=List[Dict[str, Any]])
 async def list_agent_sessions(
         project_root: Optional[str] = Query(default=None)) -> List[Dict[str, Any]]:
-    runner = _get_runner(project_root)
+    normalized_project_root = _normalize_project_root(project_root)
+    runner = _get_runner(normalized_project_root)
     return [s.to_dict() for s in
-            runner.store.list_sessions(project_root=project_root)]
+            runner.store.list_sessions(project_root=normalized_project_root)]
 
 
 @router.get("/{sid}", response_model=AgentSessionState)
 async def get_session(sid: str,
                       project_root: Optional[str] = Query(default=None)
                       ) -> AgentSessionState:
-    runner = _resolve_runner_for(sid) if project_root is None \
-        else _get_runner(project_root)
+    normalized_project_root = _normalize_project_root(project_root)
+    runner = _resolve_runner_for(sid) if normalized_project_root is None \
+        else _get_runner(normalized_project_root)
     return _snapshot(runner, sid)
 
 
@@ -447,8 +467,9 @@ async def delete_session(sid: str,
     ``sessions`` removes the full aggregate. Returns ``{deleted: sid}``
     on success or 404 if no runner knows about the id.
     """
-    runner = _resolve_runner_for(sid) if project_root is None \
-        else _get_runner(project_root)
+    normalized_project_root = _normalize_project_root(project_root)
+    runner = _resolve_runner_for(sid) if normalized_project_root is None \
+        else _get_runner(normalized_project_root)
     # Stop any in-flight background drain before removing the row so its
     # worker can't race the delete and write a child row against the
     # now-gone session (FK ``ON DELETE CASCADE`` -> IntegrityError). The

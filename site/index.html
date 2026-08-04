@@ -1,0 +1,896 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#030712" />
+    <title>CGX -- Code Graph eXecution | Local-first codebase RAG &amp; self-testing codegen</title>
+    <meta
+      name="description"
+      content="CGX indexes your repository, retrieves grounded context with a hybrid semantic + lexical + graph engine, and drives a session-shaped agent that writes self-tested code. Local-first: indexing, embeddings, retrieval and sessions never leave your machine."
+    />
+    <link rel="canonical" href="https://raminmohammadi.github.io/Averix/" />
+    <link rel="icon" type="image/svg+xml" href="assets/favicon.svg" />
+
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="CGX -- Code Graph eXecution" />
+    <meta
+      property="og:description"
+      content="Local-first codebase RAG and self-testing code generation. Hybrid retrieval, a session-shaped agent that pauses for your approval, and nothing leaves your machine."
+    />
+    <meta property="og:image" content="assets/logo.png" />
+    <meta name="twitter:card" content="summary_large_image" />
+
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="assets/styles.css" />
+  </head>
+
+  <body>
+    <a class="skip" href="#main">Skip to content</a>
+    <div class="progress-bar" id="progress" aria-hidden="true"></div>
+
+    <nav class="railnav" aria-label="Section progress">
+      <a href="#premise" data-label="Premise"><span class="rail-dot"></span></a>
+      <a href="#how" data-label="How it works"><span class="rail-dot"></span></a>
+      <a href="#retrieval" data-label="Retrieval"><span class="rail-dot"></span></a>
+      <a href="#agent" data-label="Agent"><span class="rail-dot"></span></a>
+      <a href="#surfaces" data-label="Surfaces"><span class="rail-dot"></span></a>
+      <a href="#install" data-label="Install"><span class="rail-dot"></span></a>
+      <a href="#trust" data-label="Trust"><span class="rail-dot"></span></a>
+      <a href="#docs" data-label="Docs"><span class="rail-dot"></span></a>
+    </nav>
+
+    <a class="to-top" href="#top" aria-label="Back to top">
+      <svg viewBox="0 0 20 20" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+        <path d="M10 15V5M5 9l5-5 5 5" stroke-linecap="round" stroke-linejoin="round" />
+      </svg>
+    </a>
+
+    <header class="topbar">
+      <div class="shell">
+        <a class="brand" href="#top">
+          <span class="brand-mark" aria-hidden="true">C</span>
+          <span>
+            CGX
+            <small>Code Graph eXecution</small>
+          </span>
+        </a>
+        <nav class="topnav" aria-label="Sections">
+          <a href="#how">How it works</a>
+          <a href="#retrieval">Retrieval</a>
+          <a href="#agent">Agent</a>
+          <a href="#surfaces">Surfaces</a>
+          <a href="#trust">Trust</a>
+          <a href="#docs">Docs</a>
+        </nav>
+        <a
+          class="btn btn-ghost btn-sm"
+          href="https://github.com/raminmohammadi/Averix"
+          rel="noopener"
+        >
+          <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true">
+            <path d="M8 0a8 8 0 0 0-2.53 15.59c.4.07.55-.17.55-.38v-1.34c-2.22.48-2.69-1.07-2.69-1.07-.36-.92-.89-1.17-.89-1.17-.73-.5.05-.49.05-.49.8.06 1.23.83 1.23.83.71 1.22 1.87.87 2.33.67.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.6 7.6 0 0 1 4 0c1.53-1.03 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.28.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48v2.19c0 .21.15.46.55.38A8 8 0 0 0 8 0Z" />
+          </svg>
+          GitHub
+        </a>
+      </div>
+    </header>
+
+    <main id="main">
+      <!-- ============================================================ hero -->
+      <section class="hero" id="top">
+        <div class="shell hero-grid">
+          <div>
+            <p class="eyebrow">Local-first codebase intelligence</p>
+            <h1>
+              Your repository is the context.<br />
+              The model is <em>interchangeable</em>.
+            </h1>
+            <p>
+              CGX parses your code into a graph, retrieves grounded context with a hybrid
+              semantic&nbsp;+&nbsp;lexical&nbsp;+&nbsp;graph engine, and asks a local or remote LLM to
+              answer questions or produce <strong>self-tested</strong> change plans. Indexing,
+              embeddings, retrieval, sessions, and telemetry never leave the machine.
+            </p>
+
+            <div class="hero-actions">
+              <a class="btn btn-primary" href="#install">
+                Install CGX
+                <svg viewBox="0 0 20 20" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                  <path d="M4 10h12M11 5l5 5-5 5" stroke-linecap="round" stroke-linejoin="round" />
+                </svg>
+              </a>
+              <a class="btn btn-ghost" href="#how">See the pipeline</a>
+            </div>
+
+            <div class="hero-meta">
+              <span class="pill pill-neon"><span class="dot"></span>Works fully offline</span>
+              <span class="pill">Python 3.10 – 3.12</span>
+              <span class="pill">Linux · macOS · Windows</span>
+              <span class="pill">MIT</span>
+            </div>
+          </div>
+
+          <div class="hero-logo">
+            <img
+              src="assets/logo.png"
+              width="420"
+              height="271"
+              alt="CGX -- Code Graph eXecution"
+              fetchpriority="high"
+            />
+          </div>
+        </div>
+      </section>
+
+      <!-- ======================================================== premise -->
+      <section id="premise">
+        <div class="shell">
+          <div class="section-head">
+            <p class="eyebrow">The premise</p>
+            <h2>Small models, sharp context.</h2>
+            <p class="lede">
+              A hosted assistant sees the file you opened and guesses at the rest. CGX inverts that:
+              the heavy lifting happens in a retrieval pipeline that runs on your machine and knows
+              the whole codebase, so a 3B local model can be put on equal footing with a frontier one
+              by feeding it smaller, sharper, grounded prompts.
+            </p>
+          </div>
+
+          <div class="grid grid-3">
+            <article class="card reveal">
+              <span class="card-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                  <rect x="3" y="11" width="18" height="10" rx="2" /><path d="M7 11V7a5 5 0 0 1 10 0v4" />
+                </svg>
+              </span>
+              <h3>No daemon, no account</h3>
+              <p>
+                The parser needs no Tree-sitter binaries for Python, the graph needs no database, the
+                embedding cache is one <code class="inline">.npz</code> file, and the session store is
+                SQLite. Open a project, run the UI, done.
+              </p>
+            </article>
+
+            <article class="card reveal">
+              <span class="card-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                  <path d="M12 3v18M3 12h18" /><circle cx="12" cy="12" r="9" />
+                </svg>
+              </span>
+              <h3>Model-agnostic by construction</h3>
+              <p>
+                Ollama, any OpenAI-compatible endpoint, native Google Gemini, or a self-hosted server
+                on a custom IP and path — switchable from Settings with a live <strong>Ping</strong>
+                latency check. Keys live in your OS keyring.
+              </p>
+            </article>
+
+            <article class="card reveal">
+              <span class="card-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                  <path d="M9 12l2 2 4-4" /><path d="M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0z" />
+                </svg>
+              </span>
+              <h3>Nothing lands unapproved</h3>
+              <p>
+                Every branch pauses for a typed human <strong>Decision</strong>. Every overwrite is
+                mirrored under <code class="inline">.cgx-backups/</code> and a whole run can be undone
+                with one rollback call.
+              </p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============================================================= how -->
+      <section id="how">
+        <div class="shell">
+          <div class="section-head">
+            <p class="eyebrow">How it works</p>
+            <h2>Repo → records → graph → grounded answer.</h2>
+            <p class="lede">
+              One pass over your working tree produces everything the retriever and the agent need.
+              Re-indexing is incremental by default: a parse cache keyed on each file's hash and a
+              content-addressed embedding cache mean a touched-a-few-files repo re-indexes almost
+              instantly.
+            </p>
+          </div>
+
+          <div class="pipeline-rail" aria-hidden="true"></div>
+          <div class="pipeline reveal">
+            <div class="stage">
+              <span class="stage-n">01</span>
+              <h4>Parse</h4>
+              <p>
+                Walk the repo honouring <code class="inline">.gitignore</code> and a 1 MB cap; emit one
+                chunk per file, class, function and method.
+              </p>
+              <code>cgx.parser</code>
+            </div>
+            <div class="stage">
+              <span class="stage-n">02</span>
+              <h4>Graph</h4>
+              <p>
+                Derive <code class="inline">calls</code>, <code class="inline">module</code>,
+                <code class="inline">attr</code> and <code class="inline">defined_in</code> edges over
+                the chunk set.
+              </p>
+              <code>cgx.graph</code>
+            </div>
+            <div class="stage">
+              <span class="stage-n">03</span>
+              <h4>Embed</h4>
+              <p>
+                Build two views — <strong>intent</strong> (docstrings, names) and
+                <strong>impl</strong> (signatures, bodies) — concurrently into FAISS.
+              </p>
+              <code>cgx.embeddings</code>
+            </div>
+            <div class="stage">
+              <span class="stage-n">04</span>
+              <h4>Retrieve</h4>
+              <p>
+                Fuse semantic, BM25 and graph-expansion hits with Reciprocal Rank Fusion, then rerank.
+              </p>
+              <code>cgx.retrieval</code>
+            </div>
+            <div class="stage">
+              <span class="stage-n">05</span>
+              <h4>Answer</h4>
+              <p>
+                Build a tiered Code Map prompt, stream the reasoning sketch, then the grounded answer
+                or a tested diff.
+              </p>
+              <code>cgx.answer</code>
+            </div>
+          </div>
+
+          <figure class="reveal" style="margin-top: 2.5rem; text-align: center;">
+            <div class="mermaid">
+flowchart TD
+    subgraph Setup[1. Setup & Index]
+        direction LR
+        I[1. Install<br/>pip install + pull local model] --> N[2. Index your repo<br/>reads files, respects .gitignore]
+    end
+
+    subgraph Usage[2. Choose your mode]
+        direction TB
+        A[💬 Ask<br/>Streaming explanation<br/>with citations]
+        P[🛠️ Plan<br/>Code-change diff,<br/>auto-tested]
+        AG[🤖 Agent<br/>Multi-step plan,<br/>live progress]
+    end
+
+    N --> A
+    N --> P
+    N --> AG
+
+    A --> G[Grounded answer<br/>With citations to exact files/lines]
+    P --> G
+    AG --> G
+
+    style Setup fill:#0f172a,stroke:#38bdf8,color:#fff
+    style Usage fill:#0f172a,stroke:#a78bfa,color:#fff
+    style G fill:#0b1220,stroke:#f59e0b,color:#fff
+    style A fill:#0b1220,stroke:#34d399,color:#fff
+    style P fill:#0b1220,stroke:#f59e0b,color:#fff
+    style AG fill:#0b1220,stroke:#a78bfa,color:#fff
+            </div>
+            <figcaption>The user journey — install → index → ask / plan / agent → grounded answer.</figcaption>
+          </figure>
+        </div>
+      </section>
+
+      <!-- ======================================================= retrieval -->
+      <section id="retrieval">
+        <div class="shell">
+          <div class="section-head">
+            <p class="eyebrow">Hybrid retrieval</p>
+            <h2>Four signals, one ranking.</h2>
+            <p class="lede">
+              Semantic search runs over both views, BM25 covers the lexical tail, the graph pulls in
+              structural neighbours, and symbol matches get boosted. Everything fuses through RRF,
+              with an optional cross-encoder rerank on the head of the list.
+            </p>
+          </div>
+
+          <div class="grid grid-2">
+            <div>
+              <ul class="checks reveal">
+                <li>
+                  <strong>Two-view semantics.</strong> The intent view answers "what is this for", the
+                  impl view answers "how does it do it" — searched in parallel, joined before fusion.
+                </li>
+                <li>
+                  <strong>Graph expansion.</strong> Neighbours of the top hits enter the candidate set
+                  with a tunable <code class="inline">graph_bonus</code>.
+                </li>
+                <li>
+                  <strong>Tiered Code Map prompt.</strong> When neighbours are surfaced, direct matches
+                  keep full bodies while neighbours collapse to one-line
+                  <code class="inline">name(signature) -- docstring</code> stubs, so a small model
+                  never spends its window on references it only needs to know about.
+                </li>
+                <li>
+                  <strong>Window-aware budgets.</strong> Per-tier budgets scale with the model's
+                  advertised context length.
+                </li>
+                <li>
+                  <strong>Optional rerank.</strong> The cross-encoder lazy-loads only when enabled and
+                  silently falls back to RRF order if the ML stack is absent.
+                </li>
+              </ul>
+            </div>
+
+            <div class="table-wrap reveal">
+              <table>
+                <thead>
+                  <tr>
+                    <th scope="col">HybridConfig</th>
+                    <th scope="col">Default</th>
+                    <th scope="col">Effect</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>graph_bonus</td>
+                    <td>0.2</td>
+                    <td>RRF-scaled bump for chunks reached via the import/call graph.</td>
+                  </tr>
+                  <tr>
+                    <td>symbol_boost</td>
+                    <td>0.5</td>
+                    <td>Bonus when an identifier or path matches a question token.</td>
+                  </tr>
+                  <tr>
+                    <td>enable_reranker</td>
+                    <td>False</td>
+                    <td>Run a cross-encoder over the fused head.</td>
+                  </tr>
+                  <tr>
+                    <td>reranker_top_n</td>
+                    <td>30</td>
+                    <td>How many head candidates to re-score.</td>
+                  </tr>
+                  <tr>
+                    <td>reranker_weight</td>
+                    <td>1.0</td>
+                    <td>Convex blend between cross-encoder and RRF score.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- =========================================================== agent -->
+      <section id="agent">
+        <div class="shell">
+          <div class="section-head">
+            <p class="eyebrow">The session-shaped agent</p>
+            <h2>A state machine you can pause, resume, and undo.</h2>
+            <p class="lede">
+              Every interaction belongs to a <strong>Session</strong> that survives process restarts in
+              <code class="inline">&lt;project&gt;/.cgx/sessions.db</code>. A deterministic
+              pure-Python router owns every transition — no LLM decides control flow — and the loop
+              progresses exactly one task per call, stopping at each
+              <code class="inline">ASK_USER</code> checkpoint for a typed decision.
+            </p>
+          </div>
+
+          <div class="grid grid-2">
+            <article class="card reveal">
+              <span class="pill">Explore mode · existing codebase</span>
+              <h3>Understand, then change</h3>
+              <div class="chain" aria-label="Explore mode task chain">
+                <span>EXPLORE</span><i>→</i>
+                <span class="ask">ASK_USER</span><i>→</i>
+                <span>INVESTIGATE</span><i>→</i>
+                <span>RECOMMEND</span><i>→</i>
+                <span class="ask">ASK_USER</span><i>→</i>
+                <span>PLAN_CHANGE</span><i>→</i>
+                <span class="ask">ASK_USER</span><i>→</i>
+                <span class="write">APPLY</span><i>→</i>
+                <span class="write">VERIFY</span>
+              </div>
+              <p style="margin-top: 1rem">
+                The agent proposes directions, investigates the one you pick, recommends concrete
+                options, and only drafts a change plan once you have chosen. Nothing touches disk
+                before the approval checkpoint.
+              </p>
+            </article>
+
+            <article class="card reveal">
+              <span class="pill">Greenfield mode · new project</span>
+              <h3>Clarify, scaffold, prove it runs</h3>
+              <div class="chain" aria-label="Greenfield mode task chain">
+                <span>CLARIFY_REQUIREMENTS</span><i>→</i>
+                <span class="ask">ASK_USER</span><i>→</i>
+                <span>DECOMPOSE</span><i>→</i>
+                <span class="ask">ASK_USER</span><i>→</i>
+                <span>SCAFFOLD</span><i>→</i>
+                <span class="write">APPLY</span><i>→</i>
+                <span class="write">BOOTSTRAP_ENV</span><i>→</i>
+                <span class="write">VERIFY</span><i>⟲</i>
+                <span class="write">REPAIR</span>
+              </div>
+              <p style="margin-top: 1rem">
+                Give it a plain-language idea — <em>"create a FastAPI todo app"</em> — and it asks 3–6
+                clarifying questions, plans a layered file manifest, generates each file with cross-file
+                context, provisions a project-local environment, and runs the project's own tests.
+              </p>
+            </article>
+          </div>
+
+          <div class="grid grid-3" style="margin-top: 1.25rem">
+            <article class="card reveal">
+              <h3>Verification that tells the truth</h3>
+              <p>
+                <code class="inline">BOOTSTRAP_ENV</code> provisions a <code class="inline">.venv</code>
+                for Python and the JS toolchain for a <code class="inline">package.json</code> — a
+                polyglot repo is verified in one pass — so "Flask wasn't installed" reads as a
+                collection error rather than masquerading as a test failure.
+              </p>
+            </article>
+            <article class="card reveal">
+              <h3>Repair that stops instead of flapping</h3>
+              <p>
+                Deterministic, LLM-free classifiers handle the mechanical breaks first; only genuine
+                logic failures fall back to a bounded LLM repair over at most five files. The loop runs
+                while the failing-test count strictly drops, under a hard ceiling, gated by a
+                failure-signature hash.
+              </p>
+            </article>
+            <article class="card reveal">
+              <h3>Budgets as a safety valve</h3>
+              <p>
+                A typed <code class="inline">LoopBudget</code> bounds each retry chain and a
+                session-level budget backstops the whole run: an interactive session pauses on an
+                <code class="inline">ASK_USER</code> when it is spent, a headless one ends terminally.
+              </p>
+            </article>
+          </div>
+
+          <figure class="reveal" style="margin-top: 2.5rem; text-align: center;">
+            <div class="mermaid">
+flowchart TD
+    subgraph Surfaces
+        UI[AgentPage.tsx<br/>POST /api/agent-session<br/>EventSource /events]
+        Web[cgx.webui.routes.agent_session<br/>REST + SSE]
+        CLI[cgx.cli terminal<br/>TUI dashboard]
+    end
+
+    subgraph Core[Session Loop Core]
+        Runner[SessionRunner<br/>_pick_ready → _execute → _apply_plan]
+        Execs[Executors cgx.session.tasks.*<br/>explore, clarify, scaffold, apply...]
+        Router[Router cgx.session.router<br/>TASK_SUCCESSOR edges]
+    end
+
+    subgraph Data[Persistence & Events]
+        Store[SessionStore<br/>SQLite .cgx/sessions.db]
+        Events[Event Bus<br/>SSE, TUI stream, agent.log]
+    end
+
+    Providers[cgx.answer.providers<br/>Ollama, OpenAI, Gemini]
+
+    UI --> Web
+    CLI --> Runner
+    Web --> Runner
+
+    Runner --> Execs
+    Execs --> Router
+    Execs --> Providers
+
+    Router --> Store
+    Store --> Events
+    Events -.-> UI
+
+    style Surfaces fill:#0f172a,stroke:#38bdf8,color:#fff
+    style Core fill:#0f172a,stroke:#a78bfa,color:#fff
+    style Data fill:#0f172a,stroke:#94a3b8,color:#fff
+    style Providers fill:#0b1220,stroke:#f59e0b,color:#fff
+            </div>
+            <figcaption>
+              One loop, three surfaces — the web UI, the terminal dashboard, and
+              <code class="inline">cgx agent</code> all drive the same runner over the same store.
+            </figcaption>
+          </figure>
+        </div>
+      </section>
+
+      <!-- ======================================================== surfaces -->
+      <section id="surfaces">
+        <div class="shell">
+          <div class="section-head">
+            <p class="eyebrow">Three surfaces, one engine</p>
+            <h2>Drive it however you work.</h2>
+            <p class="lede">
+              A React/Vite web UI streaming over Server-Sent Events, a stdlib-only terminal dashboard
+              that works cleanly over SSH, scriptable subcommands, and a plain Python API. They share
+              the same retrieval engine, the same session store, and the same cancel token.
+            </p>
+          </div>
+
+          <div class="tabs" role="tablist" aria-label="Surfaces">
+            <button class="tab" role="tab" id="tab-ui" aria-controls="panel-ui" aria-selected="true">Web UI</button>
+            <button class="tab" role="tab" id="tab-cli" aria-controls="panel-cli" aria-selected="false">CLI</button>
+            <button class="tab" role="tab" id="tab-py" aria-controls="panel-py" aria-selected="false">Python</button>
+          </div>
+
+          <div class="panel" role="tabpanel" id="panel-ui" aria-labelledby="tab-ui">
+            <div class="grid grid-2">
+              <div class="terminal">
+                <div class="terminal-bar">
+                  <span>launch</span>
+                  <button class="copy" type="button" data-copy="cgx-ui">copy</button>
+                </div>
+                <pre><code><span class="c"># after `pip install -e ".[ui]"`</span>
+<span class="p">$</span> cgx-ui
+<span class="c"># serving on http://127.0.0.1:8765</span></code></pre>
+              </div>
+              <ul class="checks">
+                <li><strong>Setup</strong> — pick a provider, Ping it, detect hardware, save profiles.</li>
+                <li><strong>Index</strong> — point at a root or upload a zip; cancel mid-run.</li>
+                <li><strong>Ask</strong> — streaming thought-process panel, then the grounded answer.</li>
+                <li><strong>Plan</strong> — validate diffs and run impacted tests before you read them.</li>
+                <li><strong>Agent</strong> — the task DAG with status icons, facts, artifacts, and Undo.</li>
+                <li><strong>Hardware</strong> — fit verdicts per model; fully offline.</li>
+              </ul>
+            </div>
+          </div>
+
+          <div class="panel" role="tabpanel" id="panel-cli" aria-labelledby="tab-cli" hidden>
+            <div class="terminal">
+              <div class="terminal-bar">
+                <span>cgx &lt;command&gt;</span>
+                <button class="copy" type="button" data-copy="cgx index --project-root .">copy</button>
+              </div>
+              <pre><code><span class="c"># build an index into the auto-discovered .cgx/index location</span>
+<span class="p">$</span> cgx index --project-root . --out-dir .cgx/index
+
+<span class="c"># grounded, streamed answer over the index</span>
+<span class="p">$</span> cgx ask <span class="s">"What does parse_codebase do?"</span> --think
+
+<span class="c"># a self-tested code-change plan</span>
+<span class="p">$</span> cgx plan <span class="s">"Add a --json flag to the query command"</span> --self-test --run-tests
+
+<span class="c"># one unattended turn of the session agent loop</span>
+<span class="p">$</span> cgx agent <span class="s">"Add docstrings to every public function in cgx.parser"</span>
+
+<span class="c"># provider + hardware + index status, or the interactive dashboard</span>
+<span class="p">$</span> cgx status
+<span class="p">$</span> cgx</code></pre>
+            </div>
+          </div>
+
+          <div class="panel" role="tabpanel" id="panel-py" aria-labelledby="tab-py" hidden>
+            <div class="terminal">
+              <div class="terminal-bar">
+                <span>python</span>
+                <button class="copy" type="button" data-copy="from cgx.pipeline.auto import run_index_auto">copy</button>
+              </div>
+              <pre><code><span class="k">from</span> cgx.pipeline.auto <span class="k">import</span> run_index_auto
+<span class="k">from</span> cgx.answer.engine <span class="k">import</span> answer_with_llm
+<span class="k">from</span> cgx.answer.providers <span class="k">import</span> OllamaProvider
+
+run_index_auto(project_root=<span class="s">"./"</span>, out_dir=<span class="s">"/tmp/cgx_index"</span>)
+
+prov = <span class="f">OllamaProvider</span>(model=<span class="s">"qwen2.5-coder:3b"</span>)
+ans = <span class="f">answer_with_llm</span>(
+    <span class="s">"/tmp/cgx_index/indices"</span>,
+    <span class="s">"/tmp/cgx_index/records.jsonl"</span>,
+    <span class="s">"What does parse_codebase do?"</span>,
+    prov,
+)
+<span class="f">print</span>(ans[<span class="s">"answer_md"</span>])</code></pre>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ========================================================= install -->
+      <section id="install">
+        <div class="shell">
+          <div class="section-head">
+            <p class="eyebrow">Install</p>
+            <h2>A small core, and an ML stack you opt into.</h2>
+            <p class="lede">
+              The core install skips <code class="inline">torch</code>,
+              <code class="inline">transformers</code> and
+              <code class="inline">sentence-transformers</code> entirely — heavy modules are imported
+              lazily, so the CLI and UI work out of the box. Add the ML extras only when you want local
+              embeddings or the cross-encoder reranker.
+            </p>
+          </div>
+
+          <div class="grid grid-2">
+            <div class="terminal reveal">
+              <div class="terminal-bar">
+                <span>core — no torch</span>
+                <button
+                  class="copy"
+                  type="button"
+                  data-copy="python -m venv .venv &amp;&amp; source .venv/bin/activate &amp;&amp; pip install -r requirements.txt &amp;&amp; pip install -e '.[codegen]'"
+                >
+                  copy
+                </button>
+              </div>
+              <pre><code><span class="p">$</span> git clone https://github.com/raminmohammadi/Averix
+<span class="p">$</span> cd Averix
+<span class="p">$</span> python -m venv .venv
+<span class="p">$</span> source .venv/bin/activate   <span class="c"># Windows: .venv\Scripts\Activate.ps1</span>
+<span class="p">$</span> pip install -r requirements.txt
+<span class="p">$</span> pip install -e <span class="s">".[codegen]"</span></code></pre>
+            </div>
+
+            <div class="terminal reveal">
+              <div class="terminal-bar">
+                <span>full — local embeddings + rerank</span>
+                <button
+                  class="copy"
+                  type="button"
+                  data-copy="pip install -r requirements.txt -r requirements-ml.txt &amp;&amp; pip install -e '.[codegen]'"
+                >
+                  copy
+                </button>
+              </div>
+              <pre><code><span class="p">$</span> pip install -r requirements.txt -r requirements-ml.txt
+<span class="p">$</span> pip install -e <span class="s">".[codegen]"</span>
+
+<span class="c"># pull a small local model (recommended default)</span>
+<span class="p">$</span> ollama pull qwen2.5-coder:3b
+
+<span class="p">$</span> cgx-ui   <span class="c"># http://127.0.0.1:8765</span></code></pre>
+            </div>
+          </div>
+
+          <div class="table-wrap reveal" style="margin-top: 1.75rem">
+            <table>
+              <thead>
+                <tr>
+                  <th scope="col">Extra</th>
+                  <th scope="col">Adds</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr><td>ui</td><td>FastAPI + Uvicorn web UI backend</td></tr>
+                <tr><td>embeddings</td><td><code class="inline">sentence-transformers</code>, <code class="inline">transformers</code>, <code class="inline">torch</code></td></tr>
+                <tr><td>faiss</td><td><code class="inline">faiss-cpu</code> — large speedup over the numpy fallback</td></tr>
+                <tr><td>parsers</td><td>tree-sitter grammars for JavaScript / TypeScript / TSX ingestion</td></tr>
+                <tr><td>codegen</td><td><code class="inline">unidiff</code> for stricter diff parsing</td></tr>
+                <tr><td>keyring</td><td>OS keyring for API-key storage</td></tr>
+                <tr><td>dev</td><td><code class="inline">pytest</code>, <code class="inline">ruff</code>, <code class="inline">mypy</code></td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- =========================================================== trust -->
+      <section id="trust">
+        <div class="shell">
+          <div class="section-head">
+            <p class="eyebrow">Trust model</p>
+            <h2>The complete list of egress paths.</h2>
+            <p class="lede">
+              Not a policy statement — an inventory. Parsing, embedding, indexing, retrieval and
+              reranking are on-device with no exceptions. The only way bytes leave your machine is the
+              LLM endpoint you configured yourself.
+            </p>
+          </div>
+
+          <div class="grid grid-2">
+            <div class="table-wrap reveal">
+              <table>
+                <thead>
+                  <tr>
+                    <th scope="col">Activity</th>
+                    <th scope="col">Egress</th>
+                    <th scope="col">Destination</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr><td>Parse · embed · index</td><td><span class="no">No</span></td><td>On-device.</td></tr>
+                  <tr><td>Retrieval · rerank</td><td><span class="no">No</span></td><td>On-device.</td></tr>
+                  <tr><td>Sessions · profiles · cache</td><td><span class="no">No</span></td><td><code class="inline">~/.cgx/</code>, <code class="inline">0600</code> files.</td></tr>
+                  <tr><td>Local LLM (default)</td><td>Loopback</td><td><code class="inline">localhost:11434</code> — Ollama.</td></tr>
+                  <tr><td>OpenAI-compatible</td><td><span class="yes">Yes</span></td><td>The exact base URL you configure.</td></tr>
+                  <tr><td>Google Gemini</td><td><span class="yes">Yes</span></td><td><code class="inline">generativelanguage.googleapis.com</code>.</td></tr>
+                  <tr><td>Startup telemetry</td><td>Opt-in</td><td>Off by default; install UUID + version only.</td></tr>
+                </tbody>
+              </table>
+            </div>
+
+            <ul class="checks reveal">
+              <li>
+                <strong>Secrets at rest.</strong> API keys go to the OS keyring — Keychain, GNOME
+                Keyring / KWallet, Windows Credential Manager — falling back to a
+                <code class="inline">0600</code> file. <code class="inline">~/.cgx/</code> is chmodded
+                to <code class="inline">0700</code>.
+              </li>
+              <li>
+                <strong>Writes are bounded and reversible.</strong> Apply and scaffold tasks write only
+                under the configured Project Root, mirrored per run under
+                <code class="inline">.cgx-backups/&lt;run_id&gt;/</code>.
+              </li>
+              <li>
+                <strong>No auth on the local API.</strong> The server binds
+                <code class="inline">127.0.0.1:8765</code> by default and ships no login layer — that is
+                safe on loopback, and anything else belongs behind an auth-enforcing reverse proxy.
+                Documented, not hidden.
+              </li>
+              <li>
+                <strong>Telemetry is a single opt-in ping.</strong> Enabled only by
+                <code class="inline">CGX_TELEMETRY=1</code>, carrying a random install UUID and the
+                version. No prompts, no code, no paths, no model names.
+              </li>
+            </ul>
+          </div>
+
+          <figure class="reveal" style="margin-top: 2.5rem; text-align: center;">
+            <div class="mermaid">
+flowchart TB
+    subgraph LocalMachine[🔒 LOCAL MACHINE - no network required]
+        Repo[📁 Your repository<br/>read-only ingest]
+        Indexer[⚙️ Indexer<br/>chunks, graph, embeddings]
+        Artifacts[💾 On-disk artefacts<br/>indices/, records.jsonl]
+        Agent[🤖 Agent loop<br/>session-shaped]
+        State[💬 Sessions & Cache<br/>.cgx/sessions.db]
+        Creds[🔑 Credentials<br/>OS keyring]
+
+        Repo --> Indexer
+        Indexer --> Artifacts
+        Agent <--> Artifacts
+        Agent <--> State
+    end
+
+    subgraph Cloud[☁️ OPTIONAL CLOUD]
+        LocalLLM[🧠 Local LLM default<br/>Ollama fully offline]
+        RemoteLLM[🌐 Remote LLM opt-in<br/>OpenAI-compat, Gemini]
+    end
+
+    Agent --> LocalLLM
+    Agent -.->|opt-in egress: prompt + snippets| RemoteLLM
+
+    style LocalMachine fill:#022c22,stroke:#10b981,color:#a7f3d0
+    style Cloud fill:#1e1b4b,stroke:#a78bfa,color:#c4b5fd
+    style Repo fill:#0b1220,stroke:#10b981,color:#fff
+    style Indexer fill:#0b1220,stroke:#10b981,color:#fff
+    style Artifacts fill:#0b1220,stroke:#10b981,color:#fff
+    style Agent fill:#0b1220,stroke:#10b981,color:#fff
+    style State fill:#0b1220,stroke:#10b981,color:#fff
+    style Creds fill:#0b1220,stroke:#10b981,color:#fff
+    style LocalLLM fill:#0b1220,stroke:#a78bfa,color:#fff
+    style RemoteLLM fill:#0b1220,stroke:#a78bfa,color:#fff
+            </div>
+            <figcaption>Trust boundaries — for the person who has to sign off on this.</figcaption>
+          </figure>
+        </div>
+      </section>
+
+      <!-- ============================================================ docs -->
+      <section id="docs">
+        <div class="shell">
+          <div class="section-head">
+            <p class="eyebrow">Documentation</p>
+            <h2>Four ways in, depending on what you need.</h2>
+          </div>
+
+          <div class="grid grid-4">
+            <a class="card reveal" href="https://github.com/raminmohammadi/Averix/blob/main/docs/book.md">
+              <span class="pill pill-neon">Narrative</span>
+              <h3>The CGX Book</h3>
+              <p>Follows one request end-to-end, from an unindexed tree to a tested patch on disk — and explains why each layer exists.</p>
+            </a>
+            <a class="card reveal" href="https://github.com/raminmohammadi/Averix/blob/main/docs/architecture.md">
+              <span class="pill">Reference</span>
+              <h3>Architecture</h3>
+              <p>Organised by module: every layer under <code class="inline">cgx.*</code>, the data flow, and the seams meant to be replaced.</p>
+            </a>
+            <a class="card reveal" href="https://github.com/raminmohammadi/Averix/blob/main/docs/usage.md">
+              <span class="pill">How-to</span>
+              <h3>Usage</h3>
+              <p>Organised by task: pick a provider, index, ask, plan, tune retrieval, run the agent, add a skill.</p>
+            </a>
+            <a class="card reveal" href="https://github.com/raminmohammadi/Averix/blob/main/docs/flowcharts.md">
+              <span class="pill">Diagrams</span>
+              <h3>Flowcharts</h3>
+              <p>The same system drawn for users, developers, and companies — plus every checkpoint of both loop modes.</p>
+            </a>
+          </div>
+
+          <div class="grid grid-2" style="margin-top: 1.25rem">
+            <article class="card reveal">
+              <h3>Skills — a framework is one folder</h3>
+              <p>
+                Each supported technology (<code class="inline">react</code>,
+                <code class="inline">fastapi</code>, <code class="inline">nextjs</code>,
+                <code class="inline">vue</code>, <code class="inline">tailwind</code>,
+                <code class="inline">flask</code>, <code class="inline">django</code>,
+                <code class="inline">express</code>, <code class="inline">python_cli</code>,
+                <code class="inline">sqlite</code>) bundles detection from the goal, the prompt fragment
+                the model sees, and a structural validator for the diffs it produces. Multi-skill goals
+                compose — "React UI + FastAPI backend" activates both. Adding a framework needs no
+                agent-layer edits.
+              </p>
+            </article>
+            <article class="card reveal">
+              <h3>Tested where it matters</h3>
+              <p>
+                The suite covers the parser, the embedding cache, hybrid retrieval and rerank, the
+                codegen pipeline, the session router / executors / store, the hardware matrix, the rate
+                limiter, and an end-to-end index → query smoke test with a deterministic fake embedder —
+                no model download, no GPU. CI runs a core matrix on Python 3.10 – 3.12 that asserts the
+                lazy-import path stays clean, plus an optional ML job.
+              </p>
+            </article>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <div class="shell">
+        <div class="footer-grid">
+          <div>
+            <a class="brand" href="#top">
+              <span class="brand-mark" aria-hidden="true">C</span>
+              <span>CGX<small>Code Graph eXecution</small></span>
+            </a>
+            <p style="color: var(--fg-muted); font-size: 0.8125rem; max-width: 34ch; margin: 1rem 0 0">
+              Local-first codebase RAG and self-testing code generation. Your code, your embeddings,
+              your sessions, your model.
+            </p>
+          </div>
+
+          <div>
+            <h5>Project</h5>
+            <ul>
+              <li><a href="https://github.com/raminmohammadi/Averix">Repository</a></li>
+              <li><a href="https://github.com/raminmohammadi/Averix/releases">Releases</a></li>
+              <li><a href="https://github.com/raminmohammadi/Averix/blob/main/CHANGELOG.md">Changelog</a></li>
+              <li><a href="https://github.com/raminmohammadi/Averix/blob/main/CONTRIBUTING.md">Contributing</a></li>
+            </ul>
+          </div>
+
+          <div>
+            <h5>Docs</h5>
+            <ul>
+              <li><a href="https://github.com/raminmohammadi/Averix/blob/main/docs/book.md">The CGX Book</a></li>
+              <li><a href="https://github.com/raminmohammadi/Averix/blob/main/docs/architecture.md">Architecture</a></li>
+              <li><a href="https://github.com/raminmohammadi/Averix/blob/main/docs/usage.md">Usage</a></li>
+              <li><a href="https://github.com/raminmohammadi/Averix/blob/main/docs/Agent.md">Agent reference</a></li>
+            </ul>
+          </div>
+
+          <div>
+            <h5>Surfaces</h5>
+            <ul>
+              <li><a href="#surfaces">Web UI</a></li>
+              <li><a href="#surfaces">CLI &amp; dashboard</a></li>
+              <li><a href="https://github.com/raminmohammadi/Averix/blob/main/extension/README.md">VS Code extension</a></li>
+              <li><a href="https://github.com/raminmohammadi/Averix/blob/main/docs/hardware_matrix.md">Hardware matrix</a></li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="footer-note">
+          <span>MIT licensed · built by Ramin Mohammadi</span>
+          <span>Nothing leaves your machine unless you say so.</span>
+        </div>
+      </div>
+    </footer>
+
+    <script src="assets/site.js" defer></script>
+    <script type="module">
+      import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
+      mermaid.initialize({ startOnLoad: true, theme: 'dark', background: 'transparent' });
+    </script>
+  </body>
+</html>

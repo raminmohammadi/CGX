@@ -115,7 +115,10 @@ def default_db_path(project_root: Optional[str | Path] = None) -> Path:
     (e.g. interactive scripts, tests with a tmp HOME).
     """
     if project_root:
-        return Path(project_root) / ".cgx" / "sessions.db"
+        # Canonicalize the caller-supplied root and pin the fixed
+        # ``.cgx/sessions.db`` leaf so a value carrying ``..`` cannot walk
+        # the DB out to an unexpected location (path-injection guard).
+        return Path(project_root).resolve() / ".cgx" / "sessions.db"
     return Path.home() / ".cgx" / "sessions.db"
 
 
@@ -130,7 +133,10 @@ class SessionStore:
     def __init__(self, db_path: Optional[str | Path] = None, *,
                  project_root: Optional[str | Path] = None,
                  bus: Optional[EventBus] = None) -> None:
-        self._path = Path(db_path) if db_path else default_db_path(project_root)
+        raw_path = Path(db_path) if db_path else default_db_path(project_root)
+        # Resolve to an absolute, ``..``-free path before it reaches
+        # ``sqlite3.connect`` / ``mkdir`` (path-injection guard).
+        self._path = raw_path.resolve()
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(str(self._path), check_same_thread=False)

@@ -48,11 +48,16 @@ def _has_usable_index(index_dir: Optional[str],
     """
     if not index_dir or not records_path:
         return False
-    meta = Path(index_dir) / "meta.json"
-    rec = Path(records_path)
     try:
+        # Canonicalize before the stat calls and enforce that both files
+        # stay within the caller-provided index directory.
+        base = Path(index_dir).resolve()
+        meta = (base / "meta.json").resolve()
+        rec = Path(records_path).resolve()
+        meta.relative_to(base)
+        rec.relative_to(base)
         return meta.is_file() and rec.is_file() and rec.stat().st_size > 0
-    except OSError:
+    except (OSError, ValueError):
         return False
 
 

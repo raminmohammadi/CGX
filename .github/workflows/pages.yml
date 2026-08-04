@@ -1,0 +1,44 @@
+name: Pages
+
+# Publish the static landing page in site/ to GitHub Pages. The site has no
+# build step -- it is hand-written HTML/CSS/JS -- so the job only uploads the
+# directory. Enable Pages with "Source: GitHub Actions" in repo settings.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "site/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Never run two deploys at once; cancel an in-flight one for the newer commit.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    name: Build and deploy
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload site/
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: site
+
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4

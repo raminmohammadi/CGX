@@ -412,12 +412,12 @@ print(ans["answer_md"])
 Three picture-first views of the same system live in
 [docs/flowcharts.md](docs/flowcharts.md):
 
-- **For users** ([flow_user.svg](docs/diagrams/flow_user.svg)) -- the
+- **For users** (see [User Flow](docs/flowcharts.md#for-users)) -- the
   install → index → ask/plan/agent → grounded-answer journey.
-- **For developers** ([flow_developer.svg](docs/diagrams/flow_developer.svg)) --
+- **For developers** (see [Developer Flow](docs/flowcharts.md#for-developers)) --
   the session loop's Router → executor dispatch and the full SSE
   event timeline.
-- **For companies** ([flow_company.svg](docs/diagrams/flow_company.svg)) --
+- **For companies** (see [Trust Boundaries](docs/flowcharts.md#for-companies)) --
   trust boundaries: what stays on the local machine, where credentials
   live, and the single opt-in egress path to a remote LLM.
 
