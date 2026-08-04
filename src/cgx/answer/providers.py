@@ -11,7 +11,7 @@ import requests  # intentionally re-exported; UI imports this to ensure dependen
 
 from cgx.answer.ratelimit import RateLimiter, backoff_seconds, request_with_retry
 from cgx.answer.schemas import to_gemini_schema, to_openai_response_format
-from cgx.logging_setup import scrub_secrets
+from cgx.logging_setup import redact_secrets
 
 DEFAULT_TIMEOUT = float(os.environ.get("CGX_HTTP_TIMEOUT", "120"))
 
@@ -306,7 +306,15 @@ class GeminiProvider(LLMProvider):
         self._max_retries = max(0, int(max_retries))
 
     def _url(self, method: str = "generateContent") -> str:
-        return f"{self._BASE}/{self.model}:{method}?key={self.api_key}"
+        # The API key travels in the ``x-goog-api-key`` header (see
+        # ``_auth_headers``), never in the URL query string: a key baked into
+        # the URL leaks into request logs, proxies, and -- because the URL then
+        # taints the streamed response -- into persisted session content
+        # (py/clear-text-storage). The header keeps the secret out of that flow.
+        return f"{self._BASE}/{self.model}:{method}"
+
+    def _auth_headers(self) -> Dict[str, str]:
+        return {"x-goog-api-key": self.api_key}
 
     @staticmethod
     def _map_messages(
@@ -364,7 +372,9 @@ class GeminiProvider(LLMProvider):
 
         def _post():
             return request_with_retry(
-                lambda: requests.post(self._url(), json=body, timeout=self.timeout),
+                lambda: requests.post(self._url(), json=body,
+                                      headers=self._auth_headers(),
+                                      timeout=self.timeout),
                 limiter=self._limiter,
                 max_retries=self._max_retries,
             )
@@ -403,12 +413,12 @@ class GeminiProvider(LLMProvider):
     def _scrub_secret(text: str) -> str:
         """Redact the API key from any error/log string.
 
-        Delegates to :func:`cgx.logging_setup.scrub_secrets`, the single
+        Delegates to :func:`cgx.logging_setup.redact_secrets`, the single
         source of truth for credential redaction (Gemini's URL-style
         ``key=<value>`` parameter plus the other shapes providers emit), so
         this provider and the shared retry/logging layers can never drift
         apart on what counts as a secret."""
-        return scrub_secrets(text)
+        return redact_secrets(text)
 
     @staticmethod
     def _diagnose_empty_response(data: Any) -> str:
@@ -474,13 +484,14 @@ class GeminiProvider(LLMProvider):
             body["systemInstruction"] = {"parts": [{"text": system_text}]}
         if max_tokens:
             body["generationConfig"]["maxOutputTokens"] = int(max_tokens)
-        url = self._url("streamGenerateContent") + "&alt=sse"
+        url = self._url("streamGenerateContent") + "?alt=sse"
 
         attempt = 0
         while True:
             attempt += 1
             try:
-                with requests.post(url, json=body, timeout=self.timeout, stream=True) as resp:
+                with requests.post(url, json=body, headers=self._auth_headers(),
+                                   timeout=self.timeout, stream=True) as resp:
                     resp.raise_for_status()
                     try:
                         for raw in resp.iter_lines(decode_unicode=True):

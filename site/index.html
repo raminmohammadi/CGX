@@ -384,9 +384,33 @@ flowchart TD
             </p>
           </div>
 
-          <div class="grid grid-2">
-            <article class="card reveal">
-              <span class="pill">Explore mode · existing codebase</span>
+          <div class="mode reveal">
+            <div class="mode-switch" role="tablist" aria-label="Agent mode" data-active="explore">
+              <span class="mode-thumb" aria-hidden="true"></span>
+              <button
+                class="mode-btn is-active"
+                role="tab"
+                type="button"
+                id="mode-explore"
+                aria-controls="modepanel-explore"
+                aria-selected="true"
+              >
+                Explore<small>existing codebase</small>
+              </button>
+              <button
+                class="mode-btn"
+                role="tab"
+                type="button"
+                id="mode-greenfield"
+                aria-controls="modepanel-greenfield"
+                aria-selected="false"
+                tabindex="-1"
+              >
+                Greenfield<small>new project</small>
+              </button>
+            </div>
+
+            <article class="card mode-panel" role="tabpanel" id="modepanel-explore" aria-labelledby="mode-explore">
               <h3>Understand, then change</h3>
               <div class="chain" aria-label="Explore mode task chain">
                 <span>EXPLORE</span><i>→</i>
@@ -406,8 +430,13 @@ flowchart TD
               </p>
             </article>
 
-            <article class="card reveal">
-              <span class="pill">Greenfield mode · new project</span>
+            <article
+              class="card mode-panel"
+              role="tabpanel"
+              id="modepanel-greenfield"
+              aria-labelledby="mode-greenfield"
+              hidden
+            >
               <h3>Clarify, scaffold, prove it runs</h3>
               <div class="chain" aria-label="Greenfield mode task chain">
                 <span>CLARIFY_REQUIREMENTS</span><i>→</i>
@@ -518,9 +547,10 @@ flowchart TD
           </div>
 
           <div class="tabs" role="tablist" aria-label="Surfaces">
-            <button class="tab" role="tab" id="tab-ui" aria-controls="panel-ui" aria-selected="true">Web UI</button>
-            <button class="tab" role="tab" id="tab-cli" aria-controls="panel-cli" aria-selected="false">CLI</button>
-            <button class="tab" role="tab" id="tab-py" aria-controls="panel-py" aria-selected="false">Python</button>
+            <button class="tab" role="tab" type="button" id="tab-ui" aria-controls="panel-ui" aria-selected="true">Web UI</button>
+            <button class="tab" role="tab" type="button" id="tab-cli" aria-controls="panel-cli" aria-selected="false" tabindex="-1">CLI</button>
+            <button class="tab" role="tab" type="button" id="tab-py" aria-controls="panel-py" aria-selected="false" tabindex="-1">Python</button>
+            <span class="tab-ink" aria-hidden="true"></span>
           </div>
 
           <div class="panel" role="tabpanel" id="panel-ui" aria-labelledby="tab-ui">

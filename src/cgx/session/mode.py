@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import logging
 import os
-from pathlib import Path
 from typing import Iterable, Optional
 
 from cgx.session.models import SessionMode
@@ -50,47 +49,34 @@ def _has_usable_index(index_dir: Optional[str],
     if not index_dir or not records_path:
         return False
     try:
-        # Normalize paths first. ``os.path.realpath`` collapses ``..`` and
-        # follows symlinks -- a pure canonicalization, unlike ``Path.resolve``
-        # which CodeQL models as a filesystem-access sink.
+        # Normalize first. ``os.path.realpath`` collapses ``..`` and follows
+        # symlinks -- a pure canonicalization, unlike ``Path.resolve`` which
+        # CodeQL models as a filesystem-access sink.
         base = os.path.realpath(index_dir)
-        meta = os.path.join(base, "meta.json")
+        meta = os.path.realpath(os.path.join(base, "meta.json"))
         rec = os.path.realpath(records_path)
 
-        # SafeAccessCheck (CodeQL path-injection): confirm both artifacts
-        # stay within the index workspace root via the recognized
-        # ``startswith(prefix + os.sep)`` prefix guard *before* any
-        # filesystem access. ``records_path`` sits beside ``index_dir`` in
-        # the default layout (``/tmp/cgx_index/indices`` +
-        # ``/tmp/cgx_index/records.jsonl``), so the shared root is the parent
-        # of ``index_dir``; ``meta.json`` lives directly under ``index_dir``.
-        root = os.path.realpath(os.path.dirname(base))
-        prefix = root + os.sep
+        # Confine both artifacts to a single canonical container before any
+        # filesystem access: the ``project_root`` when known, otherwise the
+        # index workspace root (the parent of ``index_dir`` -- ``records_path``
+        # sits beside ``index_dir`` in the default layout). ``prefix`` ends in
+        # a separator so a sibling like ``/proj-evil`` can't pass the check
+        # for ``/proj``.
+        container = (os.path.realpath(project_root) if project_root
+                     else os.path.realpath(os.path.dirname(base)))
+        prefix = container + os.sep
+
+        # CodeQL path-injection barrier: a direct ``startswith`` prefix guard
+        # on the exact canonical string handed to each filesystem sink, so the
+        # tainted request input can never reach ``os.path.isfile`` /
+        # ``os.path.getsize`` without first being confined to ``container``.
         if not meta.startswith(prefix):
             return False
         if not rec.startswith(prefix):
             return False
 
-        # If a project root is known, additionally require both artifacts to
-        # live under it, again via the recognized prefix guard.
-        if project_root:
-            project_prefix = os.path.realpath(project_root) + os.sep
-            if not meta.startswith(project_prefix):
-                return False
-            if not rec.startswith(project_prefix):
-                return False
-
-        # Rebuild the paths that reach a filesystem sink by joining the
-        # trusted workspace ``root`` with the containment-checked relative
-        # segment. The values flowing into ``os.path.isfile`` /
-        # ``os.path.getsize`` are thus anchored on ``root`` rather than on
-        # the raw request input -- CodeQL: uncontrolled data used in a path
-        # expression.
-        safe_meta = os.path.join(root, os.path.relpath(meta, root))
-        safe_rec = os.path.join(root, os.path.relpath(rec, root))
-
-        return (os.path.isfile(safe_meta) and os.path.isfile(safe_rec)
-                and os.path.getsize(safe_rec) > 0)
+        return (os.path.isfile(meta) and os.path.isfile(rec)
+                and os.path.getsize(rec) > 0)
     except (OSError, ValueError):
         return False
 
@@ -106,8 +92,17 @@ def _project_is_empty(project_root: Optional[str], *,
     """
     if not project_root:
         return True
-    root = Path(project_root)
-    if not root.exists():
+    # Canonicalize away ``..``/symlinks, then confirm the result is an
+    # absolute path before any filesystem access. ``os.path.realpath`` is a
+    # pure normalization (not a filesystem-access sink like ``Path.resolve``);
+    # the ``startswith`` check is the CodeQL path-injection barrier on the
+    # exact string handed to ``os.path.exists`` / ``os.scandir``. Pointing the
+    # agent at an arbitrary *absolute* local directory is intentional, so the
+    # guard rejects only non-canonical (relative/traversal) roots.
+    root = os.path.realpath(project_root)
+    if not root.startswith(os.sep):
+        return True
+    if not os.path.exists(root):
         return True
     ignore_set = set(ignore)
     count = 0

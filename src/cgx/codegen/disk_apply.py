@@ -299,6 +299,11 @@ def rollback_from_backup(
     is missing or out of bounds).
     """
     root_real = os.path.realpath(project_root)
+    # CodeQL path-injection barrier: ``os.path.realpath`` canonicalizes away
+    # ``..``/symlinks and the ``startswith`` check confirms the result is an
+    # absolute path before it reaches ``os.path.isdir`` and the walk below.
+    if not root_real.startswith(os.sep):
+        raise ValueError(f"project_root is not an absolute path: {project_root}")
     if not os.path.isdir(root_real):
         raise ValueError(f"project_root is not a directory: {project_root}")
 

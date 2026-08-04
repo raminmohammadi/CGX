@@ -10,7 +10,7 @@ import pytest
 from cgx.logging_setup import (
     SecretScrubbingFilter,
     get_logger,
-    scrub_secrets,
+    redact_secrets,
     setup_logging,
     temp_log_level,
 )
@@ -117,18 +117,18 @@ def test_temp_log_level_restores_level_when_body_raises():
         ("plain log line", "plain log line"),
     ],
 )
-def test_scrub_secrets_redacts_known_shapes(raw, expected):
-    assert scrub_secrets(raw) == expected
+def test_redact_secrets_redacts_known_shapes(raw, expected):
+    assert redact_secrets(raw) == expected
 
 
-def test_scrub_secrets_is_idempotent():
-    once = scrub_secrets("?key=AQ.SECRET&x=1")
-    assert scrub_secrets(once) == once
+def test_redact_secrets_is_idempotent():
+    once = redact_secrets("?key=AQ.SECRET&x=1")
+    assert redact_secrets(once) == once
 
 
-def test_scrub_secrets_passes_through_non_str():
-    assert scrub_secrets(None) is None  # type: ignore[arg-type]
-    assert scrub_secrets("") == ""
+def test_redact_secrets_passes_through_non_str():
+    assert redact_secrets(None) is None  # type: ignore[arg-type]
+    assert redact_secrets("") == ""
 
 
 def test_setup_logging_installs_scrubbing_filter_on_handlers():
