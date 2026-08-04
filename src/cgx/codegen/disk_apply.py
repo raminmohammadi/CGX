@@ -146,10 +146,11 @@ def apply_diffs_to_disk(
     ``diffs`` (the input diffs echoed back for UI rendering), and
     ``smoke_ok``.
     """
-    root = Path(project_root).resolve()
-    if root.exists() and not root.is_dir():
+    root_real = os.path.realpath(project_root)
+    if os.path.exists(root_real) and not os.path.isdir(root_real):
         raise ValueError(f"project_root is not a directory: {project_root}")
-    root.mkdir(parents=True, exist_ok=True)
+    os.makedirs(root_real, exist_ok=True)
+    root = Path(root_real)
 
     deduped_diffs = _dedupe_diffs(diffs)
     targets = _to_targets(deduped_diffs)
@@ -204,28 +205,28 @@ def apply_diffs_to_disk(
             continue
         if p.path in failed_paths:
             continue  # skip files that failed smoke check
-        rel = _normalize_rel(p.path, root)
-        if rel is None:
+        dest = _normalize_rel(p.path, root_real)
+        # SafeAccessCheck: confirm the normalized target stays under the
+        # project root before any filesystem access (CodeQL path-injection).
+        if dest is None or not dest.startswith(root_real + os.sep):
             failed_files.append({"file": p.path,
                                  "error": "refusing to write outside project_root"})
             continue
-        dest = root / rel
-        if not _is_under(dest, root):
-            failed_files.append({"file": p.path,
-                                 "error": "refusing to write outside project_root"})
-            continue
-        if dest.exists():
-            mirror = backup_dir / rel
-            mirror.parent.mkdir(parents=True, exist_ok=True)
+        rel = os.path.relpath(dest, root_real)
+        if os.path.exists(dest):
+            mirror = os.path.join(str(backup_dir), rel)
+            os.makedirs(os.path.dirname(mirror), exist_ok=True)
             shutil.copy2(dest, mirror)
         else:
             # Record an explicit ``.new`` marker so rollback can delete it.
-            mirror = backup_dir / (str(rel) + ".new")
-            mirror.parent.mkdir(parents=True, exist_ok=True)
-            mirror.write_text("", encoding="utf-8")
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text(p.new_content, encoding="utf-8")
-        applied.append(str(rel))
+            mirror = os.path.join(str(backup_dir), rel + ".new")
+            os.makedirs(os.path.dirname(mirror), exist_ok=True)
+            with open(mirror, "w", encoding="utf-8") as fh:
+                fh.write("")
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest, "w", encoding="utf-8") as fh:
+            fh.write(p.new_content)
+        applied.append(rel)
         logger.info("apply_diffs_to_disk: wrote %s (%d bytes)",
                     rel, len(p.new_content))
 
@@ -237,49 +238,35 @@ def apply_diffs_to_disk(
     }
 
 
-def _normalize_rel(path_str: str, root: Path) -> Path | None:
-    """Normalize a target path into one relative to ``root``.
+def _normalize_rel(path_str: str, root_real: str) -> str | None:
+    """Return an absolute, normalized path for ``path_str`` under ``root``.
 
-    The LLM sometimes emits absolute paths (e.g. ``/home/u/proj/src/x.py``)
-    in fenced-diff headers. ``Path("/root") / "/abs"`` collapses to
-    ``"/abs"`` in pathlib, which causes ``shutil.copy2(dest, mirror)`` to
-    receive the same path twice (``SameFileError``). We coerce absolute
-    paths inside ``root`` back to their project-relative form and reject
-    anything that escapes the tree (``..``, absolute paths outside root).
+    ``root_real`` must already be an ``os.path.realpath`` result. The LLM
+    sometimes emits absolute paths (e.g. ``/home/u/proj/src/x.py``) in
+    fenced-diff headers, so we coerce absolute paths inside ``root`` back
+    to the project tree and reject anything that escapes it.
+
+    Normalization uses ``os.path.normpath`` -- a pure string operation
+    that never touches the filesystem, so it is safe on untrusted input,
+    unlike ``Path.resolve`` which is itself a filesystem-access sink.
+    Callers must still apply a ``startswith`` containment guard before
+    touching the returned path.
     """
     s = (path_str or "").strip()
-    # Strip a single leading ``./`` (or repeated ``./`` segments) -- but
-    # never ``lstrip("./")`` which is a character-set strip and would
-    # eat the leading ``/`` of an absolute path, turning ``/home/u/x.py``
-    # into ``home/u/x.py`` and causing the writer to mirror the absolute
-    # path under root.
+    # Strip leading ``./`` segments without ``lstrip("./")`` (a character
+    # strip that would eat the leading ``/`` of an absolute path, turning
+    # ``/home/u/x.py`` into ``home/u/x.py``).
     while s.startswith("./"):
         s = s[2:]
     if not s:
         return None
-    candidate = Path(s)
-    if candidate.is_absolute():
-        try:
-            rel = candidate.resolve().relative_to(root)
-        except (ValueError, OSError):
-            return None
-        return rel
-    # Relative: resolve under root and confirm it still sits within root.
-    try:
-        resolved = (root / candidate).resolve()
-        rel = resolved.relative_to(root)
-    except (ValueError, OSError):
-        return None
-    return rel
-
-
-def _is_under(path: Path, root: Path) -> bool:
-    try:
-        path.resolve().relative_to(root)
-        return True
-    except Exception:
-        return False
-
+    if os.path.isabs(s):
+        full = os.path.normpath(s)
+    else:
+        full = os.path.normpath(os.path.join(root_real, s))
+    # Containment is enforced by callers via a ``startswith`` guard on the
+    # normalized result; return it unconditionally here.
+    return full
 
 
 def rollback_from_backup(
@@ -311,22 +298,20 @@ def rollback_from_backup(
     and ``error`` (top-level message when the backup directory itself
     is missing or out of bounds).
     """
-    root = Path(project_root).resolve()
-    if not root.is_dir():
+    root_real = os.path.realpath(project_root)
+    if not os.path.isdir(root_real):
         raise ValueError(f"project_root is not a directory: {project_root}")
 
-    backup_path = Path(backup_dir)
-    if not backup_path.is_absolute():
-        backup_path = (root / backup_path)
-    try:
-        backup_path = backup_path.resolve()
-    except OSError:
-        return {"restored_files": [], "deleted_files": [], "failed_files": [],
-                "error": f"backup_dir not resolvable: {backup_dir}"}
-    if not _is_under(backup_path, root):
+    if os.path.isabs(backup_dir):
+        backup_real = os.path.normpath(backup_dir)
+    else:
+        backup_real = os.path.normpath(os.path.join(root_real, backup_dir))
+    # Follow symlinks, then confirm containment before any filesystem access.
+    backup_real = os.path.realpath(backup_real)
+    if not backup_real.startswith(root_real + os.sep):
         return {"restored_files": [], "deleted_files": [], "failed_files": [],
                 "error": "backup_dir is outside project_root"}
-    if not backup_path.is_dir():
+    if not os.path.isdir(backup_real):
         return {"restored_files": [], "deleted_files": [], "failed_files": [],
                 "error": f"backup_dir does not exist: {backup_dir}"}
 
@@ -334,39 +319,31 @@ def rollback_from_backup(
     deleted: List[str] = []
     failed: List[Dict[str, str]] = []
 
-    for entry in sorted(backup_path.rglob("*")):
+    for entry in sorted(Path(backup_real).rglob("*")):
         if not entry.is_file():
             continue
-        try:
-            rel_in_backup = entry.relative_to(backup_path)
-        except ValueError:
-            continue
-
-        rel_str = str(rel_in_backup)
+        rel_str = os.path.relpath(str(entry), backup_real)
         is_new_marker = rel_str.endswith(".new")
         rel_for_target = rel_str[:-4] if is_new_marker else rel_str
 
-        target_rel = _normalize_rel(rel_for_target, root)
-        if target_rel is None:
+        target = _normalize_rel(rel_for_target, root_real)
+        # SafeAccessCheck: never touch a path outside the project root.
+        if target is None or not target.startswith(root_real + os.sep):
             failed.append({"file": rel_str,
                            "error": "refusing to touch path outside project_root"})
             continue
-        target = root / target_rel
-        if not _is_under(target, root):
-            failed.append({"file": str(target_rel),
-                           "error": "refusing to touch path outside project_root"})
-            continue
+        target_rel = os.path.relpath(target, root_real)
 
         try:
             if is_new_marker:
-                if target.exists():
-                    target.unlink()
-                deleted.append(str(target_rel))
+                if os.path.exists(target):
+                    os.remove(target)
+                deleted.append(target_rel)
                 logger.info("rollback_from_backup: deleted %s", target_rel)
             else:
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(entry, target)
-                restored.append(str(target_rel))
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                shutil.copy2(str(entry), target)
+                restored.append(target_rel)
                 logger.info("rollback_from_backup: restored %s", target_rel)
         except OSError as e:
             # Log the underlying OS error (with type) server-side only; the
@@ -374,7 +351,7 @@ def rollback_from_backup(
             # message rather than a stack-trace-bearing exception string.
             logger.warning("rollback_from_backup: failed on %s: %s: %s",
                            target_rel, type(e).__name__, e)
-            failed.append({"file": str(target_rel),
+            failed.append({"file": target_rel,
                            "error": "could not restore file"})
 
     return {"restored_files": restored, "deleted_files": deleted,

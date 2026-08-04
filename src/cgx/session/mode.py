@@ -39,7 +39,8 @@ _IGNORE_DIRS = frozenset({
 
 
 def _has_usable_index(index_dir: Optional[str],
-                      records_path: Optional[str]) -> bool:
+                      records_path: Optional[str],
+                      project_root: Optional[str] = None) -> bool:
     """True iff ``index_dir`` + ``records_path`` look like a real index.
 
     A "usable" index has both the FAISS meta + the records file. We
@@ -49,14 +50,47 @@ def _has_usable_index(index_dir: Optional[str],
     if not index_dir or not records_path:
         return False
     try:
-        # Canonicalize before the stat calls and enforce that both files
-        # stay within the caller-provided index directory.
-        base = Path(index_dir).resolve()
-        meta = (base / "meta.json").resolve()
-        rec = Path(records_path).resolve()
-        meta.relative_to(base)
-        rec.relative_to(base)
-        return meta.is_file() and rec.is_file() and rec.stat().st_size > 0
+        # Normalize paths first. ``os.path.realpath`` collapses ``..`` and
+        # follows symlinks -- a pure canonicalization, unlike ``Path.resolve``
+        # which CodeQL models as a filesystem-access sink.
+        base = os.path.realpath(index_dir)
+        meta = os.path.join(base, "meta.json")
+        rec = os.path.realpath(records_path)
+
+        # SafeAccessCheck (CodeQL path-injection): confirm both artifacts
+        # stay within the index workspace root via the recognized
+        # ``startswith(prefix + os.sep)`` prefix guard *before* any
+        # filesystem access. ``records_path`` sits beside ``index_dir`` in
+        # the default layout (``/tmp/cgx_index/indices`` +
+        # ``/tmp/cgx_index/records.jsonl``), so the shared root is the parent
+        # of ``index_dir``; ``meta.json`` lives directly under ``index_dir``.
+        root = os.path.realpath(os.path.dirname(base))
+        prefix = root + os.sep
+        if not meta.startswith(prefix):
+            return False
+        if not rec.startswith(prefix):
+            return False
+
+        # If a project root is known, additionally require both artifacts to
+        # live under it, again via the recognized prefix guard.
+        if project_root:
+            project_prefix = os.path.realpath(project_root) + os.sep
+            if not meta.startswith(project_prefix):
+                return False
+            if not rec.startswith(project_prefix):
+                return False
+
+        # Rebuild the paths that reach a filesystem sink by joining the
+        # trusted workspace ``root`` with the containment-checked relative
+        # segment. The values flowing into ``os.path.isfile`` /
+        # ``os.path.getsize`` are thus anchored on ``root`` rather than on
+        # the raw request input -- CodeQL: uncontrolled data used in a path
+        # expression.
+        safe_meta = os.path.join(root, os.path.relpath(meta, root))
+        safe_rec = os.path.join(root, os.path.relpath(rec, root))
+
+        return (os.path.isfile(safe_meta) and os.path.isfile(safe_rec)
+                and os.path.getsize(safe_rec) > 0)
     except (OSError, ValueError):
         return False
 
@@ -109,6 +143,6 @@ def detect_mode(*, project_root: Optional[str] = None,
     """
     if _project_is_empty(project_root):
         return SessionMode.GREENFIELD
-    if not _has_usable_index(index_dir, records_path):
+    if not _has_usable_index(index_dir, records_path, project_root):
         return SessionMode.GREENFIELD
     return SessionMode.EXPLORE

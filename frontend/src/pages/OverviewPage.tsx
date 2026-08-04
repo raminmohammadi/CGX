@@ -1,5 +1,5 @@
 import { useState, type ReactNode } from "react";
-import { Link } from "react-router-dom";
+import { Link } from "react-router";
 import { RefreshCw, Wifi, WifiOff } from "lucide-react";
 import { useConnection } from "../store/connection";
 import { useWorkspace } from "../store/workspace";

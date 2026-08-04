@@ -1,6 +1,6 @@
 import { Cpu } from "lucide-react";
 import { useEffect, useState } from "react";
-import { useLocation } from "react-router-dom";
+import { useLocation } from "react-router";
 import { useConnection } from "../store/connection";
 import { useWorkspace } from "../store/workspace";
 import { useTrace } from "../store/trace";

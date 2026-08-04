@@ -1,5 +1,5 @@
 import { lazy, Suspense } from "react";
-import { Navigate, Route, Routes } from "react-router-dom";
+import { Navigate, Route, Routes } from "react-router";
 import AppShell from "./layout/AppShell";
 
 // Each route is code-split so the initial bundle only includes the shell.

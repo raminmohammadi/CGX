@@ -170,9 +170,14 @@ def _mount_spa(app: FastAPI) -> None:
         if full_path.startswith("api/") or full_path.startswith("assets/"):
             return JSONResponse({"detail": "not found"}, status_code=404)
         # Pass through a real file under static/ if it exists (icons, etc.).
-        candidate = STATIC_DIR / full_path
-        if has_static and candidate.is_file():
-            return FileResponse(str(candidate))
+        # Normalize the request path then containment-check it against
+        # STATIC_DIR via the recognized ``startswith`` prefix guard before
+        # any filesystem access, so ``../`` can't escape (CodeQL path-injection).
+        static_root = os.path.realpath(str(STATIC_DIR))
+        candidate = os.path.realpath(os.path.join(static_root, full_path))
+        if (has_static and candidate.startswith(static_root + os.sep)
+                and os.path.isfile(candidate)):
+            return FileResponse(candidate)
         if has_static:
             return FileResponse(str(STATIC_DIR / "index.html"))
         return JSONResponse(

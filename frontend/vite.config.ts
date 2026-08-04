@@ -40,7 +40,7 @@ export default defineConfig({
           // React core stays separate so route-level chunks can share it
           // without duplication.
           if (
-            /[\\/]node_modules[\\/](react|react-dom|react-is|react-router|react-router-dom|@remix-run|scheduler)[\\/]/.test(id)
+            /[\\/]node_modules[\\/](react|react-dom|react-is|react-router|@remix-run|scheduler)[\\/]/.test(id)
           ) {
             return "react-vendor";
           }
