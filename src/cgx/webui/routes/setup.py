@@ -16,10 +16,13 @@ import time
 from typing import List, Optional
 
 import asyncio
+import ipaddress
 import json as _json
 import logging
+import socket
 import re
 import threading
+from urllib.parse import urlparse
 
 from fastapi import APIRouter
 from pydantic import BaseModel
@@ -33,6 +36,12 @@ from cgx.webui.models import HardwareInfo, ModelChoicesResponse
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["setup"])
+
+# Restrict outbound model-discovery requests to explicitly approved providers.
+# Keep this list aligned with supported OpenAI-compatible backends.
+_OPENAI_ALLOWED_HOSTS = {
+    "api.openai.com",
+}
 
 
 class PingRequest(BaseModel):
@@ -100,14 +109,14 @@ def ping_provider(req: PingRequest) -> PingResponse:
             if not re.fullmatch(r"[A-Za-z0-9._\-]+", model):
                 return PingResponse(ok=False, error="invalid model name")
             url = (
-                f"https://generativelanguage.googleapis.com/v1beta/models/"
-                f"{model}:generateContent?key={api_key}"
+                "https://generativelanguage.googleapis.com/v1beta/models/"
+                f"{model}:generateContent"
             )
             body = {
                 "contents": [{"role": "user", "parts": [{"text": "ping"}]}],
                 "generationConfig": {"maxOutputTokens": 1},
             }
-            r = _req.post(url, json=body, timeout=15)
+            r = _req.post(url, params={"key": api_key}, json=body, timeout=15)
             r.raise_for_status()
 
         else:
@@ -122,8 +131,15 @@ def ping_provider(req: PingRequest) -> PingResponse:
             # relative path so it can only extend ``base`` (already validated
             # above) and cannot inject a new scheme/host (SSRF guard).
             path = req.endpoint_path or "/v1/chat/completions"
-            if "://" in path or not path.startswith("/"):
-                return PingResponse(ok=False, error="invalid endpoint_path")
+            # Validate user-controlled path to prevent partial SSRF/path abuse.
+            if not path.startswith("/"):
+                return PingResponse(ok=False, error="endpoint_path must start with '/'")
+            if any(token in path for token in ("?", "#", "://", "@", "\\")):
+                return PingResponse(ok=False, error="Invalid endpoint_path")
+            if ".." in path:
+                return PingResponse(ok=False, error="Invalid endpoint_path")
+            if not re.fullmatch(r"/[A-Za-z0-9._~/%-]*", path):
+                return PingResponse(ok=False, error="Invalid endpoint_path")
             # Lightweight OPTIONS/HEAD is usually enough to confirm the host is up.
             headers = {}
             if req.api_key and not req.allow_no_auth:
@@ -250,8 +266,8 @@ _GEMINI_NONCHAT_SUBSTR = (
 
 def _gemini_list(api_key: str) -> List[str]:
     import requests as _req
-    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
-    r = _req.get(url, timeout=15)
+    url = "https://generativelanguage.googleapis.com/v1beta/models"
+    r = _req.get(url, params={"key": api_key}, timeout=15)
     try:
         r.raise_for_status()
     except Exception as exc:
@@ -279,14 +295,105 @@ def _gemini_list(api_key: str) -> List[str]:
     return out
 
 
+def _validate_openai_base_url(base_url: str) -> str:
+    raw = (base_url or "https://api.openai.com").strip()
+    parsed = urlparse(raw)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError("Invalid base_url scheme")
+    if not parsed.hostname:
+        raise ValueError("Invalid base_url host")
+
+    host = parsed.hostname.strip().lower()
+    if host == "localhost" or host.endswith(".localhost"):
+        raise ValueError("Localhost is not allowed in base_url")
+
+    # Resolve and block private/internal targets to reduce SSRF risk.
+    try:
+        addrinfos = socket.getaddrinfo(parsed.hostname, parsed.port or None, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise ValueError(f"Unable to resolve base_url host: {exc}") from exc
+
+    if not addrinfos:
+        raise ValueError("Unable to resolve base_url host")
+
+    for info in addrinfos:
+        sockaddr = info[4]
+        if not sockaddr:
+            continue
+        ip_txt = sockaddr[0]
+        try:
+            ip_obj = ipaddress.ip_address(ip_txt)
+        except ValueError:
+            raise ValueError("Resolved base_url host to an invalid IP address")
+
+        if (
+            ip_obj.is_private
+            or ip_obj.is_loopback
+            or ip_obj.is_link_local
+            or ip_obj.is_multicast
+            or ip_obj.is_reserved
+            or ip_obj.is_unspecified
+            or getattr(ip_obj, "is_site_local", False)
+        ):
+            raise ValueError("base_url resolves to a non-public IP address")
+
+    # Disallow URL components that can alter request routing/semantics.
+    if parsed.username or parsed.password:
+        raise ValueError("Userinfo is not allowed in base_url")
+    if parsed.params or parsed.query or parsed.fragment:
+        raise ValueError("Params/query/fragment are not allowed in base_url")
+
+    path = (parsed.path or "").rstrip("/")
+    if path not in ("", "/v1"):
+        raise ValueError("Only empty path or /v1 is allowed in base_url")
+
+    host = parsed.hostname
+    host_l = host.lower()
+    if host_l == "localhost":
+        raise ValueError("Localhost is not allowed")
+    if host_l not in _OPENAI_ALLOWED_HOSTS:
+        raise ValueError("Host is not in the allowed list")
+
+    def _reject_ip(ip_text: str) -> None:
+        ip = ipaddress.ip_address(ip_text)
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        ):
+            raise ValueError("Non-public IP is not allowed")
+
+    try:
+        _reject_ip(host)
+    except ValueError:
+        raise
+    except Exception:
+        infos = socket.getaddrinfo(host, None)
+        if not infos:
+            raise ValueError("Unable to resolve host")
+        for info in infos:
+            sockaddr = info[4]
+            if not sockaddr:
+                continue
+            _reject_ip(sockaddr[0])
+
+    netloc = host_l
+    if parsed.port:
+        netloc = f"{netloc}:{parsed.port}"
+    canonical = f"{parsed.scheme}://{netloc}"
+    if path == "/v1":
+        canonical += "/v1"
+    return canonical
+
+
 def _openai_list(base_url: str, api_key: str) -> List[str]:
     import requests as _req
-    # Validate the user-supplied base URL before fetching it server-side
-    # (SSRF guard: http/https + real host only, no embedded credentials).
-    raw = (base_url or "https://api.openai.com").rstrip("/")
-    if raw.endswith("/v1"):
-        raw = raw[:-3]
-    base = ollama_discovery.validate_base_url(raw)
+    base = _validate_openai_base_url(base_url)
+    if base.endswith("/v1"):
+        base = base[:-3]
     url = f"{base}/v1/models"
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     r = _req.get(url, headers=headers, timeout=15)
