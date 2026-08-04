@@ -50,47 +50,42 @@ def _has_usable_index(index_dir: Optional[str],
     if not index_dir or not records_path:
         return False
     try:
-        # Normalize paths first. ``os.path.realpath`` collapses ``..`` and
-        # follows symlinks -- a pure canonicalization, unlike ``Path.resolve``
-        # which CodeQL models as a filesystem-access sink.
+        # Normalize first. ``os.path.realpath`` collapses ``..`` and follows
+        # symlinks -- a pure canonicalization, unlike ``Path.resolve`` which
+        # CodeQL models as a filesystem-access sink.
         base = os.path.realpath(index_dir)
-        meta = os.path.join(base, "meta.json")
+        meta = os.path.realpath(os.path.join(base, "meta.json"))
         rec = os.path.realpath(records_path)
 
-        # SafeAccessCheck (CodeQL path-injection): confirm both artifacts
-        # stay within the index workspace root via the recognized
-        # ``startswith(prefix + os.sep)`` prefix guard *before* any
-        # filesystem access. ``records_path`` sits beside ``index_dir`` in
-        # the default layout (``/tmp/cgx_index/indices`` +
+        # Containment guard (CodeQL path-injection barrier): both artifacts
+        # must resolve to a location inside the index workspace root, and --
+        # when known -- inside ``project_root``. ``records_path`` sits beside
+        # ``index_dir`` in the default layout (``/tmp/cgx_index/indices`` +
         # ``/tmp/cgx_index/records.jsonl``), so the shared root is the parent
-        # of ``index_dir``; ``meta.json`` lives directly under ``index_dir``.
+        # of ``index_dir``. The exact value handed to each filesystem sink is
+        # re-checked with ``os.path.commonpath`` immediately before use, so
+        # the tainted request input can never reach ``os.path.isfile`` /
+        # ``os.path.getsize`` without passing the barrier.
         root = os.path.realpath(os.path.dirname(base))
-        prefix = root + os.sep
-        if not meta.startswith(prefix):
-            return False
-        if not rec.startswith(prefix):
-            return False
-
-        # If a project root is known, additionally require both artifacts to
-        # live under it, again via the recognized prefix guard.
+        roots = [root]
         if project_root:
-            project_prefix = os.path.realpath(project_root) + os.sep
-            if not meta.startswith(project_prefix):
-                return False
-            if not rec.startswith(project_prefix):
-                return False
+            roots.append(os.path.realpath(project_root))
 
-        # Rebuild the paths that reach a filesystem sink by joining the
-        # trusted workspace ``root`` with the containment-checked relative
-        # segment. The values flowing into ``os.path.isfile`` /
-        # ``os.path.getsize`` are thus anchored on ``root`` rather than on
-        # the raw request input -- CodeQL: uncontrolled data used in a path
-        # expression.
-        safe_meta = os.path.join(root, os.path.relpath(meta, root))
-        safe_rec = os.path.join(root, os.path.relpath(rec, root))
+        def _within(candidate: str) -> bool:
+            for allowed in roots:
+                try:
+                    if os.path.commonpath([allowed, candidate]) != allowed:
+                        return False
+                except ValueError:
+                    # Different drives / mixed absolute-relative -> reject.
+                    return False
+            return True
 
-        return (os.path.isfile(safe_meta) and os.path.isfile(safe_rec)
-                and os.path.getsize(safe_rec) > 0)
+        if not _within(meta) or not _within(rec):
+            return False
+
+        return (os.path.isfile(meta) and os.path.isfile(rec)
+                and os.path.getsize(rec) > 0)
     except (OSError, ValueError):
         return False
 
