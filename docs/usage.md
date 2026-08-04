@@ -1,6 +1,10 @@
 # Usage
 
+<details>
+<summary>
+
 ## 0. Install
+</summary>
 
 CGX splits dependencies into a **core** layer (always required) and an
 **ML extras** layer (only needed for local embedding models and the
@@ -27,7 +31,12 @@ from `nvidia-smi` -- e.g. `pip install --index-url
 https://download.pytorch.org/whl/cu128 torch` for a CUDA 12.8 driver.
 See `requirements-ml.txt` for the full recipe.
 
+</details>
+<details>
+<summary>
+
 ## The terminal dashboard
+</summary>
 
 For a terminal-first workflow, run `cgx` with no arguments (or `cgx
 dash`) to open the interactive dashboard -- a full-screen REPL that
@@ -77,7 +86,12 @@ Colour is auto-disabled when stdout is not a TTY or when `NO_COLOR` /
 explicit subcommands below (`cgx index`, `cgx ask`, `cgx serve`, ...)
 remain available for scripted, non-interactive use.
 
+</details>
+<details>
+<summary>
+
 ## The CLI (non-interactive subcommands)
+</summary>
 
 Every capability the dashboard and web UI expose is also available as a
 plain, scriptable subcommand. Run `cgx <command> --help` for the full,
@@ -103,7 +117,11 @@ button uses. Any other failure exits non-zero (`1`). Colour follows the
 same TTY / `NO_COLOR` / `CGX_FORCE_COLOR` rules as the dashboard, so
 piping to a file yields clean, escape-free text.
 
+<details>
+<summary>
+
 ### Shared provider & index flags
+</summary>
 
 `ask`, `plan`, `agent`, and `status` accept a common set of flags:
 
@@ -151,7 +169,12 @@ cgx ask "How does parse_codebase work?" \
 > so an index passed via `--index-dir` / `--records` must have been built
 > with that model (a mismatched embedding dimension is rejected at load).
 
+</details>
+<details>
+<summary>
+
 ### `cgx ask` — grounded question answering
+</summary>
 
 ```bash
 cgx ask "What does the retrieval orchestrator fuse?" \
@@ -163,7 +186,12 @@ Add `--think` to also stream the model's reasoning sketch before the
 answer. The multi-word question is a positional argument (no quoting
 required, though quoting is fine).
 
+</details>
+<details>
+<summary>
+
 ### `cgx plan` — self-testing change plans
+</summary>
 
 ```bash
 cgx plan "Add a --json flag to the query command" \
@@ -175,7 +203,12 @@ planner validate and repair its own diffs (parse + dry-apply +
 `ast.parse`); `--run-tests` executes the project's impacted tests in a
 sandbox. See §4 for the UI equivalent and the report shape.
 
+</details>
+<details>
+<summary>
+
 ### `cgx agent` — session agent loop
+</summary>
 
 ```bash
 cgx agent "Add docstrings to every public function in cgx.parser"
@@ -192,7 +225,12 @@ scaffolds a brand-new project into `--project-root`. The session
 persists in `<project_root>/.cgx/sessions.db`, so it can be resumed
 from the dashboard or web UI afterwards.
 
+</details>
+<details>
+<summary>
+
 ### `cgx status` — environment & index summary
+</summary>
 
 ```bash
 cgx status --provider ollama
@@ -203,14 +241,25 @@ Prints the resolved provider and model, a live Ollama reachability check
 is built (with its build timestamp and embedding model). This is the
 non-interactive form of the dashboard's `/status` command.
 
+</details>
+
+</details>
+<details>
+<summary>
+
 ## 1. Pick a provider
+</summary>
 
 CGX supports four provider kinds, all configurable from the **⚙️ Setup**
 tab's **Provider Type** dropdown. A **Ping** button appears on both the
 inline config card and the profile edit form -- it performs a live
 connection test and reports latency or the exact error message.
 
+<details>
+<summary>
+
 ### Ollama (default, local)
+</summary>
 
 ```bash
 ollama serve   # in another terminal
@@ -220,14 +269,24 @@ ollama pull qwen2.5-coder:3b
 Set **Provider Type → Ollama (Local)**. The default base URL is
 `http://localhost:11434`. Ping exercises `GET /api/tags`.
 
+</details>
+<details>
+<summary>
+
 ### OpenAI (cloud)
+</summary>
 
 Set **Provider Type → OpenAI (Cloud)**, enter your `OPENAI_API_KEY`,
 and choose a model (`gpt-4o-mini`, `gpt-4o`, etc.). The default base URL
 is `https://api.openai.com`. Any OpenAI-compatible endpoint (Groq,
 Together, DeepSeek, vLLM, etc.) also works here.
 
+</details>
+<details>
+<summary>
+
 ### Google Gemini (cloud)
+</summary>
 
 Set **Provider Type → Google Gemini (Cloud)**, enter your
 `GEMINI_API_KEY`, and choose a model (`gemini-1.5-flash`,
@@ -242,7 +301,12 @@ prov = GeminiProvider(model="gemini-1.5-flash", api_key="YOUR_KEY")
 # or set GEMINI_API_KEY in the environment and omit api_key
 ```
 
+</details>
+<details>
+<summary>
+
 ### Custom Server (OpenAI-Compatible)
+</summary>
 
 Set **Provider Type → Custom Server (OpenAI-Compatible)** to configure a
 self-hosted model endpoint:
@@ -268,7 +332,14 @@ persists `endpoint_path` and `allow_no_auth` alongside the other fields.
 API keys are stored in the OS keyring when available, otherwise in
 `~/.cgx/secrets.json` with `0600` permissions.
 
+</details>
+
+</details>
+<details>
+<summary>
+
 ## 2. Index a project
+</summary>
 
 ```bash
 cgx index --project-root /path/to/repo --out-dir /tmp/cgx_index
@@ -289,7 +360,11 @@ emb_cache_intent.npz       # content-addressed embedding cache (intent view)
 emb_cache_impl.npz         # content-addressed embedding cache (impl view)
 ```
 
+<details>
+<summary>
+
 ### Multi-language parsing
+</summary>
 
 `parse_codebase` dispatches each file to a parser by extension through an
 internal registry. Python (`.py`) is always parsed with the stdlib `ast`
@@ -307,7 +382,12 @@ than failing. Every parser emits the same chunk/call-relation shape, so
 retrieval, the graph, and the agent loop are language-agnostic
 downstream.
 
+</details>
+<details>
+<summary>
+
 ### Parallel two-view build and GPU detection
+</summary>
 
 `run_index_auto()` builds the intent-view and impl-view FAISS indices
 concurrently using a `ThreadPoolExecutor`, roughly halving indexing time
@@ -318,7 +398,12 @@ configuration is needed.
 The **Index** tab in the UI displays a **Cancel** button while indexing
 is in progress; clicking it terminates the SSE stream cleanly.
 
+</details>
+<details>
+<summary>
+
 ### Incremental re-indexing
+</summary>
 
 Re-indexing is cheap at **two** layers. First, at the *parse* layer
 (`cgx.parser.incremental`): a `parse_cache.json` manifest keyed on each
@@ -372,7 +457,14 @@ run_index_auto(project_root=".", out_dir="/tmp/cgx_index",
 
 Implementation lives in `src/cgx/embeddings/cache.py`.
 
+</details>
+
+</details>
+<details>
+<summary>
+
 ## 3. Ask a question
+</summary>
 
 There are two CLI entry points here. `cgx query` runs **raw hybrid
 retrieval** and prints the ranked chunks as JSON — no LLM is involved,
@@ -402,7 +494,12 @@ another tab mid-stream does **not** lose the answer -- the connection
 keeps streaming in the background and the accumulated messages are
 restored when you return to the Ask tab.
 
+</details>
+<details>
+<summary>
+
 ## 4. Generate a change plan
+</summary>
 
 From the CLI:
 
@@ -431,7 +528,12 @@ closes the SSE connection and terminates the backend stream. Tab
 switching is non-destructive -- the plan output accumulated so far is
 preserved in session state and displayed when you return.
 
+</details>
+<details>
+<summary>
+
 ## 5. Tune retrieval (optional)
+</summary>
 
 The hybrid retriever fuses semantic + lexical + graph signals via
 Reciprocal Rank Fusion. The post-fusion rerank stage is controlled by
@@ -463,7 +565,11 @@ fired (`semantic_intent`, `semantic_impl`, `lexical`, `graph_depth`,
 `symbol_match`, `reranker_score`), so the **Ask** tab's "thought process"
 panel shows exactly why a chunk ranked where it did.
 
+<details>
+<summary>
+
 ### Tiered SOURCES (Code Map)
+</summary>
 
 When the retriever's graph expansion (`graph_depth >= 1`) pulls in
 callers, callees, or import-neighbors of the top hits, CGX switches the
@@ -513,7 +619,14 @@ The architecture doc has the full developer-facing treatment under
 including the classifier rule, the `cgx.answer.context_map` public
 API, and the engine-level activation gate.
 
+</details>
+
+</details>
+<details>
+<summary>
+
 ## 6. Session-based Agent (`/agent`)
+</summary>
 
 The **🤖 Agent** tab (`/agent`) is the default agentic surface. It
 drives a **persistent, session-shaped** orchestrator under
@@ -532,7 +645,11 @@ creation and overridable from the launcher's mode picker
   manifest, and only writes anything to disk after you approve the
   plan.
 
+<details>
+<summary>
+
 ### The Explore Write Loop
+</summary>
 
 In explore mode the router seeds a root `EXPLORE` task and the agent
 walks the following chain, pausing at each `ASK_USER` for a typed
@@ -569,7 +686,12 @@ determines what the router spawns when the user picks it. The
 follow-up message that spawns a sibling EXPLORE for a different
 objective.
 
+</details>
+<details>
+<summary>
+
 ### The Greenfield Write Loop
+</summary>
 
 In greenfield mode the router seeds a root `CLARIFY_REQUIREMENTS`
 task instead. The agent never queries an index; the entire loop is
@@ -831,7 +953,11 @@ it does not change the bootstrap outcome -- but the UI renders the
 list under the manifests block so the user sees a named issue
 before `VERIFY` runs, even though `REPAIR` will still auto-fix it.
 
+<details>
+<summary>
+
 #### Two maps of the greenfield loop
+</summary>
 
 To make the write loop legible at a glance, here it is as **flow** and
 as **components** -- the same picture the architecture doc uses, kept
@@ -893,7 +1019,14 @@ flowchart TB
     class DEC,SCA,SVAL,RTV,VER,REP,ROU,BUD choc;
 ```
 
+</details>
+
+</details>
+<details>
+<summary>
+
 ### UI controls
+</summary>
 
 - **Session list** -- left panel; create a new session or resume an
   existing one. Hover a row to reveal a trash icon that calls
@@ -927,7 +1060,12 @@ flowchart TB
 - **Project Root** -- shared with the rest of the UI; persisted to
   the workspace store.
 
+</details>
+<details>
+<summary>
+
 ### Decision contract
+</summary>
 
 Every `ASK_USER` task carries `inputs.expected_kind` indicating which
 `chosen` payload the route layer (`build_decision` in
@@ -948,7 +1086,12 @@ A mismatch (e.g. empty `anchor_chunk_id` on a `choose_path`, or an
 empty `answers` dict on `clarify_answers`) returns HTTP `400` with a
 clear error so the UI can surface the failure without re-posting.
 
+</details>
+<details>
+<summary>
+
 ### HTTP surface
+</summary>
 
 JSON-only, no SSE in the current release -- the UI polls
 `GET /api/agent-session/{sid}` while any task is `in_progress` other
@@ -968,7 +1111,12 @@ Every mutating endpoint except `DELETE` returns the full
 in one round-trip; `DELETE` returns `{deleted: sid}` and the UI
 refetches the session list.
 
+</details>
+<details>
+<summary>
+
 ### Programmatic use
+</summary>
 
 The session backbone is plain Python; the route layer is a thin
 wrapper. To drive it from a script, instantiate a `SessionRunner`
@@ -1018,7 +1166,11 @@ The session database lives at `<project_root>/.cgx/sessions.db` (or
 `sessions`, `tasks`, `facts`, `decisions`, `artifacts`; one row per
 aggregate stored as a JSON blob plus indexed columns.
 
+<details>
+<summary>
+
 #### Session budgets (autonomous-loop safety valve)
+</summary>
 
 A greenfield session runs an autonomous Plan → Scaffold → Apply →
 Bootstrap → Verify → Repair loop. The per-loop regenerate/repair caps
@@ -1055,7 +1207,14 @@ The HTTP `POST /api/agent-session` route uses the unlimited defaults;
 drive budgeted / headless runs through the programmatic `SessionRunner`
 API above (or a thin wrapper of your own).
 
+</details>
+
+</details>
+<details>
+<summary>
+
 ### Skills (technology-aware scaffolding)
+</summary>
 
 CGX ships with a registry of per-technology *skills* (`skills/<name>/`)
 that activate automatically when the objective mentions them. Each
@@ -1088,14 +1247,25 @@ agent-layer changes are required. See
 
 ---
 
+</details>
+
+</details>
+<details>
+<summary>
+
 ## 7. SLM-grade execution engine
+</summary>
 
 The following features are active by default whenever the session loop
 runs and require no extra configuration. They are particularly important
 when using a local 7B model that would otherwise hallucinate dependencies
 or degrade on large files.
 
+<details>
+<summary>
+
 ### Dynamic Dependency Management (`cgx.codegen.env_manager`)
+</summary>
 
 Before VERIFY runs the project's tests, the `BOOTSTRAP_ENV` task scans
 every generated `.py` file for `import` statements and cross-references
@@ -1125,7 +1295,12 @@ registry degrades to `skipped`) and keeps `project_type=python`, so the
 Python-only gates are unchanged while VERIFY's JS runner now exercises
 the frontend against real, already-installed dependencies.
 
+</details>
+<details>
+<summary>
+
 ### Granular error context (repair loop)
+</summary>
 
 Instead of dumping the full pytest log into a retry prompt, the
 session REPAIR loop (`cgx.session.repair`) works from the failure
@@ -1139,7 +1314,14 @@ This keeps the repair prompt small and lets local models focus on the
 precise failure site rather than guessing from a wall of pytest
 output.
 
+</details>
+
+</details>
+<details>
+<summary>
+
 ## 8. Persistent chat sessions (Ask tab sidebar)
+</summary>
 
 The Ask tab's sidebar holds the local conversation store:
 
@@ -1177,7 +1359,12 @@ sessions.delete_session(m.id)
 Writes go through `os.replace` so a crash mid-write cannot corrupt
 either the index or a thread file.
 
+</details>
+<details>
+<summary>
+
 ## 9. Hardware-aware model picker (Hardware tab)
+</summary>
 
 Click **🧠 Detect hardware** to populate the local-model fit table.
 The computation is pure-local -- it reads the RAM/VRAM detected by
@@ -1208,7 +1395,12 @@ behind each row.
 The same data is exported as `docs/hardware_matrix.json` for
 downstream tooling.
 
+</details>
+<details>
+<summary>
+
 ## 10. Rate limiting and retries
+</summary>
 
 Every HTTP-backed provider (Ollama and OpenAI-compatible) goes through
 `cgx.answer.ratelimit`, which provides:
@@ -1236,7 +1428,12 @@ When you load a profile from the UI, the provider is instantiated
 with the persisted `rate_limit` / `max_retries`, so the budget is
 applied transparently to every subsequent call.
 
+</details>
+<details>
+<summary>
+
 ## 11. Anonymous telemetry (opt-in)
+</summary>
 
 `cgx.telemetry` ships an ultra-light startup ping that exists solely
 to count active installs (MAU/DAU). It is **off by default** and emits
@@ -1253,7 +1450,12 @@ Disable: unset the variable, or set `CGX_TELEMETRY=0`. To rotate the
 install id, delete `~/.cgx/install_id` and restart. The full payload
 shape lives in `src/cgx/telemetry.py`; review it before opting in.
 
+</details>
+<details>
+<summary>
+
 ## 12. VS Code extension
+</summary>
 
 [`extension/`](../extension/) hosts the CGX web UI inside a VS Code
 webview. The scaffold ships source-only; build it locally:
@@ -1279,7 +1481,12 @@ npm install -g @vscode/vsce
 vsce package        # → cgx-0.0.1.vsix
 ```
 
+</details>
+<details>
+<summary>
+
 ## 13. Terminal logging
+</summary>
 
 All operations emit structured log lines to stdout from the moment the
 server starts. `setup_logging(INFO)` is called once in `launch.py` and
@@ -1305,7 +1512,11 @@ increase verbosity set the `CGX_LOG_LEVEL` environment variable, or
 call `setup_logging` with the desired level before importing other cgx
 modules.
 
+<details>
+<summary>
+
 ### Function-call tracing (troubleshooting)
+</summary>
 
 When a session fails in a non-obvious place -- a REPAIR loop looping,
 an LLM call returning nothing, a codegen apply that silently no-ops --
@@ -1329,7 +1540,14 @@ decorator is a single `bool` check when disabled, but each `@traced`
 call still writes a JSONL row while it's on, so long-running sessions
 can produce thousands of lines.
 
+</details>
+
+</details>
+<details>
+<summary>
+
 ## 14. Task REST API
+</summary>
 
 Every SSE operation creates a task record in `~/.cgx/tasks.db` (via
 `cgx.webui.task_store`). The REST API mounted at `/api/tasks` lets you
@@ -1357,7 +1575,11 @@ curl http://localhost:8765/api/tasks/<task-id>/events | jq '.[].event_type'
 The in-UI **Cancel / Stop** buttons on each tab call
 `DELETE /api/tasks/{id}` under the hood.
 
+<details>
+<summary>
+
 ### Rollback an `apply` run
+</summary>
 
 When the Agent's `apply` task writes to `project_root`, it first
 mirrors every overwritten file into a timestamped directory under
@@ -1379,7 +1601,14 @@ existed before the run are restored from the backup; files the
 the **Undo** button surfaced by the Agent tab after a successful
 apply.
 
+</details>
+
+</details>
+<details>
+<summary>
+
 ## 15. Safety defaults
+</summary>
 
 - **Plan tab** -- CGX never writes to your project directory during
   plan generation. The "Run impacted tests" sandbox uses a temporary
@@ -1399,3 +1628,5 @@ apply.
   umask. Once a profile has been saved (or the profile store has been
   initialised), `cgx.answer.profiles._ensure_dir` chmods `~/.cgx/` to
   `0700` (owner-only). Override the root via `CGX_CONFIG_DIR`.
+
+</details>

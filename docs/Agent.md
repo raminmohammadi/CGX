@@ -18,7 +18,11 @@ the ask/plan surfaces (a `PLAN_CHANGE` task goes through the same
 
 ---
 
+<details>
+<summary>
+
 ## 1A. Session-Based Agent
+</summary>
 
 The session-based agent treats every interaction as part of an
 ongoing **Session**: a persistent record of the user's objective, the
@@ -28,7 +32,11 @@ decision log of typed user choices. State survives process restarts;
 the user can return to a session days later and pick up where they
 left off.
 
+<details>
+<summary>
+
 ### 1A.1 Why this shape?
+</summary>
 
 A one-shot agent treats every goal as a single job: plan up front,
 execute, judge, return. That works for well-scoped goals ("add
@@ -58,7 +66,12 @@ Mode is resolved in `cgx.session.mode.detect_mode`: empty / missing
 The webui route honors an explicit `mode` field on the create
 request and falls back to `detect_mode` only when none is given.
 
+</details>
+<details>
+<summary>
+
 ### 1A.2 Data model
+</summary>
 
 All session state lives under `src/cgx/session/models.py` as plain
 :mod:`dataclasses` (no Pydantic at the core layer -- Pydantic stays at
@@ -94,7 +107,12 @@ Task kinds (`TaskKind`):
 | `ASK_USER`              | Structured pause; carries an `expected_kind` indicating which decision contract the UI must satisfy. |
 | `SEARCH` / `SUMMARIZE`  | Utility kinds the router may interleave. |
 
+</details>
+<details>
+<summary>
+
 ### 1A.3 The Router
+</summary>
 
 `cgx.session.router.Router` is the central state machine. It is **pure
 Python with no LLM calls and no I/O**: every method takes the current
@@ -256,7 +274,11 @@ Five entry points cover every transition:
   decision, attaches it to the ASK_USER, marks the ASK_USER `DONE`,
   and spawns the successor implied by the decision shape (see §1A.5).
 
+<details>
+<summary>
+
 #### Loop budgets: `cgx.session.budget.LoopBudget`
+</summary>
 
 Every bounded recovery loop above spends one typed, immutable
 `LoopBudget` object instead of hand-copied dict keys. Router edges
@@ -317,8 +339,14 @@ flowchart TB
     class T term;
 ```
 
+</details>
+
+</details>
+<details>
+<summary>
 
 ### 1A.4 The Runner and executors
+</summary>
 
 `cgx.session.runner.SessionRunner` sits between the router and the
 SQLite-backed `SessionStore`. All write paths funnel through it so a
@@ -368,7 +396,12 @@ runner a single place to enforce ordering. LLM-issuing executors
 surface model name, sampling params, latency, and a redacted
 prompt/response preview (**Phase 5.1**).
 
+</details>
+<details>
+<summary>
+
 ### 1A.5 Decision contract
+</summary>
 
 Every `ASK_USER` task carries `inputs["expected_kind"]` indicating
 which `DecisionKind` the UI must satisfy. The frontend posts
@@ -390,7 +423,12 @@ A `done` recommendation closes the session focus and lets a follow-up
 message spawn a fresh sibling EXPLORE -- this is how the user signals
 "I'm satisfied with what we found; let's move on".
 
+</details>
+<details>
+<summary>
+
 ### 1A.6 Greenfield walk-through
+</summary>
 
 A greenfield session for *"build a Python app with a Flask API and a
 frontend where users enter their information and the server saves it
@@ -581,7 +619,12 @@ Five router-level guardrails keep the loop honest:
   forward on a tree with a silently-missing module, and never asks
   the user to hand-fix AI-generated code.
 
+</details>
+<details>
+<summary>
+
 ### 1A.6b The contract-first write loop (two maps)
+</summary>
 
 The greenfield chain above is the highest-leverage part of the agent
 for a contributor to understand, so here it is twice: once as **flow**
@@ -661,7 +704,12 @@ returned for one regenerate hop), `verify` / `runtime_verify -> router`
 (counts and boot outcomes season the budget), and `classify -> repair`
 (the localisation that points the fix at the right file).
 
+</details>
+<details>
+<summary>
+
 ### 1A.7 Persistence
+</summary>
 
 `cgx.session.store.SessionStore` is a thin SQLite wrapper. One
 database file holds every session for a given project root, at
@@ -706,7 +754,11 @@ Four sibling files live alongside `sessions.db`:
   session is active because those records reach the project
   `agent.log` instead.
 
+<details>
+<summary>
+
 #### Curated function-call tracing (Phase TR)
+</summary>
 
 `cgx.trace` is a single-file, curated instrumentation layer wrapping
 the router (`on_user_message`, `on_task_completed`,
@@ -744,7 +796,14 @@ through every argument list. The runner sets the context inside
 `_execute` before any decorator fires, so router / runner / executor
 records land in the correct project log.
 
+</details>
+
+</details>
+<details>
+<summary>
+
 ### 1A.8 HTTP surface
+</summary>
 
 `cgx.webui.routes.agent_session` mounts the session API at
 `/api/agent-session`:
@@ -767,7 +826,12 @@ A per-`project_root` runner cache (`_RUNNERS` in
 `agent_session.py`) reuses one `SessionStore` (and its SQLite WAL
 connection) across requests.
 
+</details>
+<details>
+<summary>
+
 ### 1A.9 React UI (`/agent`)
+</summary>
 
 `frontend/src/pages/AgentPage.tsx` is the session-shaped page; modular
 components live under `frontend/src/components/agent/`:
@@ -812,7 +876,12 @@ session deleted out-of-band or a `project_root` swap to a different
 SQLite file lands the user on the launcher instead of re-firing the
 same 404 on every mount.
 
+</details>
+<details>
+<summary>
+
 ### 1A.10 Where to look for what
+</summary>
 
 | To understand…                    | Read… |
 |-----------------------------------|-------|
@@ -846,3 +915,7 @@ same 404 on every mount.
 See [`docs/architecture.md`](architecture.md) for the broader
 system context and [`docs/book.md`](book.md) for the deep technical
 history of the pipeline.
+
+</details>
+
+</details>
