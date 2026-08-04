@@ -16,101 +16,151 @@ import os
 import matplotlib
 
 matplotlib.use("Agg")
+import matplotlib.patheffects as pe  # noqa: E402
 import matplotlib.pyplot as plt  # noqa: E402
-from matplotlib.patches import FancyArrowPatch, FancyBboxPatch  # noqa: E402
+import numpy as np  # noqa: E402
+from matplotlib.colors import LinearSegmentedColormap, to_rgb  # noqa: E402
+from matplotlib.patches import Circle, FancyArrowPatch, FancyBboxPatch  # noqa: E402
 
 OUT_DIR = os.path.join(os.path.dirname(__file__), "images")
 
-# ---- palette (muted slate + accents; light ink reads on the dark panel) ----
-BG = "#0f1729"
-INK = "#e6ecf7"
-MUTED = "#93a3ba"
-BOX = "#1b2740"
+# ---- palette (deep-space slate + luminous accents on framed dark cards) ----
+BG = "#0b1120"
+INK = "#eef3fb"
+MUTED = "#9fb0c9"
+FAINT = "#63769a"
+CARD = "#141f38"
+PANEL = "#0e1830"
 SKY = "#38bdf8"
 VIOLET = "#a78bfa"
 EMERALD = "#34d399"
 AMBER = "#fbbf24"
 ROSE = "#fb7185"
-SLATE = "#8296b1"
+SLATE = "#7f93b3"
+GRAD = ("#070c18", "#101f3f", "#0a1327")
 
 plt.rcParams["font.family"] = "DejaVu Sans"
+_SHADOW = [pe.withSimplePatchShadow(offset=(2.4, -2.4), alpha=0.45,
+                                    shadow_rgbFace="#03060d")]
 
 
-def _fig():
+def _mix(c1, c2, t):
+    """Blend two hex colours (t in [0,1]; t=0 -> c1) and return a hex string."""
+    a, b = np.array(to_rgb(c1)), np.array(to_rgb(c2))
+    r, g, bl = (a + (b - a) * t)
+    return "#%02x%02x%02x" % (int(r * 255), int(g * 255), int(bl * 255))
+
+
+def _fig(legend=None):
+    """A framed canvas with a vertical gradient wash and a wordmark footer."""
     fig, ax = plt.subplots(figsize=(12.8, 7.2), dpi=100)
-    fig.patch.set_facecolor(BG)
-    ax.set_facecolor(BG)
+    fig.patch.set_facecolor(GRAD[0])
     ax.set_xlim(0, 160)
     ax.set_ylim(0, 90)
     ax.axis("off")
+    grad = np.linspace(0, 1, 256).reshape(-1, 1)
+    cmap = LinearSegmentedColormap.from_list("bg", [GRAD[2], GRAD[1], GRAD[0]])
+    ax.imshow(grad, extent=(0, 160, 0, 90), aspect="auto", cmap=cmap,
+              origin="lower", zorder=-20)
+    ax.add_patch(FancyBboxPatch(
+        (3, 3), 154, 84, boxstyle="round,pad=0,rounding_size=3.2",
+        linewidth=1.3, edgecolor=_mix(SLATE, BG, 0.35),
+        facecolor=PANEL, alpha=0.55, zorder=-10))
+    ax.plot([6, 154], [10, 10], color=_mix(SLATE, BG, 0.3), lw=1, zorder=-9)
+    ax.text(153, 6.4, "CGX \u00b7 The Book", ha="right", va="center",
+            color=FAINT, fontsize=9, fontweight="bold", zorder=5)
+    if legend:
+        x = 6
+        for color, label in legend:
+            ax.add_patch(Circle((x + 1.2, 6.6), 1.2, facecolor=color,
+                                 edgecolor="none", zorder=6))
+            ax.text(x + 3.4, 6.5, label, ha="left", va="center", color=MUTED,
+                    fontsize=8.8, zorder=6)
+            x += 6 + len(label) * 1.75
     return fig, ax
 
 
-def box(ax, cx, cy, w, h, title, subs=None, accent=SKY, fill=BOX, ts=13, ss=10):
-    """Rounded box centered at (cx, cy) with a title and optional sub-lines."""
-    ax.add_patch(
-        FancyBboxPatch(
-            (cx - w / 2, cy - h / 2), w, h,
-            boxstyle="round,pad=0.6,rounding_size=2.2",
-            linewidth=2, edgecolor=accent, facecolor=fill, zorder=2,
-        )
-    )
+def box(ax, cx, cy, w, h, title, subs=None, accent=SKY, ts=13, ss=10,
+        badge=None):
+    """A tinted, shadowed card with an accent header bar and optional badge."""
+    x0, y0 = cx - w / 2, cy - h / 2
+    ax.add_patch(FancyBboxPatch(
+        (x0, y0), w, h, boxstyle="round,pad=0.6,rounding_size=2.4",
+        linewidth=1.8, edgecolor=accent, facecolor=_mix(accent, CARD, 0.86),
+        zorder=2, path_effects=_SHADOW))
+    ax.add_patch(FancyBboxPatch(
+        (x0 + 2.4, cy + h / 2 - 2.6), w - 4.8, 1.4,
+        boxstyle="round,pad=0.1,rounding_size=0.7", linewidth=0,
+        facecolor=accent, alpha=0.9, zorder=3))
     subs = subs or []
     if subs:
-        ax.text(cx, cy + h / 2 - 4.4, title, ha="center", va="center",
-                color=INK, fontsize=ts, fontweight="bold", zorder=3)
+        ax.text(cx, cy + h / 2 - 5.0, title, ha="center", va="center",
+                color=INK, fontsize=ts, fontweight="bold", zorder=4)
         for i, line in enumerate(subs):
-            ax.text(cx, cy + h / 2 - 9.4 - i * 4.4, line, ha="center",
-                    va="center", color=MUTED, fontsize=ss, zorder=3)
+            ax.text(cx, cy + h / 2 - 9.8 - i * 4.3, line, ha="center",
+                    va="center", color=MUTED, fontsize=ss, zorder=4)
     else:
-        ax.text(cx, cy, title, ha="center", va="center", color=INK,
-                fontsize=ts, fontweight="bold", zorder=3)
+        ax.text(cx, cy - 0.6, title, ha="center", va="center", color=INK,
+                fontsize=ts, fontweight="bold", zorder=4)
+    if badge is not None:
+        bx, by = x0 + 3.4, cy + h / 2 - 0.2
+        ax.add_patch(Circle((bx, by), 2.7, facecolor=accent,
+                            edgecolor=PANEL, linewidth=1.2, zorder=5))
+        ax.text(bx, by - 0.1, str(badge), ha="center", va="center",
+                color="#0a1220", fontsize=10, fontweight="bold", zorder=6)
 
 
-def arrow(ax, p1, p2, color=SLATE, lw=2.2, ls="-", rad=0.0):
-    ax.add_patch(
-        FancyArrowPatch(
-            p1, p2, arrowstyle="-|>", mutation_scale=18, linewidth=lw,
-            color=color, linestyle=ls, zorder=1,
-            connectionstyle=f"arc3,rad={rad}", shrinkA=2, shrinkB=2,
-        )
-    )
+def arrow(ax, p1, p2, color=SLATE, lw=2.4, ls="-", rad=0.0):
+    ax.add_patch(FancyArrowPatch(
+        p1, p2, arrowstyle="-|>", mutation_scale=17, linewidth=lw,
+        color=color, linestyle=ls, zorder=1, capstyle="round",
+        connectionstyle=f"arc3,rad={rad}", shrinkA=3, shrinkB=3,
+        path_effects=[pe.withSimplePatchShadow(offset=(1.2, -1.2),
+                                               alpha=0.3, shadow_rgbFace="#03060d")]))
 
 
 def title(ax, text, sub=None):
-    ax.text(6, 84, text, ha="left", va="center", color=INK, fontsize=17,
+    ax.text(6, 83.5, text, ha="left", va="center", color=INK, fontsize=18,
             fontweight="bold")
+    ax.add_patch(FancyBboxPatch(
+        (6, 79.6), 3.2, 0.9, boxstyle="round,pad=0.1,rounding_size=0.4",
+        linewidth=0, facecolor=SKY, zorder=3))
     if sub:
-        ax.text(6, 78.5, sub, ha="left", va="center", color=MUTED, fontsize=11)
+        ax.text(11, 79.9, sub, ha="left", va="center", color=MUTED,
+                fontsize=10.5)
 
 
 def save(fig, name):
     os.makedirs(OUT_DIR, exist_ok=True)
-    fig.savefig(os.path.join(OUT_DIR, name), facecolor=BG,
-                bbox_inches="tight", pad_inches=0.25)
+    fig.savefig(os.path.join(OUT_DIR, name), facecolor=fig.get_facecolor(),
+                bbox_inches="tight", pad_inches=0.22)
     plt.close(fig)
+
+
+_LEGEND = [(EMERALD, "on disk / local"), (SKY, "index & retrieval"),
+           (VIOLET, "reasoning"), (AMBER, "model / gate")]
 
 
 def fig_hero():
     """image.png -- one request's journey end to end."""
-    fig, ax = _fig()
+    fig, ax = _fig(legend=_LEGEND)
     title(ax, "One request, end to end",
           "repo  ->  index  ->  retrieve  ->  prompt  ->  model  ->  tested patch on disk")
-    top_y, bot_y = 60, 24
+    top_y, bot_y = 60, 26
     box(ax, 22, top_y, 30, 20, "Repository",
-        ["source tree", ".gitignore aware"], accent=EMERALD)
+        ["source tree", ".gitignore aware"], accent=EMERALD, badge=1)
     box(ax, 58, top_y, 30, 20, "Index",
-        ["chunks + graph", "two-view embeddings"], accent=SKY)
+        ["chunks + graph", "two-view embeddings"], accent=SKY, badge=2)
     box(ax, 94, top_y, 30, 20, "Retrieve",
-        ["semantic + lexical", "+ graph -> RRF"], accent=SKY)
+        ["semantic + lexical", "+ graph -> RRF"], accent=SKY, badge=3)
     box(ax, 130, top_y, 30, 20, "Prompt",
-        ["tiered Code Map", "budgeted to window"], accent=VIOLET)
+        ["tiered Code Map", "budgeted to window"], accent=VIOLET, badge=4)
     box(ax, 130, bot_y, 30, 20, "Model",
-        ["Ollama (local)", "or opt-in cloud"], accent=AMBER)
+        ["Ollama (local)", "or opt-in cloud"], accent=AMBER, badge=5)
     box(ax, 86, bot_y, 30, 20, "Validate & test",
-        ["parse diffs, syntax", "sandbox pytest"], accent=VIOLET)
+        ["parse diffs, syntax", "sandbox pytest"], accent=VIOLET, badge=6)
     box(ax, 42, bot_y, 30, 20, "Apply to disk",
-        ["backups + undo", ".cgx-backups/"], accent=EMERALD)
+        ["backups + undo", ".cgx-backups/"], accent=EMERALD, badge=7)
     arrow(ax, (37, top_y), (43, top_y))
     arrow(ax, (73, top_y), (79, top_y))
     arrow(ax, (109, top_y), (115, top_y))
@@ -137,8 +187,7 @@ def fig_ch1():
     ]:
         box(ax, cx, cy, 22, 15, t, accent=SKY, ts=11)
     box(ax, 138, 55, 34, 20, "Cloud LLM",
-        ["opt-in only", "prompt + snippets", "sent per turn"], accent=VIOLET,
-        fill="#1e1b3a")
+        ["opt-in only", "prompt + snippets", "sent per turn"], accent=VIOLET)
     arrow(ax, (97, 40), (122, 52), color=VIOLET, ls="--", rad=-0.15)
     ax.text(120, 33, "the repo, index &\nsessions never leave", color=MUTED,
             fontsize=9.5, ha="center", va="center")
@@ -245,8 +294,8 @@ def fig_ch6():
         (90, "Preflight install", ["map imports->PyPI"], SKY),
         (126, "Sandbox tests", ["impact-aware pytest"], SKY),
     ]
-    for cx, t, s, c in steps:
-        box(ax, cx, 60, 30, 18, t, s, accent=c, ts=12, ss=9.5)
+    for i, (cx, t, s, c) in enumerate(steps, start=1):
+        box(ax, cx, 60, 30, 18, t, s, accent=c, ts=12, ss=9.5, badge=i)
     for a, b in zip(steps, steps[1:]):
         arrow(ax, (a[0] + 15, 60), (b[0] - 15, 60))
     box(ax, 126, 30, 30, 18, "CodegenReport",

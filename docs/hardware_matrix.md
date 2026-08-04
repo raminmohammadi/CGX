@@ -11,7 +11,11 @@ GGUF / AWQ-style inference** (the format Ollama serves by default).
 They are intended for UI sorting and a "will this fit?" sanity check,
 not capacity planning.
 
+<details>
+<summary>
+
 ## Local-model catalogue
+</summary>
 
 The catalogue lists 8 locally-runnable models across two families
 (`coder`, `general`):
@@ -27,7 +31,11 @@ The catalogue lists 8 locally-runnable models across two families
 | `qwen2.5:7b-instruct`              |        7.0 |         10.0 |            8.0 |     32 768 | general  | general-purpose alternative to llama 8b        |
 | `phi3.5:3.8b-mini-instruct`        |        3.8 |          6.0 |            4.0 |    131 072 | general  | small, long-context, low-RAM                   |
 
+<details>
+<summary>
+
 ### Fit verdict
+</summary>
 
 `compute_local_fit(hw)` computes an **effective budget** in GB and
 classifies each entry:
@@ -48,7 +56,12 @@ The `reason` column on each row reports the exact comparison behind
 the verdict so you can sanity-check the model against your own
 machine without trusting the UI's symbol.
 
+</details>
+<details>
+<summary>
+
 ### Adding or tweaking a model
+</summary>
 
 Edit `LOCAL_MODEL_CATALOG` in `src/cgx/answer/hardware_matrix.py`,
 keep the field schema, and run:
@@ -71,7 +84,14 @@ The pytest suite (`tests/test_hardware_matrix.py`) asserts:
 - The 7B coder is flagged as tight on 32 GB RAM + 2 GB VRAM.
 - All entries fit on a 256 GB / 80 GB VRAM workstation.
 
+</details>
+
+</details>
+<details>
+<summary>
+
 ## Local vs cloud trade-offs
+</summary>
 
 The `TRADEOFFS` table is intentionally editorial -- short opinionated
 strings about each axis. `winner ∈ {local, cloud, tie}`.
@@ -87,7 +107,12 @@ strings about each axis. `winner ∈ {local, cloud, tie}`.
 | Setup effort                  | Install Ollama, pull a model (~GB-scale download).                  | Sign up, mint an API key, paste into a profile.                                                | cloud  |
 | Operational risk              | Your machine = your SLO.                                            | Vendor outages / price changes / model deprecations.                                           | local  |
 
+</details>
+<details>
+<summary>
+
 ## Caveats
+</summary>
 
 - The catalogue numbers describe **4-bit quantised** inference. Full
   FP16 weights require roughly 2.5–3× more memory.
@@ -100,7 +125,12 @@ strings about each axis. `winner ∈ {local, cloud, tie}`.
   cloud (or your hardware can host a 70B model), the verdict for a
   given dimension may legitimately flip.
 
+</details>
+<details>
+<summary>
+
 ## Programmatic access
+</summary>
 
 ```python
 from cgx.answer.hardware_matrix import (
@@ -122,3 +152,5 @@ print("\nLocal-vs-cloud:")
 for t in tradeoffs_rows():
     print(f"  {t['dimension']:30s}  -> {t['winner']}")
 ```
+
+</details>

@@ -15,7 +15,36 @@ end-to-end, read in order; each chapter assumes the one before it.
 
 ---
 
+<details open>
+<summary>
+
+### 📖 Contents
+</summary>
+
+| # | Chapter | In one line |
+|--:|---------|-------------|
+| 1 | **Why CGX exists** | Cloud assistants guess at your repo; CGX is built to know it. |
+| 2 | **From repo to records** | How a working tree becomes chunks, a knowledge graph, and two embedding views. |
+| 3 | **The retrieval pipeline** | Semantic, lexical, and graph signals, fused by Reciprocal Rank Fusion. |
+| 4 | **Assembling the prompt** | The tiered Code Map: full-body primaries, one-line neighbours, budgeted to the window. |
+| 5 | **Talking to the model** | One chat() interface fronting Ollama, OpenAI-compatible, and Gemini. |
+| 6 | **Writing to disk** | Parse, apply in memory, syntax-check, sandbox-test -- then write with backups. |
+| 7 | **The agent** | A checkpointed task DAG in SQLite that explores or scaffolds, one step at a time. |
+| 8 | **The front door** | The FastAPI + React surface: SSE streaming and tab-switch replay. |
+| 9 | **Choosing a model** | An offline catalogue that matches runnable models to your hardware. |
+| 10 | **The trust model** | Where does my code go? Nowhere, unless you ask it to. |
+| 11 | **Reading the source** | A guided reading order through the modules, in the sequence this book introduces them. |
+
+</details>
+
+---
+
+<details>
+<summary>
+
 ## Chapter 1 -- Why CGX exists
+<br><sub><i>Cloud assistants guess at your repo; CGX is built to know it.</i></sub>
+</summary>
 
 Modern code assistants live in the cloud. They are excellent at language
 modelling and abysmal at one thing that matters most to people who write
@@ -52,9 +81,14 @@ irrelevant text, and it cannot self-correct as fluently. Most of the
 machinery in CGX exists to put a small model on equal footing with a
 big one by feeding it sharper, smaller, more grounded prompts.
 
----
+</details>
+
+<details>
+<summary>
 
 ## Chapter 2 -- From repo to records
+<br><sub><i>How a working tree becomes chunks, a knowledge graph, and two embedding views.</i></sub>
+</summary>
 
 Indexing begins with `cgx.parser.parse_codebase`. The walker respects
 `.gitignore`, a user-supplied ignore-glob list, and a 1 MB file-size cap
@@ -133,9 +167,14 @@ different encoder. In practice this means a typical re-index of a
 moderate-sized repository touches the embedder only for the chunks
 that actually changed.
 
----
+</details>
+
+<details>
+<summary>
 
 ## Chapter 3 -- The retrieval pipeline
+<br><sub><i>Semantic, lexical, and graph signals, fused by Reciprocal Rank Fusion.</i></sub>
+</summary>
 
 A query enters CGX through `cgx.retrieval.orchestrator.hybrid_retrieve_two_view`.
 Three independent retrievers run against the index in parallel.
@@ -196,9 +235,14 @@ should require a separately-downloaded encoder; cloud providers
 default to `True` because the latency cost is dwarfed by the model
 call that follows. Either setting can be overridden in the profile.
 
----
+</details>
+
+<details>
+<summary>
 
 ## Chapter 4 -- Assembling the prompt
+<br><sub><i>The tiered Code Map: full-body primaries, one-line neighbours, budgeted to the window.</i></sub>
+</summary>
 
 Retrieval returns a ranked list of chunks. Turning that into a prompt
 that fits in a 3B model's context window is the job of
@@ -242,9 +286,14 @@ falls back to the older full-body formatter. There is no flag to set
 and no user intervention required -- the activation is purely a
 function of whether graph expansion contributed to the result set.
 
----
+</details>
+
+<details>
+<summary>
 
 ## Chapter 5 -- Talking to the model
+<br><sub><i>One chat() interface fronting Ollama, OpenAI-compatible, and Gemini.</i></sub>
+</summary>
 
 The prompt assembled by the Code Map is handed to a provider in
 `cgx.answer.providers`. Three are shipped: `OllamaProvider` for
@@ -279,9 +328,14 @@ asks the provider for a structured plan-with-diffs response. A
 third entry point, `generate_project_scaffold`, drives the
 new-project branch of the agent loop where no index exists yet.
 
----
+</details>
+
+<details>
+<summary>
 
 ## Chapter 6 -- Writing to disk
+<br><sub><i>Parse, apply in memory, syntax-check, sandbox-test -- then write with backups.</i></sub>
+</summary>
 
 The model returns a plan -- free-form markdown wrapped around fenced
 `diff path=...` blocks. `cgx.codegen.pipeline.validate_and_test`
@@ -344,9 +398,14 @@ changed files and only invokes pytest on the affected tests. For a
 standalone verify task (no prior apply), the agent loop instead
 calls `run_pytest_paths` against every discovered test file.
 
----
+</details>
+
+<details>
+<summary>
 
 ## Chapter 7 -- The agent
+<br><sub><i>A checkpointed task DAG in SQLite that explores or scaffolds, one step at a time.</i></sub>
+</summary>
 
 `cgx.session` ties the disk-writing pieces of Chapter 6 to the
 prompt machinery of Chapter 5 with a persistent, checkpointed loop
@@ -424,9 +483,14 @@ UIs share -- a message becomes a follow-up objective or answers an
 open `ASK_USER`, and a decision resolves a checkpoint so the loop
 can continue.
 
----
+</details>
+
+<details>
+<summary>
 
 ## Chapter 8 -- The front door
+<br><sub><i>The FastAPI + React surface: SSE streaming and tab-switch replay.</i></sub>
+</summary>
 
 The web UI is a FastAPI app composed in `cgx.webui.server.create_app`
 and served by `uvicorn` on `:8765`. Routes are split per feature
@@ -485,9 +549,14 @@ The Ask tab's sidebar reads and writes through the public API
 `delete_session`); nothing else in CGX talks directly to those
 files.
 
----
+</details>
+
+<details>
+<summary>
 
 ## Chapter 9 -- Choosing a model
+<br><sub><i>An offline catalogue that matches runnable models to your hardware.</i></sub>
+</summary>
 
 A user who has never run a local LLM has no way to know whether
 their machine will hold a 7B coder or only a 1.5B chat model.
@@ -509,9 +578,14 @@ they already have, and a one-click *Pull* button for the rest.
 Nothing in this module reaches outside Ollama; the catalogue is
 hard-coded and the probe is a localhost call.
 
----
+</details>
+
+<details>
+<summary>
 
 ## Chapter 10 -- The trust model
+<br><sub><i>Where does my code go? Nowhere, unless you ask it to.</i></sub>
+</summary>
 
 Everything in the chapters above can be summarised by one
 question: *where does my code go?* The answer in CGX is *nowhere,
@@ -548,9 +622,14 @@ originals and deletes files that did not exist before the run,
 returning `restored_files`, `deleted_files`, and `failed_files`.
 The user always has an exit door.
 
----
+</details>
+
+<details>
+<summary>
 
 ## Chapter 11 -- Reading the source
+<br><sub><i>A guided reading order through the modules, in the sequence this book introduces them.</i></sub>
+</summary>
 
 For someone landing on the repository for the first time, the
 fastest way to internalise the system is to read the modules in
@@ -594,3 +673,5 @@ walks the user-facing surfaces tab by tab; [`docs/flowcharts.md`](flowcharts.md)
 pairs hand-drawn SVG diagrams with prose for the visual learners;
 [`CHANGELOG.md`](../CHANGELOG.md) records what changed and why.
 This book is the connective tissue between them.
+
+</details>

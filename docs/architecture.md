@@ -2,7 +2,11 @@
 
 CGX is structured as a small set of cooperating layers under `cgx.*`.
 
+<details>
+<summary>
+
 ## Layers
+</summary>
 
 ```
 cgx.parser              -- language-aware tree walker → chunk records
@@ -56,7 +60,12 @@ cgx.webui.routes.agent_session -- /api/agent-session/* JSON routes for the sessi
 cgx.cli / cgx.webui     -- terminal + FastAPI/React surfaces (uvicorn on :8765)
 ```
 
+</details>
+<details>
+<summary>
+
 ## Data flow
+</summary>
 
 1. `parse_codebase` walks the repo (respecting `.gitignore`, ignore globs
    and a 1 MB file-size cap) and emits one chunk per file/class/function.
@@ -111,7 +120,12 @@ cgx.cli / cgx.webui     -- terminal + FastAPI/React surfaces (uvicorn on :8765)
 7. `generate_code_plan` does the same but routes through a
    diff-aware retry loop in `cgx.codegen.pipeline.validate_and_test`.
 
+</details>
+<details>
+<summary>
+
 ## Tiered SLM context (Code Map)
+</summary>
 
 `cgx.answer.context_map` builds the prompt-time SOURCES list as **two
 tiers** so that the small / mid-sized LLMs CGX targets locally
@@ -246,7 +260,12 @@ syntax gate silently drops the file; as a backstop
 and retries with a doubled budget (continuation-on-truncation) so a large
 file still completes in a bounded number of passes.
 
+</details>
+<details>
+<summary>
+
 ## Self-test loop
+</summary>
 
 `validate_and_test` is the orchestrator:
 
@@ -267,7 +286,12 @@ file still completes in a bounded number of passes.
 The whole report is returned under `parsed["codegen_report"]` and rendered
 in the UI as a markdown table.
 
+</details>
+<details>
+<summary>
+
 ## Structured AST insertion
+</summary>
 
 `cgx.codegen.ast_insert` provides an additive, AST-anchored alternative
 to text diffs for the common "insert a new def into this container after
@@ -302,7 +326,12 @@ signature in `diff_apply`, `validate`, `disk_apply`, or
 `orchestrator`. Callers can keep using the text-diff path; the AST
 path is opt-in via the entry points above.
 
+</details>
+<details>
+<summary>
+
 ## LLM Providers
+</summary>
 
 `cgx.answer.providers` exposes four concrete `LLMProvider` subclasses,
 all sharing a uniform `chat()` / `chat_stream()` interface so the
@@ -357,7 +386,12 @@ available endpoint (Ollama `GET /api/tags`; Gemini `generateContent`
 with `maxOutputTokens: 1`; custom `OPTIONS` / `HEAD` on the endpoint
 path). Used by the Settings page Ping button.
 
+</details>
+<details>
+<summary>
+
 ## Dynamic Dependency Management
+</summary>
 
 `cgx.codegen.env_manager` intercepts the gap between code generation and
 test execution: a generated file may import a package the model chose
@@ -379,7 +413,12 @@ Failures are logged but never abort the test run -- the model may have
 misspelled the package name, in which case pytest still runs and gives
 the retry loop a real `ImportError` to diagnose.
 
+</details>
+<details>
+<summary>
+
 ## Session-shaped agent (`cgx.session`)
+</summary>
 
 The Agent UI at `/agent` is backed by a **stateful, session-based**
 orchestrator. It persists a DAG of typed tasks under
@@ -387,7 +426,11 @@ orchestrator. It persists a DAG of typed tasks under
 with structured human-in-the-loop checkpoints, sharing the same
 retrieval, codegen, and provider stacks as the ask/plan surfaces.
 
+<details>
+<summary>
+
 ### Session modes (`cgx.session.mode`)
+</summary>
 
 A session runs in one of two **modes** -- `explore` (modify an
 existing codebase) or `greenfield` (scaffold a new project from
@@ -411,7 +454,12 @@ missing index crashes immediately, whereas mis-seeding
 `CLARIFY_REQUIREMENTS` against an existing codebase still produces
 useful clarification questions.
 
+</details>
+<details>
+<summary>
+
 ### Data model (`cgx.session.models`)
+</summary>
 
 Plain :mod:`dataclasses` (no Pydantic at the core layer -- Pydantic
 stays at the webui wire boundary). JSON-serialise via `to_dict()`,
@@ -440,7 +488,12 @@ matching the convention already used by `cgx.sessions`.
 `ASK_USER` deliberately stays `IN_PROGRESS` after its executor runs
 until a `Decision` arrives.
 
+</details>
+<details>
+<summary>
+
 ### Router (`cgx.session.router`)
+</summary>
 
 `Router` is the deterministic planning brain of the loop. **Pure
 Python, no LLM calls, no I/O**: every method takes the current session state
@@ -628,7 +681,12 @@ Five entry points cover every transition:
   | `APPROVE_PLAN` `approved=false` | No successor (loop halts; user can restart with a new objective) |
   | `FREEFORM`                 | None (handled as a new user message by the caller) |
 
+</details>
+<details>
+<summary>
+
 ### Contract-first greenfield write loop
+</summary>
 
 The greenfield write loop is the deepest chain the router drives, and
 recent work turned it from "generate files, run the tests the model
@@ -803,7 +861,11 @@ this subsection first; the six moving parts are:
    `APPLY` named is still in scope -- a no-op in greenfield (no index),
    and self-disabling on any retrieval error.
 
+<details>
+<summary>
+
 #### Flow view -- the interstate highway system
+</summary>
 
 Read tasks as **highways**, the router as the **interchange system**
 deciding which on-ramp each artifact takes, and artifacts
@@ -852,7 +914,12 @@ The progress ledger is the **weigh-station** riding along every truck:
 freight and closes the on-ramp to `REPAIR` the moment the load stops
 getting lighter.
 
+</details>
+<details>
+<summary>
+
 #### Component view -- the chocolate box map
+</summary>
 
 Each module is a **chocolate** in the box; a connector is a **flavour
 pairing** (module A hands a typed value to module B). The box has three
@@ -903,7 +970,14 @@ outcomes season the budget), and `classify + auto -> repair` (two
 localisation flavours -- crash frames and index relevance -- blended into
 one candidate set).
 
+</details>
+
+</details>
+<details>
+<summary>
+
 ### Runner (`cgx.session.runner`)
+</summary>
 
 `SessionRunner` is the orchestrator the HTTP routes call. It sits
 between the deterministic `Router` (state transitions, no IO) and the
@@ -942,7 +1016,12 @@ subsection) before delegating to `_post_message_traced` /
 `@traced("runner")` enter / exit records route to
 `<project_root>/.cgx/agent.log` rather than the global fallback.
 
+</details>
+<details>
+<summary>
+
 ### Curated function-call tracing (`cgx.trace`, Phase TR)
+</summary>
 
 `cgx.trace` is a single-file instrumentation layer that surfaces
 per-call timings for the high-signal entry points on the agent
@@ -998,7 +1077,12 @@ store on mount), and `frontend/src/layout/Header.tsx` (amber
 `TRACE` pill next to the Mode badge whenever the flag is on;
 tooltip explains env-pinned vs UI-toggled).
 
+</details>
+<details>
+<summary>
+
 ### Executors (`cgx.session.tasks`)
+</summary>
 
 An **executor** is a pure function `(TaskNode, ExecutorDeps) ->
 ExecutorResult` registered via `@register_executor(TaskKind.X)` in
@@ -1035,7 +1119,12 @@ dict. Executors validate the fields they need and return
 `ExecutorResult(failure=...)` if a required dep is missing rather
 than raising.
 
+</details>
+<details>
+<summary>
+
 ### Decision contract (`cgx.session.tasks.ask.build_decision`)
+</summary>
 
 The HTTP route layer calls `build_decision(session_id, task, chosen,
 rationale)` on every incoming decision; the function validates
@@ -1057,7 +1146,12 @@ The frontend's per-form components in
 shapes, and `tests/test_webui_agent_session.py` pins the contract
 end-to-end against the route handlers.
 
+</details>
+<details>
+<summary>
+
 ### Persistence (`cgx.session.store`)
+</summary>
 
 `SessionStore` is a thin SQLite wrapper. One database file per
 project root at `<project_root>/.cgx/sessions.db` (or
@@ -1097,7 +1191,12 @@ session-shaped persistence layout:
   row never raises into the router. The path is overridable via
   `CGX_LESSONS_PATH` so tests run hermetically.
 
+</details>
+<details>
+<summary>
+
 ### HTTP surface (`cgx.webui.routes.agent_session`)
+</summary>
 
 JSON-only, mounted at `/api/agent-session`.
 
@@ -1121,7 +1220,12 @@ Every mutating endpoint returns `AgentSessionState`
 one round-trip. There is no SSE on this surface today -- the UI
 polls while any task is `IN_PROGRESS` other than an `ASK_USER`.
 
+</details>
+<details>
+<summary>
+
 ### React UI (`/agent`)
+</summary>
 
 `frontend/src/pages/AgentPage.tsx` is the session-shaped page;
 modular components live under `frontend/src/components/agent/`:
@@ -1182,7 +1286,12 @@ session deletion or a `project_root` switch to a different SQLite
 file -- the loop that would otherwise re-fire the same 404 on every
 mount terminates after one round-trip.
 
+</details>
+<details>
+<summary>
+
 ### Testing
+</summary>
 
 * Core: unit tests over `models.py`, `store.py`, `router.py`,
   `runner.py`, `mode.py`, and each executor under
@@ -1215,9 +1324,20 @@ mount terminates after one round-trip.
 
 ---
 
+</details>
+
+</details>
+<details>
+<summary>
+
 ## Apply pipeline safeguards
+</summary>
+
+<details>
+<summary>
 
 ### Cross-file coherence check
+</summary>
 
 `cgx.codegen.validate.check_cross_file_coherence` runs as part of the
 `apply_diffs_to_disk` smoke-test step (before anything is written).  It
@@ -1228,7 +1348,12 @@ via `ast`, and flags any `from X.Y import Z` where `X/Y.jsx`, `X/Y.tsx`,
 `failed_files` with a language-mismatch diagnosis, so a downstream
 regeneration pass can fix it.
 
+</details>
+<details>
+<summary>
+
 ### Partial apply
+</summary>
 
 `apply_diffs_to_disk` previously rejected the entire batch if any file
 failed the smoke check.  It now writes files that pass validation and
@@ -1243,7 +1368,14 @@ a tab. The bridge also accepts a `cancel_event: threading.Event`;
 when it is set (e.g. via `DELETE /api/tasks/{id}`) the generator
 terminates cleanly between yields.
 
+</details>
+
+</details>
+<details>
+<summary>
+
 ## Skills
+</summary>
 
 The `skills/` package at the repo root holds modular technology-specific
 knowledge bundles. Each skill lives in its own folder under
@@ -1284,7 +1416,12 @@ Adding a new skill: create `skills/<name>/__init__.py` with a single
 `Skill` subclass, import it from `skills/__init__.py`, and append an
 instance to `SKILLS`. No agent-layer changes are required.
 
+</details>
+<details>
+<summary>
+
 ## Task registry
+</summary>
 
 `cgx.webui.task_store` is a lightweight SQLite store (database at
 `~/.cgx/tasks.db`) that records every SSE operation -- `ask`, `plan`,
@@ -1314,7 +1451,12 @@ task ends.
 | `GET`    | `/api/tasks/{id}/events`  | Return the full ordered event log for replay.   |
 | `DELETE` | `/api/tasks/{id}`         | Cancel a running task (no-op if already done).  |
 
+</details>
+<details>
+<summary>
+
 ## Apply rollback
+</summary>
 
 `cgx.codegen.disk_apply.apply_diffs_to_disk` mirrors every file it is
 about to overwrite into a timestamped directory under
@@ -1328,7 +1470,12 @@ the UI as an **Undo** button.
 delete files that did not exist before the run. The response is
 `{restored_files, deleted_files, failed_files, error}`.
 
+</details>
+<details>
+<summary>
+
 ## Persistent sessions
+</summary>
 
 `cgx.sessions` is stdlib-only and stores conversation history under
 `~/.cgx/sessions/` (or `$CGX_CONFIG_DIR/sessions/`):
@@ -1344,7 +1491,12 @@ public API (`create_session`, `append_message`, `get_messages`,
 tab calls on every interaction; failures are swallowed so chat is
 never broken by a session-store I/O error.
 
+</details>
+<details>
+<summary>
+
 ## Rate limiting
+</summary>
 
 `cgx.answer.ratelimit` adds two primitives shared by every HTTP-backed
 provider:
@@ -1362,7 +1514,12 @@ provider:
 serialised with the rest of the provider config so cloud profiles
 keep their per-tenant budget across sessions.
 
+</details>
+<details>
+<summary>
+
 ## Hardware / model matrix
+</summary>
 
 `cgx.answer.hardware_matrix` is a pure-data offline module:
 
@@ -1382,7 +1539,12 @@ The data is exported as `docs/hardware_matrix.json` and documented in
 on top of these two functions; no network call is ever made from the
 tab.
 
+</details>
+<details>
+<summary>
+
 ## Telemetry
+</summary>
 
 `cgx.telemetry.ping()` is invoked once from `cgx.webui.launch.launch()`. It
 returns immediately unless `CGX_TELEMETRY=1` is set. The opt-in
@@ -1391,7 +1553,12 @@ payload contains **only** a random install UUID (cached in
 code, no file paths, no model names, no PII. Implementation is ~50
 lines; review it before opting in.
 
+</details>
+<details>
+<summary>
+
 ## Observability
+</summary>
 
 `setup_logging(INFO)` is called once at server startup in `launch.py`,
 configuring the root logger with a timestamped formatter. Every major
@@ -1408,7 +1575,12 @@ Log lines use `[INFO]` and `[WARNING]` severity and include the logger
 name so they can be filtered in production with standard `logging`
 configuration.
 
+</details>
+<details>
+<summary>
+
 ## React frontend
+</summary>
 
 The React frontend (`frontend/src/`) supplements the server-side layers
 with two client-side modules introduced for tab persistence:
@@ -1430,7 +1602,12 @@ with two client-side modules introduced for tab persistence:
 The left sidebar reads the Zustand tasks store to determine which tabs
 have a running task and renders an animated spinner next to those tabs.
 
+</details>
+<details>
+<summary>
+
 ## Security model
+</summary>
 
 - Embedder loading via `module:attr` performs `importlib.import_module`,
   which runs the target module's top-level code. Pass trusted specs only.
@@ -1445,3 +1622,5 @@ have a running task and renders an animated spinner next to those tabs.
   `http://localhost:*` and `http://127.0.0.1:*`) and a sandboxed
   iframe; the configured `cgx.ui.url` value is HTML-escaped before
   interpolation.
+
+</details>

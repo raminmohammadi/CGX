@@ -5,7 +5,11 @@ scales cleanly, and renders inline on GitHub.
 
 ---
 
+<details>
+<summary>
+
 ## For users
+</summary>
 
 ```mermaid
 flowchart TD
@@ -54,7 +58,12 @@ LLMs are strictly opt-in.
 
 ---
 
+</details>
+<details>
+<summary>
+
 ## For developers
+</summary>
 
 ```mermaid
 flowchart TD
@@ -146,7 +155,11 @@ The [session-shaped write loop](#session-shaped-write-loop-agent)
 section below walks the two mode chains (explore and greenfield)
 checkpoint by checkpoint.
 
+<details>
+<summary>
+
 ### Inside the retrieval & codegen layers
+</summary>
 
 The executors sit on a layered retrieval / codegen pipeline that is
 documented in detail in [architecture.md](architecture.md) and
@@ -213,7 +226,14 @@ orchestrator or codegen layers.
 
 ---
 
+</details>
+
+</details>
+<details>
+<summary>
+
 ## Session-shaped write loop (`/agent`)
+</summary>
 
 The default Agent UI is backed by `cgx.session`, a stateful
 orchestrator that progresses one task at a time and pauses at every
@@ -243,7 +263,11 @@ a `RUNTIME_VERIFY` gate that boots the scaffolded app before the
 session is declared complete. Every `ASK_USER` in either path is a
 structured checkpoint, not a freeform prompt.
 
+<details>
+<summary>
+
 ### The session write loop as two maps
+</summary>
 
 Before the exit-by-exit ASCII, two analogies for the same greenfield
 pipeline. Contributors tend to hold one of these in their head.
@@ -308,7 +332,12 @@ flowchart TB
     class RUNR,ROUT,DEC,SCA,SVAL,RTV,VER,REP,CLS choc;
 ```
 
+</details>
+<details>
+<summary>
+
 ### Explore loop
+</summary>
 
 ```
                        user message
@@ -365,7 +394,12 @@ flowchart TB
                                     -> VERIFY_REPORT artifact
 ```
 
+</details>
+<details>
+<summary>
+
 ### Greenfield loop
+</summary>
 
 ```
                        user message
@@ -466,7 +500,12 @@ flowchart TB
                                        a hard boot failure -> REPAIR (#3)
 ```
 
+</details>
+<details>
+<summary>
+
 ### Autonomous repair loop (greenfield only)
+</summary>
 
 The router fires a deterministic repair cycle from four upstream
 sources: an `API_CHECK` that ends `failed` (**Phase 2.2**), a
@@ -642,7 +681,14 @@ Where to look in the repo:
 
 ---
 
+</details>
+
+</details>
+<details>
+<summary>
+
 ## For companies
+</summary>
 
 ```mermaid
 flowchart TB
@@ -708,3 +754,5 @@ liveness check (e.g. Gemini `generateContent` with `maxOutputTokens:
 1`, Ollama `GET /api/tags`) and returns only `{ok, latency_ms,
 error}`. Air-gapped operation is the default once an Ollama model is
 pulled.
+
+</details>
