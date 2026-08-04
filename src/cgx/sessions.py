@@ -82,7 +82,15 @@ def _save_index(data: Dict[str, Any]) -> None:
 
 
 def _path_for(session_id: str) -> Path:
-    return SESSIONS_DIR / f"{session_id}.jsonl"
+    # Contain the log strictly under SESSIONS_DIR: normalize the candidate
+    # (a pure string op) then require the recognized ``startswith`` prefix
+    # guard before it ever reaches the filesystem, so a crafted id with
+    # ``..`` or separators can't escape the directory (CodeQL path-injection).
+    base = os.path.realpath(str(SESSIONS_DIR))
+    full = os.path.normpath(os.path.join(base, f"{session_id}.jsonl"))
+    if not full.startswith(base + os.sep):
+        raise ValueError(f"invalid session id: {session_id!r}")
+    return Path(full)
 
 
 def list_sessions() -> List[SessionMeta]:

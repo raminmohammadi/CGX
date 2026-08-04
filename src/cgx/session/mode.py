@@ -49,14 +49,16 @@ def _has_usable_index(index_dir: Optional[str],
     if not index_dir or not records_path:
         return False
     try:
-        # Canonicalize before the stat calls and enforce that both files
-        # stay within the caller-provided index directory.
-        base = Path(index_dir).resolve()
-        meta = (base / "meta.json").resolve()
-        rec = Path(records_path).resolve()
-        meta.relative_to(base)
-        rec.relative_to(base)
-        return meta.is_file() and rec.is_file() and rec.stat().st_size > 0
+        # ``index_dir`` and ``records_path`` are independent, caller-chosen
+        # locations (siblings by default, e.g. ``/tmp/cgx_index/indices`` and
+        # ``/tmp/cgx_index/records.jsonl``), so there is no shared root to
+        # contain them under. Normalize each with ``os.path.realpath`` to
+        # collapse ``..`` segments and follow symlinks before the stat calls.
+        base = os.path.realpath(index_dir)
+        meta = os.path.join(base, "meta.json")
+        rec = os.path.realpath(records_path)
+        return (os.path.isfile(meta) and os.path.isfile(rec)
+                and os.path.getsize(rec) > 0)
     except (OSError, ValueError):
         return False
 
