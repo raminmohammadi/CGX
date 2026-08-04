@@ -37,6 +37,12 @@ from cgx.webui.models import HardwareInfo, ModelChoicesResponse
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["setup"])
 
+# Restrict outbound model-discovery requests to explicitly approved providers.
+# Keep this list aligned with supported OpenAI-compatible backends.
+_OPENAI_ALLOWED_HOSTS = {
+    "api.openai.com",
+}
+
 
 class PingRequest(BaseModel):
     kind: str = "ollama"
@@ -282,8 +288,11 @@ def _validate_openai_base_url(base_url: str) -> str:
         raise ValueError("Invalid base_url host")
 
     host = parsed.hostname
-    if host.lower() == "localhost":
+    host_l = host.lower()
+    if host_l == "localhost":
         raise ValueError("Localhost is not allowed")
+    if host_l not in _OPENAI_ALLOWED_HOSTS:
+        raise ValueError("Host is not in the allowed list")
 
     def _reject_ip(ip_text: str) -> None:
         ip = ipaddress.ip_address(ip_text)
