@@ -49,14 +49,19 @@ def _has_usable_index(index_dir: Optional[str],
     if not index_dir or not records_path:
         return False
     try:
-        # ``index_dir`` and ``records_path`` are independent, caller-chosen
-        # locations (siblings by default, e.g. ``/tmp/cgx_index/indices`` and
-        # ``/tmp/cgx_index/records.jsonl``), so there is no shared root to
-        # contain them under. Normalize each with ``os.path.realpath`` to
-        # collapse ``..`` segments and follow symlinks before the stat calls.
+        # Normalize both paths first.
         base = os.path.realpath(index_dir)
         meta = os.path.join(base, "meta.json")
         rec = os.path.realpath(records_path)
+
+        # Constrain ``records_path`` to the same index workspace as
+        # ``index_dir`` (default sibling layout under one root, e.g.
+        # ``/tmp/cgx_index/indices`` + ``/tmp/cgx_index/records.jsonl``).
+        # This blocks request-controlled absolute paths outside that root.
+        root = os.path.realpath(os.path.dirname(base))
+        if os.path.commonpath([root, rec]) != root:
+            return False
+
         return (os.path.isfile(meta) and os.path.isfile(rec)
                 and os.path.getsize(rec) > 0)
     except (OSError, ValueError):
