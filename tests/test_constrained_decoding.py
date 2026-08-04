@@ -318,3 +318,11 @@ def test_clarify_questions_reask_recovers_then_falls_back():
     qs = _ask_llm_for_questions("build an app", ExecutorDeps(provider=provider))
     assert qs == []
     assert len(provider.calls) == 2
+
+
+def test_to_gemini_schema_open_object():
+    src = {"type": "object"}
+    out = to_gemini_schema(src)
+    assert out["type"] == "OBJECT"
+    assert "properties" in out
+    assert "_extra" in out["properties"]

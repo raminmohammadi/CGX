@@ -1,6 +1,7 @@
 """Tests for engine.py pure-Python helpers (no LLM / embedder)."""
 
 import json
+import pytest
 from typing import Any, Dict, List
 
 from cgx.answer.engine import (
@@ -36,6 +37,14 @@ def test_extract_json_object_balanced():
 
 def test_extract_json_object_empty_on_garbage():
     assert _extract_json_object("not json at all") == {}
+
+
+def test_extract_json_object_markdown_fences_and_trailing_commas():
+    text = "```json\n{\n  \"foo\": \"bar\",\n  \"num\": 123,\n}\n```"
+    assert _extract_json_object(text) == {"foo": "bar", "num": 123}
+    prose = "Here is the response:\n```json\n{\"items\": [1, 2,]}\n```"
+    assert _extract_json_object(prose) == {"items": [1, 2]}
+
 
 
 def test_get_system_prompt_known_and_fallback():
@@ -1271,6 +1280,15 @@ _VALID_JSX = (
 )
 
 
+def _treesitter_available(lang: str) -> bool:
+    try:
+        from cgx.parser.treesitter_base import treesitter_available
+        return treesitter_available(lang)
+    except Exception:
+        return False
+
+
+@pytest.mark.skipif(not _treesitter_available("javascript"), reason="tree-sitter javascript unavailable")
 def test_scaffold_jsx_syntax_error_retries_and_recovers():
     from cgx.answer.engine import generate_single_scaffold_file
     provider = _QueueProvider([_BROKEN_JSX, _VALID_JSX])
@@ -1284,6 +1302,7 @@ def test_scaffold_jsx_syntax_error_retries_and_recovers():
     assert out["patch"]
 
 
+@pytest.mark.skipif(not _treesitter_available("javascript"), reason="tree-sitter javascript unavailable")
 def test_scaffold_jsx_syntax_error_flags_when_retry_still_broken():
     from cgx.answer.engine import generate_single_scaffold_file
     provider = _QueueProvider([_BROKEN_JSX, _BROKEN_JSX])
@@ -1786,9 +1805,71 @@ def test_blocking_scaffold_call_bounds_the_retries():
     assert prov.max_tokens_seen == [4_000, 8_000, 16_000]
 
 
+def test_plan_scaffold_manifest_coerces_flat_files():
+    from cgx.answer.engine import plan_scaffold_manifest
+    class _FlatProvider:
+        def chat(self, messages, **kw):
+            # Model returns flat "files" list without "layers" wrapper
+            return {"content": json.dumps({
+                "plan_md": "project plan",
+                "files": [{"path": "src/main.py", "description": "entry"}]
+            })}
+    res = plan_scaffold_manifest("idea", _FlatProvider())
+    assert res["layers"][0]["name"] == "project"
+    assert res["layers"][0]["files"][0]["path"] == "src/main.py"
+
+
+
 def test_blocking_scaffold_call_no_retry_on_clean_stop():
     from cgx.answer.engine import _blocking_scaffold_call
     prov = _TruncatingProvider(truncate_n=0)
     out = _blocking_scaffold_call(prov, [{"role": "user", "content": "x"}], 4_000)
     assert out == "print('ok')\n"
     assert prov.max_tokens_seen == [4_000]
+
+
+def test_scaffold_recovers_fenced_block_when_primary_json_fails():
+    from cgx.answer.engine import generate_single_scaffold_file
+    class _FencedProvider:
+        def __init__(self):
+            self.calls = 0
+        def chat(self, messages, **kw):
+            self.calls += 1
+            # Returns a markdown fenced code block instead of JSON
+            return {"content": "Here is the file:\n```python\ndef main():\n    return 42\n```"}
+    prov = _FencedProvider()
+    res = generate_single_scaffold_file("src/main.py", "entry point", prov)
+    assert res["content"] == "def main():\n    return 42"
+    # Should recover on primary call without triggering a second freeform call
+    assert prov.calls == 1
+
+
+def test_generate_repair_files_recovers_from_fenced_blocks():
+    from cgx.answer.engine import generate_repair_files
+    class _RepairProvider:
+        def chat(self, messages, **kw):
+            return {"content": "```python path=src/app.py\ndef run():\n    return 'fixed'\n```"}
+    res = generate_repair_files(
+        _RepairProvider(),
+        goal="fix app",
+        failure_text="AssertionError",
+        files=[{"path": "src/app.py", "content": "def run():\n    return 'bug'"}]
+    )
+    assert res == {"src/app.py": "def run():\n    return 'fixed'"}
+
+
+def test_generate_repair_files_recovers_from_comment_header():
+    from cgx.answer.engine import generate_repair_files
+    class _RepairProvider:
+        def chat(self, messages, **kw):
+            return {"content": "```python\n# src/app.py\ndef run():\n    return 'fixed'\n```"}
+    res = generate_repair_files(
+        _RepairProvider(),
+        goal="fix app",
+        failure_text="AssertionError",
+        files=[{"path": "src/app.py", "content": "def run():\n    return 'bug'"}]
+    )
+    assert res == {"src/app.py": "# src/app.py\ndef run():\n    return 'fixed'"}
+
+
+
