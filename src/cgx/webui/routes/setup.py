@@ -18,6 +18,7 @@ from typing import List, Optional
 import asyncio
 import json as _json
 import logging
+import re
 import threading
 
 from fastapi import APIRouter
@@ -92,6 +93,12 @@ def ping_provider(req: PingRequest) -> PingResponse:
             if not api_key:
                 return PingResponse(ok=False, error="Gemini requires an API key")
             model = req.model or "gemini-2.5-flash"
+            # The model name is interpolated into the request path, so restrict
+            # it to a bare model token: this stops a value like ``../`` or one
+            # carrying ``/``/``?`` from redirecting the request off the fixed
+            # Google host (SSRF guard).
+            if not re.fullmatch(r"[A-Za-z0-9._\-]+", model):
+                return PingResponse(ok=False, error="invalid model name")
             url = (
                 f"https://generativelanguage.googleapis.com/v1beta/models/"
                 f"{model}:generateContent?key={api_key}"
@@ -111,7 +118,12 @@ def ping_provider(req: PingRequest) -> PingResponse:
                 base = ollama_discovery.validate_base_url(req.base_url or "")
             except ValueError as ve:
                 return PingResponse(ok=False, error=str(ve))
+            # Constrain the user-supplied endpoint path to a leading-slash
+            # relative path so it can only extend ``base`` (already validated
+            # above) and cannot inject a new scheme/host (SSRF guard).
             path = req.endpoint_path or "/v1/chat/completions"
+            if "://" in path or not path.startswith("/"):
+                return PingResponse(ok=False, error="invalid endpoint_path")
             # Lightweight OPTIONS/HEAD is usually enough to confirm the host is up.
             headers = {}
             if req.api_key and not req.allow_no_auth:
@@ -269,9 +281,12 @@ def _gemini_list(api_key: str) -> List[str]:
 
 def _openai_list(base_url: str, api_key: str) -> List[str]:
     import requests as _req
-    base = (base_url or "https://api.openai.com").rstrip("/")
-    if base.endswith("/v1"):
-        base = base[:-3]
+    # Validate the user-supplied base URL before fetching it server-side
+    # (SSRF guard: http/https + real host only, no embedded credentials).
+    raw = (base_url or "https://api.openai.com").rstrip("/")
+    if raw.endswith("/v1"):
+        raw = raw[:-3]
+    base = ollama_discovery.validate_base_url(raw)
     url = f"{base}/v1/models"
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     r = _req.get(url, headers=headers, timeout=15)
@@ -330,9 +345,23 @@ async def ollama_pull(req: PullRequest) -> EventSourceResponse:
     _SENTINEL = object()
 
     def _worker() -> None:
-        base = (req.base_url or "http://localhost:11434").rstrip("/")
-        if base.endswith("/v1"):
-            base = base[:-3]
+        # Validate the user-supplied base URL before fetching it server-side:
+        # ``req.base_url`` comes straight off the Settings page, so passing it
+        # unchecked into ``requests`` is a server-side request forgery vector
+        # (py/partial-ssrf). ``validate_base_url`` restricts it to http/https
+        # with a real host and rebuilds it from validated components.
+        raw = (req.base_url or "http://localhost:11434").rstrip("/")
+        if raw.endswith("/v1"):
+            raw = raw[:-3]
+        try:
+            base = ollama_discovery.validate_base_url(raw)
+        except ValueError as ve:
+            err = _json.dumps({"status": "error",
+                               "error": f"invalid base_url: {ve}"[:300]
+                               }).encode()
+            loop.call_soon_threadsafe(queue.put_nowait, err)
+            loop.call_soon_threadsafe(queue.put_nowait, _SENTINEL)
+            return
         logger.info("ollama_pull: starting model=%r base=%s", req.model, base)
         line_count = 0
         saw_success = False

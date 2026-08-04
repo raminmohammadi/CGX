@@ -69,6 +69,17 @@ def redact_secrets(text: str) -> str:
     return text
 
 
+def sanitize_for_log(value: object) -> str:
+    """Return ``value`` as a single-line string safe to interpolate into a log.
+
+    Untrusted request data (session ids, questions, model names, base URLs,
+    ...) may contain ``\\r``/``\\n``; interpolating it raw lets a caller forge
+    extra log records (log injection, CWE-117). Replacing the line breaks is
+    the recognized defence, and collapsing them keeps the record on one line.
+    """
+    return str(value).replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+
+
 class SecretScrubbingFilter(logging.Filter):
     """Logging filter that scrubs credential material from every record.
 
