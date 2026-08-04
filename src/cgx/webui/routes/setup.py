@@ -296,6 +296,40 @@ def _validate_openai_base_url(base_url: str) -> str:
     if not parsed.hostname:
         raise ValueError("Invalid base_url host")
 
+    host = parsed.hostname.strip().lower()
+    if host == "localhost" or host.endswith(".localhost"):
+        raise ValueError("Localhost is not allowed in base_url")
+
+    # Resolve and block private/internal targets to reduce SSRF risk.
+    try:
+        addrinfos = socket.getaddrinfo(parsed.hostname, parsed.port or None, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise ValueError(f"Unable to resolve base_url host: {exc}") from exc
+
+    if not addrinfos:
+        raise ValueError("Unable to resolve base_url host")
+
+    for info in addrinfos:
+        sockaddr = info[4]
+        if not sockaddr:
+            continue
+        ip_txt = sockaddr[0]
+        try:
+            ip_obj = ipaddress.ip_address(ip_txt)
+        except ValueError:
+            raise ValueError("Resolved base_url host to an invalid IP address")
+
+        if (
+            ip_obj.is_private
+            or ip_obj.is_loopback
+            or ip_obj.is_link_local
+            or ip_obj.is_multicast
+            or ip_obj.is_reserved
+            or ip_obj.is_unspecified
+            or getattr(ip_obj, "is_site_local", False)
+        ):
+            raise ValueError("base_url resolves to a non-public IP address")
+
     # Disallow URL components that can alter request routing/semantics.
     if parsed.username or parsed.password:
         raise ValueError("Userinfo is not allowed in base_url")
