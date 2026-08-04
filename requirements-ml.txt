@@ -34,5 +34,5 @@
 # CPU-only (any platform, no GPU): the default `pip install torch` is fine.
 
 sentence-transformers>=2.7
-transformers>=4.40,<6
-torch>=2.1
+transformers>=5.5.0,<6
+torch>=2.13.0
