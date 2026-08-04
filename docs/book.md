@@ -23,17 +23,17 @@ end-to-end, read in order; each chapter assumes the one before it.
 
 | # | Chapter | In one line |
 |--:|---------|-------------|
-| 1 | **Why CGX exists** | Cloud assistants guess at your repo; CGX is built to know it. |
-| 2 | **From repo to records** | How a working tree becomes chunks, a knowledge graph, and two embedding views. |
-| 3 | **The retrieval pipeline** | Semantic, lexical, and graph signals, fused by Reciprocal Rank Fusion. |
-| 4 | **Assembling the prompt** | The tiered Code Map: full-body primaries, one-line neighbours, budgeted to the window. |
-| 5 | **Talking to the model** | One chat() interface fronting Ollama, OpenAI-compatible, and Gemini. |
-| 6 | **Writing to disk** | Parse, apply in memory, syntax-check, sandbox-test -- then write with backups. |
-| 7 | **The agent** | A checkpointed task DAG in SQLite that explores or scaffolds, one step at a time. |
-| 8 | **The front door** | The FastAPI + React surface: SSE streaming and tab-switch replay. |
-| 9 | **Choosing a model** | An offline catalogue that matches runnable models to your hardware. |
-| 10 | **The trust model** | Where does my code go? Nowhere, unless you ask it to. |
-| 11 | **Reading the source** | A guided reading order through the modules, in the sequence this book introduces them. |
+| 1 | [**Why CGX exists**](#chapter-1----why-cgx-exists) | Cloud assistants guess at your repo; CGX is built to know it. |
+| 2 | [**From repo to records**](#chapter-2----from-repo-to-records) | How a working tree becomes chunks, a knowledge graph, and two embedding views. |
+| 3 | [**The retrieval pipeline**](#chapter-3----the-retrieval-pipeline) | Semantic, lexical, and graph signals, fused by Reciprocal Rank Fusion. |
+| 4 | [**Assembling the prompt**](#chapter-4----assembling-the-prompt) | The tiered Code Map: full-body primaries, one-line neighbours, budgeted to the window. |
+| 5 | [**Talking to the model**](#chapter-5----talking-to-the-model) | One chat() interface fronting Ollama, OpenAI-compatible, and Gemini. |
+| 6 | [**Writing to disk**](#chapter-6----writing-to-disk) | Parse, apply in memory, syntax-check, sandbox-test -- then write with backups. |
+| 7 | [**The agent**](#chapter-7----the-agent) | A checkpointed task DAG in SQLite that explores or scaffolds, one step at a time. |
+| 8 | [**The front door**](#chapter-8----the-front-door) | The FastAPI + React surface: SSE streaming and tab-switch replay. |
+| 9 | [**Choosing a model**](#chapter-9----choosing-a-model) | An offline catalogue that matches runnable models to your hardware. |
+| 10 | [**The trust model**](#chapter-10----the-trust-model) | Where does my code go? Nowhere, unless you ask it to. |
+| 11 | [**Reading the source**](#chapter-11----reading-the-source) | A guided reading order through the modules, in the sequence this book introduces them. |
 
 </details>
 
@@ -135,10 +135,11 @@ files reach a parser, mirroring the content-addressed embedding cache one
 layer down.
 
 After parsing comes the graph. `cgx.graph.build_graph.build_knowledge_graph`
-walks the chunk list once and emits four kinds of edges: `calls` (a
-function references another), `module` (a chunk belongs to a file),
-`attr` (an attribute access on a known symbol), and `defined_in`
-(a method belongs to a class). The graph is a NetworkX `DiGraph` --
+walks the chunk list once and emits several kinds of edges: `defines`
+(a file or class owns an entity), `calls` (a function references
+another), `uses_module` (a chunk imports a module), `reads_attr` /
+`writes_attr` (an attribute access on a known symbol), and `raises`
+(a function raises an exception). The graph is a NetworkX `DiGraph` --
 the only place in CGX that depends directly on NetworkX -- and is
 persisted as JSON so reload is fast. Retrieval and embeddings never
 touch the raw `DiGraph`; they go through `cgx.graph.backend.CodeGraphBackend`,
@@ -268,10 +269,10 @@ The neighbour entries also carry a `tier=neighbor` annotation so a
 sufficiently sophisticated downstream consumer can re-rank them.
 
 The budget that decides how many primaries and how many neighbours
-fit comes from `cgx.answer.model_caps`. It exposes a five-key budget
-record (`max_primaries`, `max_neighbors`, `primary_char_cap`,
-`neighbor_char_cap`, `total_char_cap`) scaled across four model-window
-tiers: below 16K, below 64K, below 200K, and 200K or more. A 3B model
+fit comes from `cgx.answer.model_caps.get_context_map_budget`. It
+exposes a five-key budget record (`primary_max`, `neighbor_max`,
+`primary_chars`, `neighbor_chars`, `total_chars`) scaled across four
+model-window tiers: below 16K, below 64K, below 200K, and 200K or more. A 3B model
 on a 32K-token window gets a tight budget that prioritises one or
 two full primaries and many small neighbour stubs; a frontier cloud
 model on a 1M-token window gets a generous budget that can afford

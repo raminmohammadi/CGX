@@ -4,6 +4,20 @@ Thanks for your interest in CGX (Code Graph eXecution). This guide
 covers the day-to-day developer workflow and the **Skills Registry** --
 the primary, plug-and-play contribution surface.
 
+## Ways to contribute
+
+- **Add a Skill** (easiest, highest-impact). Teach CGX a new framework
+  or tool by dropping one self-contained folder under `skills/` -- no
+  agent-layer edits required. Start at
+  [Adding a new Skill](#adding-a-new-skill).
+- **Improve the core.** Retrieval, codegen, the session loop, and the
+  web UI all live under `src/cgx/`; see [Project layout](#project-layout).
+- **Sharpen the docs.** Fixes to `README.md`, the `docs/` set, or inline
+  docstrings are always welcome.
+
+Whatever the change, run through the
+[pull-request checklist](#pull-request-checklist) before opening a PR.
+
 ## Local setup
 
 ```bash
@@ -36,10 +50,19 @@ involve me?*, *what should the LLM know to do my job well?*, and *did
 the produced output actually use me correctly?*. The contract lives in
 [`skills/base.py`](skills/base.py).
 
+> **Two ways to ship a skill.** To contribute a **built-in** skill to the
+> project, follow the steps below (a folder under `skills/`, registered in
+> `skills/__init__.py`). To add a **private, local-only** skill without
+> touching the repo, drop a single `Skill` subclass into a `.py` file
+> under `~/.cgx/skills/`; it is discovered at runtime by
+> [`skills/loader.py`](skills/loader.py) and participates in
+> detection, prompt composition, and validation exactly like a built-in.
+
 ### 1. Create the skill module
 
-Add `skills/<name>/__init__.py` (or `skills/<name>.py` for a single-
-file skill) exposing one subclass of `skills.base.Skill`:
+Add a package `skills/<name>/__init__.py` exposing one subclass of
+`skills.base.Skill` (this is how every built-in skill is structured;
+a single-file `skills/<name>.py` also works):
 
 ```python
 from typing import Any, Dict, List, Optional
@@ -114,8 +137,8 @@ Run `pytest tests/test_skills_<name>.py -q` before opening a PR.
 
 - [ ] `pytest -q` is green (core matrix; ML extras optional).
 - [ ] `ruff check src tests` reports no new errors.
-- [ ] New code paths include a test (skills, codegen, agents,
-  retrieval, sessions, etc.).
+- [ ] New code paths include a test (skills, codegen, sessions,
+  retrieval, etc.).
 - [ ] No top-level imports of `torch`, `transformers`, or
   `sentence_transformers` inside `src/cgx/` -- keep them lazy inside
   function scopes so the core install stays torch-free.

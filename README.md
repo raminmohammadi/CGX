@@ -22,6 +22,31 @@ answer questions or produce **self-tested** code change plans. It is
 model-agnostic and ships with a React/Vite web UI served by a FastAPI
 backend that streams progress over Server-Sent Events.
 
+Point CGX at a repo and ask in plain English. Whether you're onboarding to
+an unfamiliar codebase, planning a refactor, or scaffolding a brand-new
+project, CGX grounds every answer and every code change in your actual
+source -- with citations to the exact files and lines -- and keeps it all on
+your machine unless you explicitly opt into a cloud model.
+
+> **Who is this for?**
+> - **New to CGX?** Start with [Install](#install) and [Quick start](#quick-start),
+>   then ask your first question. You don't need to understand the internals to use it.
+> - **Power users** who want to tune retrieval, script the CLI, or pick the
+>   right local model: jump to [Tuning hybrid retrieval](#tuning-hybrid-retrieval),
+>   the [CLI](#cli) reference, and the [Hardware picker](#hardware-aware-model-picker).
+> - **Contributors:** the [architecture](docs/architecture.md), the
+>   [agent internals](docs/Agent.md), and [CONTRIBUTING.md](CONTRIBUTING.md)
+>   explain how it works and how to extend it (start with a **Skill**).
+
+## Contents
+
+- [Highlights](#highlights) · [Install](#install) · [Quick start](#quick-start)
+- [How it works](#how-it-works) · [Session-based Agent](#session-based-agent-agent) · [Self-testing code generation](#self-testing-code-generation)
+- [Tuning retrieval](#tuning-hybrid-retrieval) · [Incremental indexing](#incremental-indexing) · [Hardware picker](#hardware-aware-model-picker)
+- [Privacy & data flow](#privacy--data-flow) · [Architecture](#architecture) · [Tests](#tests)
+
+## Highlights
+
 - **Local-first.** Indexing, embedding, retrieval, sessions, and
   telemetry **never leave the machine.** Works fully offline with
   [Ollama](https://ollama.com/).
@@ -32,63 +57,22 @@ backend that streams progress over Server-Sent Events.
 - **Hybrid retrieval.** Two-view semantic + BM25 + graph expansion,
   fused with Reciprocal Rank Fusion and an optional cross-encoder
   rerank.
-- **Session-based Agent (default `/agent`).** A persistent,
-  session-shaped orchestrator (`cgx.session`) progresses one task at
-  a time and pauses at every branch for a typed human decision. The
-  loop has two shapes auto-selected (and user-overridable) by
-  `cgx.session.mode.detect_mode`:
-  - **Explore mode** (existing codebase with an index):
-    `EXPLORE → ASK_USER(choose_path) → INVESTIGATE → RECOMMEND →
-    ASK_USER(choose_recommendation) → PLAN_CHANGE →
-    ASK_USER(approve) → APPLY → VERIFY`.
-  - **Greenfield mode** (empty / non-indexed project root, or
-    user-selected): `CLARIFY_REQUIREMENTS →
-    ASK_USER(clarify_answers) → DECOMPOSE →
-    ASK_USER(approve_plan) → SCAFFOLD → APPLY → BOOTSTRAP_ENV →
-    VERIFY`. The agent asks 3–6 clarification questions, plans a
-    layered file manifest, generates each file with cross-file
-    context, and only writes to disk after the user approves the
-    plan. `BOOTSTRAP_ENV` then provisions a project-local
-    environment (a `.venv` for Python; the JS toolchain for a
-    `package.json` project) and installs both declared and
-    detected-undeclared dependencies before `VERIFY` runs the
-    project's tests through a pluggable runner registry (pytest for
-    Python, `npm test` / `npm run build` for JS/TS -- a polyglot
-    repo is verified in one pass), so "Flask wasn't installed" reads
-    as a collection error on the `BUILD_REPORT` rather than
-    masquerading as a test failure. A failed `VERIFY` in greenfield
-    mode spawns a `REPAIR` task that first tries deterministic,
-    LLM-free classifiers (pytest-style class missing
-    `unittest.TestCase`; `ModuleNotFoundError` for a project-root
-    module; a missing fixture; a third-party import break fixed via a
-    PyPI-computed version pin) and, for ordinary logic / assertion
-    failures with no mechanical fix, falls back to a **bounded LLM
-    repair** that rewrites the smallest set of files (≤5) from the
-    failing test output and re-validates their syntax before applying.
-    The loop runs as long as the failing-test count keeps strictly
-    dropping (under an absolute 4-round ceiling, all counters managed
-    by one typed `LoopBudget`) and is gated by a failure-signature
-    hash, so repeated identical failures escalate instead of looping.
-    A session-level budget (`max_task_runs` /
-    `max_wall_seconds`) backstops the whole autonomous run: an
-    interactive session pauses on an `ASK_USER` when the budget is
-    spent, a headless one ends terminally `FAILED`.
-
-  Each direction the user picks is recorded as a structured
-  `Decision`; nothing reaches disk without an explicit approval
-  checkpoint. Session state lives in
-  `<project_root>/.cgx/sessions.db` (SQLite, one row per
-  task/fact/artifact/decision), so a session can be resumed days
-  later. See the **🤖 Agent** tab and
-  [docs/flowcharts.md § Session-shaped write loop](docs/flowcharts.md#session-shaped-write-loop-agent).
+- **Session-based Agent (default `/agent`).** Describe a goal and the
+  agent works toward it one step at a time, pausing at every branch so
+  **you approve each decision** -- nothing reaches disk until you say so.
+  It picks one of two modes automatically: **explore** an existing
+  codebase (investigate → recommend → plan → apply) or **greenfield**-
+  generate a new project from a plain-language idea (clarify → scaffold
+  → set up the environment → run the tests, repairing failures on its
+  own). Sessions are saved and resumable. Full walkthrough:
+  [Session-based Agent](#session-based-agent-agent) and
+  [docs/Agent.md](docs/Agent.md).
 - **New project generation.** Give CGX a plain-language idea
-  (e.g. *"create a FastAPI todo app"* or *"create a React calculator
-  app"*), set a destination directory as Project Root, and the
-  greenfield session chain (`CLARIFY_REQUIREMENTS → DECOMPOSE →
-  SCAFFOLD → APPLY → VERIFY`) generates a complete, working project
-  from scratch -- no existing codebase or index required. The `APPLY`
-  step writes a per-run backup mirror under
-  `<project_root>/.cgx-backups/` so the whole run can be undone via
+  (*"create a FastAPI todo app"*, *"create a React calculator app"*),
+  point it at an empty folder, and the greenfield agent scaffolds a
+  complete, working project from scratch -- no existing codebase or
+  index required. Every write is backed up under
+  `<project_root>/.cgx-backups/` and the whole run is reversible via
   `POST /api/rollback`.
 - **Modular skills registry** (`skills/`). Each supported technology
   lives in its own folder (`skills/react/`, `skills/fastapi/`,
@@ -120,7 +104,7 @@ backend that streams progress over Server-Sent Events.
   (per-view `.npz` keyed on sha256 of the corpus text) makes
   re-indexing a touched-only-a-few-files repo nearly instant.
 - **Hardware-aware model picker.** The Hardware tab reports
-  ✅/⚠️/❌ verdicts for ~8 local models against your detected RAM/VRAM
+  ✅/⚠️/❌ verdicts for 21 local models against your detected RAM/VRAM
   and shows a local-vs-cloud trade-off table.
 - **Client-side rate limiting + 429 retry** on every provider, with
   per-profile budgets persisted alongside the model config.
@@ -538,14 +522,38 @@ Three modules own every transition:
   `RUNTIME_VERIFY`, `REPAIR`), and shared (`APPLY`, `VERIFY`,
   `ASK_USER`).
 
-The HTTP surface is JSON-only at `/api/agent-session/*` (create /
-list / get / message / decision / delete). Mutating endpoints
+**Environment bootstrap and autonomous repair (greenfield).** Before
+tests run, `BOOTSTRAP_ENV` provisions a project-local environment (a
+`.venv` for Python; the JS toolchain for a `package.json` project) and
+installs both declared and detected-undeclared dependencies, so a
+missing package surfaces as a collection error on the `BUILD_REPORT`
+rather than masquerading as a test failure. `VERIFY` then runs the
+project's tests through a pluggable runner registry (pytest for Python,
+`npm test` / `npm run build` for JS/TS -- a polyglot repo is verified in
+one pass). A failed `VERIFY` spawns a `REPAIR` task that first tries
+deterministic, LLM-free classifiers (a pytest class missing
+`unittest.TestCase`, a `ModuleNotFoundError` for a project-root module,
+a missing fixture, a third-party import break fixed via a PyPI-computed
+version pin) and, for ordinary logic / assertion failures with no
+mechanical fix, falls back to a **bounded LLM repair** that rewrites the
+smallest set of files (≤5) and re-validates their syntax before
+applying. The loop continues only while the failing-test count strictly
+drops (absolute ceiling of 4 rounds, all counters in one typed
+`cgx.session.budget.LoopBudget`) and is gated by a failure-signature
+hash, so identical repeated failures escalate rather than loop. A
+session-level budget (`max_task_runs` / `max_wall_seconds`) backstops
+the whole autonomous run: interactive sessions pause on an `ASK_USER`
+when spent, headless ones end terminally `FAILED`.
+
+The HTTP surface at `/api/agent-session/*` has eight endpoints:
+seven JSON (create / list / get / message / decision / cancel /
+delete) plus a `GET /{sid}/events` **SSE** stream. Mutating endpoints
 return the full `AgentSessionState` snapshot so the React UI
 re-renders the tree in one round-trip; `DELETE /api/agent-session/
 {sid}` discards a session and its aggregate (`ON DELETE CASCADE`)
-and returns `{deleted: sid}`. The UI polls
-`GET /api/agent-session/{sid}` while a non-`ASK_USER` task is in
-flight.
+and returns `{deleted: sid}`. The UI follows a running session over
+the SSE feed and falls back to polling
+`GET /api/agent-session/{sid}` only when the stream is unhealthy.
 
 Drive it programmatically (no UI required):
 
@@ -653,20 +661,21 @@ run_index_auto(project_root="./", out_dir="/tmp/cgx_index", incremental=False)
 
 ## Hardware-aware model picker
 
-The **📊 Hardware** tab annotates a static catalogue of 8
-locally-runnable models against the RAM/VRAM detected by
+The **📊 Hardware** tab annotates a static catalogue of 21
+locally-runnable models (families: `coder`, `reasoning`, `general`)
+against the RAM/VRAM detected by
 `cgx.answer.ollama_discovery.detect_hardware()`. Each row reports:
 
 | Column        | Meaning                                                                                        |
 |---------------|------------------------------------------------------------------------------------------------|
-| `model`       | Ollama tag (e.g. `qwen2.5-coder:3b`, `llama3.1:8b-instruct`).                                  |
-| `params_b`    | Approx parameter count in billions.                                                            |
-| `min_ram_gb`  | Lower bound for 4-bit quantised inference.                                                     |
-| `rec_vram_gb` | VRAM at which throughput is smooth.                                                            |
-| `ctx_window`  | Maximum prompt window the model advertises.                                                    |
-| `family`      | `coder` or `general`.                                                                          |
-| `fit`         | ✅ *fits* / ⚠️ *tight* / ❌ *won't fit* against your detected budget.                          |
-| `reason`      | The numeric comparison behind the verdict.                                                     |
+| `name`                | Ollama tag (e.g. `qwen2.5-coder:3b`, `llama3.1:8b-instruct`).                          |
+| `params_b`            | Approx parameter count in billions.                                                   |
+| `min_ram_gb`          | Lower bound for 4-bit quantised inference.                                            |
+| `recommended_vram_gb` | VRAM at which throughput is smooth.                                                   |
+| `ctx_window`          | Maximum prompt window the model advertises.                                           |
+| `family`              | `coder`, `reasoning`, or `general`.                                                   |
+| `fit`                 | ✅ *fits* / ⚠️ *tight* / ❌ *won't fit* against your detected budget.                  |
+| `reason`              | The numeric comparison behind the verdict.                                            |
 
 The second table shows the editorial local-vs-cloud trade-off across
 **privacy, marginal cost, quality ceiling, cold/warm latency,

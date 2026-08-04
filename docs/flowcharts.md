@@ -1,7 +1,13 @@
 # CGX -- Flowcharts
 
-Three audience-specific views of the same system. Each SVG is hand-authored,
-scales cleanly, and renders inline on GitHub.
+Three audience-specific views of the same system, plus a deep dive on the
+agent's write loop. Every diagram is authored in **Mermaid**, so it renders
+inline on GitHub and stays editable in a pull request.
+
+**Pick your view:** [For users](#for-users) ·
+[For developers](#for-developers) ·
+[Session-shaped write loop](#session-shaped-write-loop-agent) ·
+[For companies](#for-companies)
 
 ---
 
@@ -145,11 +151,14 @@ returns a `RouterPlan` of actions (`CreateTask`, `UpdateTaskStatus`,
 
 **SessionStore** (`cgx.session.store`) persists sessions, tasks, facts,
 decisions and artifacts as JSON blobs in `<project>/.cgx/sessions.db`
-and emits a typed `Event` on every write. Those events fan out to the
-SSE endpoint (`GET /api/agent-session/{sid}/events`) that
-`AgentPage.tsx` subscribes to, to the TUI stream, and to the
-per-session `agent.log` trace under `~/.cgx/agent-sessions/<sid>/` --
-one feed, three consumers, replayable from the store on remount.
+and publishes a typed `Event` on the shared `EventBus`
+(`cgx.session.events`) on every write. Those events fan out to the SSE
+endpoint (`GET /api/agent-session/{sid}/events`) the React UI's
+`RunTab.tsx` subscribes to and to the TUI stream; the runner
+separately writes the project-local `agent.log` trace
+(`<project_root>/.cgx/agent.log`, mirrored under
+`~/.cgx/agent-sessions/<sid>/` when the project tree is gone) --
+replayable from the store on remount.
 
 The [session-shaped write loop](#session-shaped-write-loop-agent)
 section below walks the two mode chains (explore and greenfield)
@@ -629,16 +638,17 @@ Three pieces of code own every transition:
   persists their `outputs`, `facts`, and `artifact` after the call so
   executors are unit-testable without a database.
 
-The HTTP surface (`/api/agent-session`) is JSON-only with six
-endpoints (create / list / get / message / decision / delete).
-Mutating endpoints return the full `AgentSessionState` snapshot, so
-the React UI re-renders the whole tree in one round-trip; `DELETE`
-returns `{deleted: sid}` and the UI refreshes the session list.
-While a task is
-`IN_PROGRESS` (other than an `ASK_USER`) the UI polls
-`GET /api/agent-session/{sid}` until it pauses. Sessions persist to
-`<project_root>/.cgx/sessions.db` (one SQLite file per project root,
-WAL mode, JSON-blob rows with indexed columns).
+The HTTP surface (`/api/agent-session`) has eight endpoints -- seven
+JSON (create / list / get / message / decision / cancel / delete) plus
+a `GET /{sid}/events` **SSE** stream. Mutating endpoints return the
+full `AgentSessionState` snapshot, so the React UI re-renders the whole
+tree in one round-trip; `DELETE` returns `{deleted: sid}` and the UI
+refreshes the session list. While a task is `IN_PROGRESS` (other than
+an `ASK_USER`) the UI follows progress over the SSE feed and falls back
+to polling `GET /api/agent-session/{sid}` only when the stream is
+unhealthy. Sessions persist to `<project_root>/.cgx/sessions.db` (one
+SQLite file per project root, WAL mode, JSON-blob rows with indexed
+columns).
 
 The decision contract is pinned by `build_decision` in
 `cgx.session.tasks.ask`: `choose_path` requires `anchor_chunk_id`,

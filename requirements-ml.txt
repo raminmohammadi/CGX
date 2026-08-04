@@ -35,4 +35,4 @@
 
 sentence-transformers>=2.7
 transformers>=4.40,<6
-torch>=2.13.0
+torch>=2.1.3
