@@ -7,7 +7,7 @@ document follows a single request as it travels through CGX --
 from an unindexed working tree to a tested patch on disk -- and explains
 why each layer exists.
 
-![alt text](images/image.png)
+![One request's journey through CGX: repository to index to hybrid retrieval to a tiered prompt to the model to a tested patch on disk](images/image.png)
 
 If you want the short version, read Chapter 1 (why CGX exists) and
 Chapter 10 (the trust model). If you want to learn the system
@@ -34,14 +34,16 @@ applies the resulting patch. Nothing has to leave the host, and when it
 does -- because the user has explicitly configured a cloud provider --
 only the snippets and prompts required for the next turn are sent.
 
-![alt text](images/chapter_1.png)
+![The local-first trust boundary: parsing, embedding, retrieval, the local LLM, codegen, and apply all run on your machine; the cloud LLM is an opt-in egress](images/chapter_1.png)
 
 This local-first stance shapes every design decision downstream. The
-parser does not require Tree-sitter binaries. The graph layer does not
-require a database. The embedding cache is a single `.npz` file. The
-session store is JSONL. The task registry is SQLite. There is no daemon
-to install and no service to log in to. Open the project, run `cgx web`,
-and you are done.
+core parser needs no third-party libraries -- Python and Markdown are
+handled with the standard library, and Tree-sitter is an optional extra
+that only unlocks the JavaScript/TypeScript grammars. The graph layer
+does not require a database. The embedding cache is a pair of per-view
+`.npz` files. Conversational history is JSONL; the agent-session and
+task registries are SQLite. There is no daemon to install and no service
+to log in to. Open the project, run `cgx serve`, and you are done.
 
 The second design force is *small models matter*. A 3-billion-parameter
 local model is a different animal from a 200-billion-parameter cloud
@@ -59,9 +61,12 @@ Indexing begins with `cgx.parser.parse_codebase`. The walker respects
 that keeps generated artefacts (lockfiles, minified bundles, vendored
 dependencies) out of the corpus. For every file that survives the
 filter, an extension-dispatched parser registry produces a stream of
-*chunks*. Today only Python is registered; the registry exists so a
-future contributor can plug in a JavaScript or Go parser without
-touching the rest of the pipeline.
+*chunks*. Python (standard-library `ast`) and Markdown/RST are always
+registered; JavaScript, JSX, TypeScript, and TSX join them when the
+optional `parsers` extra (Tree-sitter) is installed. Every parser is a
+`BaseParser` subclass keyed on file extension, so adding a language is a
+self-contained change that never touches the rest of the pipeline, and
+the walker simply skips any extension with no registered parser.
 
 A chunk is a `TypedDict` defined in `cgx.parser.schema`. Its fields are
 deliberately frugal: a stable id of the form `path::kind::symbol`, the
@@ -74,15 +79,26 @@ per function or method (with full body). This three-tier shape is what
 lets retrieval return a useful neighbourhood from a single hit -- you can
 walk from a function up to its class up to its file.
 
-![alt text](images/chapter_2.png)
+![From repo to records: files flow through the parser registry into three-tier chunks, then into the knowledge graph and the two-view embedding corpus](images/chapter_2.png)
 
 The Python parser is the canonical implementation. It uses the standard
 library `ast` module, lifts helpers like `_build_file_code_stub`,
 `_collect_top_level_members`, and `_class_signature` to module scope so
 they can be unit-tested, and never imports a third-party parsing library.
-That choice has consequences -- CGX understands Python with surgical
-precision and other languages only by their file boundaries -- but it
-keeps the install footprint tiny.
+The Tree-sitter parsers in `cgx.parser.js_ts_parser` extend the same
+three-tier shape to JavaScript and TypeScript, and
+`cgx.parser.markdown_parser` chunks prose so a repository's design notes
+are retrievable next to its code. Because the walker skips any extension
+with no registered parser, a core install (without the `parsers` extra)
+still indexes Python and Markdown cleanly -- multi-language support is
+additive, never required.
+
+Re-parsing is incremental. `cgx.parser.incremental` keeps a
+`parse_cache.json` manifest keyed on each file's content hash (with its
+mtime and the schema version recorded alongside); on a re-index,
+unchanged files replay their cached chunks and only added or modified
+files reach a parser, mirroring the content-addressed embedding cache one
+layer down.
 
 After parsing comes the graph. `cgx.graph.build_graph.build_knowledge_graph`
 walks the chunk list once and emits four kinds of edges: `calls` (a
@@ -131,7 +147,7 @@ candidates whose docstring/name view sits close in vector space, the
 impl index returns candidates whose source view sits close. Two ranked
 lists come back.
 
-![alt text](images/chapter_3.png)
+![The hybrid retrieval pipeline: semantic, lexical (BM25), and graph-expansion retrievers run in parallel and are fused by Reciprocal Rank Fusion, then optionally reranked](images/chapter_3.png)
 
 The second is *lexical* search. A BM25 ranker scores the query against
 the same chunks, treating their text as a bag of tokens. BM25 is
@@ -195,7 +211,7 @@ did not ask about -- neighbours that provide structural context but
 whose bodies are mostly noise. A 3B model handed five full function
 bodies will weight all five equally and produce muddled answers.
 
-![alt text](images/chapter_4.png)
+![The tiered Code Map: graph_depth splits hits into full-body primaries and one-line neighbour stubs, sized against the model's context window](images/chapter_4.png)
 
 The Code Map classifies every hit into one of two tiers using the
 `provenance.graph_depth` field the orchestrator stamps onto each
@@ -238,7 +254,7 @@ vLLM, LM Studio, and cloud OpenAI itself), and `GeminiProvider` for
 Google's REST API. All three present the same `chat(messages, ...)`
 interface so the engine never knows which one it is talking to.
 
-![alt text](images/chapter_5.png)
+![One chat() interface fronting the Ollama, OpenAI-compatible, and Gemini providers, wrapped by rate limiting and profile resolution](images/chapter_5.png)
 
 Two cross-cutting concerns wrap every provider call. The first is
 *rate limiting*. `cgx.answer.ratelimit` implements a token-bucket
@@ -279,7 +295,7 @@ impacted tests. It returns a `CodegenReport` with four sections:
 outcome), and a `summary` dict whose `overall_ok` flag the agent
 loop uses as its self-test signal.
 
-![alt text](images/chapter_6.png)
+![The codegen pipeline: diffs are parsed, applied in memory, syntax-checked, preflight-installed, and run against impacted tests before being written to disk with a backup mirror](images/chapter_6.png)
 
 `validate_and_test` never touches the real working tree. It exists
 so the planner can ask itself "would this plan work?" before the
@@ -336,6 +352,8 @@ calls `run_pytest_paths` against every discovered test file.
 prompt machinery of Chapter 5 with a persistent, checkpointed loop
 built from four parts: a **store**, a **runner**, a **router**, and
 a registry of **executors**.
+
+![The session agent loop: the runner claims a READY task, the router walks the explore or greenfield chain, executors do the work, and everything is checkpointed in the SQLite store](images/chapter_7.png)
 
 A session is a durable aggregate -- one `Session` row plus its
 `TaskNode`s, `Fact`s, `Decision`s, and `Artifact`s -- persisted by
@@ -412,9 +430,10 @@ can continue.
 
 The web UI is a FastAPI app composed in `cgx.webui.server.create_app`
 and served by `uvicorn` on `:8765`. Routes are split per feature
-under `cgx.webui.routes` -- `ask`, `plan`, `agent_session`, `index`,
-`embed`, `hardware`, `sessions`, `tasks`, `rollback`, `setup`,
-`profiles`, `settings`, `skills`, `status` -- and a single SPA
+under `cgx.webui.routes` -- `ask`, `plan`, `agent_session`,
+`agent_profiles`, `index`, `embed`, `hardware`, `sessions`, `tasks`,
+`rollback`, `setup`, `profiles`, `settings`, `skills`, `status` -- and a
+single SPA
 fallback serves the prebuilt React bundle from `cgx/webui/static`
 for every non-API URL so React Router's client-side routing works
 on a hard refresh.
@@ -537,8 +556,12 @@ For someone landing on the repository for the first time, the
 fastest way to internalise the system is to read the modules in
 the order this book introduces them:
 
-1. `cgx/parser/parse_codebase.py` and `cgx/parser/python_parser.py`
-   -- the ingestion entry point and the only registered parser.
+1. `cgx/parser/parse_codebase.py`, `cgx/parser/base.py`,
+   `cgx/parser/python_parser.py`, `cgx/parser/js_ts_parser.py`,
+   `cgx/parser/markdown_parser.py`, and `cgx/parser/incremental.py`
+   -- the ingestion entry point, the `BaseParser` seam, the registered
+   parsers (Python, JS/TS via Tree-sitter, Markdown), and the
+   incremental parse cache.
 2. `cgx/embeddings/records.py` and `cgx/embeddings/cache.py` --
    the two-view corpus builder and the content-addressed cache.
 3. `cgx/graph/build_graph.py` and `cgx/graph/backend.py` -- the
