@@ -19,6 +19,8 @@ from urllib.parse import urlsplit, urlunsplit
 
 import requests
 
+from cgx.logging_setup import sanitize_for_log
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_BASE_URL = "http://localhost:11434"
@@ -74,7 +76,8 @@ def list_installed_models(base_url: str = DEFAULT_BASE_URL) -> List[Dict[str, An
     try:
         url = validate_base_url(base_url) + "/api/tags"
     except ValueError as e:
-        logger.info("ollama_discovery: rejected base_url %r: %s", base_url, e)
+        logger.info("ollama_discovery: rejected base_url %r: %s",
+                    sanitize_for_log(base_url), type(e).__name__)
         return []
     try:
         r = requests.get(url, timeout=DEFAULT_TIMEOUT)

@@ -16,6 +16,7 @@ import os
 from fastapi import APIRouter, HTTPException
 
 from cgx.codegen.disk_apply import rollback_from_backup
+from cgx.logging_setup import sanitize_for_log
 from cgx.webui.models import RollbackRequest
 
 logger = logging.getLogger(__name__)
@@ -61,5 +62,5 @@ def rollback(req: RollbackRequest) -> dict:
                 len(result.get("restored_files") or []),
                 len(result.get("deleted_files") or []),
                 len(result.get("failed_files") or []),
-                result.get("error"))
+                sanitize_for_log(result.get("error")))
     return result

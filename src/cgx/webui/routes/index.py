@@ -13,6 +13,7 @@ import uuid
 from fastapi import APIRouter, File, UploadFile
 from sse_starlette.sse import EventSourceResponse
 
+from cgx.logging_setup import sanitize_for_log
 from cgx.webui import task_store
 from cgx.webui.handlers import stream_index
 from cgx.webui.models import IndexBuildRequest
@@ -45,7 +46,8 @@ async def build_index(req: IndexBuildRequest) -> EventSourceResponse:
         "embed_model": req.embed_model,
     })
     cancel_event = task_store.get_cancel_event(task_id)
-    logger.info("index build route: task_id=%s project_root=%r", task_id, req.project_root)
+    logger.info("index build route: task_id=%s project_root=%r", task_id,
+                sanitize_for_log(req.project_root))
 
     def factory():
         return stream_index(

@@ -14,6 +14,7 @@ import logging
 
 from fastapi import APIRouter, HTTPException
 
+from cgx.logging_setup import sanitize_for_log
 from cgx.webui import task_store
 
 logger = logging.getLogger(__name__)
@@ -47,5 +48,5 @@ def cancel_task(task_id: str):
     cancelled = task_store.cancel_task(task_id)
     if not cancelled:
         raise HTTPException(status_code=404, detail="task not found or already finished")
-    logger.info("tasks route: cancelled task id=%s", task_id)
+    logger.info("tasks route: cancelled task id=%s", sanitize_for_log(task_id))
     return {"task_id": task_id, "status": "cancelled"}

@@ -129,10 +129,14 @@ def test_resolve_key_from_saved_profile(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(setup_mod, "load_api_key", lambda name: "from-store" if name == "p1" else None)
     captured: Dict[str, Any] = {}
 
-    def fake_get(url, *_args, **_kwargs):
+    def fake_get(url, *_args, **kwargs):
         captured["url"] = url
+        captured["headers"] = kwargs.get("headers") or {}
         return _FakeResp(_gemini_payload())
 
     with patch("requests.get", side_effect=fake_get):
         cloud_models(CloudModelsRequest(kind="gemini", profile_name="p1"))
-    assert "key=from-store" in captured["url"]
+    # The resolved key is sent via the x-goog-api-key header, never the URL
+    # query string, so it can't leak into request logs/proxies.
+    assert captured["headers"].get("x-goog-api-key") == "from-store"
+    assert "from-store" not in captured["url"]

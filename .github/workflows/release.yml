@@ -88,7 +88,7 @@ jobs:
           path: dist
 
       - name: Create or update GitHub Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@c12583777ecdfd3be55c69cf75464299dc01057e  # v3
         with:
           files: dist/*
           generate_release_notes: true
@@ -111,7 +111,7 @@ jobs:
           path: dist
 
       - name: Publish
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33  # release/v1
         with:
           packages-dir: dist/
           skip-existing: true

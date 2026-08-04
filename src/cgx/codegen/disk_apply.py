@@ -28,6 +28,7 @@ from cgx.codegen.diff_apply import (
     parse_fenced_diffs,
 )
 from cgx.codegen.validate import check_cross_file_coherence, validate_patch_results
+from cgx.logging_setup import sanitize_for_log
 from cgx.trace import traced
 
 logger = logging.getLogger(__name__)
@@ -344,18 +345,20 @@ def rollback_from_backup(
                 if os.path.exists(target):
                     os.remove(target)
                 deleted.append(target_rel)
-                logger.info("rollback_from_backup: deleted %s", target_rel)
+                logger.info("rollback_from_backup: deleted %s",
+                            sanitize_for_log(target_rel))
             else:
                 os.makedirs(os.path.dirname(target), exist_ok=True)
                 shutil.copy2(str(entry), target)
                 restored.append(target_rel)
-                logger.info("rollback_from_backup: restored %s", target_rel)
+                logger.info("rollback_from_backup: restored %s",
+                            sanitize_for_log(target_rel))
         except OSError as e:
             # Log the underlying OS error (with type) server-side only; the
             # returned payload is surfaced in the UI, so expose a generic
             # message rather than a stack-trace-bearing exception string.
             logger.warning("rollback_from_backup: failed on %s: %s: %s",
-                           target_rel, type(e).__name__, e)
+                           sanitize_for_log(target_rel), type(e).__name__, e)
             failed.append({"file": target_rel,
                            "error": "could not restore file"})
 

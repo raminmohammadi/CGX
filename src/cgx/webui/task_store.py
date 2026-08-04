@@ -26,6 +26,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from cgx.logging_setup import sanitize_for_log
+
 logger = logging.getLogger(__name__)
 
 _DB_PATH = Path.home() / ".cgx" / "tasks.db"
@@ -151,7 +153,7 @@ def cancel_task(task_id: str) -> bool:
             (now, task_id),
         )
         conn.commit()
-    logger.info("task_store: cancelled task id=%s", task_id)
+    logger.info("task_store: cancelled task id=%s", sanitize_for_log(task_id))
     return True
 
 

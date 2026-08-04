@@ -18,6 +18,7 @@ import logging
 import os
 from typing import Iterable, Optional
 
+from cgx.logging_setup import sanitize_for_log
 from cgx.session.models import SessionMode
 
 logger = logging.getLogger(__name__)
@@ -114,7 +115,8 @@ def _project_is_empty(project_root: Optional[str], *,
             if count >= threshold:
                 return False
     except OSError as exc:
-        logger.warning("mode: scandir(%s) failed: %s", root, exc)
+        logger.warning("mode: scandir(%s) failed: %s",
+                       sanitize_for_log(root), type(exc).__name__)
         return True
     return count < threshold
 
