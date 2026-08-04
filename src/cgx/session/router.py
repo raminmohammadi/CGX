@@ -49,6 +49,7 @@ from cgx.session.greenfield_edges import (
     _scaffold_failed_files_actions,
     _scaffold_payload_regenerate_actions,
     _scaffold_resume_actions,
+    _scaffold_skill_regenerate_actions,
     _verify_lesson_actions,
 )
 from cgx.session.models import (
@@ -966,6 +967,7 @@ _COMPLETION_GUARDS: Tuple[Tuple[TaskKind, _CompletionGuard], ...] = (
     (TaskKind.SCAFFOLD, _scaffold_failed_files_actions),
     (TaskKind.SCAFFOLD, _scaffold_payload_regenerate_actions),
     (TaskKind.SCAFFOLD, _scaffold_contract_regenerate_actions),
+    (TaskKind.SCAFFOLD, _scaffold_skill_regenerate_actions),
     (TaskKind.APPLY, _apply_failed_files_actions),
 )
 

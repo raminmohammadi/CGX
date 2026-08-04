@@ -12,7 +12,7 @@ prior goal so retrieval still has the high-level objective in scope.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from cgx.session.models import (
     Artifact,
@@ -46,6 +46,7 @@ def run_plan_change(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     # Imported lazily; the answer engine drags retrieval + FAISS in.
     from cgx.answer.engine import generate_code_plan
 
+    skill_names = session_skills(task, deps)
     try:
         result = generate_code_plan(
             index_dir=deps.index_dir,
@@ -54,7 +55,7 @@ def run_plan_change(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             provider=deps.provider,
             project_root=deps.project_root,
             embedder=deps.extra.get("embedder") if deps.extra else None,
-            skills=session_skills(task, deps),
+            skills=skill_names,
         )
     except Exception as exc:
         logger.exception("PLAN_CHANGE: generate_code_plan crashed")
@@ -65,6 +66,15 @@ def run_plan_change(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     diffs = _normalize_diffs((result or {}).get("diffs"))
     citations = (result or {}).get("citations") or []
     confidence = (result or {}).get("confidence")
+
+    # Skill-structural gate: run the active technology skills' plan
+    # validators over the produced diffs and surface a fatal verdict on the
+    # artifact + outputs so the ASK_USER approval gate can show it before
+    # the user approves the change. PLAN_CHANGE is user-approved rather than
+    # auto-looped, so the verdict is advisory here (no automatic regenerate).
+    # Best-effort and non-fatal -- any failure in the skills layer degrades
+    # to no verdict so the plan is never blocked by the checker itself.
+    skill_verdict = _skill_plan_verdict(skill_names, diffs, task_text)
 
     artifact = Artifact.new(
         session_id=task.session_id,
@@ -78,6 +88,7 @@ def run_plan_change(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             "diffs": diffs,
             "citations": citations,
             "confidence": confidence,
+            "skill_verdict": skill_verdict,
         },
     )
     return ExecutorResult(
@@ -85,12 +96,39 @@ def run_plan_change(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             "plan_artifact_id": artifact.artifact_id,
             "diffs_count": len(diffs),
             "confidence": confidence,
+            "skill_verdict": skill_verdict,
         },
         artifact=artifact,
     )
 
 
 # --------------------- helpers ---------------------
+
+def _skill_plan_verdict(skill_names: Any, diffs: List[Dict[str, str]],
+                        task_text: str) -> Optional[Dict[str, Any]]:
+    """Return a fatal skill plan verdict for ``diffs``, or ``None``.
+
+    Resolves the active skills exactly as the planner did -- an explicit
+    pinned list, else detection over the task text -- and runs their plan
+    validators. Best-effort: any failure in the skills layer returns
+    ``None`` so PLAN_CHANGE is never blocked by the checker itself.
+    """
+    try:
+        import skills as _sk
+        active = (_sk.skills_by_names(list(skill_names)) if skill_names
+                  else _sk.detect_skills(task_text))
+        verdict = _sk.validate_plan(active, diffs, goal=task_text)
+    except Exception:  # pragma: no cover - defensive: gate is best-effort
+        logger.exception("PLAN_CHANGE: skill validation raised; skipping")
+        return None
+    if verdict is None:
+        return None
+    return {
+        "skill": verdict.skill,
+        "confidence": verdict.confidence,
+        "rationale": verdict.rationale,
+        "severity": verdict.severity,
+    }
 
 def _compose_task_text(task: TaskNode) -> str:
     """Build the planner's task description from session context."""

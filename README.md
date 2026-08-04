@@ -80,10 +80,13 @@ your machine unless you explicitly opt into a cloud model.
   `skills/django/`, `skills/express/`, `skills/python_cli/`,
   `skills/sqlite/`) and bundles three things: detection from the goal,
   the prompt fragment the LLM sees while generating, and a structural
-  validator (`skills.validate_scaffold` / `validate_plan`) that checks
-  the produced diffs. Multi-skill goals compose naturally -- *"React UI
+  validator that runs on the produced diffs. The SCAFFOLD executor
+  invokes `skills.validate_scaffold` after each generation, and a fatal
+  verdict (e.g. a React goal that emitted no JS/TS source) drives a
+  whole-tree regenerate rather than silently applying a Python-only
+  output. Multi-skill goals compose naturally -- *"React UI
   + FastAPI backend"* activates both, so the scaffold prompt carries
-  both layouts. Adding a new framework is a single-folder change with
+  both layouts and both validators run. Adding a new framework is a single-folder change with
   no agent-layer edits. See
   [docs/usage.md](docs/usage.md#skills-technology-aware-scaffolding)
   for the full table and [docs/architecture.md](docs/architecture.md#skills)

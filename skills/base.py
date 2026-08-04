@@ -49,14 +49,18 @@ ROLES: Tuple[str, ...] = (
 class SkillVerdict:
     """Validation outcome from a skill's check on produced diffs.
 
-    Mirrors :class:`cgx.agents.judge.Verdict` so the Judge can pass the
-    skill's verdict through verbatim. 
-    
-    ``passed=False`` with the default ``severity="error"`` short-circuits
-    the Judge to FAIL with this skill's rationale; 
-    
-    ``severity="warning"`` is advisory only the Judge surfaces the rationale but does
-    not fail the task on it.
+    Consumed by the SCAFFOLD executor (:mod:`cgx.session.tasks.scaffold`)
+    and surfaced through the registry helpers in :mod:`skills`.
+
+    ``passed=False`` with the default ``severity="error"`` is a fatal
+    verdict: the SCAFFOLD executor records it as ``skill_verdict`` and the
+    router turns it into a whole-tree regenerate (bounded by the shared
+    regenerate budget) so a scaffold that cannot possibly satisfy the
+    technology is re-authored rather than applied.
+
+    ``severity="warning"`` is advisory: it is collected via
+    :func:`skills.collect_scaffold_warnings` and rides along on the
+    scaffold artifact without failing or regenerating the task.
     """
 
     passed: bool

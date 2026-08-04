@@ -759,6 +759,64 @@ def _scaffold_contract_regenerate_actions(
     return actions
 
 
+def _scaffold_skill_regenerate_actions(
+        completed: TaskNode,
+        tasks: List[TaskNode]) -> List[RouterAction]:
+    """Regenerate a SCAFFOLD whose output fails an active skill's check.
+
+    Complements the contract/payload regenerate guards: this one owns the
+    technology-skill structural gate. When SCAFFOLD recorded a fatal
+    ``skill_verdict`` (e.g. a React goal that emitted no JS/TS source, or a
+    FastAPI goal with no Python app module) and every file otherwise
+    generated, fold the verdict's rationale into a whole-tree regenerate
+    constraint so the retry sees exactly which technology contract the
+    output missed. Bounded by
+    :data:`~cgx.session.budget.REGENERATE_BUDGET` and a per-skill flap
+    signature (a retry that reproduces the identical verdict has shown the
+    generator cannot satisfy it), and deliberately **non-terminal**: on a
+    spent budget or a repeated verdict the empty return lets the dispatcher
+    take SCAFFOLD -> APPLY so VERIFY -- which exercises the tree against a
+    real suite -- makes the final call rather than the static gate failing
+    the session. Returns an empty list (normal edge) for a scaffold that
+    passed the gate, one that dropped files, a repeated verdict, or a spent
+    budget.
+    """
+    from cgx.session.repair.propose import propose_regenerate  # dep direction
+
+    outputs = completed.outputs or {}
+    if int(outputs.get("failed_count") or 0) > 0:
+        return []
+    verdict = outputs.get("skill_verdict")
+    if not isinstance(verdict, dict):
+        return []
+    rationale = str(verdict.get("rationale") or "").strip()
+    if not rationale:
+        return []
+    budget = LoopBudget.from_inputs(completed.inputs)
+    skill = str(verdict.get("skill") or "").strip() or "skill"
+    signature = f"skill_verdict|{skill}"
+    if budget.regenerate_exhausted or budget.seen(signature):
+        return []
+    constraint = {
+        "kind": "unmet_skill",
+        "rationale": (f"the generated files do not satisfy the {skill!r} "
+                      f"skill's structural check: {rationale}"),
+        "skill": skill,
+    }
+    actions: List[RouterAction] = []
+    skip_states = {TaskNodeStatus.DONE, TaskNodeStatus.FAILED,
+                   TaskNodeStatus.ABANDONED}
+    for t in _collect_descendants(completed.task_id, tasks):
+        if t.status in skip_states:
+            continue
+        actions.append(UpdateTaskStatus(
+            task_id=t.task_id, status=TaskNodeStatus.ABANDONED))
+    actions.append(CreateTask(propose_regenerate(
+        completed, constraint,
+        prior_failure_signatures=_appended_signature(budget, signature))))
+    return actions
+
+
 def _actionable_payload_warnings(
         outputs: Dict[str, object]) -> List[Dict[str, object]]:
     """Return the cross-language seam warnings a regenerate can act on.
