@@ -99,6 +99,29 @@ CLARIFY_QUESTIONS_SCHEMA: Dict[str, Any] = {
     "required": ["questions"],
 }
 
+# CLARIFY_PATHS schema for answer engine clarify_paths mode.
+CLARIFY_PATHS_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "restatement": {"type": "string"},
+        "options": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "rationale": {"type": "string"},
+                    "chunk_id": {"type": "string"},
+                },
+                "required": ["title", "rationale", "chunk_id"],
+            },
+        },
+        "follow_up_question": {"type": "string"},
+    },
+    "required": ["restatement", "options", "follow_up_question"],
+}
+
 # REPAIR whole-file rewrites. Mirrors engine._LOGIC_REPAIR_SYSTEM: the model
 # returns complete corrected files as ``{files:[{path, content}]}`` (an empty
 # array is its explicit "no fix" signal).

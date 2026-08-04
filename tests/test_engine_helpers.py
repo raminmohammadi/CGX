@@ -1872,4 +1872,81 @@ def test_generate_repair_files_recovers_from_comment_header():
     assert res == {"src/app.py": "# src/app.py\ndef run():\n    return 'fixed'"}
 
 
+def test_sanitize_inline_citations_removes_hallucinated_ids():
+    from cgx.answer.engine import _sanitize_inline_citations
+    text = "Implemented in `foo()` [[chunk_1]] and `bar()` [[chunk_9999]], which is great."
+    cleaned = _sanitize_inline_citations(text, ["chunk_1", "chunk_2"])
+    assert "[[chunk_1]]" in cleaned
+    assert "[[chunk_9999]]" not in cleaned
+    assert "and `bar()`," in cleaned
+
+
+def test_recover_clarify_options_from_prose():
+    from cgx.answer.engine import _recover_clarify_options_from_prose
+    cands = [
+        {"chunk_id": "chunk_0", "path": "src/a.py"},
+        {"chunk_id": "chunk_1", "path": "src/b.py"},
+    ]
+    content = (
+        "1. **Refactor Auth** — Fix token validation in [[chunk_0]]\n"
+        "2. **Add Cache Index** — Faster embedding lookup in [[chunk_1]]\n"
+    )
+    opts = _recover_clarify_options_from_prose(content, cands)
+    assert len(opts) == 2
+    assert opts[0]["chunk_id"] == "chunk_0"
+    assert "Refactor Auth" in opts[0]["title"]
+    assert opts[1]["chunk_id"] == "chunk_1"
+    assert "Faster embedding lookup" in opts[1]["rationale"]
+
+
+def test_as_sources_with_meta_enforces_char_budget():
+    from cgx.answer.engine import _as_sources_with_meta
+    hits = [
+        {"chunk_id": "chunk_0"},
+        {"chunk_id": "chunk_1"},
+        {"chunk_id": "chunk_2"},
+        {"chunk_id": "chunk_3"},
+    ]
+    cmap = {
+        "chunk_0": {"text": "a" * 400},
+        "chunk_1": {"text": "b" * 400},
+        "chunk_2": {"text": "c" * 400},
+        "chunk_3": {"text": "d" * 400},
+    }
+    sources = _as_sources_with_meta(hits, cmap, max_chunks=10, total_chars_budget=1000)
+    assert len(sources) == 3
+
+
+def test_answer_with_llm_accepts_markdown_prose_and_extracts_inline_citations(tmp_path):
+    from cgx.answer.engine import answer_with_llm
+    class _ProseProvider:
+        calls = 0
+        def chat(self, messages, **kw):
+            self.calls += 1
+            return {"content": "The function calculates the sum of two integers [[src/math.py::func::add]]."}
+
+    index_dir = tmp_path / "indices"
+    index_dir.mkdir(parents=True)
+    (index_dir / "meta.json").write_text('{"schema_version": 1, "project_root": "."}', encoding="utf-8")
+    (index_dir / "intent.rows.jsonl").write_text('{"chunk_id": "src/math.py::func::add", "text": "def add(a, b): return a + b"}\n', encoding="utf-8")
+    (index_dir / "impl.rows.jsonl").write_text('', encoding="utf-8")
+
+    records_path = tmp_path / "records.jsonl"
+    records_path.write_text('{"chunk_id": "src/math.py::func::add", "text": "def add(a, b): return a + b"}\n', encoding="utf-8")
+
+    provider = _ProseProvider()
+    hits = [{"chunk_id": "src/math.py::func::add", "score": 1.0, "view": "intent"}]
+    res = answer_with_llm(
+        str(index_dir),
+        str(records_path),
+        "what does add do?",
+        provider,
+        hits=hits,
+    )
+    assert "calculates the sum" in res["answer_md"]
+    assert res["citations"] == [{"chunk_id": "src/math.py::func::add"}]
+    assert provider.calls == 1
+
+
+
 

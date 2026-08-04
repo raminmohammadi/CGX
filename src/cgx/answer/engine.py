@@ -9,6 +9,7 @@ from pathlib import Path
 from cgx.io.persist import load_indices, load_jsonl
 from cgx.answer.providers import LLMProvider
 from cgx.answer.schemas import (
+    CLARIFY_PATHS_SCHEMA,
     MANIFEST_SCHEMA,
     REPAIR_FILES_SCHEMA,
     validate_json_schema,
@@ -217,6 +218,7 @@ def _as_sources_with_meta(
     max_chars: int = 900,
     *,
     focus_terms: Optional[List[str]] = None,
+    total_chars_budget: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """Select top hits and attach trimmed text + structured meta for grounding & debug.
 
@@ -225,6 +227,7 @@ def _as_sources_with_meta(
     to reduce prompt size without losing the relevant span.
     """
     out: List[Dict[str, Any]] = []
+    total_chars_accum = 0
     for h in hits[:max_chunks]:
         cid = str(h.get("chunk_id"))
         row = cmap.get(cid) or {}
@@ -248,6 +251,12 @@ def _as_sources_with_meta(
             body = _window_text(text or "", terms, max_chars)
         else:
             body = _trim(text or "", max_chars)
+        if total_chars_budget is not None and total_chars_accum + len(body) > total_chars_budget:
+            if len(out) >= 3:
+                break
+            rem = max(100, total_chars_budget - total_chars_accum)
+            body = body[:rem]
+        total_chars_accum += len(body)
         out.append({
             "chunk_id": cid,
             "path": path,
@@ -502,6 +511,24 @@ def _hits_from_records(indices: Dict[str, Any], records_path: Optional[str], sym
             view, _row = view_r
             hits.append({"chunk_id": cid, "score": 3.0, "view": view})
     return hits
+
+# Matches ``[[chunk_id]]`` citation tokens in Markdown text
+_INLINE_CITATION_RE = re.compile(r"\[\[([^\[\]]+)\]\]")
+
+def _sanitize_inline_citations(answer_md: str, allowed_ids: Sequence[str]) -> str:
+    """Strip or clean inline [[chunk_id]] tokens that are not present in allowed_ids."""
+    if not answer_md or not isinstance(answer_md, str):
+        return str(answer_md or "")
+    allowed_set = set(allowed_ids)
+    def _replace_cite(m: re.Match) -> str:
+        cid = m.group(1).strip()
+        if cid in allowed_set:
+            return m.group(0)
+        return ""
+    cleaned = _INLINE_CITATION_RE.sub(_replace_cite, answer_md)
+    cleaned = re.sub(r' +\.', '.', cleaned)
+    cleaned = re.sub(r' +,', ',', cleaned)
+    return cleaned
 
 def _sanitize_citations(citations, allowed_ids):
     out = []
@@ -885,10 +912,7 @@ def _prepare_answer_request(
         # retrieval yields nothing (missing/empty index).
         base_hits = _auto_retrieve_hits(index_dir, records_path, question, top_k)
         if not base_hits:
-            for name in ["intent", "impl"]:
-                vw = (indices.get("views") or {}).get(name) or {}
-                for r in (vw.get("rows") or [])[:top_k]:
-                    base_hits.append({"chunk_id": r.get("chunk_id"), "score": 1.0, "view": name})
+            logger.warning("_prepare_answer_request: _auto_retrieve_hits returned no hits for question: %r", question)
 
     seen = set()
     merged_hits: List[Dict[str, Any]] = []
@@ -922,10 +946,10 @@ def _prepare_answer_request(
         int(((h.get("provenance") or {}) if isinstance(h, dict) else {}).get("graph_depth", 0) or 0) >= 1
         for h in merged_hits
     )
+    from cgx.answer.model_caps import get_context_map_budget
+    budget = get_context_map_budget(provider)
     if _has_neighbors:
         from cgx.answer.context_map import build_tiered_context, load_records_by_id
-        from cgx.answer.model_caps import get_context_map_budget
-        budget = get_context_map_budget(provider)
         sources = build_tiered_context(
             merged_hits, cmap, load_records_by_id(records_path),
             budget=budget, focus_terms=focus_terms or None,
@@ -937,6 +961,7 @@ def _prepare_answer_request(
             max_chunks=40 if mode == "symbol_explain" else 24,
             max_chars=max_chars,
             focus_terms=focus_terms or None,
+            total_chars_budget=budget.get("total_chars") if isinstance(budget, dict) else None,
         )
 
     if target and target_matched and mode in _SYMBOL_TARGETED_MODES:
@@ -1144,6 +1169,42 @@ def _clarify_user_message(
     return "\n\n".join(p for p in parts if p)
 
 
+def _recover_clarify_options_from_prose(
+    content: str, candidates: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Recover structured options from a markdown list if JSON extraction failed."""
+    if not content or not candidates:
+        return []
+    allowed = {c["chunk_id"]: c for c in candidates}
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for line in content.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        cites = _INLINE_CITATION_RE.findall(line)
+        valid_cid = None
+        for cid in cites:
+            if cid in allowed and cid not in seen:
+                valid_cid = cid
+                break
+        if not valid_cid:
+            continue
+        seen.add(valid_cid)
+        text = _INLINE_CITATION_RE.sub("", line).strip(" -*#1234567890.:")
+        parts = re.split(r"[-—:]", text, maxsplit=1)
+        title = parts[0].replace("**", "").replace("*", "").strip() or f"Investigate {valid_cid}"
+        rationale = (parts[1].strip() if len(parts) > 1 else text).replace("**", "").replace("*", "").strip()
+        out.append({
+            "title": title[:60],
+            "rationale": rationale,
+            "chunk_id": valid_cid,
+        })
+        if len(out) >= 5:
+            break
+    return out
+
+
 def _call_clarify_llm(
     provider: LLMProvider,
     goal: str,
@@ -1162,17 +1223,38 @@ def _call_clarify_llm(
         {"role": "user", "content": _clarify_user_message(
             goal, candidates, sources, retry_hint)},
     ]
-    resp = provider.chat(messages, temperature=0.2)
+    kwargs: Dict[str, Any] = {}
+    if getattr(provider, "supports_json_schema", False):
+        kwargs["force_json"] = True
+        kwargs["json_schema"] = CLARIFY_PATHS_SCHEMA
+    resp = provider.chat(messages, temperature=0.2, **kwargs)
     content = (resp.get("content") or "").strip()
     parsed = _extract_json_object(content)
+    if isinstance(parsed, dict) and parsed.get("options"):
+        return parsed
+    recovered = _recover_clarify_options_from_prose(content, candidates)
+    if recovered:
+        return {
+            "restatement": goal,
+            "options": recovered,
+            "follow_up_question": "Which of these directions would you like to pursue first?",
+        }
     if not parsed or not isinstance(parsed, dict):
         messages.append({"role": "assistant", "content": content})
         messages.append({"role": "user", "content": (
             "Reformat your previous reply as STRICT JSON exactly matching "
             "the schema (restatement / options[] / follow_up_question). "
             "No prose outside JSON.")})
-        resp2 = provider.chat(messages, temperature=0)
+        resp2 = provider.chat(messages, temperature=0, **kwargs)
         parsed = _extract_json_object((resp2.get("content") or "")) or {}
+        if not (isinstance(parsed, dict) and parsed.get("options")):
+            recovered2 = _recover_clarify_options_from_prose((resp2.get("content") or ""), candidates)
+            if recovered2:
+                return {
+                    "restatement": goal,
+                    "options": recovered2,
+                    "follow_up_question": "Which of these directions would you like to pursue first?",
+                }
     return parsed if isinstance(parsed, dict) else {}
 
 
@@ -1355,12 +1437,15 @@ def answer_with_llm(
     parsed: Dict[str, Any] = _extract_json_object(content)
 
     if not parsed or not isinstance(parsed, dict) or not parsed.get("answer_md"):
-        messages.append({"role": "assistant", "content": content})
-        messages.append({"role": "user", "content": "Reformat to strict JSON only. "
-                                                   "Ensure non-empty 'answer_md' grounded in SOURCES with citations. "
-                                                   "Keep the same content; do not add external knowledge."})
-        resp2 = provider.chat(messages, temperature=0)
-        parsed = _extract_json_object((resp2.get("content") or "")) or {"answer_md": content, "citations": []}
+        if content and not content.strip().startswith("{"):
+            parsed = {"answer_md": content, "citations": []}
+        else:
+            messages.append({"role": "assistant", "content": content})
+            messages.append({"role": "user", "content": "Reformat to strict JSON only. "
+                                                       "Ensure non-empty 'answer_md' grounded in SOURCES with citations. "
+                                                       "Keep the same content; do not add external knowledge."})
+            resp2 = provider.chat(messages, temperature=0)
+            parsed = _extract_json_object((resp2.get("content") or "")) or {"answer_md": (resp2.get("content") or content), "citations": []}
 
     ans = parsed.get("answer_md")
     if isinstance(ans, dict):
@@ -1388,7 +1473,12 @@ def answer_with_llm(
         parsed["confidence"] = 0.2
 
     allowed_ids = [s['chunk_id'] for s in sources]
-    parsed["citations"] = _sanitize_citations(parsed.get("citations", []), allowed_ids)
+    if not parsed.get("citations"):
+        raw_cites = [{"chunk_id": m.group(1)} for m in _INLINE_CITATION_RE.finditer(parsed.get("answer_md", ""))]
+        parsed["citations"] = _sanitize_citations(raw_cites, allowed_ids)
+    else:
+        parsed["citations"] = _sanitize_citations(parsed.get("citations", []), allowed_ids)
+    parsed["answer_md"] = _sanitize_inline_citations(parsed.get("answer_md", ""), allowed_ids)
     parsed.setdefault("suggested_changes", [])
     if "confidence" not in parsed or not isinstance(parsed["confidence"], (int, float)):
         parsed["confidence"] = 0.6 if parsed["citations"] else 0.4
@@ -1404,11 +1494,6 @@ def answer_with_llm(
     }
 
     return parsed
-
-
-# Matches ``[[chunk_id]]`` citation tokens in streamed Markdown so the final
-# event can carry a structured ``citations`` list alongside the raw answer.
-_INLINE_CITATION_RE = re.compile(r"\[\[([^\[\]]+)\]\]")
 
 
 def answer_with_llm_stream(
