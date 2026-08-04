@@ -124,6 +124,15 @@ def ping_provider(req: PingRequest) -> PingResponse:
             except ValueError as ve:
                 return PingResponse(ok=False, error=str(ve))
             path = req.endpoint_path or "/v1/chat/completions"
+            # Validate user-controlled path to prevent partial SSRF/path abuse.
+            if not path.startswith("/"):
+                return PingResponse(ok=False, error="endpoint_path must start with '/'")
+            if any(token in path for token in ("?", "#", "://", "@", "\\")):
+                return PingResponse(ok=False, error="Invalid endpoint_path")
+            if ".." in path:
+                return PingResponse(ok=False, error="Invalid endpoint_path")
+            if not re.fullmatch(r"/[A-Za-z0-9._~/%-]*", path):
+                return PingResponse(ok=False, error="Invalid endpoint_path")
             # Lightweight OPTIONS/HEAD is usually enough to confirm the host is up.
             headers = {}
             if req.api_key and not req.allow_no_auth:
