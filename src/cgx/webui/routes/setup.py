@@ -16,10 +16,13 @@ import time
 from typing import List, Optional
 
 import asyncio
+import ipaddress
 import json as _json
 import logging
+import socket
 import re
 import threading
+from urllib.parse import urlparse
 
 from fastapi import APIRouter
 from pydantic import BaseModel
@@ -270,9 +273,50 @@ def _gemini_list(api_key: str) -> List[str]:
     return out
 
 
+def _validate_openai_base_url(base_url: str) -> str:
+    base = (base_url or "https://api.openai.com").strip().rstrip("/")
+    parsed = urlparse(base)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError("Invalid base_url scheme")
+    if not parsed.hostname:
+        raise ValueError("Invalid base_url host")
+
+    host = parsed.hostname
+    if host.lower() == "localhost":
+        raise ValueError("Localhost is not allowed")
+
+    def _reject_ip(ip_text: str) -> None:
+        ip = ipaddress.ip_address(ip_text)
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        ):
+            raise ValueError("Non-public IP is not allowed")
+
+    try:
+        _reject_ip(host)
+    except ValueError:
+        raise
+    except Exception:
+        infos = socket.getaddrinfo(host, None)
+        if not infos:
+            raise ValueError("Unable to resolve host")
+        for info in infos:
+            sockaddr = info[4]
+            if not sockaddr:
+                continue
+            _reject_ip(sockaddr[0])
+
+    return base
+
+
 def _openai_list(base_url: str, api_key: str) -> List[str]:
     import requests as _req
-    base = (base_url or "https://api.openai.com").rstrip("/")
+    base = _validate_openai_base_url(base_url)
     if base.endswith("/v1"):
         base = base[:-3]
     url = f"{base}/v1/models"
