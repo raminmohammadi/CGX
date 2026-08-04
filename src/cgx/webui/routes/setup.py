@@ -37,8 +37,12 @@ router = APIRouter(tags=["setup"])
 
 # Restrict outbound model-discovery requests to explicitly approved providers.
 # Keep this list aligned with supported OpenAI-compatible backends.
-_OPENAI_ALLOWED_HOSTS = {
-    "api.openai.com",
+# Map each approved host to its canonical, compile-time-constant base URL.
+# The validated host is used only as a lookup key; the value returned to the
+# caller is a constant string, which is what keeps attacker-controlled text
+# out of the outbound request (SSRF barrier).
+_OPENAI_ALLOWED_BASES = {
+    "api.openai.com": "https://api.openai.com",
 }
 
 
@@ -315,18 +319,13 @@ def _validate_openai_base_url(base_url: str) -> str:
     if path not in ("", "/v1"):
         raise ValueError("Only empty path or /v1 is allowed in base_url")
 
-    # The host allowlist is the SSRF barrier: model discovery can only ever
-    # reach an explicitly approved, public provider, so a user-supplied
-    # base_url can never be pointed at an internal/private service. The URL
-    # is then rebuilt from these validated, constant components.
-    host_l = parsed.hostname.lower()
-    if host_l not in _OPENAI_ALLOWED_HOSTS:
+    # SSRF barrier: the validated host is used only as a lookup key into a
+    # constant allowlist, and the base URL handed back is a compile-time
+    # constant string. No attacker-controlled text flows into the outbound
+    # request, so model discovery can only ever reach an approved provider.
+    canonical = _OPENAI_ALLOWED_BASES.get(parsed.hostname.lower())
+    if canonical is None:
         raise ValueError("Host is not in the allowed list")
-
-    netloc = host_l
-    if parsed.port:
-        netloc = f"{netloc}:{parsed.port}"
-    canonical = f"{parsed.scheme}://{netloc}"
     if path == "/v1":
         canonical += "/v1"
     return canonical
