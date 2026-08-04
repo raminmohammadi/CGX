@@ -41,6 +41,7 @@ from cgx.session.mode import detect_mode
 from cgx.session.models import SessionMode
 from cgx.session.tasks.ask import build_decision
 from cgx.session.tasks.base import ExecutorDeps
+from cgx.logging_setup import sanitize_for_log
 from cgx.webui.handlers import _resolve_provider
 from cgx.webui.models import (
     AgentSessionCreateRequest,
@@ -157,7 +158,7 @@ async def _drain_ready(runner: SessionRunner, session_id: str,
         # thread with no owner.
         if _consume_cancel(session_id):
             logger.info("drain: cancel honoured for session %s; stopping "
-                        "before the next task", session_id)
+                        "before the next task", sanitize_for_log(session_id))
             get_default_bus().publish(Event(
                 type=EventType.SESSION_UPDATED, session_id=session_id,
                 payload={"cancelled": True}))
@@ -169,7 +170,7 @@ async def _drain_ready(runner: SessionRunner, session_id: str,
         # trip an ``ON DELETE CASCADE`` FK error).
         if runner.store.get_session(session_id) is None:
             logger.info("drain: session %s no longer exists; stopping",
-                        session_id)
+                        sanitize_for_log(session_id))
             return
         try:
             task = await asyncio.to_thread(
@@ -180,14 +181,15 @@ async def _drain_ready(runner: SessionRunner, session_id: str,
             # than a drain failure. Any other error propagates as before.
             if runner.store.get_session(session_id) is None:
                 logger.info("drain: session %s deleted mid-task; discarding "
-                            "in-flight result", session_id)
+                            "in-flight result", sanitize_for_log(session_id))
                 return
             raise
         if task is None:
             return
     logger.warning(
         "drain: hit max_steps=%d for session %s without quiescing; "
-        "a READY task may remain undispatched", max_steps, session_id)
+        "a READY task may remain undispatched", max_steps,
+        sanitize_for_log(session_id))
 
 
 # --------------------- background drain ---------------------

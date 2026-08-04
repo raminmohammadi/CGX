@@ -20,6 +20,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from cgx.logging_setup import sanitize_for_log
 
 logger = logging.getLogger(__name__)
 
@@ -127,5 +128,5 @@ def delete_agent_profile(name: str) -> bool:
     profiles.pop(name, None)
     raw["profiles"] = profiles
     _write_json(AGENT_PROFILES_PATH, raw)
-    logger.info("agent_profiles: deleted name=%r", name)
+    logger.info("agent_profiles: deleted name=%r", sanitize_for_log(name))
     return True

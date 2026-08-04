@@ -23,6 +23,7 @@ from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
 from cgx.embeddings.catalog import EMBED_MODEL_CATALOG, find_by_name, is_cached
+from cgx.logging_setup import sanitize_for_log
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["embed"])
@@ -127,7 +128,8 @@ async def embed_pull(req: EmbedPullRequest) -> EventSourceResponse:
     ``pytorch_model.bin`` only downloads the safetensors copy.
     """
     if not find_by_name(req.model):
-        logger.info("embed_pull: %r not in catalog -- proceeding anyway", req.model)
+        logger.info("embed_pull: %r not in catalog -- proceeding anyway",
+                    sanitize_for_log(req.model))
 
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue = asyncio.Queue(maxsize=256)

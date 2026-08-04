@@ -23,7 +23,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
-from cgx.logging_setup import redact_secrets
+from cgx.logging_setup import redact_secrets, sanitize_for_log
 
 
 logger = logging.getLogger(__name__)
@@ -140,7 +140,7 @@ def delete_session(session_id: str) -> bool:
         _path_for(session_id).unlink(missing_ok=True)
     except Exception as e:
         logger.warning("sessions: failed to delete log for %s: %s: %s",
-                       session_id, type(e).__name__, e)
+                       sanitize_for_log(session_id), type(e).__name__, e)
     return True
 
 
@@ -185,7 +185,7 @@ def load_messages(session_id: str) -> List[Dict[str, Any]]:
                 out.append(json.loads(line))
             except Exception as e:
                 logger.warning("sessions: skipping malformed message in %s: %s: %s",
-                               session_id, type(e).__name__, e)
+                               sanitize_for_log(session_id), type(e).__name__, e)
                 continue
     return out
 

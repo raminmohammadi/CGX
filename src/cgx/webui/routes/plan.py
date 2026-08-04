@@ -9,6 +9,7 @@ import logging
 from fastapi import APIRouter
 from sse_starlette.sse import EventSourceResponse
 
+from cgx.logging_setup import sanitize_for_log
 from cgx.webui import task_store
 from cgx.webui.handlers import stream_plan
 from cgx.webui.models import PlanRequest
@@ -30,7 +31,8 @@ async def plan(req: PlanRequest) -> EventSourceResponse:
         "project_root": req.project_root,
     })
     cancel_event = task_store.get_cancel_event(task_id)
-    logger.info("plan route: task_id=%s task=%r", task_id, req.task[:60])
+    logger.info("plan route: task_id=%s task=%r", task_id,
+                sanitize_for_log(req.task[:60]))
 
     def factory():
         return stream_plan(

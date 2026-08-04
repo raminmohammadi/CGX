@@ -24,6 +24,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from cgx.logging_setup import sanitize_for_log
 
 logger = logging.getLogger(__name__)
 
@@ -184,7 +185,7 @@ def _load_secret(name: str) -> Optional[str]:
         except Exception as e:
             logger.warning("profiles: keyring get_password failed for profile %r, "
                            "falling back to secrets file: %s: %s",
-                           name, type(e).__name__, e)
+                           sanitize_for_log(name), type(e).__name__, e)
     data = _read_json(SECRETS_PATH)
     val = data.get(name)
     return val if isinstance(val, str) and val else None
@@ -197,7 +198,7 @@ def _delete_secret(name: str) -> None:
             kr.delete_password(KEYRING_SERVICE, name)
         except Exception as e:
             logger.warning("profiles: keyring delete_password failed for profile %r: %s: %s",
-                           name, type(e).__name__, e)
+                           sanitize_for_log(name), type(e).__name__, e)
     data = _read_json(SECRETS_PATH)
     if name in data:
         data.pop(name, None)
@@ -289,13 +290,14 @@ def delete_profile(name: str) -> bool:
     raw = _read_json(PROFILES_PATH)
     profiles = raw.get("profiles") or {}
     if name not in profiles:
-        logger.info("profiles: delete no-op (not found) name=%r", name)
+        logger.info("profiles: delete no-op (not found) name=%r",
+                    sanitize_for_log(name))
         return False
     profiles.pop(name, None)
     raw["profiles"] = profiles
     _write_json(PROFILES_PATH, raw)
     _delete_secret(name)
-    logger.info("profiles: deleted name=%r", name)
+    logger.info("profiles: deleted name=%r", sanitize_for_log(name))
     return True
 
 
