@@ -6,6 +6,9 @@ backs the **📊 Hardware** tab in the CGX UI. Source of truth:
 - `src/cgx/answer/hardware_matrix.py` -- the Python module
 - `docs/hardware_matrix.json` -- same data, exported for tooling
 
+For how to read the verdicts in the UI, see
+[usage § Hardware-aware model picker](usage.md#9-hardware-aware-model-picker-hardware-tab).
+
 Numbers are deliberate approximations for **4-bit quantised
 GGUF / AWQ-style inference** (the format Ollama serves by default).
 They are intended for UI sorting and a "will this fit?" sanity check,
@@ -17,19 +20,34 @@ not capacity planning.
 ## Local-model catalogue
 </summary>
 
-The catalogue lists 8 locally-runnable models across two families
-(`coder`, `general`):
+The catalogue lists 21 locally-runnable models across three families
+(`coder`, `general`, `reasoning`). Rows are grouped by family and, within
+each family, ascend by `params_b` -- the exact order `compute_local_fit`
+returns and the Hardware tab renders:
 
-| Model                              | Params (B) | Min RAM (GB) | Rec. VRAM (GB) | Ctx window | Family   | Notes                                          |
-|------------------------------------|-----------:|-------------:|---------------:|-----------:|----------|------------------------------------------------|
-| `qwen2.5-coder:1.5b`               |        1.5 |          4.0 |            2.0 |     32 768 | coder    | smallest viable coder; CPU-friendly            |
-| `qwen2.5-coder:3b`                 |        3.0 |          6.0 |            4.0 |     32 768 | coder    | balanced default for code Q&A                  |
-| `qwen2.5-coder:7b-instruct`        |        7.0 |         10.0 |            8.0 |     32 768 | coder    | higher-quality coder; sweet spot on 16 GB GPUs |
-| `qwen2.5-coder:14b-instruct`       |       14.0 |         20.0 |           16.0 |     32 768 | coder    | near-cloud coder quality; needs ≥16 GB VRAM    |
-| `llama3.2:3b-instruct`             |        3.0 |          6.0 |            4.0 |    131 072 | general  | long context, light general-purpose            |
-| `llama3.1:8b-instruct`             |        8.0 |         12.0 |            8.0 |    131 072 | general  | general-purpose with strong reasoning          |
-| `qwen2.5:7b-instruct`              |        7.0 |         10.0 |            8.0 |     32 768 | general  | general-purpose alternative to llama 8b        |
-| `phi3.5:3.8b-mini-instruct`        |        3.8 |          6.0 |            4.0 |    131 072 | general  | small, long-context, low-RAM                   |
+| Model | Params (B) | Min RAM (GB) | Rec. VRAM (GB) | Ctx window | Family | Notes |
+|-------|-----------:|-------------:|---------------:|-----------:|--------|-------|
+| `qwen2.5-coder:1.5b` | 1.5 | 4.0 | 2.0 | 32 768 | coder | smallest viable coder; CPU-friendly |
+| `qwen2.5-coder:3b` | 3.0 | 6.0 | 4.0 | 32 768 | coder | balanced default for code Q&A |
+| `deepseek-coder:6.7b` | 6.7 | 10.0 | 8.0 | 16 384 | coder | strong FIM; good code completion on 8 GB GPU |
+| `qwen2.5-coder:7b-instruct` | 7.0 | 10.0 | 8.0 | 32 768 | coder | higher-quality coder; sweet spot on 16 GB GPUs |
+| `qwen2.5-coder:14b-instruct` | 14.0 | 20.0 | 16.0 | 32 768 | coder | near-cloud coder quality; needs ≥16 GB VRAM |
+| `deepseek-coder-v2:16b` | 16.0 | 20.0 | 16.0 | 163 840 | coder | MoE architecture; very long context; needs ≥16 GB VRAM |
+| `gemma3:1b` | 1.0 | 3.0 | 2.0 | 32 768 | general | ultra-light; runs CPU-only on any modern laptop |
+| `gemma2:2b` | 2.0 | 4.0 | 2.0 | 8 192 | general | efficient small model; good quality-per-GB |
+| `gemma4:e2b` | 2.0 | 8.0 | 8.0 | 131 072 | general | Effective 2B; ~7.2 GB on disk; mobile/edge tier |
+| `llama3.2:3b-instruct` | 3.0 | 6.0 | 4.0 | 131 072 | general | long context, light general-purpose |
+| `phi3.5:3.8b-mini-instruct` | 3.8 | 6.0 | 4.0 | 131 072 | general | small, long-context, low-RAM |
+| `gemma3:4b` | 4.0 | 6.0 | 4.0 | 131 072 | general | capable laptop model with very long context |
+| `gemma4:e4b` | 4.0 | 12.0 | 10.0 | 131 072 | general | Effective 4B (gemma4:latest alias); ~9.6 GB on disk |
+| `qwen2.5:7b-instruct` | 7.0 | 10.0 | 8.0 | 32 768 | general | general-purpose alternative to llama 8b |
+| `llama3.1:8b-instruct` | 8.0 | 12.0 | 8.0 | 131 072 | general | general-purpose with strong reasoning |
+| `gemma2:9b` | 9.0 | 12.0 | 8.0 | 8 192 | general | high-quality general; sweet spot on 12 GB RAM |
+| `gemma4:12b` | 12.0 | 10.0 | 8.0 | 262 144 | general | Workstation dense; ~7.6 GB on disk at default quant |
+| `deepseek-r1:1.5b` | 1.5 | 4.0 | 2.0 | 65 536 | reasoning | tiny reasoning model; runs on most laptops |
+| `deepseek-r1:7b` | 7.0 | 10.0 | 8.0 | 65 536 | reasoning | chain-of-thought reasoning; solid on 8 GB GPU |
+| `gemma4:26b` | 26.0 | 22.0 | 18.0 | 262 144 | reasoning | MoE (4B active/token); ~18 GB on disk |
+| `gemma4:31b` | 31.0 | 24.0 | 24.0 | 262 144 | reasoning | Dense; ~20 GB on disk; near-cloud quality |
 
 <details>
 <summary>
@@ -78,11 +96,19 @@ with open('docs/hardware_matrix.json', 'w') as f:
 
 The pytest suite (`tests/test_hardware_matrix.py`) asserts:
 
-- All entries have the required fields.
-- Rows are sorted by `params_b`.
-- The 14B coder is rejected on an 8 GB-RAM CPU-only machine.
-- The 7B coder is flagged as tight on 32 GB RAM + 2 GB VRAM.
-- All entries fit on a 256 GB / 80 GB VRAM workstation.
+- All entries have the required fields and are well-typed
+  (`test_catalog_is_non_empty_and_well_typed`).
+- Rows are grouped by family (`coder → general → reasoning`) and
+  ascend by `params_b` within each family
+  (`test_compute_local_fit_rows_grouped_by_family_then_params`).
+- Large models are rejected on a tiny machine, and tight-VRAM
+  configurations are flagged
+  (`test_compute_local_fit_tiny_machine_rejects_large_models`,
+  `test_compute_local_fit_tight_vram_flagged_as_tight`).
+- Everything fits on a 256 GB / 80 GB-VRAM workstation, and unknown
+  hardware marks every row `❓`
+  (`test_compute_local_fit_huge_machine_fits_everything`,
+  `test_compute_local_fit_unknown_hardware_marks_all_unknown`).
 
 </details>
 

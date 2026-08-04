@@ -1,6 +1,22 @@
 # Architecture
 
 CGX is structured as a small set of cooperating layers under `cgx.*`.
+Data flows one way -- **parse → graph → embed → retrieve → answer /
+codegen** -- with the session-shaped agent orchestrating that pipeline one
+typed task at a time. Each section below opens as a collapsible block.
+
+**Contents:** [Layers](#layers) · [Data flow](#data-flow) ·
+[Tiered context (Code Map)](#tiered-slm-context-code-map) ·
+[Self-test loop](#self-test-loop) · [AST insertion](#structured-ast-insertion) ·
+[LLM providers](#llm-providers) ·
+[Dependency management](#dynamic-dependency-management) ·
+[Session-shaped agent](#session-shaped-agent-cgxsession) ·
+[Apply safeguards](#apply-pipeline-safeguards) · [Skills](#skills) ·
+[Task registry](#task-registry) · [Apply rollback](#apply-rollback) ·
+[Persistent sessions](#persistent-sessions) · [Rate limiting](#rate-limiting) ·
+[Hardware matrix](#hardware--model-matrix) · [Telemetry](#telemetry) ·
+[Observability](#observability) · [React frontend](#react-frontend) ·
+[Security model](#security-model)
 
 <details>
 <summary>
@@ -51,7 +67,7 @@ cgx.session.tasks       -- registered executors (EXPLORE/INVESTIGATE/RECOMMEND/C
 cgx.session.repair      -- deterministic, LLM-free classifier / locator / proposer for the REPAIR executor
 cgx.sessions            -- append-only JSONL conversation store (Ask tab history)
 cgx.telemetry           -- opt-in anonymous startup ping
-cgx.logging_setup       -- shared setup_logging() invoked once from launch.py
+cgx.logging_setup       -- shared setup_logging() invoked once from cgx.webui.launch
 cgx.webui.task_store    -- SQLite task registry + threading.Event cancel tokens
 cgx.webui.routes.tasks  -- REST API for task list / get / event-replay / cancel
 cgx.webui.routes.rollback -- POST /api/rollback restores from an apply backup dir
@@ -80,8 +96,8 @@ cgx.cli / cgx.webui     -- terminal + FastAPI/React surfaces (uvicorn on :8765)
    re-parsed. A hierarchical repo map (`cgx.answer.repo_map`) is also
    emitted and cached (`repo_map.json`) for cheap whole-repo planning
    context.
-2. `build_knowledge_graph` derives a NetworkX graph with `calls`, `module`,
-   `attr` and `defined_in` edges.
+2. `build_knowledge_graph` derives a NetworkX graph with `defines`, `calls`,
+   `uses_module`, `reads_attr` / `writes_attr`, and `raises` edges.
 3. `make_index_records` materialises chunk records, then
    `prepare_embedding_corpus` builds two views:
    - **intent** -- NL-friendly summary (docstrings, names).
@@ -441,7 +457,9 @@ deterministic auto-detector; callers can override it explicitly via
 the `POST /api/agent-session` body.
 
 * **`explore`** -- the project root exists, is non-empty, and has a
-  usable FAISS index under `<root>/cgx_index/meta.json`. The session
+  usable FAISS index (a `meta.json` under the index dir plus a
+  non-empty `records.jsonl`; default layout
+  `<project_root>/.cgx/index/indices/meta.json`). The session
   seeds `EXPLORE` and walks the retrieval-grounded loop below.
 * **`greenfield`** -- the project root is missing, empty, or has no
   index. The session seeds `CLARIFY_REQUIREMENTS` and walks the
@@ -1198,15 +1216,18 @@ session-shaped persistence layout:
 ### HTTP surface (`cgx.webui.routes.agent_session`)
 </summary>
 
-JSON-only, mounted at `/api/agent-session`.
+Mounted at `/api/agent-session` -- seven JSON endpoints plus one SSE
+stream.
 
 | Method | Path                                  | Purpose |
 |--------|---------------------------------------|---------|
 | `POST` | `/api/agent-session`                  | Create a session, seed the root task (`EXPLORE` in explore mode, `CLARIFY_REQUIREMENTS` in greenfield mode), optionally drain READY tasks. Accepts an optional `mode: "explore" | "greenfield"`; falls back to `cgx.session.mode.detect_mode` when absent. Returns the full snapshot. |
 | `GET`  | `/api/agent-session?project_root=...` | List sessions for a project. |
 | `GET`  | `/api/agent-session/{sid}`            | Full state snapshot (`session + tasks + artifacts + facts + decisions`). |
+| `GET`  | `/api/agent-session/{sid}/events`     | **SSE** stream of live session events off the process-wide `EventBus`; a `snapshot` frame first, then one named frame per store write, with 15 s `ping` keep-alives. |
 | `POST` | `/api/agent-session/{sid}/message`    | Post a follow-up message. Spawns a sibling `EXPLORE` when no `ASK_USER` is open. |
 | `POST` | `/api/agent-session/{sid}/decision`   | Resolve a pending `ASK_USER` with a typed `{task_id, chosen, rationale?}` payload. |
+| `POST` | `/api/agent-session/{sid}/cancel`     | Cooperative stop (**P2.2**): the running drain halts after the current task finishes (no mid-flight abort); a later message/decision re-drives from where it stopped. |
 | `DELETE` | `/api/agent-session/{sid}`          | Discard a session and its aggregate (tasks / facts / decisions / artifacts) via SQLite `ON DELETE CASCADE`. Returns `{deleted: sid}` or 404. |
 
 A per-`project_root` runner cache (`_RUNNERS` in the route module)
@@ -1217,8 +1238,10 @@ once the synchronous tasks finish or an `ASK_USER` pauses the loop.
 
 Every mutating endpoint returns `AgentSessionState`
 (`cgx.webui.models`) so the React UI can render the updated tree in
-one round-trip. There is no SSE on this surface today -- the UI
-polls while any task is `IN_PROGRESS` other than an `ASK_USER`.
+one round-trip. While a task is `IN_PROGRESS` (other than an
+`ASK_USER`) the UI follows progress over the `/{sid}/events` SSE feed
+and falls back to polling `GET /api/agent-session/{sid}` only when the
+stream is unhealthy.
 
 </details>
 <details>
@@ -1523,7 +1546,8 @@ keep their per-tenant budget across sessions.
 
 `cgx.answer.hardware_matrix` is a pure-data offline module:
 
-- `LOCAL_MODEL_CATALOG` -- 8 locally-runnable models with `name`,
+- `LOCAL_MODEL_CATALOG` -- 21 locally-runnable models across three
+  families (`coder`, `general`, `reasoning`), each with `name`,
   `params_b`, `min_ram_gb`, `recommended_vram_gb`, `ctx_window`,
   `family`, and a one-line `notes` blurb.
 - `compute_local_fit(hw)` -- annotates the catalogue with a verdict

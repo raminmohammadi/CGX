@@ -1,5 +1,17 @@
 # Usage
 
+CGX is driven from three surfaces that share one engine: a **terminal
+dashboard**, a set of scriptable **CLI subcommands**, and a **Python API**.
+This guide walks each capability in order -- install, provider, index, ask,
+plan, and the session-based agent -- one numbered section at a time.
+
+**Jump to:** [Install](#0-install) · [Terminal dashboard](#the-terminal-dashboard)
+· [CLI](#the-cli-non-interactive-subcommands) · [Pick a provider](#1-pick-a-provider)
+· [Index](#2-index-a-project) · [Ask](#3-ask-a-question) · [Plan](#4-generate-a-change-plan)
+· [Tune retrieval](#5-tune-retrieval-optional) · [Agent](#6-session-based-agent-agent)
+· [Chat sessions](#8-persistent-chat-sessions-ask-tab-sidebar)
+· [Hardware](#9-hardware-aware-model-picker-hardware-tab) · [Safety defaults](#15-safety-defaults)
+
 <details>
 <summary>
 
@@ -250,10 +262,15 @@ non-interactive form of the dashboard's `/status` command.
 ## 1. Pick a provider
 </summary>
 
-CGX supports four provider kinds, all configurable from the **⚙️ Setup**
-tab's **Provider Type** dropdown. A **Ping** button appears on both the
-inline config card and the profile edit form -- it performs a live
-connection test and reports latency or the exact error message.
+CGX supports four provider types, each selectable from the **⚙️ Setup**
+tab's **Provider Type** dropdown. (The non-interactive CLI's
+`--provider` flag exposes them as the five kind strings listed in the
+[shared-flags table](#shared-provider--index-flags) above -- `ollama`,
+`openai`, `openai-compat`, `gemini`, `custom` -- since a bare OpenAI-
+compatible endpoint and a fully custom server are distinct kinds under
+the hood.) A **Ping** button appears on both the inline config card and
+the profile edit form -- it performs a live connection test and reports
+latency or the exact error message.
 
 <details>
 <summary>
@@ -1093,17 +1110,20 @@ clear error so the UI can surface the failure without re-posting.
 ### HTTP surface
 </summary>
 
-JSON-only, no SSE in the current release -- the UI polls
-`GET /api/agent-session/{sid}` while any task is `in_progress` other
-than an `ASK_USER`:
+Seven JSON endpoints plus a `GET /{sid}/events` SSE stream. While a
+task is `in_progress` (other than an `ASK_USER`) the UI follows
+progress over the SSE feed and falls back to polling
+`GET /api/agent-session/{sid}` only when the stream is unhealthy:
 
 | Method | Path                                  | Body / params |
 |--------|---------------------------------------|---------------|
 | `POST` | `/api/agent-session`                  | `{objective, project_root?, title?, mode?, provider, index, run_initial_task?}` -- creates a session, seeds the root task (`EXPLORE` in explore mode, `CLARIFY_REQUIREMENTS` in greenfield mode; `mode` defaults to `detect_mode(project_root)` when absent), drains READY tasks until something pauses. |
 | `GET`  | `/api/agent-session?project_root=...` | List sessions for the project. |
 | `GET`  | `/api/agent-session/{sid}`            | Full snapshot: `{session, tasks, artifacts, facts, decisions}`. |
+| `GET`  | `/api/agent-session/{sid}/events`     | **SSE** stream of live session events (a `snapshot` frame first, then one frame per store write, 15 s `ping` keep-alives). Subscribe with an `EventSource`. |
 | `POST` | `/api/agent-session/{sid}/message`    | `{message, provider, index, run_initial_task?}` -- post a follow-up; spawns a sibling `EXPLORE` when no `ASK_USER` is open. |
 | `POST` | `/api/agent-session/{sid}/decision`   | `{task_id, chosen, rationale?, provider, index, run_initial_task?}` -- resolve a pending `ASK_USER`. |
+| `POST` | `/api/agent-session/{sid}/cancel`     | Cooperative stop -- the running drain halts after the current task finishes; a later message/decision re-drives from where it stopped. |
 | `DELETE` | `/api/agent-session/{sid}?project_root=...` | Discard the session and its tasks / facts / decisions / artifacts (SQLite `ON DELETE CASCADE`). Returns `{deleted: sid}` or 404. |
 
 Every mutating endpoint except `DELETE` returns the full
@@ -1489,7 +1509,8 @@ vsce package        # → cgx-0.0.1.vsix
 </summary>
 
 All operations emit structured log lines to stdout from the moment the
-server starts. `setup_logging(INFO)` is called once in `launch.py` and
+server starts. `setup_logging(level="INFO")` is called once in
+`cgx.webui.launch` (the `cgx-ui` / `python app.py` entry point) and
 configures the root logger with a timestamped, module-prefixed formatter.
 
 What each module logs:
@@ -1521,7 +1542,7 @@ modules.
 When a session fails in a non-obvious place -- a REPAIR loop looping,
 an LLM call returning nothing, a codegen apply that silently no-ops --
 flip the **Function-call tracing** toggle on the `/settings` page (or
-export `CGX_TRACE=1` before launching `cgx web`) and rerun the failing
+export `CGX_TRACE=1` before launching `cgx serve`) and rerun the failing
 step. While the toggle is on, an amber `TRACE` pill appears in the
 header and every curated entry point on the agent loop -- router,
 runner, executor, repair (`classify` / `locate` / `propose`), LLM
