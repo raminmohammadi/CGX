@@ -21,10 +21,35 @@ export default function TraceSection({ refreshKey }: SectionProps) {
   const [source, setSource] = useState(""); // "" = global fallback log
   const [hideHttp, setHideHttp] = useState(true);
   const [sel, setSel] = useState<AdminLogEntry | null>(null);
+  const [nonce, setNonce] = useState(0);
+  const [busy, setBusy] = useState(false);
+  const [delErr, setDelErr] = useState<string | null>(null);
   const { data, error } = useAsync(
     () => api.adminLogs({ event: event || undefined, limit: 500, project_root: source || undefined }),
-    [refreshKey, event, source],
+    [refreshKey, event, source, nonce],
   );
+
+  // Delete trace logs only (global fallback or a project agent.log). The
+  // backend hard-limits deletion to known log filenames -- never other files.
+  async function del(all: boolean) {
+    const what = all
+      ? "ALL trace logs (global + every known project)"
+      : source
+        ? `traces for ${shortRoot(source)}`
+        : "the global (HTTP · CLI) trace log";
+    if (!window.confirm(`Delete ${what}? Only trace/log files are removed. This cannot be undone.`)) return;
+    setBusy(true);
+    setDelErr(null);
+    try {
+      await api.deleteLogs(all ? { all: true } : { project_root: source || undefined });
+      setSel(null);
+      setNonce((n) => n + 1);
+    } catch (e: any) {
+      setDelErr(String(e?.message || e));
+    } finally {
+      setBusy(false);
+    }
+  }
   // Project roots seen in recent activity runs -> selectable trace sources.
   const { data: runsData } = useAsync(() => api.activityRuns({ limit: 300 }), [refreshKey]);
   const roots = useMemo(() => {
@@ -85,9 +110,26 @@ export default function TraceSection({ refreshKey }: SectionProps) {
               >
                 {hideHttp ? "HTTP hidden" : "HTTP shown"}
               </button>
+              <button
+                onClick={() => del(false)}
+                disabled={busy}
+                className="av-btn-ghost whitespace-nowrap text-red-400 disabled:opacity-40"
+                title={source ? "Delete this project's agent.log" : "Delete the global fallback trace log"}
+              >
+                Delete
+              </button>
+              <button
+                onClick={() => del(true)}
+                disabled={busy}
+                className="av-btn-ghost whitespace-nowrap text-red-400 disabled:opacity-40"
+                title="Delete every trace log (global + all known projects)"
+              >
+                Delete all
+              </button>
             </div>
           }
         />
+        <ErrorLine error={delErr} />
         {logs.length > 0 && (
           <div className="flex flex-wrap items-center gap-1.5 mb-3">
             <Chip label="all" count={logs.length} active={cat === "all"} onClick={() => setCat("all")} />

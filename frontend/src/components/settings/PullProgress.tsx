@@ -8,6 +8,8 @@ export type PullProgressState = {
   completed: number;
   done: boolean;
   error: string | null;
+  // Optional clean local name the model was re-aliased to after download.
+  renamedTo?: string | null;
 };
 
 export function PullProgress({ pull, model }: { pull: PullProgressState | null; model: string }) {
@@ -35,7 +37,9 @@ export function PullProgress({ pull, model }: { pull: PullProgressState | null; 
         {pull.error
           ? pull.error.slice(0, 80)
           : pull.done
-          ? "Download complete"
+          ? pull.renamedTo
+            ? `Download complete -- saved as ${pull.renamedTo}`
+            : "Download complete"
           : pct !== null
           ? `${pull.status} -- ${pct}%`
           : pull.status}

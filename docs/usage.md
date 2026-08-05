@@ -338,7 +338,19 @@ actual inference call.
 The **Settings → Browse Hugging Face** panel additionally lists GGUF
 repositories from the Hub with live search and sort, and **Pull** hands
 the `hf.co/<repo>[:<quant>]` tag to your local Ollama daemon -- no HF
-token required, since the download goes through Ollama.
+token required, since the download goes through Ollama. After the pull,
+the model is re-aliased to a clean local name (e.g.
+`hf.co/ornith-ai/Ornith-1.0-9B-GGUF` -> `Ornith-1.0-9B-GGUF`) instead of
+being stored under the full web address. The panel sends this via the
+optional `local_name` on `POST /api/ollama/pull`, and the backend applies
+it with Ollama's `POST /api/copy` + `DELETE /api/delete` (instant, no
+re-download); the final name is reported back over the progress stream. After the pull,
+the model is re-aliased to a clean local name (e.g.
+`hf.co/ornith-ai/Ornith-1.0-9B-GGUF` -> `Ornith-1.0-9B-GGUF`) instead of
+being stored under the full web address. The panel sends this via the
+optional `local_name` on `POST /api/ollama/pull`, and the backend applies
+it with Ollama's `POST /api/copy` + `DELETE /api/delete` (instant, no
+re-download); the final name is reported back over the progress stream.
 
 </details>
 <details>

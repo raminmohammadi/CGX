@@ -190,6 +190,42 @@ def fallback_trace_log_path() -> Path:
     return _FALLBACK_DIR / _FALLBACK_FILE
 
 
+def delete_fallback_trace_log() -> int:
+    """Delete the global fallback trace log (and its rotation backups).
+
+    Closes the live rotating handler first so the file descriptor is
+    released before unlink (mandatory on Windows, tidy everywhere). The
+    logger is reset so the next emit re-opens a fresh file. Returns the
+    number of files removed. Safe to call when nothing has been written.
+    """
+    global _fallback_logger
+    if _fallback_logger is not None:
+        for h in list(_fallback_logger.handlers):
+            try:
+                h.close()
+            except Exception:  # pragma: no cover - defensive
+                pass
+            _fallback_logger.removeHandler(h)
+        _fallback_logger = None
+    removed = 0
+    base = _FALLBACK_DIR / _FALLBACK_FILE
+    # The base file plus RotatingFileHandler backups (``.log.1`` ... ``.log.N``).
+    candidates = [base] + [
+        base.with_name(f"{_FALLBACK_FILE}.{i}")
+        for i in range(1, _FALLBACK_BACKUPS + 1)
+    ]
+    for p in candidates:
+        try:
+            p.unlink()
+            removed += 1
+        except FileNotFoundError:
+            continue
+        except Exception as e:  # pragma: no cover - defensive
+            logging.getLogger(__name__).warning(
+                "delete_fallback_trace_log: %s (%s)", p, e)
+    return removed
+
+
 class _JsonlFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         payload = getattr(record, "trace_event", None) or {"event": record.msg}

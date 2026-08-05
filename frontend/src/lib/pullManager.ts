@@ -14,6 +14,9 @@ export interface PullState {
   completed: number;
   done: boolean;
   error: string | null;
+  // Clean local name the model was re-aliased to (set once the backend
+  // reports a successful /api/copy of an ``hf.co/<repo>`` pull).
+  renamedTo: string | null;
 }
 
 type Listener = (state: PullState | null) => void;
@@ -42,6 +45,7 @@ export function startPull(
   model: string,
   base_url: string,
   onRefreshInstalled?: () => void,
+  local_name?: string,
 ) {
   _conn?.abort();
   _state = {
@@ -52,6 +56,7 @@ export function startPull(
     completed: 0,
     done: false,
     error: null,
+    renamedTo: null,
   };
   _notify();
 
@@ -77,6 +82,7 @@ export function startPull(
         completed: data.completed ?? _state.completed,
         done: data.status === "success" || errMsg != null,
         error: errMsg ?? _state.error,
+        renamedTo: data.renamed_to ?? _state.renamedTo,
       };
       _notify();
     },
@@ -105,6 +111,7 @@ export function startPull(
         _notify();
       }
     },
+    local_name,
   );
 }
 

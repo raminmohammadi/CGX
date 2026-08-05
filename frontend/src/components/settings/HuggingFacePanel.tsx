@@ -1,6 +1,18 @@
 import { useEffect, useState } from "react";
-import { Download, Heart, Loader2, RefreshCw, Search, X } from "lucide-react";
-import { api, type HfHubModel } from "../../lib/api";
+import {
+  AlertTriangle,
+  CheckCircle,
+  Cpu,
+  Download,
+  Gauge,
+  Heart,
+  Loader2,
+  RefreshCw,
+  Search,
+  X,
+  XCircle,
+} from "lucide-react";
+import { api, type HfHubModel, type HfModelFit } from "../../lib/api";
 import { cancelPull, startPull, usePullState } from "../../lib/pullManager";
 import { Card, CardHeader } from "../Card";
 import { Pill } from "../Pill";
@@ -24,6 +36,19 @@ function compact(n: number): string {
   return String(n);
 }
 
+// Derive a short, human-friendly Ollama tag from a Hub repo id so the pulled
+// model shows up as e.g. ``ornith-1.0-9b-gguf`` instead of the full
+// ``hf.co/ornith-ai/Ornith-1.0-9B-GGUF`` web address. The quant, when chosen,
+// becomes the tag (``…:q4_k_m``).
+function localName(repoId: string, quant?: string): string {
+  const base = (repoId.split("/").pop() || repoId)
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, "-")
+    .replace(/^[-.]+|[-.]+$/g, "");
+  const tag = quant ? quant.toLowerCase().replace(/[^a-z0-9._-]+/g, "-") : "";
+  return tag ? `${base}:${tag}` : base;
+}
+
 export function HuggingFacePanel() {
   const [search, setSearch] = useState("");
   const [sort, setSort] = useState("trending_score");
@@ -31,7 +56,22 @@ export function HuggingFacePanel() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [quant, setQuant] = useState<Record<string, string>>({});
+  // Per-repo "Check fit" state: the resolved spec + verdict, an in-flight
+  // flag, and any error, all keyed by the Hub repo id.
+  const [fit, setFit] = useState<Record<string, HfModelFit>>({});
+  const [fitLoading, setFitLoading] = useState<Record<string, boolean>>({});
+  const [fitError, setFitError] = useState<Record<string, string>>({});
   const activePull = usePullState();
+
+  const checkFit = (repo: string) => {
+    setFitLoading((s) => ({ ...s, [repo]: true }));
+    setFitError((s) => ({ ...s, [repo]: "" }));
+    api
+      .hfFit(repo)
+      .then((r) => setFit((s) => ({ ...s, [repo]: r })))
+      .catch((e: any) => setFitError((s) => ({ ...s, [repo]: String(e?.message || e) })))
+      .finally(() => setFitLoading((s) => ({ ...s, [repo]: false })));
+  };
 
   const load = () => {
     setLoading(true);
@@ -52,7 +92,9 @@ export function HuggingFacePanel() {
   const pull = (m: HfHubModel) => {
     const q = quant[m.id];
     const tag = q ? `${m.pull_tag}:${q}` : m.pull_tag;
-    startPull(tag, OLLAMA_BASE_URL);
+    // Re-alias to a clean local name so the model isn't stored under the full
+    // hf.co/<repo> web address.
+    startPull(tag, OLLAMA_BASE_URL, undefined, localName(m.id, q));
   };
 
   return (

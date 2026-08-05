@@ -106,6 +106,50 @@ def test_admin_logs_missing_file_is_empty(tmp_path):
 
 
 # --------------------------------------------------------------------------
+# DELETE /api/admin/logs: purges a project's agent.log (+ backups), only
+# --------------------------------------------------------------------------
+def test_admin_delete_logs_project(tmp_path):
+    from urllib.parse import quote
+
+    from cgx.webui.server import create_app
+
+    log_dir = tmp_path / ".cgx"
+    log_dir.mkdir(parents=True)
+    log = log_dir / "agent.log"
+    log.write_text("{}\n", encoding="utf-8")
+    (log_dir / "agent.log.1").write_text("{}\n", encoding="utf-8")
+    app = create_app()
+
+    q = quote(str(tmp_path))
+    r = asyncio.run(_asgi(app, "DELETE", f"/api/admin/logs?project_root={q}"))
+    body = json.loads(r["body"])
+    assert r["status"] == 200 and body["deleted"] == 2
+    assert not log.exists() and not (log_dir / "agent.log.1").exists()
+
+
+def test_admin_delete_logs_refuses_symlink_and_other_files(tmp_path):
+    """A planted symlink or a non-log filename must never be unlinked."""
+    from urllib.parse import quote
+
+    from cgx.webui.server import create_app
+
+    secret = tmp_path / "secret.txt"
+    secret.write_text("keep me", encoding="utf-8")
+    log_dir = tmp_path / "proj" / ".cgx"
+    log_dir.mkdir(parents=True)
+    # Hostile: agent.log is a symlink pointing at an unrelated file.
+    (log_dir / "agent.log").symlink_to(secret)
+    app = create_app()
+
+    q = quote(str(tmp_path / "proj"))
+    r = asyncio.run(_asgi(app, "DELETE", f"/api/admin/logs?project_root={q}"))
+    body = json.loads(r["body"])
+    assert r["status"] == 200 and body["deleted"] == 0
+    # Neither the symlink target nor the symlink entry itself was removed.
+    assert secret.exists() and secret.read_text(encoding="utf-8") == "keep me"
+
+
+# --------------------------------------------------------------------------
 # /api/admin/metrics + /api/admin/overview
 # --------------------------------------------------------------------------
 def test_admin_metrics_and_overview_routes():

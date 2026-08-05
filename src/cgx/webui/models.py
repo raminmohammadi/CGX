@@ -66,6 +66,9 @@ class IndexBuildRequest(BaseModel):
 class AskRequest(BaseModel):
     question: str
     session_id: Optional[str] = None
+    # When set, this run's llm_call trace records route to the project-local
+    # <project_root>/.cgx/agent.log instead of the global fallback trace log.
+    project_root: Optional[str] = None
     index: IndexLocation = Field(default_factory=IndexLocation)
     provider: ProviderConfig = Field(default_factory=ProviderConfig)
 
@@ -310,6 +313,10 @@ class HardwareMatrixRow(BaseModel):
     fit: str
     reason: str
     notes: str
+    # True when the tag is currently installed in the local Ollama daemon
+    # (either a catalogue entry the user has pulled, or an installed-only
+    # model appended to the matrix so the table reflects what's on disk).
+    installed: bool = False
 
 
 class TradeoffRow(BaseModel):
@@ -323,3 +330,20 @@ class HardwareMatrixResponse(BaseModel):
     hardware: HardwareInfo
     rows: List[HardwareMatrixRow]
     tradeoffs: List[TradeoffRow]
+
+
+class HfModelFitResponse(BaseModel):
+    """Spec + hardware verdict for a single Hugging Face repo (fit check)."""
+    repo: str
+    params_b: float = 0.0
+    # How ``params_b`` was determined: "safetensors" (exact from the Hub),
+    # "name" (parsed from the repo id), or "unknown".
+    params_source: str = "unknown"
+    min_ram_gb: float = 0.0
+    rec_vram_gb: float = 0.0
+    ctx_window: int = 0
+    fit: str = "unknown"
+    reason: str = ""
+    pipeline_tag: Optional[str] = None
+    gated: bool = False
+    hardware: HardwareInfo = Field(default_factory=HardwareInfo)

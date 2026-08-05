@@ -157,6 +157,30 @@ def _resolve_provider(
     return govern(prov)
 
 
+def _traced_provider(prov: Any, run_id: str) -> Any:
+    """Wrap an ask/plan provider so its LLM calls emit rich trace records.
+
+    Mirrors the agent loop's instrumentation: the session runner wraps its
+    provider with :class:`TracingProvider` to emit an ``llm_call`` trace
+    record (full redacted prompt + response) plus the always-on LLM RED
+    metrics for every chat call. The web-UI ask/plan paths have no session
+    store to persist the resulting Facts, so we bind a synthetic pair keyed
+    on ``run_id`` and never drain -- the accumulated Facts are discarded
+    when the request generator finishes; only the trace + metrics side
+    effects are wanted. Routing (project ``agent.log`` vs the global
+    fallback) is decided by the ``project_root`` on the trace context, which
+    the caller sets alongside ``run_id``.
+    """
+    try:
+        from cgx.session.llm_trace import TracingProvider
+        traced = TracingProvider(prov)
+        traced.bind(run_id, run_id)
+        return traced
+    except Exception:  # pragma: no cover - tracing must never break a request
+        logger.warning("stream: tracing shim unavailable; continuing untraced")
+        return prov
+
+
 def stream_index(
     *, project_root: Optional[str], out_dir: str, embed_model: str,
     metric: str, index_type: str, zip_path: Optional[str],
@@ -215,6 +239,7 @@ def stream_ask(
     num_ctx: Optional[int] = None,
     endpoint_path: str = "/v1/chat/completions", allow_no_auth: bool = False,
     think: bool = False,
+    project_root: Optional[str] = None,
     cancel_event=None,
 ) -> Iterator[Event]:
     """Stream thoughts then the grounded answer with sources + meta."""
@@ -222,9 +247,11 @@ def stream_ask(
     # Provenance join key for this execution: stamped into the returned meta
     # (so the client can attach feedback to it) and onto the trace context
     # (so llm_trace stamps the same run_id onto every LLM_CALL of this run).
+    # ``project_root`` routes this run's llm_call trace records to the
+    # project-local agent.log instead of the global fallback (when set).
     run_id = new_run_id()
     t0 = time.perf_counter()
-    set_trace_context(run_id=run_id)
+    set_trace_context(run_id=run_id, project_root=(project_root or None))
     try:
         prov = _resolve_provider(
             use_profile=use_profile, profile_name=profile_name, kind=kind,
@@ -236,6 +263,7 @@ def stream_ask(
         logger.error("stream_ask: provider init failed: %s", e)
         yield "error", {"message": f"{type(e).__name__}: {e}"}
         return
+    prov = _traced_provider(prov, run_id)
 
     if cancel_event and cancel_event.is_set():
         yield "cancelled", {"message": "Cancelled"}
@@ -390,7 +418,7 @@ def stream_plan(
     logger.info("stream_plan: task=%r self_test=%s model=%s", task[:80], self_test, model)
     run_id = new_run_id()
     t0 = time.perf_counter()
-    set_trace_context(run_id=run_id)
+    set_trace_context(run_id=run_id, project_root=(project_root or None))
     try:
         prov = _resolve_provider(
             use_profile=use_profile, profile_name=profile_name, kind=kind,
@@ -402,6 +430,7 @@ def stream_plan(
         logger.error("stream_plan: provider init failed: %s", e)
         yield "error", {"message": f"{type(e).__name__}: {e}"}
         return
+    prov = _traced_provider(prov, run_id)
 
     if cancel_event and cancel_event.is_set():
         yield "cancelled", {"message": "Cancelled"}

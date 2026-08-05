@@ -12,6 +12,7 @@ from cgx.webui.routes.setup import (
     _GEMINI_FALLBACK,
     _HF_FALLBACK,
     _OPENAI_FALLBACK,
+    _sanitize_local_name,
     cloud_models,
     hf_models,
 )
@@ -210,12 +211,27 @@ def test_hf_models_uses_fixed_host_and_sanitizes_sort():
 
     with patch("requests.get", side_effect=fake_get):
         hf_models(search="x", sort="../etc/passwd", limit=9999)
-    # Host is the fixed Hub constant; an out-of-allowlist sort is coerced and
-    # the limit is clamped, so no attacker value reaches the outbound request.
+    # Host is the fixed Hub constant; an out-of-allowlist sort is coerced to the
+    # Hub's camelCase default and the limit is clamped, so no attacker value
+    # reaches the outbound request.
     assert captured["url"] == "https://huggingface.co/api/models"
-    assert captured["params"]["sort"] == "trending_score"
+    assert captured["params"]["sort"] == "trendingScore"
     assert captured["params"]["limit"] == 100
     assert captured["params"]["filter"] == "gguf"
+
+
+def test_hf_models_translates_trending_sort_to_camelcase():
+    captured: Dict[str, Any] = {}
+
+    def fake_get(url, *_args, **kwargs):
+        captured["params"] = kwargs.get("params") or {}
+        return _FakeResp(_hf_hub_payload())
+
+    # The Hub rejects snake_case ``trending_score`` with HTTP 400; the friendly
+    # key the UI sends must be translated to the camelCase the Hub expects.
+    with patch("requests.get", side_effect=fake_get):
+        hf_models(search="", sort="trending_score", limit=40)
+    assert captured["params"]["sort"] == "trendingScore"
 
 
 def test_hf_models_returns_empty_on_error():
@@ -223,3 +239,26 @@ def test_hf_models_returns_empty_on_error():
     with patch("requests.get", side_effect=_ConnErr("down")):
         r = hf_models()
     assert r.models == []
+
+
+# ------------------- local-name sanitisation (HF pull re-alias) -------------
+
+@pytest.mark.parametrize("raw,expected", [
+    # Bare name gets the implicit ``:latest`` tag.
+    ("Ornith-1.0-9B-GGUF", "Ornith-1.0-9B-GGUF:latest"),
+    # Explicit quant tag is preserved.
+    ("ornith-1.0-9b-gguf:q4_k_m", "ornith-1.0-9b-gguf:q4_k_m"),
+    # Empty / whitespace -> None (no rename requested).
+    ("", None),
+    ("   ", None),
+    # A registry-style ``namespace/repo`` is rejected: it must be a single
+    # bare model name, so it can't smuggle a host/namespace into /api/copy.
+    ("ornith-ai/Ornith-1.0-9B-GGUF", None),
+    # ``hf.co/...`` (contains '/') is likewise rejected.
+    ("hf.co/ornith-ai/Ornith-1.0-9B-GGUF", None),
+    # Odd characters are rejected rather than silently mangled.
+    ("bad name!", None),
+    ("../evil", None),
+])
+def test_sanitize_local_name(raw, expected):
+    assert _sanitize_local_name(raw) == expected

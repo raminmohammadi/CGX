@@ -465,6 +465,32 @@ def _pick_default(kind: str, choices: List[str]) -> str:
 class PullRequest(BaseModel):
     model: str
     base_url: str = "http://localhost:11434"
+    # Optional clean local name to give the model once pulled. When the source
+    # tag is an ``hf.co/<repo>`` one, Ollama otherwise keeps the full web
+    # address as the model name; supplying ``local_name`` re-aliases it to a
+    # short, human-friendly tag (via /api/copy + /api/delete of the source).
+    local_name: Optional[str] = None
+
+
+# A valid Ollama model tag is ``name[:tag]`` -- lowercase-ish path segment plus
+# an optional tag. We restrict a user-supplied ``local_name`` to that shape so
+# it can never smuggle a registry host/namespace (``a/b``) or odd characters
+# into the copy destination.
+_OLLAMA_NAME_RE = re.compile(r"[A-Za-z0-9]+(?:[._-][A-Za-z0-9]+)*")
+
+
+def _sanitize_local_name(raw: str) -> Optional[str]:
+    """Coerce ``raw`` into a safe ``name[:tag]`` Ollama model name or None."""
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    name, _, tag = raw.partition(":")
+    if not _OLLAMA_NAME_RE.fullmatch(name):
+        return None
+    tag = tag or "latest"
+    if not _OLLAMA_NAME_RE.fullmatch(tag):
+        return None
+    return f"{name}:{tag}"
 
 
 @router.post("/ollama/pull")
@@ -566,6 +592,31 @@ async def ollama_pull(req: PullRequest) -> EventSourceResponse:
                 logger.warning("ollama_pull: finished model=%r lines=%d "
                                "result=incomplete (no success/error event)",
                                req.model, line_count)
+            # On a clean pull, optionally re-alias the model to a short local
+            # name so it no longer shows up as the full ``hf.co/<repo>`` web
+            # address. Best-effort: any failure here leaves the original tag in
+            # place and never turns a successful download into a UI error.
+            dest = _sanitize_local_name(req.local_name or "")
+            if saw_success and not saw_error and dest and dest != req.model:
+                try:
+                    cr = _req.post(f"{base}/api/copy",
+                                   json={"source": req.model, "destination": dest},
+                                   timeout=60)
+                    if cr.status_code < 400:
+                        _req.delete(f"{base}/api/delete",
+                                    json={"model": req.model}, timeout=60)
+                        logger.info("ollama_pull: re-aliased %r -> %r",
+                                    req.model, dest)
+                        note = _json.dumps({"status": "success",
+                                            "renamed_to": dest}).encode()
+                        loop.call_soon_threadsafe(queue.put_nowait, note)
+                    else:
+                        logger.warning("ollama_pull: copy to %r returned HTTP %s"
+                                       " -- keeping original tag",
+                                       dest, cr.status_code)
+                except Exception:
+                    logger.warning("ollama_pull: re-alias to %r failed -- "
+                                   "keeping original tag", dest, exc_info=True)
             loop.call_soon_threadsafe(queue.put_nowait, _SENTINEL)
 
     threading.Thread(target=_worker, daemon=True, name="ollama-pull").start()
@@ -645,9 +696,19 @@ def cloud_models(req: CloudModelsRequest) -> ModelChoicesResponse:
 
 # --------------------- Hugging Face Hub browse (Part B) ---------------------
 
-# Sort keys the Hub /api/models endpoint understands. We map to this allowlist
-# so an arbitrary ``sort`` query value can never be forwarded verbatim.
-_HF_HUB_SORTS = {"trending_score", "downloads", "likes", "lastModified", "createdAt"}
+# Accepted (friendly) sort keys -> the exact value the Hub /api/models endpoint
+# expects. The Hub uses camelCase ``trendingScore`` and rejects anything else
+# with HTTP 400, so we translate rather than forward the query value verbatim
+# (this doubles as the SSRF/abuse allowlist). ``trendingScore`` is also accepted
+# as an alias so either spelling from a client resolves correctly.
+_HF_HUB_SORTS = {
+    "trending_score": "trendingScore",
+    "trendingScore": "trendingScore",
+    "downloads": "downloads",
+    "likes": "likes",
+    "lastModified": "lastModified",
+    "createdAt": "createdAt",
+}
 # Quantization labels embedded in GGUF filenames (e.g. ``...-Q4_K_M.gguf``).
 # Used to surface per-quant pull tags (``hf.co/<repo>:Q4_K_M``) for Ollama.
 _HF_QUANT_RE = re.compile(r"(?i)(Q\d[0-9A-Z_]*|IQ\d[0-9A-Z_]*|BF16|F16|F32)")
@@ -679,7 +740,7 @@ def _hf_hub_gguf_list(search: str, sort: str, limit: int) -> List[HfHubModel]:
     """
     import requests as _req
 
-    sort_key = sort if sort in _HF_HUB_SORTS else "trending_score"
+    sort_key = _HF_HUB_SORTS.get(sort, "trendingScore")
     n = max(1, min(int(limit or 30), 100))
     params = {"filter": "gguf", "sort": sort_key, "limit": n, "full": "true"}
     if search.strip():

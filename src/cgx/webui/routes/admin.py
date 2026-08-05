@@ -23,7 +23,8 @@ from fastapi.responses import JSONResponse
 
 from cgx import metrics as _metrics
 from cgx.redact import redact_mapping
-from cgx.trace import fallback_trace_log_path
+from cgx.session.agent_log import delete_project_trace_log
+from cgx.trace import delete_fallback_trace_log, fallback_trace_log_path
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["admin"])
@@ -84,6 +85,65 @@ def admin_logs(
     path = _log_path(project_root)
     rows = _read_jsonl(path, limit=limit, event=event, since=since)
     return JSONResponse({"source": str(path), "logs": rows, "count": len(rows)})
+
+
+def _known_project_roots() -> List[str]:
+    """Distinct project roots seen in the activity store (trusted internal).
+
+    Used only by the ``scope=all`` sweep; the request never supplies the
+    root set, so an attacker cannot inject arbitrary paths to delete.
+    """
+    roots: List[str] = []
+    try:
+        from cgx.activity import get_default_run_store
+        seen = set()
+        for run in get_default_run_store().recent(limit=500):
+            root = run.get("project_root")
+            if root and root not in seen:
+                seen.add(root)
+                roots.append(root)
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning("admin delete: project-root enumeration failed: %s", e)
+    return roots
+
+
+@router.delete("/admin/logs")
+def delete_logs(
+    project_root: Optional[str] = Query(None),
+    scope: Optional[str] = Query(None),
+) -> JSONResponse:
+    """Delete trace/log files only -- never any other file on the machine.
+
+    Three modes, in precedence order:
+
+    * ``scope=all`` -- purge the global fallback log plus every project
+      ``agent.log`` known to the activity store.
+    * ``project_root=<path>`` -- purge just that project's ``agent.log``.
+    * neither -- purge just the global fallback log.
+
+    Deletion is delegated to helpers that only ever unlink files literally
+    named ``cgx-trace.log`` / ``agent.log`` (plus rotation backups), refuse
+    symlinks, and require a regular file -- so a caller-supplied
+    ``project_root`` cannot be leveraged to remove anything else.
+    """
+    removed = 0
+    targets: List[str] = []
+    if scope == "all":
+        removed += delete_fallback_trace_log()
+        targets.append("fallback")
+        for root in _known_project_roots():
+            n = delete_project_trace_log(root)
+            if n:
+                removed += n
+                targets.append(root)
+    elif project_root:
+        removed += delete_project_trace_log(project_root)
+        targets.append(project_root)
+    else:
+        removed += delete_fallback_trace_log()
+        targets.append("fallback")
+    return JSONResponse({"deleted": removed, "scope": scope or "single",
+                         "targets": targets})
 
 
 @router.get("/admin/metrics")

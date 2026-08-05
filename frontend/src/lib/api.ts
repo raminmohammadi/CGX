@@ -134,6 +134,23 @@ export type HardwareMatrixRow = {
   fit: "fits" | "tight" | "won't fit" | string;
   reason: string;
   notes: string;
+  // True when the tag is currently pulled into the local Ollama daemon.
+  installed?: boolean;
+};
+
+// Spec + hardware verdict for a single Hugging Face repo (fit check).
+export type HfModelFit = {
+  repo: string;
+  params_b: number;
+  params_source: "safetensors" | "name" | "unknown" | string;
+  min_ram_gb: number;
+  rec_vram_gb: number;
+  ctx_window: number;
+  fit: "fits" | "tight" | "won't fit" | "unknown" | string;
+  reason: string;
+  pipeline_tag?: string | null;
+  gated: boolean;
+  hardware: HardwareInfo;
 };
 
 export type TradeoffRow = {
@@ -529,12 +546,13 @@ export const api = {
   ollamaPull: (
     model: string,
     base_url: string,
-    onProgress: (data: { status?: string; total?: number; completed?: number; error?: string }) => void,
+    onProgress: (data: { status?: string; total?: number; completed?: number; error?: string; renamed_to?: string }) => void,
     onDone: () => void,
     onError?: (err: unknown) => void,
+    local_name?: string,
   ) => streamSSE(
     "/api/ollama/pull",
-    { model, base_url },
+    local_name ? { model, base_url, local_name } : { model, base_url },
     (event, data) => {
       if (event === "progress") onProgress(data);
       else if (event === "done") onDone();
@@ -577,7 +595,12 @@ export const api = {
       `/api/setup/hf_models${qs ? `?${qs}` : ""}`,
     );
   },
-  hardwareMatrix: () => jsonReq<HardwareMatrixResponse>("/api/hardware/matrix"),
+  hardwareMatrix: (base_url?: string) =>
+    jsonReq<HardwareMatrixResponse>(
+      `/api/hardware/matrix${base_url ? `?base_url=${encodeURIComponent(base_url)}` : ""}`,
+    ),
+  hfFit: (repo: string) =>
+    jsonReq<HfModelFit>(`/api/hardware/hf_fit?repo=${encodeURIComponent(repo)}`),
   detectHardware: () => jsonReq<HardwareInfo>("/api/setup/hardware"),
 
   listSessions: () => jsonReq<SessionSummary[]>("/api/sessions"),
@@ -747,6 +770,16 @@ export const api = {
     const qs = q.toString();
     return jsonReq<{ source: string; logs: AdminLogEntry[]; count: number }>(
       `/api/admin/logs${qs ? `?${qs}` : ""}`,
+    );
+  },
+  deleteLogs: (params?: { project_root?: string; all?: boolean }) => {
+    const q = new URLSearchParams();
+    if (params?.all) q.set("scope", "all");
+    else if (params?.project_root) q.set("project_root", params.project_root);
+    const qs = q.toString();
+    return jsonReq<{ deleted: number; scope: string; targets: string[] }>(
+      `/api/admin/logs${qs ? `?${qs}` : ""}`,
+      "DELETE",
     );
   },
 

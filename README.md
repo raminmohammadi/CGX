@@ -287,7 +287,9 @@ Tabs (left → right):
    latency check. Detect hardware (RAM + GPU VRAM) and tune sampling
    parameters. Save named profiles; API keys are stored in your OS keyring.
    A **Browse Hugging Face** panel lists GGUF repositories from the Hub
-   and pulls them straight into your local Ollama daemon.
+   and pulls them straight into your local Ollama daemon, re-aliasing each
+   download to a clean local name (e.g. `Ornith-1.0-9B-GGUF`) instead of
+   the full `hf.co/<repo>` web address.
 2. **Index** -- point at a project root or upload a `.zip`. Honours
    `.gitignore` and a 1 MB file-size cap; emits `indices/`,
    `records.jsonl`, `chunks.jsonl`, `graph.json` and per-view

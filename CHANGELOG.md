@@ -22,6 +22,24 @@ Two additive, low-risk features that make CGX Hugging Face-friendly.
   hands the `hf.co/<repo>[:<quant>]` tag to the local Ollama daemon and
   streams progress through the shared `PullProgress` bar -- no HF token
   required. Outbound Hub/router hosts are added to the SSRF allowlist.
+* **Clean local names for pulled GGUFs.** A model pulled through the
+  Browse panel is no longer stored under its full `hf.co/<repo>` web
+  address. `/api/ollama/pull` (`PullRequest`) gains an optional
+  `local_name`; on a successful pull the backend re-aliases the model via
+  Ollama's `POST /api/copy` + `DELETE /api/delete` (instant, no
+  re-download) so `hf.co/ornith-ai/Ornith-1.0-9B-GGUF` lands as
+  `Ornith-1.0-9B-GGUF`, then emits a `renamed_to` progress event the UI
+  surfaces as "Download complete -- saved as <name>". `local_name` is
+  passed through `_sanitize_local_name`, which restricts it to a bare
+  `name[:tag]` (rejecting `/`, `..`, and stray characters) so it cannot
+  smuggle a registry host/namespace into the copy destination. The
+  re-alias is best-effort: any failure leaves the original tag in place
+  and never turns a good download into a UI error.
+* **Fixed: Browse panel empty on the default Trending sort.** The Hub
+  `/api/models` endpoint rejects snake_case `sort=trending_score` with
+  HTTP 400 -- it requires camelCase `trendingScore`. `_HF_HUB_SORTS` now
+  maps the friendly UI key to the exact value the Hub expects, so the
+  default sort returns results (other sorts were already correct).
 
 ## Unreleased -- Agent-loop hardening (import classification + polyglot provisioning)
 

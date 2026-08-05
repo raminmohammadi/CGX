@@ -80,6 +80,17 @@ local Ollama daemon via the existing `hf.co/<repo>[:<quant>]` mechanism
 and streams progress through the shared `PullProgress` bar — no HF token
 required, since the download goes through Ollama.
 
+Once the download completes, the model is **re-aliased to a clean local
+name** so it isn't stored under the full `hf.co/…` web address:
+`hf.co/ornith-ai/Ornith-1.0-9B-GGUF` becomes `Ornith-1.0-9B-GGUF` (with
+the chosen quant as the tag, e.g. `…:q4_k_m`). The panel derives this
+name from the repo id and passes it as the optional `local_name` on
+`POST /api/ollama/pull`; the backend then runs Ollama's `POST /api/copy`
+followed by `DELETE /api/delete` (instant — no re-download) and reports
+the final name back over the progress stream ("Download complete — saved
+as `<name>`"). The re-alias is best-effort: if it fails, the original tag
+is kept and the download is never reported as an error.
+
 ## Custom server (OpenAI-compatible)
 
 For a self-hosted model on a private subnet:

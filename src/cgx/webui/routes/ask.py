@@ -28,6 +28,7 @@ async def ask(req: AskRequest) -> EventSourceResponse:
         "question": req.question,
         "model": pcfg.model,
         "session_id": req.session_id,
+        "project_root": req.project_root,
     })
     cancel_event = task_store.get_cancel_event(task_id)
     logger.info("ask route: task_id=%s question=%r", task_id,
@@ -47,6 +48,7 @@ async def ask(req: AskRequest) -> EventSourceResponse:
             endpoint_path=getattr(pcfg, "endpoint_path", "/v1/chat/completions"),
             allow_no_auth=bool(getattr(pcfg, "allow_no_auth", False)),
             think=bool(getattr(pcfg, "think", False)),
+            project_root=req.project_root,
             cancel_event=cancel_event,
         ):
             if ev == "intent":
