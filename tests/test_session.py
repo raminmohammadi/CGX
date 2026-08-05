@@ -3926,9 +3926,14 @@ def test_decompose_executor_happy_path_emits_work_plan(
     assert result.failure is None
     assert result.artifact.kind is ArtifactKind.WORK_PLAN
     layers = result.artifact.content["layers"]
-    assert layers[0]["files"][0]["path"] == "app.py"
+    # _order_manifest_layers regroups files into strict pipeline buckets
+    # (models/utils -> core -> api/main -> tests); app.py lands in the
+    # api bucket and README.md in the core bucket, so assert presence
+    # across the flattened tree rather than a fixed slot.
+    paths = [f["path"] for lay in layers for f in lay["files"]]
+    assert "app.py" in paths
     assert result.outputs["file_count"] == 2
-    assert result.outputs["layer_count"] == 1
+    assert result.outputs["layer_count"] == 2
     # The composed goal carried the user's answer through to the planner.
     assert "Python + Flask" in result.artifact.content["composed_goal"]
 
@@ -4191,7 +4196,11 @@ def test_decompose_orders_files_by_dependency(store, monkeypatch):
             {"path": "src/util.py", "description": "helpers"}]}],
     })
     assert result.failure is None
-    paths = [f["path"] for f in result.artifact.content["layers"][0]["files"]]
+    # src/util.py buckets ahead of src/app.py (models/utils layer before
+    # the api layer), so the dependency is still generated first; assert
+    # the ordering across the flattened tree.
+    paths = [f["path"] for lay in result.artifact.content["layers"]
+             for f in lay["files"]]
     assert paths.index("src/util.py") < paths.index("src/app.py")
 
 
@@ -4220,7 +4229,8 @@ def test_decompose_prunes_dangling_dependency(store, monkeypatch):
             {"path": "src/util.py", "description": "helpers"}]}],
     })
     assert result.failure is None
-    files = result.artifact.content["layers"][0]["files"]
+    files = [f for lay in result.artifact.content["layers"]
+             for f in lay["files"]]
     app = next(f for f in files if f["path"] == "src/app.py")
     assert app["depends_on"] == ["src/util.py"]
 
@@ -4330,7 +4340,8 @@ def test_decompose_keeps_existing_vite_entry_html(store, monkeypatch):
             {"path": "vite.config.js", "description": "vite config"}]}],
     })
     assert result.failure is None
-    paths = [f["path"] for f in result.artifact.content["layers"][0]["files"]]
+    paths = [f["path"] for lay in result.artifact.content["layers"]
+             for f in lay["files"]]
     assert paths.count("index.html") == 1
 
 
@@ -13360,6 +13371,11 @@ class _ScriptedLocalProvider:
                         if path.endswith(".py")
                         else f"placeholder for {path}\n")
             return {"content": _json.dumps({"content": body})}
+        # Mandatory project-skeleton pass (DECOMPOSE) -- a plain chat call
+        # carrying the manifest paths, no schema and no per-file marker.
+        if "Manifest Paths:" in user:
+            self.calls.append("skeleton")
+            return {"content": "```python\npass\n```"}
         self.calls.append("unrouted")
         return {"content": "{}"}
 
