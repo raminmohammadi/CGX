@@ -236,6 +236,19 @@ def run_repair(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             if pip_roots:
                 return _run_verify_missing_dependency_repair(
                     task, verify_artifact_id, content, pip_roots, signature)
+            
+            # The top-level package exists in the project but the leaf does
+            # not (e.g. src.config). This is a missing first-party file the
+            # scaffold never generated. Carry the paths so the router
+            # targets the regenerate to add them.
+            missing_paths = []
+            for dotted in missing_module_names(content):
+                path = dotted.replace(".", "/") + ".py"
+                missing_paths.append(path)
+            if missing_paths:
+                extra_plan_fields["missing_files"] = [
+                    {"path": p, "description": stack_entry_description(p)}
+                    for p in missing_paths]
         rationale = _pythonpath_rationale(pp_locations, bool(diffs))
         locations_payload = [_pp_loc_to_dict(loc) for loc in pp_locations]
     elif classification == "missing_fixture":
@@ -1169,6 +1182,10 @@ def _select_repair_strategy(
         # exactly which fixtures the regenerated tests must define.
         constraints["missing_fixtures"] = list(
             extra_plan_fields.get("missing_fixtures") or [])
+    elif classification == "missing_module_pythonpath":
+        missing_files = list(extra_plan_fields.get("missing_files") or [])
+        if missing_files:
+            constraints["missing_files"] = missing_files
     elif classification == "assertion_drift":
         # A plain assertion failure the bounded patch could not fix. When
         # the failure named implementation file(s) in its traceback, carry
