@@ -10,6 +10,7 @@
   <a href="https://github.com/raminmohammadi/CGX/releases"><img src="https://img.shields.io/github/v/release/raminmohammadi/CGX?label=RELEASE" alt="GitHub release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/github/license/raminmohammadi/CGX?color=blue" alt="MIT License"></a>
     <a href="https://github.com/raminmohammadi/CGX/actions/workflows/pages.yml?branch=main"><img src="https://github.com/raminmohammadi/CGX/actions/workflows/pages.yml/badge.svg?branch=main" alt="Page Build"></a>
+  <a href="https://github.com/raminmohammadi/CGX/wiki"><img src="https://img.shields.io/badge/WIKI-docs-blue?logo=github" alt="Wiki"></a>
 </p>
 
 # CGX -- Code Graph eXecution
