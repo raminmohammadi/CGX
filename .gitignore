@@ -225,3 +225,6 @@ extension/out/
 # CGX runtime artifacts
 /cgx_index/
 src/cgx.egg-info/
+
+# Test-run config/state dirs (SQLite stores created by the suite)
+.pytest_cgx_config/

@@ -22,6 +22,14 @@ from cgx.answer.intent import detect_intent
 from cgx.answer.model_caps import model_supports_thinking
 from cgx.answer.scope import resolve_scope_for_intent
 from cgx.governance import govern
+from cgx.guardrails import (
+    GuardrailConfig,
+    assert_llm_enabled,
+    check_diffs,
+    record_findings,
+    scan_context,
+    scan_text,
+)
 from cgx.pipeline.auto import IndexBuildCancelled, run_index_auto, run_query_auto
 from cgx.registry import new_run_id, register_known_prompts
 from cgx.trace import set_trace_context
@@ -67,6 +75,46 @@ def _monitor_codegen(report: Optional[Dict[str, Any]],
         logger.warning("monitor.observe_codegen failed: %s", e)
 
 
+def _guard_input(question: str, hits: Optional[List[Dict[str, Any]]],
+                 *, run_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Scan the user question + retrieved chunks for prompt injection.
+
+    Best-effort: guardrails annotate + alert, they never break a request.
+    Returns the findings as dicts for the response ``meta``.
+    """
+    try:
+        cfg = GuardrailConfig.from_env()
+        if not (cfg.enabled and cfg.scan_input):
+            return []
+        findings = scan_text(question, source="user") + scan_context(hits or [])
+        record_findings(findings, run_id=run_id, kind="input")
+        return [f.to_dict() for f in findings]
+    except Exception as e:  # pragma: no cover - guardrails are non-critical
+        logger.warning("guardrail input scan failed: %s", e)
+        return []
+
+
+def _guard_output(diffs: List[Dict[str, Any]], *, project_root: Optional[str],
+                  run_id: Optional[str] = None) -> Tuple[List[Dict[str, Any]], bool]:
+    """Scan generated diffs for secret literals + path escapes.
+
+    Returns ``(findings, block)`` where ``block`` is True only when a critical
+    finding fired *and* ``CGX_GUARDRAIL_BLOCK_SECRETS`` is set (hard-stop).
+    """
+    try:
+        cfg = GuardrailConfig.from_env()
+        if not (cfg.enabled and cfg.scan_output):
+            return [], False
+        findings = check_diffs(diffs or [], project_root=project_root)
+        record_findings(findings, run_id=run_id, kind="output")
+        block = cfg.block_secret_output and any(
+            f.severity == "critical" for f in findings)
+        return [f.to_dict() for f in findings], block
+    except Exception as e:  # pragma: no cover - guardrails are non-critical
+        logger.warning("guardrail output scan failed: %s", e)
+        return [], False
+
+
 def _format_stream_failure(e: BaseException) -> str:
     """Render an exception raised by ``provider.chat_stream`` for the
     ``thought_warning`` UI banner.
@@ -90,6 +138,9 @@ def _resolve_provider(
     endpoint_path: str = "/v1/chat/completions",
     allow_no_auth: bool = False,
 ) -> Any:
+    # Subsystem K kill-switch: refuse to build any provider when the operator
+    # has engaged CGX_LLM_DISABLED, so no LLM call can run this request.
+    assert_llm_enabled()
     if use_profile and profile_name:
         prov = provider_from_profile_name(profile_name)
     else:
@@ -218,6 +269,10 @@ def stream_ask(
     hits = retrieval.get("hits", []) or []
     logger.info("stream_ask: retrieval returned %d hits", len(hits))
 
+    # Subsystem K: scan user question + retrieved chunks for prompt injection
+    # before they reach the model. Advisory -- annotate + alert, never block.
+    guard_findings = _guard_input(question or "", hits, run_id=run_id)
+
     if cancel_event and cancel_event.is_set():
         yield "cancelled", {"message": "Cancelled"}
         return
@@ -300,6 +355,8 @@ def stream_ask(
     meta = json_safe({k: v for k, v in result.items() if k != "debug"})
     meta.setdefault("run_id", run_id)
     meta.setdefault("model", model)
+    if guard_findings:
+        meta["guardrails"] = guard_findings
     try:
         meta.setdefault("prompt_version",
                         register_known_prompts().version_of(f"ask_stream:{mode}"))
@@ -341,6 +398,9 @@ def stream_plan(
     if cancel_event and cancel_event.is_set():
         yield "cancelled", {"message": "Cancelled"}
         return
+
+    # Subsystem K: scan the task text for prompt injection before generation.
+    guard_findings = _guard_input(task or "", None, run_id=run_id)
 
     sketch = [
         {"role": "system", "content": "You are a principal engineer thinking out loud."},
@@ -384,11 +444,22 @@ def stream_plan(
     diffs = diffs_payload(out.get("diffs") or [])
     logger.info("stream_plan: plan ready diffs=%d", len(diffs))
     _monitor_codegen(out.get("codegen_report"), run_id=run_id)
+    # Subsystem K: scan generated diffs for secret literals + path escapes.
+    out_findings, block = _guard_output(diffs, project_root=project_root,
+                                        run_id=run_id)
+    if block:
+        logger.error("stream_plan: guardrail hard-stop (secret in output)")
+        yield "error", {"message": ("guardrail: generated code contains a "
+                                    "secret-shaped literal; plan withheld")}
+        return
     meta = json_safe({k: v for k, v in out.items()
                       if k not in {"debug", "diffs", "plan_md",
                                    "codegen_report"}})
     meta.setdefault("run_id", run_id)
     meta.setdefault("model", model)
+    guard_all = guard_findings + out_findings
+    if guard_all:
+        meta["guardrails"] = guard_all
     yield "plan", {
         "plan_md": stringify(out.get("plan_md", "")),
         "diffs": diffs,
