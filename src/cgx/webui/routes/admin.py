@@ -31,26 +31,34 @@ router = APIRouter(tags=["admin"])
 
 
 def _log_path(project_root: Optional[str]) -> Path:
-    """Trace source: a project's ``.cgx/agent.log`` or the global fallback."""
-    if project_root:
-        base = Path.cwd().resolve()
-        raw = Path(os.fspath(project_root))
-        if raw.is_absolute():
-            logger.warning("admin log path rejected absolute input: %s", project_root)
+    """Trace source: a project's ``.cgx/agent.log`` or the global fallback.
+
+    ``project_root`` is caller-controlled, so the log path is never built by
+    interpolating it into a longer string: the root is first canonicalised
+    with :func:`os.path.realpath` (collapsing ``..`` and following any
+    symlink on the *root* itself), then the trailing path components are the
+    compile-time constants ``.cgx`` / ``agent.log``. The resolved file is
+    finally required to still live at ``<real_root>/.cgx/agent.log`` -- so a
+    symlinked ``.cgx`` or ``agent.log`` planted to escape the root is
+    rejected and falls back to the global log rather than reading an
+    arbitrary file.
+    """
+    if not project_root:
+        return fallback_trace_log_path()
+    safe = project_root.replace("\r", "\\r").replace("\n", "\\n")
+    try:
+        real_root = Path(os.path.realpath(os.fspath(project_root)))
+        candidate = real_root / ".cgx" / "agent.log"
+        # Reject symlink escape: the fully-resolved file must still be the
+        # constant log path directly under the resolved root.
+        resolved = Path(os.path.realpath(candidate))
+        if resolved != real_root / ".cgx" / "agent.log":
+            logger.warning("admin log path rejected (symlink escape): %s", safe)
             return fallback_trace_log_path()
-        rel = Path(os.path.normpath(os.fspath(project_root)))
-        if rel.parts and rel.parts[0] == "..":
-            logger.warning("admin log path rejected traversal input: %s", project_root)
-            return fallback_trace_log_path()
-        candidate = (base / rel).resolve()
-        try:
-            candidate.relative_to(base)
-        except ValueError:
-            safe_project_root = project_root.replace("\r", "\\r").replace("\n", "\\n")
-            logger.warning("admin log path rejected outside base: %s", safe_project_root)
-            return fallback_trace_log_path()
-        return candidate / ".cgx" / "agent.log"
-    return fallback_trace_log_path()
+        return candidate
+    except OSError as e:  # pragma: no cover - defensive
+        logger.warning("admin log path rejected (%s): %s", type(e).__name__, safe)
+        return fallback_trace_log_path()
 
 
 def _read_jsonl(path: Path, *, limit: int, event: Optional[str],
