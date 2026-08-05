@@ -14,10 +14,10 @@ Emits an :class:`Artifact` of kind ``SCAFFOLD_PATCHES`` whose
 disk-apply path without special casing greenfield.
 """
 
-import sqlite3
 from __future__ import annotations
 
 import logging
+import sqlite3
 import os
 import re
 import time
