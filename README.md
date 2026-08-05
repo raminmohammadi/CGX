@@ -778,8 +778,8 @@ recorder is best-effort so an observability failure can never break a request.
 
 | Area | What it gives you |
 |------|-------------------|
-| **Observability** | In-process Prometheus metrics at `GET /api/metrics` (RED-style LLM latency/cost/token series) + a curated `@traced` function-call tracer (`CGX_TRACE`) with secret redaction. |
-| **User activity & admin** | A per-run activity store (grounding + token/cost/latency) and a read-only admin explorer that stitches logs, metrics, alerts and feedback into one redacted view. |
+| **Observability** | In-process Prometheus metrics at `GET /api/metrics` (RED-style LLM latency/cost/token series) + a curated `@traced` function-call tracer (`CGX_TRACE`) with secret redaction. Traced ask/plan/agent runs log every LLM call's full redacted prompt + response to the project `agent.log`. |
+| **User activity & admin** | A per-run activity store (grounding + token/cost/latency) and an admin explorer that stitches logs, metrics, alerts and feedback into one redacted view. The Ops → Trace hub browses per-project traces and can purge trace logs (log-files-only, symlink-safe) via `DELETE /api/admin/logs`. |
 | **Evaluation** | An offline retrieval + codegen harness over golden sets under `evals/`, wired into CI as a quality gate (`python -m cgx.eval`). |
 | **Lineage** | A prompt/model registry + per-run `run_id` join key + index lineage so any record joins back to exactly what produced it. |
 | **AIOps monitoring** | Groundedness / retrieval-drift / cost-anomaly / repair-health checks that persist `Alert` records (`CGX_MON_*`), surfaced at `GET /api/monitor/alerts`. |

@@ -1650,7 +1650,7 @@ response `meta`.
 |-----------|---------|---------|
 | B -- Observability | `cgx.metrics`, `cgx.trace`, `cgx.redact` | `GET /api/metrics`; `@traced` → `agent.log` / `cgx-trace.log` |
 | C -- User activity | `cgx.activity` (`activity.db`) | `GET /api/activity/{runs,runs/{id},summary}` |
-| D -- Admin explorer | `cgx.webui.routes.admin` | `GET /api/admin/{logs,metrics,overview}` |
+| D -- Admin explorer | `cgx.webui.routes.admin` | `GET /api/admin/{logs,metrics,overview}`; `DELETE /api/admin/logs` (trace-log purge, log-files-only) |
 | E -- Evaluation | `cgx.eval`, `evals/` | `python -m cgx.eval`; CI gate |
 | F -- Lineage | `cgx.registry` | prompt fingerprint / `run_id` / index lineage |
 | G -- AIOps monitoring | `cgx.monitor` (`monitor.db`) | `GET /api/monitor/alerts` |

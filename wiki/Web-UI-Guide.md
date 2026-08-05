@@ -73,6 +73,20 @@ expose an **Endpoint Path** field and a **Skip auth** toggle for
 private-subnet servers. Optional per-profile `rate_limit` and
 `max_retries` apply automatically to every call made by that profile.
 
+### 8. Ops (`/ops`)
+The unified **observability hub** over the MLOps layer: live metrics,
+pipeline/subsystem cards, and a **Trace explorer**. The explorer reads the
+`@traced` function-call log (enable tracing with `CGX_TRACE` or the Settings
+toggle) and lets you switch **source** between the Global fallback (HTTP / CLI
+records) and any project's `agent.log` — the latter holds the rich records:
+each LLM call with its **full prompt + response**, plus router, executor,
+codegen, scaffold, and repair spans. Records are newest-first, redacted
+server-side, filterable by event and category, with an "HTTP hidden" toggle and
+click-through detail. **Ask** and **Plan** runs are traced into their project's
+log too, not just the agent. **Delete** (current source) and **Delete all**
+controls purge trace/log files only — never any other file — each behind a
+confirmation. Deep dive: **[[MLOps and Production]]**.
+
 ---
 
 ## Cross-cutting UI behaviour

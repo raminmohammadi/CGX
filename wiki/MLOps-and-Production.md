@@ -31,7 +31,7 @@ grounding signals to the thumbs-down that later became an eval candidate.
 |------|---------|---------|
 | **Observability** | `cgx.metrics`, `cgx.trace`, `cgx.redact` | Prometheus text at `GET /api/metrics`; `@traced` tracer (`CGX_TRACE`) with secret redaction |
 | **User activity** | `cgx.activity` (`activity.db`) | `GET /api/activity/{runs,runs/{id},summary}` |
-| **Admin explorer** | `cgx.webui.routes.admin` | `GET /api/admin/{logs,metrics,overview}` (server-side redacted) |
+| **Admin explorer** | `cgx.webui.routes.admin` | `GET /api/admin/{logs,metrics,overview}` + `DELETE /api/admin/logs` (server-side redacted) |
 | **Evaluation** | `cgx.eval`, `evals/` | `python -m cgx.eval`; CI quality gate |
 | **Lineage** | `cgx.registry` | prompt fingerprint / `run_id` / index lineage |
 | **AIOps monitoring** | `cgx.monitor` (`monitor.db`) | drift/quality/cost `Alert`s at `GET /api/monitor/alerts` |
@@ -55,6 +55,32 @@ by default, flipped on with `CGX_TRACE` — routing to the project `agent.log`
 in-session or `~/.cgx/cgx-trace.log` otherwise. `cgx.redact` masks
 credential-shaped literals before anything reaches a log, trace, store, or the
 admin API.
+
+With tracing on, every model call also emits a rich **`llm_call`** record
+carrying the **full redacted prompt and response** plus `model` / `latency_ms`
+/ token counts and the `run_id` join key — beside the `enter` / `exit` /
+`error` span records (categories: `router`, `llm`, `retrieval`, `codegen`,
+`pipeline`, `executor`, `repair.*`). The agent loop produces these natively,
+and the web-UI **Ask** / **Plan** paths do too: they set `project_root` on the
+trace context and wrap their provider with the tracing shim, so a traced
+ask/plan writes the same records into that project's `agent.log`.
+
+### Trace explorer + delete (Ops hub)
+
+The **Ops hub** (`/ops` → **Trace**) is the UI over the admin read API. A
+**source** selector switches between the Global fallback (HTTP / CLI records)
+and any project's `agent.log` (the rich LLM / router / codegen / scaffold /
+repair records); records are newest-first, redacted server-side, filterable by
+event and category, and each opens to its full prompt/response. The section
+also exposes **Delete** (current source) and **Delete all** controls backed by
+`DELETE /api/admin/logs`.
+
+Deletion is **hard-limited to trace/log files** — it only ever unlinks files
+literally named `cgx-trace.log` / `agent.log` (and their rotation backups),
+requires a regular file, and **refuses symlinks**, so a caller-supplied
+`project_root` can never be used to delete anything else on the machine. The
+`scope=all` sweep enumerates project roots from the activity store, never from
+the request. See [[Privacy and Security]] for the full threat model.
 
 ---
 

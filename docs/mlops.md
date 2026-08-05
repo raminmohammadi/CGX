@@ -58,6 +58,26 @@ route to the project-local `agent.log`; outside a session they fall through to
 `~/.cgx/cgx-trace.log`. Set `CGX_OTEL=1` to also emit spans over OpenTelemetry
 when the SDK is installed.
 
+Each `@traced` entry point emits an `enter` record (`{category, fn}`, plus a
+bounded `args` repr when `args=True`), then either an `exit` record with
+`elapsed_ms` or a `trace_error` record with `error_type` + a truncated message.
+Categories group the entry points -- `router`, `llm`, `retrieval`, `codegen`,
+`pipeline`, `executor`, and `repair.*`. On top of the span records,
+`cgx.session.llm_trace` emits one **`llm_call`** record per model call carrying
+the full provenance and, crucially, the **full redacted prompt and response**
+(`prompt_full` / `response_full`, alongside `prompt_preview` /
+`response_preview`, `model`, `latency_ms`, `streamed`, char counts, `sampling`,
+and the `fact_id` / `run_id` join keys). This is what turns the trace explorer
+from a request log into a full record of every LLM interaction.
+
+The **agent loop** produces these `llm_call` records natively (the session
+runner wraps its provider with `TracingProvider`). The web-UI **Ask** and
+**Plan** paths do the same: `stream_ask` / `stream_plan` set the `run_id` and
+`project_root` on the trace context and wrap their provider with the tracing
+shim (`_traced_provider`), so a traced ask/plan writes the same rich `llm_call`
+records into that project's `agent.log`. With tracing on, every LLM interaction
+across agent, ask, and plan is therefore reviewable end to end.
+
 `cgx.redact` masks credential-shaped literals (API keys, bearer tokens,
 `key=value` pairs, provider key prefixes) before any text reaches a log, a
 trace, a store, or the admin API -- defence-in-depth so a secret echoed into a
@@ -87,10 +107,41 @@ Activity page reads:
 stitches the observability stores into one admin view. Every line is passed
 through `cgx.redact.redact_mapping` before it leaves the process.
 
-- `GET /api/admin/logs` -- the JSONL function-call trace log (trace explorer).
+- `GET /api/admin/logs` -- the JSONL function-call trace log (trace explorer),
+  newest first, redacted, with `event` / `since` / `limit` filters. The
+  **source** is chosen by the optional `project_root` query param: omit it to
+  read the global fallback (`~/.cgx/cgx-trace.log`, i.e. HTTP / CLI records),
+  or pass a project root to read that project's `<root>/.cgx/agent.log` with
+  the rich `llm_call` (full prompt + response), router, executor, codegen,
+  scaffold, and repair records.
 - `GET /api/admin/metrics` -- a structured snapshot of the metrics registry.
 - `GET /api/admin/overview` -- an audit-lite health view folding activity (C),
   alerts (G) and feedback (H) into one payload.
+- `DELETE /api/admin/logs` -- purge trace/log files. Three modes, in
+  precedence order: `?scope=all` clears the global fallback **and** every
+  project `agent.log` known to the activity store; `?project_root=<path>`
+  clears just that project's `agent.log`; with neither, it clears just the
+  global fallback. Returns `{deleted, scope, targets}`.
+
+**Deletion security.** The delete path is deliberately narrow so a
+caller-supplied `project_root` can never be leveraged to remove anything but a
+CGX trace log. Deletion is delegated to `cgx.trace.delete_fallback_trace_log`
+and `cgx.session.agent_log.delete_project_trace_log`, which only ever unlink a
+file whose basename is literally `cgx-trace.log` / `agent.log` (plus the
+numbered rotation backups) -- the filename is a compile-time constant, so no
+`../` traversal can escape to an arbitrary path. Each candidate must be an
+existing **regular file** (`lstat` + `S_ISREG`); **symlinks are refused**
+outright, so a planted `agent.log -> /etc/shadow` cannot redirect the unlink.
+The `scope=all` sweep enumerates its project roots from the activity store
+(trusted internal data), never from the request. The live rotating file handle
+is closed before unlink and re-opened lazily on the next write.
+
+The **Ops hub** (`/ops` → **Trace**) is the UI over this API: a source selector
+(Global vs. any project seen in recent activity), an `event` filter, a
+category breakdown, an "HTTP hidden" toggle, and click-through to a record's
+full redacted prompt/response. It also carries **Delete** (current source) and
+**Delete all** controls, each behind a confirmation that spells out exactly
+what is removed; deletion only ever touches trace/log files.
 
 ---
 
