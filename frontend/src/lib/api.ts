@@ -348,6 +348,43 @@ async function jsonReq<T>(
   return res.json() as Promise<T>;
 }
 
+// --- User Activity (Subsystem C): per-run observation store ---
+export type RunRecord = {
+  run_id: string;
+  created_at: number;
+  kind: string;
+  model?: string | null;
+  prompt_version?: string | null;
+  owner?: string | null;
+  project_root?: string | null;
+  tokens_in?: number | null;
+  tokens_out?: number | null;
+  tokens_total?: number | null;
+  cost_usd?: number | null;
+  latency_ms?: number | null;
+  n_sources: number;
+  n_citations: number;
+  confidence?: number | null;
+  grounded?: boolean | null;
+  status: string;
+  question: string;
+  labels: Record<string, any>;
+};
+
+export type ActivitySummary = {
+  total: number;
+  cost_usd: number;
+  tokens_total: number;
+  errors: number;
+  by_kind: Record<string, { runs: number; cost_usd: number; tokens_total: number; errors: number }>;
+};
+
+export type RunDetail = {
+  run: RunRecord;
+  feedback: Array<Record<string, any>>;
+  alerts: Array<Record<string, any>>;
+};
+
 export const api = {
   status: () => jsonReq<StatusResponse>("/api/status"),
   ollamaHealth: (base_url: string) =>
@@ -544,6 +581,20 @@ export const api = {
     jsonReq<TraceSettings>("/api/settings/trace"),
   setTraceSettings: (enabled: boolean) =>
     jsonReq<TraceSettings>("/api/settings/trace", "POST", { enabled }),
+
+  // --- User Activity (Subsystem C) ---
+  activityRuns: (params?: { kind?: string; owner?: string; status?: string; limit?: number }) => {
+    const q = new URLSearchParams();
+    if (params?.kind) q.set("kind", params.kind);
+    if (params?.owner) q.set("owner", params.owner);
+    if (params?.status) q.set("status", params.status);
+    if (params?.limit) q.set("limit", String(params.limit));
+    const qs = q.toString();
+    return jsonReq<{ runs: RunRecord[]; count: number }>(`/api/activity/runs${qs ? `?${qs}` : ""}`);
+  },
+  activitySummary: () => jsonReq<ActivitySummary>("/api/activity/summary"),
+  activityRunDetail: (runId: string) =>
+    jsonReq<RunDetail>(`/api/activity/runs/${encodeURIComponent(runId)}`),
 };
 
 export type TraceSettings = {

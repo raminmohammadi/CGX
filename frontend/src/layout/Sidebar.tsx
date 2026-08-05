@@ -13,6 +13,7 @@ import {
   Settings,
   Trash2,
   Wand2,
+  Activity,
 } from "lucide-react";
 import { api, type SessionSummary } from "../lib/api";
 import { useWorkspace } from "../store/workspace";
@@ -43,6 +44,10 @@ const navGroups: { eyebrow: string; tabs: NavTab[] }[] = [
   {
     eyebrow: "Retrieval",
     tabs: [{ to: "/index", label: "Incremental Index", icon: Database, pageKey: "index" }],
+  },
+  {
+    eyebrow: "Observability",
+    tabs: [{ to: "/activity", label: "User Activity", icon: Activity, pageKey: null }],
   },
   {
     eyebrow: "System",

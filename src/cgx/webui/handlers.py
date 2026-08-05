@@ -12,16 +12,18 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+from cgx.activity import record_run
 from cgx.answer.engine import answer_with_llm_stream, generate_code_plan
 from cgx.answer.intent import detect_intent
 from cgx.answer.model_caps import model_supports_thinking
 from cgx.answer.scope import resolve_scope_for_intent
-from cgx.governance import govern
+from cgx.governance import govern, resolve_owner
 from cgx.guardrails import (
     GuardrailConfig,
     assert_llm_enabled,
@@ -221,6 +223,7 @@ def stream_ask(
     # (so the client can attach feedback to it) and onto the trace context
     # (so llm_trace stamps the same run_id onto every LLM_CALL of this run).
     run_id = new_run_id()
+    t0 = time.perf_counter()
     set_trace_context(run_id=run_id)
     try:
         prov = _resolve_provider(
@@ -367,6 +370,10 @@ def stream_ask(
         len(answer_md), len(sources), answer_delta_tokens,
     )
     _monitor_answer(result, run_id=run_id)
+    # Subsystem C: persist a per-run observation for the activity page.
+    record_run(kind="ask", run_id=run_id, meta=meta, sources=sources,
+               question=question or "", model=model, owner=resolve_owner(),
+               latency_ms=(time.perf_counter() - t0) * 1000.0)
     yield "answer", {"answer_md": answer_md, "sources": sources, "meta": meta}
 
 
@@ -382,6 +389,7 @@ def stream_plan(
     """Stream sketch thoughts, then the generated plan + structured diffs."""
     logger.info("stream_plan: task=%r self_test=%s model=%s", task[:80], self_test, model)
     run_id = new_run_id()
+    t0 = time.perf_counter()
     set_trace_context(run_id=run_id)
     try:
         prov = _resolve_provider(
@@ -449,6 +457,10 @@ def stream_plan(
                                         run_id=run_id)
     if block:
         logger.error("stream_plan: guardrail hard-stop (secret in output)")
+        record_run(kind="plan", run_id=run_id, question=task or "", model=model,
+                   owner=resolve_owner(), project_root=project_root,
+                   status="blocked",
+                   latency_ms=(time.perf_counter() - t0) * 1000.0)
         yield "error", {"message": ("guardrail: generated code contains a "
                                     "secret-shaped literal; plan withheld")}
         return
@@ -460,6 +472,10 @@ def stream_plan(
     guard_all = guard_findings + out_findings
     if guard_all:
         meta["guardrails"] = guard_all
+    # Subsystem C: persist a per-run observation for the activity page.
+    record_run(kind="plan", run_id=run_id, meta=meta, question=task or "",
+               model=model, owner=resolve_owner(), project_root=project_root,
+               latency_ms=(time.perf_counter() - t0) * 1000.0)
     yield "plan", {
         "plan_md": stringify(out.get("plan_md", "")),
         "diffs": diffs,
