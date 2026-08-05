@@ -42,8 +42,10 @@ class SQLiteSkill(Skill):
             "string-format user input into SQL.\n"
             "- Use `with sqlite3.connect(path) as conn:` for transaction "
             "scoping, or an explicit `conn.commit()` after writes.\n"
-            "- Default database file at `./data/app.db` (mkdir the data "
-            "directory at startup if absent)."
+            "- Default database file at `./data/app.db`. You MUST import `os` and create the parent "
+            "directory first (e.g. `import os; os.makedirs('./data', exist_ok=True)`) inside `init_db()`.\n"
+            "- IMPORTANT: Do NOT call `init_db()` at the top-level of the module. Only call it "
+            "inside `if __name__ == '__main__':` or let the main application entrypoint call it."
         )
 
     def plan_system_prompt(self) -> str:
