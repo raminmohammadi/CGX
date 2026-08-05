@@ -11062,8 +11062,42 @@ def test_tracing_provider_records_chat_as_fact():
     assert fact.content["sampling"]["temperature"] == 0.7
     assert fact.content["sampling"]["max_tokens"] == 64
     assert fact.content["sampling"]["force_json"] is False
+    # Absent provider usage, tokens are estimated and cost is unknown.
+    assert fact.content["token_source"] == "estimated"
+    assert fact.content["cost_source"] == "unknown"
+    assert fact.content["tokens_total"] >= 1
     # drain clears the buffer.
     assert tp.drain() == []
+
+
+def test_tracing_provider_records_provider_usage_and_metrics():
+    """Provider-reported usage is stored truthfully and mirrored to metrics."""
+    from cgx import metrics as _metrics
+    from cgx.session.llm_trace import TracingProvider
+
+    class _UsageProvider(_StubChatProvider):
+        def chat(self, messages, **kw):
+            return {"content": "ok", "provider": "gemini",
+                    "raw": {"usageMetadata": {"promptTokenCount": 100,
+                                              "candidatesTokenCount": 20}}}
+
+    _metrics.reset_for_tests()
+    tp = TracingProvider(_UsageProvider(model="gemini-2.5-flash"))
+    tp.bind("s", "t")
+    tp.chat([{"role": "user", "content": "hi"}])
+    fact = tp.drain()[0]
+    assert fact.content["provider"] == "gemini"
+    assert fact.content["token_source"] == "provider"
+    assert fact.content["tokens_in"] == 100
+    assert fact.content["tokens_out"] == 20
+    # gemini-2.5-flash is in the default price table -> a real cost estimate.
+    assert fact.content["cost_source"] == "default"
+    assert fact.content["cost_usd"] > 0
+    rendered = _metrics.render_prometheus()
+    assert "cgx_llm_calls_total" in rendered
+    assert "cgx_llm_tokens_total" in rendered
+    assert "cgx_llm_call_latency_ms_count" in rendered
+    _metrics.reset_for_tests()
 
 
 def test_tracing_provider_records_streamed_response():

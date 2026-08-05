@@ -25,6 +25,8 @@ from __future__ import annotations
 import time
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
+from cgx import metrics as _metrics
+from cgx import usage as _usage
 from cgx.redact import redact_text
 from cgx.session.models import Fact, FactKind
 from cgx.trace import emit_llm_call
@@ -155,15 +157,17 @@ class TracingProvider:
         if self._binding is None:
             return
         session_id, task_id = self._binding
+        # Flatten once (full text) so token accounting sees the true payload
+        # before truncation shrinks it for storage.
+        full_prompt = _flatten_messages(messages)
+        full_response = ""
+        if isinstance(response, dict):
+            full_response = str(response.get("content") or "")
         # Redact before truncation so a secret split across the truncation
         # boundary can't survive in either half of the stored row.
-        prompt_text = _truncate(
-            redact_text(_flatten_messages(messages)), _PROMPT_CHAR_CAP)
-        response_text = ""
-        if isinstance(response, dict):
-            response_text = _truncate(
-                redact_text(str(response.get("content") or "")),
-                _RESPONSE_CHAR_CAP)
+        prompt_text = _truncate(redact_text(full_prompt), _PROMPT_CHAR_CAP)
+        response_text = _truncate(
+            redact_text(full_response), _RESPONSE_CHAR_CAP)
         sampling: Dict[str, Any] = {
             "temperature": float(temperature),
             "max_tokens": max_tokens,
@@ -173,18 +177,31 @@ class TracingProvider:
             for k, v in extras.items():
                 if isinstance(v, (str, int, float, bool, type(None))):
                     sampling.setdefault(k, v)
+        provider = self._provider_name(response)
+        usage = _usage.extract_usage(
+            response, prompt_text=full_prompt, response_text=full_response)
+        cost = _usage.estimate_cost(
+            self.model, usage["tokens_in"], usage["tokens_out"])
         content: Dict[str, Any] = {
             "model": self.model,
+            "provider": provider,
             "prompt": prompt_text,
             "response": response_text,
             "prompt_chars": len(prompt_text),
             "response_chars": len(response_text),
+            "tokens_in": usage["tokens_in"],
+            "tokens_out": usage["tokens_out"],
+            "tokens_total": usage["tokens_total"],
+            "token_source": usage["token_source"],
+            "cost_usd": cost["cost_usd"],
+            "cost_source": cost["cost_source"],
             "latency_ms": round(latency_ms, 2),
             "sampling": sampling,
             "streamed": bool(streamed),
         }
         if error:
             content["error"] = redact_text(error)
+        self._emit_metrics(provider, latency_ms, usage, cost, error)
         fact = Fact.new(
             session_id=session_id,
             kind=FactKind.LLM_CALL,
@@ -199,3 +216,41 @@ class TracingProvider:
             component="session", model=self.model, messages=messages,
             response=response, error=error, latency_ms=latency_ms,
             sampling=sampling, streamed=streamed, fact_id=fact.fact_id)
+
+    def _provider_name(self, response: Any) -> str:
+        if isinstance(response, dict) and response.get("provider"):
+            return str(response["provider"])
+        cls = type(self._inner).__name__.lower()
+        for name in ("ollama", "gemini", "openai"):
+            if name in cls:
+                return name if name != "openai" else "openai-compat"
+        return cls or "unknown"
+
+    def _emit_metrics(self, provider: str, latency_ms: float,
+                      usage: Dict[str, Any], cost: Dict[str, Any],
+                      error: Optional[str]) -> None:
+        """Record RED-style LLM metrics; independent of the trace toggle."""
+        model = self.model or "unknown"
+        outcome = "error" if error else "ok"
+        try:
+            _metrics.inc("cgx_llm_calls_total",
+                         help="LLM chat calls by provider/model/outcome.",
+                         provider=provider, model=model, outcome=outcome)
+            _metrics.observe("cgx_llm_call_latency_ms", latency_ms,
+                             help="LLM chat call latency in milliseconds.",
+                             provider=provider, model=model)
+            _metrics.inc("cgx_llm_tokens_total", usage["tokens_in"],
+                         help="LLM tokens by direction/provider/model.",
+                         direction="in", provider=provider, model=model)
+            _metrics.inc("cgx_llm_tokens_total", usage["tokens_out"],
+                         direction="out", provider=provider, model=model)
+            if cost["cost_usd"]:
+                _metrics.inc("cgx_llm_cost_usd_total", cost["cost_usd"],
+                             help="Estimated LLM cost in USD by provider/model.",
+                             provider=provider, model=model)
+            if error:
+                _metrics.inc("cgx_llm_errors_total",
+                             help="LLM chat call errors by provider.",
+                             provider=provider)
+        except Exception:  # pragma: no cover - metrics must never break a call
+            pass

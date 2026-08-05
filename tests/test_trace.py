@@ -217,6 +217,44 @@ def test_emit_trace_helper_respects_toggle(tmp_path: Path):
     assert any(e.get("event") == "http_request" for e in events)
 
 
+def test_request_id_propagates_into_records(tmp_path: Path):
+    """A request_id set on the context appears on every emitted record."""
+    token = tr.set_trace_context(
+        project_root=str(tmp_path), request_id="req-42")
+    tr.set_trace_enabled(True)
+    try:
+        @tr.traced("test")
+        def f():
+            return 1
+
+        assert f() == 1
+    finally:
+        tr.reset_trace_context(token)
+
+    events = _read_agent_log(tmp_path)
+    assert events
+    for e in events:
+        if e.get("event") in ("trace_enter", "trace_exit"):
+            assert e.get("request_id") == "req-42"
+
+
+def test_otel_span_is_noop_when_disabled(tmp_path: Path, monkeypatch):
+    """With CGX_OTEL unset, the decorator never touches OpenTelemetry."""
+    monkeypatch.delenv("CGX_OTEL", raising=False)
+    token = tr.set_trace_context(project_root=str(tmp_path))
+    tr.set_trace_enabled(False)
+    try:
+        @tr.traced("test")
+        def f():
+            return 7
+
+        # Neither trace nor OTel enabled -> fast path, value still returned.
+        assert f() == 7
+        assert tr._otel_enabled() is False
+    finally:
+        tr.reset_trace_context(token)
+
+
 def test_fallback_logger_when_no_project_root(tmp_path: Path, monkeypatch):
     fake_home = tmp_path / "home"
     monkeypatch.setattr(tr, "_FALLBACK_DIR", fake_home / ".cgx")

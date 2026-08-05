@@ -81,6 +81,56 @@ def trace_source() -> str:
     return "env" if _env_pin() is not None else "runtime"
 
 
+# ----- Optional OpenTelemetry span sink --------------------------------------
+# Off by default and dependency-optional: when ``CGX_OTEL`` is truthy *and*
+# the ``opentelemetry`` SDK is importable, each ``@traced`` call opens a real
+# span. Because spans propagate via contextvars just like ``trace_context``,
+# the session -> task -> executor -> llm/retrieval tree is reconstructed for
+# free. When disabled or the SDK is absent, ``_otel_span`` is a no-op.
+
+_OTEL_ENV = "CGX_OTEL"
+_otel_tracer: Any = None
+_otel_checked = False
+
+
+def _otel_enabled() -> bool:
+    return os.environ.get(_OTEL_ENV, "").strip().lower() in _TRUE
+
+
+def _get_tracer() -> Any:
+    global _otel_tracer, _otel_checked
+    if _otel_checked:
+        return _otel_tracer
+    _otel_checked = True
+    try:  # pragma: no cover - exercised only when opentelemetry is installed
+        from opentelemetry import trace as _otrace
+        _otel_tracer = _otrace.get_tracer("cgx")
+    except Exception:
+        _otel_tracer = None
+    return _otel_tracer
+
+
+class _NullSpanCtx:
+    def __enter__(self) -> None:
+        return None
+
+    def __exit__(self, *exc: Any) -> bool:
+        return False
+
+
+def _otel_span(name: str, category: str) -> Any:
+    if not _otel_enabled():
+        return _NullSpanCtx()
+    tracer = _get_tracer()
+    if tracer is None:
+        return _NullSpanCtx()
+    try:  # pragma: no cover - requires the optional SDK
+        return tracer.start_as_current_span(
+            name, attributes={"cgx.category": category})
+    except Exception:
+        return _NullSpanCtx()
+
+
 # Per-task context propagated via contextvars so nested @traced calls
 # (including async ones) inherit the active session/task/project root.
 trace_context: contextvars.ContextVar[Dict[str, Any]] = contextvars.ContextVar(
@@ -92,8 +142,14 @@ def set_trace_context(
     session_id: Optional[str] = None,
     task_id: Optional[str] = None,
     project_root: Optional[str] = None,
+    request_id: Optional[str] = None,
 ) -> contextvars.Token:
-    """Push a new trace context frame. Returns a token for ``reset_trace_context``."""
+    """Push a new trace context frame. Returns a token for ``reset_trace_context``.
+
+    ``request_id`` correlates every record emitted while handling one HTTP
+    request (set by the web middleware) so the admin trace explorer can
+    group a run end-to-end across session/task boundaries.
+    """
     cur = dict(trace_context.get() or {})
     if session_id is not None:
         cur["session_id"] = session_id
@@ -101,6 +157,8 @@ def set_trace_context(
         cur["task_id"] = task_id
     if project_root is not None:
         cur["project_root"] = project_root
+    if request_id is not None:
+        cur["request_id"] = request_id
     return trace_context.set(cur)
 
 
@@ -164,6 +222,8 @@ def _emit(event: str, **fields: Any) -> None:
         payload["session_id"] = ctx["session_id"]
     if "task_id" in ctx:
         payload["task_id"] = ctx["task_id"]
+    if "request_id" in ctx:
+        payload["request_id"] = ctx["request_id"]
     payload.update(fields)
     project_root = ctx.get("project_root")
     if project_root:
@@ -224,43 +284,53 @@ def traced(category: str, *, args: bool = False) -> Callable[[F], F]:
         if asyncio.iscoroutinefunction(func):
             @functools.wraps(func)
             async def aw(*a: Any, **kw: Any) -> Any:
-                if not is_trace_enabled():
+                traced_on = is_trace_enabled()
+                if not traced_on and not _otel_enabled():
                     return await func(*a, **kw)
                 t0 = time.perf_counter()
-                enter: Dict[str, Any] = {"category": category, "fn": qual}
-                if args:
-                    enter["args"] = _arg_summary(func, a, kw)
-                _emit("trace_enter", **enter)
-                try:
-                    result = await func(*a, **kw)
-                except BaseException as exc:
-                    _emit("trace_error", category=category, fn=qual,
-                          elapsed_ms=int((time.perf_counter() - t0) * 1000),
-                          error_type=type(exc).__name__, error=str(exc)[:300])
-                    raise
-                _emit("trace_exit", category=category, fn=qual,
-                      elapsed_ms=int((time.perf_counter() - t0) * 1000))
+                if traced_on:
+                    enter: Dict[str, Any] = {"category": category, "fn": qual}
+                    if args:
+                        enter["args"] = _arg_summary(func, a, kw)
+                    _emit("trace_enter", **enter)
+                with _otel_span(qual, category):
+                    try:
+                        result = await func(*a, **kw)
+                    except BaseException as exc:
+                        if traced_on:
+                            _emit("trace_error", category=category, fn=qual,
+                                  elapsed_ms=int((time.perf_counter() - t0) * 1000),
+                                  error_type=type(exc).__name__, error=str(exc)[:300])
+                        raise
+                if traced_on:
+                    _emit("trace_exit", category=category, fn=qual,
+                          elapsed_ms=int((time.perf_counter() - t0) * 1000))
                 return result
             return aw  # type: ignore[return-value]
 
         @functools.wraps(func)
         def sw(*a: Any, **kw: Any) -> Any:
-            if not is_trace_enabled():
+            traced_on = is_trace_enabled()
+            if not traced_on and not _otel_enabled():
                 return func(*a, **kw)
             t0 = time.perf_counter()
-            enter: Dict[str, Any] = {"category": category, "fn": qual}
-            if args:
-                enter["args"] = _arg_summary(func, a, kw)
-            _emit("trace_enter", **enter)
-            try:
-                result = func(*a, **kw)
-            except BaseException as exc:
-                _emit("trace_error", category=category, fn=qual,
-                      elapsed_ms=int((time.perf_counter() - t0) * 1000),
-                      error_type=type(exc).__name__, error=str(exc)[:300])
-                raise
-            _emit("trace_exit", category=category, fn=qual,
-                  elapsed_ms=int((time.perf_counter() - t0) * 1000))
+            if traced_on:
+                enter: Dict[str, Any] = {"category": category, "fn": qual}
+                if args:
+                    enter["args"] = _arg_summary(func, a, kw)
+                _emit("trace_enter", **enter)
+            with _otel_span(qual, category):
+                try:
+                    result = func(*a, **kw)
+                except BaseException as exc:
+                    if traced_on:
+                        _emit("trace_error", category=category, fn=qual,
+                              elapsed_ms=int((time.perf_counter() - t0) * 1000),
+                              error_type=type(exc).__name__, error=str(exc)[:300])
+                    raise
+            if traced_on:
+                _emit("trace_exit", category=category, fn=qual,
+                      elapsed_ms=int((time.perf_counter() - t0) * 1000))
             return result
         return sw  # type: ignore[return-value]
     return decorate
@@ -338,8 +408,10 @@ def emit_llm_call(
 
 def reset_for_tests() -> None:
     """Reset runtime flag + fallback logger. Test-only."""
-    global _runtime_enabled, _fallback_logger
+    global _runtime_enabled, _fallback_logger, _otel_tracer, _otel_checked
     _runtime_enabled = None
+    _otel_tracer = None
+    _otel_checked = False
     if _fallback_logger is not None:
         for h in list(_fallback_logger.handlers):
             try:
