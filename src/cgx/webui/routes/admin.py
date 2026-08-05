@@ -32,8 +32,14 @@ router = APIRouter(tags=["admin"])
 def _log_path(project_root: Optional[str]) -> Path:
     """Trace source: a project's ``.cgx/agent.log`` or the global fallback."""
     if project_root:
-        root = os.path.realpath(os.fspath(project_root))
-        return Path(root) / ".cgx" / "agent.log"
+        base = Path.cwd().resolve()
+        candidate = Path(os.fspath(project_root)).resolve()
+        try:
+            candidate.relative_to(base)
+        except ValueError:
+            logger.warning("admin log path rejected outside base: %s", project_root)
+            return fallback_trace_log_path()
+        return candidate / ".cgx" / "agent.log"
     return fallback_trace_log_path()
 
 
