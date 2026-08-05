@@ -79,6 +79,25 @@ class PlanRequest(BaseModel):
     provider: ProviderConfig = Field(default_factory=ProviderConfig)
 
 
+class FeedbackRequest(BaseModel):
+    """A thumbs up/down (+ optional comment) on an ask/plan result.
+
+    ``run_id`` and the version fields are echoed back from the ``meta`` the
+    ask/plan stream returned, so a rating joins to the exact execution.
+    """
+
+    rating: str  # "up" | "down"
+    run_id: Optional[str] = None
+    session_id: Optional[str] = None
+    kind: str = "ask"  # "ask" | "plan"
+    comment: Optional[str] = None
+    question: Optional[str] = None
+    answer_preview: Optional[str] = None
+    model: Optional[str] = None
+    prompt_version: Optional[str] = None
+    labels: Dict[str, Any] = Field(default_factory=dict)
+
+
 class ProfileUpsertRequest(BaseModel):
     name: str
     kind: str = "ollama"  # "ollama" | "openai-compat" | "gemini" | "custom"

@@ -22,6 +22,8 @@ from cgx.answer.intent import detect_intent
 from cgx.answer.model_caps import model_supports_thinking
 from cgx.answer.scope import resolve_scope_for_intent
 from cgx.pipeline.auto import IndexBuildCancelled, run_index_auto, run_query_auto
+from cgx.registry import new_run_id, register_known_prompts
+from cgx.trace import set_trace_context
 from cgx.webui.helpers import (
     build_provider,
     diffs_payload,
@@ -36,7 +38,8 @@ from cgx.webui.helpers import (
 Event = Tuple[str, Dict[str, Any]]
 
 
-def _monitor_answer(result: Optional[Dict[str, Any]]) -> None:
+def _monitor_answer(result: Optional[Dict[str, Any]],
+                    *, run_id: Optional[str] = None) -> None:
     """Feed a finished answer payload to the AIOps groundedness monitor.
 
     Best-effort: monitoring must never break a user request, so any failure
@@ -46,18 +49,19 @@ def _monitor_answer(result: Optional[Dict[str, Any]]) -> None:
         return
     try:
         from cgx.monitor import get_default_monitor
-        get_default_monitor().observe_answer(result)
+        get_default_monitor().observe_answer(result, run_id=run_id)
     except Exception as e:  # pragma: no cover - monitoring is non-critical
         logger.warning("monitor.observe_answer failed: %s", e)
 
 
-def _monitor_codegen(report: Optional[Dict[str, Any]]) -> None:
+def _monitor_codegen(report: Optional[Dict[str, Any]],
+                     *, run_id: Optional[str] = None) -> None:
     """Feed a ``codegen_report`` to the AIOps repair-health monitor."""
     if not isinstance(report, dict):
         return
     try:
         from cgx.monitor import get_default_monitor
-        get_default_monitor().observe_codegen(report)
+        get_default_monitor().observe_codegen(report, run_id=run_id)
     except Exception as e:  # pragma: no cover - monitoring is non-critical
         logger.warning("monitor.observe_codegen failed: %s", e)
 
@@ -156,6 +160,11 @@ def stream_ask(
 ) -> Iterator[Event]:
     """Stream thoughts then the grounded answer with sources + meta."""
     logger.info("stream_ask: question=%r model=%s", question[:80], model)
+    # Provenance join key for this execution: stamped into the returned meta
+    # (so the client can attach feedback to it) and onto the trace context
+    # (so llm_trace stamps the same run_id onto every LLM_CALL of this run).
+    run_id = new_run_id()
+    set_trace_context(run_id=run_id)
     try:
         prov = _resolve_provider(
             use_profile=use_profile, profile_name=profile_name, kind=kind,
@@ -283,11 +292,18 @@ def stream_ask(
     answer_md = stringify(result.get("answer_md", ""))
     sources = json_safe((result.get("debug") or {}).get("sources", []))
     meta = json_safe({k: v for k, v in result.items() if k != "debug"})
+    meta.setdefault("run_id", run_id)
+    meta.setdefault("model", model)
+    try:
+        meta.setdefault("prompt_version",
+                        register_known_prompts().version_of(f"ask_stream:{mode}"))
+    except Exception:  # pragma: no cover - provenance is best-effort
+        pass
     logger.info(
         "stream_ask: answer ready len=%d sources=%d delta_tokens=%d",
         len(answer_md), len(sources), answer_delta_tokens,
     )
-    _monitor_answer(result)
+    _monitor_answer(result, run_id=run_id)
     yield "answer", {"answer_md": answer_md, "sources": sources, "meta": meta}
 
 
@@ -302,6 +318,8 @@ def stream_plan(
 ) -> Iterator[Event]:
     """Stream sketch thoughts, then the generated plan + structured diffs."""
     logger.info("stream_plan: task=%r self_test=%s model=%s", task[:80], self_test, model)
+    run_id = new_run_id()
+    set_trace_context(run_id=run_id)
     try:
         prov = _resolve_provider(
             use_profile=use_profile, profile_name=profile_name, kind=kind,
@@ -359,14 +377,17 @@ def stream_plan(
 
     diffs = diffs_payload(out.get("diffs") or [])
     logger.info("stream_plan: plan ready diffs=%d", len(diffs))
-    _monitor_codegen(out.get("codegen_report"))
+    _monitor_codegen(out.get("codegen_report"), run_id=run_id)
+    meta = json_safe({k: v for k, v in out.items()
+                      if k not in {"debug", "diffs", "plan_md",
+                                   "codegen_report"}})
+    meta.setdefault("run_id", run_id)
+    meta.setdefault("model", model)
     yield "plan", {
         "plan_md": stringify(out.get("plan_md", "")),
         "diffs": diffs,
         "report": report_summary(out.get("codegen_report")),
-        "meta": json_safe({k: v for k, v in out.items()
-                           if k not in {"debug", "diffs", "plan_md",
-                                        "codegen_report"}}),
+        "meta": meta,
     }
 
 
