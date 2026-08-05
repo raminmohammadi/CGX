@@ -3289,8 +3289,9 @@ _SINGLE_FILE_SYSTEM = (
     '{"content": "complete file content as a string"}\n\n'
     "Rules:\n"
     "- Output the full file -- no stubs, no placeholders, no ellipsis.\n"
+    "- If you use standard libraries or external packages (e.g., sqlite3, os, React), you MUST explicitly import them at the top of the file. Do not leave undefined names.\n"
     "- Use imports consistent with what already exists in the project.\n"
-    "- ONLY import local modules/components if they are explicitly part of the project or provided in the context. Do NOT hallucinate imports for files that do not exist.\n"
+    "- ONLY import local modules/components if they are explicitly listed in the PROJECT MANIFEST. You are FORBIDDEN from importing ANY local file or component that is not in the PROJECT MANIFEST.\n"
     "- Pay close attention to relative import paths (e.g., `./` vs `../`).\n"
     "- Do not repeat or regenerate any already-existing file.\n"
     "- The content MUST be functionally different from every file in "
@@ -4141,7 +4142,7 @@ def generate_single_scaffold_file(
                 syntax_ok = False
                 syntax_error = (
                     f"uses undefined name(s) {unbound}: never imported, "
-                    "assigned, or defined anywhere in this file")
+                    "assigned, or defined anywhere in this file. YOU MUST IMPORT IT AT THE TOP OF THE FILE. Regenerate the file with the missing imports added.")
                 content = ""
 
     # Test-collectability gate: a pytest module that parses cleanly but
