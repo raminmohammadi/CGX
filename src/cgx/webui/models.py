@@ -22,7 +22,7 @@ class ProviderConfig(BaseModel):
 
     use_profile: bool = False
     profile_name: Optional[str] = None
-    kind: str = "ollama"  # "ollama" | "openai-compat" | "gemini" | "custom"
+    kind: str = "ollama"  # "ollama" | "openai-compat" | "gemini" | "huggingface" | "custom"
     model: str = "qwen2.5-coder:3b"
     base_url: str = "http://localhost:11434"
     api_key: Optional[str] = None
@@ -66,6 +66,9 @@ class IndexBuildRequest(BaseModel):
 class AskRequest(BaseModel):
     question: str
     session_id: Optional[str] = None
+    # When set, this run's llm_call trace records route to the project-local
+    # <project_root>/.cgx/agent.log instead of the global fallback trace log.
+    project_root: Optional[str] = None
     index: IndexLocation = Field(default_factory=IndexLocation)
     provider: ProviderConfig = Field(default_factory=ProviderConfig)
 
@@ -79,9 +82,53 @@ class PlanRequest(BaseModel):
     provider: ProviderConfig = Field(default_factory=ProviderConfig)
 
 
+class FeedbackRequest(BaseModel):
+    """A thumbs up/down (+ optional comment) on an ask/plan result.
+
+    ``run_id`` and the version fields are echoed back from the ``meta`` the
+    ask/plan stream returned, so a rating joins to the exact execution.
+    """
+
+    rating: str  # "up" | "down"
+    run_id: Optional[str] = None
+    session_id: Optional[str] = None
+    kind: str = "ask"  # "ask" | "plan"
+    comment: Optional[str] = None
+    question: Optional[str] = None
+    answer_preview: Optional[str] = None
+    model: Optional[str] = None
+    prompt_version: Optional[str] = None
+    labels: Dict[str, Any] = Field(default_factory=dict)
+
+
+# --------------------- data governance (Subsystem M) ---------------------
+
+class GovPurgeRequest(BaseModel):
+    """Trigger a TTL retention sweep.
+
+    ``retention_days`` overrides the ambient ``CGX_RETENTION_DAYS`` policy for
+    this one sweep; when omitted the env-resolved policy is used.
+    """
+
+    retention_days: Optional[int] = None
+
+
+class GovEraseRequest(BaseModel):
+    """Right-to-erasure by ``run_id`` or ``owner`` (exactly one required)."""
+
+    run_id: Optional[str] = None
+    owner: Optional[str] = None
+
+
+class GovScanRequest(BaseModel):
+    """Audit a snippet of text for PII, returning counts + a scrubbed preview."""
+
+    text: str
+
+
 class ProfileUpsertRequest(BaseModel):
     name: str
-    kind: str = "ollama"  # "ollama" | "openai-compat" | "gemini" | "custom"
+    kind: str = "ollama"  # "ollama" | "openai-compat" | "gemini" | "huggingface" | "custom"
     model: str = "qwen2.5-coder:3b"
     base_url: str = "http://localhost:11434"
     api_key: Optional[str] = None
@@ -266,6 +313,10 @@ class HardwareMatrixRow(BaseModel):
     fit: str
     reason: str
     notes: str
+    # True when the tag is currently installed in the local Ollama daemon
+    # (either a catalogue entry the user has pulled, or an installed-only
+    # model appended to the matrix so the table reflects what's on disk).
+    installed: bool = False
 
 
 class TradeoffRow(BaseModel):
@@ -279,3 +330,20 @@ class HardwareMatrixResponse(BaseModel):
     hardware: HardwareInfo
     rows: List[HardwareMatrixRow]
     tradeoffs: List[TradeoffRow]
+
+
+class HfModelFitResponse(BaseModel):
+    """Spec + hardware verdict for a single Hugging Face repo (fit check)."""
+    repo: str
+    params_b: float = 0.0
+    # How ``params_b`` was determined: "safetensors" (exact from the Hub),
+    # "name" (parsed from the repo id), or "unknown".
+    params_source: str = "unknown"
+    min_ram_gb: float = 0.0
+    rec_vram_gb: float = 0.0
+    ctx_window: int = 0
+    fit: str = "unknown"
+    reason: str = ""
+    pipeline_tag: Optional[str] = None
+    gated: bool = False
+    hardware: HardwareInfo = Field(default_factory=HardwareInfo)

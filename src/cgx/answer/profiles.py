@@ -40,7 +40,7 @@ KEYRING_SERVICE = "cgx"
 #: extra ordering quality is worth the cost. Local kinds (``ollama``) and
 #: bring-your-own-server kinds (``custom``) stay off by default to honour the
 #: air-gapped / zero-extra-dep posture; users can still opt in per profile.
-_CLOUD_KINDS: tuple = ("openai-compat", "gemini")
+_CLOUD_KINDS: tuple = ("openai-compat", "gemini", "huggingface")
 
 
 def default_reranker_for_kind(kind: str) -> bool:
@@ -54,7 +54,7 @@ def default_reranker_for_kind(kind: str) -> bool:
 @dataclass
 class Profile:
     name: str
-    kind: str  # "ollama" | "openai-compat" | "gemini" | "custom"
+    kind: str  # "ollama" | "openai-compat" | "gemini" | "huggingface" | "custom"
     model: str
     base_url: str
     temperature: float = 0.2

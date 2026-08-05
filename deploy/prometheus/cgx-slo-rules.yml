@@ -1,0 +1,151 @@
+# Prometheus recording + alerting rules for CGX SLOs.
+#
+# Scrape target: the CGX web server's ``/api/metrics`` endpoint (Prometheus
+# text format, no client library needed). Liveness/readiness are at the root
+# ``/healthz`` and ``/readyz``; ``cgx_ready`` mirrors readiness as a gauge.
+#
+# Load into Prometheus via ``rule_files`` in prometheus.yml, e.g.:
+#   rule_files:
+#     - /etc/prometheus/rules/cgx-slo-rules.yml
+#
+# SLO targets (edit to taste):
+#   - Availability : 99.5% of HTTP requests non-5xx (30d window).
+#   - Latency      : 95% of requests < 1s (per route).
+#   - LLM success  : 99% of LLM calls succeed.
+groups:
+  - name: cgx_sli_recording
+    interval: 30s
+    rules:
+      # --- HTTP RED SLIs -------------------------------------------------
+      - record: cgx:http_requests:rate5m
+        expr: sum(rate(cgx_http_requests_total[5m]))
+
+      - record: cgx:http_errors:rate5m
+        expr: sum(rate(cgx_http_requests_total{status=~"5.."}[5m]))
+
+      - record: cgx:http_error_ratio:rate5m
+        expr: |
+          sum(rate(cgx_http_requests_total{status=~"5.."}[5m]))
+            / clamp_min(sum(rate(cgx_http_requests_total[5m])), 1e-9)
+
+      # p95 request latency per route (buckets are in milliseconds).
+      - record: cgx:http_latency_ms:p95_5m
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le, route) (rate(cgx_http_request_duration_ms_bucket[5m]))
+          )
+
+      # --- LLM SLIs ------------------------------------------------------
+      - record: cgx:llm_calls:rate5m
+        expr: sum(rate(cgx_llm_calls_total[5m]))
+
+      - record: cgx:llm_error_ratio:rate5m
+        expr: |
+          sum(rate(cgx_llm_calls_total{outcome="error"}[5m]))
+            / clamp_min(sum(rate(cgx_llm_calls_total[5m])), 1e-9)
+
+      - record: cgx:llm_latency_ms:p95_5m
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le, model) (rate(cgx_llm_call_latency_ms_bucket[5m]))
+          )
+
+      # --- Cost / usage --------------------------------------------------
+      - record: cgx:llm_cost_usd:rate1h
+        expr: sum by (provider, model) (rate(cgx_llm_cost_usd_total[1h]))
+
+  - name: cgx_slo_alerts
+    rules:
+      # Readiness: /readyz reports a critical subsystem down.
+      - alert: CgxNotReady
+        expr: cgx_ready == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "CGX readiness probe failing"
+          description: "cgx_ready has been 0 for >2m (a critical subsystem is down)."
+
+      # Availability SLO: fast-burn (2% budget in 1h) on a 99.5% target.
+      - alert: CgxHighErrorRateFastBurn
+        expr: cgx:http_error_ratio:rate5m > (14.4 * 0.005)
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "CGX 5xx error ratio burning error budget fast"
+          description: "5m error ratio {{ $value | humanizePercentage }} exceeds 14.4x the 0.5% budget."
+
+      # Latency SLO: p95 request latency over 1s for a sustained window.
+      - alert: CgxHighLatencyP95
+        expr: max(cgx:http_latency_ms:p95_5m) > 1000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "CGX p95 request latency high"
+          description: "p95 request latency {{ $value }}ms exceeds the 1000ms objective for 10m."
+
+      # LLM reliability SLO: >1% of LLM calls erroring.
+      - alert: CgxLlmErrorRateHigh
+        expr: cgx:llm_error_ratio:rate5m > 0.01
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "CGX LLM call error ratio high"
+          description: "LLM error ratio {{ $value | humanizePercentage }} exceeds the 1% objective for 10m."
+
+  # --- AIOps quality / drift / cost monitors ---------------------------
+  # These fire on the ``cgx_monitor_alerts_total`` counter emitted by
+  # ``cgx.monitor`` (groundedness, repair-loop health, retrieval/embedding
+  # drift, provider cost/error anomalies). The in-process store keeps the
+  # full alert detail for the admin page; these rules page on sustained rate.
+  - name: cgx_aiops_alerts
+    rules:
+      # Any critical monitor alert (repair_failed, provider_error_rate,
+      # citation_invalid at <50% coverage) recurring over a short window.
+      - alert: CgxAiopsCriticalAlerts
+        expr: sum(rate(cgx_monitor_alerts_total{severity="critical"}[15m])) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "CGX AIOps critical monitor alerts firing"
+          description: "One or more critical quality/cost monitors have fired in the last 15m."
+
+      # Ungrounded / invalid-citation answers trending up: a retrieval or
+      # prompt regression usually shows here before users complain.
+      - alert: CgxGroundednessDegraded
+        expr: |
+          sum(rate(cgx_monitor_alerts_total{code=~"citation_invalid|ungrounded_answer"}[30m])) > 0.1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "CGX answer groundedness degrading"
+          description: "Invalid-citation/ungrounded answers rising over 30m -- check retrieval + prompts."
+
+      # Repair loop churn/failure: codegen self-test not converging.
+      - alert: CgxRepairLoopUnhealthy
+        expr: |
+          sum(rate(cgx_monitor_alerts_total{code=~"repair_failed|repair_loop_churn"}[30m])) > 0.05
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "CGX codegen repair loop unhealthy"
+          description: "Repair failures/churn rising over 30m -- inspect codegen reports."
+
+      # Cost or embedding/retrieval drift detected.
+      - alert: CgxDriftOrCostAnomaly
+        expr: |
+          sum(rate(cgx_monitor_alerts_total{code=~"cost_spike|embedding_model_drift|retrieval_score_drift"}[1h])) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "CGX drift or cost anomaly detected"
+          description: "A cost spike or retrieval/embedding drift monitor fired in the last hour."

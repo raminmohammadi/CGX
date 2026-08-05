@@ -16,7 +16,8 @@ inference which is what Ollama serves by default.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+import re
+from typing import Any, Dict, List, Optional, Tuple
 
 
 # (name, params_b, min_ram_gb, recommended_vram_gb, ctx_window, family, notes)
@@ -157,6 +158,98 @@ def compute_local_fit(hw: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any
     rows.sort(key=lambda r: (_family_order.get(r["family"], 99),
                              r["params_b"], r["model"]))
     return rows
+
+
+# Size hint embedded in a model tag / repo id, e.g. ``7b``, ``1.5B``,
+# ``e4b`` (→ 4), ``qwen2.5-coder:7b-instruct`` (→ 7). A trailing ``b`` word
+# boundary keeps it from matching version numbers like ``qwen2.5``.
+_SIZE_HINT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*b\b", re.IGNORECASE)
+
+
+def params_from_name(name: str) -> float:
+    """Best-effort parameter count (in billions) parsed from a model name.
+
+    Used for models that aren't in :data:`LOCAL_MODEL_CATALOG` -- an
+    installed Ollama tag or a Hugging Face repo id -- so the fit table can
+    still size them. Returns ``0.0`` when no ``<N>b`` hint is present.
+    """
+    m = _SIZE_HINT_RE.search(name or "")
+    return float(m.group(1)) if m else 0.0
+
+
+def parse_parameter_size(value: Optional[str]) -> float:
+    """Parse Ollama's ``details.parameter_size`` (e.g. ``"7.6B"``) to billions.
+
+    Returns ``0.0`` when the value is missing or unparseable.
+    """
+    if not value:
+        return 0.0
+    m = re.search(r"(\d+(?:\.\d+)?)\s*([bmk])?", str(value).strip(), re.IGNORECASE)
+    if not m:
+        return 0.0
+    n = float(m.group(1))
+    unit = (m.group(2) or "b").lower()
+    if unit == "m":
+        return round(n / 1000.0, 3)
+    if unit == "k":
+        return round(n / 1_000_000.0, 6)
+    return n
+
+
+def estimate_requirements(params_b: float) -> Tuple[float, float]:
+    """Approximate (min_ram_gb, recommended_vram_gb) for a 4-bit quant model.
+
+    Calibrated against :data:`LOCAL_MODEL_CATALOG` so estimated rows line up
+    with the hand-curated ones: ~0.55 GB of weights per billion params plus
+    KV-cache / runtime overhead. Meant for UI sizing, not capacity planning.
+    """
+    if params_b <= 0:
+        return (0.0, 0.0)
+    rec_vram = round(params_b * 1.1 + 0.7, 1)
+    min_ram = round(params_b * 1.3 + 2.5, 1)
+    return (min_ram, rec_vram)
+
+
+def make_fit_row(
+    name: str,
+    params_b: float,
+    hw: Optional[Dict[str, Any]] = None,
+    *,
+    family: str = "general",
+    ctx_window: int = 0,
+    notes: str = "",
+    min_ram_gb: Optional[float] = None,
+    rec_vram_gb: Optional[float] = None,
+    installed: bool = False,
+) -> Dict[str, Any]:
+    """Build a single fit-matrix row for an arbitrary model.
+
+    Reuses :func:`_verdict` so installed Ollama tags and Hugging Face repos
+    are scored the same way as the static catalogue. When ``min_ram_gb`` /
+    ``rec_vram_gb`` aren't supplied they're derived from ``params_b`` via
+    :func:`estimate_requirements`. A ``params_b`` of ``0`` yields an
+    ``unknown`` verdict rather than a misleading "fits".
+    """
+    hw = hw or {}
+    est_ram, est_vram = estimate_requirements(params_b)
+    min_ram_gb = est_ram if min_ram_gb is None else min_ram_gb
+    rec_vram_gb = est_vram if rec_vram_gb is None else rec_vram_gb
+    if params_b <= 0:
+        v = {"fit": "unknown", "reason": "parameter count could not be determined"}
+    else:
+        v = _verdict({"min_ram_gb": min_ram_gb, "recommended_vram_gb": rec_vram_gb}, hw)
+    return {
+        "model": name,
+        "params_b": params_b,
+        "min_ram_gb": min_ram_gb,
+        "rec_vram_gb": rec_vram_gb,
+        "ctx_window": ctx_window,
+        "family": family,
+        "fit": v["fit"],
+        "reason": v["reason"],
+        "notes": notes,
+        "installed": installed,
+    }
 
 
 # Local-vs-cloud trade-offs. Pure editorial summary; no live numbers, no

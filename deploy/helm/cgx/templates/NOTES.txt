@@ -1,0 +1,21 @@
+CGX has been deployed as release "{{ .Release.Name }}".
+
+1. Wait for the pod to become ready:
+   kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "cgx.fullname" . }}
+
+2. Reach the web UI:
+{{- if .Values.ingress.enabled }}
+   Ingress:
+   {{- range .Values.ingress.hosts }}
+     http{{ if $.Values.ingress.tls }}s{{ end }}://{{ .host }}
+   {{- end }}
+{{- else if eq .Values.service.type "ClusterIP" }}
+   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "cgx.fullname" . }} 8765:{{ .Values.service.port }}
+   then open http://127.0.0.1:8765
+{{- else }}
+   Service type is {{ .Values.service.type }} -- resolve its external address with:
+   kubectl -n {{ .Release.Namespace }} get svc {{ include "cgx.fullname" . }}
+{{- end }}
+
+Probes: liveness {{ .Values.probes.liveness.path }}, readiness {{ .Values.probes.readiness.path }}.
+Metrics: /api/metrics{{ if .Values.serviceMonitor.enabled }} (scraped via ServiceMonitor){{ end }}.

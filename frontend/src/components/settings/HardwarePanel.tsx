@@ -1,19 +1,63 @@
 import { useEffect, useState } from "react";
-import { AlertTriangle, CheckCircle, Microchip, RefreshCcw, XCircle } from "lucide-react";
-import { api, type HardwareMatrixResponse } from "../../lib/api";
+import {
+  AlertTriangle,
+  CheckCircle,
+  Cpu,
+  Gauge,
+  HardDrive,
+  Loader2,
+  Microchip,
+  RefreshCcw,
+  Search,
+  XCircle,
+} from "lucide-react";
+import { api, type HardwareMatrixResponse, type HfModelFit } from "../../lib/api";
+import { useWorkspace } from "../../store/workspace";
 import { Card, CardHeader } from "../Card";
+import { Pill } from "../Pill";
 import { StatCard } from "../StatCard";
+import { TextInput } from "../Input";
+
+// GGUF / Ollama models live in the local daemon, so the installed-model probe
+// targets the active Ollama host (or localhost when a cloud provider is set).
+const DEFAULT_OLLAMA_BASE_URL = "http://localhost:11434";
 
 export function HardwarePanel() {
+  const provider = useWorkspace((s) => s.provider);
+  const ollamaBaseUrl =
+    provider.kind === "ollama" && provider.base_url ? provider.base_url : DEFAULT_OLLAMA_BASE_URL;
+
   const [data, setData] = useState<HardwareMatrixResponse | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // Ad-hoc Hugging Face fit checker: paste a repo id, size it against the
+  // detected hardware budget without pulling anything.
+  const [hfRepo, setHfRepo] = useState("");
+  const [hfFit, setHfFit] = useState<HfModelFit | null>(null);
+  const [hfBusy, setHfBusy] = useState(false);
+  const [hfError, setHfError] = useState<string | null>(null);
+
+  const checkHfFit = async () => {
+    const repo = hfRepo.trim();
+    if (!repo) return;
+    setHfBusy(true);
+    setHfError(null);
+    setHfFit(null);
+    try {
+      setHfFit(await api.hfFit(repo));
+    } catch (e: any) {
+      setHfError(String(e?.message || e));
+    } finally {
+      setHfBusy(false);
+    }
+  };
 
   const load = async () => {
     setBusy(true);
     setError(null);
     try {
-      const d = await api.hardwareMatrix();
+      const d = await api.hardwareMatrix(ollamaBaseUrl);
       setData(d);
     } catch (e: any) {
       setError(String(e?.message || e));
@@ -24,17 +68,19 @@ export function HardwarePanel() {
 
   useEffect(() => {
     load();
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ollamaBaseUrl]);
 
   const ram = data?.hardware?.ram_gb;
   const vram = data?.hardware?.gpu_vram_gb;
+  const installedCount = data?.rows?.filter((r) => r.installed).length ?? 0;
 
   return (
     <div className="space-y-6">
       <CardHeader
         eyebrow="Hardware"
         title="Hardware-Aware Local Catalog"
-        description="Cross-references localized system resources directly against 4-bit quantized GGUF inference thresholds."
+        description="Cross-references localized system resources directly against 4-bit quantized GGUF inference thresholds. Models you've already pulled into Ollama are flagged as Downloaded."
         right={
           <button onClick={load} disabled={busy} className="av-btn-primary">
             <Microchip className="h-3 w-3" />
@@ -43,7 +89,7 @@ export function HardwarePanel() {
         }
       />
 
-      <div className="grid grid-cols-3 gap-3">
+      <div className="grid grid-cols-4 gap-3">
         <StatCard label="System RAM" value={ram != null ? `${ram.toFixed(1)} GB` : "--"} tone="neon" />
         <StatCard
           label="GPU VRAM"
@@ -51,6 +97,11 @@ export function HardwarePanel() {
           tone={vram != null ? "neon" : "slate"}
         />
         <StatCard label="Catalog rows" value={data ? `${data.rows.length}` : "--"} tone="slate" />
+        <StatCard
+          label="Installed"
+          value={data ? `${installedCount}` : "--"}
+          tone={installedCount > 0 ? "neon" : "slate"}
+        />
       </div>
 
       <div className="bg-surface rounded-xl border border-muted overflow-hidden">
@@ -62,17 +113,27 @@ export function HardwarePanel() {
               <th className="p-3 text-[10px]">Min RAM</th>
               <th className="p-3 text-[10px]">Rec VRAM</th>
               <th className="p-3 text-[10px]">Family</th>
+              <th className="p-3 text-[10px]">Status</th>
               <th className="p-3 text-[10px]">Fit</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-white/5 text-slate-300">
             {data?.rows?.map((r) => (
-              <tr key={r.model} title={r.reason}>
+              <tr key={r.model} title={r.reason} className={r.installed ? "bg-emerald-500/5" : undefined}>
                 <td className="p-3 font-semibold text-white">{r.model}</td>
-                <td className="p-3">{r.params_b.toFixed(1)}B</td>
-                <td className="p-3">{r.min_ram_gb.toFixed(1)} GB</td>
-                <td className="p-3">{r.rec_vram_gb.toFixed(1)} GB</td>
+                <td className="p-3">{r.params_b > 0 ? `${r.params_b.toFixed(1)}B` : "—"}</td>
+                <td className="p-3">{r.min_ram_gb > 0 ? `${r.min_ram_gb.toFixed(1)} GB` : "—"}</td>
+                <td className="p-3">{r.rec_vram_gb > 0 ? `${r.rec_vram_gb.toFixed(1)} GB` : "—"}</td>
                 <td className="p-3 text-slate-400">{r.family}</td>
+                <td className="p-3">
+                  {r.installed ? (
+                    <Pill tone="neon">
+                      <HardDrive className="h-3 w-3" /> Downloaded
+                    </Pill>
+                  ) : (
+                    <span className="text-slate-600">—</span>
+                  )}
+                </td>
                 <td className={`p-3 font-medium ${fitColor(r.fit)}`}>
                   <span className="flex items-center gap-1.5">
                     <FitIcon fit={r.fit} />
@@ -84,7 +145,7 @@ export function HardwarePanel() {
             ))}
             {!data?.rows?.length && (
               <tr>
-                <td colSpan={6} className="p-6 text-center text-slate-500">
+                <td colSpan={7} className="p-6 text-center text-slate-500">
                   {busy ? "Loading…" : error || "No catalog rows."}
                 </td>
               </tr>
@@ -92,6 +153,41 @@ export function HardwarePanel() {
           </tbody>
         </table>
       </div>
+
+      <Card padded>
+        <CardHeader
+          eyebrow="Hugging Face"
+          title="Test a Hugging Face model"
+          description="Paste any Hub repo id (e.g. Qwen/Qwen2.5-Coder-7B-Instruct) to estimate its requirements and check them against your hardware before pulling."
+        />
+        <form
+          className="flex gap-2 mt-2"
+          onSubmit={(e) => {
+            e.preventDefault();
+            checkHfFit();
+          }}
+        >
+          <div className="relative flex-1">
+            <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-slate-500" />
+            <TextInput
+              value={hfRepo}
+              onChange={(e) => setHfRepo(e.target.value)}
+              placeholder="owner/repo"
+              className="w-full pl-8 font-mono text-xs"
+            />
+          </div>
+          <button type="submit" className="av-btn-primary whitespace-nowrap" disabled={hfBusy || !hfRepo.trim()}>
+            {hfBusy ? <Loader2 className="h-3 w-3 animate-spin" /> : <Gauge className="h-3 w-3" />}
+            Check fit
+          </button>
+        </form>
+        {hfError && <p className="text-xs text-red-400 font-mono mt-2">{hfError}</p>}
+        {hfFit && (
+          <div className="mt-3">
+            <FitResult fit={hfFit} />
+          </div>
+        )}
+      </Card>
 
       <Card padded>
         <CardHeader title="Local-First vs Cloud Trade-offs" eyebrow="Matrix" />
@@ -139,6 +235,49 @@ function FitIcon({ fit }: { fit: string }) {
   if (f.includes("fits")) return <CheckCircle className="h-3.5 w-3.5 text-emerald-400 shrink-0" />;
   if (f.includes("tight")) return <AlertTriangle className="h-3.5 w-3.5 text-amber-400 shrink-0" />;
   return <XCircle className="h-3.5 w-3.5 text-red-400 shrink-0" />;
+}
+
+// Inline spec + hardware verdict rendered under the HF fit checker.
+function FitResult({ fit }: { fit: HfModelFit }) {
+  const ram = fit.hardware?.ram_gb;
+  const vram = fit.hardware?.gpu_vram_gb;
+  const paramsLabel =
+    fit.params_b > 0
+      ? `${fit.params_b.toFixed(1)}B${fit.params_source === "name" ? " (est.)" : ""}`
+      : "unknown";
+  return (
+    <div className="bg-slate-950 rounded-lg border border-white/5 p-3 space-y-2">
+      <div className={`flex items-center gap-1.5 text-xs font-medium ${fitColor(fit.fit)}`}>
+        {fit.fit.toLowerCase().includes("unknown") ? (
+          <Cpu className="h-3.5 w-3.5 shrink-0" />
+        ) : (
+          <FitIcon fit={fit.fit} />
+        )}
+        <span className="uppercase font-mono">{fit.fit}</span>
+        <span className="text-slate-500 font-mono text-[10px]">— {fit.reason}</span>
+      </div>
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-[10px] font-mono">
+        <Spec label="Params" value={paramsLabel} />
+        <Spec label="Min RAM" value={fit.min_ram_gb > 0 ? `${fit.min_ram_gb.toFixed(1)} GB` : "—"} />
+        <Spec label="Rec VRAM" value={fit.rec_vram_gb > 0 ? `${fit.rec_vram_gb.toFixed(1)} GB` : "—"} />
+        <Spec
+          label="Your budget"
+          value={`${ram != null ? `${ram.toFixed(0)}G RAM` : "?"} / ${
+            vram != null ? `${vram.toFixed(0)}G VRAM` : "no GPU"
+          }`}
+        />
+      </div>
+    </div>
+  );
+}
+
+function Spec({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="bg-slate-900/60 px-2 py-1.5 rounded border border-white/5">
+      <p className="text-slate-500">{label}</p>
+      <p className="text-slate-200 truncate">{value}</p>
+    </div>
+  );
 }
 
 function winnerClasses(winner: string): string {

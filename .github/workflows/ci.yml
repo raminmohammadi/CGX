@@ -92,6 +92,35 @@ jobs:
         run: |
           pytest -q
 
+  eval:
+    name: Eval gate (Python 3.11)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install core deps (no torch / transformers)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -e ".[dev,codegen,parsers]"
+
+      # The gate always exercises the codegen eval (diff parse -> in-memory
+      # apply -> syntax check) against the pinned golden set. The retrieval
+      # eval self-skips when faiss is absent (as it is in this core install),
+      # so the gate stays green here and the full retrieval scoring runs in the
+      # ML job's pytest. A non-zero exit fails the merge on quality regressions.
+      - name: Run eval gate
+        env:
+          CGX_CONFIG_DIR: ${{ runner.temp }}/cgx-config
+        run: |
+          python -m cgx.eval
+
   frontend:
     name: Frontend (Node 20)
     runs-on: ubuntu-latest

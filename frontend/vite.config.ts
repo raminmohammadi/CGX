@@ -19,6 +19,9 @@ export default defineConfig({
         target: "http://127.0.0.1:8765",
         changeOrigin: true,
       },
+      // Kubernetes-style probes live at the root, not under /api.
+      "/healthz": { target: "http://127.0.0.1:8765", changeOrigin: true },
+      "/readyz": { target: "http://127.0.0.1:8765", changeOrigin: true },
     },
   },
   build: {

@@ -55,10 +55,11 @@ def build_provider(
 ) -> LLMProvider:
     """Construct a provider with per-call overrides for temperature/tokens.
 
-    Supports four kinds:
+    Supports five kinds:
       - ``ollama``       -- local Ollama server
       - ``openai-compat``-- OpenAI or any /v1/chat/completions-compatible API
       - ``gemini``       -- Google Gemini via REST
+      - ``huggingface``  -- Hugging Face Inference Providers (OpenAI-compatible router)
       - ``custom``       -- OpenAI-compatible with custom host, path, and optional auth-bypass
     """
     ollama_opts: Dict[str, Any] = {"temperature": float(temperature),
@@ -81,6 +82,23 @@ def build_provider(
         return GeminiProvider(
             model=model or "gemini-2.5-flash",
             api_key=api_key or "",
+            **rl_kwargs,
+        )
+
+    if kind == "huggingface":
+        # Hugging Face Inference Providers expose an OpenAI-compatible router at
+        # https://router.huggingface.co/v1, so ``OpenAICompatProvider`` works
+        # verbatim. The only HF-specifics are the fixed host and the ``hf_...``
+        # bearer token, which we also accept from the standard HF env vars so a
+        # user who exported one doesn't have to paste it into a profile.
+        hf_key = (api_key or os.environ.get("HF_TOKEN")
+                  or os.environ.get("HUGGINGFACEHUB_API_TOKEN") or None)
+        return OpenAICompatProvider(
+            model=model,
+            base_url="https://router.huggingface.co",
+            api_key=hf_key,
+            extra_options=openai_opts,
+            endpoint_path="/v1/chat/completions",
             **rl_kwargs,
         )
 

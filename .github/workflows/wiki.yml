@@ -1,0 +1,69 @@
+name: Wiki
+
+# Mirror the tracked wiki/ folder to the repository's GitHub Wiki
+# (the companion <repo>.wiki.git). Editing the wiki here -- under version
+# control and code review -- is the source of truth; this job pushes the
+# folder contents to the wiki on every change to main so the rendered Wiki
+# tab stays in sync. The wiki repo is pushable with the default GITHUB_TOKEN
+# once "contents: write" is granted.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "wiki/**"
+      - ".github/workflows/wiki.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# Serialize wiki pushes so two commits landing close together can't race
+# each other into a rejected non-fast-forward push.
+concurrency:
+  group: wiki
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish wiki
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Sync wiki/ and push to the Wiki repo
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          wiki_url="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.wiki.git"
+
+          # The wiki repo does not exist until the first page is created via
+          # the UI. Clone it if present; otherwise start a fresh repo that we
+          # push to create it.
+          if git clone "$wiki_url" wiki-repo 2>/dev/null; then
+            echo "Cloned existing wiki repo."
+          else
+            echo "Wiki repo empty or missing -- initializing a new one."
+            git init wiki-repo
+            git -C wiki-repo remote add origin "$wiki_url"
+          fi
+
+          # Mirror the folder contents (delete pages removed from wiki/),
+          # preserving the wiki repo's own .git directory.
+          rsync -a --delete --exclude='.git' wiki/ wiki-repo/
+
+          cd wiki-repo
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "No wiki changes to publish."
+            exit 0
+          fi
+
+          git commit -m "Sync wiki from ${GITHUB_SHA}"
+          # The default branch of a GitHub wiki repo is "master".
+          git push origin HEAD:master

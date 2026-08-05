@@ -3,7 +3,7 @@
 CGX is model-agnostic. Every generation path (Ask, Plan, Agent) talks to
 an `LLMProvider` through a uniform `chat()` / `chat_stream()` interface,
 so switching backends never changes the rest of the system. This page
-covers the four provider types and the hardware-aware model picker.
+covers the provider types and the hardware-aware model picker.
 
 ---
 
@@ -15,6 +15,7 @@ covers the four provider types and the hardware-aware model picker.
 | **OpenAI (cloud)**     | `openai`                    | `https://api.openai.com` |
 | **OpenAI-compatible**  | `openai-compat`             | Any `/v1/chat/completions` endpoint (Groq, Together, DeepSeek, vLLM, …) |
 | **Google Gemini**      | `gemini`                    | `generativelanguage.googleapis.com` |
+| **Hugging Face**       | `huggingface`               | `router.huggingface.co` (OpenAI-compatible Inference Providers) |
 | **Custom server**      | `custom`                    | Your self-hosted endpoint (custom path, optional auth-bypass) |
 
 Choose a provider from the **Setup** tab's *Provider Type* dropdown, or
@@ -52,6 +53,43 @@ from cgx.answer.providers import GeminiProvider
 prov = GeminiProvider(model="gemini-1.5-flash", api_key="YOUR_KEY")
 # or set GEMINI_API_KEY and omit api_key
 ```
+
+## Hugging Face Inference (cloud)
+
+Set **Provider Type → Hugging Face (Cloud)**, paste a Hugging Face token
+(`hf_…`), and pick a model. HF's **Inference Providers** expose an
+OpenAI-compatible router at `https://router.huggingface.co/v1`, so CGX
+reuses `OpenAICompatProvider` verbatim — the host and endpoint path are
+hardcoded and only the token varies. The token is also read from the
+`HF_TOKEN` / `HUGGINGFACEHUB_API_TOKEN` environment variables when not
+supplied inline.
+
+The model dropdown is populated from the router's **public**
+`/v1/models` list (no token required to browse), so you can see what's
+available before pasting a key; the token is only needed for the actual
+inference call. Ping validates the token with a 1-token completion when a
+model is set, or falls back to the public model list otherwise.
+
+### Browse Hugging Face → pull GGUFs locally
+
+The **Settings → Browse Hugging Face** panel lists GGUF repositories from
+the Hub (`huggingface.co/api/models?filter=gguf`) with live search, sort
+(trending / downloads / likes / recently updated), download and like
+counts, and detected quantization labels. **Pull** hands the tag to your
+local Ollama daemon via the existing `hf.co/<repo>[:<quant>]` mechanism
+and streams progress through the shared `PullProgress` bar — no HF token
+required, since the download goes through Ollama.
+
+Once the download completes, the model is **re-aliased to a clean local
+name** so it isn't stored under the full `hf.co/…` web address:
+`hf.co/ornith-ai/Ornith-1.0-9B-GGUF` becomes `Ornith-1.0-9B-GGUF` (with
+the chosen quant as the tag, e.g. `…:q4_k_m`). The panel derives this
+name from the repo id and passes it as the optional `local_name` on
+`POST /api/ollama/pull`; the backend then runs Ollama's `POST /api/copy`
+followed by `DELETE /api/delete` (instant — no re-download) and reports
+the final name back over the progress stream ("Download complete — saved
+as `<name>`"). The re-alias is best-effort: if it fails, the original tag
+is kept and the download is never reported as an error.
 
 ## Custom server (OpenAI-compatible)
 

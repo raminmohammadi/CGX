@@ -34,6 +34,7 @@ Pick the path that matches what you need right now.
 | Choose a provider / model for my hardware     | **[[Providers and Models]]** |
 | Tune retrieval, caching, or rate limits       | **[[Configuration and Tuning]]** |
 | Understand what leaves my machine             | **[[Privacy and Security]]** |
+| Run CGX in production (metrics, deploy)        | **[[MLOps and Production]]** |
 | Read the internals as a contributor           | **[[Architecture]]** · **[[Contributing]]** |
 | Fix a problem                                 | **[[Troubleshooting and FAQ]]** |
 
@@ -58,8 +59,9 @@ Pick the path that matches what you need right now.
   telemetry never leave the machine. Works fully offline with
   [Ollama](https://ollama.com/).
 - **Universal LLM provider.** Ollama (local), OpenAI-compatible
-  endpoints, native Google Gemini, or any self-hosted server — switchable
-  at runtime with a live latency **Ping** check.
+  endpoints, native Google Gemini, Hugging Face Inference, or any
+  self-hosted server — switchable at runtime with a live latency
+  **Ping** check.
 - **Hybrid retrieval.** Two-view semantic + BM25 + graph expansion,
   fused with Reciprocal Rank Fusion and an optional cross-encoder rerank.
 - **Session-based agent.** Describe a goal; the agent works toward it one
@@ -109,6 +111,7 @@ The wiki is the curated, navigable entry point. The in-repo `docs/` set
 holds the authoritative deep dives that individual wiki pages link into:
 
 - [`docs/architecture.md`](https://github.com/raminmohammadi/Averix/blob/main/docs/architecture.md) — full architecture reference
+- [`docs/mlops.md`](https://github.com/raminmohammadi/Averix/blob/main/docs/mlops.md) — production MLOps operator guide
 - [`docs/usage.md`](https://github.com/raminmohammadi/Averix/blob/main/docs/usage.md) — exhaustive usage guide
 - [`docs/Agent.md`](https://github.com/raminmohammadi/Averix/blob/main/docs/Agent.md) — session-agent internals
 - [`docs/flowcharts.md`](https://github.com/raminmohammadi/Averix/blob/main/docs/flowcharts.md) — audience-specific diagrams

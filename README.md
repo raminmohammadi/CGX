@@ -47,7 +47,8 @@ your machine unless you explicitly opt into a cloud model.
 - [Highlights](#highlights) · [Install](#install) · [Quick start](#quick-start)
 - [How it works](#how-it-works) · [Session-based Agent](#session-based-agent-agent) · [Self-testing code generation](#self-testing-code-generation)
 - [Tuning retrieval](#tuning-hybrid-retrieval) · [Incremental indexing](#incremental-indexing) · [Hardware picker](#hardware-aware-model-picker)
-- [Privacy & data flow](#privacy--data-flow) · [Architecture](#architecture) · [Tests](#tests)
+- [Privacy & data flow](#privacy--data-flow) · [Architecture](#architecture)
+- [MLOps & production](#mlops--production) · [Tests](#tests)
 
 ## Highlights
 
@@ -55,9 +56,10 @@ your machine unless you explicitly opt into a cloud model.
   telemetry **never leave the machine.** Works fully offline with
   [Ollama](https://ollama.com/).
 - **Universal LLM provider.** Ollama (local), OpenAI-compatible
-  endpoints, native **Google Gemini**, or any self-hosted server with a
-  custom IP, path, and optional auth-bypass -- switchable from the Settings
-  tab with a live **Ping** latency check. API keys live in your OS keyring.
+  endpoints, native **Google Gemini**, **Hugging Face** Inference
+  Providers, or any self-hosted server with a custom IP, path, and
+  optional auth-bypass -- switchable from the Settings tab with a live
+  **Ping** latency check. API keys live in your OS keyring.
 - **Hybrid retrieval.** Two-view semantic + BM25 + graph expansion,
   fused with Reciprocal Rank Fusion and an optional cross-encoder
   rerank.
@@ -131,6 +133,13 @@ your machine unless you explicitly opt into a cloud model.
 - 🖥️ **Terminal observability.** All operations emit structured
   `[INFO]`/`[WARNING]` log lines to stdout from startup
   (`setup_logging(INFO)` in `launch.py`).
+- 📊 **Production MLOps layer.** Prometheus metrics (`/api/metrics`),
+  curated function-call tracing, per-run activity + admin explorers,
+  an offline eval + CI quality gate, AIOps drift/quality/cost alerts, a
+  user-feedback flywheel, per-owner cost/quota budgets, PII/retention
+  governance, `/healthz` + `/readyz` probes, and a container / Compose /
+  Helm deployment path -- all local-first and zero-config. See
+  [docs/mlops.md](docs/mlops.md).
 - ⚡ **Parallel two-view execution.** FAISS index building
   (`run_index_auto`) and semantic retrieval (`HybridRetriever.search`)
   both run the intent and impl views concurrently via
@@ -276,10 +285,14 @@ public internet.
 Tabs (left → right):
 
 1. **Setup** -- choose a **Provider Type** (Ollama, OpenAI, Google
-   Gemini, or Custom Server), fill in the model and credentials, and click
-   **Ping** to verify the connection with a live latency check. Detect
-   hardware (RAM + GPU VRAM) and tune sampling parameters. Save named
-   profiles; API keys are stored in your OS keyring.
+   Gemini, Hugging Face, or Custom Server), fill in the model and
+   credentials, and click **Ping** to verify the connection with a live
+   latency check. Detect hardware (RAM + GPU VRAM) and tune sampling
+   parameters. Save named profiles; API keys are stored in your OS keyring.
+   A **Browse Hugging Face** panel lists GGUF repositories from the Hub
+   and pulls them straight into your local Ollama daemon, re-aliasing each
+   download to a clean local name (e.g. `Ornith-1.0-9B-GGUF`) instead of
+   the full `hf.co/<repo>` web address.
 2. **Index** -- point at a project root or upload a `.zip`. Honours
    `.gitignore` and a 1 MB file-size cap; emits `indices/`,
    `records.jsonl`, `chunks.jsonl`, `graph.json` and per-view
@@ -325,7 +338,8 @@ Tabs (left → right):
    and operational risk. Pure-offline; no network calls fire from this
    tab.
 7. **Profiles** -- save provider configurations for any supported
-   provider kind (`ollama`, `openai-compat`, `gemini`, `custom`). Custom
+   provider kind (`ollama`, `openai-compat`, `gemini`, `huggingface`,
+   `custom`). Custom
    profiles expose an **Endpoint Path** field and a **Skip auth** toggle
    for private-subnet servers. API keys are persisted in the OS keyring
    when available, otherwise in a `0600`-permissioned file under
@@ -381,6 +395,13 @@ prov = OllamaProvider(model="qwen2.5-coder:3b")
 
 # Google Gemini
 # prov = GeminiProvider(model="gemini-1.5-flash", api_key="YOUR_KEY")
+
+# Hugging Face Inference Providers (OpenAI-compatible router)
+# prov = OpenAICompatProvider(
+#     model="openai/gpt-oss-20b",
+#     base_url="https://router.huggingface.co",
+#     api_key="hf_YOUR_TOKEN",  # or set HF_TOKEN in the environment
+# )
 
 # Custom self-hosted server (no auth, non-standard path)
 # prov = OpenAICompatProvider(
@@ -749,6 +770,34 @@ See [`docs/architecture.md`](docs/architecture.md) for a deeper dive.
 
 ---
 
+## MLOps & production
+
+Beyond the request pipeline, CGX ships a full MLOps layer for running the
+service in production -- observability, evaluation, monitoring, governance,
+and deployment -- built with the same local-first, stdlib-first, zero-config
+philosophy as the rest of the tool. Every store is SQLite (WAL,
+`$CGX_CONFIG_DIR`-aware), metrics are collected in-process, and every
+recorder is best-effort so an observability failure can never break a request.
+
+| Area | What it gives you |
+|------|-------------------|
+| **Observability** | In-process Prometheus metrics at `GET /api/metrics` (RED-style LLM latency/cost/token series) + a curated `@traced` function-call tracer (`CGX_TRACE`) with secret redaction. Traced ask/plan/agent runs log every LLM call's full redacted prompt + response to the project `agent.log`. |
+| **User activity & admin** | A per-run activity store (grounding + token/cost/latency) and an admin explorer that stitches logs, metrics, alerts and feedback into one redacted view. The Ops → Trace hub browses per-project traces and can purge trace logs (log-files-only, symlink-safe) via `DELETE /api/admin/logs`. |
+| **Evaluation** | An offline retrieval + codegen harness over golden sets under `evals/`, wired into CI as a quality gate (`python -m cgx.eval`). |
+| **Lineage** | A prompt/model registry + per-run `run_id` join key + index lineage so any record joins back to exactly what produced it. |
+| **AIOps monitoring** | Groundedness / retrieval-drift / cost-anomaly / repair-health checks that persist `Alert` records (`CGX_MON_*`), surfaced at `GET /api/monitor/alerts`. |
+| **Feedback flywheel** | Thumbs up/down + comments that export down-votes into eval candidates and unify with cross-session lessons. |
+| **Cost & quota** | Truthful token/cost accounting (`CGX_MODEL_PRICING`) plus per-owner day budgets with soft-warn / hard-stop (`CGX_BUDGET_*`). |
+| **Reliability** | `/healthz` (liveness) + `/readyz` (readiness) probes and Prometheus SLO rules. |
+| **Guardrails** | Prompt-injection heuristics (direct + indirect), secret-in-output / path-escape checks, and an `CGX_LLM_DISABLED` kill-switch. |
+| **Data governance** | Configurable retention/TTL, right-to-erasure, and a PII scan/scrub pass beyond credential redaction (`/api/govdata/*`). |
+| **Packaging** | Multi-stage Docker image, a Compose stack (CGX + Prometheus + Grafana), and a Helm chart under `deploy/`. |
+
+Full operator guide: [`docs/mlops.md`](docs/mlops.md). Deployment guide:
+[`deploy/README.md`](deploy/README.md).
+
+---
+
 ## Privacy & data flow
 
 CGX is built around **local-first** processing. The following table is
@@ -762,6 +811,7 @@ the complete list of network egress paths in the product:
 | Local LLM (default: Ollama)       | Yes (loopback)  | `http://localhost:11434` -- never leaves your box. |
 | OpenAI-compatible providers       | Yes             | The exact base URL / endpoint path you configure. |
 | Google Gemini provider            | Yes             | `generativelanguage.googleapis.com` only.         |
+| Hugging Face Inference provider   | Yes             | `router.huggingface.co` only.                     |
 | Session history, profiles, cache  | **No**          | `~/.cgx/` (locked-down `0600` files).             |
 | Anonymous startup telemetry       | **Opt-in**      | Disabled by default; see below.                   |
 

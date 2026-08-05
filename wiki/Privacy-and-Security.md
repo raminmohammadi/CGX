@@ -32,7 +32,8 @@ CGX only makes outbound network calls in these cases:
 
 | Path | When it happens |
 |------|-----------------|
-| **Cloud LLM provider** | You explicitly select OpenAI, Gemini, an OpenAI-compatible endpoint, or a custom server. Your prompt (which includes retrieved code snippets) is sent to that provider. |
+| **Cloud LLM provider** | You explicitly select OpenAI, Gemini, Hugging Face Inference, an OpenAI-compatible endpoint, or a custom server. Your prompt (which includes retrieved code snippets) is sent to that provider. |
+| **Browse Hugging Face** | The Settings panel lists GGUF repositories from `huggingface.co/api/models`; **Pull** delegates the download to your local Ollama daemon (`hf.co/<repo>`), which then re-aliases the model to a clean local name via loopback `POST /api/copy` + `DELETE /api/delete` (no extra outbound traffic). |
 | **Provider Ping** | The Setup tab / `POST /api/provider/ping` runs a live reachability check against the configured provider. |
 | **Model discovery** | Listing available models for a cloud provider, restricted to an allow-list of approved hosts (SSRF barrier in `webui/routes/setup.py`). |
 | **First-run model download** | Hugging Face downloads the embedding model once, then caches it. |
@@ -111,10 +112,21 @@ The agent only writes inside the **Project Root** you configure, and only
 
 ## Tracing & redaction
 
-Function-call tracing (`CGX_TRACE=1` or the `/settings` toggle) records
-only **bounded, redacted previews** of prompts/responses plus byte
-counts — full payloads stay in the local session store. See
-`cgx.trace` and `cgx.redact`.
+Function-call tracing (`CGX_TRACE=1` or the `/settings` toggle) writes
+`@traced` span records and, per LLM call, an `llm_call` record with the
+**full prompt and response** — but everything is passed through
+`cgx.redact` first, so credential-shaped literals are masked before they
+reach disk or the admin API. Records land in the project-local
+`<root>/.cgx/agent.log` (or the global `~/.cgx/cgx-trace.log` for
+HTTP / CLI activity) and **never leave the machine**. Tracing is off by
+default. See `cgx.trace` and `cgx.redact`.
+
+You can purge these trace logs from **Ops → Trace** (or
+`DELETE /api/admin/logs`). That path is hard-limited to trace/log files:
+it only unlinks files literally named `agent.log` / `cgx-trace.log` (and
+their rotation backups), requires a regular file, and refuses symlinks —
+so a supplied `project_root` can never be turned into a delete of any
+other file on the machine.
 
 ---
 

@@ -1,0 +1,17 @@
+apiVersion: v2
+name: cgx
+description: CGX (Code Graph eXecution) -- local-first codebase RAG web service.
+type: application
+# Chart version is independent of the app version it deploys.
+version: 0.1.0
+appVersion: "0.2.0"
+keywords:
+  - rag
+  - codebase
+  - llm
+  - code-generation
+home: https://github.com/cgx-dev/cgx
+sources:
+  - https://github.com/cgx-dev/cgx
+maintainers:
+  - name: Ramin Mohammadi

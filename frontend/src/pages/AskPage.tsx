@@ -37,7 +37,7 @@ function modelSupportsThinking(model: string | undefined): boolean {
 }
 
 export default function AskPage() {
-  const { provider, index, selectedSessionId, setSelectedSession, setProvider } = useWorkspace();
+  const { provider, index, projectRoot, selectedSessionId, setSelectedSession, setProvider } = useWorkspace();
   const { ask, setAsk, appendAskMessage, resetAsk } = useTasks();
   const { busy, messages, error } = ask;
   const offline = useConnection((s) => s.offline);
@@ -157,7 +157,8 @@ export default function AskPage() {
     abortConnection(PAGE_KEY);
     const conn = streamSSE(
       "/api/ask",
-      { question: text, session_id: sid || null, index, provider },
+      { question: text, session_id: sid || null,
+        project_root: projectRoot || null, index, provider },
       (ev, data) => {
         if (ev === "thought" && data?.delta) {
           // Append delta to thought using functional updater.

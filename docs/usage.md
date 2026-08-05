@@ -73,7 +73,7 @@ are commands:
 | `/index [path]`    | Build/refresh the code graph for the project.     |
 | `/project <path>`  | Switch the active project directory.              |
 | `/model <name>`    | Set the model for the current provider.           |
-| `/provider <name>` | Use a saved profile, or `ollama`/`openai`/`gemini`. |
+| `/provider <name>` | Use a saved profile, or `ollama`/`openai`/`gemini`/`huggingface`. |
 | `/status`          | Show provider, index, and hardware status.        |
 | `/serve`           | Launch the web UI (FastAPI + React).              |
 | `/clear`           | Clear the screen and scrollback.                  |
@@ -140,7 +140,7 @@ piping to a file yields clean, escape-free text.
 | Flag             | Default                    | Purpose                                                     |
 | ---------------- | -------------------------- | ---------------------------------------------------------- |
 | `--project-root` | current directory          | Project whose index is queried / written.                  |
-| `--provider`     | `ollama`                   | One of `ollama`, `openai`, `openai-compat`, `gemini`, `custom`. |
+| `--provider`     | `ollama`                   | One of `ollama`, `openai`, `openai-compat`, `gemini`, `huggingface`, `custom`. |
 | `--model`        | provider default           | LLM name; always overrides a profile's model when given.   |
 | `--base-url`     | `http://localhost:11434`   | Provider endpoint (Ollama / OpenAI-compatible).            |
 | `--profile`      | none                       | A saved provider profile (see §1) — takes precedence over `--provider`/`--base-url`. |
@@ -262,13 +262,13 @@ non-interactive form of the dashboard's `/status` command.
 ## 1. Pick a provider
 </summary>
 
-CGX supports four provider types, each selectable from the **⚙️ Setup**
+CGX supports several provider types, each selectable from the **⚙️ Setup**
 tab's **Provider Type** dropdown. (The non-interactive CLI's
-`--provider` flag exposes them as the five kind strings listed in the
+`--provider` flag exposes them as the kind strings listed in the
 [shared-flags table](#shared-provider--index-flags) above -- `ollama`,
-`openai`, `openai-compat`, `gemini`, `custom` -- since a bare OpenAI-
-compatible endpoint and a fully custom server are distinct kinds under
-the hood.) A **Ping** button appears on both the inline config card and
+`openai`, `openai-compat`, `gemini`, `huggingface`, `custom` -- since a
+bare OpenAI-compatible endpoint and a fully custom server are distinct
+kinds under the hood.) A **Ping** button appears on both the inline config card and
 the profile edit form -- it performs a live connection test and reports
 latency or the exact error message.
 
@@ -317,6 +317,40 @@ from cgx.answer.providers import GeminiProvider
 prov = GeminiProvider(model="gemini-1.5-flash", api_key="YOUR_KEY")
 # or set GEMINI_API_KEY in the environment and omit api_key
 ```
+
+</details>
+<details>
+<summary>
+
+### Hugging Face (cloud)
+</summary>
+
+Set **Provider Type → Hugging Face (Cloud)**, paste a Hugging Face token
+(`hf_…`), and choose a model. HF's **Inference Providers** expose an
+OpenAI-compatible router at `https://router.huggingface.co/v1`, so CGX
+reuses `OpenAICompatProvider` -- the host and endpoint path are hardcoded
+and only the token varies. The token is also read from the `HF_TOKEN` /
+`HUGGINGFACEHUB_API_TOKEN` environment variables when not supplied inline.
+The model dropdown is populated from the router's **public** `/v1/models`
+list (no token required to browse); the token is only needed for the
+actual inference call.
+
+The **Settings → Browse Hugging Face** panel additionally lists GGUF
+repositories from the Hub with live search and sort, and **Pull** hands
+the `hf.co/<repo>[:<quant>]` tag to your local Ollama daemon -- no HF
+token required, since the download goes through Ollama. After the pull,
+the model is re-aliased to a clean local name (e.g.
+`hf.co/ornith-ai/Ornith-1.0-9B-GGUF` -> `Ornith-1.0-9B-GGUF`) instead of
+being stored under the full web address. The panel sends this via the
+optional `local_name` on `POST /api/ollama/pull`, and the backend applies
+it with Ollama's `POST /api/copy` + `DELETE /api/delete` (instant, no
+re-download); the final name is reported back over the progress stream. After the pull,
+the model is re-aliased to a clean local name (e.g.
+`hf.co/ornith-ai/Ornith-1.0-9B-GGUF` -> `Ornith-1.0-9B-GGUF`) instead of
+being stored under the full web address. The panel sends this via the
+optional `local_name` on `POST /api/ollama/pull`, and the backend applies
+it with Ollama's `POST /api/copy` + `DELETE /api/delete` (instant, no
+re-download); the final name is reported back over the progress stream.
 
 </details>
 <details>

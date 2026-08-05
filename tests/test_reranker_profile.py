@@ -45,6 +45,7 @@ def profiles_module(tmp_path, monkeypatch):
     ("custom", False),
     ("openai-compat", True),
     ("gemini", True),
+    ("huggingface", True),
     ("OpenAI-Compat", True),   # case-insensitive
     ("", False),
 ])

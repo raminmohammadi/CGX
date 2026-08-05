@@ -12,16 +12,29 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+from cgx.activity import record_run
 from cgx.answer.engine import answer_with_llm_stream, generate_code_plan
 from cgx.answer.intent import detect_intent
 from cgx.answer.model_caps import model_supports_thinking
 from cgx.answer.scope import resolve_scope_for_intent
+from cgx.governance import govern, resolve_owner
+from cgx.guardrails import (
+    GuardrailConfig,
+    assert_llm_enabled,
+    check_diffs,
+    record_findings,
+    scan_context,
+    scan_text,
+)
 from cgx.pipeline.auto import IndexBuildCancelled, run_index_auto, run_query_auto
+from cgx.registry import new_run_id, register_known_prompts
+from cgx.trace import set_trace_context
 from cgx.webui.helpers import (
     build_provider,
     diffs_payload,
@@ -34,6 +47,74 @@ from cgx.webui.helpers import (
 
 
 Event = Tuple[str, Dict[str, Any]]
+
+
+def _monitor_answer(result: Optional[Dict[str, Any]],
+                    *, run_id: Optional[str] = None) -> None:
+    """Feed a finished answer payload to the AIOps groundedness monitor.
+
+    Best-effort: monitoring must never break a user request, so any failure
+    (import, DB, or check error) is swallowed with a warning.
+    """
+    if not isinstance(result, dict):
+        return
+    try:
+        from cgx.monitor import get_default_monitor
+        get_default_monitor().observe_answer(result, run_id=run_id)
+    except Exception as e:  # pragma: no cover - monitoring is non-critical
+        logger.warning("monitor.observe_answer failed: %s", e)
+
+
+def _monitor_codegen(report: Optional[Dict[str, Any]],
+                     *, run_id: Optional[str] = None) -> None:
+    """Feed a ``codegen_report`` to the AIOps repair-health monitor."""
+    if not isinstance(report, dict):
+        return
+    try:
+        from cgx.monitor import get_default_monitor
+        get_default_monitor().observe_codegen(report, run_id=run_id)
+    except Exception as e:  # pragma: no cover - monitoring is non-critical
+        logger.warning("monitor.observe_codegen failed: %s", e)
+
+
+def _guard_input(question: str, hits: Optional[List[Dict[str, Any]]],
+                 *, run_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Scan the user question + retrieved chunks for prompt injection.
+
+    Best-effort: guardrails annotate + alert, they never break a request.
+    Returns the findings as dicts for the response ``meta``.
+    """
+    try:
+        cfg = GuardrailConfig.from_env()
+        if not (cfg.enabled and cfg.scan_input):
+            return []
+        findings = scan_text(question, source="user") + scan_context(hits or [])
+        record_findings(findings, run_id=run_id, kind="input")
+        return [f.to_dict() for f in findings]
+    except Exception as e:  # pragma: no cover - guardrails are non-critical
+        logger.warning("guardrail input scan failed: %s", e)
+        return []
+
+
+def _guard_output(diffs: List[Dict[str, Any]], *, project_root: Optional[str],
+                  run_id: Optional[str] = None) -> Tuple[List[Dict[str, Any]], bool]:
+    """Scan generated diffs for secret literals + path escapes.
+
+    Returns ``(findings, block)`` where ``block`` is True only when a critical
+    finding fired *and* ``CGX_GUARDRAIL_BLOCK_SECRETS`` is set (hard-stop).
+    """
+    try:
+        cfg = GuardrailConfig.from_env()
+        if not (cfg.enabled and cfg.scan_output):
+            return [], False
+        findings = check_diffs(diffs or [], project_root=project_root)
+        record_findings(findings, run_id=run_id, kind="output")
+        block = cfg.block_secret_output and any(
+            f.severity == "critical" for f in findings)
+        return [f.to_dict() for f in findings], block
+    except Exception as e:  # pragma: no cover - guardrails are non-critical
+        logger.warning("guardrail output scan failed: %s", e)
+        return [], False
 
 
 def _format_stream_failure(e: BaseException) -> str:
@@ -59,13 +140,45 @@ def _resolve_provider(
     endpoint_path: str = "/v1/chat/completions",
     allow_no_auth: bool = False,
 ) -> Any:
+    # Subsystem K kill-switch: refuse to build any provider when the operator
+    # has engaged CGX_LLM_DISABLED, so no LLM call can run this request.
+    assert_llm_enabled()
     if use_profile and profile_name:
-        return provider_from_profile_name(profile_name)
-    return build_provider(
-        kind=kind, model=model, base_url=base_url, api_key=api_key or None,
-        temperature=temperature, num_predict=num_predict, num_ctx=num_ctx,
-        endpoint_path=endpoint_path, allow_no_auth=allow_no_auth,
-    )
+        prov = provider_from_profile_name(profile_name)
+    else:
+        prov = build_provider(
+            kind=kind, model=model, base_url=base_url, api_key=api_key or None,
+            temperature=temperature, num_predict=num_predict, num_ctx=num_ctx,
+            endpoint_path=endpoint_path, allow_no_auth=allow_no_auth,
+        )
+    # Subsystem I: wrap at the single provider choke-point so every ask/plan
+    # and agent-session call is quota-checked (hard-stop) and metered. A
+    # disabled config returns the provider unchanged.
+    return govern(prov)
+
+
+def _traced_provider(prov: Any, run_id: str) -> Any:
+    """Wrap an ask/plan provider so its LLM calls emit rich trace records.
+
+    Mirrors the agent loop's instrumentation: the session runner wraps its
+    provider with :class:`TracingProvider` to emit an ``llm_call`` trace
+    record (full redacted prompt + response) plus the always-on LLM RED
+    metrics for every chat call. The web-UI ask/plan paths have no session
+    store to persist the resulting Facts, so we bind a synthetic pair keyed
+    on ``run_id`` and never drain -- the accumulated Facts are discarded
+    when the request generator finishes; only the trace + metrics side
+    effects are wanted. Routing (project ``agent.log`` vs the global
+    fallback) is decided by the ``project_root`` on the trace context, which
+    the caller sets alongside ``run_id``.
+    """
+    try:
+        from cgx.session.llm_trace import TracingProvider
+        traced = TracingProvider(prov)
+        traced.bind(run_id, run_id)
+        return traced
+    except Exception:  # pragma: no cover - tracing must never break a request
+        logger.warning("stream: tracing shim unavailable; continuing untraced")
+        return prov
 
 
 def stream_index(
@@ -126,10 +239,19 @@ def stream_ask(
     num_ctx: Optional[int] = None,
     endpoint_path: str = "/v1/chat/completions", allow_no_auth: bool = False,
     think: bool = False,
+    project_root: Optional[str] = None,
     cancel_event=None,
 ) -> Iterator[Event]:
     """Stream thoughts then the grounded answer with sources + meta."""
     logger.info("stream_ask: question=%r model=%s", question[:80], model)
+    # Provenance join key for this execution: stamped into the returned meta
+    # (so the client can attach feedback to it) and onto the trace context
+    # (so llm_trace stamps the same run_id onto every LLM_CALL of this run).
+    # ``project_root`` routes this run's llm_call trace records to the
+    # project-local agent.log instead of the global fallback (when set).
+    run_id = new_run_id()
+    t0 = time.perf_counter()
+    set_trace_context(run_id=run_id, project_root=(project_root or None))
     try:
         prov = _resolve_provider(
             use_profile=use_profile, profile_name=profile_name, kind=kind,
@@ -141,6 +263,7 @@ def stream_ask(
         logger.error("stream_ask: provider init failed: %s", e)
         yield "error", {"message": f"{type(e).__name__}: {e}"}
         return
+    prov = _traced_provider(prov, run_id)
 
     if cancel_event and cancel_event.is_set():
         yield "cancelled", {"message": "Cancelled"}
@@ -176,6 +299,10 @@ def stream_ask(
 
     hits = retrieval.get("hits", []) or []
     logger.info("stream_ask: retrieval returned %d hits", len(hits))
+
+    # Subsystem K: scan user question + retrieved chunks for prompt injection
+    # before they reach the model. Advisory -- annotate + alert, never block.
+    guard_findings = _guard_input(question or "", hits, run_id=run_id)
 
     if cancel_event and cancel_event.is_set():
         yield "cancelled", {"message": "Cancelled"}
@@ -257,10 +384,24 @@ def stream_ask(
     answer_md = stringify(result.get("answer_md", ""))
     sources = json_safe((result.get("debug") or {}).get("sources", []))
     meta = json_safe({k: v for k, v in result.items() if k != "debug"})
+    meta.setdefault("run_id", run_id)
+    meta.setdefault("model", model)
+    if guard_findings:
+        meta["guardrails"] = guard_findings
+    try:
+        meta.setdefault("prompt_version",
+                        register_known_prompts().version_of(f"ask_stream:{mode}"))
+    except Exception:  # pragma: no cover - provenance is best-effort
+        pass
     logger.info(
         "stream_ask: answer ready len=%d sources=%d delta_tokens=%d",
         len(answer_md), len(sources), answer_delta_tokens,
     )
+    _monitor_answer(result, run_id=run_id)
+    # Subsystem C: persist a per-run observation for the activity page.
+    record_run(kind="ask", run_id=run_id, meta=meta, sources=sources,
+               question=question or "", model=model, owner=resolve_owner(),
+               latency_ms=(time.perf_counter() - t0) * 1000.0)
     yield "answer", {"answer_md": answer_md, "sources": sources, "meta": meta}
 
 
@@ -275,6 +416,9 @@ def stream_plan(
 ) -> Iterator[Event]:
     """Stream sketch thoughts, then the generated plan + structured diffs."""
     logger.info("stream_plan: task=%r self_test=%s model=%s", task[:80], self_test, model)
+    run_id = new_run_id()
+    t0 = time.perf_counter()
+    set_trace_context(run_id=run_id, project_root=(project_root or None))
     try:
         prov = _resolve_provider(
             use_profile=use_profile, profile_name=profile_name, kind=kind,
@@ -286,10 +430,14 @@ def stream_plan(
         logger.error("stream_plan: provider init failed: %s", e)
         yield "error", {"message": f"{type(e).__name__}: {e}"}
         return
+    prov = _traced_provider(prov, run_id)
 
     if cancel_event and cancel_event.is_set():
         yield "cancelled", {"message": "Cancelled"}
         return
+
+    # Subsystem K: scan the task text for prompt injection before generation.
+    guard_findings = _guard_input(task or "", None, run_id=run_id)
 
     sketch = [
         {"role": "system", "content": "You are a principal engineer thinking out loud."},
@@ -332,13 +480,36 @@ def stream_plan(
 
     diffs = diffs_payload(out.get("diffs") or [])
     logger.info("stream_plan: plan ready diffs=%d", len(diffs))
+    _monitor_codegen(out.get("codegen_report"), run_id=run_id)
+    # Subsystem K: scan generated diffs for secret literals + path escapes.
+    out_findings, block = _guard_output(diffs, project_root=project_root,
+                                        run_id=run_id)
+    if block:
+        logger.error("stream_plan: guardrail hard-stop (secret in output)")
+        record_run(kind="plan", run_id=run_id, question=task or "", model=model,
+                   owner=resolve_owner(), project_root=project_root,
+                   status="blocked",
+                   latency_ms=(time.perf_counter() - t0) * 1000.0)
+        yield "error", {"message": ("guardrail: generated code contains a "
+                                    "secret-shaped literal; plan withheld")}
+        return
+    meta = json_safe({k: v for k, v in out.items()
+                      if k not in {"debug", "diffs", "plan_md",
+                                   "codegen_report"}})
+    meta.setdefault("run_id", run_id)
+    meta.setdefault("model", model)
+    guard_all = guard_findings + out_findings
+    if guard_all:
+        meta["guardrails"] = guard_all
+    # Subsystem C: persist a per-run observation for the activity page.
+    record_run(kind="plan", run_id=run_id, meta=meta, question=task or "",
+               model=model, owner=resolve_owner(), project_root=project_root,
+               latency_ms=(time.perf_counter() - t0) * 1000.0)
     yield "plan", {
         "plan_md": stringify(out.get("plan_md", "")),
         "diffs": diffs,
         "report": report_summary(out.get("codegen_report")),
-        "meta": json_safe({k: v for k, v in out.items()
-                           if k not in {"debug", "diffs", "plan_md",
-                                        "codegen_report"}}),
+        "meta": meta,
     }
 
 

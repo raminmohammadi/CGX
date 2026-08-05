@@ -45,6 +45,13 @@ _OPENAI_ALLOWED_BASES = {
     "api.openai.com": "https://api.openai.com",
 }
 
+# Hugging Face hosts CGX may reach server-side. Both are compile-time
+# constants so no attacker-controlled text ever flows into the outbound
+# request host (SSRF barrier): the router serves OpenAI-compatible inference
+# and the Hub serves the model catalog browsed from the Settings page.
+_HF_ROUTER_BASE = "https://router.huggingface.co"
+_HF_HUB_BASE = "https://huggingface.co"
+
 
 class PingRequest(BaseModel):
     kind: str = "ollama"
@@ -120,6 +127,33 @@ def ping_provider(req: PingRequest) -> PingResponse:
             }
             r = _req.post(url, params={"key": api_key}, json=body, timeout=15)
             r.raise_for_status()
+
+        elif req.kind == "huggingface":
+            import requests as _req
+            # The router host is a fixed constant, so there is no SSRF surface
+            # here. When a token + model are supplied we validate both with a
+            # 1-token chat completion; otherwise we fall back to the public
+            # model list, which confirms reachability without a key. The model
+            # id travels in the JSON body (never the URL), so it can't redirect
+            # the request off the fixed host.
+            model = (req.model or "").strip()
+            headers = {"Content-Type": "application/json"}
+            if req.api_key:
+                headers["Authorization"] = f"Bearer {req.api_key}"
+            if req.api_key and model:
+                body = {
+                    "model": model,
+                    "messages": [{"role": "user", "content": "ping"}],
+                    "max_tokens": 1,
+                    "stream": False,
+                }
+                r = _req.post(f"{_HF_ROUTER_BASE}/v1/chat/completions",
+                              headers=headers, json=body, timeout=20)
+                r.raise_for_status()
+            else:
+                r = _req.get(f"{_HF_ROUTER_BASE}/v1/models",
+                             headers=headers, timeout=10)
+                r.raise_for_status()
 
         else:
             # openai-compat or custom: attempt a GET to the base URL to verify reachability.
@@ -240,6 +274,18 @@ _OPENAI_FALLBACK = [
     "gpt-4.1-mini",
     "gpt-4.1",
 ]
+# Short list of strong chat/coder models served by HF Inference Providers,
+# used when the live router listing is unavailable so the dropdown is never
+# empty for a user who just picked the Hugging Face kind.
+_HF_FALLBACK = [
+    "openai/gpt-oss-20b",
+    "openai/gpt-oss-120b",
+    "Qwen/Qwen2.5-Coder-32B-Instruct",
+    "Qwen/Qwen3-Coder-480B-A35B-Instruct",
+    "deepseek-ai/DeepSeek-V3-0324",
+    "meta-llama/Llama-3.3-70B-Instruct",
+    "zai-org/GLM-4.5",
+]
 
 # OpenAI returns every model id including embeddings/audio/image; this filter
 # keeps the dropdown focused on chat-capable text models.
@@ -359,12 +405,54 @@ def _openai_list(base_url: str, api_key: str) -> List[str]:
     return out
 
 
+def _hf_inference_list(api_key: str) -> List[str]:
+    """List chat models served by HF Inference Providers via the router.
+
+    ``GET https://router.huggingface.co/v1/models`` is public (no key needed
+    to list), so this populates the dropdown before the user pastes a token;
+    the key is only required for the actual inference call. Keeps text->text
+    models and drops image/audio-only ones.
+    """
+    import requests as _req
+    url = f"{_HF_ROUTER_BASE}/v1/models"
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    r = _req.get(url, headers=headers, timeout=15)
+    r.raise_for_status()
+    data = r.json() if r.content else {}
+    items = data.get("data") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        return []
+    out: List[str] = []
+    for m in items:
+        if not isinstance(m, dict):
+            continue
+        mid = str(m.get("id") or "")
+        if not mid:
+            continue
+        arch = m.get("architecture") if isinstance(m.get("architecture"), dict) else {}
+        in_mods = arch.get("input_modalities") or []
+        out_mods = arch.get("output_modalities") or []
+        # Keep chat models: text must be an accepted input and a produced
+        # output. Empty modality lists (older entries) are treated as text.
+        if in_mods and "text" not in in_mods:
+            continue
+        if out_mods and "text" not in out_mods:
+            continue
+        out.append(mid)
+    return sorted(set(out))
+
+
 def _pick_default(kind: str, choices: List[str]) -> str:
     """Pick a sensible default highlighting newest flash-tier model."""
     if not choices:
         return ""
     if kind == "gemini":
         for prefer in ("gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash"):
+            if prefer in choices:
+                return prefer
+    elif kind == "huggingface":
+        for prefer in ("Qwen/Qwen2.5-Coder-32B-Instruct", "openai/gpt-oss-20b",
+                       "deepseek-ai/DeepSeek-V3-0324"):
             if prefer in choices:
                 return prefer
     else:
@@ -377,6 +465,32 @@ def _pick_default(kind: str, choices: List[str]) -> str:
 class PullRequest(BaseModel):
     model: str
     base_url: str = "http://localhost:11434"
+    # Optional clean local name to give the model once pulled. When the source
+    # tag is an ``hf.co/<repo>`` one, Ollama otherwise keeps the full web
+    # address as the model name; supplying ``local_name`` re-aliases it to a
+    # short, human-friendly tag (via /api/copy + /api/delete of the source).
+    local_name: Optional[str] = None
+
+
+# A valid Ollama model tag is ``name[:tag]`` -- lowercase-ish path segment plus
+# an optional tag. We restrict a user-supplied ``local_name`` to that shape so
+# it can never smuggle a registry host/namespace (``a/b``) or odd characters
+# into the copy destination.
+_OLLAMA_NAME_RE = re.compile(r"[A-Za-z0-9]+(?:[._-][A-Za-z0-9]+)*")
+
+
+def _sanitize_local_name(raw: str) -> Optional[str]:
+    """Coerce ``raw`` into a safe ``name[:tag]`` Ollama model name or None."""
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    name, _, tag = raw.partition(":")
+    if not _OLLAMA_NAME_RE.fullmatch(name):
+        return None
+    tag = tag or "latest"
+    if not _OLLAMA_NAME_RE.fullmatch(tag):
+        return None
+    return f"{name}:{tag}"
 
 
 @router.post("/ollama/pull")
@@ -478,6 +592,31 @@ async def ollama_pull(req: PullRequest) -> EventSourceResponse:
                 logger.warning("ollama_pull: finished model=%r lines=%d "
                                "result=incomplete (no success/error event)",
                                req.model, line_count)
+            # On a clean pull, optionally re-alias the model to a short local
+            # name so it no longer shows up as the full ``hf.co/<repo>`` web
+            # address. Best-effort: any failure here leaves the original tag in
+            # place and never turns a successful download into a UI error.
+            dest = _sanitize_local_name(req.local_name or "")
+            if saw_success and not saw_error and dest and dest != req.model:
+                try:
+                    cr = _req.post(f"{base}/api/copy",
+                                   json={"source": req.model, "destination": dest},
+                                   timeout=60)
+                    if cr.status_code < 400:
+                        _req.delete(f"{base}/api/delete",
+                                    json={"model": req.model}, timeout=60)
+                        logger.info("ollama_pull: re-aliased %r -> %r",
+                                    req.model, dest)
+                        note = _json.dumps({"status": "success",
+                                            "renamed_to": dest}).encode()
+                        loop.call_soon_threadsafe(queue.put_nowait, note)
+                    else:
+                        logger.warning("ollama_pull: copy to %r returned HTTP %s"
+                                       " -- keeping original tag",
+                                       dest, cr.status_code)
+                except Exception:
+                    logger.warning("ollama_pull: re-alias to %r failed -- "
+                                   "keeping original tag", dest, exc_info=True)
             loop.call_soon_threadsafe(queue.put_nowait, _SENTINEL)
 
     threading.Thread(target=_worker, daemon=True, name="ollama-pull").start()
@@ -538,4 +677,118 @@ def cloud_models(req: CloudModelsRequest) -> ModelChoicesResponse:
             choices=choices, recommended_default=_pick_default("openai", choices),
         )
 
+    if kind == "huggingface":
+        # The router's model list is public, so we list even without a key --
+        # this lets the dropdown populate the moment the user picks the kind,
+        # before they've pasted a token.
+        try:
+            choices = _hf_inference_list(api_key)
+        except Exception:
+            choices = []
+        if not choices:
+            choices = list(_HF_FALLBACK)
+        return ModelChoicesResponse(
+            choices=choices, recommended_default=_pick_default("huggingface", choices),
+        )
+
     return ModelChoicesResponse(choices=[], recommended_default="")
+
+
+# --------------------- Hugging Face Hub browse (Part B) ---------------------
+
+# Accepted (friendly) sort keys -> the exact value the Hub /api/models endpoint
+# expects. The Hub uses camelCase ``trendingScore`` and rejects anything else
+# with HTTP 400, so we translate rather than forward the query value verbatim
+# (this doubles as the SSRF/abuse allowlist). ``trendingScore`` is also accepted
+# as an alias so either spelling from a client resolves correctly.
+_HF_HUB_SORTS = {
+    "trending_score": "trendingScore",
+    "trendingScore": "trendingScore",
+    "downloads": "downloads",
+    "likes": "likes",
+    "lastModified": "lastModified",
+    "createdAt": "createdAt",
+}
+# Quantization labels embedded in GGUF filenames (e.g. ``...-Q4_K_M.gguf``).
+# Used to surface per-quant pull tags (``hf.co/<repo>:Q4_K_M``) for Ollama.
+_HF_QUANT_RE = re.compile(r"(?i)(Q\d[0-9A-Z_]*|IQ\d[0-9A-Z_]*|BF16|F16|F32)")
+
+
+class HfHubModel(BaseModel):
+    id: str
+    downloads: int = 0
+    likes: int = 0
+    pipeline_tag: Optional[str] = None
+    gated: bool = False
+    # ``ollama pull hf.co/<repo>`` grabs a default quant; append ``:<quant>``
+    # to pick a specific one. The frontend uses ``pull_tag`` verbatim.
+    pull_tag: str = ""
+    quants: List[str] = []
+
+
+class HfModelsResponse(BaseModel):
+    models: List[HfHubModel] = []
+
+
+def _hf_hub_gguf_list(search: str, sort: str, limit: int) -> List[HfHubModel]:
+    """Browse GGUF repositories on the Hub that Ollama can pull directly.
+
+    Queries the public Hub catalog at ``huggingface.co/api/models`` filtered
+    to ``gguf`` models. The host is a fixed constant and every user value goes
+    through the ``params`` mapping (URL-encoded), so nothing attacker-supplied
+    can redirect the request off-host (SSRF barrier).
+    """
+    import requests as _req
+
+    sort_key = _HF_HUB_SORTS.get(sort, "trendingScore")
+    n = max(1, min(int(limit or 30), 100))
+    params = {"filter": "gguf", "sort": sort_key, "limit": n, "full": "true"}
+    if search.strip():
+        params["search"] = search.strip()
+    r = _req.get(f"{_HF_HUB_BASE}/api/models", params=params, timeout=15)
+    r.raise_for_status()
+    data = r.json() if r.content else []
+    if not isinstance(data, list):
+        return []
+    out: List[HfHubModel] = []
+    for m in data:
+        if not isinstance(m, dict):
+            continue
+        mid = str(m.get("id") or m.get("modelId") or "")
+        if not mid:
+            continue
+        quants: List[str] = []
+        for sib in (m.get("siblings") or []):
+            fname = str((sib or {}).get("rfilename") or "")
+            if not fname.lower().endswith(".gguf"):
+                continue
+            hit = _HF_QUANT_RE.search(fname)
+            if hit:
+                q = hit.group(1).upper()
+                if q not in quants:
+                    quants.append(q)
+        out.append(HfHubModel(
+            id=mid,
+            downloads=int(m.get("downloads") or 0),
+            likes=int(m.get("likes") or 0),
+            pipeline_tag=(str(m.get("pipeline_tag")) if m.get("pipeline_tag") else None),
+            gated=bool(m.get("gated")),
+            pull_tag=f"hf.co/{mid}",
+            quants=quants,
+        ))
+    return out
+
+
+@router.get("/setup/hf_models", response_model=HfModelsResponse)
+def hf_models(search: str = "", sort: str = "trending_score", limit: int = 30) -> HfModelsResponse:
+    """List GGUF models on the Hugging Face Hub for one-click Ollama pulls.
+
+    Powers the Settings "Browse Hugging Face" panel. Each entry carries a
+    ready-to-use ``pull_tag`` (``hf.co/<repo>``) plus any detected quant
+    labels so the user can pull a specific quantization. Returns an empty
+    list on any upstream failure so the panel degrades gracefully.
+    """
+    try:
+        return HfModelsResponse(models=_hf_hub_gguf_list(search, sort, limit))
+    except Exception:
+        return HfModelsResponse(models=[])

@@ -1,4 +1,4 @@
-export type ProviderKind = "ollama" | "openai-compat" | "gemini" | "custom";
+export type ProviderKind = "ollama" | "openai-compat" | "gemini" | "huggingface" | "custom";
 
 export interface ProfileEditState {
   name: string;
@@ -33,6 +33,14 @@ export const KIND_DEFAULTS: Record<ProviderKind, Partial<ProfileEditState>> = {
     endpoint_path: "/v1beta/models",
     allow_no_auth: false,
   },
+  huggingface: {
+    // Fixed OpenAI-compatible router host; the backend hardcodes it too, so
+    // the Base URL field is hidden for this kind.
+    base_url: "https://router.huggingface.co",
+    model: "Qwen/Qwen2.5-Coder-32B-Instruct",
+    endpoint_path: "/v1/chat/completions",
+    allow_no_auth: false,
+  },
   custom: {
     base_url: "",
     model: "",
@@ -58,11 +66,14 @@ export const KIND_LABELS: Record<ProviderKind, string> = {
   ollama: "Ollama (Local)",
   "openai-compat": "OpenAI (Cloud)",
   gemini: "Google Gemini (Cloud)",
+  huggingface: "Hugging Face (Cloud)",
   custom: "Custom Server (OpenAI-Compatible)",
 };
 
 export function needsApiKey(kind: ProviderKind): boolean {
-  return kind === "openai-compat" || kind === "gemini" || kind === "custom";
+  return (
+    kind === "openai-compat" || kind === "gemini" || kind === "huggingface" || kind === "custom"
+  );
 }
 
 export function needsEndpointPath(kind: ProviderKind): boolean {
@@ -70,7 +81,8 @@ export function needsEndpointPath(kind: ProviderKind): boolean {
 }
 
 export function needsBaseUrl(kind: ProviderKind): boolean {
-  return kind !== "gemini";
+  // Gemini and Hugging Face both use a fixed, backend-hardcoded host.
+  return kind !== "gemini" && kind !== "huggingface";
 }
 
 // Show the pull button whenever Ollama is reachable and the model isn't installed yet.

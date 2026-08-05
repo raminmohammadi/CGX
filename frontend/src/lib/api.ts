@@ -6,7 +6,7 @@ import { streamSSE } from "./sse";
 export type ProviderConfig = {
   use_profile: boolean;
   profile_name?: string | null;
-  kind: "ollama" | "openai-compat" | "gemini" | "custom";
+  kind: "ollama" | "openai-compat" | "gemini" | "huggingface" | "custom";
   model: string;
   base_url: string;
   api_key?: string | null;
@@ -134,6 +134,23 @@ export type HardwareMatrixRow = {
   fit: "fits" | "tight" | "won't fit" | string;
   reason: string;
   notes: string;
+  // True when the tag is currently pulled into the local Ollama daemon.
+  installed?: boolean;
+};
+
+// Spec + hardware verdict for a single Hugging Face repo (fit check).
+export type HfModelFit = {
+  repo: string;
+  params_b: number;
+  params_source: "safetensors" | "name" | "unknown" | string;
+  min_ram_gb: number;
+  rec_vram_gb: number;
+  ctx_window: number;
+  fit: "fits" | "tight" | "won't fit" | "unknown" | string;
+  reason: string;
+  pipeline_tag?: string | null;
+  gated: boolean;
+  hardware: HardwareInfo;
 };
 
 export type TradeoffRow = {
@@ -348,6 +365,173 @@ async function jsonReq<T>(
   return res.json() as Promise<T>;
 }
 
+// --- User Activity (Subsystem C): per-run observation store ---
+export type RunRecord = {
+  run_id: string;
+  created_at: number;
+  kind: string;
+  model?: string | null;
+  prompt_version?: string | null;
+  owner?: string | null;
+  project_root?: string | null;
+  tokens_in?: number | null;
+  tokens_out?: number | null;
+  tokens_total?: number | null;
+  cost_usd?: number | null;
+  latency_ms?: number | null;
+  n_sources: number;
+  n_citations: number;
+  confidence?: number | null;
+  grounded?: boolean | null;
+  status: string;
+  question: string;
+  labels: Record<string, any>;
+};
+
+export type ActivitySummary = {
+  total: number;
+  cost_usd: number;
+  tokens_total: number;
+  errors: number;
+  by_kind: Record<string, { runs: number; cost_usd: number; tokens_total: number; errors: number }>;
+};
+
+export type RunDetail = {
+  run: RunRecord;
+  feedback: Array<Record<string, any>>;
+  alerts: Array<Record<string, any>>;
+};
+
+// --- Admin (Subsystem D): logs / trace explorer, metrics, audit-lite ---
+export type AdminLogEntry = Record<string, any> & { event?: string; ts?: number };
+
+export type MetricSeries = { name: string; labels: Record<string, string>; value: number };
+export type HistogramSeries = {
+  name: string;
+  labels: Record<string, string>;
+  count: number;
+  sum: number;
+  buckets: Array<[number | string, number]>;
+};
+export type MetricsSnapshot = {
+  counters: MetricSeries[];
+  gauges: MetricSeries[];
+  histograms: HistogramSeries[];
+};
+
+export type AdminOverview = {
+  activity: Partial<ActivitySummary>;
+  http: { requests: number; errors: number };
+  feedback: Record<string, any>;
+  alerts: {
+    total: number;
+    by_severity: Record<string, number>;
+    recent: Array<Record<string, any>>;
+  };
+};
+
+// --- AIOps monitoring (Subsystem G): persisted alerts ---
+export type MonitorAlert = {
+  alert_id: string;
+  created_at: number;
+  code: string;
+  severity: "info" | "warning" | "critical" | string;
+  run_id?: string | null;
+  value?: number | null;
+  threshold?: number | null;
+  message: string;
+  labels: Record<string, any>;
+};
+
+// --- Feedback loop (Subsystem H) ---
+export type FeedbackStats = {
+  total: number;
+  up: number;
+  down: number;
+  satisfaction: number | null;
+  by_kind: Record<string, { up: number; down: number }>;
+};
+export type FeedbackRow = {
+  feedback_id: string;
+  created_at: number;
+  rating: "up" | "down" | string;
+  run_id?: string | null;
+  session_id?: string | null;
+  kind: string;
+  comment: string;
+  question: string;
+  answer_preview: string;
+  model?: string | null;
+  prompt_version?: string | null;
+  labels: Record<string, any>;
+};
+
+// --- Cost & quota governance (Subsystem I) ---
+export type OwnerUsage = {
+  owner: string;
+  state: "ok" | "warn" | "exceeded" | string;
+  cost_used: number;
+  cost_limit: number;
+  tokens_used: number;
+  tokens_limit: number;
+  day?: string;
+  tokens_in?: number;
+  tokens_out?: number;
+  tokens_total?: number;
+  cost_usd?: number;
+  calls?: number;
+};
+export type UsageRow = {
+  owner: string;
+  day: string;
+  tokens_in: number;
+  tokens_out: number;
+  tokens_total: number;
+  cost_usd: number;
+  calls: number;
+};
+
+// --- Data governance (Subsystem M) ---
+export type GovPolicy = {
+  retention_days: number;
+  store_full_text: boolean;
+  scrub_pii: boolean;
+  preview_cap: number;
+};
+export type GovScanResult = {
+  findings: Array<{ type: string; count: number }>;
+  total: number;
+  scrubbed: string;
+};
+
+// --- Reliability & health (Subsystem J) ---
+export type HealthCheck = {
+  name: string;
+  ok: boolean;
+  critical: boolean;
+  detail: Record<string, any>;
+};
+export type LivenessReport = { status: string; checks: HealthCheck[] };
+export type ReadinessReport = {
+  status: string;
+  ready: boolean;
+  ts?: number;
+  checks: HealthCheck[];
+};
+
+// --- Hugging Face Hub browse (GGUF models pullable via Ollama) ---
+export type HfHubModel = {
+  id: string;
+  downloads: number;
+  likes: number;
+  pipeline_tag?: string | null;
+  gated: boolean;
+  // Ready-to-use ``ollama pull`` target, e.g. ``hf.co/<repo>``.
+  pull_tag: string;
+  // Detected quantization labels (``Q4_K_M`` …) for ``pull_tag:<quant>``.
+  quants: string[];
+};
+
 export const api = {
   status: () => jsonReq<StatusResponse>("/api/status"),
   ollamaHealth: (base_url: string) =>
@@ -362,12 +546,13 @@ export const api = {
   ollamaPull: (
     model: string,
     base_url: string,
-    onProgress: (data: { status?: string; total?: number; completed?: number; error?: string }) => void,
+    onProgress: (data: { status?: string; total?: number; completed?: number; error?: string; renamed_to?: string }) => void,
     onDone: () => void,
     onError?: (err: unknown) => void,
+    local_name?: string,
   ) => streamSSE(
     "/api/ollama/pull",
-    { model, base_url },
+    local_name ? { model, base_url, local_name } : { model, base_url },
     (event, data) => {
       if (event === "progress") onProgress(data);
       else if (event === "done") onDone();
@@ -400,7 +585,22 @@ export const api = {
       "POST",
       body,
     ),
-  hardwareMatrix: () => jsonReq<HardwareMatrixResponse>("/api/hardware/matrix"),
+  hfModels: (params: { search?: string; sort?: string; limit?: number } = {}) => {
+    const q = new URLSearchParams();
+    if (params.search) q.set("search", params.search);
+    if (params.sort) q.set("sort", params.sort);
+    if (params.limit) q.set("limit", String(params.limit));
+    const qs = q.toString();
+    return jsonReq<{ models: HfHubModel[] }>(
+      `/api/setup/hf_models${qs ? `?${qs}` : ""}`,
+    );
+  },
+  hardwareMatrix: (base_url?: string) =>
+    jsonReq<HardwareMatrixResponse>(
+      `/api/hardware/matrix${base_url ? `?base_url=${encodeURIComponent(base_url)}` : ""}`,
+    ),
+  hfFit: (repo: string) =>
+    jsonReq<HfModelFit>(`/api/hardware/hf_fit?repo=${encodeURIComponent(repo)}`),
   detectHardware: () => jsonReq<HardwareInfo>("/api/setup/hardware"),
 
   listSessions: () => jsonReq<SessionSummary[]>("/api/sessions"),
@@ -544,6 +744,109 @@ export const api = {
     jsonReq<TraceSettings>("/api/settings/trace"),
   setTraceSettings: (enabled: boolean) =>
     jsonReq<TraceSettings>("/api/settings/trace", "POST", { enabled }),
+
+  // --- User Activity (Subsystem C) ---
+  activityRuns: (params?: { kind?: string; owner?: string; status?: string; limit?: number }) => {
+    const q = new URLSearchParams();
+    if (params?.kind) q.set("kind", params.kind);
+    if (params?.owner) q.set("owner", params.owner);
+    if (params?.status) q.set("status", params.status);
+    if (params?.limit) q.set("limit", String(params.limit));
+    const qs = q.toString();
+    return jsonReq<{ runs: RunRecord[]; count: number }>(`/api/activity/runs${qs ? `?${qs}` : ""}`);
+  },
+  activitySummary: () => jsonReq<ActivitySummary>("/api/activity/summary"),
+  activityRunDetail: (runId: string) =>
+    jsonReq<RunDetail>(`/api/activity/runs/${encodeURIComponent(runId)}`),
+
+  // --- Admin (Subsystem D) ---
+  adminOverview: () => jsonReq<AdminOverview>("/api/admin/overview"),
+  adminMetrics: () => jsonReq<MetricsSnapshot>("/api/admin/metrics"),
+  adminLogs: (params?: { event?: string; limit?: number; project_root?: string }) => {
+    const q = new URLSearchParams();
+    if (params?.event) q.set("event", params.event);
+    if (params?.limit) q.set("limit", String(params.limit));
+    if (params?.project_root) q.set("project_root", params.project_root);
+    const qs = q.toString();
+    return jsonReq<{ source: string; logs: AdminLogEntry[]; count: number }>(
+      `/api/admin/logs${qs ? `?${qs}` : ""}`,
+    );
+  },
+  deleteLogs: (params?: { project_root?: string; all?: boolean }) => {
+    const q = new URLSearchParams();
+    if (params?.all) q.set("scope", "all");
+    else if (params?.project_root) q.set("project_root", params.project_root);
+    const qs = q.toString();
+    return jsonReq<{ deleted: number; scope: string; targets: string[] }>(
+      `/api/admin/logs${qs ? `?${qs}` : ""}`,
+      "DELETE",
+    );
+  },
+
+  // --- AIOps monitoring (Subsystem G) ---
+  monitorAlerts: (params?: { severity?: string; code?: string; limit?: number; since?: number }) => {
+    const q = new URLSearchParams();
+    if (params?.severity) q.set("severity", params.severity);
+    if (params?.code) q.set("code", params.code);
+    if (params?.limit) q.set("limit", String(params.limit));
+    if (params?.since) q.set("since", String(params.since));
+    const qs = q.toString();
+    return jsonReq<{ alerts: MonitorAlert[]; count: number }>(
+      `/api/monitor/alerts${qs ? `?${qs}` : ""}`,
+    );
+  },
+
+  // --- Feedback loop (Subsystem H) ---
+  feedbackStats: (since?: number) =>
+    jsonReq<FeedbackStats>(`/api/feedback/stats${since ? `?since=${since}` : ""}`),
+  feedbackList: (params?: { rating?: string; kind?: string; run_id?: string; limit?: number }) => {
+    const q = new URLSearchParams();
+    if (params?.rating) q.set("rating", params.rating);
+    if (params?.kind) q.set("kind", params.kind);
+    if (params?.run_id) q.set("run_id", params.run_id);
+    if (params?.limit) q.set("limit", String(params.limit));
+    const qs = q.toString();
+    return jsonReq<{ feedback: FeedbackRow[]; count: number }>(
+      `/api/feedback${qs ? `?${qs}` : ""}`,
+    );
+  },
+
+  // --- Cost & quota governance (Subsystem I) ---
+  usage: (owner?: string, day?: string) => {
+    const q = new URLSearchParams();
+    if (owner) q.set("owner", owner);
+    if (day) q.set("day", day);
+    const qs = q.toString();
+    return jsonReq<OwnerUsage>(`/api/usage${qs ? `?${qs}` : ""}`);
+  },
+  usageSummary: (day?: string) =>
+    jsonReq<{ usage: UsageRow[]; count: number }>(`/api/usage/summary${day ? `?day=${day}` : ""}`),
+
+  // --- Data governance (Subsystem M) ---
+  govPolicy: () => jsonReq<GovPolicy>("/api/govdata/policy"),
+  govScan: (text: string) => jsonReq<GovScanResult>("/api/govdata/scan", "POST", { text }),
+  govPurge: (retention_days?: number | null) =>
+    jsonReq<{ ok: boolean; deleted: Record<string, number>; total: number }>(
+      "/api/govdata/purge",
+      "POST",
+      { retention_days: retention_days ?? null },
+    ),
+  govErase: (body: { run_id?: string; owner?: string }) =>
+    jsonReq<{ ok: boolean; deleted: Record<string, number>; total: number }>(
+      "/api/govdata/erase",
+      "POST",
+      body,
+    ),
+
+  // --- Reliability & health (Subsystem J) ---
+  // Probes live at the root (not under /api); the dev proxy forwards them too.
+  liveness: () => jsonReq<LivenessReport>("/healthz"),
+  // /readyz returns 503 when not ready, so parse the body regardless of status
+  // rather than letting jsonReq throw on the non-2xx.
+  readiness: async (): Promise<ReadinessReport> => {
+    const res = await fetch("/readyz");
+    return (await res.json()) as ReadinessReport;
+  },
 };
 
 export type TraceSettings = {

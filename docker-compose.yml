@@ -1,0 +1,64 @@
+# Local observability stack: CGX + Prometheus + Grafana.
+#
+#   docker compose up --build
+#     CGX UI      -> http://localhost:8765
+#     Prometheus  -> http://localhost:9090
+#     Grafana     -> http://localhost:3000  (admin / ${GRAFANA_ADMIN_PASSWORD})
+#
+# Prometheus scrapes CGX at /api/metrics and loads the SLO rules from
+# deploy/prometheus/. Grafana is auto-provisioned with the Prometheus
+# datasource. Config + observation DBs persist in the cgx-data volume.
+
+services:
+  cgx:
+    build:
+      context: .
+      args:
+        CGX_EXTRAS: ui
+    image: cgx:latest
+    ports:
+      - "8765:8765"
+    environment:
+      CGX_HOST: 0.0.0.0
+      CGX_PORT: "8765"
+      CGX_CONFIG_DIR: /data
+      # Data-governance policy (Subsystem M) -- opt-in retention/scrub.
+      CGX_RETENTION_DAYS: "30"
+    volumes:
+      - cgx-data:/data
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:latest
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/prometheus/cgx-slo-rules.yml:/etc/prometheus/rules/cgx-slo-rules.yml:ro
+      - prom-data:/prometheus
+    depends_on:
+      - cgx
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      # Dev default only -- override GRAFANA_ADMIN_PASSWORD in production.
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+volumes:
+  cgx-data:
+  prom-data:
+  grafana-data:

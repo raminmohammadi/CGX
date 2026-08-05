@@ -15,8 +15,8 @@ typed task at a time. Each section below opens as a collapsible block.
 [Task registry](#task-registry) · [Apply rollback](#apply-rollback) ·
 [Persistent sessions](#persistent-sessions) · [Rate limiting](#rate-limiting) ·
 [Hardware matrix](#hardware--model-matrix) · [Telemetry](#telemetry) ·
-[Observability](#observability) · [React frontend](#react-frontend) ·
-[Security model](#security-model)
+[Observability](#observability) · [MLOps subsystems](#mlops-subsystems) ·
+[React frontend](#react-frontend) · [Security model](#security-model)
 
 <details>
 <summary>
@@ -74,6 +74,19 @@ cgx.webui.routes.rollback -- POST /api/rollback restores from an apply backup di
 cgx.webui.routes.setup  -- discovery endpoints + POST /api/provider/ping
 cgx.webui.routes.agent_session -- /api/agent-session/* JSON routes for the session backbone
 cgx.cli / cgx.webui     -- terminal + FastAPI/React surfaces (uvicorn on :8765)
+cgx.metrics             -- stdlib in-process metrics registry + Prometheus text exporter (/api/metrics)
+cgx.trace               -- curated @traced function-call tracer (CGX_TRACE) → agent.log / cgx-trace.log
+cgx.redact              -- credential-shape redaction for logs / traces / stored payloads
+cgx.registry            -- prompt fingerprint + run_id + index lineage (provenance join keys)
+cgx.usage               -- truthful token + cost accounting (CGX_MODEL_PRICING)
+cgx.health              -- liveness / readiness probes backing /healthz + /readyz
+cgx.activity            -- per-run observation store (activity.db) + record_run recorder
+cgx.eval                -- offline retrieval + codegen eval harness + CI quality gate
+cgx.monitor             -- AIOps drift/quality/cost checks → Alert store (monitor.db)
+cgx.feedback            -- thumbs up/down + comments (feedback.db) + eval-candidate flywheel
+cgx.governance          -- per-owner cost/quota budgets (usage.db) + GovernedProvider choke-point
+cgx.guardrails          -- prompt-injection / secret-output / path-escape checks + LLM kill-switch
+cgx.govdata             -- retention TTL, right-to-erasure, PII scan/scrub over the obs stores
 ```
 
 </details>
@@ -356,7 +369,7 @@ orchestration layer never knows which backend it is talking to.
 | Class | Kind string | Notes |
 |---|---|---|
 | `OllamaProvider` | `"ollama"` | Local Ollama via `/api/chat`; JSON mode via `format: "json"`. |
-| `OpenAICompatProvider` | `"openai-compat"` or `"custom"` | Any `/v1/chat/completions`-compatible endpoint. Accepts `endpoint_path` to override the path suffix and `allow_no_auth=True` to skip Bearer auth (private subnets). |
+| `OpenAICompatProvider` | `"openai-compat"`, `"custom"`, or `"huggingface"` | Any `/v1/chat/completions`-compatible endpoint. Accepts `endpoint_path` to override the path suffix and `allow_no_auth=True` to skip Bearer auth (private subnets). For `"huggingface"` the host and endpoint path are pinned to the Inference Providers router (`https://router.huggingface.co/v1`) and only the token varies. |
 | `GeminiProvider` | `"gemini"` | Google Gemini via `generativelanguage.googleapis.com`. Maps CGX's `messages` to Gemini's `contents` + `systemInstruction`; merges consecutive same-role turns; uses `responseMimeType: "application/json"` for JSON mode; streams via `streamGenerateContent`. |
 
 **Schema-constrained decoding** (`cgx.answer.schemas`): every `chat()`
@@ -385,8 +398,8 @@ saved profile) goes through one factory.
 **Reranker policy** (`enable_reranker`): an `Optional[bool]` whose
 `None` value means "auto" and resolves through
 `default_reranker_for_kind(kind)` -- cloud kinds (`openai-compat`,
-`gemini`) opt in by default, local / private kinds (`ollama`, `custom`)
-opt out. Explicit `True` / `False` on the profile wins.
+`gemini`, `huggingface`) opt in by default, local / private kinds
+(`ollama`, `custom`) opt out. Explicit `True` / `False` on the profile wins.
 `resolve_enable_reranker(profile)` is the single helper that returns
 the effective flag. The value threads from `Profile` →
 `cgx.pipeline.auto.run_query_auto(enable_reranker=…)` →
@@ -1617,6 +1630,40 @@ operation then emits structured log lines to stdout:
 Log lines use `[INFO]` and `[WARNING]` severity and include the logger
 name so they can be filtered in production with standard `logging`
 configuration.
+
+</details>
+<details>
+<summary>
+
+## MLOps subsystems
+</summary>
+
+On top of the request pipeline, CGX carries a production MLOps layer. Each
+subsystem follows the same conventions: an in-process metrics feed, a SQLite
+store (WAL, `$CGX_CONFIG_DIR`-aware, path-injection-guarded) where it needs
+persistence, and a best-effort recorder so an observability failure can never
+break an ask/plan/agent request. They are joined by a single per-run key --
+the `run_id` minted in `cgx.registry` and stamped onto the trace context and
+response `meta`.
+
+| Subsystem | Modules | Surface |
+|-----------|---------|---------|
+| B -- Observability | `cgx.metrics`, `cgx.trace`, `cgx.redact` | `GET /api/metrics`; `@traced` → `agent.log` / `cgx-trace.log` |
+| C -- User activity | `cgx.activity` (`activity.db`) | `GET /api/activity/{runs,runs/{id},summary}` |
+| D -- Admin explorer | `cgx.webui.routes.admin` | `GET /api/admin/{logs,metrics,overview}`; `DELETE /api/admin/logs` (trace-log purge, log-files-only) |
+| E -- Evaluation | `cgx.eval`, `evals/` | `python -m cgx.eval`; CI gate |
+| F -- Lineage | `cgx.registry` | prompt fingerprint / `run_id` / index lineage |
+| G -- AIOps monitoring | `cgx.monitor` (`monitor.db`) | `GET /api/monitor/alerts` |
+| H -- Feedback | `cgx.feedback` (`feedback.db`) | `GET/POST /api/feedback`, `/api/feedback/stats` |
+| I -- Cost & quota | `cgx.governance` (`usage.db`), `cgx.usage` | `GET /api/usage`, `/api/usage/summary` |
+| J -- Reliability | `cgx.health` | `GET /healthz`, `/readyz` |
+| K -- Guardrails | `cgx.guardrails` | advisory findings in `meta` + alert store |
+| M -- Data governance | `cgx.govdata` | `GET/POST /api/govdata/*` |
+| L -- Packaging | `Dockerfile`, `docker-compose.yml`, `deploy/helm/cgx` | container / Compose / Helm |
+
+The full operator guide -- endpoints, env vars, and store layout -- lives in
+[mlops.md](mlops.md); deployment specifics are in
+[../deploy/README.md](../deploy/README.md).
 
 </details>
 <details>

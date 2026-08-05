@@ -15,6 +15,7 @@ client-side URLs (``/ask``, ``/plan`` …) that the server must serve as
 from __future__ import annotations
 
 import os
+import uuid
 from pathlib import Path
 
 import time
@@ -24,15 +25,28 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from cgx.trace import emit_trace as _trace_emit, is_trace_enabled
+from cgx import metrics as _metrics
+from cgx.trace import (
+    emit_trace as _trace_emit,
+    is_trace_enabled,
+    reset_trace_context,
+    set_trace_context,
+)
 
 from cgx.webui.routes import (
+    activity as activity_route,
+    admin as admin_route,
     agent_profiles,
     agent_session,
     ask,
     embed,
+    feedback as feedback_route,
+    govdata as govdata_route,
     hardware,
+    health as health_route,
     index as index_route,
+    metrics as metrics_route,
+    monitor as monitor_route,
     plan,
     profiles,
     rollback,
@@ -42,12 +56,44 @@ from cgx.webui.routes import (
     skills as skills_route,
     status,
     tasks,
+    usage as usage_route,
 )
 
 
 HERE = Path(__file__).resolve().parent
 STATIC_DIR = HERE / "static"
 ASSETS_DIR = STATIC_DIR / "assets"
+
+
+def _route_template(request: Request, fallback: str) -> str:
+    """Low-cardinality route label for metrics.
+
+    Prefers the matched route's path template (``/api/tasks/{id}/events``)
+    over the raw URL so per-id paths don't explode metric cardinality.
+    Falls back to a coarse bucket for unmatched paths.
+    """
+    route = request.scope.get("route")
+    tmpl = getattr(route, "path", None)
+    if tmpl:
+        return str(tmpl)
+    if fallback.startswith("/api/"):
+        return "/api/_unmatched"
+    return "/_spa"
+
+
+def _record_red(request: Request, method: str, elapsed_ms: float,
+                status_code: int) -> None:
+    """Record Rate/Errors/Duration metrics for one HTTP request."""
+    try:
+        path = _route_template(request, request.url.path)
+        _metrics.inc("cgx_http_requests_total",
+                     help="HTTP requests by method/route/status.",
+                     method=method, route=path, status=str(status_code))
+        _metrics.observe("cgx_http_request_duration_ms", elapsed_ms,
+                         help="HTTP request duration in milliseconds.",
+                         method=method, route=path)
+    except Exception:  # pragma: no cover - metrics must never break a request
+        pass
 
 
 def create_app() -> FastAPI:
@@ -73,27 +119,46 @@ def create_app() -> FastAPI:
         allow_credentials=False,
     )
 
-    # Per-request trace bracket (Phase TR.3). One ``enter``/``exit`` record
-    # per HTTP request when the global trace flag is on. The toggle-off
-    # branch is a single bool check so production overhead stays near zero.
+    # Per-request observability bracket. Three concerns, cheapest first:
+    #   1. request_id -- always assigned and propagated on the trace context
+    #      (+ echoed as ``X-Request-ID``) so every downstream record for one
+    #      request correlates end-to-end.
+    #   2. RED metrics -- always recorded (rate/errors/duration per route),
+    #      independent of the trace toggle, for the /api/metrics scrape.
+    #   3. Curated trace enter/exit -- only when the global trace flag is on.
     @app.middleware("http")
-    async def _trace_requests(request: Request, call_next):
-        if not is_trace_enabled():
-            return await call_next(request)
+    async def _observe_requests(request: Request, call_next):
+        request_id = request.headers.get("x-request-id") or uuid.uuid4().hex
+        traced = is_trace_enabled()
         t0 = time.perf_counter()
-        path = request.url.path
         method = request.method
-        _trace_emit("trace_enter", category="http", fn=f"{method} {path}")
+        path = request.url.path
+        token = set_trace_context(request_id=request_id)
+        if traced:
+            _trace_emit("trace_enter", category="http",
+                        fn=f"{method} {path}", request_id=request_id)
+        status_code = 500
         try:
             response = await call_next(request)
+            status_code = getattr(response, "status_code", 200)
         except BaseException as exc:
-            _trace_emit("trace_error", category="http", fn=f"{method} {path}",
-                        elapsed_ms=int((time.perf_counter() - t0) * 1000),
-                        error_type=type(exc).__name__, error=str(exc)[:300])
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            _record_red(request, method, elapsed_ms, status_code)
+            if traced:
+                _trace_emit("trace_error", category="http",
+                            fn=f"{method} {path}", request_id=request_id,
+                            elapsed_ms=int(elapsed_ms),
+                            error_type=type(exc).__name__, error=str(exc)[:300])
+            reset_trace_context(token)
             raise
-        _trace_emit("trace_exit", category="http", fn=f"{method} {path}",
-                    elapsed_ms=int((time.perf_counter() - t0) * 1000),
-                    status_code=getattr(response, "status_code", None))
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        _record_red(request, method, elapsed_ms, status_code)
+        response.headers["X-Request-ID"] = request_id
+        if traced:
+            _trace_emit("trace_exit", category="http", fn=f"{method} {path}",
+                        request_id=request_id, elapsed_ms=int(elapsed_ms),
+                        status_code=status_code)
+        reset_trace_context(token)
         return response
 
     # --- REST + SSE routes ---
@@ -112,6 +177,18 @@ def create_app() -> FastAPI:
     app.include_router(tasks.router, prefix="/api")
     app.include_router(rollback.router, prefix="/api")
     app.include_router(settings_route.router, prefix="/api")
+    app.include_router(metrics_route.router, prefix="/api")
+    app.include_router(monitor_route.router, prefix="/api")
+    app.include_router(feedback_route.router, prefix="/api")
+    app.include_router(usage_route.router, prefix="/api")
+    app.include_router(activity_route.router, prefix="/api")
+    app.include_router(admin_route.router, prefix="/api")
+    app.include_router(govdata_route.router, prefix="/api")
+
+    # Liveness/readiness probes at the root (``/healthz``, ``/readyz``) -- no
+    # ``/api`` prefix, and registered before the SPA catch-all so the React
+    # fallback can't shadow them.
+    app.include_router(health_route.router)
 
     # --- Static SPA (built React app) ---
     _mount_spa(app)

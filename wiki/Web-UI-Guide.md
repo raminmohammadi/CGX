@@ -22,11 +22,13 @@ It binds to `127.0.0.1:8765` by default; open <http://localhost:8765>.
 ## The tabs (left → right)
 
 ### 1. Setup
-Choose a **Provider Type** (Ollama, OpenAI, Google Gemini, or Custom
-Server), fill in the model and credentials, and click **Ping** to verify
-the connection with a live latency check. Detect hardware (RAM + GPU
-VRAM), tune sampling parameters, and save named profiles. API keys are
-stored in your OS keyring. See **[[Providers and Models]]**.
+Choose a **Provider Type** (Ollama, OpenAI, Google Gemini, Hugging Face,
+or Custom Server), fill in the model and credentials, and click **Ping**
+to verify the connection with a live latency check. Detect hardware
+(RAM + GPU VRAM), tune sampling parameters, and save named profiles. API
+keys are stored in your OS keyring. A **Browse Hugging Face** panel lists
+GGUF repositories from the Hub and pulls them straight into your local
+Ollama daemon. See **[[Providers and Models]]**.
 
 ### 2. Index
 Point at a project root or upload a `.zip`. Honours `.gitignore` and a
@@ -70,6 +72,20 @@ Save provider configurations for any supported kind. Custom profiles
 expose an **Endpoint Path** field and a **Skip auth** toggle for
 private-subnet servers. Optional per-profile `rate_limit` and
 `max_retries` apply automatically to every call made by that profile.
+
+### 8. Ops (`/ops`)
+The unified **observability hub** over the MLOps layer: live metrics,
+pipeline/subsystem cards, and a **Trace explorer**. The explorer reads the
+`@traced` function-call log (enable tracing with `CGX_TRACE` or the Settings
+toggle) and lets you switch **source** between the Global fallback (HTTP / CLI
+records) and any project's `agent.log` — the latter holds the rich records:
+each LLM call with its **full prompt + response**, plus router, executor,
+codegen, scaffold, and repair spans. Records are newest-first, redacted
+server-side, filterable by event and category, with an "HTTP hidden" toggle and
+click-through detail. **Ask** and **Plan** runs are traced into their project's
+log too, not just the agent. **Delete** (current source) and **Delete all**
+controls purge trace/log files only — never any other file — each behind a
+confirmation. Deep dive: **[[MLOps and Production]]**.
 
 ---
 

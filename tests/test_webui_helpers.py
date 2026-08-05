@@ -41,6 +41,26 @@ def test_build_provider_handles_default_base_url_for_ollama():
     assert "11434" in p.base_url
 
 
+def test_build_provider_huggingface_uses_fixed_router_host():
+    from cgx.answer.providers import OpenAICompatProvider
+    p = build_provider(kind="huggingface", model="openai/gpt-oss-20b",
+                       base_url="ignored://whatever", api_key="hf_test")
+    assert isinstance(p, OpenAICompatProvider)
+    assert p.model == "openai/gpt-oss-20b"
+    # The host is hardcoded to the HF router regardless of any base_url arg,
+    # so a caller can never redirect inference off the fixed endpoint.
+    assert p.base_url == "https://router.huggingface.co"
+    assert p.endpoint_path == "/v1/chat/completions"
+
+
+def test_build_provider_huggingface_falls_back_to_env_token(monkeypatch):
+    monkeypatch.delenv("HUGGINGFACEHUB_API_TOKEN", raising=False)
+    monkeypatch.setenv("HF_TOKEN", "hf_from_env")
+    p = build_provider(kind="huggingface", model="m", base_url="", api_key=None)
+    # The env token is picked up when no key is passed explicitly.
+    assert getattr(p, "api_key", None) == "hf_from_env"
+
+
 def test_build_provider_forwards_rate_limit_and_retries():
     p = build_provider(kind="openai", model="m", base_url="http://x", api_key=None,
                        rate_limit=2.0, max_retries=4)

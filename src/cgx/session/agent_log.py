@@ -149,6 +149,82 @@ def log_event(project_root: Optional[str], event: str, **fields: Any) -> None:
         _emit_to(_stable_path(str(session_id)), event, ts, fields)
 
 
+def _drop_handler_for(path: Path) -> None:
+    """Close + evict the cached rotating handler for ``path`` (if any).
+
+    Releases the OS file descriptor so the file can be unlinked; the next
+    :func:`log_event` for that path lazily re-opens a fresh handler.
+    """
+    key = str(path)
+    with _handlers_lock:
+        h = _handlers.pop(key, None)
+    if h is not None:
+        try:
+            h.close()
+        except Exception:  # pragma: no cover - defensive
+            pass
+
+
+def _unlink_log_file(path: Path) -> bool:
+    """Unlink one trace-log file with a hard safety gate.
+
+    Deletion is deliberately narrow so a caller-supplied ``project_root``
+    can never be leveraged to remove anything other than a CGX trace log:
+
+    * the basename must be the known log file or one of its rotation
+      backups (``agent.log`` / ``agent.log.1`` ...), never anything else;
+    * the target must be an existing *regular file*, never a directory;
+    * symlinks are refused outright (``lstat``-based check) so a planted
+      ``agent.log -> /etc/shadow`` symlink can't redirect the unlink.
+
+    Returns True when a file was removed.
+    """
+    name = path.name
+    allowed = {_LOG_FILE_NAME} | {
+        f"{_LOG_FILE_NAME}.{i}" for i in range(1, _BACKUP_COUNT + 1)
+    }
+    if name not in allowed:
+        return False
+    try:
+        st = path.lstat()
+    except (FileNotFoundError, OSError):
+        return False
+    import stat as _stat
+    # Regular files only: reject symlinks (S_ISLNK) and directories.
+    if not _stat.S_ISREG(st.st_mode):
+        return False
+    _drop_handler_for(path)
+    try:
+        path.unlink()
+        return True
+    except FileNotFoundError:
+        return False
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning("agent_log: unlink failed for %s (%s)", path, e)
+        return False
+
+
+def delete_project_trace_log(project_root: str) -> int:
+    """Delete a project's ``<root>/.cgx/agent.log`` (+ rotation backups).
+
+    Only ever touches files literally named ``agent.log`` /
+    ``agent.log.<n>`` inside the resolved ``<project_root>/.cgx``
+    directory. The filename is a compile-time constant, so even a hostile
+    ``project_root`` cannot escape to an arbitrary path via traversal, and
+    :func:`_unlink_log_file` refuses symlinks and non-regular files.
+    Returns the number of files removed; a no-op (returns 0) when the
+    project has no agent log.
+    """
+    if not project_root:
+        return 0
+    base = _resolve_path(project_root)
+    candidates = [base] + [
+        base.with_name(f"{_LOG_FILE_NAME}.{i}")
+        for i in range(1, _BACKUP_COUNT + 1)
+    ]
+    return sum(1 for p in candidates if _unlink_log_file(p))
+
+
 def reset_for_tests() -> None:
     """Close + drop every cached handler. Test-only."""
     with _handlers_lock:
