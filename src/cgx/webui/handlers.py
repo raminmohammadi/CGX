@@ -21,6 +21,7 @@ from cgx.answer.engine import answer_with_llm_stream, generate_code_plan
 from cgx.answer.intent import detect_intent
 from cgx.answer.model_caps import model_supports_thinking
 from cgx.answer.scope import resolve_scope_for_intent
+from cgx.governance import govern
 from cgx.pipeline.auto import IndexBuildCancelled, run_index_auto, run_query_auto
 from cgx.registry import new_run_id, register_known_prompts
 from cgx.trace import set_trace_context
@@ -90,12 +91,17 @@ def _resolve_provider(
     allow_no_auth: bool = False,
 ) -> Any:
     if use_profile and profile_name:
-        return provider_from_profile_name(profile_name)
-    return build_provider(
-        kind=kind, model=model, base_url=base_url, api_key=api_key or None,
-        temperature=temperature, num_predict=num_predict, num_ctx=num_ctx,
-        endpoint_path=endpoint_path, allow_no_auth=allow_no_auth,
-    )
+        prov = provider_from_profile_name(profile_name)
+    else:
+        prov = build_provider(
+            kind=kind, model=model, base_url=base_url, api_key=api_key or None,
+            temperature=temperature, num_predict=num_predict, num_ctx=num_ctx,
+            endpoint_path=endpoint_path, allow_no_auth=allow_no_auth,
+        )
+    # Subsystem I: wrap at the single provider choke-point so every ask/plan
+    # and agent-session call is quota-checked (hard-stop) and metered. A
+    # disabled config returns the provider unchanged.
+    return govern(prov)
 
 
 def stream_index(

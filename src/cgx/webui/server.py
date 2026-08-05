@@ -53,6 +53,7 @@ from cgx.webui.routes import (
     skills as skills_route,
     status,
     tasks,
+    usage as usage_route,
 )
 
 
@@ -176,6 +177,7 @@ def create_app() -> FastAPI:
     app.include_router(metrics_route.router, prefix="/api")
     app.include_router(monitor_route.router, prefix="/api")
     app.include_router(feedback_route.router, prefix="/api")
+    app.include_router(usage_route.router, prefix="/api")
 
     # Liveness/readiness probes at the root (``/healthz``, ``/readyz``) -- no
     # ``/api`` prefix, and registered before the SPA catch-all so the React
