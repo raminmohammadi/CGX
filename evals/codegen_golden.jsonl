@@ -1,0 +1,3 @@
+{"id": "add-new-file", "task": "Add a helper module", "plan_file": "codegen_cases/add_new_file.md", "expect": {"overall_ok": true}}
+{"id": "empty-plan", "task": "Refactor everything", "plan_file": "codegen_cases/empty_plan.md", "expect": {"overall_ok": false}}
+{"id": "syntax-error", "task": "Add a broken helper", "plan_file": "codegen_cases/syntax_error.md", "expect": {"overall_ok": false}}

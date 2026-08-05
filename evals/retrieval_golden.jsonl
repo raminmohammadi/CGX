@@ -1,0 +1,4 @@
+{"query": "add two numbers together", "relevant": ["calc.py::method::Calculator.add"]}
+{"query": "multiply two numbers", "relevant": ["calc.py::method::Calculator.multiply"]}
+{"query": "reconnect to the database with retries", "relevant": ["db.py::function::databaseReconnect"]}
+{"query": "parse command line arguments", "relevant": ["db.py::function::parse_input_args"]}
