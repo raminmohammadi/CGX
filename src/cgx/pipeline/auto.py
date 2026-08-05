@@ -40,6 +40,11 @@ from cgx.retrieval.orchestrator import (
 from cgx.io.persist import save_indices, load_indices, save_jsonl, load_jsonl
 from cgx.retrieval.lexical import get_cached_lexical_index
 from cgx.answer.scope import apply_scope_penalty
+from cgx.pipeline.instrument import (
+    metered,
+    record_index_build,
+    record_retrieval,
+)
 from cgx.trace import traced
 
 # Graph persistence
@@ -85,6 +90,7 @@ class IndexBuildCancelled(Exception):
     """
 
 
+@metered(record_index_build)
 def run_index_auto(
     project_root: str,
     out_dir: str,
@@ -377,6 +383,7 @@ def run_index_auto(
 # Query wrapper (ALL SIGNALS + IMPACT)
 # ---------------------------
 
+@metered(record_retrieval)
 @traced("pipeline")
 def run_query_auto(
     index_dir: str,

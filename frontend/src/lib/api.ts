@@ -413,6 +413,95 @@ export type AdminOverview = {
   };
 };
 
+// --- AIOps monitoring (Subsystem G): persisted alerts ---
+export type MonitorAlert = {
+  alert_id: string;
+  created_at: number;
+  code: string;
+  severity: "info" | "warning" | "critical" | string;
+  run_id?: string | null;
+  value?: number | null;
+  threshold?: number | null;
+  message: string;
+  labels: Record<string, any>;
+};
+
+// --- Feedback loop (Subsystem H) ---
+export type FeedbackStats = {
+  total: number;
+  up: number;
+  down: number;
+  satisfaction: number | null;
+  by_kind: Record<string, { up: number; down: number }>;
+};
+export type FeedbackRow = {
+  feedback_id: string;
+  created_at: number;
+  rating: "up" | "down" | string;
+  run_id?: string | null;
+  session_id?: string | null;
+  kind: string;
+  comment: string;
+  question: string;
+  answer_preview: string;
+  model?: string | null;
+  prompt_version?: string | null;
+  labels: Record<string, any>;
+};
+
+// --- Cost & quota governance (Subsystem I) ---
+export type OwnerUsage = {
+  owner: string;
+  state: "ok" | "warn" | "exceeded" | string;
+  cost_used: number;
+  cost_limit: number;
+  tokens_used: number;
+  tokens_limit: number;
+  day?: string;
+  tokens_in?: number;
+  tokens_out?: number;
+  tokens_total?: number;
+  cost_usd?: number;
+  calls?: number;
+};
+export type UsageRow = {
+  owner: string;
+  day: string;
+  tokens_in: number;
+  tokens_out: number;
+  tokens_total: number;
+  cost_usd: number;
+  calls: number;
+};
+
+// --- Data governance (Subsystem M) ---
+export type GovPolicy = {
+  retention_days: number;
+  store_full_text: boolean;
+  scrub_pii: boolean;
+  preview_cap: number;
+};
+export type GovScanResult = {
+  findings: Array<{ type: string; count: number }>;
+  total: number;
+  scrubbed: string;
+};
+
+// --- Reliability & health (Subsystem J) ---
+export type HealthCheck = {
+  name: string;
+  ok: boolean;
+  critical: boolean;
+  detail: Record<string, any>;
+};
+export type LivenessReport = { status: string; checks: HealthCheck[] };
+export type ReadinessReport = {
+  status: string;
+  ready: boolean;
+  ts?: number;
+  checks: HealthCheck[];
+};
+
 export const api = {
   status: () => jsonReq<StatusResponse>("/api/status"),
   ollamaHealth: (base_url: string) =>
@@ -636,6 +725,71 @@ export const api = {
     return jsonReq<{ source: string; logs: AdminLogEntry[]; count: number }>(
       `/api/admin/logs${qs ? `?${qs}` : ""}`,
     );
+  },
+
+  // --- AIOps monitoring (Subsystem G) ---
+  monitorAlerts: (params?: { severity?: string; code?: string; limit?: number; since?: number }) => {
+    const q = new URLSearchParams();
+    if (params?.severity) q.set("severity", params.severity);
+    if (params?.code) q.set("code", params.code);
+    if (params?.limit) q.set("limit", String(params.limit));
+    if (params?.since) q.set("since", String(params.since));
+    const qs = q.toString();
+    return jsonReq<{ alerts: MonitorAlert[]; count: number }>(
+      `/api/monitor/alerts${qs ? `?${qs}` : ""}`,
+    );
+  },
+
+  // --- Feedback loop (Subsystem H) ---
+  feedbackStats: (since?: number) =>
+    jsonReq<FeedbackStats>(`/api/feedback/stats${since ? `?since=${since}` : ""}`),
+  feedbackList: (params?: { rating?: string; kind?: string; run_id?: string; limit?: number }) => {
+    const q = new URLSearchParams();
+    if (params?.rating) q.set("rating", params.rating);
+    if (params?.kind) q.set("kind", params.kind);
+    if (params?.run_id) q.set("run_id", params.run_id);
+    if (params?.limit) q.set("limit", String(params.limit));
+    const qs = q.toString();
+    return jsonReq<{ feedback: FeedbackRow[]; count: number }>(
+      `/api/feedback${qs ? `?${qs}` : ""}`,
+    );
+  },
+
+  // --- Cost & quota governance (Subsystem I) ---
+  usage: (owner?: string, day?: string) => {
+    const q = new URLSearchParams();
+    if (owner) q.set("owner", owner);
+    if (day) q.set("day", day);
+    const qs = q.toString();
+    return jsonReq<OwnerUsage>(`/api/usage${qs ? `?${qs}` : ""}`);
+  },
+  usageSummary: (day?: string) =>
+    jsonReq<{ usage: UsageRow[]; count: number }>(`/api/usage/summary${day ? `?day=${day}` : ""}`),
+
+  // --- Data governance (Subsystem M) ---
+  govPolicy: () => jsonReq<GovPolicy>("/api/govdata/policy"),
+  govScan: (text: string) => jsonReq<GovScanResult>("/api/govdata/scan", "POST", { text }),
+  govPurge: (retention_days?: number | null) =>
+    jsonReq<{ ok: boolean; deleted: Record<string, number>; total: number }>(
+      "/api/govdata/purge",
+      "POST",
+      { retention_days: retention_days ?? null },
+    ),
+  govErase: (body: { run_id?: string; owner?: string }) =>
+    jsonReq<{ ok: boolean; deleted: Record<string, number>; total: number }>(
+      "/api/govdata/erase",
+      "POST",
+      body,
+    ),
+
+  // --- Reliability & health (Subsystem J) ---
+  // Probes live at the root (not under /api); the dev proxy forwards them too.
+  liveness: () => jsonReq<LivenessReport>("/healthz"),
+  // /readyz returns 503 when not ready, so parse the body regardless of status
+  // rather than letting jsonReq throw on the non-2xx.
+  readiness: async (): Promise<ReadinessReport> => {
+    const res = await fetch("/readyz");
+    return (await res.json()) as ReadinessReport;
   },
 };
 
