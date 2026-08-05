@@ -1,10 +1,22 @@
 import { useEffect, useState } from "react";
-import { AlertTriangle, CheckCircle, HardDrive, Microchip, RefreshCcw, XCircle } from "lucide-react";
-import { api, type HardwareMatrixResponse } from "../../lib/api";
+import {
+  AlertTriangle,
+  CheckCircle,
+  Cpu,
+  Gauge,
+  HardDrive,
+  Loader2,
+  Microchip,
+  RefreshCcw,
+  Search,
+  XCircle,
+} from "lucide-react";
+import { api, type HardwareMatrixResponse, type HfModelFit } from "../../lib/api";
 import { useWorkspace } from "../../store/workspace";
 import { Card, CardHeader } from "../Card";
 import { Pill } from "../Pill";
 import { StatCard } from "../StatCard";
+import { TextInput } from "../Input";
 
 // GGUF / Ollama models live in the local daemon, so the installed-model probe
 // targets the active Ollama host (or localhost when a cloud provider is set).
@@ -18,6 +30,28 @@ export function HardwarePanel() {
   const [data, setData] = useState<HardwareMatrixResponse | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // Ad-hoc Hugging Face fit checker: paste a repo id, size it against the
+  // detected hardware budget without pulling anything.
+  const [hfRepo, setHfRepo] = useState("");
+  const [hfFit, setHfFit] = useState<HfModelFit | null>(null);
+  const [hfBusy, setHfBusy] = useState(false);
+  const [hfError, setHfError] = useState<string | null>(null);
+
+  const checkHfFit = async () => {
+    const repo = hfRepo.trim();
+    if (!repo) return;
+    setHfBusy(true);
+    setHfError(null);
+    setHfFit(null);
+    try {
+      setHfFit(await api.hfFit(repo));
+    } catch (e: any) {
+      setHfError(String(e?.message || e));
+    } finally {
+      setHfBusy(false);
+    }
+  };
 
   const load = async () => {
     setBusy(true);
@@ -121,6 +155,41 @@ export function HardwarePanel() {
       </div>
 
       <Card padded>
+        <CardHeader
+          eyebrow="Hugging Face"
+          title="Test a Hugging Face model"
+          description="Paste any Hub repo id (e.g. Qwen/Qwen2.5-Coder-7B-Instruct) to estimate its requirements and check them against your hardware before pulling."
+        />
+        <form
+          className="flex gap-2 mt-2"
+          onSubmit={(e) => {
+            e.preventDefault();
+            checkHfFit();
+          }}
+        >
+          <div className="relative flex-1">
+            <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-slate-500" />
+            <TextInput
+              value={hfRepo}
+              onChange={(e) => setHfRepo(e.target.value)}
+              placeholder="owner/repo"
+              className="w-full pl-8 font-mono text-xs"
+            />
+          </div>
+          <button type="submit" className="av-btn-primary whitespace-nowrap" disabled={hfBusy || !hfRepo.trim()}>
+            {hfBusy ? <Loader2 className="h-3 w-3 animate-spin" /> : <Gauge className="h-3 w-3" />}
+            Check fit
+          </button>
+        </form>
+        {hfError && <p className="text-xs text-red-400 font-mono mt-2">{hfError}</p>}
+        {hfFit && (
+          <div className="mt-3">
+            <FitResult fit={hfFit} />
+          </div>
+        )}
+      </Card>
+
+      <Card padded>
         <CardHeader title="Local-First vs Cloud Trade-offs" eyebrow="Matrix" />
         <div className="grid grid-cols-2 gap-3 text-xs">
           {data?.tradeoffs?.map((t) => (
@@ -166,6 +235,49 @@ function FitIcon({ fit }: { fit: string }) {
   if (f.includes("fits")) return <CheckCircle className="h-3.5 w-3.5 text-emerald-400 shrink-0" />;
   if (f.includes("tight")) return <AlertTriangle className="h-3.5 w-3.5 text-amber-400 shrink-0" />;
   return <XCircle className="h-3.5 w-3.5 text-red-400 shrink-0" />;
+}
+
+// Inline spec + hardware verdict rendered under the HF fit checker.
+function FitResult({ fit }: { fit: HfModelFit }) {
+  const ram = fit.hardware?.ram_gb;
+  const vram = fit.hardware?.gpu_vram_gb;
+  const paramsLabel =
+    fit.params_b > 0
+      ? `${fit.params_b.toFixed(1)}B${fit.params_source === "name" ? " (est.)" : ""}`
+      : "unknown";
+  return (
+    <div className="bg-slate-950 rounded-lg border border-white/5 p-3 space-y-2">
+      <div className={`flex items-center gap-1.5 text-xs font-medium ${fitColor(fit.fit)}`}>
+        {fit.fit.toLowerCase().includes("unknown") ? (
+          <Cpu className="h-3.5 w-3.5 shrink-0" />
+        ) : (
+          <FitIcon fit={fit.fit} />
+        )}
+        <span className="uppercase font-mono">{fit.fit}</span>
+        <span className="text-slate-500 font-mono text-[10px]">— {fit.reason}</span>
+      </div>
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-[10px] font-mono">
+        <Spec label="Params" value={paramsLabel} />
+        <Spec label="Min RAM" value={fit.min_ram_gb > 0 ? `${fit.min_ram_gb.toFixed(1)} GB` : "—"} />
+        <Spec label="Rec VRAM" value={fit.rec_vram_gb > 0 ? `${fit.rec_vram_gb.toFixed(1)} GB` : "—"} />
+        <Spec
+          label="Your budget"
+          value={`${ram != null ? `${ram.toFixed(0)}G RAM` : "?"} / ${
+            vram != null ? `${vram.toFixed(0)}G VRAM` : "no GPU"
+          }`}
+        />
+      </div>
+    </div>
+  );
+}
+
+function Spec({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="bg-slate-900/60 px-2 py-1.5 rounded border border-white/5">
+      <p className="text-slate-500">{label}</p>
+      <p className="text-slate-200 truncate">{value}</p>
+    </div>
+  );
 }
 
 function winnerClasses(winner: string): string {

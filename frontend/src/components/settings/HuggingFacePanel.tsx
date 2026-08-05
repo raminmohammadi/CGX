@@ -102,7 +102,7 @@ export function HuggingFacePanel() {
       <CardHeader
         eyebrow="Hugging Face Hub"
         title="Browse GGUF models"
-        description="Pull any GGUF repository straight into Ollama via hf.co/<repo>."
+        description="Pull any GGUF repository straight into Ollama via hf.co/<repo>. Use Check fit to size a model against your hardware before pulling."
         right={
           <button className="av-btn-ghost" onClick={load} disabled={loading}>
             {loading ? <Loader2 className="h-3 w-3 animate-spin" /> : <RefreshCw className="h-3 w-3" />}
@@ -179,6 +179,19 @@ export function HuggingFacePanel() {
                       ))}
                     </Select>
                   )}
+                  <button
+                    className="av-btn-ghost whitespace-nowrap"
+                    onClick={() => checkFit(m.id)}
+                    disabled={fitLoading[m.id]}
+                    title="Estimate this model's requirements and check it against your hardware"
+                  >
+                    {fitLoading[m.id] ? (
+                      <Loader2 className="h-3 w-3 animate-spin" />
+                    ) : (
+                      <Gauge className="h-3 w-3" />
+                    )}
+                    Check fit
+                  </button>
                   {isPulling ? (
                     <button className="av-btn-ghost whitespace-nowrap" onClick={cancelPull}>
                       <X className="h-3 w-3" /> Cancel
@@ -190,6 +203,10 @@ export function HuggingFacePanel() {
                   )}
                 </div>
               </div>
+              {fitError[m.id] && (
+                <p className="text-xs text-red-400 font-mono">{fitError[m.id]}</p>
+              )}
+              {fit[m.id] && <FitResult fit={fit[m.id]} />}
               {activePull && activePull.model.startsWith(m.pull_tag) && (
                 <PullProgress pull={activePull} model={activePull.model} />
               )}
@@ -201,5 +218,53 @@ export function HuggingFacePanel() {
         )}
       </div>
     </Card>
+  );
+}
+
+function fitTone(fit: string): { color: string; Icon: typeof CheckCircle } {
+  const f = fit.toLowerCase();
+  if (f.includes("fits")) return { color: "text-emerald-400", Icon: CheckCircle };
+  if (f.includes("tight")) return { color: "text-amber-400", Icon: AlertTriangle };
+  if (f.includes("unknown")) return { color: "text-slate-400", Icon: Cpu };
+  return { color: "text-red-400", Icon: XCircle };
+}
+
+// Inline spec + hardware verdict rendered under a model card after Check fit.
+function FitResult({ fit }: { fit: HfModelFit }) {
+  const { color, Icon } = fitTone(fit.fit);
+  const ram = fit.hardware?.ram_gb;
+  const vram = fit.hardware?.gpu_vram_gb;
+  const paramsLabel =
+    fit.params_b > 0
+      ? `${fit.params_b.toFixed(1)}B${fit.params_source === "name" ? " (est.)" : ""}`
+      : "unknown";
+  return (
+    <div className="bg-slate-950 rounded-lg border border-white/5 p-3 space-y-2">
+      <div className={`flex items-center gap-1.5 text-xs font-medium ${color}`}>
+        <Icon className="h-3.5 w-3.5 shrink-0" />
+        <span className="uppercase font-mono">{fit.fit}</span>
+        <span className="text-slate-500 font-mono text-[10px]">— {fit.reason}</span>
+      </div>
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-[10px] font-mono">
+        <Spec label="Params" value={paramsLabel} />
+        <Spec label="Min RAM" value={fit.min_ram_gb > 0 ? `${fit.min_ram_gb.toFixed(1)} GB` : "—"} />
+        <Spec label="Rec VRAM" value={fit.rec_vram_gb > 0 ? `${fit.rec_vram_gb.toFixed(1)} GB` : "—"} />
+        <Spec
+          label="Your budget"
+          value={`${ram != null ? `${ram.toFixed(0)}G RAM` : "?"} / ${
+            vram != null ? `${vram.toFixed(0)}G VRAM` : "no GPU"
+          }`}
+        />
+      </div>
+    </div>
+  );
+}
+
+function Spec({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="bg-slate-900/60 px-2 py-1.5 rounded border border-white/5">
+      <p className="text-slate-500">{label}</p>
+      <p className="text-slate-200 truncate">{value}</p>
+    </div>
   );
 }
