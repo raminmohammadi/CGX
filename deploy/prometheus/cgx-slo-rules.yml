@@ -97,3 +97,55 @@ groups:
         annotations:
           summary: "CGX LLM call error ratio high"
           description: "LLM error ratio {{ $value | humanizePercentage }} exceeds the 1% objective for 10m."
+
+  # --- AIOps quality / drift / cost monitors ---------------------------
+  # These fire on the ``cgx_monitor_alerts_total`` counter emitted by
+  # ``cgx.monitor`` (groundedness, repair-loop health, retrieval/embedding
+  # drift, provider cost/error anomalies). The in-process store keeps the
+  # full alert detail for the admin page; these rules page on sustained rate.
+  - name: cgx_aiops_alerts
+    rules:
+      # Any critical monitor alert (repair_failed, provider_error_rate,
+      # citation_invalid at <50% coverage) recurring over a short window.
+      - alert: CgxAiopsCriticalAlerts
+        expr: sum(rate(cgx_monitor_alerts_total{severity="critical"}[15m])) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "CGX AIOps critical monitor alerts firing"
+          description: "One or more critical quality/cost monitors have fired in the last 15m."
+
+      # Ungrounded / invalid-citation answers trending up: a retrieval or
+      # prompt regression usually shows here before users complain.
+      - alert: CgxGroundednessDegraded
+        expr: |
+          sum(rate(cgx_monitor_alerts_total{code=~"citation_invalid|ungrounded_answer"}[30m])) > 0.1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "CGX answer groundedness degrading"
+          description: "Invalid-citation/ungrounded answers rising over 30m -- check retrieval + prompts."
+
+      # Repair loop churn/failure: codegen self-test not converging.
+      - alert: CgxRepairLoopUnhealthy
+        expr: |
+          sum(rate(cgx_monitor_alerts_total{code=~"repair_failed|repair_loop_churn"}[30m])) > 0.05
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "CGX codegen repair loop unhealthy"
+          description: "Repair failures/churn rising over 30m -- inspect codegen reports."
+
+      # Cost or embedding/retrieval drift detected.
+      - alert: CgxDriftOrCostAnomaly
+        expr: |
+          sum(rate(cgx_monitor_alerts_total{code=~"cost_spike|embedding_model_drift|retrieval_score_drift"}[1h])) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "CGX drift or cost anomaly detected"
+          description: "A cost spike or retrieval/embedding drift monitor fired in the last hour."

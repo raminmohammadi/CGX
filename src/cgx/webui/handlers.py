@@ -36,6 +36,32 @@ from cgx.webui.helpers import (
 Event = Tuple[str, Dict[str, Any]]
 
 
+def _monitor_answer(result: Optional[Dict[str, Any]]) -> None:
+    """Feed a finished answer payload to the AIOps groundedness monitor.
+
+    Best-effort: monitoring must never break a user request, so any failure
+    (import, DB, or check error) is swallowed with a warning.
+    """
+    if not isinstance(result, dict):
+        return
+    try:
+        from cgx.monitor import get_default_monitor
+        get_default_monitor().observe_answer(result)
+    except Exception as e:  # pragma: no cover - monitoring is non-critical
+        logger.warning("monitor.observe_answer failed: %s", e)
+
+
+def _monitor_codegen(report: Optional[Dict[str, Any]]) -> None:
+    """Feed a ``codegen_report`` to the AIOps repair-health monitor."""
+    if not isinstance(report, dict):
+        return
+    try:
+        from cgx.monitor import get_default_monitor
+        get_default_monitor().observe_codegen(report)
+    except Exception as e:  # pragma: no cover - monitoring is non-critical
+        logger.warning("monitor.observe_codegen failed: %s", e)
+
+
 def _format_stream_failure(e: BaseException) -> str:
     """Render an exception raised by ``provider.chat_stream`` for the
     ``thought_warning`` UI banner.
@@ -261,6 +287,7 @@ def stream_ask(
         "stream_ask: answer ready len=%d sources=%d delta_tokens=%d",
         len(answer_md), len(sources), answer_delta_tokens,
     )
+    _monitor_answer(result)
     yield "answer", {"answer_md": answer_md, "sources": sources, "meta": meta}
 
 
@@ -332,6 +359,7 @@ def stream_plan(
 
     diffs = diffs_payload(out.get("diffs") or [])
     logger.info("stream_plan: plan ready diffs=%d", len(diffs))
+    _monitor_codegen(out.get("codegen_report"))
     yield "plan", {
         "plan_md": stringify(out.get("plan_md", "")),
         "diffs": diffs,
