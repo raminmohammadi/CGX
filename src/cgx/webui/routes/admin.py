@@ -39,7 +39,12 @@ def _log_path(project_root: Optional[str]) -> Path:
         if raw.is_absolute():
             logger.warning("admin log path rejected absolute input: %s", safe_project_root)
             return fallback_trace_log_path()
-        rel = Path(os.path.normpath(os.fspath(project_root)))
+        # Reject ambiguous/dangerous relative forms before any join.
+        if (
+            str(rel) in {"", ".", ".."}
+            or rel.is_absolute()
+            or any(part == ".." for part in rel.parts)
+        ):
         if rel.parts and rel.parts[0] == "..":
             logger.warning("admin log path rejected traversal input: %s", safe_project_root)
             return fallback_trace_log_path()
