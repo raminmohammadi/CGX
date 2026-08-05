@@ -143,12 +143,16 @@ def set_trace_context(
     task_id: Optional[str] = None,
     project_root: Optional[str] = None,
     request_id: Optional[str] = None,
+    run_id: Optional[str] = None,
 ) -> contextvars.Token:
     """Push a new trace context frame. Returns a token for ``reset_trace_context``.
 
     ``request_id`` correlates every record emitted while handling one HTTP
     request (set by the web middleware) so the admin trace explorer can
-    group a run end-to-end across session/task boundaries.
+    group a run end-to-end across session/task boundaries. ``run_id`` is the
+    coarser provenance join key (minted by :func:`cgx.registry.new_run_id`)
+    that the LLM tracer stamps onto every ``LLM_CALL`` so calls, metrics, and
+    later feedback rows can be joined to one execution.
     """
     cur = dict(trace_context.get() or {})
     if session_id is not None:
@@ -159,6 +163,8 @@ def set_trace_context(
         cur["project_root"] = project_root
     if request_id is not None:
         cur["request_id"] = request_id
+    if run_id is not None:
+        cur["run_id"] = run_id
     return trace_context.set(cur)
 
 

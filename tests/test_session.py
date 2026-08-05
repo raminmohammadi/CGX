@@ -11066,8 +11066,31 @@ def test_tracing_provider_records_chat_as_fact():
     assert fact.content["token_source"] == "estimated"
     assert fact.content["cost_source"] == "unknown"
     assert fact.content["tokens_total"] >= 1
+    # Every call carries a prompt version fingerprint (provenance join key);
+    # run_id is None outside a run context.
+    assert fact.content["prompt_version"]
+    assert fact.content["run_id"] is None
     # drain clears the buffer.
     assert tp.drain() == []
+
+
+def test_tracing_provider_stamps_run_id_from_trace_context():
+    """A run_id on the trace context is stamped onto the LLM_CALL fact."""
+    from cgx.registry import fingerprint
+    from cgx.session.llm_trace import TracingProvider
+    from cgx.trace import reset_trace_context, set_trace_context
+
+    tp = TracingProvider(_StubChatProvider(model="m", reply="hi"))
+    tp.bind("sess-A", "task-X")
+    token = set_trace_context(run_id="run_abc123")
+    try:
+        tp.chat([{"role": "user", "content": "ping"}])
+    finally:
+        reset_trace_context(token)
+    fact = tp.drain()[0]
+    assert fact.content["run_id"] == "run_abc123"
+    # The recorded version is the content fingerprint of the flattened prompt.
+    assert fact.content["prompt_version"] == fingerprint("[user]\nping")
 
 
 def test_tracing_provider_records_provider_usage_and_metrics():

@@ -99,6 +99,10 @@ def save_indices(indices: Dict[str, Any], out_dir: str) -> None:
         "project_root": indices.get("project_root"),
         "indexed_at": indices.get("indexed_at") or _now_iso(),
         "counts": indices.get("counts"),
+        # Provenance block stamped by run_index_auto (CGX version, git
+        # revision, embedder identity, index_id). Persisted verbatim so a
+        # later load can join records back to what produced them.
+        "lineage": dict(indices.get("lineage") or {}),
         "views": {},
     }
 
@@ -126,6 +130,10 @@ def save_indices(indices: Dict[str, Any], out_dir: str) -> None:
     # Top-level dim mirror (either view; both share the same embedder).
     meta["embed_dim"] = (meta["views"].get("intent", {}).get("dim")
                          or meta["views"].get("impl", {}).get("dim"))
+    # Backfill the embedder dim into the lineage block: it's only known here,
+    # after the FAISS index is written, not at the earlier stamp site.
+    if isinstance(meta.get("lineage"), dict):
+        meta["lineage"].setdefault("embed_dim", meta["embed_dim"])
 
     with open(os.path.join(out_dir, "meta.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
@@ -218,6 +226,7 @@ def _load_indices_from_disk(in_dir: str) -> Dict[str, Any]:
         "indexed_at": meta.get("indexed_at"),
         "counts": meta.get("counts"),
         "schema_version": meta.get("schema_version"),
+        "lineage": meta.get("lineage") or {},
         "views": {},
     }
     for view in ("intent", "impl"):

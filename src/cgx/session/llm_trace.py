@@ -26,10 +26,11 @@ import time
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from cgx import metrics as _metrics
+from cgx import registry as _registry
 from cgx import usage as _usage
 from cgx.redact import redact_text
 from cgx.session.models import Fact, FactKind
-from cgx.trace import emit_llm_call
+from cgx.trace import emit_llm_call, trace_context
 
 
 _PROMPT_CHAR_CAP = 8_000
@@ -182,6 +183,10 @@ class TracingProvider:
             response, prompt_text=full_prompt, response_text=full_response)
         cost = _usage.estimate_cost(
             self.model, usage["tokens_in"], usage["tokens_out"])
+        # Provenance join key: the coarse run_id from the trace context plus
+        # a content fingerprint of the prompt actually sent, so this call can
+        # be tied to one execution and to the exact prompt version used.
+        ctx = trace_context.get() or {}
         content: Dict[str, Any] = {
             "model": self.model,
             "provider": provider,
@@ -198,6 +203,8 @@ class TracingProvider:
             "latency_ms": round(latency_ms, 2),
             "sampling": sampling,
             "streamed": bool(streamed),
+            "run_id": ctx.get("run_id"),
+            "prompt_version": _registry.fingerprint(full_prompt),
         }
         if error:
             content["error"] = redact_text(error)

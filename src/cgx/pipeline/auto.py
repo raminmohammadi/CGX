@@ -300,6 +300,16 @@ def run_index_auto(
     indices["project_root"] = os.path.abspath(project_root)
     indices["indexed_at"] = indexed_at
     indices["counts"] = {k: len(v) for k, v in per_view.items()}
+    # Full lineage block (CGX version, indexed repo git revision, embedder
+    # identity, a unique index_id) so a later run can tell which code + repo
+    # state produced this index -- a stale/foreign index becomes detectable.
+    try:
+        from cgx import registry as _registry
+        indices["lineage"] = _registry.build_index_lineage(
+            project_root=project_root, embed_model=embed_model,
+            index_type=index_type, metric=metric)
+    except Exception as e:  # pragma: no cover - lineage must not fail a build
+        logger.warning("lineage stamp failed, continuing: %s", e)
 
     # ---------------- Persist ----------------
     try:
