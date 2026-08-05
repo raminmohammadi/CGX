@@ -67,6 +67,25 @@ _IMPORT_TO_PYPI: Dict[str, str] = {
 # the bare root is dropped before the missing-package probe.
 _NAMESPACE_ROOTS: frozenset = frozenset({"google", "azure"})
 
+# Commonly imported top-level third-party framework and library roots that are
+# never project-local first-party modules. Used by import resolution and
+# scaffold validation so transitive framework dependencies (e.g. werkzeug) are
+# never misclassified as missing local modules or flagged by phantom gates.
+_COMMON_THIRDPARTY_ROOTS: frozenset = frozenset({
+    "werkzeug", "flask", "flask_cors", "flask_sqlalchemy", "flask_login",
+    "flask_jwt_extended", "flask_migrate", "flask_restful", "flask_wtf",
+    "wtforms", "jinja2", "markupsafe", "itsdangerous", "click", "pydantic",
+    "fastapi", "starlette", "uvicorn", "gunicorn", "httpx", "requests",
+    "urllib3", "aiohttp", "websockets", "sqlalchemy", "alembic", "psycopg2",
+    "asyncpg", "pymongo", "redis", "celery", "kombu", "pytest", "pytest_mock",
+    "pytest_asyncio", "pytest_cov", "mock", "factory", "numpy", "pandas",
+    "scipy", "matplotlib", "seaborn", "torch", "torchvision", "transformers",
+    "huggingface_hub", "scikit_learn", "sklearn", "PIL", "cv2", "skimage",
+    "nltk", "spacy", "boto3", "botocore", "google", "azure", "aws", "jwt",
+    "jose", "yaml", "dotenv", "pydantic_settings", "git", "serial", "usb",
+    "bs4", "rich", "typer", "tqdm", "joblib", "loguru", "tenacity",
+})
+
 
 _STDLIB_TOP = frozenset({
     "abc", "ast", "asyncio", "base64", "binascii", "builtins", "cgi",

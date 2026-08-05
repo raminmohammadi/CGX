@@ -88,6 +88,12 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         return ExecutorResult(
             failure="SCAFFOLD: work plan carries no layers")
 
+    manifest_paths = []
+    for lyr in layers:
+        for f in lyr.get("files", []):
+            if "path" in f:
+                manifest_paths.append(f["path"])
+
     # Contract-first (P0): the WORK_PLAN carries a ``contracts`` block --
     # the shared interfaces (endpoints, schemas, function signatures,
     # constants) DECOMPOSE declared. Thread it into every per-file
@@ -297,7 +303,8 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
                     pool.submit(
                         _generate_one, p, d, layer_name,
                         list(context_snapshot), deps.provider, goal,
-                        depends_on=dep, contracts=contracts, skills=skills): i
+                        depends_on=dep, contracts=contracts, skills=skills,
+                        manifest_paths=manifest_paths): i
                     for i, (p, d, dep) in enumerate(pending)
                 }
                 for fut in as_completed(fut_to_idx):
@@ -322,7 +329,8 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
                 ok, fail = _generate_one(
                     p, d, layer_name, list(existing_with_content),
                     deps.provider, goal, on_token=on_token,
-                    depends_on=dep, contracts=contracts, skills=skills)
+                    depends_on=dep, contracts=contracts, skills=skills,
+                    manifest_paths=manifest_paths)
                 elapsed_ms = int((time.time() - started) * 1000)
                 layer_results.append((ok, fail))
                 if ok is not None:
@@ -804,7 +812,8 @@ def _known_import_root_resolver(
     module the planner omitted, to be authored rather than dropped).
     """
     from cgx.codegen.env_manager import (
-        _IMPORT_TO_PYPI, _NAMESPACE_ROOTS, _STDLIB_TOP, _is_local_package)
+        _COMMON_THIRDPARTY_ROOTS, _IMPORT_TO_PYPI, _NAMESPACE_ROOTS,
+        _STDLIB_TOP, _is_local_package)
 
     # Module/package names resolvable inside the project: every ``.py``
     # basename and directory segment from the manifest + generated batch.
@@ -858,6 +867,7 @@ def _known_import_root_resolver(
         norm = root_name.lower().replace("-", "_")
         if (root_name == "__future__" or norm in _STDLIB_TOP
                 or root_name in _NAMESPACE_ROOTS
+                or norm in _COMMON_THIRDPARTY_ROOTS
                 or root_name in known_local or norm in declared):
             return True
         pypi = _IMPORT_TO_PYPI.get(root_name)
@@ -1002,6 +1012,10 @@ def _looks_local_module_ref(mod: str, root: str) -> bool:
     top name instead, so that shape is left to the requirements repair
     rather than fabricated as an empty first-party module.
     """
+    from cgx.codegen.env_manager import _COMMON_THIRDPARTY_ROOTS, _IMPORT_TO_PYPI, _STDLIB_TOP
+    norm = root.lower().replace("-", "_")
+    if norm in _COMMON_THIRDPARTY_ROOTS or norm in _STDLIB_TOP or root in _IMPORT_TO_PYPI:
+        return False
     return "." in mod or "_" in root
 
 
@@ -1059,7 +1073,7 @@ def _missing_first_party_imports(
     parse failures abstain for that file.
     """
     import ast as _ast
-    from cgx.codegen.env_manager import _IMPORT_TO_PYPI
+    from cgx.codegen.env_manager import _COMMON_THIRDPARTY_ROOTS, _IMPORT_TO_PYPI, _STDLIB_TOP
     from cgx.session.scaffold_validate import _module_name_for_path
 
     known, _known_local = _known_import_root_resolver(
@@ -1121,6 +1135,9 @@ def _missing_first_party_imports(
                 if not mod or mod == importer_mod:
                     continue
                 root = mod.split(".")[0]
+                norm_root = root.lower().replace("-", "_")
+                if norm_root in _COMMON_THIRDPARTY_ROOTS or norm_root in _STDLIB_TOP:
+                    continue
                 first_party = False
                 if root in fp_roots:
                     first_party = True
@@ -1465,7 +1482,12 @@ def _phantom_first_party_import_failures(
                 if not mod:
                     continue
                 if "." in mod:
-                    if (mod.split(".")[0] in fp_roots
+                    root_name = mod.split(".")[0]
+                    norm_root = root_name.lower().replace("-", "_")
+                    from cgx.codegen.env_manager import _COMMON_THIRDPARTY_ROOTS, _STDLIB_TOP
+                    if (root_name in fp_roots
+                            and norm_root not in _COMMON_THIRDPARTY_ROOTS
+                            and norm_root not in _STDLIB_TOP
                             and mod not in modules and mod not in prefixes
                             and mod not in phantom):
                         phantom.append(mod)
@@ -1644,6 +1666,7 @@ def _generate_one(
         depends_on: Optional[List[str]] = None,
         contracts: Optional[Dict[str, Any]] = None,
         skills: Optional[List[str]] = None,
+        manifest_paths: Optional[List[str]] = None,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, str]]]:
     """Generate one scaffold file. Returns ``(ok_entry, fail_entry)``.
 
@@ -1672,6 +1695,7 @@ def _generate_one(
             on_token=on_token,
             depends_on=depends_on,
             contracts=contracts,
+            manifest_paths=manifest_paths,
         )
     except Exception as exc:
         logger.exception(

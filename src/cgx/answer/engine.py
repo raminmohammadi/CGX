@@ -2158,7 +2158,10 @@ def _extension_framework_pin(path: str) -> str:
             f"- Do NOT emit Vue SFC syntax: no `<template>`, no `<script "
             f"setup>`, no `<style scoped>`, no `import ... from 'vue'`.\n"
             f"- Do NOT emit Svelte syntax or a full HTML document.\n"
-            f"- Use functional components with hooks (useState, useEffect)."
+            f"- Use functional components with hooks (useState, useEffect).\n"
+            f"- IMPORTANT: Be precise with relative imports. From `src/main.jsx` (or any `src/` file), "
+            f"import sibling components as `./components/...`. For test files under `tests/`, "
+            f"remember that `tests/` and `src/` are siblings, so use `../src/components/...`."
         )
     if ext == "vue":
         return (
@@ -2173,6 +2176,19 @@ def _extension_framework_pin(path: str) -> str:
             "- This is a Svelte component. Use `<script>` + markup + "
             "`<style>` blocks.\n"
             "- Do NOT emit React JSX or Vue SFC syntax."
+        )
+    if ext == "py":
+        return (
+            "FILE EXTENSION CONSTRAINT (.py):\n"
+            "- This is a Python source file. Write valid Python 3 code.\n"
+            "- IMPORTANT: Do NOT execute side-effects (like database initialization, "
+            "network requests, or starting a server) at the module level. Put them "
+            "inside `if __name__ == '__main__':` or a dedicated startup function. "
+            "The file must be safely importable without crashing or hanging.\n"
+            "- Do NOT import fixtures from `conftest.py` (e.g. `from conftest import client`). "
+            "Pytest automatically injects fixtures into test functions.\n"
+            "- Ensure all referenced symbols (e.g. `init_db`) are imported from their correct "
+            "modules or defined locally. Do NOT use undefined names."
         )
     return ""
 
@@ -3265,6 +3281,7 @@ _SINGLE_FILE_SYSTEM = (
     "You are a senior software engineer generating EXACTLY ONE source file.\n\n"
     "You will be given:\n"
     "- The project goal\n"
+    "- The project manifest (list of ALL file paths that will exist in this project)\n"
     "- The file path and its purpose\n"
     "- The content of files already generated in this project\n\n"
     "Output the COMPLETE content of the requested file only. "
@@ -3273,6 +3290,8 @@ _SINGLE_FILE_SYSTEM = (
     "Rules:\n"
     "- Output the full file -- no stubs, no placeholders, no ellipsis.\n"
     "- Use imports consistent with what already exists in the project.\n"
+    "- ONLY import local modules/components if they are explicitly part of the project or provided in the context. Do NOT hallucinate imports for files that do not exist.\n"
+    "- Pay close attention to relative import paths (e.g., `./` vs `../`).\n"
     "- Do not repeat or regenerate any already-existing file.\n"
     "- The content MUST be functionally different from every file in "
     "ALREADY GENERATED FILES. Do NOT copy another file's body and rename "
@@ -3613,6 +3632,7 @@ def generate_single_scaffold_file(
     on_token: Optional[Callable[[str], None]] = None,
     depends_on: Optional[List[str]] = None,
     contracts: Optional[Dict[str, Any]] = None,
+    manifest_paths: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Generate the content of a single file in a new-project scaffold.
 
@@ -3771,6 +3791,8 @@ def generate_single_scaffold_file(
     contract_block = _render_contracts_for_prompt(contracts)
     if contract_block:
         parts.append(contract_block)
+    if manifest_paths:
+        parts.append("PROJECT MANIFEST (All file paths in this project):\n" + "\n".join(f"- {p}" for p in manifest_paths))
     parts.append(f"FILE TO GENERATE:\nPath: {path}\nPurpose: {description}")
     if layer:
         parts.append(f"Layer: {layer}")
@@ -3819,6 +3841,19 @@ def generate_single_scaffold_file(
                 "ALREADY GENERATED FILES (do not re-emit these; signatures "
                 "shown, bodies elided):\n\n" + "\n\n".join(context_blocks)
             )
+
+        if path.endswith(".py") and digest_pool:
+            sym_index = _module_symbol_index(digest_pool)
+            sym_lines = []
+            for mod_name, syms in sorted(sym_index.items()):
+                if syms and mod_name and not mod_name.endswith(".__init__"):
+                    sym_lines.append(f"- {mod_name}: {', '.join(sorted(syms))}")
+            if sym_lines:
+                parts.append(
+                    "AVAILABLE PROJECT MODULE SYMBOLS (when importing from "
+                    "project modules, import ONLY these names; do NOT invent symbols):\n"
+                    + "\n".join(sym_lines[:30])
+                )
 
     context = "\n\n".join(parts)
 

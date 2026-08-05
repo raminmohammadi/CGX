@@ -122,7 +122,7 @@ def test_decompose_passes_session_skills_to_manifest_planner(store, monkeypatch)
 
     captured = {}
 
-    def fake_manifest(composed, provider, goal=None, skills=None):
+    def fake_manifest(composed, provider, goal=None, skills=None, **kwargs):
         captured["skills"] = skills
         return {"plan_md": "p", "layers": [{"name": "app", "files": [
             {"path": "app.py", "description": "entry"}]}]}
@@ -154,7 +154,7 @@ def test_scaffold_passes_session_skills_to_generator(store, monkeypatch):
     def fake_generate(path, description, provider, *,
                       layer=None, existing_files_with_content=None,
                       goal=None, skills=None, on_token=None,
-                      depends_on=None, contracts=None):
+                      depends_on=None, contracts=None, **kwargs):
         captured["skills"] = skills
         return {"file": path, "patch": f"+++ {path}\nx", "content": "x",
                 "syntax_ok": True, "confidence": 0.9}

@@ -3907,7 +3907,7 @@ def test_decompose_executor_happy_path_emits_work_plan(
             {"id": "q1", "prompt": "Framework?"}], "source": "llm"})
     store.save_artifact(req)
 
-    def fake_manifest(composed, provider, goal=None, skills=None):
+    def fake_manifest(composed, provider, goal=None, skills=None, **kwargs):
         return {
             "plan_md": "## Plan\n- app.py\n- README.md",
             "layers": [{"name": "app", "files": [
@@ -3939,7 +3939,7 @@ def test_decompose_executor_stores_contracts_on_work_plan(store, monkeypatch):
     session = Session.new("g", mode=SessionMode.GREENFIELD)
     store.save_session(session)
 
-    def fake_manifest(composed, provider, goal=None, skills=None):
+    def fake_manifest(composed, provider, goal=None, skills=None, **kwargs):
         return {
             "plan_md": "p",
             "contracts": {
@@ -4496,7 +4496,7 @@ def test_scaffold_executor_happy_path_accumulates_context(
     def fake_generate(path, description, provider, *,
                       layer=None, existing_files_with_content=None,
                       goal=None, on_token=None, depends_on=None,
-                      contracts=None, skills=None):
+                      contracts=None, skills=None, **kwargs):
         seen_contexts.append(
             [c["path"] for c in (existing_files_with_content or [])])
         body = f"# {path}\nprint('{path}')\n"
@@ -4542,7 +4542,7 @@ def test_scaffold_threads_contracts_to_generator(store, monkeypatch):
     def fake_generate(path, description, provider, *,
                       layer=None, existing_files_with_content=None,
                       goal=None, on_token=None, depends_on=None,
-                      contracts=None, skills=None):
+                      contracts=None, skills=None, **kwargs):
         seen.append(contracts)
         return {"file": path, "patch": f"+++ {path}\nx",
                 "content": "x", "syntax_ok": True}
@@ -5203,6 +5203,21 @@ def test_missing_first_party_imports_skips_single_word_source_import():
     assert _missing_first_party_imports(files, layers, None) == {}
 
 
+def test_missing_first_party_imports_ignores_common_thirdparty_frameworks():
+    """Dotted third-party imports (werkzeug.security, sqlalchemy.orm) are never first-party."""
+    from cgx.session.tasks.scaffold import _missing_first_party_imports
+    files = [
+        {"path": "backend/app.py",
+         "content": ("from werkzeug.security import generate_password_hash\n"
+                     "from sqlalchemy.orm import Session\n"
+                     "from pydantic import BaseModel\n")},
+        {"path": "tests/test_app.py",
+         "content": "from werkzeug.security import check_password_hash\n"},
+    ]
+    layers = [{"files": [{"path": "backend/app.py"}, {"path": "tests/test_app.py"}]}]
+    assert _missing_first_party_imports(files, layers, None) == {}
+
+
 def test_scaffold_synthesizes_omitted_first_party_module(store, monkeypatch):
     """A planned test importing an unplanned app module gets the module authored.
 
@@ -5398,7 +5413,7 @@ def test_scaffold_targeted_regenerate_reuses_good_diffs(store, monkeypatch):
     def fake_generate(path, description, provider, *,
                       layer=None, existing_files_with_content=None,
                       goal=None, on_token=None, depends_on=None,
-                      contracts=None, skills=None):
+                      contracts=None, skills=None, **kwargs):
         seen.append({"path": path,
                      "context": [c["path"]
                                  for c in (existing_files_with_content or [])]})
@@ -5755,7 +5770,7 @@ def test_scaffold_parallel_generation_preserves_order_and_cross_layer_context(
     def fake_generate(path, description, provider, *,
                       layer=None, existing_files_with_content=None, goal=None,
                       on_token=None, depends_on=None, contracts=None,
-                      skills=None):
+                      skills=None, **kwargs):
         with lock:
             seen[path] = [c["path"] for c in (existing_files_with_content or [])]
         if path == "src/B.jsx":
@@ -12672,7 +12687,7 @@ def test_scaffold_augments_goal_with_regenerate_constraints(
     def fake_generate(path, description, provider, *,
                       layer=None, existing_files_with_content=None,
                       goal=None, on_token=None, depends_on=None,
-                      contracts=None, skills=None):
+                      contracts=None, skills=None, **kwargs):
         seen_goals.append(goal)
         body = "x = 1\n"
         return {"file": path, "patch": f"+++ {path}\n{body}",
@@ -12931,7 +12946,7 @@ def test_scaffold_injects_relevant_lessons_into_goal(
     def fake_generate(path, description, provider, *,
                       layer=None, existing_files_with_content=None,
                       goal=None, on_token=None, depends_on=None,
-                      contracts=None, skills=None):
+                      contracts=None, skills=None, **kwargs):
         seen_goals.append(goal)
         body = "x = 1\n"
         return {"file": path, "patch": f"+++ {path}\n{body}",

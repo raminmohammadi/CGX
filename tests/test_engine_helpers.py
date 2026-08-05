@@ -1500,6 +1500,25 @@ def test_generate_single_scaffold_file_threads_contracts_into_prompt():
     assert "PROJECT CONTRACTS" not in plain.messages[0][1]["content"]
 
 
+def test_generate_single_scaffold_file_includes_symbol_inventory():
+    """Python file prompt includes AVAILABLE PROJECT MODULE SYMBOLS."""
+    from cgx.answer.engine import generate_single_scaffold_file
+
+    db_mod = {
+        "path": "src/db.py",
+        "content": "def get_db():\n    return 'db'\n\ndef init_db():\n    pass\n",
+    }
+    provider = _RecordingQueueProvider([_VALID_PY])
+    generate_single_scaffold_file(
+        "src/app.py", "application entrypoint", provider,
+        layer="core", goal="build app",
+        existing_files_with_content=[db_mod],
+    )
+    user = provider.messages[0][1]["content"]
+    assert "AVAILABLE PROJECT MODULE SYMBOLS" in user
+    assert "- src.db: get_db, init_db" in user
+
+
 # ---------------------------------------------------------------------
 # clarify_paths structured generation
 # ---------------------------------------------------------------------
