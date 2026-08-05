@@ -53,9 +53,10 @@ your machine unless you explicitly opt into a cloud model.
   telemetry **never leave the machine.** Works fully offline with
   [Ollama](https://ollama.com/).
 - **Universal LLM provider.** Ollama (local), OpenAI-compatible
-  endpoints, native **Google Gemini**, or any self-hosted server with a
-  custom IP, path, and optional auth-bypass -- switchable from the Settings
-  tab with a live **Ping** latency check. API keys live in your OS keyring.
+  endpoints, native **Google Gemini**, **Hugging Face** Inference
+  Providers, or any self-hosted server with a custom IP, path, and
+  optional auth-bypass -- switchable from the Settings tab with a live
+  **Ping** latency check. API keys live in your OS keyring.
 - **Hybrid retrieval.** Two-view semantic + BM25 + graph expansion,
   fused with Reciprocal Rank Fusion and an optional cross-encoder
   rerank.
@@ -281,10 +282,12 @@ public internet.
 Tabs (left → right):
 
 1. **Setup** -- choose a **Provider Type** (Ollama, OpenAI, Google
-   Gemini, or Custom Server), fill in the model and credentials, and click
-   **Ping** to verify the connection with a live latency check. Detect
-   hardware (RAM + GPU VRAM) and tune sampling parameters. Save named
-   profiles; API keys are stored in your OS keyring.
+   Gemini, Hugging Face, or Custom Server), fill in the model and
+   credentials, and click **Ping** to verify the connection with a live
+   latency check. Detect hardware (RAM + GPU VRAM) and tune sampling
+   parameters. Save named profiles; API keys are stored in your OS keyring.
+   A **Browse Hugging Face** panel lists GGUF repositories from the Hub
+   and pulls them straight into your local Ollama daemon.
 2. **Index** -- point at a project root or upload a `.zip`. Honours
    `.gitignore` and a 1 MB file-size cap; emits `indices/`,
    `records.jsonl`, `chunks.jsonl`, `graph.json` and per-view
@@ -330,7 +333,8 @@ Tabs (left → right):
    and operational risk. Pure-offline; no network calls fire from this
    tab.
 7. **Profiles** -- save provider configurations for any supported
-   provider kind (`ollama`, `openai-compat`, `gemini`, `custom`). Custom
+   provider kind (`ollama`, `openai-compat`, `gemini`, `huggingface`,
+   `custom`). Custom
    profiles expose an **Endpoint Path** field and a **Skip auth** toggle
    for private-subnet servers. API keys are persisted in the OS keyring
    when available, otherwise in a `0600`-permissioned file under
@@ -386,6 +390,13 @@ prov = OllamaProvider(model="qwen2.5-coder:3b")
 
 # Google Gemini
 # prov = GeminiProvider(model="gemini-1.5-flash", api_key="YOUR_KEY")
+
+# Hugging Face Inference Providers (OpenAI-compatible router)
+# prov = OpenAICompatProvider(
+#     model="openai/gpt-oss-20b",
+#     base_url="https://router.huggingface.co",
+#     api_key="hf_YOUR_TOKEN",  # or set HF_TOKEN in the environment
+# )
 
 # Custom self-hosted server (no auth, non-standard path)
 # prov = OpenAICompatProvider(
@@ -795,6 +806,7 @@ the complete list of network egress paths in the product:
 | Local LLM (default: Ollama)       | Yes (loopback)  | `http://localhost:11434` -- never leaves your box. |
 | OpenAI-compatible providers       | Yes             | The exact base URL / endpoint path you configure. |
 | Google Gemini provider            | Yes             | `generativelanguage.googleapis.com` only.         |
+| Hugging Face Inference provider   | Yes             | `router.huggingface.co` only.                     |
 | Session history, profiles, cache  | **No**          | `~/.cgx/` (locked-down `0600` files).             |
 | Anonymous startup telemetry       | **Opt-in**      | Disabled by default; see below.                   |
 

@@ -2,6 +2,27 @@
 
 All notable changes are documented here. Versions follow semver-ish.
 
+## Unreleased -- Hugging Face integration (Inference Providers + GGUF browse)
+
+Two additive, low-risk features that make CGX Hugging Face-friendly.
+
+* **Hugging Face Inference provider** (`kind="huggingface"`). HF's
+  Inference Providers expose an OpenAI-compatible router at
+  `https://router.huggingface.co/v1`, so CGX reuses `OpenAICompatProvider`
+  verbatim -- the host and endpoint path are pinned and only the token
+  varies (read inline or from `HF_TOKEN` / `HUGGINGFACEHUB_API_TOKEN`).
+  The Setup dropdown, `cloud_models` discovery, and `ping` all learn the
+  new kind; the model list is populated from the router's public
+  `/v1/models` (no token required to browse). The kind opts into the
+  cross-encoder reranker by default like the other cloud kinds.
+* **Browse Hugging Face panel.** A new Settings panel lists GGUF
+  repositories from the Hub (`huggingface.co/api/models?filter=gguf`) with
+  live search, sort (trending / downloads / likes / recently updated),
+  download and like counts, and detected quantization labels. **Pull**
+  hands the `hf.co/<repo>[:<quant>]` tag to the local Ollama daemon and
+  streams progress through the shared `PullProgress` bar -- no HF token
+  required. Outbound Hub/router hosts are added to the SSRF allowlist.
+
 ## Unreleased -- Agent-loop hardening (import classification + polyglot provisioning)
 
 Two residual convergence gaps from the `ses_0408ac4084b04b4c` post-mortem,

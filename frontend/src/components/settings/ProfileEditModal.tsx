@@ -62,7 +62,7 @@ export function ProfileEditModal({
       })();
       return;
     }
-    if (kind === "gemini" || kind === "openai-compat" || kind === "custom") {
+    if (kind === "gemini" || kind === "openai-compat" || kind === "custom" || kind === "huggingface") {
       (async () => {
         try {
           const r = await api.cloudModels({
@@ -235,7 +235,13 @@ export function ProfileEditModal({
                 <TextInput
                   value={edit.model}
                   placeholder={
-                    edit.kind === "gemini" ? "gemini-2.5-flash" : edit.kind === "openai-compat" ? "gpt-4o-mini" : "qwen2.5-coder:3b"
+                    edit.kind === "gemini"
+                      ? "gemini-2.5-flash"
+                      : edit.kind === "openai-compat"
+                      ? "gpt-4o-mini"
+                      : edit.kind === "huggingface"
+                      ? "Qwen/Qwen2.5-Coder-32B-Instruct"
+                      : "qwen2.5-coder:3b"
                   }
                   onChange={(e) => setEdit({ ...edit, model: e.target.value })}
                   className="flex-1"
@@ -278,13 +284,27 @@ export function ProfileEditModal({
 
             {needsApiKey(edit.kind) && (
               <Field
-                label={edit.kind === "gemini" ? "Gemini API Key" : edit.kind === "openai-compat" ? "OpenAI API Key" : "Bearer Token (optional)"}
+                label={
+                  edit.kind === "gemini"
+                    ? "Gemini API Key"
+                    : edit.kind === "openai-compat"
+                    ? "OpenAI API Key"
+                    : edit.kind === "huggingface"
+                    ? "Hugging Face Token"
+                    : "Bearer Token (optional)"
+                }
                 className="col-span-2"
               >
                 <TextInput
                   type="password"
                   value={edit.api_key}
-                  placeholder={edit.allow_no_auth ? "skip -- private subnet" : "sk-…"}
+                  placeholder={
+                    edit.allow_no_auth
+                      ? "skip -- private subnet"
+                      : edit.kind === "huggingface"
+                      ? "hf_…"
+                      : "sk-…"
+                  }
                   onChange={(e) => setEdit({ ...edit, api_key: e.target.value })}
                 />
               </Field>

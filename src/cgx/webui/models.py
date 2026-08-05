@@ -22,7 +22,7 @@ class ProviderConfig(BaseModel):
 
     use_profile: bool = False
     profile_name: Optional[str] = None
-    kind: str = "ollama"  # "ollama" | "openai-compat" | "gemini" | "custom"
+    kind: str = "ollama"  # "ollama" | "openai-compat" | "gemini" | "huggingface" | "custom"
     model: str = "qwen2.5-coder:3b"
     base_url: str = "http://localhost:11434"
     api_key: Optional[str] = None
@@ -125,7 +125,7 @@ class GovScanRequest(BaseModel):
 
 class ProfileUpsertRequest(BaseModel):
     name: str
-    kind: str = "ollama"  # "ollama" | "openai-compat" | "gemini" | "custom"
+    kind: str = "ollama"  # "ollama" | "openai-compat" | "gemini" | "huggingface" | "custom"
     model: str = "qwen2.5-coder:3b"
     base_url: str = "http://localhost:11434"
     api_key: Optional[str] = None

@@ -6,7 +6,7 @@ import { streamSSE } from "./sse";
 export type ProviderConfig = {
   use_profile: boolean;
   profile_name?: string | null;
-  kind: "ollama" | "openai-compat" | "gemini" | "custom";
+  kind: "ollama" | "openai-compat" | "gemini" | "huggingface" | "custom";
   model: string;
   base_url: string;
   api_key?: string | null;
@@ -502,6 +502,19 @@ export type ReadinessReport = {
   checks: HealthCheck[];
 };
 
+// --- Hugging Face Hub browse (GGUF models pullable via Ollama) ---
+export type HfHubModel = {
+  id: string;
+  downloads: number;
+  likes: number;
+  pipeline_tag?: string | null;
+  gated: boolean;
+  // Ready-to-use ``ollama pull`` target, e.g. ``hf.co/<repo>``.
+  pull_tag: string;
+  // Detected quantization labels (``Q4_K_M`` …) for ``pull_tag:<quant>``.
+  quants: string[];
+};
+
 export const api = {
   status: () => jsonReq<StatusResponse>("/api/status"),
   ollamaHealth: (base_url: string) =>
@@ -554,6 +567,16 @@ export const api = {
       "POST",
       body,
     ),
+  hfModels: (params: { search?: string; sort?: string; limit?: number } = {}) => {
+    const q = new URLSearchParams();
+    if (params.search) q.set("search", params.search);
+    if (params.sort) q.set("sort", params.sort);
+    if (params.limit) q.set("limit", String(params.limit));
+    const qs = q.toString();
+    return jsonReq<{ models: HfHubModel[] }>(
+      `/api/setup/hf_models${qs ? `?${qs}` : ""}`,
+    );
+  },
   hardwareMatrix: () => jsonReq<HardwareMatrixResponse>("/api/hardware/matrix"),
   detectHardware: () => jsonReq<HardwareInfo>("/api/setup/hardware"),
 

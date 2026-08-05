@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Cog, Microchip, Plug, Radio, Plus, Search } from "lucide-react";
+import { Cog, Microchip, Plug, Radio, Plus, Search, Boxes } from "lucide-react";
 import { api, type PingResult, type ProfileSummary } from "../lib/api";
 import { usePullState } from "../lib/pullManager";
 import { useWorkspace } from "../store/workspace";
@@ -10,15 +10,17 @@ import { ActiveProviderCard } from "../components/settings/ActiveProviderCard";
 import { ProfilesTable } from "../components/settings/ProfilesTable";
 import { TracePanel } from "../components/settings/TracePanel";
 import { HardwarePanel } from "../components/settings/HardwarePanel";
+import { HuggingFacePanel } from "../components/settings/HuggingFacePanel";
 import { ProfileEditModal } from "../components/settings/ProfileEditModal";
 import { emptyEdit, type ProfileEditState, type ProviderKind } from "../components/settings/providerKinds";
 import { cn } from "../lib/utils";
 
-type Category = "provider" | "profiles" | "observability" | "hardware";
+type Category = "provider" | "profiles" | "huggingface" | "observability" | "hardware";
 
 const CATEGORIES: { key: Category; label: string; icon: typeof Plug }[] = [
   { key: "provider", label: "Active Provider", icon: Plug },
   { key: "profiles", label: "Saved Profiles", icon: Cog },
+  { key: "huggingface", label: "Browse Hugging Face", icon: Boxes },
   { key: "observability", label: "Observability", icon: Radio },
   { key: "hardware", label: "Hardware", icon: Microchip },
 ];
@@ -80,7 +82,7 @@ export default function SettingsPage() {
       refreshModels();
       return;
     }
-    if (kind === "gemini" || kind === "openai-compat" || kind === "custom") {
+    if (kind === "gemini" || kind === "openai-compat" || kind === "custom" || kind === "huggingface") {
       const inlineKey = provider.api_key || "";
       const profileName = provider.use_profile && provider.profile_name ? provider.profile_name : null;
       api
@@ -216,7 +218,7 @@ export default function SettingsPage() {
       </div>
 
       {/* ── Right: selected category ── */}
-      <div className={cn("flex-1 overflow-y-auto p-6 space-y-6", category === "hardware" ? "max-w-6xl" : "max-w-4xl")}>
+      <div className={cn("flex-1 overflow-y-auto p-6 space-y-6", category === "hardware" || category === "huggingface" ? "max-w-6xl" : "max-w-4xl")}>
         {category === "provider" && (
           <ActiveProviderCard
             provider={provider}
@@ -243,6 +245,8 @@ export default function SettingsPage() {
             onDelete={remove}
           />
         )}
+
+        {category === "huggingface" && <HuggingFacePanel />}
 
         {category === "observability" && (
           <TracePanel

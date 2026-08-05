@@ -22,11 +22,13 @@ It binds to `127.0.0.1:8765` by default; open <http://localhost:8765>.
 ## The tabs (left → right)
 
 ### 1. Setup
-Choose a **Provider Type** (Ollama, OpenAI, Google Gemini, or Custom
-Server), fill in the model and credentials, and click **Ping** to verify
-the connection with a live latency check. Detect hardware (RAM + GPU
-VRAM), tune sampling parameters, and save named profiles. API keys are
-stored in your OS keyring. See **[[Providers and Models]]**.
+Choose a **Provider Type** (Ollama, OpenAI, Google Gemini, Hugging Face,
+or Custom Server), fill in the model and credentials, and click **Ping**
+to verify the connection with a live latency check. Detect hardware
+(RAM + GPU VRAM), tune sampling parameters, and save named profiles. API
+keys are stored in your OS keyring. A **Browse Hugging Face** panel lists
+GGUF repositories from the Hub and pulls them straight into your local
+Ollama daemon. See **[[Providers and Models]]**.
 
 ### 2. Index
 Point at a project root or upload a `.zip`. Honours `.gitignore` and a

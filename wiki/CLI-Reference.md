@@ -39,7 +39,7 @@ failure exits `1`. Colour follows the TTY / `NO_COLOR` /
 | Flag             | Default                  | Purpose |
 |------------------|--------------------------|---------|
 | `--project-root` | current directory        | Project whose index is read / written. |
-| `--provider`     | `ollama`                 | `ollama`, `openai`, `openai-compat`, `gemini`, or `custom`. |
+| `--provider`     | `ollama`                 | `ollama`, `openai`, `openai-compat`, `gemini`, `huggingface`, or `custom`. |
 | `--model`        | provider default         | LLM name; always overrides a profile's model. |
 | `--base-url`     | `http://localhost:11434` | Provider endpoint. |
 | `--profile`      | none                     | A saved profile — takes precedence over `--provider`/`--base-url`. |

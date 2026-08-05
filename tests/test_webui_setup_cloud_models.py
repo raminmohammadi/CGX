@@ -10,8 +10,10 @@ import pytest
 from cgx.webui.routes.setup import (
     CloudModelsRequest,
     _GEMINI_FALLBACK,
+    _HF_FALLBACK,
     _OPENAI_FALLBACK,
     cloud_models,
+    hf_models,
 )
 
 
@@ -140,3 +142,84 @@ def test_resolve_key_from_saved_profile(monkeypatch: pytest.MonkeyPatch):
     # query string, so it can't leak into request logs/proxies.
     assert captured["headers"].get("x-goog-api-key") == "from-store"
     assert "from-store" not in captured["url"]
+
+
+# --------------------------- Hugging Face ---------------------------
+
+def _hf_inference_payload() -> Dict[str, Any]:
+    return {"data": [
+        {"id": "openai/gpt-oss-20b",
+         "architecture": {"input_modalities": ["text"],
+                          "output_modalities": ["text"]}},
+        {"id": "Qwen/Qwen2.5-Coder-32B-Instruct",
+         "architecture": {"input_modalities": ["text"],
+                          "output_modalities": ["text"]}},
+        {"id": "black-forest-labs/FLUX.1-dev",
+         "architecture": {"input_modalities": ["text"],
+                          "output_modalities": ["image"]}},
+    ]}
+
+
+def _hf_hub_payload():
+    return [
+        {"id": "unsloth/Qwen3-Coder-GGUF", "downloads": 1000, "likes": 42,
+         "pipeline_tag": "text-generation", "gated": False,
+         "siblings": [{"rfilename": "model-Q4_K_M.gguf"},
+                      {"rfilename": "model-Q8_0.gguf"},
+                      {"rfilename": "README.md"}]},
+    ]
+
+
+def test_huggingface_lists_text_models_and_drops_image_only():
+    with patch("requests.get", return_value=_FakeResp(_hf_inference_payload())):
+        r = cloud_models(CloudModelsRequest(kind="huggingface"))
+    assert "openai/gpt-oss-20b" in r.choices
+    assert "Qwen/Qwen2.5-Coder-32B-Instruct" in r.choices
+    # Image-output model is filtered out of the chat dropdown.
+    assert "black-forest-labs/FLUX.1-dev" not in r.choices
+    assert r.recommended_default == "Qwen/Qwen2.5-Coder-32B-Instruct"
+
+
+def test_huggingface_falls_back_to_static_list_on_error():
+    from requests import ConnectionError as _ConnErr
+    with patch("requests.get", side_effect=_ConnErr("boom")):
+        r = cloud_models(CloudModelsRequest(kind="huggingface"))
+    assert r.choices == list(_HF_FALLBACK)
+    assert r.recommended_default in _HF_FALLBACK
+
+
+def test_hf_models_parses_hub_and_builds_pull_tags():
+    with patch("requests.get", return_value=_FakeResp(_hf_hub_payload())):
+        r = hf_models(search="qwen", sort="downloads", limit=5)
+    assert len(r.models) == 1
+    m = r.models[0]
+    assert m.id == "unsloth/Qwen3-Coder-GGUF"
+    assert m.pull_tag == "hf.co/unsloth/Qwen3-Coder-GGUF"
+    # Quant labels are extracted from the .gguf siblings (README ignored).
+    assert m.quants == ["Q4_K_M", "Q8_0"]
+    assert m.downloads == 1000 and m.likes == 42
+
+
+def test_hf_models_uses_fixed_host_and_sanitizes_sort():
+    captured: Dict[str, Any] = {}
+
+    def fake_get(url, *_args, **kwargs):
+        captured["url"] = url
+        captured["params"] = kwargs.get("params") or {}
+        return _FakeResp(_hf_hub_payload())
+
+    with patch("requests.get", side_effect=fake_get):
+        hf_models(search="x", sort="../etc/passwd", limit=9999)
+    # Host is the fixed Hub constant; an out-of-allowlist sort is coerced and
+    # the limit is clamped, so no attacker value reaches the outbound request.
+    assert captured["url"] == "https://huggingface.co/api/models"
+    assert captured["params"]["sort"] == "trending_score"
+    assert captured["params"]["limit"] == 100
+    assert captured["params"]["filter"] == "gguf"
+
+
+def test_hf_models_returns_empty_on_error():
+    from requests import ConnectionError as _ConnErr
+    with patch("requests.get", side_effect=_ConnErr("down")):
+        r = hf_models()
+    assert r.models == []

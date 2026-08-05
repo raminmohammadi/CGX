@@ -369,7 +369,7 @@ orchestration layer never knows which backend it is talking to.
 | Class | Kind string | Notes |
 |---|---|---|
 | `OllamaProvider` | `"ollama"` | Local Ollama via `/api/chat`; JSON mode via `format: "json"`. |
-| `OpenAICompatProvider` | `"openai-compat"` or `"custom"` | Any `/v1/chat/completions`-compatible endpoint. Accepts `endpoint_path` to override the path suffix and `allow_no_auth=True` to skip Bearer auth (private subnets). |
+| `OpenAICompatProvider` | `"openai-compat"`, `"custom"`, or `"huggingface"` | Any `/v1/chat/completions`-compatible endpoint. Accepts `endpoint_path` to override the path suffix and `allow_no_auth=True` to skip Bearer auth (private subnets). For `"huggingface"` the host and endpoint path are pinned to the Inference Providers router (`https://router.huggingface.co/v1`) and only the token varies. |
 | `GeminiProvider` | `"gemini"` | Google Gemini via `generativelanguage.googleapis.com`. Maps CGX's `messages` to Gemini's `contents` + `systemInstruction`; merges consecutive same-role turns; uses `responseMimeType: "application/json"` for JSON mode; streams via `streamGenerateContent`. |
 
 **Schema-constrained decoding** (`cgx.answer.schemas`): every `chat()`
@@ -398,8 +398,8 @@ saved profile) goes through one factory.
 **Reranker policy** (`enable_reranker`): an `Optional[bool]` whose
 `None` value means "auto" and resolves through
 `default_reranker_for_kind(kind)` -- cloud kinds (`openai-compat`,
-`gemini`) opt in by default, local / private kinds (`ollama`, `custom`)
-opt out. Explicit `True` / `False` on the profile wins.
+`gemini`, `huggingface`) opt in by default, local / private kinds
+(`ollama`, `custom`) opt out. Explicit `True` / `False` on the profile wins.
 `resolve_enable_reranker(profile)` is the single helper that returns
 the effective flag. The value threads from `Profile` →
 `cgx.pipeline.auto.run_query_auto(enable_reranker=…)` →

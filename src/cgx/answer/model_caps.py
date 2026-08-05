@@ -97,6 +97,15 @@ _MODEL_CONTEXT_TOKENS: Dict[str, int] = {
     "gemma4":                    128_000,
     "gemma":                       8_192,
     "starcoder2":                 16_384,
+    # Hugging Face Inference model ids use an ``org/Name`` form; the
+    # family-substring match below resolves most (e.g. ``deepseek-v3``,
+    # ``qwen2.5-coder``). These fill the gaps for the hyphenated Llama tags
+    # and the gpt-oss / GLM families that don't overlap a local key.
+    "gpt-oss":                   128_000,
+    "llama-3.3":                 128_000,
+    "llama-3.1":                 128_000,
+    "llama-3.2":                 128_000,
+    "glm-4":                     128_000,
 }
 
 

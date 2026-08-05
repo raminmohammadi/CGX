@@ -32,7 +32,8 @@ CGX only makes outbound network calls in these cases:
 
 | Path | When it happens |
 |------|-----------------|
-| **Cloud LLM provider** | You explicitly select OpenAI, Gemini, an OpenAI-compatible endpoint, or a custom server. Your prompt (which includes retrieved code snippets) is sent to that provider. |
+| **Cloud LLM provider** | You explicitly select OpenAI, Gemini, Hugging Face Inference, an OpenAI-compatible endpoint, or a custom server. Your prompt (which includes retrieved code snippets) is sent to that provider. |
+| **Browse Hugging Face** | The Settings panel lists GGUF repositories from `huggingface.co/api/models`; **Pull** delegates the download to your local Ollama daemon (`hf.co/<repo>`). |
 | **Provider Ping** | The Setup tab / `POST /api/provider/ping` runs a live reachability check against the configured provider. |
 | **Model discovery** | Listing available models for a cloud provider, restricted to an allow-list of approved hosts (SSRF barrier in `webui/routes/setup.py`). |
 | **First-run model download** | Hugging Face downloads the embedding model once, then caches it. |

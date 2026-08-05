@@ -30,7 +30,7 @@ from cgx.embeddings.loader import load_embedder_from_spec
 
 # Provider kinds accepted by ``--provider``; mirrors the dashboard so the
 # non-interactive CLI and the TUI resolve providers identically.
-_PROVIDER_KINDS = ("ollama", "openai", "openai-compat", "gemini", "custom")
+_PROVIDER_KINDS = ("ollama", "openai", "openai-compat", "gemini", "huggingface", "custom")
 
 
 def _resolve_embedder_or_model(args: argparse.Namespace) -> tuple[Any, str]:

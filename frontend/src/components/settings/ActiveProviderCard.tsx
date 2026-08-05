@@ -142,6 +142,8 @@ export function ActiveProviderCard({
                   ? "GEMINI_API_KEY"
                   : provider.kind === "openai-compat"
                   ? "OPENAI_API_KEY"
+                  : provider.kind === "huggingface"
+                  ? "HF_TOKEN (hf_…)"
                   : "Bearer token (optional)"
               }
               value={provider.api_key || ""}

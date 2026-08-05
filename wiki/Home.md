@@ -59,8 +59,9 @@ Pick the path that matches what you need right now.
   telemetry never leave the machine. Works fully offline with
   [Ollama](https://ollama.com/).
 - **Universal LLM provider.** Ollama (local), OpenAI-compatible
-  endpoints, native Google Gemini, or any self-hosted server — switchable
-  at runtime with a live latency **Ping** check.
+  endpoints, native Google Gemini, Hugging Face Inference, or any
+  self-hosted server — switchable at runtime with a live latency
+  **Ping** check.
 - **Hybrid retrieval.** Two-view semantic + BM25 + graph expansion,
   fused with Reciprocal Rank Fusion and an optional cross-encoder rerank.
 - **Session-based agent.** Describe a goal; the agent works toward it one
