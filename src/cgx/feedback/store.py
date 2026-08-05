@@ -170,6 +170,22 @@ class FeedbackStore:
             out.append(d)
         return out
 
+    # --- data lifecycle (Subsystem M): retention + right-to-erasure --------
+    def purge(self, *, before: float) -> int:
+        """Delete feedback recorded before ``before`` (epoch); row count."""
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM feedback WHERE created_at < ?", (float(before),))
+            self._conn.commit()
+            return int(cur.rowcount)
+
+    def delete_run(self, run_id: str) -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM feedback WHERE run_id = ?", (run_id,))
+            self._conn.commit()
+            return int(cur.rowcount)
+
     def stats(self, *, since: Optional[float] = None) -> Dict[str, Any]:
         """Aggregate up/down counts (overall and per kind) for dashboards."""
         where, params = "", []

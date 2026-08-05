@@ -115,3 +115,19 @@ class UsageMeter:
     def summary(self, *, day: Optional[str] = None) -> List[Dict[str, Any]]:
         """Per-owner totals for ``day`` (for the usage dashboard)."""
         return [self.totals(o, day=day) for o in self.owners(day=day)]
+
+    # --- data lifecycle (Subsystem M): retention + right-to-erasure --------
+    def purge(self, *, before: float) -> int:
+        """Delete usage rows recorded before ``before`` (epoch); row count."""
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM usage WHERE created_at < ?", (float(before),))
+            self._conn.commit()
+            return int(cur.rowcount)
+
+    def delete_owner(self, owner: str) -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM usage WHERE owner = ?", (owner,))
+            self._conn.commit()
+            return int(cur.rowcount)

@@ -153,3 +153,19 @@ class AlertStore:
             d["labels"] = json.loads(d.pop("labels_json") or "{}")
             out.append(d)
         return out
+
+    # --- data lifecycle (Subsystem M): retention + right-to-erasure --------
+    def purge(self, *, before: float) -> int:
+        """Delete alerts recorded before ``before`` (epoch); row count."""
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM alerts WHERE created_at < ?", (float(before),))
+            self._conn.commit()
+            return int(cur.rowcount)
+
+    def delete_run(self, run_id: str) -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM alerts WHERE run_id = ?", (run_id,))
+            self._conn.commit()
+            return int(cur.rowcount)

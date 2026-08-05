@@ -98,6 +98,31 @@ class FeedbackRequest(BaseModel):
     labels: Dict[str, Any] = Field(default_factory=dict)
 
 
+# --------------------- data governance (Subsystem M) ---------------------
+
+class GovPurgeRequest(BaseModel):
+    """Trigger a TTL retention sweep.
+
+    ``retention_days`` overrides the ambient ``CGX_RETENTION_DAYS`` policy for
+    this one sweep; when omitted the env-resolved policy is used.
+    """
+
+    retention_days: Optional[int] = None
+
+
+class GovEraseRequest(BaseModel):
+    """Right-to-erasure by ``run_id`` or ``owner`` (exactly one required)."""
+
+    run_id: Optional[str] = None
+    owner: Optional[str] = None
+
+
+class GovScanRequest(BaseModel):
+    """Audit a snippet of text for PII, returning counts + a scrubbed preview."""
+
+    text: str
+
+
 class ProfileUpsertRequest(BaseModel):
     name: str
     kind: str = "ollama"  # "ollama" | "openai-compat" | "gemini" | "custom"

@@ -196,6 +196,29 @@ class RunStore:
         return {"total": total, "cost_usd": round(cost, 6),
                 "tokens_total": tokens, "errors": errors, "by_kind": by_kind}
 
+    # --- data lifecycle (Subsystem M): retention + right-to-erasure --------
+    def purge(self, *, before: float) -> int:
+        """Delete runs recorded before ``before`` (epoch seconds); row count."""
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM runs WHERE created_at < ?", (float(before),))
+            self._conn.commit()
+            return int(cur.rowcount)
+
+    def delete_run(self, run_id: str) -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM runs WHERE run_id = ?", (run_id,))
+            self._conn.commit()
+            return int(cur.rowcount)
+
+    def delete_owner(self, owner: str) -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM runs WHERE owner = ?", (owner,))
+            self._conn.commit()
+            return int(cur.rowcount)
+
 
 def _row_to_dict(row: Any) -> Dict[str, Any]:
     d = dict(zip(_COLS, row, strict=False))

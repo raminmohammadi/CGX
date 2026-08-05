@@ -9,7 +9,7 @@ logged -- so the observability layer stays strictly non-critical.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from cgx.activity.store import (
     KINDS,
@@ -18,6 +18,9 @@ from cgx.activity.store import (
     default_run_db_path,
     get_default_run_store,
 )
+
+if TYPE_CHECKING:
+    from cgx.govdata import GovernanceConfig
 
 logger = logging.getLogger(__name__)
 
@@ -44,14 +47,21 @@ def record_run(*, kind: str, run_id: str,
                project_root: Optional[str] = None,
                latency_ms: Optional[float] = None,
                status: str = "ok",
-               store: Optional[RunStore] = None) -> None:
+               store: Optional[RunStore] = None,
+               policy: Optional["GovernanceConfig"] = None) -> None:
     """Persist one run observation, extracting signals from ``meta`` defensively.
 
-    Best-effort: any failure is logged and swallowed so a recording error can
-    never break the ask/plan response.
+    The stored ``question`` (and any string labels) pass through the
+    data-governance text policy (Subsystem M): PII is scrubbed when
+    ``scrub_pii`` is on and the text is capped to a preview when
+    ``store_full_text`` is off. Best-effort: any failure is logged and
+    swallowed so a recording error can never break the ask/plan response.
     """
     try:
         meta = meta or {}
+        if policy is None:
+            from cgx.govdata import GovernanceConfig
+            policy = GovernanceConfig.from_env()
         citations = meta.get("citations") or []
         n_citations = len(citations) if isinstance(citations, list) else 0
         n_sources = len(sources or [])
@@ -59,6 +69,10 @@ def record_run(*, kind: str, run_id: str,
         grounded: Optional[bool] = None
         if n_sources or n_citations or confidence is not None:
             grounded = n_citations > 0
+        labels = {k: meta[k] for k in ("intent", "mode")
+                  if k in meta and isinstance(meta[k], (str, int, float))}
+        labels = {k: (policy.apply_text_policy(v) if isinstance(v, str) else v)
+                  for k, v in labels.items()}
         rec = RunRecord(
             kind=kind, run_id=run_id,
             model=model or meta.get("model"),
@@ -71,9 +85,9 @@ def record_run(*, kind: str, run_id: str,
             latency_ms=_as_float(latency_ms),
             n_sources=n_sources, n_citations=n_citations,
             confidence=confidence, grounded=grounded,
-            status=status, question=(question or "")[:500],
-            labels={k: meta[k] for k in ("intent", "mode")
-                    if k in meta and isinstance(meta[k], (str, int, float))},
+            status=status,
+            question=policy.apply_text_policy(question or ""),
+            labels=labels,
         )
         (store or get_default_run_store()).record(rec)
     except Exception as e:  # pragma: no cover - activity is non-critical
