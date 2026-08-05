@@ -415,6 +415,25 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     if synthesized_modules:
         _checkpoint_progress(deps, artifact)
 
+    # Frontend component-coherence synthesis: similar to first-party module
+    # synthesis above, for the JS/TS family. A scaffold model routinely
+    # writes `import './InputField'` in an entry point without authoring
+    # the component, so `npm run build` cannot resolve it and the whole
+    # tree is unbuildable. Synthesize the missing component dynamically so
+    # the imports resolve natively without forcing a regenerate.
+    components_synthesized: List[str] = []
+    try:
+        components_synthesized = _synthesize_missing_frontend_components(
+            diffs=diffs, generated=generated,
+            existing_with_content=existing_with_content, layers=layers,
+            goal=goal, provider=deps.provider, contracts=contracts,
+            skills=skills, project_root=deps.project_root)
+    except Exception:  # pragma: no cover
+        logger.exception("SCAFFOLD: frontend component synthesis raised; skipping")
+        components_synthesized = []
+    if components_synthesized:
+        _checkpoint_progress(deps, artifact)
+
     # Frontend asset-coherence pass: symmetric with the first-party module
     # synthesis above, for the JS/TS family. A scaffold model routinely
     # writes ``import './index.css'`` in an entry point without authoring
@@ -2121,6 +2140,7 @@ _JS_ASSET_EXTS = (
 # Cap on stylesheet stubs synthesized in one pass so a badly-planned tree
 # cannot fan the bundle out unboundedly (mirrors _SYNTH_MODULE_BUDGET).
 _SYNTH_STYLESHEET_BUDGET = 16
+_SYNTH_COMPONENT_BUDGET = 8
 
 # JS test-harness synthesis (P1a). When the scaffold authored JS/TS test
 # files but omitted the toolchain that runs them, VERIFY's NpmRunner has no
@@ -2271,6 +2291,117 @@ def _synthesize_missing_frontend_stylesheets(
         "work plan omitted; synthesized empty stub(s) %s so the build "
         "resolves", added)
     return added
+
+
+def _synthesize_missing_frontend_components(
+        *,
+        diffs: List[Dict[str, str]],
+        generated: List[Dict[str, Any]],
+        existing_with_content: List[Dict[str, str]],
+        layers: List[Any],
+        goal: str,
+        provider: Any,
+        contracts: Optional[Dict[str, Any]],
+        skills: Optional[List[str]],
+        project_root: Optional[str],
+) -> List[str]:
+    """Author missing frontend components that generated files import.
+    
+    If the plan omitted a component (like InputField) but another component
+    imports it, author it dynamically to match how its caller uses it, 
+    preventing the need for the caller to delete the import.
+    """
+    if provider is None:
+        return []
+        
+    from cgx.answer.engine import _content_to_new_file_patch, _js_relative_imports
+    
+    existing_paths = {
+        _norm_rel_path(str(e.get("path") or "")) for e in existing_with_content}
+    root = Path(project_root) if project_root else None
+    
+    candidates: Dict[str, List[str]] = {}
+    
+    for path, content in _generated_js_sources(existing_with_content):
+        for spec in _js_relative_imports(content):
+            ext = _specifier_extension(spec)
+            if ext in _STYLESHEET_EXTS or ext in _JS_ASSET_EXTS:
+                continue
+            target = _resolve_relative_specifier(path, spec)
+            if not target:
+                continue
+            
+            # If the import has no extension, assume .jsx for React projects
+            if _specifier_extension(target) not in _JS_SCRIPT_EXTS:
+                # Check if ANY valid extension exists first
+                exists = False
+                for cand_ext in _JS_SCRIPT_EXTS:
+                    cand = target + cand_ext
+                    if _norm_rel_path(cand) in existing_paths or (root and (root / cand).exists()):
+                        exists = True
+                        break
+                    cand_idx = f"{target}/index{cand_ext}"
+                    if _norm_rel_path(cand_idx) in existing_paths or (root and (root / cand_idx).exists()):
+                        exists = True
+                        break
+                if exists:
+                    continue
+                target += ".jsx"
+            else:
+                if _norm_rel_path(target) in existing_paths or (root and (root / target).exists()):
+                    continue
+                
+            importers = candidates.setdefault(target, [])
+            if path not in importers:
+                importers.append(path)
+                
+    if not candidates:
+        return []
+        
+    synth_files: List[Dict[str, Any]] = []
+    added: List[str] = []
+    
+    def _add(path: str, content: str, ok_meta: Optional[Dict[str, Any]]) -> None:
+        patch = (ok_meta["patch"] if ok_meta else _content_to_new_file_patch(path, content))
+        diffs.append({"file": path, "patch": patch})
+        generated.append({
+            "file": path, "layer": "synthesized",
+            "syntax_ok": bool(ok_meta["syntax_ok"]) if ok_meta else True,
+            "confidence": ok_meta.get("confidence") if ok_meta else None,
+            "bytes": len(content), "synthesized": True})
+        existing_with_content.append({"path": path, "content": content})
+        existing_paths.add(_norm_rel_path(path))
+        synth_files.append({"path": path})
+        added.append(path)
+        
+    for target, importers in sorted(candidates.items(), key=lambda kv: kv[0])[:_SYNTH_COMPONENT_BUDGET]:
+        if target in existing_paths:
+            continue
+            
+        desc = (f"Frontend component (file `{target}`). Other generated files "
+                f"import this component, but the work plan omitted it, so author "
+                f"it now to match how its callers already use it.")
+                
+        context = [e for e in existing_with_content if str(e.get("path") or "") in importers] or list(existing_with_content)
+        
+        ok, _fail = _generate_one(
+            target, desc, "synthesized", context, provider, goal,
+            depends_on=None, contracts=contracts, skills=skills)
+            
+        if ok is None:
+            logger.warning("SCAFFOLD: could not synthesize omitted frontend component %r", target)
+            continue
+            
+        _add(ok["file"], ok["content"], ok)
+        
+    if synth_files:
+        layers.append({"name": "synthesized", "files": synth_files})
+        logger.warning(
+            "SCAFFOLD: work plan omitted frontend component(s) imported by "
+            "generated files; synthesized %s so the importers resolve", added)
+            
+    return added
+
 
 
 def _is_js_test_path(path: str) -> bool:
