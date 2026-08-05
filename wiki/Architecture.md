@@ -44,7 +44,8 @@ Two surfaces sit on top: the **CLI** (`cli/`) and the **web UI**
 | `webui/` | FastAPI app (`server`), `routes/`, SSE (`sse`), task store, and the launcher (`launch`). Serves the built SPA from `static/`. |
 | `cli/` | The `cgx` command (`main`) and the interactive terminal dashboard (`tui/`). |
 | `io/` | Persistence for indices, records, chunks, and graphs (`persist`). |
-| Cross-cutting | `config` (env-driven dataclasses), `trace` / `redact` (observability), `telemetry` (opt-in ping), `logging_setup`. |
+| Cross-cutting | `config` (env-driven dataclasses), `trace` / `redact` / `metrics` (observability), `telemetry` (opt-in ping), `logging_setup`. |
+| MLOps layer | `metrics`, `health`, `registry`, `usage`, `activity`, `eval`, `monitor`, `feedback`, `governance`, `guardrails`, `govdata` — the production observability/governance subsystems. See **[[MLOps and Production]]**. |
 
 `skills/` lives at the **repo root** (not under `src/cgx/`) — a
 plug-and-play registry consumed by `answer.engine` and the session
@@ -116,5 +117,6 @@ These hold across the codebase; respect them when contributing:
 
 - **[[How It Works]]** — the retrieval pipeline in depth.
 - **[[Session Based Agent]]** — the orchestrator internals.
+- **[[MLOps and Production]]** — the observability/governance/deploy layer.
 - **[[Contributing]]** — dev setup, tests, and the PR checklist.
 - [`docs/architecture.md`](https://github.com/raminmohammadi/Averix/blob/main/docs/architecture.md) — the full reference.

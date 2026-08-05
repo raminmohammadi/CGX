@@ -34,6 +34,7 @@ Pick the path that matches what you need right now.
 | Choose a provider / model for my hardware     | **[[Providers and Models]]** |
 | Tune retrieval, caching, or rate limits       | **[[Configuration and Tuning]]** |
 | Understand what leaves my machine             | **[[Privacy and Security]]** |
+| Run CGX in production (metrics, deploy)        | **[[MLOps and Production]]** |
 | Read the internals as a contributor           | **[[Architecture]]** · **[[Contributing]]** |
 | Fix a problem                                 | **[[Troubleshooting and FAQ]]** |
 
@@ -109,6 +110,7 @@ The wiki is the curated, navigable entry point. The in-repo `docs/` set
 holds the authoritative deep dives that individual wiki pages link into:
 
 - [`docs/architecture.md`](https://github.com/raminmohammadi/Averix/blob/main/docs/architecture.md) — full architecture reference
+- [`docs/mlops.md`](https://github.com/raminmohammadi/Averix/blob/main/docs/mlops.md) — production MLOps operator guide
 - [`docs/usage.md`](https://github.com/raminmohammadi/Averix/blob/main/docs/usage.md) — exhaustive usage guide
 - [`docs/Agent.md`](https://github.com/raminmohammadi/Averix/blob/main/docs/Agent.md) — session-agent internals
 - [`docs/flowcharts.md`](https://github.com/raminmohammadi/Averix/blob/main/docs/flowcharts.md) — audience-specific diagrams

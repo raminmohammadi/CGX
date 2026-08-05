@@ -18,6 +18,9 @@
 - [[Skills Registry]]
 - [[Configuration and Tuning]]
 
+**Operate & deploy**
+- [[MLOps and Production]]
+
 **Trust & internals**
 - [[Privacy and Security]]
 - [[Architecture]]

@@ -63,6 +63,25 @@ These map to the dataclasses in
 
 ---
 
+## MLOps & production knobs
+
+The production layer (**[[MLOps and Production]]**) is env-driven too:
+
+| Variable | Purpose |
+|----------|---------|
+| `CGX_TRACE` / `CGX_OTEL` | Pin the `@traced` tracer on/off; emit OpenTelemetry spans when the SDK is present. |
+| `CGX_MODEL_PRICING` | JSON `{model: {"in": x, "out": y}}` price overrides (USD / 1M tokens) for cost accounting. |
+| `CGX_BUDGET_ENABLED` / `CGX_BUDGET_DAILY_TOKENS` / `CGX_BUDGET_DAILY_COST_USD` / `CGX_BUDGET_SOFT_RATIO` / `CGX_BUDGET_OWNERS` | Per-owner day budgets + soft-warn ratio. |
+| `CGX_MON_*` | AIOps monitor thresholds (confidence, citation coverage, drift drop, cost spike ratio, error rate, repair attempts). |
+| `CGX_GUARDRAIL_*` / `CGX_LLM_DISABLED` | Guardrail toggles and the LLM kill-switch. |
+| `CGX_RETENTION_DAYS` / `CGX_SCRUB_PII` / `CGX_STORE_FULL_TEXT` / `CGX_PREVIEW_CAP` | Retention TTL, PII scrubbing, and full-vs-preview text policy. |
+| `CGX_EVAL_CANDIDATES_PATH` | Override the feedback flywheel's eval-candidate JSONL path. |
+
+The full reference and endpoints are in
+[`docs/mlops.md`](https://github.com/raminmohammadi/Averix/blob/main/docs/mlops.md).
+
+---
+
 ## Incremental indexing
 
 `run_index_auto` is incremental by default at **two** layers:
@@ -122,4 +141,5 @@ regenerate budgets (`REPAIR_BUDGET=4`, `REGENERATE_BUDGET=3`, …) in
 
 - **[[How It Works]]** — what each stage does.
 - **[[Providers and Models]]** — provider-side configuration.
+- **[[MLOps and Production]]** — the production observability/governance layer.
 - [`docs/usage.md`](https://github.com/raminmohammadi/Averix/blob/main/docs/usage.md#5-tune-retrieval-optional).
