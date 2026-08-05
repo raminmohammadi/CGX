@@ -5,7 +5,18 @@ from __future__ import annotations
 import asyncio
 import json
 
+from cgx.activity import RunRecord, RunStore
 from cgx.metrics import MetricsRegistry
+
+
+def _allowlist_root(monkeypatch, root: str) -> None:
+    """Register ``root`` in a fresh in-memory activity store + install it as
+    the process default, so the admin allow-list recognises it."""
+    import cgx.activity.store as store_mod
+
+    store = RunStore(":memory:")
+    store.record(RunRecord(kind="ask", project_root=str(root)))
+    monkeypatch.setattr(store_mod, "_DEFAULT", store)
 
 
 # --------------------------------------------------------------------------
@@ -62,7 +73,7 @@ async def _asgi(app, method, path):
 # --------------------------------------------------------------------------
 # /api/admin/logs: reads project agent.log, redacts + filters, newest first
 # --------------------------------------------------------------------------
-def test_admin_logs_route_redacts_and_filters(tmp_path):
+def test_admin_logs_route_redacts_and_filters(tmp_path, monkeypatch):
     from urllib.parse import quote
 
     from cgx.webui.server import create_app
@@ -76,6 +87,7 @@ def test_admin_logs_route_redacts_and_filters(tmp_path):
         json.dumps({"event": "trace_exit", "ts": 200.0, "elapsed_ms": 5}) + "\n",
         encoding="utf-8",
     )
+    _allowlist_root(monkeypatch, tmp_path)
     app = create_app()
 
     q = quote(str(tmp_path))
@@ -94,21 +106,44 @@ def test_admin_logs_route_redacts_and_filters(tmp_path):
     assert [x["event"] for x in logs] == ["trace_exit", "trace_enter"]
 
 
-def test_admin_logs_missing_file_is_empty(tmp_path):
+def test_admin_logs_known_root_missing_file_is_empty(tmp_path, monkeypatch):
+    """A known project root with no agent.log yet reads back empty."""
     from urllib.parse import quote
 
     from cgx.webui.server import create_app
 
+    _allowlist_root(monkeypatch, tmp_path)
     app = create_app()
-    q = quote(str(tmp_path / "nope"))
+    q = quote(str(tmp_path))
     r = asyncio.run(_asgi(app, "GET", f"/api/admin/logs?project_root={q}"))
-    assert r["status"] == 200 and json.loads(r["body"])["count"] == 0
+    body = json.loads(r["body"])
+    assert r["status"] == 200 and body["count"] == 0
+    assert body["source"].endswith("/.cgx/agent.log")
+
+
+def test_admin_logs_unknown_root_falls_back_to_global(tmp_path, monkeypatch):
+    """A project root not on the activity-store allow-list is refused: the
+    reader falls back to the global log instead of touching the given path."""
+    from urllib.parse import quote
+
+    from cgx.webui.server import create_app
+
+    # Allow-list a *different* root, so ``tmp_path`` is not recognised.
+    _allowlist_root(monkeypatch, tmp_path / "allowed")
+    app = create_app()
+    q = quote(str(tmp_path / "evil"))
+    r = asyncio.run(_asgi(app, "GET", f"/api/admin/logs?project_root={q}"))
+    body = json.loads(r["body"])
+    assert r["status"] == 200
+    # Source is the global fallback, never the caller-supplied project path.
+    assert "agent.log" not in body["source"]
+    assert str(tmp_path / "evil") not in body["source"]
 
 
 # --------------------------------------------------------------------------
 # DELETE /api/admin/logs: purges a project's agent.log (+ backups), only
 # --------------------------------------------------------------------------
-def test_admin_delete_logs_project(tmp_path):
+def test_admin_delete_logs_project(tmp_path, monkeypatch):
     from urllib.parse import quote
 
     from cgx.webui.server import create_app
@@ -118,6 +153,7 @@ def test_admin_delete_logs_project(tmp_path):
     log = log_dir / "agent.log"
     log.write_text("{}\n", encoding="utf-8")
     (log_dir / "agent.log.1").write_text("{}\n", encoding="utf-8")
+    _allowlist_root(monkeypatch, tmp_path)
     app = create_app()
 
     q = quote(str(tmp_path))
@@ -127,7 +163,7 @@ def test_admin_delete_logs_project(tmp_path):
     assert not log.exists() and not (log_dir / "agent.log.1").exists()
 
 
-def test_admin_delete_logs_refuses_symlink_and_other_files(tmp_path):
+def test_admin_delete_logs_refuses_symlink_and_other_files(tmp_path, monkeypatch):
     """A planted symlink or a non-log filename must never be unlinked."""
     from urllib.parse import quote
 
@@ -139,6 +175,7 @@ def test_admin_delete_logs_refuses_symlink_and_other_files(tmp_path):
     log_dir.mkdir(parents=True)
     # Hostile: agent.log is a symlink pointing at an unrelated file.
     (log_dir / "agent.log").symlink_to(secret)
+    _allowlist_root(monkeypatch, tmp_path / "proj")
     app = create_app()
 
     q = quote(str(tmp_path / "proj"))
@@ -147,6 +184,29 @@ def test_admin_delete_logs_refuses_symlink_and_other_files(tmp_path):
     assert r["status"] == 200 and body["deleted"] == 0
     # Neither the symlink target nor the symlink entry itself was removed.
     assert secret.exists() and secret.read_text(encoding="utf-8") == "keep me"
+
+
+def test_admin_delete_logs_rejects_unknown_root(tmp_path, monkeypatch):
+    """A project root not on the activity-store allow-list is refused: no
+    file is touched and the response is flagged ``rejected``."""
+    from urllib.parse import quote
+
+    from cgx.webui.server import create_app
+
+    log_dir = tmp_path / "evil" / ".cgx"
+    log_dir.mkdir(parents=True)
+    log = log_dir / "agent.log"
+    log.write_text("{}\n", encoding="utf-8")
+    # Allow-list a *different* root so ``evil`` is not recognised.
+    _allowlist_root(monkeypatch, tmp_path / "allowed")
+    app = create_app()
+
+    q = quote(str(tmp_path / "evil"))
+    r = asyncio.run(_asgi(app, "DELETE", f"/api/admin/logs?project_root={q}"))
+    body = json.loads(r["body"])
+    assert r["status"] == 200 and body["deleted"] == 0 and body.get("rejected")
+    # The unknown project's log is left untouched.
+    assert log.exists()
 
 
 # --------------------------------------------------------------------------
