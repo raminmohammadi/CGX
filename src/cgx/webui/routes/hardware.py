@@ -43,6 +43,11 @@ _HF_HUB_BASE = "https://huggingface.co"
 _HF_REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
+def _sanitize_for_log(value: object) -> str:
+    """Return a single-line representation safe for plain-text logs."""
+    return str(value).replace("\r", "").replace("\n", "")
+
+
 @router.get("/hardware/matrix", response_model=HardwareMatrixResponse)
 def matrix(base_url: str = ollama_discovery.DEFAULT_BASE_URL) -> HardwareMatrixResponse:
     try:
@@ -131,7 +136,11 @@ def hf_fit(repo: str) -> HfModelFitResponse:
         pipeline_tag = spec.get("pipeline_tag") or None
         gated = bool(spec.get("gated"))
     except Exception as e:
-        logger.info("hardware.hf_fit: spec fetch failed for %r: %s", repo, type(e).__name__)
+        logger.info(
+            "hardware.hf_fit: spec fetch failed for %r: %s",
+            _sanitize_for_log(repo),
+            type(e).__name__,
+        )
 
     if params_b <= 0:
         params_b = params_from_name(repo)
