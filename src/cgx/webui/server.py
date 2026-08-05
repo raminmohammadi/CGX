@@ -35,6 +35,7 @@ from cgx.trace import (
 
 from cgx.webui.routes import (
     activity as activity_route,
+    admin as admin_route,
     agent_profiles,
     agent_session,
     ask,
@@ -180,6 +181,7 @@ def create_app() -> FastAPI:
     app.include_router(feedback_route.router, prefix="/api")
     app.include_router(usage_route.router, prefix="/api")
     app.include_router(activity_route.router, prefix="/api")
+    app.include_router(admin_route.router, prefix="/api")
 
     # Liveness/readiness probes at the root (``/healthz``, ``/readyz``) -- no
     # ``/api`` prefix, and registered before the SPA catch-all so the React

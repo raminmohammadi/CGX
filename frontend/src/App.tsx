@@ -10,6 +10,7 @@ const PlanPage = lazy(() => import("./pages/PlanPage"));
 const AgentPage = lazy(() => import("./pages/AgentPage"));
 const IndexPage = lazy(() => import("./pages/IndexPage"));
 const ActivityPage = lazy(() => import("./pages/ActivityPage"));
+const AdminPage = lazy(() => import("./pages/AdminPage"));
 const SettingsPage = lazy(() => import("./pages/SettingsPage"));
 
 function RouteFallback() {
@@ -70,6 +71,14 @@ export default function App() {
           element={
             <Suspense fallback={<RouteFallback />}>
               <ActivityPage />
+            </Suspense>
+          }
+        />
+        <Route
+          path="/admin"
+          element={
+            <Suspense fallback={<RouteFallback />}>
+              <AdminPage />
             </Suspense>
           }
         />

@@ -385,6 +385,34 @@ export type RunDetail = {
   alerts: Array<Record<string, any>>;
 };
 
+// --- Admin (Subsystem D): logs / trace explorer, metrics, audit-lite ---
+export type AdminLogEntry = Record<string, any> & { event?: string; ts?: number };
+
+export type MetricSeries = { name: string; labels: Record<string, string>; value: number };
+export type HistogramSeries = {
+  name: string;
+  labels: Record<string, string>;
+  count: number;
+  sum: number;
+  buckets: Array<[number | string, number]>;
+};
+export type MetricsSnapshot = {
+  counters: MetricSeries[];
+  gauges: MetricSeries[];
+  histograms: HistogramSeries[];
+};
+
+export type AdminOverview = {
+  activity: Partial<ActivitySummary>;
+  http: { requests: number; errors: number };
+  feedback: Record<string, any>;
+  alerts: {
+    total: number;
+    by_severity: Record<string, number>;
+    recent: Array<Record<string, any>>;
+  };
+};
+
 export const api = {
   status: () => jsonReq<StatusResponse>("/api/status"),
   ollamaHealth: (base_url: string) =>
@@ -595,6 +623,20 @@ export const api = {
   activitySummary: () => jsonReq<ActivitySummary>("/api/activity/summary"),
   activityRunDetail: (runId: string) =>
     jsonReq<RunDetail>(`/api/activity/runs/${encodeURIComponent(runId)}`),
+
+  // --- Admin (Subsystem D) ---
+  adminOverview: () => jsonReq<AdminOverview>("/api/admin/overview"),
+  adminMetrics: () => jsonReq<MetricsSnapshot>("/api/admin/metrics"),
+  adminLogs: (params?: { event?: string; limit?: number; project_root?: string }) => {
+    const q = new URLSearchParams();
+    if (params?.event) q.set("event", params.event);
+    if (params?.limit) q.set("limit", String(params.limit));
+    if (params?.project_root) q.set("project_root", params.project_root);
+    const qs = q.toString();
+    return jsonReq<{ source: string; logs: AdminLogEntry[]; count: number }>(
+      `/api/admin/logs${qs ? `?${qs}` : ""}`,
+    );
+  },
 };
 
 export type TraceSettings = {

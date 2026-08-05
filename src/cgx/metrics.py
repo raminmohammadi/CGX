@@ -131,6 +131,40 @@ class MetricsRegistry:
                         lines.append(f"{name}_count{_fmt_labels(key)} {int(cell['count'])}")
         return "\n".join(lines) + ("\n" if lines else "")
 
+    def snapshot(self) -> Dict[str, object]:
+        """Structured (non-Prometheus) view of every series for the admin API.
+
+        Returns ``{"counters"|"gauges": [{name, labels, value}...],
+        "histograms": [{name, labels, count, sum, buckets:[[le,count]...]}...]}``
+        with label keys expanded back into plain dicts.
+        """
+        def _labels(key: LabelKey) -> Dict[str, str]:
+            return {k: v for k, v in key}
+
+        with self._lock:
+            counters = [{"name": n, "labels": _labels(k), "value": v}
+                        for n, fam in sorted(self._counters.items())
+                        for k, v in sorted(fam.items())]
+            gauges = [{"name": n, "labels": _labels(k), "value": v}
+                      for n, fam in sorted(self._gauges.items())
+                      for k, v in sorted(fam.items())]
+            hists = []
+            for n, fam in sorted(self._hist.items()):
+                for k, cell in sorted(fam.items()):
+                    buckets = [[("+Inf" if b == float("inf") else float(b)),
+                                int(c)]
+                               for b, c in zip(cell["buckets"], cell["counts"],  # type: ignore[arg-type]
+                                               strict=False)]
+                    # Mirror render(): the cumulative ``+Inf`` bucket equals
+                    # the total observation count.
+                    if not buckets or buckets[-1][0] != "+Inf":
+                        buckets.append(["+Inf", int(cell["count"])])  # type: ignore[arg-type]
+                    hists.append({"name": n, "labels": _labels(k),
+                                  "count": int(cell["count"]),  # type: ignore[arg-type]
+                                  "sum": float(cell["sum"]),  # type: ignore[arg-type]
+                                  "buckets": buckets})
+        return {"counters": counters, "gauges": gauges, "histograms": hists}
+
     def reset(self) -> None:
         with self._lock:
             self._counters.clear()
@@ -167,6 +201,10 @@ def observe(name: str, value: float, *, help: Optional[str] = None,
 
 def render_prometheus() -> str:
     return _REGISTRY.render()
+
+
+def snapshot() -> Dict[str, object]:
+    return _REGISTRY.snapshot()
 
 
 def reset_for_tests() -> None:

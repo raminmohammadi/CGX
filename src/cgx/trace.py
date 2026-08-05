@@ -181,6 +181,15 @@ _FALLBACK_BACKUPS = 3
 _fallback_logger: Optional[logging.Logger] = None
 
 
+def fallback_trace_log_path() -> Path:
+    """Path of the global JSONL trace log the admin explorer reads back.
+
+    This is the same file the fallback logger writes to (records emitted
+    outside any session -- HTTP routes, CLI, direct retrieval/codegen).
+    """
+    return _FALLBACK_DIR / _FALLBACK_FILE
+
+
 class _JsonlFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         payload = getattr(record, "trace_event", None) or {"event": record.msg}

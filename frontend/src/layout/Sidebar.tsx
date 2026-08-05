@@ -14,6 +14,7 @@ import {
   Trash2,
   Wand2,
   Activity,
+  ShieldCheck,
 } from "lucide-react";
 import { api, type SessionSummary } from "../lib/api";
 import { useWorkspace } from "../store/workspace";
@@ -47,7 +48,10 @@ const navGroups: { eyebrow: string; tabs: NavTab[] }[] = [
   },
   {
     eyebrow: "Observability",
-    tabs: [{ to: "/activity", label: "User Activity", icon: Activity, pageKey: null }],
+    tabs: [
+      { to: "/activity", label: "User Activity", icon: Activity, pageKey: null },
+      { to: "/admin", label: "Admin", icon: ShieldCheck, pageKey: null },
+    ],
   },
   {
     eyebrow: "System",
