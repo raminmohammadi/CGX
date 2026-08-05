@@ -1,48 +1,53 @@
 import { useEffect, useMemo, useState } from "react";
 import { Card, CardHeader } from "../../components/Card";
-import { Pill, type PillTone } from "../../components/Pill";
+import { Pill } from "../../components/Pill";
 import { BarList, type BarRow } from "../../components/charts";
 import { api, type AdminLogEntry } from "../../lib/api";
+import { useWorkspace } from "../../store/workspace";
 import { cn, formatRelative } from "../../lib/utils";
 import { ErrorLine, fmtMs, useAsync, type SectionProps } from "./common";
+import { TraceDetail, catChartTone, catTone, deriveCat, eventTone, recLabel } from "./traceDetail";
 
-// Trace category -> pill tone (matches the @traced() categories in cgx.trace).
-function catTone(cat: string): PillTone {
-  if (cat.startsWith("repair")) return "red";
-  if (cat === "llm") return "neon";
-  if (cat === "retrieval") return "amber";
-  if (cat === "router" || cat === "pipeline") return "purple";
-  return "slate"; // codegen + anything else
+// Trailing path segments for a compact source label (full path kept in title).
+function shortRoot(root: string): string {
+  const parts = root.replace(/\/+$/, "").split("/").filter(Boolean);
+  return parts.length <= 2 ? root : "…/" + parts.slice(-2).join("/");
 }
-function eventTone(ev: string): PillTone {
-  if (ev === "trace_error") return "red";
-  if (ev === "trace_exit") return "neon";
-  return "slate"; // trace_enter / other
-}
-const META = new Set(["event", "ts", "category", "fn", "elapsed_ms"]);
-const CORRELATION = ["run_id", "request_id", "session_id", "task_id"];
 
 export default function TraceSection({ refreshKey }: SectionProps) {
+  const projectRoot = useWorkspace((s) => s.projectRoot);
   const [event, setEvent] = useState("");
   const [cat, setCat] = useState("all");
+  const [source, setSource] = useState(""); // "" = global fallback log
+  const [hideHttp, setHideHttp] = useState(true);
   const [sel, setSel] = useState<AdminLogEntry | null>(null);
   const { data, error } = useAsync(
-    () => api.adminLogs({ event: event || undefined, limit: 500 }),
-    [refreshKey, event],
+    () => api.adminLogs({ event: event || undefined, limit: 500, project_root: source || undefined }),
+    [refreshKey, event, source],
   );
-  const logs = data?.logs ?? [];
-  useEffect(() => setSel(null), [refreshKey, event, cat]);
+  // Project roots seen in recent activity runs -> selectable trace sources.
+  const { data: runsData } = useAsync(() => api.activityRuns({ limit: 300 }), [refreshKey]);
+  const roots = useMemo(() => {
+    const set = new Set<string>();
+    if (projectRoot) set.add(projectRoot);
+    for (const r of runsData?.runs ?? []) if (r.project_root) set.add(r.project_root);
+    return [...set];
+  }, [projectRoot, runsData]);
+
+  const allLogs = data?.logs ?? [];
+  const logs = hideHttp ? allLogs.filter((r) => deriveCat(r) !== "http") : allLogs;
+  useEffect(() => setSel(null), [refreshKey, event, cat, source, hideHttp]);
 
   // Category breakdown (client-side) + the chips used to filter the list.
   const cats = useMemo(() => {
     const m: Record<string, number> = {};
-    for (const r of logs) m[String(r.category ?? "?")] = (m[String(r.category ?? "?")] ?? 0) + 1;
+    for (const r of logs) m[deriveCat(r)] = (m[deriveCat(r)] ?? 0) + 1;
     return m;
   }, [logs]);
   const catBars: BarRow[] = Object.entries(cats)
     .sort((a, b) => b[1] - a[1])
-    .map(([label, value]) => ({ label, value, tone: "purple" as const }));
-  const rows = cat === "all" ? logs : logs.filter((r) => String(r.category) === cat);
+    .map(([label, value]) => ({ label, value, tone: catChartTone(label) }));
+  const rows = cat === "all" ? logs : logs.filter((r) => deriveCat(r) === cat);
 
   return (
     <div className="space-y-6">
@@ -51,14 +56,36 @@ export default function TraceSection({ refreshKey }: SectionProps) {
         <CardHeader
           eyebrow="Admin explorer (D) · Tracing (B)"
           title="Function-call trace"
-          description="Newest first · secrets redacted server-side · click a record for full detail."
+          description="Pick a project to read its agent.log — LLM calls (full prompt + response), router, executors, codegen, scaffold & repair. The Global source holds only HTTP/CLI traces. Newest first · secrets redacted server-side · click a record for detail."
           right={
-            <input
-              value={event}
-              onChange={(e) => setEvent(e.target.value)}
-              placeholder="filter event/fn…"
-              className="av-input text-xs w-44"
-            />
+            <div className="flex items-center gap-2">
+              <select
+                value={source}
+                onChange={(e) => setSource(e.target.value)}
+                className="av-input text-xs w-52"
+                title="Trace source (project agent.log vs. global fallback)"
+              >
+                <option value="">Global (HTTP · CLI)</option>
+                {roots.map((r) => (
+                  <option key={r} value={r} title={r}>
+                    {shortRoot(r)}
+                  </option>
+                ))}
+              </select>
+              <input
+                value={event}
+                onChange={(e) => setEvent(e.target.value)}
+                placeholder="filter event/fn…"
+                className="av-input text-xs w-40"
+              />
+              <button
+                onClick={() => setHideHttp((v) => !v)}
+                className={cn("av-btn-ghost whitespace-nowrap", hideHttp && "text-emerald-400")}
+                title="Hide high-volume HTTP request traces"
+              >
+                {hideHttp ? "HTTP hidden" : "HTTP shown"}
+              </button>
+            </div>
           }
         />
         {logs.length > 0 && (
@@ -76,25 +103,30 @@ export default function TraceSection({ refreshKey }: SectionProps) {
           <div className="col-span-2 space-y-1 max-h-[32rem] overflow-y-auto text-[11px] font-mono">
             {rows.length === 0 && (
               <p className="text-slate-500 italic">
-                No trace records. Enable tracing with CGX_TRACE=1 or the trace toggle in Settings.
+                No trace records here. Enable tracing (CGX_TRACE=1 or the Settings toggle), run an
+                ask/plan/agent, then select its project as the source above — the Global source only
+                collects HTTP/CLI traces.
               </p>
             )}
-            {rows.map((r, i) => (
-              <button
-                key={i}
-                onClick={() => setSel(r)}
-                className={cn(
-                  "w-full text-left p-2 rounded border flex items-center gap-2 transition",
-                  sel === r ? "bg-slate-950 border-emerald-500/30" : "bg-slate-950/40 border-white/5 hover:border-white/10",
-                )}
-              >
-                <Pill tone={eventTone(String(r.event))}>{String(r.event ?? "?").replace("trace_", "")}</Pill>
-                {r.category != null && <Pill tone={catTone(String(r.category))}>{String(r.category)}</Pill>}
-                <span className="text-slate-300 truncate flex-1">{String(r.fn ?? "")}</span>
-                {r.elapsed_ms != null && <span className="text-slate-500 shrink-0">{fmtMs(Number(r.elapsed_ms))}</span>}
-                <span className="text-slate-600 shrink-0">{formatRelative(r.ts)}</span>
-              </button>
-            ))}
+            {rows.map((r, i) => {
+              const elapsed = r.elapsed_ms ?? r.latency_ms;
+              return (
+                <button
+                  key={i}
+                  onClick={() => setSel(r)}
+                  className={cn(
+                    "w-full text-left p-2 rounded border flex items-center gap-2 transition",
+                    sel === r ? "bg-slate-950 border-emerald-500/30" : "bg-slate-950/40 border-white/5 hover:border-white/10",
+                  )}
+                >
+                  <Pill tone={eventTone(String(r.event))}>{String(r.event ?? "?").replace("trace_", "")}</Pill>
+                  <Pill tone={catTone(deriveCat(r))}>{deriveCat(r)}</Pill>
+                  <span className="text-slate-300 truncate flex-1">{recLabel(r)}</span>
+                  {elapsed != null && <span className="text-slate-500 shrink-0">{fmtMs(Number(elapsed))}</span>}
+                  <span className="text-slate-600 shrink-0">{formatRelative(r.ts)}</span>
+                </button>
+              );
+            })}
           </div>
 
           <div className="space-y-4">
@@ -111,34 +143,6 @@ export default function TraceSection({ refreshKey }: SectionProps) {
         </div>
         <p className="text-[10px] text-slate-500 font-mono mt-3 truncate">source: {data?.source ?? "--"}</p>
       </Card>
-    </div>
-  );
-}
-
-function TraceDetail({ rec }: { rec: AdminLogEntry }) {
-  const ids = CORRELATION.filter((k) => rec[k] != null);
-  const extra = Object.entries(rec).filter(([k]) => !META.has(k) && !CORRELATION.includes(k));
-  return (
-    <div className="space-y-1.5 text-[11px] font-mono">
-      <Row label="event" value={String(rec.event ?? "--")} />
-      <Row label="category" value={String(rec.category ?? "--")} />
-      <Row label="fn" value={String(rec.fn ?? "--")} />
-      <Row label="elapsed" value={rec.elapsed_ms != null ? fmtMs(Number(rec.elapsed_ms)) : "--"} />
-      {ids.map((k) => (
-        <Row key={k} label={k} value={String(rec[k])} accent />
-      ))}
-      {extra.map(([k, v]) => (
-        <Row key={k} label={k} value={typeof v === "object" ? JSON.stringify(v) : String(v)} />
-      ))}
-    </div>
-  );
-}
-
-function Row({ label, value, accent }: { label: string; value: string; accent?: boolean }) {
-  return (
-    <div className="bg-slate-950 p-2 rounded border border-white/5 flex justify-between gap-3">
-      <span className="text-slate-500 shrink-0">{label}</span>
-      <span className={cn("truncate text-right", accent ? "text-emerald-400" : "text-slate-200")}>{value}</span>
     </div>
   );
 }
