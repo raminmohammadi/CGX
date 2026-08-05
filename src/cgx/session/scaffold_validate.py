@@ -303,6 +303,37 @@ def validate_requirements_text(
     return "".join(lines), adjustments
 
 
+def _rewrite_pydantic_v2_imports(text: str) -> Tuple[str, bool]:
+    """Deterministically rewrite hallucinated Pydantic V1 BaseSettings imports."""
+    if not text or "BaseSettings" not in text:
+        return text, False
+    
+    # 1. BaseSettings alone on a line
+    new_text, n1 = re.subn(
+        r'^(\s*)from\s+pydantic\s+import\s+BaseSettings(\s*(?:#.*)?)$',
+        r'\1from pydantic_settings import BaseSettings\2',
+        text,
+        flags=re.MULTILINE
+    )
+    
+    # 2. BaseSettings mixed with other imports
+    new_text, n2 = re.subn(
+        r'^(\s*)from\s+pydantic\s+import\s+(.*?)\bBaseSettings\b(.*?)$',
+        r'\1from pydantic import \2\3\n\1from pydantic_settings import BaseSettings',
+        new_text,
+        flags=re.MULTILINE
+    )
+    
+    # Clean up empty commas and hanging imports
+    new_text, _ = re.subn(r'from\s+pydantic\s+import\s*,\s*', 'from pydantic import ', new_text, flags=re.MULTILINE)
+    new_text, _ = re.subn(r',\s*,', ', ', new_text)
+    new_text, _ = re.subn(r',\s*$', '', new_text, flags=re.MULTILINE)
+    new_text, _ = re.subn(r'^(\s*)from\s+pydantic\s+import\s*$', r'', new_text, flags=re.MULTILINE)
+    
+    changed = n1 > 0 or n2 > 0
+    return new_text, changed
+
+
 def validate_scaffold_diffs(
         diffs: List[Dict[str, str]],
         file_contents: Dict[str, str], *,
@@ -326,25 +357,69 @@ def validate_scaffold_diffs(
     first_party = _first_party_names(
         list(new_contents.keys())
         + [str(e.get("file") or "") for e in new_diffs])
+    pydantic_settings_needed = False
     for idx, entry in enumerate(new_diffs):
         path = str(entry.get("file") or "").strip()
-        if not path or not is_requirements_path(path):
+        if not path:
             continue
         original = new_contents.get(path)
         if not isinstance(original, str) or not original:
             continue
-        rewritten, adjustments = validate_requirements_text(
-            original, pypi_client=pypi_client, first_party=first_party)
-        if not adjustments or rewritten == original:
-            continue
-        new_diffs[idx] = {
-            "file": path,
-            "patch": _content_to_new_file_patch(path, rewritten),
-        }
-        new_contents[path] = rewritten
-        for adj in adjustments:
-            adj["file"] = path
-            all_adjustments.append(adj)
+        
+        if path.endswith(".py"):
+            rewritten, changed = _rewrite_pydantic_v2_imports(original)
+            if changed:
+                new_diffs[idx] = {
+                    "file": path,
+                    "patch": _content_to_new_file_patch(path, rewritten),
+                }
+                new_contents[path] = rewritten
+                pydantic_settings_needed = True
+                all_adjustments.append({
+                    "action": "rewrite_pydantic_v2",
+                    "file": path,
+                    "source": "sanitizer"
+                })
+        elif is_requirements_path(path):
+            rewritten, adjustments = validate_requirements_text(
+                original, pypi_client=pypi_client, first_party=first_party)
+            if not adjustments or rewritten == original:
+                continue
+            new_diffs[idx] = {
+                "file": path,
+                "patch": _content_to_new_file_patch(path, rewritten),
+            }
+            new_contents[path] = rewritten
+            for adj in adjustments:
+                adj["file"] = path
+                all_adjustments.append(adj)
+
+    if pydantic_settings_needed:
+        req_path = None
+        for p in new_contents:
+            if is_requirements_path(p):
+                req_path = p
+                break
+        if req_path:
+            req_text = new_contents[req_path]
+            if "pydantic-settings" not in req_text.lower():
+                ending = "\n" if not req_text or req_text.endswith("\n") else "\n\n"
+                req_text += ending + "pydantic-settings\n"
+                new_contents[req_path] = req_text
+                for idx, entry in enumerate(new_diffs):
+                    if entry.get("file") == req_path:
+                        new_diffs[idx] = {
+                            "file": req_path,
+                            "patch": _content_to_new_file_patch(req_path, req_text),
+                        }
+                        break
+                all_adjustments.append({
+                    "action": "inject_dependency",
+                    "name": "pydantic-settings",
+                    "file": req_path,
+                    "source": "sanitizer"
+                })
+
     return new_diffs, new_contents, all_adjustments
 
 

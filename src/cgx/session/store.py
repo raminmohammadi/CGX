@@ -138,19 +138,31 @@ class SessionStore:
     def __init__(self, db_path: Optional[str | Path] = None, *,
                  project_root: Optional[str | Path] = None,
                  bus: Optional[EventBus] = None) -> None:
-        raw_path = Path(db_path) if db_path else default_db_path(project_root)
-        # Canonicalize with ``os.path.realpath`` (pure normalization, not the
-        # ``Path.resolve`` filesystem-access sink) and confirm the result is
-        # an absolute, ``..``-free path before it reaches ``mkdir`` /
-        # ``sqlite3.connect``. The ``startswith`` check is the CodeQL
-        # path-injection barrier on the exact string handed to those sinks.
-        resolved = os.path.realpath(os.fspath(raw_path))
-        if not resolved.startswith(os.sep):
-            raise ValueError(f"session DB path is not absolute: {raw_path!r}")
-        self._path = Path(resolved)
-        self._path.parent.mkdir(parents=True, exist_ok=True)
+        if db_path is not None and os.fspath(db_path) == ":memory:":
+            # Honour SQLite's in-memory sentinel verbatim. Running it through
+            # ``os.path.realpath`` below would resolve it to ``<cwd>/:memory:``
+            # and ``sqlite3.connect`` would then create a stray physical file
+            # named ``:memory:`` instead of an in-memory database.
+            self._path = Path(":memory:")
+            connect_target = ":memory:"
+        else:
+            raw_path = (Path(db_path) if db_path
+                        else default_db_path(project_root))
+            # Canonicalize with ``os.path.realpath`` (pure normalization, not
+            # the ``Path.resolve`` filesystem-access sink) and confirm the
+            # result is an absolute, ``..``-free path before it reaches
+            # ``mkdir`` / ``sqlite3.connect``. The ``startswith`` check is the
+            # CodeQL path-injection barrier on the exact string handed to
+            # those sinks.
+            resolved = os.path.realpath(os.fspath(raw_path))
+            if not resolved.startswith(os.sep):
+                raise ValueError(
+                    f"session DB path is not absolute: {raw_path!r}")
+            self._path = Path(resolved)
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            connect_target = str(self._path)
         self._lock = threading.Lock()
-        self._conn = sqlite3.connect(str(self._path), check_same_thread=False)
+        self._conn = sqlite3.connect(connect_target, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
