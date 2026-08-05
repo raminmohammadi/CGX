@@ -1,0 +1,42 @@
+# Keep the build context small + reproducible. The SPA is built inside the
+# image (stage 1), so node_modules and any local static build are excluded;
+# virtualenvs, caches, and local data never belong in the image.
+
+.git
+.gitignore
+*.md
+!README.md
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# Frontend -- rebuilt in-image; ship only sources.
+frontend/node_modules/
+frontend/*.tsbuildinfo
+src/cgx/webui/static/
+
+# Tests, notebooks, docs, editor + local state.
+tests/
+notebooks/
+docs/
+site/
+wiki/
+extension/
+evals/
+.cgx/
+*.db
+*.sqlite*
+.pytest_cgx_config/
+.idea/
+.vscode/
+temp.py

@@ -1,0 +1,25 @@
+# Prometheus config for the CGX docker-compose stack.
+#
+# Scrapes the CGX web server's Prometheus text endpoint (/api/metrics -- no
+# client library required) and loads the CGX SLO recording + alerting rules.
+# Liveness/readiness are probed by the orchestrator at /healthz and /readyz;
+# readiness is also mirrored as the ``cgx_ready`` gauge used by the rules.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - /etc/prometheus/rules/cgx-slo-rules.yml
+
+scrape_configs:
+  - job_name: cgx
+    metrics_path: /api/metrics
+    static_configs:
+      - targets: ["cgx:8765"]
+        labels:
+          service: cgx
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

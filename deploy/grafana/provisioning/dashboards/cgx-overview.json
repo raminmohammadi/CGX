@@ -1,0 +1,70 @@
+{
+  "title": "CGX Overview",
+  "uid": "cgx-overview",
+  "tags": ["cgx"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "HTTP request rate (5m)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        { "expr": "cgx:http_requests:rate5m", "legendFormat": "requests/s" }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "HTTP 5xx error ratio (5m)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "percentunit" }, "overrides": [] },
+      "targets": [
+        { "expr": "cgx:http_error_ratio:rate5m", "legendFormat": "error ratio" }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "HTTP p95 latency by route (ms)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] },
+      "targets": [
+        { "expr": "cgx:http_latency_ms:p95_5m", "legendFormat": "{{route}}" }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "LLM p95 latency by model (ms)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] },
+      "targets": [
+        { "expr": "cgx:llm_latency_ms:p95_5m", "legendFormat": "{{model}}" }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "LLM cost (USD/hr) by provider/model",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "fieldConfig": { "defaults": { "unit": "currencyUSD" }, "overrides": [] },
+      "targets": [
+        { "expr": "cgx:llm_cost_usd:rate1h", "legendFormat": "{{provider}}/{{model}}" }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "AIOps monitor alerts (rate 15m)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "targets": [
+        { "expr": "sum by (severity) (rate(cgx_monitor_alerts_total[15m]))", "legendFormat": "{{severity}}" }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+# Load any dashboard JSON dropped into the dashboards folder on startup.
+apiVersion: 1
+
+providers:
+  - name: CGX
+    orgId: 1
+    folder: CGX
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/provisioning/dashboards
+      foldersFromFilesStructure: false
