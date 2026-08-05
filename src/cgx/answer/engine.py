@@ -2486,8 +2486,11 @@ def generate_project_skeleton(paths: List[str], provider: Any, goal: str) -> str
         return ""
     system = (
         "You are an API architect. Generate a complete Project Skeleton for the given files.\n"
-        "Return a unified string containing the folder structure and ALL file signatures "
-        "(classes, function names, type hints, docstrings, AND module-level variables/constants like FastAPI 'app' or configuration objects). "
+        "Output a single unified Python script containing the signatures for ALL the given files. "
+        "Use comments like `# --- src/config.py ---` to separate files.\n"
+        "Include classes, function names, type hints, docstrings, AND module-level variables/constants "
+        "(like FastAPI 'app' or configuration instances like 'settings = Config()').\n"
+        "IMPORTANT: We use Pydantic V2. `BaseSettings` MUST be imported from `pydantic_settings`, NOT `pydantic`.\n"
         "Use 'pass' for all bodies. Do NOT write implementation logic. Return ONLY the skeleton in a python code block."
     )
     user_msg = f"Project Goal:\n{goal}\n\nManifest Paths:\n" + "\n".join(f"- {p}" for p in paths)
@@ -3321,6 +3324,7 @@ _SINGLE_FILE_SYSTEM = (
     "- Use imports consistent with what already exists in the project.\n"
     "- ONLY import local modules/components if they are explicitly listed in the PROJECT MANIFEST. You are FORBIDDEN from importing ANY local file or component that is not in the PROJECT MANIFEST.\n"
     "- You MUST strictly adhere to the PROJECT CONTRACTS and Project Skeleton. ONLY use symbols, functions, classes, and variables that are explicitly defined there. Do NOT hallucinate undefined variables (e.g. app, API_BASE) if they are not exported by the skeleton.\n"
+    "- You MUST IMPLEMENT every symbol, function, and variable defined for this file in the Project Skeleton. If the skeleton says your file exports 'settings', you MUST define 'settings' in your file. Do NOT omit them!\n"
     "- Assume the project root is the Python path. All imports must be absolute starting from the root directories: src., backend., or tests.. Never use 'import main', use 'from backend.main import router' (or whatever is explicitly in the skeleton).\n"
     "- Pay close attention to relative import paths (e.g., `./` vs `../`).\n"
     "- Do not repeat or regenerate any already-existing file.\n"
@@ -3331,6 +3335,7 @@ _SINGLE_FILE_SYSTEM = (
     "file, return {\"content\": \"\"} instead.\n"
     "- Satisfy the file's stated purpose exactly.\n"
     "Python import discipline (applies to every .py file in this project):\n"
+    "- We use Pydantic V2. `BaseSettings` MUST be imported from `pydantic_settings`, NOT `pydantic`.\n"
     "- src/ is a sys.path ROOT, NOT a package. There is no src/__init__.py.\n"
     "- Inside files under src/, import sibling modules by their flat name. "
     "RIGHT: `from chat_manager import ChatManager`. "
