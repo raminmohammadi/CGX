@@ -44,7 +44,8 @@ your machine unless you explicitly opt into a cloud model.
 - [Highlights](#highlights) · [Install](#install) · [Quick start](#quick-start)
 - [How it works](#how-it-works) · [Session-based Agent](#session-based-agent-agent) · [Self-testing code generation](#self-testing-code-generation)
 - [Tuning retrieval](#tuning-hybrid-retrieval) · [Incremental indexing](#incremental-indexing) · [Hardware picker](#hardware-aware-model-picker)
-- [Privacy & data flow](#privacy--data-flow) · [Architecture](#architecture) · [Tests](#tests)
+- [Privacy & data flow](#privacy--data-flow) · [Architecture](#architecture)
+- [MLOps & production](#mlops--production) · [Tests](#tests)
 
 ## Highlights
 
@@ -128,6 +129,13 @@ your machine unless you explicitly opt into a cloud model.
 - 🖥️ **Terminal observability.** All operations emit structured
   `[INFO]`/`[WARNING]` log lines to stdout from startup
   (`setup_logging(INFO)` in `launch.py`).
+- 📊 **Production MLOps layer.** Prometheus metrics (`/api/metrics`),
+  curated function-call tracing, per-run activity + admin explorers,
+  an offline eval + CI quality gate, AIOps drift/quality/cost alerts, a
+  user-feedback flywheel, per-owner cost/quota budgets, PII/retention
+  governance, `/healthz` + `/readyz` probes, and a container / Compose /
+  Helm deployment path -- all local-first and zero-config. See
+  [docs/mlops.md](docs/mlops.md).
 - ⚡ **Parallel two-view execution.** FAISS index building
   (`run_index_auto`) and semantic retrieval (`HybridRetriever.search`)
   both run the intent and impl views concurrently via
@@ -743,6 +751,34 @@ See [`extension/README.md`](extension/README.md) for the full setup.
 ## Architecture
 
 See [`docs/architecture.md`](docs/architecture.md) for a deeper dive.
+
+---
+
+## MLOps & production
+
+Beyond the request pipeline, CGX ships a full MLOps layer for running the
+service in production -- observability, evaluation, monitoring, governance,
+and deployment -- built with the same local-first, stdlib-first, zero-config
+philosophy as the rest of the tool. Every store is SQLite (WAL,
+`$CGX_CONFIG_DIR`-aware), metrics are collected in-process, and every
+recorder is best-effort so an observability failure can never break a request.
+
+| Area | What it gives you |
+|------|-------------------|
+| **Observability** | In-process Prometheus metrics at `GET /api/metrics` (RED-style LLM latency/cost/token series) + a curated `@traced` function-call tracer (`CGX_TRACE`) with secret redaction. |
+| **User activity & admin** | A per-run activity store (grounding + token/cost/latency) and a read-only admin explorer that stitches logs, metrics, alerts and feedback into one redacted view. |
+| **Evaluation** | An offline retrieval + codegen harness over golden sets under `evals/`, wired into CI as a quality gate (`python -m cgx.eval`). |
+| **Lineage** | A prompt/model registry + per-run `run_id` join key + index lineage so any record joins back to exactly what produced it. |
+| **AIOps monitoring** | Groundedness / retrieval-drift / cost-anomaly / repair-health checks that persist `Alert` records (`CGX_MON_*`), surfaced at `GET /api/monitor/alerts`. |
+| **Feedback flywheel** | Thumbs up/down + comments that export down-votes into eval candidates and unify with cross-session lessons. |
+| **Cost & quota** | Truthful token/cost accounting (`CGX_MODEL_PRICING`) plus per-owner day budgets with soft-warn / hard-stop (`CGX_BUDGET_*`). |
+| **Reliability** | `/healthz` (liveness) + `/readyz` (readiness) probes and Prometheus SLO rules. |
+| **Guardrails** | Prompt-injection heuristics (direct + indirect), secret-in-output / path-escape checks, and an `CGX_LLM_DISABLED` kill-switch. |
+| **Data governance** | Configurable retention/TTL, right-to-erasure, and a PII scan/scrub pass beyond credential redaction (`/api/govdata/*`). |
+| **Packaging** | Multi-stage Docker image, a Compose stack (CGX + Prometheus + Grafana), and a Helm chart under `deploy/`. |
+
+Full operator guide: [`docs/mlops.md`](docs/mlops.md). Deployment guide:
+[`deploy/README.md`](deploy/README.md).
 
 ---
 
