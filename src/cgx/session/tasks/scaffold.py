@@ -17,6 +17,7 @@ disk-apply path without special casing greenfield.
 from __future__ import annotations
 
 import logging
+import sqlite3
 import os
 import re
 import time
@@ -2054,6 +2055,12 @@ def _checkpoint_progress(deps: ExecutorDeps, artifact: Artifact) -> None:
         return
     try:
         store.save_artifact(artifact)
+    except sqlite3.IntegrityError:
+        # Occurs if the user deletes the session from the UI while the background
+        # task is still running (FOREIGN KEY constraint on session_id fails).
+        logger.warning(
+            "SCAFFOLD: checkpoint skipped (session %s likely deleted)",
+            artifact.session_id)
     except Exception:  # pragma: no cover - defensive: checkpoint is best-effort
         logger.exception("SCAFFOLD: checkpoint save_artifact failed")
 
