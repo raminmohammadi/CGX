@@ -23,7 +23,7 @@ from cgx.retrieval.orchestrator import (
 from networkx.readwrite import json_graph
 import networkx as nx  # type: ignore
 
-from cgx.trace import traced
+from cgx.trace import traced, emit_trace
 
 logger = logging.getLogger(__name__)
 
@@ -2421,6 +2421,7 @@ _MANIFEST_SYSTEM = (
     "{\n"
     '  "plan_md": "2-4 sentence architecture overview",\n'
     '  "contracts": {\n'
+    '    "project_skeleton": "def login_user(token: str) -> bool: pass",\n'
     '    "endpoints": [{"method": "POST", "path": "/api/x",\n'
     '      "request": {"a": "number"}, "response": {"result": "number"},\n'
     '      "description": "one-line purpose"}],\n'
@@ -2443,7 +2444,11 @@ _MANIFEST_SYSTEM = (
     "Rules:\n"
     "- Relative POSIX paths only. No top-level project-name prefix "
     "(wrong: calculator/src/App.jsx, right: src/App.jsx).\n"
-    "- Group files by layer: core logic, UI, config/packaging, tests.\n"
+    "- Group files strictly into the following layers in order:\n"
+    "  1. Layer 1 (No dependencies): Models, Configs, Utils (e.g., src/models.py, backend/config.py).\n"
+    "  2. Layer 2 (Depends on L1): Core logic, Auth (e.g., src/core.py, src/auth.py).\n"
+    "  3. Layer 3 (Depends on L1 & L2): API Routes, Main App (e.g., backend/main.py).\n"
+    "  4. Layer 4 (Depends on everything): Tests (tests/test_*.py).\n"
     "- Test files REQUIRED under tests/.\n"
     "- Optional per file: \"depends_on\" lists sibling manifest paths this "
     "file imports/needs so files generate dependency-first. Every entry "
@@ -2465,10 +2470,7 @@ _MANIFEST_SYSTEM = (
     "across the boundary.\n"
     "- contracts (optional, but STRONGLY preferred for any multi-file or "
     "client/server project): declare the shared interfaces every file must "
-    "agree on -- HTTP endpoints (method/path/request/response), data schemas "
-    "(name + fields), shared function signatures (name/signature/module) and "
-    "shared constants. Files then implement these EXACTLY instead of "
-    "re-inventing endpoint paths, field names, or signatures per file.\n"
+    "agree on. MUST include a 'project_skeleton' string containing the folder structure and signatures of all files (classes, function names, type hints, docstrings) with 'pass' in the bodies.\n"
     "- 3 to 15 files total. Prefer completeness over brevity.\n"
     "- Canonical top-level dirs: src/, backend/, tests/, public/, docs/.\n"
     "- A frontend manifest uses Vite and MUST list index.html at the project "
@@ -2478,6 +2480,28 @@ _MANIFEST_SYSTEM = (
 
 
 @traced("llm")
+def generate_project_skeleton(paths: List[str], provider: Any, goal: str) -> str:
+    """Generate a code skeleton for all files before scaffolding begins."""
+    if not provider:
+        return ""
+    system = (
+        "You are an API architect. Generate a complete Project Skeleton for the given files.\n"
+        "Return a unified string containing the folder structure and ALL file signatures "
+        "(classes, function names, type hints, docstrings, AND module-level variables/constants like FastAPI 'app' or configuration objects). "
+        "Use 'pass' for all bodies. Do NOT write implementation logic. Return ONLY the skeleton in a python code block."
+    )
+    user_msg = f"Project Goal:\n{goal}\n\nManifest Paths:\n" + "\n".join(f"- {p}" for p in paths)
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user_msg},
+    ]
+    resp = provider.chat(messages=messages, max_tokens=4000, temperature=0.0)
+    text = (resp or {}).get("content", "") if isinstance(resp, dict) else ""
+    skeleton = _first_fenced_block_body(text) or text
+    emit_trace("project_skeleton", skeleton=skeleton)
+    return skeleton
+
+
 def plan_scaffold_manifest(
     idea: str,
     provider: Any,
@@ -2862,6 +2886,10 @@ def _render_contracts_for_prompt(contracts: Any) -> str:
                          + (f" = {val!r}" if val is not None else ""))
         if lines:
             sections.append("Shared constants:\n" + "\n".join(lines))
+
+    skeleton = contracts.get("project_skeleton")
+    if isinstance(skeleton, str) and skeleton.strip():
+        sections.append("Project Skeleton:\n" + skeleton.strip())
 
     if not sections:
         return ""
@@ -3292,6 +3320,8 @@ _SINGLE_FILE_SYSTEM = (
     "- If you use standard libraries or external packages (e.g., sqlite3, os, React), you MUST explicitly import them at the top of the file. Do not leave undefined names.\n"
     "- Use imports consistent with what already exists in the project.\n"
     "- ONLY import local modules/components if they are explicitly listed in the PROJECT MANIFEST. You are FORBIDDEN from importing ANY local file or component that is not in the PROJECT MANIFEST.\n"
+    "- You MUST strictly adhere to the PROJECT CONTRACTS and Project Skeleton. ONLY use symbols, functions, classes, and variables that are explicitly defined there. Do NOT hallucinate undefined variables (e.g. app, API_BASE) if they are not exported by the skeleton.\n"
+    "- Assume the project root is the Python path. All imports must be absolute starting from the root directories: src., backend., or tests.. Never use 'import main', use 'from backend.main import router' (or whatever is explicitly in the skeleton).\n"
     "- Pay close attention to relative import paths (e.g., `./` vs `../`).\n"
     "- Do not repeat or regenerate any already-existing file.\n"
     "- The content MUST be functionally different from every file in "
@@ -3758,6 +3788,8 @@ def generate_single_scaffold_file(
             "framework or language than the one declared for this project.\n\n"
         )
         system = _SINGLE_FILE_SYSTEM + header + skill_fragment
+    
+    emit_trace("scaffold_rules", rules=system)
 
     # Defense-in-depth: hard-pin framework conventions by file extension so
     # the model cannot cross-contaminate frameworks (Vue SFC under .jsx,
@@ -4108,9 +4140,11 @@ def generate_single_scaffold_file(
             else:
                 first = violations[0]
                 syntax_ok = False
+                avail = ", ".join(first.get("available") or []) or "(nothing importable)"
                 syntax_error = (
-                    "imports undefined first-party symbol(s) "
-                    f"{first['missing']} from module '{first['module']}'")
+                    f"imports undefined first-party symbol(s) "
+                    f"{first['missing']} from module '{first['module']}'. "
+                    f"Available symbols in '{first['module']}' are: [{avail}]")
                 content = ""
 
     # Undefined-name gate: a file can parse cleanly, import only modules

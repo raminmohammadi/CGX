@@ -45,6 +45,7 @@ from cgx.session.tasks.base import (
     register_executor,
     session_skills,
 )
+from cgx.trace import emit_trace
 
 logger = logging.getLogger(__name__)
 
@@ -1716,6 +1717,7 @@ def _generate_one(
             contracts=contracts,
             manifest_paths=manifest_paths,
         )
+        emit_trace("scaffold_result", path=path, result=result)
     except Exception as exc:
         logger.exception(
             "SCAFFOLD: generate_single_scaffold_file crashed for %s", path)

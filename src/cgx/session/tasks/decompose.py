@@ -100,6 +100,22 @@ def run_decompose(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     if contract_error:
         return ExecutorResult(failure=contract_error)
 
+    # Mandatory skeleton pass (P0b): generate the full project skeleton
+    # before SCAFFOLD starts.
+    from cgx.answer.engine import generate_project_skeleton
+    manifest_paths = []
+    for lay in layers:
+        if isinstance(lay, dict):
+            for f in (lay.get("files") or []):
+                if isinstance(f, dict) and f.get("path"):
+                    manifest_paths.append(str(f["path"]))
+                    
+    skeleton = generate_project_skeleton(manifest_paths, deps.provider, composed_goal)
+    if not isinstance(contracts, dict):
+        contracts = {}
+    if skeleton:
+        contracts["project_skeleton"] = skeleton
+
     artifact = Artifact.new(
         session_id=task.session_id,
         produced_by_task_id=task.task_id,
@@ -659,20 +675,41 @@ def _validate_manifest_coherence(
 
 def _order_manifest_layers(
         layers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Topologically sort files *within* each layer by intra-layer
-    ``depends_on`` hints so a file is generated after the siblings it
-    imports. Declared order is preserved for independent files (stable);
-    layer order is left untouched -- cross-layer dependencies are assumed
-    satisfied by the planner's layering.
+    """Topologically sort files by hard-coding the pipeline into 4 strict layers
+    (Models -> Core -> API -> Tests) and sorting within each layer.
     """
     out: List[Dict[str, Any]] = []
+    all_files: List[Dict[str, Any]] = []
+    
     for lay in layers:
-        if not isinstance(lay, dict):
-            out.append(lay)
-            continue
-        files = [f for f in (lay.get("files") or [])
-                 if isinstance(f, dict) and f.get("path")]
-        out.append({**lay, "files": _toposort_files(files)})
+        if isinstance(lay, dict):
+            for f in (lay.get("files") or []):
+                if isinstance(f, dict) and f.get("path"):
+                    all_files.append(f)
+                    
+    layer1, layer2, layer3, layer4 = [], [], [], []
+    for f in all_files:
+        path = str(f.get("path", "")).lower()
+        if "test" in path:
+            layer4.append(f)
+        elif any(kw in path for kw in ["model", "config", "util", "schema"]):
+            layer1.append(f)
+        elif any(kw in path for kw in ["main", "app", "route", "api", "server"]):
+            layer3.append(f)
+        else:
+            layer2.append(f)
+            
+    buckets = [
+        {"name": "models_configs_utils", "files": layer1},
+        {"name": "core_logic_auth", "files": layer2},
+        {"name": "api_routes_main", "files": layer3},
+        {"name": "tests", "files": layer4},
+    ]
+    
+    for lay in buckets:
+        if lay["files"]:
+            out.append({**lay, "files": _toposort_files(lay["files"])})
+            
     return out
 
 

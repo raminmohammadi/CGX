@@ -1077,6 +1077,12 @@ it doesn't (HTTP middleware, CLI, retrieval / codegen called
 outside a session), records fall through to a rotating fallback
 logger at `~/.cgx/cgx-trace.log` (2 MiB, 3 backups).
 
+When tracing is enabled, the agent also emits detailed functional payloads:
+* **LLM Calls:** Full `prompt_full` and `response_full` payloads bypass the standard 240-character preview truncation.
+* **Scaffold Results:** The raw file generation output (including syntax validation results) is emitted immediately after a file is generated.
+* **Project Skeleton:** A snapshot of the exact interface skeleton designed by the API Architect.
+* **Generation Rules:** The precise constraints (`_SINGLE_FILE_SYSTEM`) applied to the single-file generator before it authors a file.
+
 Toggle precedence:
 
 1. `$CGX_TRACE` env var (`1`/`true`/`yes`/`on` pins ON;

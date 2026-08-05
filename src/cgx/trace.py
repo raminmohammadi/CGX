@@ -319,6 +319,8 @@ def emit_llm_call(
         "response_chars": len(resp_text),
         "prompt_preview": preview_text(prompt, _LLM_PREVIEW_CAP),
         "response_preview": preview_text(resp_text, _LLM_PREVIEW_CAP),
+        "prompt_full": prompt,
+        "response_full": resp_text,
         "latency_ms": round(float(latency_ms), 2),
         "streamed": bool(streamed),
     }
