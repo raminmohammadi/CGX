@@ -2583,8 +2583,9 @@ def _js_import_coherence_failures(
                 "file": path,
                 "error": (
                     f"relative script import(s) {specs} do not resolve to a "
-                    "generated module or a file on disk; import only existing "
-                    "siblings or author the referenced module"),
+                    "generated module or a file on disk; YOU MUST REMOVE THIS IMPORT. "
+                    "Do NOT invent new components that are not in the PROJECT MANIFEST. "
+                    "Regenerate the file without these imports."),
             })
     return failures
 
