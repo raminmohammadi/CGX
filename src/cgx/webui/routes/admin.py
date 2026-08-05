@@ -37,7 +37,8 @@ def _log_path(project_root: Optional[str]) -> Path:
         try:
             candidate.relative_to(base)
         except ValueError:
-            logger.warning("admin log path rejected outside base: %s", project_root)
+            safe_project_root = project_root.replace("\r", "\\r").replace("\n", "\\n")
+            logger.warning("admin log path rejected outside base: %s", safe_project_root)
             return fallback_trace_log_path()
         return candidate / ".cgx" / "agent.log"
     return fallback_trace_log_path()
