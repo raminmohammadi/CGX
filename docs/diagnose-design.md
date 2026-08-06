@@ -54,16 +54,30 @@ existing `classify.py` plumbing (no new parsing):
 class FailureContext:
     gate: str                 # "verify" | "smoke" | "api_check" | "runtime"
     classification: str       # classify.py token (may be "unknown")
-    failure_signature: str    # classify.failure_signature(content)
-    failure_text: str         # classify._failure_text(content), bounded
-    traceback_files: tuple[str, ...]   # classify.traceback_source_files(content)
+    failure_signature: str    # echoes the report's cached signature,
+                              # else classify.failure_signature(content)
+    failure_text: str         # gate-normalized failure blob, bounded to
+                              # FAILURE_TEXT_LIMIT (4000 chars)
+    traceback_files: tuple[str, ...]   # classify.traceback_source_files(text)
     installed_packages: tuple[str, ...]  # from BUILD_REPORT.installed_packages
     goal: str                 # session goal / requirements summary
     manifest_files: tuple[str, ...]     # current SCAFFOLD manifest paths
 ```
 
-`FailureContext` lives in a new `src/cgx/session/repair/context.py` and is
-pure (no I/O) so it is trivially testable and traceable.
+`FailureContext` lives in `src/cgx/session/repair/context.py` and is pure
+(no I/O) so it is trivially testable and traceable. The
+`FailureContext.from_report(gate, content, …)` factory folds each gate:
+
+- `verify` → `classify.classify_verify_report` + `classify.failure_text`
+- `runtime` → `classify.classify_runtime_report` + `classify.runtime_failure_text`
+- `smoke` / `api_check` → no dedicated classifier, so `classification`
+  defaults to `"unknown"` (a caller with a sharper verdict passes
+  `classification=`), and `failure_text` is rendered locally from the
+  failing modules' / references' stderr tails.
+
+`traceback_files` reuses `classify.traceback_source_files` over the
+normalized blob so every gate localizes to `.py` files with no second
+parser; `to_dict()` renders the tuple fields as lists for tracing.
 
 ## 5. `DIAGNOSIS` artifact schema
 

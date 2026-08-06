@@ -8655,6 +8655,152 @@ def test_traceback_source_files_empty_without_frames():
         {"stdout": "E   assert 1 == 3", "stderr": ""}) == ()
 
 
+# --------------------- FailureContext normalization (D1) -------------------
+
+def test_failure_context_verify_normalizes_and_reuses_signature():
+    """A VERIFY_REPORT folds into a FailureContext, reusing its cached
+    ``failure_signature`` and localizing the traceback files."""
+    from cgx.session.repair.context import FailureContext
+    content = {
+        "outcome": "assertions_failed",
+        "returncode": 1,
+        "stdout": (
+            "tests/test_util.py:5: in test_scale\n"
+            "    assert scale(2) == 4\n"
+            "src/util.py:3: in scale\n"
+            "    return x * 3\n"
+            "E   AssertionError: assert 6 == 4\n"
+        ),
+        "stderr": "",
+        "failure_signature": "cached-verify-sig",
+    }
+    fc = FailureContext.from_report(
+        "verify", content, goal="a calculator",
+        manifest_files=["src/util.py"], installed_packages=["pytest"])
+    assert fc.gate == "verify"
+    assert fc.classification == "assertion_drift"
+    # The precomputed signature is trusted, not recomputed.
+    assert fc.failure_signature == "cached-verify-sig"
+    assert "AssertionError" in fc.failure_text
+    assert fc.traceback_files == ("tests/test_util.py", "src/util.py")
+    assert fc.installed_packages == ("pytest",)
+    assert fc.manifest_files == ("src/util.py",)
+    assert fc.goal == "a calculator"
+
+
+def test_failure_context_computes_signature_when_absent():
+    """No cached signature -> FailureContext recomputes it via classify."""
+    from cgx.session.repair.classify import failure_signature
+    from cgx.session.repair.context import FailureContext
+    content = {"outcome": "assertions_failed", "returncode": 1,
+               "stdout": "E   AssertionError: 1 == 2"}
+    fc = FailureContext.from_report("verify", content)
+    assert fc.failure_signature == failure_signature(content)
+
+
+def test_failure_context_runtime_uses_runtime_text_and_frames():
+    """A RUNTIME_REPORT folds its failing probe stderr tails into one blob
+    and localizes the boot file from the captured traceback frame."""
+    from cgx.session.repair.classify import classify_runtime_report
+    from cgx.session.repair.context import FailureContext
+    content = {
+        "outcome": "failed",
+        "probes": [
+            {"file": "backend/app.py", "kind": "import_error", "ok": False,
+             "stderr_tail": (
+                 "Traceback (most recent call last):\n"
+                 '  File "backend/app.py", line 10, in <module>\n'
+                 "    db.init_app(app)\n"
+                 "NameError: name 'db' is not defined")},
+            {"file": "backend/ok.py", "kind": "import", "ok": True,
+             "stderr_tail": ""},
+        ],
+        "failed_entries": ["backend/app.py"],
+        "failure_signature": "runtime_boot|backend/app.py",
+    }
+    fc = FailureContext.from_report("runtime", content)
+    assert fc.gate == "runtime"
+    assert fc.classification == classify_runtime_report(content)
+    assert "NameError: name 'db' is not defined" in fc.failure_text
+    assert "backend/ok.py" not in fc.failure_text
+    assert fc.traceback_files == ("backend/app.py",)
+
+
+def test_failure_context_smoke_concatenates_failing_modules():
+    """SMOKE has no classifier: it maps to ``unknown`` and its blob is the
+    failing modules' stderr tails plus a failing build smoke."""
+    from cgx.session.repair.context import FailureContext
+    content = {
+        "outcome": "failed",
+        "modules": [
+            {"module": "werkzeug", "ok": False,
+             "stderr_tail": "ImportError: cannot import name 'url_quote'"},
+            {"module": "flask", "ok": True, "stderr_tail": ""},
+        ],
+        "build_smoke": {"label": "vite build", "ok": False,
+                        "stderr_tail": "[UNRESOLVED_ENTRY] index.html"},
+        "failure_signature": "smoke_import|werkzeug",
+    }
+    fc = FailureContext.from_report("smoke", content)
+    assert fc.gate == "smoke"
+    assert fc.classification == "unknown"
+    assert "url_quote" in fc.failure_text
+    assert "vite build" in fc.failure_text
+    assert "flask" not in fc.failure_text
+    assert fc.failure_signature == "smoke_import|werkzeug"
+
+
+def test_failure_context_api_check_renders_failed_references():
+    """API_CHECK folds its failed references into ``module.name: error`` lines
+    and appends any probe_error."""
+    from cgx.session.repair.context import FailureContext
+    content = {
+        "outcome": "failed",
+        "failed_references": [
+            {"module": "werkzeug.urls", "name": "url_quote",
+             "error": "ImportError: cannot import name 'url_quote'"},
+        ],
+        "probe_error": "probe crashed: exit 1",
+        "failure_signature": "api_check|werkzeug.urls.url_quote",
+    }
+    fc = FailureContext.from_report("api_check", content)
+    assert fc.gate == "api_check"
+    assert fc.classification == "unknown"
+    assert "werkzeug.urls.url_quote: ImportError" in fc.failure_text
+    assert "probe crashed: exit 1" in fc.failure_text
+
+
+def test_failure_context_explicit_classification_overrides_gate_default():
+    """A caller-supplied classification wins over the derived token."""
+    from cgx.session.repair.context import FailureContext
+    fc = FailureContext.from_report(
+        "smoke", {"outcome": "failed", "modules": []},
+        classification="smoke_import_failure")
+    assert fc.classification == "smoke_import_failure"
+
+
+def test_failure_context_truncates_failure_text():
+    """A pathological multi-thousand-line dump is bounded for small models."""
+    from cgx.session.repair.context import FAILURE_TEXT_LIMIT, FailureContext
+    huge = "E   AssertionError: boom\n" + ("x" * (FAILURE_TEXT_LIMIT * 2))
+    fc = FailureContext.from_report(
+        "verify", {"outcome": "assertions_failed", "stdout": huge})
+    assert len(fc.failure_text) == FAILURE_TEXT_LIMIT
+
+
+def test_failure_context_to_dict_is_json_friendly():
+    """``to_dict`` renders the tuple fields as lists for tracing/persistence."""
+    from cgx.session.repair.context import FailureContext
+    fc = FailureContext.from_report(
+        "verify", {"outcome": "assertions_failed", "stdout": "E   assert 0"},
+        manifest_files=["a.py"], installed_packages=["pytest"])
+    d = fc.to_dict()
+    assert isinstance(d["traceback_files"], list)
+    assert d["manifest_files"] == ["a.py"]
+    assert d["installed_packages"] == ["pytest"]
+    assert d["gate"] == "verify"
+
+
 def test_locate_unittest_pytest_mix_finds_offending_class(tmp_path: Path):
     from cgx.session.repair.locate import locate_unittest_pytest_mix
     rel = "tests/test_app.py"
