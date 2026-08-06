@@ -26,12 +26,14 @@ from cgx.session.models import (
 )
 from cgx.session.scaffold_validate import (missing_stack_entry_files,
                                            stack_entry_description)
+from cgx.session.scope import estimate_scope
 from cgx.session.tasks.base import (
     ExecutorDeps,
     ExecutorResult,
     register_executor,
     session_skills,
 )
+from cgx.trace import emit_trace
 
 logger = logging.getLogger(__name__)
 
@@ -58,10 +60,18 @@ def run_decompose(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     # Lazy import: the answer engine drags retrieval + prompt builders.
     from cgx.answer.engine import plan_scaffold_manifest
 
+    # Deterministic scope calibration (P1.1): derive a complexity tier and
+    # a "minimal viable stack" ceiling from the composed goal so the planner
+    # cannot over-scope a simple objective (a calculator dragging in a DB,
+    # migrations, auth, a frontend framework, and Selenium E2E tests).
+    scope = estimate_scope(composed_goal)
+    emit_trace("scope_estimate", stage="decompose", **scope.as_dict())
+
     skills = session_skills(task, deps)
     try:
         result = plan_scaffold_manifest(
-            composed_goal, deps.provider, goal=composed_goal, skills=skills)
+            composed_goal, deps.provider, goal=composed_goal, skills=skills,
+            scope_constraint=scope.constraint)
     except Exception as exc:
         logger.exception("DECOMPOSE: plan_scaffold_manifest crashed")
         return ExecutorResult(
@@ -127,6 +137,8 @@ def run_decompose(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             "plan_md": plan_md,
             "layers": layers,
             "contracts": contracts,
+            "project_complexity": scope.complexity,
+            "scope": scope.as_dict(),
         },
     )
     return ExecutorResult(
@@ -135,6 +147,8 @@ def run_decompose(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             "file_count": _layer_file_count(layers),
             "layer_count": len(layers),
             "contract_count": _contract_entry_count(contracts),
+            "project_complexity": scope.complexity,
+            "scope_max_files": scope.max_files,
         },
         artifact=artifact,
     )

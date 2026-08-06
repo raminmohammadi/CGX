@@ -2471,7 +2471,8 @@ _MANIFEST_SYSTEM = (
     "- contracts (optional, but STRONGLY preferred for any multi-file or "
     "client/server project): declare the shared interfaces every file must "
     "agree on. MUST include a 'project_skeleton' string containing the folder structure and signatures of all files (classes, function names, type hints, docstrings) with 'pass' in the bodies.\n"
-    "- 3 to 15 files total. Prefer completeness over brevity.\n"
+    "- 3 to 15 files total, but any SCOPE CEILING in the request is a hard "
+    "cap -- never exceed it, and prefer the minimal viable stack.\n"
     "- Canonical top-level dirs: src/, backend/, tests/, public/, docs/.\n"
     "- A frontend manifest uses Vite and MUST list index.html at the project "
     "root (not public/index.html) alongside vite.config.js -- Vite resolves its "
@@ -2512,6 +2513,7 @@ def plan_scaffold_manifest(
     goal: Optional[str] = None,
     skills: Optional[List[str]] = None,
     existing_files: Optional[List[str]] = None,
+    scope_constraint: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Return a file manifest for a new project -- paths and descriptions only, no content.
 
@@ -2548,6 +2550,9 @@ def plan_scaffold_manifest(
         parts.append(f"TASK DESCRIPTION:\n{idea_clean}")
     else:
         parts.append(f"PROJECT IDEA:\n{idea_clean}")
+    scope_clean = (scope_constraint or "").strip()
+    if scope_clean:
+        parts.append(scope_clean)
     if existing_files:
         listed = "\n".join(f"- {p}" for p in list(existing_files)[:60])
         parts.append("EXISTING FILES (already planned -- do NOT repeat):\n" + listed)
@@ -2626,6 +2631,8 @@ def plan_scaffold_manifest(
     # surrendering to the empty-layer placeholder.
     if not _layers_have_files(parsed) and goal_clean:
         retry_context = f"PROJECT IDEA:\n{idea_clean[:600]}"
+        if scope_clean:
+            retry_context += "\n\n" + scope_clean
         if existing_files:
             listed = "\n".join(f"- {p}" for p in list(existing_files)[:60])
             retry_context += "\n\nEXISTING FILES (already planned -- do NOT repeat):\n" + listed

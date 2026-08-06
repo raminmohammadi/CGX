@@ -4027,6 +4027,109 @@ def test_decompose_executor_defaults_contracts_to_empty(store, monkeypatch):
     assert result.outputs["contract_count"] == 0
 
 
+# ------------- P1.1: deterministic scope calibration -------------
+
+def test_estimate_scope_trivial_goal_is_tight_and_minimal():
+    """A bare 'calculator' names no heavy feature -> trivial, tight ceiling."""
+    from cgx.session.scope import estimate_scope
+    profile = estimate_scope("build a small calculator")
+    assert profile.complexity == "trivial"
+    assert profile.max_files == 5
+    assert profile.requested_features == ()
+    # The injected constraint fences off the exact over-scoping we saw.
+    assert "SCOPE CEILING" in profile.constraint
+    assert "at most 5 files" in profile.constraint
+    assert "a database, ORM, or migrations" in profile.constraint
+    assert "browser/E2E tests" in profile.constraint
+
+
+def test_estimate_scope_detects_requested_features_and_climbs():
+    """Explicitly-named capabilities raise the tier and are NOT fenced off."""
+    from cgx.session.scope import estimate_scope
+    profile = estimate_scope(
+        "a FastAPI service with a Postgres database, JWT auth and a React UI")
+    assert profile.complexity == "complex"
+    assert profile.max_files == 20
+    assert set(profile.requested_features) == {
+        "api_server", "database", "auth", "frontend"}
+    # Requested categories must not appear in the "do NOT introduce" line.
+    assert "a database, ORM, or migrations" not in profile.constraint
+    assert "authentication or user accounts" not in profile.constraint
+
+
+def test_clarify_records_project_complexity_on_requirements_sheet():
+    """CLARIFY stamps the goal-level complexity tier onto the sheet."""
+    from cgx.session.tasks.clarify_requirements import run_clarify_requirements
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    t = TaskNode.new(session.session_id, TaskKind.CLARIFY_REQUIREMENTS,
+                     "c", inputs={"goal": "build a small calculator"})
+    result = run_clarify_requirements(t, ExecutorDeps())
+    assert result.failure is None
+    assert result.artifact.content["project_complexity"] == "trivial"
+    assert result.artifact.content["scope"]["max_files"] == 5
+    assert result.outputs["project_complexity"] == "trivial"
+
+
+def test_decompose_threads_scope_constraint_into_planner(store, monkeypatch):
+    """DECOMPOSE passes the minimal-stack ceiling into the manifest planner
+    and records the complexity tier on the WORK_PLAN."""
+    from cgx.session.tasks.decompose import run_decompose
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    seen = {}
+
+    def fake_manifest(composed, provider, goal=None, skills=None,
+                      scope_constraint=None, **kwargs):
+        seen["scope_constraint"] = scope_constraint
+        return {"plan_md": "p", "layers": [{"name": "core", "files": [
+            {"path": "calculator.py", "description": "core"},
+            {"path": "tests/test_calculator.py", "description": "tests"}]}]}
+
+    monkeypatch.setattr("cgx.answer.engine.plan_scaffold_manifest",
+                        fake_manifest)
+    t = TaskNode.new(session.session_id, TaskKind.DECOMPOSE, "d",
+                     inputs={"prior_goal": "build a calculator", "answers": {}})
+    result = run_decompose(
+        t, ExecutorDeps(provider=_StubProvider(""), store=store))
+    assert result.failure is None
+    assert seen["scope_constraint"] and "SCOPE CEILING" in seen["scope_constraint"]
+    assert result.artifact.content["project_complexity"] == "trivial"
+    assert result.artifact.content["scope"]["max_files"] == 5
+    assert result.outputs["project_complexity"] == "trivial"
+    assert result.outputs["scope_max_files"] == 5
+
+
+def test_scope_estimate_traced_to_agent_log_when_enabled(tmp_path):
+    """With tracing toggled on, the scope estimate lands as a trace record."""
+    from cgx.session.tasks.clarify_requirements import run_clarify_requirements
+    from cgx.session import agent_log
+    from cgx import trace as trace_mod
+
+    agent_log.reset_for_tests()
+    trace_mod.reset_for_tests()
+    if trace_mod.is_trace_enabled():  # env-pinned: nothing to assert against
+        return
+    trace_mod.set_trace_enabled(True)
+    token = trace_mod.set_trace_context(
+        session_id="ses_scope", task_id="task_scope",
+        project_root=str(tmp_path))
+    try:
+        session = Session.new("g", mode=SessionMode.GREENFIELD)
+        t = TaskNode.new(session.session_id, TaskKind.CLARIFY_REQUIREMENTS,
+                         "c", inputs={"goal": "build a small calculator"})
+        run_clarify_requirements(t, ExecutorDeps())
+    finally:
+        trace_mod.reset_trace_context(token)
+        trace_mod.reset_for_tests()
+        agent_log.reset_for_tests()
+
+    records = _read_agent_log(tmp_path)
+    scope_events = [r for r in records if r.get("event") == "scope_estimate"]
+    assert scope_events, "scope_estimate should be traced when enabled"
+    assert scope_events[0]["stage"] == "clarify"
+    assert scope_events[0]["complexity"] == "trivial"
+
+
 # ------------- P0a: mandatory cross-seam endpoint contracts -------------
 
 def test_is_client_server_manifest_detects_and_abstains():

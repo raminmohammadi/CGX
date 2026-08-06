@@ -29,11 +29,13 @@ from cgx.session.models import (
     TaskKind,
     TaskNode,
 )
+from cgx.session.scope import estimate_scope
 from cgx.session.tasks.base import (
     ExecutorDeps,
     ExecutorResult,
     register_executor,
 )
+from cgx.trace import emit_trace
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +92,12 @@ def run_clarify_requirements(task: TaskNode,
 
     questions = _ask_llm_for_questions(goal, deps) or _FALLBACK_QUESTIONS
 
+    # Deterministic first read of project size (P1.1). This is only the
+    # goal-level estimate; DECOMPOSE recomputes it over the composed goal
+    # (goal + clarify answers) to derive the planner's scope ceiling.
+    scope = estimate_scope(goal)
+    emit_trace("scope_estimate", stage="clarify", **scope.as_dict())
+
     artifact = Artifact.new(
         session_id=task.session_id,
         produced_by_task_id=task.task_id,
@@ -98,12 +106,15 @@ def run_clarify_requirements(task: TaskNode,
             "goal": goal,
             "questions": questions,
             "source": "llm" if questions is not _FALLBACK_QUESTIONS else "fallback",
+            "project_complexity": scope.complexity,
+            "scope": scope.as_dict(),
         },
     )
     return ExecutorResult(
         outputs={
             "requirements_artifact_id": artifact.artifact_id,
             "question_count": len(questions),
+            "project_complexity": scope.complexity,
         },
         artifact=artifact,
     )
