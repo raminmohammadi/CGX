@@ -4255,6 +4255,95 @@ def test_plan_critique_traced_to_agent_log_when_enabled(
     assert events[0]["removed_count"] == 1
 
 
+# ------------- P1.3: coherence surgery as a plan-quality signal -------------
+
+def _cyclic_py_manifest():
+    """Three independent 2-cycles: the gate breaks three back-edges, so the
+    surgery score clears COHERENCE_MUTATION_THRESHOLD. Pure Python (no
+    client/server seam) so the exhausted-budget path reaches WORK_PLAN."""
+    return {"plan_md": "p", "layers": [{"name": "core", "files": [
+        {"path": "a.py", "description": "a", "depends_on": ["b.py"]},
+        {"path": "b.py", "description": "b", "depends_on": ["a.py"]},
+        {"path": "c.py", "description": "c", "depends_on": ["d.py"]},
+        {"path": "d.py", "description": "d", "depends_on": ["c.py"]},
+        {"path": "e.py", "description": "e", "depends_on": ["f.py"]},
+        {"path": "f.py", "description": "f", "depends_on": ["e.py"]}]}]}
+
+
+def test_decompose_reasks_when_coherence_surgery_is_heavy(store, monkeypatch):
+    """A manifest the gate had to rewrite heavily is re-planned once rather
+    than scaffolded, using the existing DECOMPOSE_RETRY_BUDGET path."""
+    result = _run_decompose_with_manifest(
+        store, monkeypatch, _cyclic_py_manifest())
+    assert result.artifact is None
+    assert result.retryable is True
+    assert result.failure and "heavy structural repair" in result.failure
+    assert "dependency cycle" in result.failure
+
+
+def test_decompose_proceeds_after_reask_budget_exhausted(store, monkeypatch):
+    """On the retry (budget spent) the repaired manifest ships -- P1.3 is
+    never worse than today's in-place repair."""
+    from cgx.session.tasks.decompose import run_decompose
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    monkeypatch.setattr("cgx.answer.engine.plan_scaffold_manifest",
+                        lambda *a, **kw: _cyclic_py_manifest())
+    t = TaskNode.new(session.session_id, TaskKind.DECOMPOSE, "d",
+                     inputs={"prior_goal": "g", "answers": {},
+                             "decompose_retry": 1})
+    result = run_decompose(
+        t, ExecutorDeps(provider=_StubProvider(""), store=store))
+    assert result.failure is None
+    assert result.outputs["coherence_surgery"] >= 3
+
+
+def test_decompose_light_surgery_does_not_reask(store, monkeypatch):
+    """A single routine repair stays below the threshold and ships."""
+    result = _run_decompose_with_manifest(store, monkeypatch, {
+        "plan_md": "p", "layers": [{"name": "core", "files": [
+            {"path": "a.py", "description": "a", "depends_on": ["b.py"]},
+            {"path": "b.py", "description": "b", "depends_on": ["a.py"]},
+            {"path": "c.py", "description": "c"}]}]})
+    assert result.failure is None
+    assert result.outputs["coherence_surgery"] == 1
+
+
+def test_plan_coherence_traced_to_agent_log_when_enabled(
+        store, monkeypatch, tmp_path):
+    """With tracing on, the coherence surgery tally lands as a trace record."""
+    from cgx.session.tasks.decompose import run_decompose
+    from cgx.session import agent_log
+    from cgx import trace as trace_mod
+
+    agent_log.reset_for_tests()
+    trace_mod.reset_for_tests()
+    if trace_mod.is_trace_enabled():  # env-pinned: nothing to assert against
+        return
+    monkeypatch.setattr("cgx.answer.engine.plan_scaffold_manifest",
+                        lambda *a, **kw: _cyclic_py_manifest())
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    trace_mod.set_trace_enabled(True)
+    token = trace_mod.set_trace_context(
+        session_id=session.session_id, task_id="task_dec",
+        project_root=str(tmp_path))
+    try:
+        t = TaskNode.new(session.session_id, TaskKind.DECOMPOSE, "d",
+                         inputs={"prior_goal": "g", "answers": {}})
+        run_decompose(t, ExecutorDeps(provider=_StubProvider(""), store=store))
+    finally:
+        trace_mod.reset_trace_context(token)
+        trace_mod.set_trace_enabled(False)
+
+    records = _read_agent_log(tmp_path)
+    events = [r for r in records if r.get("event") == "plan_coherence"]
+    assert events, "plan_coherence should be traced when enabled"
+    assert events[0]["stage"] == "decompose"
+    assert events[0]["broken_cycles"] == 3
+    assert events[0]["surgery_score"] >= 3
+
+
 # ------------- P0a: mandatory cross-seam endpoint contracts -------------
 
 def test_is_client_server_manifest_detects_and_abstains():

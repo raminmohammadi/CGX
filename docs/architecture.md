@@ -707,7 +707,10 @@ Five entry points cover every transition:
   hung in `active` with a dead FAILED leaf and no successor -- asking
   the user to hand-fix AI-generated code is never a valid recovery.
   One recoverable exception: a `DECOMPOSE` whose executor marked the
-  failure `retryable` (an empty or unbuildable manifest) is re-queued
+  failure `retryable` (an empty or unbuildable manifest, or one the
+  deterministic coherence gate had to heavily repair -- **P1.3**,
+  `surgery_score ≥ COHERENCE_MUTATION_THRESHOLD` across relocated
+  entries / cut cross-language edges / broken cycles) is re-queued
   once by `_decompose_retry_actions` with the concrete failure folded
   into its goal as a constraint, bounded by
   `DECOMPOSE_RETRY_BUDGET=1`. Explore-mode sessions keep their

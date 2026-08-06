@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import logging
 import re
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from cgx.session.budget import LoopBudget
 from cgx.session.models import (
     Artifact,
     ArtifactKind,
@@ -101,10 +103,34 @@ def run_decompose(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     # manifest is logically unbuildable, then topologically order files by
     # dependency hints so SCAFFOLD generates dependencies before their
     # consumers.
-    _inject_stack_entry_files(layers)
-    coherence_error = _validate_manifest_coherence(layers)
+    report = CoherenceReport()
+    _inject_stack_entry_files(layers, report)
+    coherence_error = _validate_manifest_coherence(layers, report)
     if coherence_error:
         return ExecutorResult(failure=coherence_error, retryable=True)
+
+    # Coherence surgery as a plan-quality signal (P1.3). The gate above
+    # repairs an incoherent manifest in place, but a plan that needed
+    # *heavy* structural surgery (a misfiled entry point, cross-language
+    # depends_on no import can express, a dependency cycle) is one the
+    # planner got wrong at the source -- scaffolding it drags that churn
+    # downstream. When the surgery score clears the threshold and a
+    # DECOMPOSE_RETRY_BUDGET re-ask is still available, fold the surgery
+    # summary into the goal and re-plan once. On the retry (budget spent)
+    # we proceed with the repaired manifest, so this is never worse than
+    # today's behaviour.
+    emit_trace("plan_coherence", stage="decompose", **report.as_dict())
+    budget = LoopBudget.from_inputs(task.inputs)
+    if (report.surgery_score >= COHERENCE_MUTATION_THRESHOLD
+            and not budget.decompose_retry_exhausted):
+        logger.warning(
+            "DECOMPOSE: coherence gate performed heavy surgery "
+            "(score=%d, %s); re-asking the planner for a coherent manifest",
+            report.surgery_score, report.as_dict())
+        return ExecutorResult(
+            failure=_coherence_reask_constraint(report),
+            retryable=True)
+
     layers = _order_manifest_layers(layers)
 
     # Mandatory endpoint contracts for a cross-language client/server manifest
@@ -160,6 +186,7 @@ def run_decompose(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             "project_complexity": scope.complexity,
             "scope_max_files": scope.max_files,
             "critique_removed": len(critique_removed),
+            "coherence_surgery": report.surgery_score,
         },
         artifact=artifact,
     )
@@ -511,6 +538,75 @@ def _manifest_files(layers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             if isinstance(f, dict) and f.get("path")]
 
 
+# Number of *heavyweight* structural repairs (relocated entry points,
+# cut cross-language edges, broken cycles) above which DECOMPOSE stops
+# trusting its own plan and re-asks the planner once (P1.3). Three was
+# chosen from the calculator run that motivated this work: that manifest
+# tripped exactly one of each defect, so the third repair is the point
+# where "a slip" becomes "an incoherent plan". Kept deliberately high so
+# a single routine repair never burns the DECOMPOSE_RETRY_BUDGET.
+COHERENCE_MUTATION_THRESHOLD = 3
+
+
+@dataclass
+class CoherenceReport:
+    """Tally of the in-place repairs the coherence gate performed.
+
+    Populated by :func:`_inject_stack_entry_files` and
+    :func:`_validate_manifest_coherence` when a report is threaded in, and
+    read back in :func:`run_decompose` as a plan-quality signal. Only the
+    three heavyweight structural defects feed :attr:`surgery_score` (the
+    re-ask trigger); ``injected`` and ``dangling_pruned`` are recorded for
+    observability but are routine and cheap, so they never inflate it.
+    """
+    relocated: List[str] = field(default_factory=list)
+    injected: List[str] = field(default_factory=list)
+    dangling_pruned: List[str] = field(default_factory=list)
+    cross_language_cut: List[str] = field(default_factory=list)
+    broken_cycles: List[str] = field(default_factory=list)
+
+    @property
+    def surgery_score(self) -> int:
+        return (len(self.relocated)
+                + len(self.cross_language_cut)
+                + len(self.broken_cycles))
+
+    def as_dict(self) -> Dict[str, int]:
+        return {
+            "relocated": len(self.relocated),
+            "injected": len(self.injected),
+            "dangling_pruned": len(self.dangling_pruned),
+            "cross_language_cut": len(self.cross_language_cut),
+            "broken_cycles": len(self.broken_cycles),
+            "surgery_score": self.surgery_score,
+        }
+
+
+def _coherence_reask_constraint(report: "CoherenceReport") -> str:
+    """Explain, for the DECOMPOSE re-ask, why the prior plan was rejected.
+
+    Folded into ``prior_goal`` by :func:`_fold_failure_into_goal` so the
+    planner LLM sees the concrete defects (not a bare "try again") and can
+    fix them at the source.
+    """
+    parts: List[str] = []
+    if report.relocated:
+        parts.append("misfiled required entry file(s): "
+                     + ", ".join(report.relocated))
+    if report.cross_language_cut:
+        parts.append("declared cross-language depends_on no import can "
+                     "express on: " + ", ".join(report.cross_language_cut))
+    if report.broken_cycles:
+        parts.append("introduced dependency cycle(s): "
+                     + ", ".join(report.broken_cycles))
+    detail = "; ".join(parts) or "required heavy structural repair"
+    return ("DECOMPOSE: the prior manifest needed heavy structural repair "
+            f"({detail}). Re-plan a coherent manifest -- place entry files "
+            "where the toolchain resolves them, only declare depends_on "
+            "between files of the same language, and avoid dependency "
+            "cycles.")
+
+
 # Source extensions grouped by the runtime that imports them. Only
 # families whose members can import each other are listed: a file's
 # ``depends_on`` is an import hint, so an edge between two families is
@@ -538,7 +634,7 @@ def _lang_family(path: str) -> Optional[str]:
 
 def _repair_cross_language_deps(
         files: List[Dict[str, Any]],
-        layers: List[Dict[str, Any]]) -> None:
+        layers: List[Dict[str, Any]]) -> List[str]:
     """Drop ``depends_on`` edges no import statement could express.
 
     A planner that lays out a React frontend beside a Python backend
@@ -561,7 +657,11 @@ def _repair_cross_language_deps(
     anyway just relocates the hallucination from the import list to the
     test bodies. Non-test files are never dropped -- a mislinked module
     is still buildable, and losing one silently could gut the project.
+
+    Returns the paths whose cross-language edges were cut, so the caller
+    can tally the repair as a plan-quality signal (P1.3).
     """
+    touched: List[str] = []
     doomed: set = set()
     for f in files:
         deps = [str(d) for d in (f.get("depends_on") or [])]
@@ -576,13 +676,14 @@ def _repair_cross_language_deps(
             continue
         kept = [d for d in deps if d not in alien]
         f["depends_on"] = kept
+        touched.append(f["path"])
         logger.warning(
             "DECOMPOSE: dropping cross-language depends_on %s from %r "
             "(%s cannot import them)", alien, f["path"], own)
         if not kept and _is_test_file(f["path"]):
             doomed.add(f["path"])
     if not doomed:
-        return
+        return touched
     logger.warning(
         "DECOMPOSE: dropping unsatisfiable test file(s) %s -- every file "
         "they were planned to cover is in another language",
@@ -597,6 +698,7 @@ def _repair_cross_language_deps(
         surviving = f.get("depends_on")
         if isinstance(surviving, list) and surviving:
             f["depends_on"] = [d for d in surviving if d not in doomed]
+    return touched
 
 
 def _find_dependency_cycle(
@@ -675,7 +777,9 @@ def _relocate_misplaced_stack_entries(
     return moved
 
 
-def _inject_stack_entry_files(layers: List[Dict[str, Any]]) -> List[str]:
+def _inject_stack_entry_files(
+        layers: List[Dict[str, Any]],
+        report: Optional["CoherenceReport"] = None) -> List[str]:
     """Add toolchain-mandated entry files the planner left out.
 
     A manifest that declares ``vite.config.js`` but no root
@@ -685,6 +789,9 @@ def _inject_stack_entry_files(layers: List[Dict[str, Any]]) -> List[str]:
     is re-authored. Appending the entry to the layer that carries its
     trigger turns a guaranteed dead end into a normally-generated file.
     Mutates ``layers`` in place and returns the paths that were added.
+
+    When ``report`` is supplied, relocated and injected entry paths are
+    tallied on it as a plan-quality signal (P1.3).
     """
     files = _manifest_files(layers)
     paths = [f["path"] for f in files]
@@ -693,6 +800,8 @@ def _inject_stack_entry_files(layers: List[Dict[str, Any]]) -> List[str]:
         return []
     moved = _relocate_misplaced_stack_entries(files, missing)
     if moved:
+        if report is not None:
+            report.relocated.extend(moved)
         logger.warning(
             "DECOMPOSE: manifest misfiled required entry file(s) %s; "
             "moving them to where the toolchain resolves them", moved)
@@ -719,6 +828,8 @@ def _inject_stack_entry_files(layers: List[Dict[str, Any]]) -> List[str]:
         target["files"].append(node)
         added.append(entry["path"])
     if added:
+        if report is not None:
+            report.injected.extend(added)
         logger.warning(
             "DECOMPOSE: manifest omitted required entry file(s) %s; "
             "injecting them so the project can build", added)
@@ -726,7 +837,8 @@ def _inject_stack_entry_files(layers: List[Dict[str, Any]]) -> List[str]:
 
 
 def _validate_manifest_coherence(
-        layers: List[Dict[str, Any]]) -> Optional[str]:
+        layers: List[Dict[str, Any]],
+        report: Optional["CoherenceReport"] = None) -> Optional[str]:
     """Deterministic manifest sanity check.
 
     Fails DECOMPOSE early only when the plan is logically unbuildable:
@@ -751,6 +863,8 @@ def _validate_manifest_coherence(
         kept = [d for d in deps if d in path_set]
         if len(kept) != len(deps):
             dropped = [d for d in deps if d not in path_set]
+            if report is not None:
+                report.dangling_pruned.append(f["path"])
             logger.warning(
                 "DECOMPOSE: pruning dangling depends_on %s from %r",
                 dropped, f["path"])
@@ -759,7 +873,9 @@ def _validate_manifest_coherence(
     # Runs after the dangling prune so a phantom path is reported as
     # phantom rather than as a foreign language, and before the cycle
     # search so a dropped node cannot leave a half-lit cycle behind.
-    _repair_cross_language_deps(files, layers)
+    cut = _repair_cross_language_deps(files, layers)
+    if report is not None:
+        report.cross_language_cut.extend(cut)
     files = _manifest_files(layers)
     by_path = {f["path"]: f for f in files}
 
@@ -770,6 +886,8 @@ def _validate_manifest_coherence(
         entry = by_path[src]
         entry["depends_on"] = [d for d in (entry.get("depends_on") or [])
                                if d != dst]
+        if report is not None:
+            report.broken_cycles.append(f"{src} -> {dst}")
         logger.warning(
             "DECOMPOSE: breaking dependency cycle %s by dropping edge "
             "%r -> %r", " -> ".join(cycle), src, dst)
