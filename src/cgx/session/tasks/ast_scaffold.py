@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 import time
 from typing import Any, Dict, List
 
@@ -10,6 +11,34 @@ from cgx.codegen.ast_gluer import ASTAssembler
 from cgx.trace import traced
 
 logger = logging.getLogger(__name__)
+
+# ``generate_project_skeleton`` returns a single unified script that separates
+# per-file sections with a comment marker like ``# --- src/config.py ---``.
+# This matches that marker and captures the path token.
+_SKELETON_MARKER = re.compile(r"^\s*#\s*-{2,}\s*(?P<path>.+?)\s*-{2,}\s*$")
+
+
+def _split_skeleton_by_path(skeleton: str) -> Dict[str, str]:
+    """Split a unified skeleton script into ``{path: code}`` sections.
+
+    ``generate_project_skeleton`` emits one string containing the signatures
+    for every manifest file, delimited by ``# --- <path> ---`` comment
+    markers. The AST fallback needs the section for a single file, so parse
+    the markers back into a per-path map. Lines before the first marker are
+    ignored; a file with no marker simply won't be found (callers degrade to
+    an empty skeleton).
+    """
+    sections: Dict[str, List[str]] = {}
+    current: str = ""
+    for line in skeleton.splitlines():
+        m = _SKELETON_MARKER.match(line)
+        if m:
+            current = m.group("path").strip()
+            sections.setdefault(current, [])
+            continue
+        if current:
+            sections[current].append(line)
+    return {p: "\n".join(lines).strip() for p, lines in sections.items()}
 
 @traced("ast_scaffold.generate_header")
 def _generate_header(path: str, provider: Any, goal: str, context: str) -> str:
@@ -24,7 +53,8 @@ Return ONLY valid Python code containing imports and module-level constants. No 
             {"role": "user", "content": prompt}
         ]
         res = provider.chat(messages=messages, force_json=False)
-        return res.get("content", "")
+        text = res.get("content", "")
+        return text.replace("```python", "").replace("```", "").strip()
     except Exception as e:
         logger.error("Failed to generate AST header for %s: %s", path, e)
         return ""
@@ -81,12 +111,44 @@ def run_ast_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
                         if "path" in f:
                             regen_files.append(f["path"])
                             
-    skeleton = contracts.get("project_skeleton", {})
+    # ``project_skeleton`` is the unified string produced by
+    # ``generate_project_skeleton``; split it into a per-path map. Tolerate a
+    # dict (legacy / future shape) by mapping each value to its "content".
+    raw_skeleton = contracts.get("project_skeleton", "")
+    if isinstance(raw_skeleton, str):
+        skeleton = _split_skeleton_by_path(raw_skeleton)
+    elif isinstance(raw_skeleton, dict):
+        skeleton = {}
+        for p, v in raw_skeleton.items():
+            if isinstance(v, dict):
+                content = v.get("content", "")
+                skeleton[p] = ("\n".join(content)
+                               if isinstance(content, list) else str(content))
+            elif isinstance(v, list):
+                skeleton[p] = "\n".join(str(x) for x in v)
+            else:
+                skeleton[p] = str(v)
+    else:
+        skeleton = {}
 
     diffs = []
     generated = []
     failed = []
     
+    prior_scaffold_id = str(task.inputs.get("prior_scaffold_artifact_id") or "").strip()
+    if prior_scaffold_id and deps.store:
+        prior_scaffold = deps.store.get_artifact(prior_scaffold_id)
+        if prior_scaffold and prior_scaffold.content:
+            prior_generated = prior_scaffold.content.get("generated") or []
+            prior_diffs = prior_scaffold.content.get("diffs") or []
+            regen_set = set(regen_files)
+            for file_entry in prior_generated:
+                if isinstance(file_entry, dict) and file_entry.get("file") not in regen_set:
+                    generated.append(file_entry)
+            for diff_entry in prior_diffs:
+                if isinstance(diff_entry, dict) and diff_entry.get("file") not in regen_set:
+                    diffs.append(diff_entry)
+
     total_files = len(regen_files)
     progress_done = 0
     progress_failed = 0
@@ -122,8 +184,7 @@ def run_ast_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         
         assembler = ASTAssembler(header)
         
-        file_skeleton = skeleton.get(path, {}).get("content", [])
-        skeleton_code = "\n".join(file_skeleton)
+        skeleton_code = skeleton.get(path, "")
         symbols = []
         try:
             import ast
@@ -146,9 +207,20 @@ def run_ast_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         # Unparse the final assembled AST
         try:
             final_content = assembler.unparse()
+            import difflib
+            patch_lines = list(difflib.unified_diff(
+                [],
+                final_content.splitlines(keepends=True),
+                fromfile=f"a/{path}",
+                tofile=f"b/{path}",
+                n=3
+            ))
+            patch = "".join(patch_lines)
+            if not patch:
+                patch = f"--- /dev/null\n+++ b/{path}\n@@ -0,0 +0,0 @@\n"
             diffs.append({
                 "file": path,
-                "patch": f"--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,1 @@\n+# AST Generated" # simplified diff
+                "patch": patch
             })
             generated.append({
                 "file": path,
