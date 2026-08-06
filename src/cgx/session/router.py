@@ -40,6 +40,7 @@ from cgx.session.budget import LoopBudget
 from cgx.session.greenfield_edges import (
     _apply_failed_files_actions,
     _decompose_retry_actions,
+    _diagnose_dispatch_actions,
     _make_budget_ask,
     _repair_install_deps_actions,
     _repair_regenerate_actions,
@@ -52,6 +53,7 @@ from cgx.session.greenfield_edges import (
     _scaffold_skill_regenerate_actions,
     _verify_lesson_actions,
 )
+from cgx.session.repair.classify import DIAGNOSE_CLASSIFICATIONS
 from cgx.session.models import (
     Decision,
     DecisionKind,
@@ -575,7 +577,20 @@ def _verify_to_repair_or_terminal(parent: TaskNode) -> List[TaskNode]:
         new_signature = f"{outcome}|rc={outputs.get('returncode')}"
     if budget.seen(new_signature):
         return []
+    spent = budget.spend_repair(
+        new_signature, failing_count=new_count, passing_count=new_passing)
     verify_artifact_id = parent.produced_artifact_id
+    # A reasoning-class failure (design §8.1) routes to the DIAGNOSE rung
+    # instead of a mechanical REPAIR: the gate emits a ``classification``
+    # token so the pure router gates by membership test alone. Mechanical
+    # tokens keep the fast path straight to REPAIR. The already-spent budget
+    # (same attempt + flap accounting the REPAIR path uses) threads verbatim.
+    classification = str(outputs.get("classification") or "").strip()
+    if classification in DIAGNOSE_CLASSIFICATIONS:
+        return [_diagnose_node(
+            parent, source_key="verify_artifact_id",
+            source_id=verify_artifact_id, classification=classification,
+            budget=spent, mode=mode)]
     return [TaskNode.new(
         session_id=parent.session_id,
         kind=TaskKind.REPAIR,
@@ -589,11 +604,48 @@ def _verify_to_repair_or_terminal(parent: TaskNode) -> List[TaskNode]:
             "apply_artifact_id": parent.inputs.get("apply_artifact_id"),
             "prior_goal": parent.inputs.get("prior_goal"),
             "mode": mode,
-            **budget.spend_repair(
-                new_signature, failing_count=new_count,
-                passing_count=new_passing).repair_chain_inputs(),
+            **spent.repair_chain_inputs(),
         },
     )]
+
+
+def _diagnose_node(parent: TaskNode, *, source_key: str, source_id: str,
+                   classification: str, budget: LoopBudget,
+                   mode: str) -> TaskNode:
+    """Spawn the DIAGNOSE reasoning rung for a reasoning-class gate failure.
+
+    A gate failure whose ``classification`` is in
+    :data:`~cgx.session.repair.classify.DIAGNOSE_CLASSIFICATIONS` routes
+    here instead of straight to a mechanical REPAIR. DIAGNOSE reasons over
+    the concrete failure + the real repo + the repair ledger and emits a
+    typed verdict the :func:`_diagnose_dispatch_actions` guard maps to a
+    scoped successor. ``budget`` is the already-spent :class:`LoopBudget`
+    (the gate charged the round on this edge exactly as the REPAIR path
+    would), threaded verbatim so the reasoning rung stays under the shared
+    :data:`~cgx.session.budget.REPAIR_BUDGET` and carries the ledger id
+    forward. ``source_key`` names the report id key DIAGNOSE reads
+    (``verify_artifact_id`` / ``runtime_artifact_id`` / ...).
+    """
+    return TaskNode.new(
+        session_id=parent.session_id,
+        kind=TaskKind.DIAGNOSE,
+        name="Diagnose the gate failure",
+        description=("Reason over the concrete gate failure, the real repo, "
+                     "and what earlier rounds already tried, then emit one "
+                     "minimal-action verdict the pure router dispatches."),
+        parent_task_id=parent.task_id,
+        inputs={
+            source_key: source_id,
+            "classification": classification,
+            "build_artifact_id": parent.inputs.get("build_artifact_id"),
+            "apply_artifact_id": parent.inputs.get("apply_artifact_id"),
+            "scaffold_artifact_id": parent.inputs.get("scaffold_artifact_id"),
+            "plan_artifact_id": parent.inputs.get("plan_artifact_id"),
+            "prior_goal": parent.inputs.get("prior_goal"),
+            "mode": mode,
+            **budget.repair_chain_inputs(),
+        },
+    )
 
 
 def _verify_successors(parent: TaskNode) -> List[TaskNode]:
@@ -680,6 +732,15 @@ def _runtime_verify_to_repair_or_terminal(parent: TaskNode) -> List[TaskNode]:
         new_signature = f"runtime_failed|count={failed}"
     if budget.seen(new_signature):
         return []
+    spent = budget.spend_repair(new_signature)
+    # Reasoning-class boot failures route to DIAGNOSE (design §8.1); a
+    # mechanical token keeps the fast path straight to REPAIR.
+    classification = str(outputs.get("classification") or "").strip()
+    if classification in DIAGNOSE_CLASSIFICATIONS:
+        return [_diagnose_node(
+            parent, source_key="runtime_artifact_id",
+            source_id=parent.produced_artifact_id,
+            classification=classification, budget=spent, mode=mode)]
     return [TaskNode.new(
         session_id=parent.session_id,
         kind=TaskKind.REPAIR,
@@ -695,7 +756,7 @@ def _runtime_verify_to_repair_or_terminal(parent: TaskNode) -> List[TaskNode]:
             "scaffold_artifact_id": parent.inputs.get("scaffold_artifact_id"),
             "prior_goal": parent.inputs.get("prior_goal"),
             "mode": mode,
-            **budget.spend_repair(new_signature).repair_chain_inputs(),
+            **spent.repair_chain_inputs(),
         },
     )]
 
@@ -965,6 +1026,10 @@ _COMPLETION_GUARDS: Tuple[Tuple[TaskKind, _CompletionGuard], ...] = (
     (TaskKind.REPAIR, _repair_regenerate_actions),
     (TaskKind.REPAIR,
      lambda completed, tasks: _repair_terminal_failure_actions(completed)),
+    # DIAGNOSE always dispatches (the escalate arm regenerates or fails
+    # terminally), so this guard never declines and no TASK_SUCCESSOR entry
+    # is needed -- the reasoning rung is never stranded.
+    (TaskKind.DIAGNOSE, _diagnose_dispatch_actions),
     (TaskKind.SCAFFOLD, _scaffold_failed_files_actions),
     (TaskKind.SCAFFOLD, _scaffold_payload_regenerate_actions),
     (TaskKind.SCAFFOLD, _scaffold_contract_regenerate_actions),

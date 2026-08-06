@@ -33,6 +33,7 @@ from cgx.session.models import (
     TaskKind,
     TaskNode,
 )
+from cgx.session.repair.classify import DIAGNOSE_CLASSIFICATIONS
 from cgx.session.repair.context import (
     GATE_API_CHECK,
     GATE_RUNTIME,
@@ -59,9 +60,10 @@ MINIMAL_ACTIONS = frozenset({
 
 # The "needs reasoning" gate (design §12.4): a subset of REPAIR's
 # regenerate classes. Mechanical tokens keep their fast path to REPAIR;
-# only these ambiguous ones route to DIAGNOSE.
-_DIAGNOSE_CLASSES = frozenset(
-    {"assertion_drift", "collection_error", "unknown", "runtime_failure"})
+# only these ambiguous ones route to DIAGNOSE. Sourced from the single
+# router-facing constant so the executor's notion of "ambiguous" and the
+# router's gate cannot drift apart.
+_DIAGNOSE_CLASSES = frozenset(DIAGNOSE_CLASSIFICATIONS)
 
 # Deterministic-first (design §12.1): an import/boot failure whose
 # traceback already localizes to first-party files needs no model -- a
@@ -159,6 +161,12 @@ def run_diagnose(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             "repair_attempt": attempt,
             "confidence": diagnosis.get("confidence"),
             "target_files": list(diagnosis.get("target_files") or []),
+            # Dependency lists ride the outputs (not just the DIAGNOSIS
+            # artifact) so the pure router can dispatch a BOOTSTRAP_ENV
+            # install / de-scope without ever reading an artifact.
+            "add_dependencies": list(diagnosis.get("add_dependencies") or []),
+            "remove_dependencies":
+                list(diagnosis.get("remove_dependencies") or []),
             "used_model": used_model,
             "repair_ledger_fact_id": ledger_fact.fact_id,
             source_key: source_id,

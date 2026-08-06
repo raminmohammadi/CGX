@@ -14832,3 +14832,261 @@ def test_repair_retrieval_calls_query_when_index_present(tmp_path, monkeypatch):
     assert calls, "run_query_auto should have been called"
     # Only the existing first-party file survives resolution.
     assert out == ["calc.py"]
+
+
+# --------------------- DIAGNOSE router wiring (P2.5) ---------------------
+#
+# Two seams: (1) the gate -> DIAGNOSE edges -- a reasoning-class
+# ``classification`` on a failed VERIFY / RUNTIME_VERIFY routes to the
+# DIAGNOSE rung instead of a mechanical REPAIR; (2) the
+# ``_diagnose_dispatch_actions`` guard -- a completed DIAGNOSE verdict's
+# ``minimal_action`` maps to exactly one deterministic successor. The
+# router stays pure: it reads only ``classification`` / ``minimal_action``
+# and the dependency / target-file lists the executor already placed in
+# ``outputs``.
+
+
+def _diagnose_completed(*, minimal_action: str, extra_outputs: dict | None = None,
+                        repair_attempt: int = 1, prior_repair_regens: int = 0,
+                        with_scaffold: bool = True):
+    """Build a SCAFFOLD->APPLY->VERIFY->DIAGNOSE(DONE) chain.
+
+    Returns ``(session, diagnose, tasks)``. The DIAGNOSE node carries the
+    verdict ``minimal_action`` (+ any ``extra_outputs``) the dispatch guard
+    reads; the SCAFFOLD ancestor lets the regenerate / escalate arms splice
+    a scoped re-scaffold.
+    """
+    from cgx.session.models import SessionMode
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    tasks: list = []
+    parent_id = None
+    if with_scaffold:
+        scaffold = TaskNode.new(
+            session.session_id, TaskKind.SCAFFOLD, "scaffold",
+            inputs={"work_plan_artifact_id": "art_plan",
+                    "repair_regenerate_attempt": prior_repair_regens})
+        scaffold.status = TaskNodeStatus.DONE
+        apply_t = TaskNode.new(
+            session.session_id, TaskKind.APPLY, "apply",
+            parent_task_id=scaffold.task_id, inputs={})
+        apply_t.status = TaskNodeStatus.DONE
+        verify = TaskNode.new(
+            session.session_id, TaskKind.VERIFY, "verify",
+            parent_task_id=apply_t.task_id, inputs={})
+        verify.status = TaskNodeStatus.DONE
+        tasks += [scaffold, apply_t, verify]
+        parent_id = verify.task_id
+    diag = TaskNode.new(
+        session.session_id, TaskKind.DIAGNOSE, "diagnose",
+        parent_task_id=parent_id,
+        inputs={"verify_artifact_id": "art_verify",
+                "build_artifact_id": "art_build",
+                "apply_artifact_id": "art_applied",
+                "scaffold_artifact_id": "art_scaffold",
+                "plan_artifact_id": "art_plan",
+                "prior_goal": "g",
+                "mode": SessionMode.GREENFIELD.value,
+                "repair_attempt": repair_attempt})
+    outputs = {"minimal_action": minimal_action,
+               "verify_artifact_id": "art_verify",
+               "repair_attempt": repair_attempt}
+    outputs.update(extra_outputs or {})
+    diag.outputs = outputs
+    diag.status = TaskNodeStatus.DONE
+    tasks.append(diag)
+    return session, diag, tasks
+
+
+# (minimal_action, extra outputs, expected successor kind)
+_DIAGNOSE_DISPATCH_CASES = [
+    ("patch_files", {"target_files": ["src/x.py"]}, TaskKind.REPAIR),
+    ("add_dependency", {"add_dependencies": ["flask"]}, TaskKind.BOOTSTRAP_ENV),
+    ("remove_dependency", {"remove_dependencies": ["selenium"]},
+     TaskKind.BOOTSTRAP_ENV),
+    ("adjust_manifest", {"target_files": ["src/x.py"]}, TaskKind.SCAFFOLD),
+    ("regenerate_files", {"target_files": ["src/x.py"]}, TaskKind.SCAFFOLD),
+    ("escalate", {}, TaskKind.SCAFFOLD),
+]
+
+
+@pytest.mark.parametrize(
+    "action,extra,kind", _DIAGNOSE_DISPATCH_CASES,
+    ids=[c[0] for c in _DIAGNOSE_DISPATCH_CASES])
+def test_diagnose_dispatch_routes_each_minimal_action(action, extra, kind):
+    """Every minimal_action verdict maps to exactly one successor kind."""
+    session, diag, tasks = _diagnose_completed(
+        minimal_action=action, extra_outputs=extra)
+    plan = Router().on_task_completed(
+        session=session, completed=diag, tasks=tasks)
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    assert len(creates) == 1
+    assert creates[0].task.kind is kind
+
+
+def test_diagnose_patch_files_spawns_targeted_repair():
+    """patch_files -> REPAIR reusing the diagnosed source report + targets."""
+    session, diag, tasks = _diagnose_completed(
+        minimal_action="patch_files", repair_attempt=2,
+        extra_outputs={"target_files": ["src/handlers.py"],
+                       "repair_ledger_fact_id": "fact_led",
+                       "repair_attempt": 2})
+    plan = Router().on_task_completed(
+        session=session, completed=diag, tasks=tasks)
+    rep = [a.task for a in plan.actions if isinstance(a, CreateTask)][0]
+    assert rep.kind is TaskKind.REPAIR
+    assert rep.inputs["verify_artifact_id"] == "art_verify"
+    assert rep.inputs["target_files"] == ["src/handlers.py"]
+    # The gate-charged attempt + the ledger id ride the chain verbatim.
+    assert rep.inputs["repair_attempt"] == 2
+    assert rep.inputs["repair_ledger_fact_id"] == "fact_led"
+
+
+def test_diagnose_add_dependency_spawns_bootstrap_install():
+    """add_dependency -> BOOTSTRAP_ENV threading missing_modules to install."""
+    session, diag, tasks = _diagnose_completed(
+        minimal_action="add_dependency",
+        extra_outputs={"add_dependencies": ["flask", "flask_cors"],
+                       "repair_ledger_fact_id": "fact_led"})
+    plan = Router().on_task_completed(
+        session=session, completed=diag, tasks=tasks)
+    boot = [a.task for a in plan.actions if isinstance(a, CreateTask)][0]
+    assert boot.kind is TaskKind.BOOTSTRAP_ENV
+    assert boot.inputs["missing_modules"] == ["flask", "flask_cors"]
+    assert boot.inputs["repair_ledger_fact_id"] == "fact_led"
+
+
+def test_diagnose_remove_dependency_spawns_bootstrap_descope():
+    """remove_dependency -> BOOTSTRAP_ENV threading descope_packages (C3)."""
+    session, diag, tasks = _diagnose_completed(
+        minimal_action="remove_dependency",
+        extra_outputs={"remove_dependencies": ["selenium", "playwright"]})
+    plan = Router().on_task_completed(
+        session=session, completed=diag, tasks=tasks)
+    boot = [a.task for a in plan.actions if isinstance(a, CreateTask)][0]
+    assert boot.kind is TaskKind.BOOTSTRAP_ENV
+    assert boot.inputs["descope_packages"] == ["selenium", "playwright"]
+
+
+def test_diagnose_regenerate_files_scopes_scaffold_to_targets():
+    """regenerate_files -> a SCAFFOLD scoped to exactly the named files."""
+    session, diag, tasks = _diagnose_completed(
+        minimal_action="regenerate_files",
+        extra_outputs={"target_files": ["src/main.py"],
+                       "scaffold_artifact_id": "art_scaffold"})
+    plan = Router().on_task_completed(
+        session=session, completed=diag, tasks=tasks)
+    sc = [a.task for a in plan.actions if isinstance(a, CreateTask)][0]
+    assert sc.kind is TaskKind.SCAFFOLD
+    assert sc.inputs["regenerate_files"] == ["src/main.py"]
+    assert sc.inputs["prior_scaffold_artifact_id"] == "art_scaffold"
+
+
+def test_diagnose_escalate_regenerates_whole_tree():
+    """escalate -> today's whole-tree regenerate (no file scoping)."""
+    session, diag, tasks = _diagnose_completed(minimal_action="escalate")
+    plan = Router().on_task_completed(
+        session=session, completed=diag, tasks=tasks)
+    sc = [a.task for a in plan.actions if isinstance(a, CreateTask)][0]
+    assert sc.kind is TaskKind.SCAFFOLD
+    assert not sc.inputs.get("regenerate_files")
+
+
+def test_diagnose_patch_files_without_source_report_escalates():
+    """A malformed patch verdict (no source id) degrades to escalate."""
+    session, diag, tasks = _diagnose_completed(minimal_action="patch_files")
+    diag.outputs.pop("verify_artifact_id")
+    plan = Router().on_task_completed(
+        session=session, completed=diag, tasks=tasks)
+    sc = [a.task for a in plan.actions if isinstance(a, CreateTask)][0]
+    # No REPAIR -- the additive fallback re-scaffolds instead of stranding.
+    assert sc.kind is TaskKind.SCAFFOLD
+
+
+def test_diagnose_add_dependency_empty_list_escalates():
+    """add_dependency with no packages degrades to escalate, never stranded."""
+    session, diag, tasks = _diagnose_completed(
+        minimal_action="add_dependency", extra_outputs={"add_dependencies": []})
+    plan = Router().on_task_completed(
+        session=session, completed=diag, tasks=tasks)
+    sc = [a.task for a in plan.actions if isinstance(a, CreateTask)][0]
+    assert sc.kind is TaskKind.SCAFFOLD
+
+
+def test_diagnose_unknown_action_escalates():
+    """An unrecognized (or empty) verdict falls through to escalate."""
+    session, diag, tasks = _diagnose_completed(minimal_action="not_a_verdict")
+    plan = Router().on_task_completed(
+        session=session, completed=diag, tasks=tasks)
+    sc = [a.task for a in plan.actions if isinstance(a, CreateTask)][0]
+    assert sc.kind is TaskKind.SCAFFOLD
+
+
+def test_diagnose_escalate_without_scaffold_lineage_fails_session():
+    """escalate with no SCAFFOLD ancestor to regenerate fails terminally."""
+    session, diag, tasks = _diagnose_completed(
+        minimal_action="escalate", with_scaffold=False)
+    plan = Router().on_task_completed(
+        session=session, completed=diag, tasks=tasks)
+    assert [a for a in plan.actions if isinstance(a, CreateTask)] == []
+    status = [a for a in plan.actions if isinstance(a, UpdateSessionStatus)]
+    assert len(status) == 1
+    assert status[0].status is SessionStatus.FAILED
+
+
+# --------------------- gate -> DIAGNOSE routing ---------------------
+
+
+@pytest.mark.parametrize(
+    "classification",
+    ["assertion_drift", "collection_error", "unknown"])
+def test_router_verify_reasoning_class_routes_to_diagnose(classification):
+    """A reasoning-class VERIFY failure spawns DIAGNOSE, not a bare REPAIR."""
+    session = Session.new("g")
+    ver = _greenfield_failed_verify(signature="sig1", session=session)
+    ver.outputs["classification"] = classification
+    plan = Router().on_task_completed(
+        session=session, completed=ver, tasks=[ver])
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    assert len(creates) == 1
+    diag = creates[0].task
+    assert diag.kind is TaskKind.DIAGNOSE
+    assert diag.inputs["verify_artifact_id"] == "art_verify"
+    assert diag.inputs["classification"] == classification
+    # The gate charged the round on this edge exactly as REPAIR would.
+    assert diag.inputs["repair_attempt"] == 1
+    assert diag.parent_task_id == ver.task_id
+
+
+def test_router_verify_mechanical_class_stays_repair():
+    """A mechanical classification keeps the fast path straight to REPAIR."""
+    session = Session.new("g")
+    ver = _greenfield_failed_verify(signature="sig1", session=session)
+    ver.outputs["classification"] = "third_party_import_break"
+    plan = Router().on_task_completed(
+        session=session, completed=ver, tasks=[ver])
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    assert len(creates) == 1
+    assert creates[0].task.kind is TaskKind.REPAIR
+
+
+def test_router_runtime_verify_reasoning_class_routes_to_diagnose():
+    """A reasoning-class RUNTIME_VERIFY boot failure spawns DIAGNOSE."""
+    from cgx.session.models import SessionMode
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    rv = TaskNode.new(
+        session.session_id, TaskKind.RUNTIME_VERIFY, "runtime",
+        inputs={"mode": SessionMode.GREENFIELD.value})
+    rv.produced_artifact_id = "art_runtime"
+    rv.outputs = {"outcome": "failed",
+                  "failure_signature": "runtime_boot|app.py",
+                  "classification": "runtime_failure"}
+    rv.status = TaskNodeStatus.DONE
+    plan = Router().on_task_completed(
+        session=session, completed=rv, tasks=[rv])
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    assert len(creates) == 1
+    diag = creates[0].task
+    assert diag.kind is TaskKind.DIAGNOSE
+    assert diag.inputs["runtime_artifact_id"] == "art_runtime"
+    assert diag.inputs["classification"] == "runtime_failure"
+    assert diag.inputs["repair_attempt"] == 1

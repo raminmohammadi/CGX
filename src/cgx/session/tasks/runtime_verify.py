@@ -141,6 +141,13 @@ def run_runtime_verify(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         "failed_entries": failed,
         "failure_signature": signature,
     }
+    # Pre-compute the classification token here (as VERIFY does) so the
+    # pure router can gate a hard boot failure to the DIAGNOSE reasoning
+    # rung vs a mechanical REPAIR by membership test alone (design 12.4)
+    # -- it never runs the classifier itself.
+    from cgx.session.repair.classify import classify_runtime_report
+    classification = classify_runtime_report(content)
+    content["classification"] = classification
     artifact = Artifact.new(
         session_id=task.session_id,
         produced_by_task_id=task.task_id,
@@ -154,6 +161,7 @@ def run_runtime_verify(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             "tested_count": len(probes),
             "failed_count": len(failed),
             "failure_signature": signature,
+            "classification": classification,
         },
         artifact=artifact,
     )

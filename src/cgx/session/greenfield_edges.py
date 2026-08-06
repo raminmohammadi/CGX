@@ -280,6 +280,263 @@ def _repair_terminal_failure_actions(
     ]
 
 
+# --------------------- DIAGNOSE verdict dispatch (P2.5) ---------------------
+
+# Source-report id keys DIAGNOSE echoes back in ``outputs``, in the same
+# router-preference order the executor probes them (runtime -> api_check ->
+# smoke -> verify). The dispatch threads the surviving one into the
+# successor REPAIR so a targeted patch reads the same failure it diagnosed.
+_DIAGNOSE_SOURCE_KEYS = (
+    "runtime_artifact_id", "api_check_artifact_id",
+    "smoke_artifact_id", "verify_artifact_id",
+)
+
+
+def _diagnose_dispatch_actions(completed: TaskNode,
+                               tasks: List[TaskNode]) -> List[RouterAction]:
+    """Map a completed DIAGNOSE verdict to its deterministic successor.
+
+    The router stays pure (design §8): it reads only the closed
+    ``minimal_action`` enum plus the dependency / target-file lists
+    DIAGNOSE already placed in ``outputs`` and dispatches an existing
+    recovery path -- a targeted REPAIR (``patch_files``), a BOOTSTRAP_ENV
+    dependency install (``add_dependency``) or de-scope (``remove_dependency``,
+    Workstream C3), a scoped SCAFFOLD via ``propose_regenerate``
+    (``adjust_manifest`` / ``regenerate_files``), and today's whole-tree
+    regenerate / re-plan for ``escalate``. The repair ledger id and repair
+    attempt ride ``repair_chain_inputs`` so the next round reads the same
+    working memory and stays under the shared REPAIR_BUDGET. Always returns
+    at least one action so a DIAGNOSE node is never stranded.
+    """
+    action = str((completed.outputs or {}).get("minimal_action")
+                 or "escalate").strip()
+    if action == "patch_files":
+        return _diagnose_patch_actions(completed, tasks)
+    if action == "add_dependency":
+        return _diagnose_add_dependency_actions(completed, tasks)
+    if action == "remove_dependency":
+        return _diagnose_remove_dependency_actions(completed, tasks)
+    if action in ("adjust_manifest", "regenerate_files"):
+        return _diagnose_regenerate_actions(completed, tasks)
+    return _diagnose_escalate_actions(completed, tasks)
+
+
+def _diagnose_chain_budget(completed: TaskNode) -> LoopBudget:
+    """The repair-chain budget to thread out of a DIAGNOSE verdict.
+
+    Pins ``repair_attempt`` to the value DIAGNOSE echoed back (the gate
+    already charged the round on the gate -> DIAGNOSE edge) and points the
+    ledger id at the ``REPAIR_LEDGER`` fact DIAGNOSE just appended, so the
+    next round reads the same working memory and never re-proposes a proven
+    dead end -- while the router itself never reads the fact (stays pure).
+    """
+    outputs = completed.outputs or {}
+    budget = LoopBudget.from_inputs(completed.inputs or {})
+    budget = budget.with_repair_attempt(
+        int(outputs.get("repair_attempt") or budget.repair_attempt or 1))
+    ledger_id = str(outputs.get("repair_ledger_fact_id") or "").strip()
+    if ledger_id:
+        budget = budget.with_repair_ledger(ledger_id)
+    return budget
+
+
+def _diagnose_source_report(completed: TaskNode) -> tuple:
+    """The ``(source_key, source_id)`` DIAGNOSE diagnosed, or ``(None, None)``."""
+    outputs = completed.outputs or {}
+    for key in _DIAGNOSE_SOURCE_KEYS:
+        val = str(outputs.get(key) or "").strip()
+        if val:
+            return key, val
+    return None, None
+
+
+def _diagnose_patch_actions(completed: TaskNode,
+                            tasks: List[TaskNode]) -> List[RouterAction]:
+    """``patch_files`` -> a targeted REPAIR reusing the patch -> APPLY path."""
+    source_key, source_id = _diagnose_source_report(completed)
+    if not source_id:
+        return _diagnose_escalate_actions(completed, tasks)
+    outputs = completed.outputs or {}
+    inputs = completed.inputs or {}
+    budget = _diagnose_chain_budget(completed)
+    repair = TaskNode.new(
+        session_id=completed.session_id,
+        kind=TaskKind.REPAIR,
+        name="Apply diagnosed patch",
+        description=("Author the targeted patch the DIAGNOSE verdict scoped "
+                     "to the implicated file(s) so the shared APPLY executor "
+                     "can write it."),
+        parent_task_id=completed.task_id,
+        inputs={
+            source_key: source_id,
+            "build_artifact_id": inputs.get("build_artifact_id"),
+            "apply_artifact_id": inputs.get("apply_artifact_id"),
+            "scaffold_artifact_id": inputs.get("scaffold_artifact_id"),
+            "prior_goal": inputs.get("prior_goal"),
+            "mode": inputs.get("mode") or SessionMode.GREENFIELD.value,
+            "target_files": list(outputs.get("target_files") or []),
+            **budget.repair_chain_inputs(),
+        },
+    )
+    return [CreateTask(repair)]
+
+
+def _diagnose_add_dependency_actions(
+        completed: TaskNode, tasks: List[TaskNode]) -> List[RouterAction]:
+    """``add_dependency`` -> a BOOTSTRAP_ENV install (mirrors install_deps)."""
+    packages = [str(m).strip()
+                for m in ((completed.outputs or {}).get("add_dependencies")
+                          or []) if str(m).strip()]
+    if not packages:
+        return _diagnose_escalate_actions(completed, tasks)
+    inputs = completed.inputs or {}
+    boot = TaskNode.new(
+        session_id=completed.session_id,
+        kind=TaskKind.BOOTSTRAP_ENV,
+        name="Install diagnosed dependencies",
+        description=("Re-provision the project venv to install the "
+                     "third-party package(s) the DIAGNOSE verdict found "
+                     "missing, then re-probe via API_CHECK."),
+        parent_task_id=completed.task_id,
+        inputs={
+            "apply_artifact_id": inputs.get("apply_artifact_id"),
+            "plan_artifact_id": inputs.get("plan_artifact_id"),
+            "scaffold_artifact_id": inputs.get("scaffold_artifact_id"),
+            "prior_goal": inputs.get("prior_goal"),
+            "mode": inputs.get("mode") or SessionMode.GREENFIELD.value,
+            "missing_modules": packages,
+            **_diagnose_chain_budget(completed).repair_chain_inputs(),
+        },
+    )
+    return [CreateTask(boot)]
+
+
+def _diagnose_remove_dependency_actions(
+        completed: TaskNode, tasks: List[TaskNode]) -> List[RouterAction]:
+    """``remove_dependency`` -> a BOOTSTRAP_ENV de-scope (Workstream C3).
+
+    The unrunnable distribution names DIAGNOSE placed in
+    ``remove_dependencies`` thread through ``descope_packages``; the
+    BOOTSTRAP_ENV executor scrubs them from requirements.txt before the
+    venv resolves, symmetric to its scan-driven de-scope, then re-probes
+    via API_CHECK.
+    """
+    packages = [str(m).strip()
+                for m in ((completed.outputs or {}).get("remove_dependencies")
+                          or []) if str(m).strip()]
+    if not packages:
+        return _diagnose_escalate_actions(completed, tasks)
+    inputs = completed.inputs or {}
+    boot = TaskNode.new(
+        session_id=completed.session_id,
+        kind=TaskKind.BOOTSTRAP_ENV,
+        name="De-scope unrunnable dependencies",
+        description=("Re-provision the project venv after scrubbing the "
+                     "unrunnable dependency(ies) the DIAGNOSE verdict "
+                     "de-scoped from requirements.txt, then re-probe via "
+                     "API_CHECK."),
+        parent_task_id=completed.task_id,
+        inputs={
+            "apply_artifact_id": inputs.get("apply_artifact_id"),
+            "plan_artifact_id": inputs.get("plan_artifact_id"),
+            "scaffold_artifact_id": inputs.get("scaffold_artifact_id"),
+            "prior_goal": inputs.get("prior_goal"),
+            "mode": inputs.get("mode") or SessionMode.GREENFIELD.value,
+            "descope_packages": packages,
+            **_diagnose_chain_budget(completed).repair_chain_inputs(),
+        },
+    )
+    return [CreateTask(boot)]
+
+
+def _diagnose_regenerate_actions(
+        completed: TaskNode, tasks: List[TaskNode]) -> List[RouterAction]:
+    """``adjust_manifest`` / ``regenerate_files`` -> a scoped SCAFFOLD."""
+    outputs = completed.outputs or {}
+    action = str(outputs.get("minimal_action") or "").strip()
+    target_files = [str(f).strip() for f in (outputs.get("target_files") or [])
+                    if str(f).strip()]
+    note = (f"DIAGNOSE ({action}) scoped the fix to: "
+            + (", ".join(target_files) or "the file manifest") + ".")
+    return _diagnose_scaffold_regenerate(
+        completed, tasks, regenerate_files=target_files or None,
+        extra_constraints={"kind": f"diagnose_{action}", "rationale": note},
+        note=note)
+
+
+def _diagnose_escalate_actions(
+        completed: TaskNode, tasks: List[TaskNode]) -> List[RouterAction]:
+    """``escalate`` -> today's whole-tree regenerate / re-plan (design §5).
+
+    The strictly-additive fallback: a verdict DIAGNOSE could not resolve
+    hands off to the existing ladder, so behavior is never *worse* than the
+    current jump-to-regenerate. Also the safety net for a malformed verdict
+    (a ``patch_files`` with no source report, an empty dependency list).
+    """
+    note = _diagnose_escalate_note(completed)
+    return _diagnose_scaffold_regenerate(
+        completed, tasks, regenerate_files=None,
+        extra_constraints={"kind": "diagnose_escalate", "rationale": note},
+        note=note)
+
+
+def _diagnose_escalate_note(completed: TaskNode) -> str:
+    sig = str((completed.outputs or {}).get("failure_signature") or "").strip()
+    base = ("DIAGNOSE could not resolve the failure with a minimal action; "
+            "escalating to a whole-tree regenerate / re-plan")
+    return f"{base} (signature={sig})." if sig else base + "."
+
+
+def _diagnose_scaffold_regenerate(
+        completed: TaskNode, tasks: List[TaskNode], *,
+        regenerate_files: Optional[List[str]],
+        extra_constraints: Dict[str, object], note: str) -> List[RouterAction]:
+    """Abandon the live subtree and re-queue a (scoped) SCAFFOLD.
+
+    Shared by the ``regenerate_files`` / ``adjust_manifest`` and
+    ``escalate`` verdicts: the difference is only whether the regenerate
+    is file-scoped. Reuses the same ``repair_regenerate_attempt`` counter
+    and ``propose_regenerate`` splice as :func:`_repair_regenerate_actions`
+    so the correctness loop stays bounded by
+    :data:`~cgx.session.budget.REPAIR_REGENERATE_BUDGET`; when that is
+    spent (or no SCAFFOLD lineage exists) it escalates once to a revised
+    plan via :func:`_replan_or_fail`, which terminates the session
+    ``FAILED`` only as a last resort.
+    """
+    from cgx.session.repair.propose import propose_regenerate  # dep direction
+
+    scaffold = _find_scaffold_ancestor(completed, tasks)
+    if scaffold is None:
+        return [UpdateSessionStatus(
+            session_id=completed.session_id, status=SessionStatus.FAILED)]
+    scaffold_budget = LoopBudget.from_inputs(scaffold.inputs)
+    if scaffold_budget.repair_regenerate_exhausted:
+        return _replan_or_fail(
+            completed, tasks, scaffold=scaffold, failure_note=note)
+    prior_scaffold_id = str(
+        (completed.outputs or {}).get("scaffold_artifact_id") or "").strip()
+    targeted = (list(regenerate_files)
+                if regenerate_files and prior_scaffold_id else None)
+    actions: List[RouterAction] = []
+    skip_states = {TaskNodeStatus.DONE, TaskNodeStatus.FAILED,
+                   TaskNodeStatus.ABANDONED}
+    for t in _collect_descendants(scaffold.task_id, tasks):
+        if t.status in skip_states:
+            continue
+        actions.append(UpdateTaskStatus(
+            task_id=t.task_id, status=TaskNodeStatus.ABANDONED))
+    new_scaffold = propose_regenerate(
+        scaffold, extra_constraints,
+        regenerate_files=targeted,
+        prior_scaffold_artifact_id=prior_scaffold_id or None,
+        prior_failure_signatures=LoopBudget.from_inputs(
+            completed.inputs).prior_failure_signatures)
+    new_scaffold.inputs["repair_regenerate_attempt"] = (
+        scaffold_budget.spend_repair_regenerate().repair_regenerate_attempt)
+    actions.append(CreateTask(new_scaffold))
+    return actions
+
+
 def _apply_failed_files_actions(completed: TaskNode,
                                 tasks: List[TaskNode]) -> List[RouterAction]:
     """Regenerate (or terminally fail) a greenfield APPLY that dropped files.

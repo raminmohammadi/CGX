@@ -46,6 +46,23 @@ REPAIR_CLASSIFICATIONS: Tuple[str, ...] = (
 RepairClassification = str  # one of REPAIR_CLASSIFICATIONS
 
 
+# The subset of classifications the pure router hands to the DIAGNOSE
+# reasoning rung instead of a mechanical REPAIR (design §8/§12.4). These
+# are exactly the tokens where today's ladder jumps straight to a
+# whole-tree regenerate: an ``assertion_drift`` / ``collection_error`` /
+# ``unknown`` VERIFY failure, or a ``runtime_failure`` boot failure. Every
+# other (mechanical) token keeps its fast path straight to REPAIR. The
+# router only *reads* a gate's emitted ``classification`` and tests
+# membership here -- it never runs the classifier itself, so it stays
+# pure/IO-free. Kept in sync with :data:`RUNTIME_REPAIR_CLASSIFICATION`.
+DIAGNOSE_CLASSIFICATIONS: Tuple[str, ...] = (
+    "assertion_drift",
+    "collection_error",
+    "unknown",
+    "runtime_failure",
+)
+
+
 # Pytest renders AttributeError tracebacks with the offending
 # attribute name in quotes. ``assertLogs`` is the canonical case from
 # the screenshot, but the same shape covers every ``self.assert*``

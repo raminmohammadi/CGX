@@ -172,9 +172,16 @@ def run_verify(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     # Pre-compute the repair-loop signature here (rather than in the
     # router) so the deterministic Router stays IO-free; the value is
     # stable across re-runs of the same failure.
-    from cgx.session.repair.classify import failure_signature
+    from cgx.session.repair.classify import (
+        classify_verify_report, failure_signature)
     sig = failure_signature(content)
     content["failure_signature"] = sig
+    # Pre-compute the classification token here too so the pure router can
+    # gate a fixable failure to the DIAGNOSE reasoning rung vs a mechanical
+    # REPAIR by membership test alone (design 12.4) -- it never runs the
+    # classifier itself. Stable across re-runs of the same failure.
+    classification = classify_verify_report(content)
+    content["classification"] = classification
     artifact = Artifact.new(
         session_id=task.session_id,
         produced_by_task_id=task.task_id,
@@ -204,6 +211,7 @@ def run_verify(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             **_progress_counts(
                 verify_outcome, failures, combined.pytest_tests_selected),
             "failure_signature": sig,
+            "classification": classification,
             "returncode": combined.returncode,
             "js_tests_present": combined.js_tests_present,
             "js_tests_ran": combined.js_tests_ran,

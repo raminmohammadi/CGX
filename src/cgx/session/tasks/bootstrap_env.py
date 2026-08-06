@@ -135,6 +135,13 @@ def run_bootstrap_env(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     # (no router/ledger change); gated on "declared but imported by nothing"
     # so a package the code uses is untouched -- never worse than today.
     descoped_deps = _descope_dead_e2e_requirements(root, applied_files)
+    # De-scope a dependency a DIAGNOSE ``remove_dependency`` verdict named
+    # unrunnable (Workstream C3): the router threads the distribution names
+    # via ``descope_packages``. Symmetric to the scan-driven scrub above and
+    # to the ``missing_modules`` *add* path below, applied before the venv
+    # resolves so the fix is durable and model-independent.
+    descoped_deps = descoped_deps + _descope_verdict_requirements(
+        root, task.inputs.get("descope_packages"))
 
     try:
         python_exe = ensure_project_venv(str(root), timeout=timeout)
@@ -401,6 +408,36 @@ def _descope_dead_e2e_requirements(root: Path,
         emit_trace("dependency_descope", stage="bootstrap_env",
                    removed=removed, removed_count=len(removed))
         logger.info("BOOTSTRAP_ENV: de-scoped %d dead browser/E2E "
+                    "dependency(ies): %s", len(removed), removed)
+    return removed
+
+
+def _descope_verdict_requirements(root: Path, packages: Any) -> List[str]:
+    """Scrub the distribution(s) a DIAGNOSE ``remove_dependency`` named (C3).
+
+    The router threads the verdict's ``remove_dependencies`` through the
+    BOOTSTRAP_ENV node's ``descope_packages`` input; drop each from
+    requirements.txt via
+    :func:`cgx.codegen.env_manager.remove_from_requirements`, the same
+    idempotent remove path the scan-driven E2E scrub uses. Best-effort: any
+    failure leaves requirements.txt untouched so a de-scope never blocks the
+    build. Emits a ``dependency_descope`` trace record and returns the
+    distribution names actually removed.
+    """
+    names = [str(p).strip() for p in (packages or []) if str(p).strip()]
+    if not names:
+        return []
+    try:
+        from cgx.codegen.env_manager import remove_from_requirements
+        removed = remove_from_requirements(str(root), names)
+    except Exception as exc:  # pragma: no cover - best-effort scrub
+        logger.warning("BOOTSTRAP_ENV: verdict de-scope scrub raised %s", exc)
+        return []
+    if removed:
+        emit_trace("dependency_descope", stage="bootstrap_env",
+                   source="diagnose_verdict",
+                   removed=removed, removed_count=len(removed))
+        logger.info("BOOTSTRAP_ENV: de-scoped %d verdict "
                     "dependency(ies): %s", len(removed), removed)
     return removed
 

@@ -5,12 +5,16 @@
 loop in [`docs/flowcharts.md`](flowcharts.md)).
 
 **Implementation status:** the typed model additions (§3), the
-`FailureContext` normalizer (§4), the `DIAGNOSE` executor itself (§6), and
-the `RepairLedger` working memory (§7) have landed
-(`src/cgx/session/tasks/diagnose.py`, `src/cgx/session/repair/ledger.py`).
-The router wiring (§8) is the remaining Phase 2 task; until it lands the
-executor is unit-tested in isolation and not yet reachable from the
-greenfield edges.
+`FailureContext` normalizer (§4), the `DIAGNOSE` executor itself (§6), the
+`RepairLedger` working memory (§7), and the router wiring (§8) have all
+landed (`src/cgx/session/tasks/diagnose.py`,
+`src/cgx/session/repair/ledger.py`, `src/cgx/session/router.py`,
+`src/cgx/session/greenfield_edges.py`). The reasoning rung is now reachable
+from the greenfield edges: reasoning-class gate failures enter `DIAGNOSE`
+and its verdict dispatches to a scoped successor, and the `remove_dependency`
+verdict (C3) scrubs `requirements.txt` via the `BOOTSTRAP_ENV`
+`descope_packages` hook. Every branch is covered by table-driven router
+tests in `tests/test_session.py`.
 
 This document specifies `DIAGNOSE`, a new **reasoning executor** inserted
 between the mechanical `REPAIR` patch and the nuclear whole-tree
@@ -215,9 +219,12 @@ Two deterministic changes, both table/guard-driven and LLM-free:
    spawns `TaskKind.DIAGNOSE` rather than a mechanical `REPAIR`. Mechanical
    tokens keep the fast path straight to `REPAIR` (Workstream D2). The
    same `REPAIR_BUDGET` + flap guard apply verbatim.
-2. **Dispatch the verdict.** Add `DIAGNOSE` to `TASK_SUCCESSOR` and a
-   `DIAGNOSE` block to `_COMPLETION_GUARDS` that maps `minimal_action`
-   to existing successors — no new mutation machinery:
+2. **Dispatch the verdict.** A `DIAGNOSE` guard in `_COMPLETION_GUARDS`
+   (`_diagnose_dispatch_actions`) maps `minimal_action` to existing
+   successors — no new mutation machinery. The guard always returns at
+   least one action (the `escalate` arm regenerates or fails terminally),
+   so `DIAGNOSE` needs no `TASK_SUCCESSOR` fallback entry and is never
+   stranded:
 
    | `minimal_action`   | Router successor                                        |
    |--------------------|--------------------------------------------------------|
