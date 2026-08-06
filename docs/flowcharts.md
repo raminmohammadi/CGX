@@ -126,10 +126,11 @@ their own pace, which is what makes a session resumable after a
 restart.
 
 **Executors** (`cgx.session.tasks.*`) are plain functions registered
-per `TaskKind` via `@register_executor` -- sixteen of them, from
+per `TaskKind` via `@register_executor` -- seventeen of them, from
 EXPLORE and INVESTIGATE through SCAFFOLD, APPLY, the verification
 ladder (BOOTSTRAP_ENV → API_CHECK → SMOKE → VERIFY → RUNTIME_VERIFY),
-REPAIR, and the Phase 2 DIAGNOSE reasoning rung. Each returns an
+REPAIR, the Phase 2 DIAGNOSE reasoning rung, and the Phase 3.2
+RE_VERIFY incremental gate. Each returns an
 `ExecutorResult` carrying typed facts and
 artifacts plus a `retryable` flag. The apply executor performs a
 **partial apply** (write passing files, record `failed_files`) and a
@@ -300,6 +301,9 @@ flowchart LR
     DISP -- "patch_files" --> REP
     DISP -- "add / remove_dependency" --> BS
     DISP -- "adjust / regenerate_files / escalate" --> SCA
+    REP -.->|"verify-origin marker (C2)"| RVF(["RE_VERIFY<br/>only failing test file(s)"])
+    BS -.->|"verify-origin marker (C2)"| RVF
+    RVF --> IC
     RUN --> IC2{"router"}
     IC2 -- "boots / no entry (no coverage gap)" --> DONE((COMPLETED))
     IC2 -- "boot fails (mechanical)" --> REP
@@ -312,7 +316,7 @@ flowchart LR
     classDef road fill:#3b6ea5,stroke:#274c73,color:#fff;
     classDef gate fill:#7d5ba6,stroke:#4c3575,color:#fff;
     classDef term fill:#4c956c,stroke:#2c6e49,color:#fff;
-    class CQ,DEC,SCA,APP,BS,AC,SM,VER,RUN,REP,DIAG road;
+    class CQ,DEC,SCA,APP,BS,AC,SM,VER,RUN,REP,DIAG,RVF road;
     class IC,IC2,DISP gate;
     class DONE,FAIL term;
 ```
@@ -335,6 +339,7 @@ flowchart TB
       CLS["repair/classify.py"]
       DGN["tasks/diagnose.py<br/>FailureContext + bounded ReAct"]
       LED["repair/ledger.py<br/>REPAIR_LEDGER memory"]
+      RVF["tasks/re_verify.py<br/>scoped pytest re-run (C2)"]
     end
     RUNR --> ROUT
     DEC -->|contracts| SCA
@@ -346,6 +351,8 @@ flowchart TB
     ROUT -->|"reasoning-class -> DIAGNOSE"| DGN
     LED -->|tried actions| DGN
     DGN -->|minimal_action verdict| ROUT
+    ROUT -->|"verify-origin fix -> scoped re-run"| RVF
+    RVF -->|scoped VERIFY_REPORT| ROUT
     ROUT -->|funds a round?| REP
     REP -->|REPAIR_PLAN| RUNR
 
@@ -607,7 +614,22 @@ successor (`patch_files -> REPAIR`, `add / remove_dependency ->
 BOOTSTRAP_ENV`, `adjust_manifest / regenerate_files -> scoped SCAFFOLD`,
 `escalate -> whole-tree regenerate / _replan`). Mechanical tokens keep
 the fast path below unchanged; a provider outage or garbled reply
-degrades cleanly to `escalate`, so the rung is never worse than today:
+degrades cleanly to `escalate`, so the rung is never worse than today.
+
+**Phase 3.2 -- incremental RE_VERIFY (C2).** When the diagnosed source
+was a `VERIFY` failure, the fix builders stamp a `reverify_origin_gate` +
+`reverify_report_id` marker onto the spawned `REPAIR` / `BOOTSTRAP_ENV`
+node. That marker rides `inputs` down the fix chain, and at the edge that
+would normally re-enter verification (`_apply_to_verify` after a patch,
+`_bootstrap_to_api_check` after a dependency add / de-scope) the router
+splices a `RE_VERIFY` node (`_re_verify_node`) that re-runs pytest against
+**only** the origin report's failing test file(s) instead of the full
+`BOOTSTRAP_ENV → API_CHECK → SMOKE → VERIFY` chain. `RE_VERIFY` emits a
+shape-identical `VERIFY_REPORT`, so `_re_verify_successors` delegates to
+`_verify_successors`: green hands off to `RUNTIME_VERIFY`, a still-failing
+reasoning-class outcome routes back to `DIAGNOSE` under the shared budget.
+Non-`VERIFY` origins (and the scoped-scaffold arm) carry no marker and run
+the full chain, so behavior is never worse than before:
 
 ```mermaid
 flowchart TB
@@ -630,7 +652,11 @@ flowchart TB
     REP --> STRAT{"_select_repair_strategy<br/>(Phase 6.1)"}
 
     STRAT -- "patch<br/>(≤5 diffs, patchable class)" --> APP["APPLY<br/>build_artifact_id carried forward,<br/>BOOTSTRAP_ENV skipped"]
-    APP --> VER2["VERIFY"]
+    APP --> AMRK{"verify-origin<br/>marker? (C2)"}
+    AMRK -- "yes" --> RVF["RE_VERIFY<br/>scoped: only failing test file(s)"]
+    AMRK -- "no" --> VER2["VERIFY"]
+    RVF -- passed --> LES
+    RVF -- "still failing" --> GUARD
     VER2 -- passed --> LES["RecordLesson → lessons.jsonl<br/>(Phase 7.1, iff REPAIR on chain)"]
     VER2 -- "still failing" --> GUARD
 
@@ -642,7 +668,9 @@ flowchart TB
     RPL -- exhausted --> SURV(["proceed with surviving files"])
 
     STRAT -- "install_deps<br/>(missing_dependency)" --> BOOT["BOOTSTRAP_ENV re-run:<br/>install missing_modules +<br/>sync requirements.txt"]
-    BOOT --> LOOP2(["re-probes via API_CHECK →<br/>SMOKE → VERIFY"])
+    BOOT --> BMRK{"verify-origin<br/>marker? (C2)"}
+    BMRK -- "yes" --> RVF
+    BMRK -- "no" --> LOOP2(["re-probes via API_CHECK →<br/>SMOKE → VERIFY"])
 
     STRAT -- "empty diffs<br/>(unknown / marker present)" --> ASK["ASK_USER(freeform)<br/>classification + rationale"]
 
@@ -650,8 +678,8 @@ flowchart TB
     classDef gate fill:#7d5ba6,stroke:#4c3575,color:#fff;
     classDef term fill:#4c956c,stroke:#2c6e49,color:#fff;
     classDef bad fill:#bc4749,stroke:#7f2d2f,color:#fff;
-    class AC,SM,VF,RV,SRC,REP,APP,VER2,SCA,DEC,ASK,BOOT,DIAG road;
-    class GUARD,STRAT,RGUARD,RPL,DVERD gate;
+    class AC,SM,VF,RV,SRC,REP,APP,VER2,SCA,DEC,ASK,BOOT,DIAG,RVF road;
+    class GUARD,STRAT,RGUARD,RPL,DVERD,AMRK,BMRK gate;
     class LES,LOOP,LOOP2,SURV term;
     class FAIL bad;
 ```
@@ -722,9 +750,10 @@ Where to look in the repo:
 | Repair classify / locate / propose | `src/cgx/session/repair/{classify,locate,propose}.py` |
 | DIAGNOSE reasoning rung  | `src/cgx/session/tasks/diagnose.py` + `src/cgx/session/repair/{context,ledger}.py` (Phase 2) |
 | Reasoning-class gate set | `src/cgx/session/repair/classify.py :: DIAGNOSE_CLASSIFICATIONS` + `src/cgx/session/greenfield_edges.py :: _diagnose_dispatch_actions` |
+| Incremental RE_VERIFY (C2) | `src/cgx/session/tasks/re_verify.py` + `src/cgx/session/router.py :: _re_verify_node`/`_re_verify_successors` (Phase 3.2) |
 | PyPI metadata client     | `src/cgx/session/repair/pypi_client.py` (Phase 3.2) |
 | Explore executors        | `src/cgx/session/tasks/{explore,investigate,recommend,plan_change}.py` |
-| Greenfield executors     | `src/cgx/session/tasks/{clarify_requirements,decompose,scaffold,bootstrap_env,api_check,smoke,runtime_verify,repair,diagnose}.py` |
+| Greenfield executors     | `src/cgx/session/tasks/{clarify_requirements,decompose,scaffold,bootstrap_env,api_check,smoke,runtime_verify,repair,diagnose,re_verify}.py` |
 | Contract + coherence gates | `src/cgx/session/scaffold_validate.py :: {check_contract_compliance, cross_check_first_party_imports, check_client_server_payload_coherence}` |
 | Frontend coherence passes | `src/cgx/session/tasks/scaffold.py :: {_synthesize_missing_frontend_stylesheets, _js_import_coherence_failures}` |
 | Targeted build-smoke repair | `src/cgx/session/repair/classify.py :: unresolved_import_sources` + `src/cgx/session/tasks/repair.py :: _build_smoke_target_files` |

@@ -237,6 +237,24 @@ Two deterministic changes, both table/guard-driven and LLM-free:
 
    Every row already exists as a code path; `DIAGNOSE` just *chooses*
    among them with reasoning + memory instead of the current fixed jump.
+3. **Re-verify only the affected gate (C2, implemented).** When the
+   diagnosed source was a `VERIFY` failure, the fix builders stamp a
+   `reverify_origin_gate` + `reverify_report_id` marker onto the spawned
+   `REPAIR`/`BOOTSTRAP_ENV` node. That marker rides `inputs` down the fix
+   chain and, at the edge that would normally re-enter verification
+   (`_apply_to_verify` after a patch, `_bootstrap_to_api_check` after a
+   dependency add/de-scope), the router splices a `TaskKind.RE_VERIFY`
+   node via the shared `_re_verify_node` helper instead of the full
+   `BOOTSTRAP_ENV → API_CHECK → SMOKE → VERIFY` chain. `RE_VERIFY` re-runs
+   pytest against **only** the origin report's failing test file(s) and
+   emits a `VERIFY_REPORT` identical in shape (same `classification` +
+   `failure_signature` + progress counts), so its successor
+   (`_re_verify_successors`) simply delegates to `_verify_successors`:
+   green hands off to `RUNTIME_VERIFY`, a still-failing reasoning-class
+   outcome routes back to `DIAGNOSE` under the shared budget. Non-`VERIFY`
+   origins (and the `regenerate_files` / `adjust_manifest` scoped-scaffold
+   arm) return no marker and run the full chain, so behavior is never
+   worse than before.
 
 ## 9. Observability (cross-cutting requirement)
 
@@ -274,12 +292,16 @@ flowchart LR
     V -- adjust_manifest --> SC["scoped SCAFFOLD"]
     V -- regenerate_files --> SC
     V -- escalate --> RG["whole-tree regenerate / re-plan"]
-    APP --> RV["re-verify affected gate (C2)"]
-    BE --> RV
-    BED --> RV
-    SC --> RV
+    APP --> RVG{"verify-origin<br/>marker? (C2)"}
+    BE --> RVG
+    BED --> RVG
+    RVG -- yes --> RV["RE_VERIFY<br/>(only failing test file(s))"]
+    RVG -- no --> FULL["full BOOTSTRAP_ENV → API_CHECK<br/>→ SMOKE → VERIFY chain"]
+    SC --> FULL
     RV -- still failing --> DIAG
+    FULL -- still failing --> DIAG
     RV -- green --> OK((done))
+    FULL -- green --> OK
     DIAG -. ledger append every round .-> LED[("REPAIR_LEDGER fact")]
 ```
 

@@ -104,6 +104,13 @@ These hold across the codebase; respect them when contributing:
   dependency install/de-scope, or a **scoped** regenerate) instead of
   nuking the whole tree. Deterministic-first: it degrades to `escalate`
   on any provider outage. See **[[Session Based Agent]]**.
+- **Re-verify only what broke.** When a diagnosed fix originated from a
+  `VERIFY` failure, the router splices a **RE_VERIFY** task that re-runs
+  pytest against only the failing test file(s) instead of replaying the
+  whole `BOOTSTRAP_ENV → API_CHECK → SMOKE → VERIFY` chain — the venv is
+  already provisioned and every other gate already passed. Non-`VERIFY`
+  origins run the full chain, so behavior is never worse than before. See
+  **[[Session Based Agent]]**.
 - **Additive persistence.** Index/record writers are add-only and
   degrade gracefully when optional deps (FAISS, ML stack) are absent.
 - **Skills add no agent-layer edits.** New technology support is a

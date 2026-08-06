@@ -68,6 +68,7 @@ CLARIFY_REQUIREMENTS -> ASK_USER(clarify_answers)
                   -> (mechanical failure) REPAIR --> APPLY (re-enters loop)
                   -> (reasoning-class failure) DIAGNOSE
                         --> {REPAIR | BOOTSTRAP_ENV | scoped SCAFFOLD | regenerate}
+                        --> (verify-origin fix) RE_VERIFY (only failing test file(s))
 ```
 
 - **CLARIFY_REQUIREMENTS** asks 3–6 questions about stack, storage,
@@ -122,6 +123,19 @@ install/de-scope, a **scoped** `SCAFFOLD` that regenerates only the named
 files, or today's whole-tree regenerate / re-plan). It is
 **deterministic-first**: a provider outage or garbled reply degrades
 cleanly to `escalate`, so the rung is never worse than before.
+
+**Incremental RE_VERIFY (Phase 3.2, C2).** When a `DIAGNOSE`-driven fix
+originated from a `VERIFY` failure, the router does not replay the whole
+`BOOTSTRAP_ENV → API_CHECK → SMOKE → VERIFY` chain — the venv is already
+provisioned and every other gate already passed. Instead the fix builders
+stamp a marker onto the `REPAIR` / `BOOTSTRAP_ENV` node that rides down
+the fix chain, and at the edge that would re-enter verification the router
+splices a **RE_VERIFY** task that re-runs pytest against **only** the
+origin report's failing test file(s). It emits a shape-identical
+`VERIFY_REPORT`, so a green re-run hands off to `RUNTIME_VERIFY` and a
+still-failing reasoning-class outcome routes back to `DIAGNOSE` under the
+shared budget. Non-`VERIFY` origins (and the scoped-scaffold arm) carry no
+marker and run the full chain, so behavior is never worse than before.
 
 The loop continues **only while the failing-test count strictly drops**
 (absolute ceiling of 4 rounds) and is gated by a failure-signature hash,

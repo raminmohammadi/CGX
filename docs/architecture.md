@@ -547,7 +547,8 @@ matching the convention already used by `cgx.sessions`.
   `BOOTSTRAP_ENV`, `API_CHECK` (**Phase 2.2**), `SMOKE`
   (**Phase 2.1**), `RUNTIME_VERIFY` (**P1**), `REPAIR`, `DIAGNOSE`
   (**Phase 2**, the reasoning rung between `REPAIR` and whole-tree
-  regenerate).
+  regenerate), `RE_VERIFY` (**Phase 3.2**, the incremental gate that
+  re-runs only the affected test file(s) after a scoped fix).
 * Shared: `APPLY`, `VERIFY`, `ASK_USER`, plus utility kinds
   `SEARCH` / `SUMMARIZE`.
 
@@ -716,6 +717,19 @@ Five entry points cover every transition:
                                      bounds the install loop)
   REPAIR (empty plan)  -> ASK_USER(freeform)
   APPLY (repair)       -> VERIFY (no BOOTSTRAP_ENV)
+  # (Phase 3.2, C2): a DIAGNOSE-driven fix whose origin gate was VERIFY
+  # carries a reverify_origin_gate + reverify_report_id marker down its
+  # inputs; at the edge that would re-enter verification the router splices
+  # RE_VERIFY (scoped pytest re-run of only the failing test file(s))
+  # instead of the full BOOTSTRAP_ENV -> API_CHECK -> SMOKE -> VERIFY chain.
+  APPLY (repair, verify-origin marker)
+                       -> RE_VERIFY (_re_verify_node: scoped re-run;
+                                     emits a shape-identical VERIFY_REPORT)
+  BOOTSTRAP_ENV (repair, verify-origin marker)
+                       -> RE_VERIFY (same splice at _bootstrap_to_api_check)
+  RE_VERIFY            -> RUNTIME_VERIFY (passed) | DIAGNOSE (reasoning-class
+                          failure, shared budget) -- _re_verify_successors
+                          delegates to _verify_successors
   ```
 * `on_task_failed(session, failed, tasks, retryable=False)` --
   terminal transition for a *hard* failure (an executor that returned
@@ -992,6 +1006,9 @@ flowchart LR
     DISP -- "add / remove_dependency" --> BOOT
     DISP -- "adjust_manifest / regenerate_files / escalate" --> SCA
     REP --> RP --> APP
+    APP -.->|"verify-origin marker (C2)"| RVF(["RE_VERIFY hwy<br/>only failing test file(s)"])
+    BOOT -.->|"verify-origin marker (C2)"| RVF
+    RVF --> VR
 
     IC -- "budget spent / flap" --> FAIL((FAILED))
     IC2 -- "budget spent" --> FAIL
@@ -1000,7 +1017,7 @@ flowchart LR
     classDef freight fill:#e9d8a6,stroke:#b08968,color:#222;
     classDef gate fill:#7d5ba6,stroke:#4c3575,color:#fff;
     classDef term fill:#4c956c,stroke:#2c6e49,color:#fff;
-    class DEC,SCA,APP,BOOT,VER,RUN,REP,DIAG road;
+    class DEC,SCA,APP,BOOT,VER,RUN,REP,DIAG,RVF road;
     class WP,SP,VR,RR,RP,DG freight;
     class IC,IC2,DISP gate;
     class DONE,FAIL term;
@@ -1043,6 +1060,7 @@ flowchart TB
         RPR["repair.py<br/>_retrieval_relevant_files"]
         CLS["classify.py<br/>traceback_source_files"]
         AUTO["pipeline/auto.py<br/>run_query_auto"]
+        RVF["re_verify.py<br/>scoped pytest re-run (C2)"]
       end
     end
 
@@ -1059,10 +1077,12 @@ flowchart TB
     RTR -->|"funds another round?"| RPR
     CLS -->|"crash-frame files"| RPR
     AUTO -->|"index-relevant files"| RPR
+    RTR -->|"verify-origin fix -> scoped re-run (C2)"| RVF
+    RVF -->|"scoped VERIFY_REPORT"| RTR
 
     classDef choc fill:#6f4e37,stroke:#3e2723,color:#fff;
     classDef tray fill:#f3e5d8,stroke:#c9a27e,color:#222;
-    class DECM,ENG,SCAF,SV,RTV,VFY,RTR,DGN,LED,RPR,CLS,AUTO choc;
+    class DECM,ENG,SCAF,SV,RTV,VFY,RTR,DGN,LED,RPR,CLS,AUTO,RVF choc;
 ```
 
 Flavour-pairing key: `decompose -> engine` (contracts sweeten every
@@ -1222,6 +1242,7 @@ Concrete executors:
 | `tasks/verify.py`                   | `VERIFY_REPORT` artifact via the impacted-tests runner. Reads `python_exe` from the upstream `BUILD_REPORT` (when present) so pytest runs inside the project venv; classifies pytest's exit code into an `outcome` token (`passed` / `assertions_failed` / `collection_error` / `no_tests_collected` / `timeout` / `pytest_missing` / `skipped`). Invokes pytest with `--junitxml=<tmp> -rN --tb=long` and parses the XML into a structured `failures: [{nodeid, type, message, traceback}]` list via stdlib `xml.etree` (**Phase 3.1**) so the classifier consumes typed records rather than re-regexing stdout. Persists a `reproduce_cmd` -- a single `shlex.quote`-escaped shell line that re-runs the exact failing pytest invocation under the project venv (**Phase 1.2**) -- which the UI renders above the stdout pane. Also computes and stores a `failure_signature` (sha1 of outcome + returncode + first error line, truncated) so the router's progress detector can compare attempts without re-reading the artifact. In greenfield mode, "no tests discovered yet" reports `ran=False` + `skipped_reason` instead of failing. Emits `passing_count` / `collected_count` for the router's coverage-aware progress ledger; on a *non-executing* outcome (`collection_error` / `timeout` / `pytest_missing`) `_progress_counts` forces `passing_count=0` (leaving `failing_count` unknown unless junit enumerated an erroring module) so an empty junit is read as "nothing ran", never as false forward progress (**#1**). The JS/TS half runs through `NpmRunner`, which invokes the real `test` script (`vitest`/`jest`, `ran_tests=True`) when one exists and only falls back to a `npm run build` smoke (`ran_tests=False` → `no_tests`) otherwise. **JS coverage signal (P1b)**: `NpmRunner` also reports `tests_present` (`_has_js_test_files` walks the tree, pruning `node_modules`/build dirs, for `*.test.*` / `*.spec.*` / `__tests__/*`), which `_combine_verify_outcomes` threads into the report as `js_tests_present` / `js_tests_ran`. This exposes the ses_4cbf963cdc67435a masking hole -- a scaffolded React suite that only got a build smoke reports `no_tests` for the JS half but the merged worst-case token stays `passed` on the green Python half -- as an explicit `js_tests_present=True` / `js_tests_ran=False` pair for P2's terminal fail-closed policy, rather than letting it hide behind the passing Python signal. |
 | `tasks/repair.py`                   | `REPAIR_PLAN` artifact: reads the upstream `VERIFY_REPORT` / `SMOKE_REPORT` / `API_CHECK_REPORT`, classifies the failure via `cgx.session.repair.classify` (deterministic, LLM-free; refactored to a small registry in **Phase 3.2**), locates offending classes/modules/fixtures via `cgx.session.repair.locate` (AST scan + project-root resolution), and emits unified diffs via `cgx.session.repair.propose` shaped for the shared APPLY executor. v1 classifications: `unittest_pytest_mix`, `missing_module_pythonpath` (Fix G2: `locate_missing_module_pythonpath` only resolves a target when its *full* dotted path exists on disk via `_dotted_path_resolves` -- a genuine sys.path gap yields a `conftest.py` diff and stays on the `patch` branch, whereas a missing *leaf* module such as `tests.auth` where `tests/` exists but `tests/auth.py` does not produces no diff and, because `missing_module_pythonpath` is now in `_REGENERATE_CLASSES`, routes to `strategy=regenerate` rather than being papered over with an unhelpful pythonpath patch), `missing_fixture`, `hallucinated_api`, and `third_party_import_break` (**Phase 3.2**, recognises `ImportError: cannot import name '<x>' from '<pkg>'` and `ModuleNotFoundError` for third-party modules; `propose_third_party_pin` reads `installed_packages` from BUILD_REPORT, queries `https://pypi.org/pypi/{pkg}/{version}/json` via `cgx.session.repair.pypi_client` -- on-disk cache under `~/.cgx/pypi-cache/`, fake-fetcher DI for tests -- computes a corrective pin from the peer-dependency table, and emits a `requirements.txt` diff), `first_party_symbol_mismatch` (**Part 3** -- the pure classifier is disk-free and still reports the raw `third_party_import_break` shape for `cannot import name '<x>' from '<Y>'`, but the REPAIR executor re-resolves each imported-from module `Y` via `locate._dotted_path_resolves`: when `Y` is a *first-party* module on disk under `project_root` it imported cleanly yet never bound `<x>`, which no PyPI pin can add, so the executor re-classifies to this token, extracts the exact `symbol`/`module` pairs via `classify.import_name_breaks`, and -- because the token is in `_REGENERATE_CLASSES` and handled by `_select_repair_strategy` -- routes to `strategy=regenerate` naming the missing symbols and forbidding a dependency pin; only a genuinely third-party `Y` stays on the PyPI-pin path, fixing the flap where a first-party miss was pinned against a nonexistent package), plus the newer `missing_dependency` (a `requires the <pkg> package to be installed` RuntimeError names the exact distribution via `required_package_names`; a `ModuleNotFoundError` whose top-level name nothing under the project root claims falls back here via `_pip_installable_roots`), `circular_import` (`partially initialized module` -- `circular_import_modules` extracts the cycle members for the regenerate constraint), `relative_import_error` (`attempted relative import beyond top-level package`), `empty_test_suite` (pytest exit 5 with test files selected), and `collection_error` (**#2** -- pytest exit 2/3/4, a first-party import/usage error surfaced at collection time that a re-scaffold structurally cannot fix, returned as its own first-class token so an empty deterministic plan escalates to `ASK_USER` rather than looping the regenerate budget). `_select_repair_strategy` then chooses among three branches (**Phase 6.1**): `strategy=patch` (≤5 diffs in a patchable class) writes through the shared APPLY executor; `strategy=regenerate` (no diffs in a regenerate-eligible class, or >5 diffs; always for SMOKE / API_CHECK breaks) -- the router walks up to the nearest `SCAFFOLD` ancestor via `propose_regenerate`, marks every live descendant `ABANDONED`, and re-queues a fresh `SCAFFOLD` with bumped `regenerate_attempt`, `regenerate_constraints` appended to its `inputs`, and a `regenerated_from_task_id` back-pointer (syntax churn capped at `REGENERATE_BUDGET=3` per manifest, semantic rewrites of an applied tree at `REPAIR_REGENERATE_BUDGET=2` per ancestor chain; the failed chain's `prior_failure_signatures` are folded into the fresh SCAFFOLD by `propose_regenerate` and threaded down its APPLY → … → VERIFY chain by `_scaffold_to_apply`, so a regenerate that reproduces the identical signature is stopped by the flap detector; a JS build-smoke `Could not resolve "<spec>" from "<file>"` whose importer was generated is repaired *proportionately* -- `_build_smoke_target_files` (via `classify.unresolved_import_sources`) names the on-disk importer(s) under `extra_constraints.target_files` and the router regenerates only those against the prior `SCAFFOLD_PATCHES` artifact via `regenerate_files` + `prior_scaffold_artifact_id`, reusing every prior-good diff instead of re-authoring the whole tree, which reproduced the identical miss in ses_aa99f1fb6914488d); `strategy=install_deps` (`missing_dependency` only, no diffs) -- the router re-queues a `BOOTSTRAP_ENV` whose preflight installs the explicit `missing_modules` and syncs `requirements.txt`, then flows back through `API_CHECK` → `SMOKE` → `VERIFY` under the shared repair budget. Content carries `classification`, `failure_signature`, `repair_attempt`, `strategy`, `extra_constraints`, `rationale`, `locations`, and `diffs` (plus `missing_modules` on an install-deps plan). Empty diffs (classification `unknown`, or proposer marker already present) escalate via the router to `ASK_USER(freeform)`. *(greenfield mode)* |
 | `tasks/diagnose.py` *(Phase 2)*     | `DIAGNOSIS` artifact: the **reasoning rung** between a mechanical `REPAIR` and a whole-tree regenerate, reached only for a *reasoning-class* gate failure (`assertion_drift` / `collection_error` / `unknown` / `runtime_failure` -- the shared `cgx.session.repair.classify.DIAGNOSE_CLASSIFICATIONS` set; mechanical tokens keep their instant `REPAIR` fast path). **Deterministic-first**: it reuses the `classify` / `locate` plumbing before it ever calls the model, so a provider outage or garbled reply degrades cleanly to `escalate` (never worse than today). It normalizes the upstream `VERIFY_REPORT` / `SMOKE_REPORT` / `API_CHECK_REPORT` / `RUNTIME_REPORT` / `BUILD_REPORT` into one `FailureContext` (error text, `failure_signature`, traceback files, installed packages, goal, manifest -- P2.2), then runs a **bounded, read-only ReAct loop** (`DIAGNOSE_STEPS=3` tool calls -- read file / grep / inspect installed pkgs) under the shared `REPAIR_BUDGET`, consulting the `REPAIR_LEDGER` fact (P2.4) so it never repeats an action a prior round already tried. Emits a typed `DIAGNOSIS` carrying `root_cause`, `confidence`, and a single `minimal_action ∈ {patch_files, add_dependency, remove_dependency, adjust_manifest, regenerate_files, escalate}` plus `target_files` / `add_dependencies` / `remove_dependencies`; those dependency lists are mirrored into `outputs` so the pure router's `_diagnose_dispatch_actions` guard can dispatch `BOOTSTRAP_ENV` without reading the artifact. The LLM call is `trace_llm_call`-wrapped and the executor emits `diagnose_step` (per tool use) + `diagnose_verdict` (`minimal_action`, `confidence`, `signature`) trace records. *(greenfield mode)* |
+| `tasks/re_verify.py` *(Phase 3.2, C2)* | `VERIFY_REPORT` artifact (shape-identical to `VERIFY`'s): the **incremental re-verification** gate, spawned only after a `DIAGNOSE`-driven scoped fix whose origin gate was `VERIFY`. The fix builders stamp a `reverify_origin_gate` + `reverify_report_id` marker onto the `REPAIR` / `BOOTSTRAP_ENV` node; the marker rides `inputs` down the fix chain and at the edge that would re-enter verification (`_apply_to_verify` after a patch, `_bootstrap_to_api_check` after a dependency add/de-scope) the router splices `RE_VERIFY` via the shared `_re_verify_node` helper instead of the full `BOOTSTRAP_ENV → API_CHECK → SMOKE → VERIFY` chain -- the venv is already provisioned and every other gate already passed. `run_re_verify` reuses the `verify.py` helpers to re-run pytest against **only** the origin report's failing test file(s) (`_failing_test_files` resolves each junit `nodeid`'s dotted classname back to a selected file, falling back to the full selected set so a re-run never exercises zero tests) and emits a `VERIFY_REPORT` with the same `classification` + `failure_signature` + progress counts plus a `reverify=True` provenance marker. Its successor (`_re_verify_successors`) delegates to `_verify_successors`, so a green re-run hands off to `RUNTIME_VERIFY` and a still-failing reasoning-class outcome routes back to `DIAGNOSE` under the shared budget; `on_task_completed` treats `RE_VERIFY` like `VERIFY` for lesson + terminal-session actions. Emits a `re_verify` trace record (`outcome`, `classification`, `signature`, `scoped_files`, `origin_report_id`). *(greenfield mode)* |
 | `tasks/ask.py`                      | Pseudo-executor: surfaces the question payload; the runner keeps the task at `IN_PROGRESS` until `build_decision` consumes a user reply. |
 
 `ExecutorDeps` carries optional `project_root`, `index_dir`,
