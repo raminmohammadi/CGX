@@ -72,6 +72,12 @@ def run_bootstrap_env(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     applied_files = _resolve_applied_files(task, deps)
     timeout = float(task.inputs.get("timeout_seconds") or 300.0)
 
+    if project_type == "unknown":
+        if task.inputs.get("missing_modules"):
+            project_type = "python"
+        elif any(f.endswith(".py") for f in applied_files):
+            project_type = "python"
+
     if project_type == "node":
         return _bootstrap_node(task, root, applied_files, timeout)
 
