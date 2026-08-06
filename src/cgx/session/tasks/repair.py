@@ -647,7 +647,12 @@ def _run_smoke_repair(task: TaskNode, deps: ExecutorDeps,
         # the router regenerates only these files against the prior scaffold
         # (reusing every prior-good diff) instead of re-authoring the tree.
         extra_constraints["target_files"] = list(target_files)
-    strategy = "install_deps" if failed else "regenerate"
+    if failed:
+        strategy = "install_deps"
+    elif missing_entries or target_files:
+        strategy = "regenerate"
+    else:
+        strategy = "escalate"
     artifact = Artifact.new(
         session_id=task.session_id,
         produced_by_task_id=task.task_id,
