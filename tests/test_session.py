@@ -9777,7 +9777,7 @@ def test_repair_executor_emits_smoke_repair_plan(store, tmp_path: Path):
 def test_repair_executor_emits_regenerate_for_build_smoke_failure(
         store, tmp_path: Path):
     """A JS build-smoke break -> strategy=regenerate with targeted files.
-    
+
     If the error names a file (e.g. TS2345 in App.jsx), it should be extracted
     and used for a targeted AST regeneration instead of escalating.
     """
@@ -9804,12 +9804,12 @@ def test_repair_executor_emits_regenerate_for_build_smoke_failure(
         inputs={"smoke_artifact_id": smoke_artifact.artifact_id,
                 "mode": SessionMode.GREENFIELD.value,
                 "repair_attempt": 1})
-    
+
     # Touch the file so the target file extractor confirms it exists
     src_dir = tmp_path / "src"
     src_dir.mkdir()
     (src_dir / "App.jsx").touch()
-    
+
     deps = ExecutorDeps(project_root=str(tmp_path), store=store)
     from cgx.session.tasks.base import _REGISTRY
     result = _REGISTRY[TaskKind.REPAIR](repair_task, deps)
@@ -15386,6 +15386,47 @@ def test_ast_fallback_rejects_empty_output(store):
     content = result.artifact.content
     assert content["generated"] == []
     assert [f["file"] for f in content["failed"]] == ["tests/test_core.py"]
+
+
+def test_ast_fallback_rejects_undefined_first_party_import(store):
+    """A hallucinated first-party import must fail the file, not ship it.
+
+    The fallback runs only after SCAFFOLD's gates rejected a file twice,
+    yet it marked everything it assembled ``syntax_ok=True``. SCAFFOLD's
+    own cross-file import check now runs over the assembled tree.
+    """
+    from cgx.session.models import SessionMode
+    from cgx.session.tasks.ast_scaffold import run_ast_scaffold
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    work_plan = Artifact.new(
+        session_id=session.session_id, produced_by_task_id="t_plan",
+        kind=ArtifactKind.WORK_PLAN,
+        content={"contracts": {"project_skeleton":
+                               "# --- app/core.py ---\n"
+                               "def add(a, b):\n    ...\n"
+                               "# --- tests/test_core.py ---\n"
+                               "def test_add():\n    ...\n"}})
+    store.save_artifact(work_plan)
+    provider = _RecordingProvider([
+        "import math\n",
+        "def add(a, b):\n    return a + b\n",
+        "from app.core import subtract\n",
+        "def test_add():\n    assert True\n",
+    ])
+    task = TaskNode.new(
+        session.session_id, TaskKind.AST_REGENERATE, "regenerate",
+        inputs={"work_plan_artifact_id": work_plan.artifact_id,
+                "prior_goal": "g",
+                "regenerate_files": ["app/core.py", "tests/test_core.py"]})
+    result = run_ast_scaffold(
+        task, ExecutorDeps(store=store, provider=provider))
+    content = result.artifact.content
+    assert [g["file"] for g in content["generated"]] == ["app/core.py"]
+    assert [d["file"] for d in content["diffs"]] == ["app/core.py"]
+    failed = content["failed"]
+    assert [f["file"] for f in failed] == ["tests/test_core.py"]
+    assert "subtract" in failed[0]["error"]
 
 
 def test_api_check_probe_resolves_lazy_submodules(tmp_path):

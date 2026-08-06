@@ -138,6 +138,60 @@ def _assembly_rejection(content: str,
     return None
 
 
+def _demote_import_failures(generated: List[Dict[str, Any]],
+                            diffs: List[Dict[str, Any]],
+                            failed: List[Dict[str, str]],
+                            regenerated: set) -> int:
+    """Move files importing undefined first-party symbols into ``failed``.
+
+    The fallback fires only after SCAFFOLD's own gates rejected a file
+    twice, yet it handed its output to APPLY unchecked. Run SCAFFOLD's
+    cross-file import check over the assembled tree and fail any file
+    this round regenerated that imports a name the target module never
+    defines, so the router builds a targeted regenerate instead of
+    shipping a broken import.
+
+    Best-effort, matching the scaffold convention: any error in the
+    checker abstains and leaves the tree untouched. Returns the number of
+    files demoted.
+    """
+    contents = {e["file"]: e["content"] for e in generated
+                if isinstance(e, dict) and e.get("file")
+                and isinstance(e.get("content"), str)}
+    if not contents:
+        return 0
+    try:
+        from cgx.session.scaffold_validate import (
+            cross_check_first_party_imports)
+        warnings = cross_check_first_party_imports(contents)
+    except Exception:  # pragma: no cover - defensive: checker is best-effort
+        logger.exception("AST fallback: import cross-check raised; skipping")
+        return 0
+
+    reasons: Dict[str, List[str]] = {}
+    for w in warnings:
+        path = str(w.get("file") or "")
+        if path not in regenerated:
+            continue
+        reasons.setdefault(path, []).append(
+            f"{w.get('name')!r} is not defined in {w.get('module')!r}")
+    if not reasons:
+        return 0
+
+    for path, msgs in reasons.items():
+        logger.warning("AST fallback rejected %s: %s", path, "; ".join(msgs))
+        failed.append({
+            "file": path,
+            "error": ("AST fallback imported undefined first-party "
+                      f"symbol(s): {'; '.join(msgs)}"),
+        })
+    generated[:] = [e for e in generated
+                    if not (isinstance(e, dict) and e.get("file") in reasons)]
+    diffs[:] = [d for d in diffs
+                if not (isinstance(d, dict) and d.get("file") in reasons)]
+    return len(reasons)
+
+
 @register_executor(TaskKind.AST_REGENERATE)
 @traced("ast_scaffold.run")
 def run_ast_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
@@ -314,6 +368,9 @@ def run_ast_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
                 index=progress_done, total=total_files,
                 status="failed", elapsed_ms=int((time.time() - started) * 1000),
                 failed_count=progress_failed)
+
+    _demote_import_failures(
+        generated, diffs, failed, {p for p in regen_files if p})
 
     artifact = Artifact.new(
         session_id=task.session_id,
