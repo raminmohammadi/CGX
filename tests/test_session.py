@@ -118,6 +118,23 @@ def test_dataclass_to_dict_uses_enum_string_values():
     assert d["stale"] is False
 
 
+def test_diagnose_model_kinds_present_and_round_trip():
+    # P2.1: the reasoning rung's typed additions exist with the exact
+    # string values the pure router / store serialization depend on.
+    assert TaskKind.DIAGNOSE.value == "diagnose"
+    assert ArtifactKind.DIAGNOSIS.value == "diagnosis"
+    assert FactKind.REPAIR_LEDGER.value == "repair_ledger"
+    assert TaskKind("diagnose") is TaskKind.DIAGNOSE
+    assert ArtifactKind("diagnosis") is ArtifactKind.DIAGNOSIS
+    assert FactKind("repair_ledger") is FactKind.REPAIR_LEDGER
+
+    ledger = Fact.new("ses_x", FactKind.REPAIR_LEDGER, {"attempts": []})
+    assert ledger.to_dict()["kind"] == "repair_ledger"
+    diag = Artifact.new("ses_x", "task_x", ArtifactKind.DIAGNOSIS,
+                        {"minimal_action": "escalate"})
+    assert diag.to_dict()["kind"] == "diagnosis"
+
+
 # --------------------- store round-trips ---------------------
 
 def test_save_and_get_session_round_trip(store: SessionStore):

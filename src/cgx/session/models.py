@@ -70,6 +70,14 @@ class TaskKind(str, enum.Enum):
     mismatch). It emits a typed plan; the existing APPLY executor
     consumes it like any other diff source.
 
+    DIAGNOSE is the reasoning rung between the mechanical REPAIR patch
+    and the whole-tree regenerate: spawned for the ambiguous
+    ``_DIAGNOSE_CLASSES`` failures, it runs the deterministic
+    classifiers first and only falls back to a bounded, read-only ReAct
+    loop over the failure + repo + repair ledger. It emits a typed
+    DIAGNOSIS artifact whose ``minimal_action`` the pure router
+    dispatches to an existing successor.
+
     RUNTIME_VERIFY is the post-VERIFY runtime gate (greenfield only):
     once the unit suite the model wrote passes, it boots the scaffolded
     app / import-and-call smokes the entry modules so "the tests pass"
@@ -92,6 +100,7 @@ class TaskKind(str, enum.Enum):
     API_CHECK = "api_check"
     SMOKE = "smoke"
     REPAIR = "repair"
+    DIAGNOSE = "diagnose"
     AST_REGENERATE = "ast_regenerate"
 
 
@@ -101,6 +110,10 @@ class FactKind(str, enum.Enum):
     PARAMETER = "parameter"
     ANCHOR = "anchor"
     LLM_CALL = "llm_call"
+    # Durable working memory of attempted repair actions + outcomes
+    # threaded along one repair chain, so DIAGNOSE never repeats a
+    # failed action (see docs/diagnose-design.md §7).
+    REPAIR_LEDGER = "repair_ledger"
 
 
 class ArtifactKind(str, enum.Enum):
@@ -119,6 +132,10 @@ class ArtifactKind(str, enum.Enum):
     API_CHECK_REPORT = "api_check_report"
     SMOKE_REPORT = "smoke_report"
     REPAIR_PLAN = "repair_plan"
+    # Typed output of the DIAGNOSE executor: a one-line root cause plus a
+    # closed ``minimal_action`` the pure router dispatches (see
+    # docs/diagnose-design.md §5).
+    DIAGNOSIS = "diagnosis"
 
 
 class DecisionKind(str, enum.Enum):

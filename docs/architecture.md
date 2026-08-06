@@ -535,8 +535,8 @@ matching the convention already used by `cgx.sessions`.
 |----------------|---------|
 | `Session`      | Root aggregate: `original_objective`, `project_root`, `root_task_id`, `status`, timestamps. Carries the **Phase E** session budget: config `max_task_runs`, `max_wall_seconds`, `headless` (explore defaults to unlimited/off; a greenfield session seeds a finite `GREENFIELD_MAX_TASK_RUNS=60` / `GREENFIELD_MAX_WALL_SECONDS=3600` backstop in `SessionRunner.start_session` unless the caller passes an explicit cap) plus live counters `task_runs` and `first_task_started_at`. The store round-trips the new fields with backward-compatible `.get()` defaults, so pre-existing sessions load unchanged. |
 | `TaskNode`     | One node in the per-session DAG. Carries `kind`, `name`, `description`, `parent_task_id`, `status`, `inputs`, `outputs`, `produced_artifact_id`, `consumed_decision_ids`, `error`, lifecycle timestamps. |
-| `Fact`         | Append-only piece of session knowledge (`FILE` / `SYMBOL` / `PARAMETER` / `ANCHOR` / `LLM_CALL`). `LLM_CALL` facts (**Phase 5.1**) carry `{provider, model, sampling_params, prompt, response, latency_ms, tokens_in, tokens_out, source_task_id, role}` recorded by every LLM call site in `cgx.answer.engine`, `clarify_requirements.py`, `decompose.py`, and `scaffold.py` via `cgx.session.llm_trace.trace_llm_call`. Updates set `stale=True` rather than mutating `content`. |
-| `Artifact`     | Typed output produced by a finished task. Explore-mode kinds: `DIRECTIONS_LIST`, `FINDINGS_BUNDLE`, `RECOMMENDATION_LIST`, `CODE_CHANGE_PLAN`. Greenfield-mode kinds: `REQUIREMENTS_SHEET`, `WORK_PLAN`, `SCAFFOLD_PATCHES`, `BUILD_REPORT`, `API_CHECK_REPORT`, `SMOKE_REPORT`, `REPAIR_PLAN`. Shared write-loop kinds: `APPLIED_CHANGES`, `VERIFY_REPORT`, `SESSION_DIGEST`. |
+| `Fact`         | Append-only piece of session knowledge (`FILE` / `SYMBOL` / `PARAMETER` / `ANCHOR` / `LLM_CALL` / `REPAIR_LEDGER`). `LLM_CALL` facts (**Phase 5.1**) carry `{provider, model, sampling_params, prompt, response, latency_ms, tokens_in, tokens_out, source_task_id, role}` recorded by every LLM call site in `cgx.answer.engine`, `clarify_requirements.py`, `decompose.py`, and `scaffold.py` via `cgx.session.llm_trace.trace_llm_call`. `REPAIR_LEDGER` facts (**Phase 2**) are the durable working memory of attempted repair actions + outcomes threaded along one repair chain so `DIAGNOSE` never repeats a failed action. Updates set `stale=True` rather than mutating `content`. |
+| `Artifact`     | Typed output produced by a finished task. Explore-mode kinds: `DIRECTIONS_LIST`, `FINDINGS_BUNDLE`, `RECOMMENDATION_LIST`, `CODE_CHANGE_PLAN`. Greenfield-mode kinds: `REQUIREMENTS_SHEET`, `WORK_PLAN`, `SCAFFOLD_PATCHES`, `BUILD_REPORT`, `API_CHECK_REPORT`, `SMOKE_REPORT`, `REPAIR_PLAN`, `DIAGNOSIS` (**Phase 2**, the `DIAGNOSE` executor's typed verdict). Shared write-loop kinds: `APPLIED_CHANGES`, `VERIFY_REPORT`, `SESSION_DIGEST`. |
 | `Decision`     | Structured record of a user choice resolving an `ASK_USER`. Downstream tasks reference decisions by `decision_id`. |
 | `KnowledgeBase` / `DecisionLog` | Per-session views over the facts and decisions tables. |
 
@@ -545,7 +545,9 @@ matching the convention already used by `cgx.sessions`.
 * Explore loop: `EXPLORE`, `INVESTIGATE`, `RECOMMEND`, `PLAN_CHANGE`.
 * Greenfield loop: `CLARIFY_REQUIREMENTS`, `DECOMPOSE`, `SCAFFOLD`,
   `BOOTSTRAP_ENV`, `API_CHECK` (**Phase 2.2**), `SMOKE`
-  (**Phase 2.1**), `RUNTIME_VERIFY` (**P1**), `REPAIR`.
+  (**Phase 2.1**), `RUNTIME_VERIFY` (**P1**), `REPAIR`, `DIAGNOSE`
+  (**Phase 2**, the reasoning rung between `REPAIR` and whole-tree
+  regenerate).
 * Shared: `APPLY`, `VERIFY`, `ASK_USER`, plus utility kinds
   `SEARCH` / `SUMMARIZE`.
 
