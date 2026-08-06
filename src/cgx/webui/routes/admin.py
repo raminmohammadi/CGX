@@ -30,31 +30,54 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["admin"])
 
 
+def _known_project_roots() -> List[str]:
+    """Distinct project roots seen in the activity store (trusted internal).
+
+    The request never supplies the root set, so an attacker cannot inject an
+    arbitrary path -- the trace reader and the ``scope=all`` delete sweep
+    both draw their project roots from here, not from raw request input.
+    """
+    roots: List[str] = []
+    try:
+        from cgx.activity import get_default_run_store
+        seen = set()
+        for run in get_default_run_store().recent(limit=500):
+            root = run.get("project_root")
+            if root and root not in seen:
+                seen.add(root)
+                roots.append(root)
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning("admin: project-root enumeration failed: %s", e)
+    return roots
+
+
 def _log_path(project_root: Optional[str]) -> Path:
-    """Trace source: a project's ``.cgx/agent.log`` or the global fallback."""
-    if project_root:
-        safe_project_root = project_root.replace("\r", "\\r").replace("\n", "\\n")
-        base = Path.cwd().resolve()
-        raw = Path(os.fspath(project_root))
-        if raw.is_absolute():
-            logger.warning("admin log path rejected absolute input: %s", safe_project_root)
-            return fallback_trace_log_path()
-        # Reject ambiguous/dangerous relative forms before any join.
-        if (
-            str(rel) in {"", ".", ".."}
-            or rel.is_absolute()
-            or any(part == ".." for part in rel.parts)
-        ):
-        if rel.parts and rel.parts[0] == "..":
-            logger.warning("admin log path rejected traversal input: %s", safe_project_root)
-            return fallback_trace_log_path()
-        candidate = (base / rel).resolve()
+    """Trace source: a project's ``.cgx/agent.log`` or the global fallback.
+
+    ``project_root`` is caller-controlled, so it is never used to build a
+    filesystem path directly. Instead it must **exactly match** (after
+    :func:`os.path.realpath` canonicalisation) one of the project roots the
+    activity store has already recorded -- a closed allow-list of paths CGX
+    itself produced. Any value not on that list (including traversal or
+    symlink tricks) falls back to the global log, so untrusted input can
+    never steer the reader at an arbitrary file.
+    """
+    if not project_root:
+        return fallback_trace_log_path()
+    safe = project_root.replace("\r", "\\r").replace("\n", "\\n")
+    try:
+        want = os.path.realpath(os.fspath(project_root))
+    except OSError:  # pragma: no cover - defensive
+        logger.warning("admin log path rejected (bad path): %s", safe)
+        return fallback_trace_log_path()
+    for known in _known_project_roots():
         try:
-            candidate.relative_to(base)
-        except ValueError:
-            logger.warning("admin log path rejected outside base: %s", safe_project_root)
-            return fallback_trace_log_path()
-        return candidate / ".cgx" / "agent.log"
+            if os.path.realpath(known) == want:
+                # Trailing components are compile-time constants.
+                return Path(want) / ".cgx" / "agent.log"
+        except OSError:  # pragma: no cover - defensive
+            continue
+    logger.warning("admin log path rejected (unknown project root): %s", safe)
     return fallback_trace_log_path()
 
 
@@ -107,26 +130,6 @@ def admin_logs(
     return JSONResponse({"source": str(path), "logs": rows, "count": len(rows)})
 
 
-def _known_project_roots() -> List[str]:
-    """Distinct project roots seen in the activity store (trusted internal).
-
-    Used only by the ``scope=all`` sweep; the request never supplies the
-    root set, so an attacker cannot inject arbitrary paths to delete.
-    """
-    roots: List[str] = []
-    try:
-        from cgx.activity import get_default_run_store
-        seen = set()
-        for run in get_default_run_store().recent(limit=500):
-            root = run.get("project_root")
-            if root and root not in seen:
-                seen.add(root)
-                roots.append(root)
-    except Exception as e:  # pragma: no cover - defensive
-        logger.warning("admin delete: project-root enumeration failed: %s", e)
-    return roots
-
-
 @router.delete("/admin/logs")
 def delete_logs(
     project_root: Optional[str] = Query(None),
@@ -141,10 +144,13 @@ def delete_logs(
     * ``project_root=<path>`` -- purge just that project's ``agent.log``.
     * neither -- purge just the global fallback log.
 
-    Deletion is delegated to helpers that only ever unlink files literally
-    named ``cgx-trace.log`` / ``agent.log`` (plus rotation backups), refuse
-    symlinks, and require a regular file -- so a caller-supplied
-    ``project_root`` cannot be leveraged to remove anything else.
+    A caller-supplied ``project_root`` must **exactly match** (after
+    canonicalisation) a project root the activity store already recorded --
+    the same closed allow-list the trace reader uses -- so untrusted input
+    cannot steer the delete at an arbitrary path. On top of that, deletion
+    is delegated to helpers that only ever unlink files literally named
+    ``cgx-trace.log`` / ``agent.log`` (plus rotation backups), refuse
+    symlinks, and require a regular file.
     """
     removed = 0
     targets: List[str] = []
@@ -157,6 +163,13 @@ def delete_logs(
                 removed += n
                 targets.append(root)
     elif project_root:
+        want = os.path.realpath(os.fspath(project_root))
+        known = any(os.path.realpath(r) == want for r in _known_project_roots())
+        if not known:
+            safe = project_root.replace("\r", "\\r").replace("\n", "\\n")
+            logger.warning("admin delete rejected (unknown project root): %s", safe)
+            return JSONResponse({"deleted": 0, "scope": "single",
+                                 "targets": [], "rejected": True})
         removed += delete_project_trace_log(project_root)
         targets.append(project_root)
     else:

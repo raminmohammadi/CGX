@@ -34,6 +34,7 @@ Pick the path that matches what you need right now.
 | Choose a provider / model for my hardware     | **[[Providers and Models]]** |
 | Tune retrieval, caching, or rate limits       | **[[Configuration and Tuning]]** |
 | Understand what leaves my machine             | **[[Privacy and Security]]** |
+| Decode the Ops hub tab by tab (cards, charts, buttons) | **[[Ops and Observability]]** |
 | Run CGX in production (metrics, deploy)        | **[[MLOps and Production]]** |
 | Read the internals as a contributor           | **[[Architecture]]** · **[[Contributing]]** |
 | Fix a problem                                 | **[[Troubleshooting and FAQ]]** |
