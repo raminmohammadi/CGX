@@ -1,8 +1,9 @@
+import ast
 import logging
 import os
 import re
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 from cgx.session.models import Artifact, ArtifactKind, TaskKind, TaskNode
 from cgx.session.tasks.base import ExecutorDeps, ExecutorResult, register_executor
@@ -110,6 +111,31 @@ def _resolve_goal(task: TaskNode, deps: ExecutorDeps,
     except Exception:  # pragma: no cover - defensive: store hiccup
         return ""
     return str(getattr(session, "original_objective", "") or "").strip()
+
+
+def _assembly_rejection(content: str,
+                        symbols: List[Tuple[str, str]],
+                        module: ast.Module) -> Optional[str]:
+    """Why the assembled file must not be handed to APPLY, if it must not.
+
+    ``ASTAssembler`` degrades to an empty module when the header does not
+    parse and silently drops components that do not, so ``unparse`` can
+    succeed on nothing at all. The result used to be recorded as
+    ``generated`` with ``syntax_ok=True`` -- in session
+    ``ses_fa6f72a9d3da4217`` a 1-byte file overwrote a real one. An empty
+    assembly, or one missing a symbol the skeleton requires, is a failed
+    regeneration and must be reported as such.
+    """
+    if not content.strip():
+        return "AST fallback produced an empty file"
+    defined = {node.name for node in module.body
+               if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                    ast.ClassDef))}
+    missing = [name for name, _ in symbols if name not in defined]
+    if missing:
+        return ("AST fallback produced no definition for required "
+                f"symbol(s): {missing}")
+    return None
 
 
 @register_executor(TaskKind.AST_REGENERATE)
@@ -220,7 +246,6 @@ def run_ast_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
 
         symbols = []
         try:
-            import ast
             parsed = ast.parse(skeleton_code)
             for node in parsed.body:
                 if isinstance(node, ast.FunctionDef):
@@ -240,6 +265,18 @@ def run_ast_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         # Unparse the final assembled AST
         try:
             final_content = assembler.unparse()
+            rejection = _assembly_rejection(
+                final_content, symbols, assembler.module)
+            if rejection:
+                logger.warning("AST fallback rejected %s: %s", path, rejection)
+                failed.append({"file": path, "error": rejection})
+                progress_failed += 1
+                _emit_scaffold_progress(
+                    deps, task, file=path, layer="ast_fallback",
+                    index=progress_done, total=total_files, status="failed",
+                    elapsed_ms=int((time.time() - started) * 1000),
+                    failed_count=progress_failed)
+                continue
             import difflib
             patch_lines = list(difflib.unified_diff(
                 [],
