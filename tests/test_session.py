@@ -15300,3 +15300,147 @@ def test_re_verify_failing_test_files_falls_back_to_all_when_unresolved():
     from cgx.session.tasks.re_verify import _failing_test_files
     content = {"tests_selected": ["tests/test_a.py"], "failures": []}
     assert _failing_test_files(content) == ["tests/test_a.py"]
+
+
+# ---------------------------------------------------------------------
+# Regression harness for session ``ses_fa6f72a9d3da4217`` (Calculator2).
+#
+# Each test encodes an input shape taken from that run's trace so the fix
+# is proven against the real failure rather than a reconstruction.
+# ---------------------------------------------------------------------
+
+class _RecordingProvider:
+    """Provider stub that records every prompt and replays canned text."""
+
+    def __init__(self, replies=None):
+        self.prompts: List[str] = []
+        self._replies = list(replies or [])
+
+    def chat(self, messages, force_json=False, **kwargs):
+        self.prompts.append(messages[-1]["content"])
+        return {"content": self._replies.pop(0) if self._replies
+                else "import os\n"}
+
+
+def test_ast_fallback_prompt_carries_the_project_goal(store):
+    """The AST fallback must never prompt with an empty project goal.
+
+    The router threads ``prior_goal``; the executor read ``composed_goal``,
+    so every fallback prompt had a blank goal and the model invented a
+    Flask app inside a FastAPI project.
+    """
+    from cgx.session.models import SessionMode
+    from cgx.session.tasks.ast_scaffold import run_ast_scaffold
+    session = Session.new("create a calculator app using fast-api and "
+                          "react frontend", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    work_plan = Artifact.new(
+        session_id=session.session_id, produced_by_task_id="t_plan",
+        kind=ArtifactKind.WORK_PLAN,
+        content={"contracts": {"project_skeleton":
+                               "# --- tests/test_core.py ---\n"
+                               "def test_compute():\n    ...\n"}})
+    store.save_artifact(work_plan)
+    provider = _RecordingProvider(
+        ["import pytest\n", "def test_compute():\n    assert True\n"])
+    task = TaskNode.new(
+        session.session_id, TaskKind.AST_REGENERATE, "regenerate",
+        inputs={"work_plan_artifact_id": work_plan.artifact_id,
+                "prior_goal": ("create a calculator app using fast-api "
+                               "and react frontend"),
+                "regenerate_attempt": 2,
+                "regenerate_files": ["tests/test_core.py"]})
+    run_ast_scaffold(task, ExecutorDeps(store=store, provider=provider))
+    assert provider.prompts, "the fallback issued no prompts"
+    for prompt in provider.prompts:
+        assert "create a calculator app using fast-api" in prompt, prompt
+    # The header prompt must carry the file's skeleton as context; it was
+    # hardcoded to "" while only the symbol prompt got the skeleton.
+    assert "def test_compute" in provider.prompts[0]
+
+
+def test_ast_fallback_rejects_empty_output(store):
+    """The fallback must gate its own output before APPLY writes it.
+
+    Prose replies leave the assembler with nothing to unparse, and the
+    1-byte file that came out still shipped as ``generated``.
+    """
+    from cgx.session.models import SessionMode
+    from cgx.session.tasks.ast_scaffold import run_ast_scaffold
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    work_plan = Artifact.new(
+        session_id=session.session_id, produced_by_task_id="t_plan",
+        kind=ArtifactKind.WORK_PLAN,
+        content={"contracts": {"project_skeleton":
+                               "# --- tests/test_core.py ---\n"}})
+    store.save_artifact(work_plan)
+    provider = _RecordingProvider(["Sure! Here is what I would write."] * 3)
+    task = TaskNode.new(
+        session.session_id, TaskKind.AST_REGENERATE, "regenerate",
+        inputs={"work_plan_artifact_id": work_plan.artifact_id,
+                "prior_goal": "g",
+                "regenerate_files": ["tests/test_core.py"]})
+    result = run_ast_scaffold(
+        task, ExecutorDeps(store=store, provider=provider))
+    content = result.artifact.content
+    assert content["generated"] == []
+    assert [f["file"] for f in content["failed"]] == ["tests/test_core.py"]
+
+
+def test_api_check_probe_resolves_lazy_submodules(tmp_path):
+    """``from jose import jwt`` works but ``hasattr(jose, 'jwt')`` is False.
+
+    The probe used ``hasattr`` alone, so any lazily-bound submodule was
+    reported as a hallucinated attribute. ``concurrent.futures`` is the
+    stdlib-only reproduction of the same shape.
+    """
+    import concurrent
+    import sys
+    from cgx.session.tasks.api_check import _probe_references
+    assert not hasattr(concurrent, "futures"), (
+        "precondition: concurrent.futures must be lazily bound")
+    rows, probe_error = _probe_references(
+        sys.executable,
+        [("concurrent", "futures"), ("json", "no_such_symbol")],
+        30.0, tmp_path)
+    assert probe_error is None
+    by_name = {(r["module"], r["name"]): r for r in rows}
+    assert by_name[("concurrent", "futures")]["ok"] is True
+    # A genuinely absent attribute must still fail, message intact.
+    absent = by_name[("json", "no_such_symbol")]
+    assert absent["ok"] is False
+    assert "AttributeError" in absent["error"]
+
+
+def test_bootstrap_unresolved_requested_roots_are_reported():
+    """A root ``install_deps`` asked for that is *still* unimportable.
+
+    This is the loop that killed the session: API_CHECK classified the
+    hallucinated ``app`` module as ``missing_dependency``, BOOTSTRAP_ENV
+    installed nothing, and the re-probe produced a byte-identical
+    signature. Roots that survive an install round unimportable are
+    recorded as ``uninstallable`` so API_CHECK calls them hallucinations.
+    """
+    import sys
+    from cgx.session.tasks.bootstrap_env import _unresolved_requested_roots
+    unresolved = _unresolved_requested_roots(
+        ["json", "cgx_definitely_not_a_real_module"], sys.executable)
+    assert unresolved == ["cgx_definitely_not_a_real_module"]
+
+
+def test_task_from_json_tolerates_an_unknown_kind():
+    """A legacy row must not 500 the snapshot endpoint forever.
+
+    One persisted task with ``kind='agentic_repair'`` -- a value dropped
+    from the enum -- made every GET on the session raise ValueError.
+    """
+    import json as _json
+    from cgx.session.store import _task_from_json
+    blob = _json.dumps({
+        "task_id": "task_legacy", "session_id": "ses_legacy",
+        "kind": "agentic_repair", "name": "legacy", "description": "",
+        "status": "done", "inputs": {}, "created_at": 1.0})
+    node = _task_from_json(blob)
+    assert node.task_id == "task_legacy"
+    assert node.kind is TaskKind.UNKNOWN
