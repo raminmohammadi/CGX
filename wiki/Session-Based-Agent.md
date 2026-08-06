@@ -60,6 +60,7 @@ EXPLORE -> ASK_USER(choose_path)
 CLARIFY_REQUIREMENTS -> ASK_USER(clarify_answers)
    -> DECOMPOSE (contracts + layers) -> ASK_USER(approve_plan)
         -> SCAFFOLD (contract + coherence gates) -> APPLY
+             |-(on failure)-> AST_REGENERATE -> APPLY
              -> BOOTSTRAP_ENV -> API_CHECK -> SMOKE -> VERIFY
                   -> (passed) RUNTIME_VERIFY -> COMPLETED
                   -> (fixable failure) REPAIR --> APPLY (re-enters loop)
@@ -70,7 +71,7 @@ CLARIFY_REQUIREMENTS -> ASK_USER(clarify_answers)
 - **DECOMPOSE** folds your answers into the goal and emits a `WORK_PLAN`. The generated manifest is **programmatically bucketed** into 4 strict topological layers (Models -> Core -> API -> Tests) to enforce dependency resolution. It also executes a dedicated **Project Skeleton** pass to generate interface stubs for all files, embedding them into a `contracts` block that every subsequent file generation step must adhere to (alongside shared endpoints / schemas / functions / constants).
 - **SCAFFOLD** generates each file strictly layer-by-layer, injecting the Project Skeleton and prior layer context, then runs
   best-effort static gates (import coherence, contract compliance,
-  client/server payload & response coherence) before anything is written.
+  client/server payload & response coherence) before anything is written. If generating the file as a whole fails repeatedly, the router escalates to **AST_REGENERATE** to parse the skeleton and prompt the LLM symbol-by-symbol (function by function).
 - **BOOTSTRAP_ENV** provisions a project-local environment (a `.venv` for
   Python, the JS toolchain for `package.json`) and installs both declared
   and detected-undeclared dependencies.
