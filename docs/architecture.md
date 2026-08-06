@@ -370,6 +370,26 @@ When the traditional file-level scaffolding (which prompts the LLM for the entir
 4. **Assembly:** The `ASTAssembler` (`cgx.codegen.ast_gluer`) securely injects each symbol into the syntax tree, avoiding regex-based manipulation and guaranteeing well-formed code at every step.
 5. **Observability:** Each symbol generated emits an `ast_fallback` progress beat to the MLOps dashboard in real time.
 
+```mermaid
+flowchart TD
+    SCAFFOLD[SCAFFOLD<br>Repeated file failures] --> AST_REGENERATE([AST_REGENERATE Task])
+    AST_REGENERATE --> SKELETON[Extract project_skeleton<br>from WORK_PLAN]
+    SKELETON --> PARSE[Parse skeleton using<br>Python's ast module]
+    PARSE --> HEADER[LLM: Generate file header<br>Imports & Module-level constants]
+    HEADER --> ASSEMBLER[Initialize ASTAssembler<br>with header]
+    ASSEMBLER --> LOOP{For each Class/Function}
+    LOOP -- next symbol --> GEN[LLM: Generate single symbol implementation]
+    GEN --> INJECT[ASTAssembler: securely inject<br>symbol into syntax tree]
+    INJECT --> OBSERVE[Emit ast_fallback live progress<br>to MLOps dashboard]
+    OBSERVE --> LOOP
+    LOOP -- all symbols complete --> OUT([Produce SCAFFOLD_PATCHES artifact])
+    
+    classDef step fill:#3b6ea5,stroke:#274c73,color:#fff;
+    classDef doc fill:#0f172a,stroke:#38bdf8,color:#fff;
+    class SCAFFOLD,AST_REGENERATE,OUT doc;
+    class SKELETON,PARSE,HEADER,ASSEMBLER,LOOP,GEN,INJECT,OBSERVE step;
+```
+
 </details>
 <details>
 <summary>

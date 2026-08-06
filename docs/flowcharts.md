@@ -442,7 +442,9 @@ flowchart TB
                   +-------------------+
                             |   per-file generate_single_scaffold_file,
                             |   accumulates sibling context;
-                            |   failures captured in `failed[]`
+                            |   failures captured in `failed[]`;
+                            |   on repeated failure -> AST_REGENERATE
+                            |   (symbol-by-symbol fallback)
                             v -> SCAFFOLD_PATCHES artifact
                        +-------+
                        | APPLY |  same writer as explore; inputs carry
