@@ -568,7 +568,8 @@ def _run_smoke_repair(task: TaskNode, deps: ExecutorDeps,
     content = dict(smoke_artifact.content or {})
     failed = [str(m) for m in content.get("failed_modules") or []]
     build_smoke = content.get("build_smoke")
-    build_broke = isinstance(build_smoke, dict) and not build_smoke.get("ok")
+    build_smoke_dict = build_smoke if isinstance(build_smoke, dict) else {}
+    build_broke = bool(build_smoke_dict) and not build_smoke_dict.get("ok")
     signature = str(content.get("failure_signature") or "").strip()
     if not signature:
         signature = "smoke_import|" + ",".join(sorted(failed))
@@ -589,8 +590,8 @@ def _run_smoke_repair(task: TaskNode, deps: ExecutorDeps,
         # JS/TS build-smoke break: the frontend does not build. There is
         # no dependency to pin; re-authoring the offending files is the
         # only fix, so fold the build error into the regenerate feedback.
-        build_stderr = str(build_smoke.get("stderr_tail") or "")
-        label = str(build_smoke.get("label") or "npm run build")
+        build_stderr = str(build_smoke_dict.get("stderr_tail") or "")
+        label = str(build_smoke_dict.get("label") or "npm run build")
         # ... unless the bundler could not resolve its *entry module*, in
         # which case no amount of re-authoring helps: the file is absent
         # from the manifest, so the regenerate has to add it.
@@ -608,7 +609,7 @@ def _run_smoke_repair(task: TaskNode, deps: ExecutorDeps,
             # instead of re-authoring the whole tree -- which reproduced the
             # identical miss in ses_aa99f1fb6914488d.
             target_files = _build_smoke_target_files(
-                build_stderr, deps.project_root)
+                build_stderr, str(deps.project_root))
             if target_files:
                 rationale = (
                     f"The JS/TS build-smoke (`{label}`) failed: "
