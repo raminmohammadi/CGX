@@ -49,8 +49,25 @@ from cgx.session.tasks.base import (
     ExecutorResult,
     register_executor,
 )
+from cgx.trace import emit_trace
 
 logger = logging.getLogger(__name__)
+
+
+# Browser/E2E automation distributions that need a real display the
+# unattended sandbox lacks, mapped to the import root a test would use.
+# A package is only scrubbed when NO applied file imports that root, so a
+# dependency the code actually uses is never removed. Restricted to
+# libraries imported directly in test code -- pytest plugins
+# (pytest-selenium / pytest-playwright), which activate via requirements
+# without an explicit import, are deliberately excluded so an in-use plugin
+# is never mistaken for dead.
+_BROWSER_E2E_PACKAGES: Dict[str, str] = {
+    "selenium": "selenium",
+    "playwright": "playwright",
+    "splinter": "splinter",
+    "helium": "helium",
+}
 
 
 @register_executor(TaskKind.BOOTSTRAP_ENV)
@@ -109,6 +126,15 @@ def run_bootstrap_env(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     # requirements.txt *before* the venv installs so the fix is durable
     # (survives re-bootstrap) and model-independent.
     _pin_transitive_constraints(root)
+
+    # De-scope a dead browser/E2E dependency (P1.4): the symmetric *remove*
+    # counterpart to the preflight *add* path below. A selenium/playwright
+    # distribution requirements.txt declares but no applied file imports
+    # cannot run in the headless sandbox and only bloats the install, so
+    # scrub it before the venv resolves. Deterministic and self-contained
+    # (no router/ledger change); gated on "declared but imported by nothing"
+    # so a package the code uses is untouched -- never worse than today.
+    descoped_deps = _descope_dead_e2e_requirements(root, applied_files)
 
     try:
         python_exe = ensure_project_venv(str(root), timeout=timeout)
@@ -328,6 +354,7 @@ def run_bootstrap_env(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             "uninstallable_count": len(uninstallable),
             "missing_import_count": len(missing_runtime),
             "style_issue_count": len(style_issues),
+            "descoped_dep_count": len(descoped_deps),
         },
         artifact=artifact,
         failure=failure,
@@ -335,6 +362,48 @@ def run_bootstrap_env(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
 
 
 # --------------------- helpers ---------------------
+
+def _descope_dead_e2e_requirements(root: Path,
+                                   applied_files: List[str]) -> List[str]:
+    """Scrub a dead browser/E2E dependency from requirements.txt (P1.4).
+
+    A :data:`_BROWSER_E2E_PACKAGES` distribution that requirements.txt
+    declares but whose import root no applied file uses cannot run in the
+    unattended sandbox (no display) and only slows the venv install. Remove
+    it via :func:`cgx.codegen.env_manager.remove_from_requirements`, keeping
+    the flow symmetric to the preflight *add*. Gated on "declared but
+    imported by no applied file", so an E2E suite that is actually present
+    (its tests import selenium) keeps its dependency. Best-effort: any
+    failure leaves requirements.txt untouched. Emits a ``dependency_descope``
+    trace record and returns the distribution names removed.
+    """
+    try:
+        from cgx.codegen.env_manager import (
+            _read_requirements, remove_from_requirements, scan_imports)
+        declared = _read_requirements(str(root))
+        candidates = {
+            pkg: imp for pkg, imp in _BROWSER_E2E_PACKAGES.items()
+            if pkg.replace("-", "_") in declared}
+        if not candidates:
+            return []
+        py_files = [str(root / p) for p in applied_files
+                    if str(p).lower().endswith(".py")]
+        imported = {r.split(".")[0] for r in scan_imports(py_files)}
+        dead = sorted(pkg for pkg, imp in candidates.items()
+                      if imp not in imported)
+        if not dead:
+            return []
+        removed = remove_from_requirements(str(root), dead)
+    except Exception as exc:  # pragma: no cover - best-effort scrub
+        logger.warning("BOOTSTRAP_ENV: E2E de-scope scrub raised %s", exc)
+        return []
+    if removed:
+        emit_trace("dependency_descope", stage="bootstrap_env",
+                   removed=removed, removed_count=len(removed))
+        logger.info("BOOTSTRAP_ENV: de-scoped %d dead browser/E2E "
+                    "dependency(ies): %s", len(removed), removed)
+    return removed
+
 
 def _detect_project_type(root: Path) -> str:
     """Return ``python`` / ``node`` for a known stack, else ``unknown``.

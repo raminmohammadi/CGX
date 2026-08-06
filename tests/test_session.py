@@ -4344,6 +4344,139 @@ def test_plan_coherence_traced_to_agent_log_when_enabled(
     assert events[0]["surgery_score"] >= 3
 
 
+# ------------- P1.4: dependency/test de-scoping -------------
+
+def test_unrunnable_descope_needles_gated_on_request():
+    """Browser/E2E needles fire only when the goal did NOT request E2E."""
+    from cgx.session.scope import unrunnable_descope_needles
+    needles = unrunnable_descope_needles(())
+    assert "selenium" in needles and "e2e" in needles
+    # An explicit request suppresses the de-scope entirely.
+    assert unrunnable_descope_needles(("browser_e2e",)) == ()
+
+
+def test_remove_from_requirements_symmetric_and_idempotent(tmp_path):
+    """remove_from_requirements drops matched lines, keeps the rest, and is
+    a no-op on a second run (the symmetric counterpart to update)."""
+    from cgx.codegen.env_manager import remove_from_requirements
+    req = tmp_path / "requirements.txt"
+    req.write_text("flask==2.1\n# a comment\nselenium>=4.0\nrequests\n",
+                   encoding="utf-8")
+    removed = remove_from_requirements(str(tmp_path), ["Selenium"])
+    assert removed == ["selenium"]
+    text = req.read_text(encoding="utf-8")
+    assert "selenium" not in text.lower()
+    assert "flask==2.1" in text and "requests" in text
+    assert "# a comment" in text
+    # Already absent -> no-op (idempotent).
+    assert remove_from_requirements(str(tmp_path), ["selenium"]) == []
+
+
+def _e2e_manifest():
+    """A calculator manifest carrying an unrequested selenium E2E suite
+    alongside a real unit test, so the de-scope has a test to keep."""
+    return {"plan_md": "p", "layers": [{"name": "core", "files": [
+        {"path": "calculator.py", "description": "core arithmetic"},
+        {"path": "tests/test_calculator.py", "description": "unit tests",
+         "depends_on": ["calculator.py"]},
+        {"path": "tests/test_e2e.py",
+         "description": "selenium browser end-to-end flow",
+         "depends_on": ["calculator.py"]}]}]}
+
+
+def test_decompose_descopes_unrequested_e2e_files(store, monkeypatch):
+    """A goal that never asked for E2E has its selenium suite de-scoped
+    before scaffolding; the unit test and source survive."""
+    result = _run_decompose_with_manifest(store, monkeypatch, _e2e_manifest())
+    assert result.failure is None
+    paths = {f["path"] for lay in result.artifact.content["layers"]
+             for f in lay["files"]}
+    assert "tests/test_e2e.py" not in paths
+    assert "calculator.py" in paths
+    assert "tests/test_calculator.py" in paths
+    assert result.outputs["descoped_files"] == 1
+
+
+def test_decompose_keeps_explicitly_requested_e2e(store, monkeypatch):
+    """When the goal spells out Selenium E2E, the suite is kept (honoured)."""
+    from cgx.session.tasks.decompose import run_decompose
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    monkeypatch.setattr("cgx.answer.engine.plan_scaffold_manifest",
+                        lambda *a, **kw: _e2e_manifest())
+    t = TaskNode.new(session.session_id, TaskKind.DECOMPOSE, "d",
+                     inputs={"prior_goal":
+                             "a calculator with selenium e2e tests",
+                             "answers": {}})
+    result = run_decompose(
+        t, ExecutorDeps(provider=_StubProvider(""), store=store))
+    assert result.failure is None
+    paths = {f["path"] for lay in result.artifact.content["layers"]
+             for f in lay["files"]}
+    assert "tests/test_e2e.py" in paths
+    assert result.outputs["descoped_files"] == 0
+
+
+def test_plan_descope_traced_to_agent_log_when_enabled(
+        store, monkeypatch, tmp_path):
+    """With tracing on, the de-scope outcome lands as a trace record."""
+    from cgx.session.tasks.decompose import run_decompose
+    from cgx.session import agent_log
+    from cgx import trace as trace_mod
+
+    agent_log.reset_for_tests()
+    trace_mod.reset_for_tests()
+    if trace_mod.is_trace_enabled():  # env-pinned: nothing to assert against
+        return
+    monkeypatch.setattr("cgx.answer.engine.plan_scaffold_manifest",
+                        lambda *a, **kw: _e2e_manifest())
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    trace_mod.set_trace_enabled(True)
+    token = trace_mod.set_trace_context(
+        session_id=session.session_id, task_id="task_dec",
+        project_root=str(tmp_path))
+    try:
+        t = TaskNode.new(session.session_id, TaskKind.DECOMPOSE, "d",
+                         inputs={"prior_goal": "g", "answers": {}})
+        run_decompose(t, ExecutorDeps(provider=_StubProvider(""), store=store))
+    finally:
+        trace_mod.reset_trace_context(token)
+        trace_mod.set_trace_enabled(False)
+
+    records = _read_agent_log(tmp_path)
+    events = [r for r in records if r.get("event") == "plan_descope"]
+    assert events, "plan_descope should be traced when enabled"
+    assert events[0]["stage"] == "decompose"
+    assert events[0]["removed"] == ["tests/test_e2e.py"]
+    assert events[0]["removed_count"] == 1
+
+
+def test_bootstrap_descopes_dead_e2e_dependency(tmp_path):
+    """A declared selenium that no applied file imports is scrubbed from
+    requirements.txt; a package the code uses is left in place."""
+    from cgx.session.tasks.bootstrap_env import _descope_dead_e2e_requirements
+    (tmp_path / "requirements.txt").write_text(
+        "flask==2.1\nselenium>=4.0\n", encoding="utf-8")
+    (tmp_path / "app.py").write_text("import flask\n", encoding="utf-8")
+    removed = _descope_dead_e2e_requirements(tmp_path, ["app.py"])
+    assert removed == ["selenium"]
+    text = (tmp_path / "requirements.txt").read_text(encoding="utf-8")
+    assert "selenium" not in text.lower() and "flask" in text
+
+
+def test_bootstrap_keeps_imported_e2e_dependency(tmp_path):
+    """selenium stays when an applied file actually imports it."""
+    from cgx.session.tasks.bootstrap_env import _descope_dead_e2e_requirements
+    (tmp_path / "requirements.txt").write_text(
+        "selenium>=4.0\n", encoding="utf-8")
+    (tmp_path / "test_e2e.py").write_text(
+        "from selenium import webdriver\n", encoding="utf-8")
+    assert _descope_dead_e2e_requirements(tmp_path, ["test_e2e.py"]) == []
+    assert "selenium" in (tmp_path / "requirements.txt").read_text(
+        encoding="utf-8").lower()
+
+
 # ------------- P0a: mandatory cross-seam endpoint contracts -------------
 
 def test_is_client_server_manifest_detects_and_abstains():
@@ -13881,6 +14014,12 @@ class _ScriptedLocalProvider:
                         if path.endswith(".py")
                         else f"placeholder for {path}\n")
             return {"content": _json.dumps({"content": body})}
+        # Bounded plan self-critique (DECOMPOSE, P1.2) -- a plain chat call
+        # asking for speculative files to drop. Return no removals so the
+        # scripted manifest ships intact (today's degrade-to-safe behaviour).
+        if "speculative files to remove" in user:
+            self.calls.append("critique")
+            return {"content": _json.dumps({"remove": []})}
         # Mandatory project-skeleton pass (DECOMPOSE) -- a plain chat call
         # carrying the manifest paths, no schema and no per-file marker.
         if "Manifest Paths:" in user:

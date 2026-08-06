@@ -28,7 +28,7 @@ from cgx.session.models import (
 )
 from cgx.session.scaffold_validate import (missing_stack_entry_files,
                                            stack_entry_description)
-from cgx.session.scope import estimate_scope
+from cgx.session.scope import estimate_scope, unrunnable_descope_needles
 from cgx.session.tasks.base import (
     ExecutorDeps,
     ExecutorResult,
@@ -96,6 +96,15 @@ def run_decompose(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     # depends_on target.
     layers, critique_removed = _apply_plan_critique(
         layers, composed_goal, scope, deps)
+
+    # Dependency/test de-scoping (P1.4): deterministically drop manifest
+    # files for a sandbox-unrunnable capability the goal never requested --
+    # browser/E2E tests (Selenium/Playwright/Cypress) that need a real
+    # display the unattended agent sandbox lacks, so they can only ever fail
+    # at VERIFY. Gated by the same _safe_removals guardrails as the critique,
+    # so a de-scope can never drop an entry point, the last source/test file,
+    # or a depends_on target; an explicitly requested E2E suite is kept.
+    layers, descope_removed = _descope_unrunnable(layers, scope)
 
     # Deterministic coherence gate: repair what can be repaired in place
     # (missing stack entry points, dangling depends_on, dependency cycles
@@ -186,6 +195,7 @@ def run_decompose(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             "project_complexity": scope.complexity,
             "scope_max_files": scope.max_files,
             "critique_removed": len(critique_removed),
+            "descoped_files": len(descope_removed),
             "coherence_surgery": report.surgery_score,
         },
         artifact=artifact,
@@ -255,6 +265,40 @@ def _safe_removals(layers: List[Dict[str, Any]],
     if had_test and not test_left:
         candidates = [p for p in candidates if not _is_test_file(p)]
     return candidates
+
+
+def _descope_unrunnable(layers: List[Dict[str, Any]], scope: Any) -> tuple:
+    """De-scope (P1.4) a sandbox-unrunnable capability the goal didn't ask for.
+
+    Drops manifest files for a heavy capability that is categorically
+    unrunnable in the unattended agent sandbox -- browser/E2E tests
+    (Selenium/Playwright/Cypress), which need a real display -- but only when
+    the goal did not explicitly request it (``scope.requested_features``). A
+    file is flagged when its path or any string field (description/purpose)
+    names one of the capability's keywords. The deterministic
+    :func:`_safe_removals` guardrails decide what is actually dropped, so a
+    de-scope can never gut every source file or drop the only tests. Returns
+    ``(layers, removed_paths)`` and emits a ``plan_descope`` trace record.
+    """
+    needles = unrunnable_descope_needles(
+        getattr(scope, "requested_features", ()) or ())
+    removed: List[str] = []
+    if needles:
+        flagged: List[str] = []
+        for f in _manifest_files(layers):
+            path = str(f.get("path") or "")
+            haystack = " ".join(
+                [path] + [str(v) for k, v in f.items()
+                          if k != "depends_on" and isinstance(v, str)]).lower()
+            if any(needle in haystack for needle in needles):
+                flagged.append(path)
+        removed = _safe_removals(layers, flagged)
+        if removed:
+            layers = _drop_files(layers, removed)
+    emit_trace("plan_descope", stage="decompose",
+               unrunnable=list(needles), removed=removed,
+               removed_count=len(removed))
+    return layers, removed
 
 
 def _drop_files(layers: List[Dict[str, Any]],

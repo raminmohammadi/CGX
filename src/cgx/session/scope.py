@@ -23,7 +23,7 @@ and the signal is cheap enough to compute on every plan.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple
 
 # Heavy capability -> substrings that signal the user actually asked for
 # it. Matched case-insensitively against the goal padded with spaces, so
@@ -88,6 +88,32 @@ class ScopeProfile:
             "max_files": self.max_files,
             "requested_features": list(self.requested_features),
         }
+
+
+# Capabilities that cannot run in the unattended agent sandbox no matter
+# who asked for them: browser/E2E suites need a real display the headless
+# environment does not provide. These are the only capabilities eligible
+# for deterministic de-scoping (P1.4), and even then only when the goal did
+# NOT explicitly request them -- an explicit request is honoured, so the
+# de-scope only ever trims speculative, unrunnable architecture.
+SANDBOX_UNRUNNABLE_FEATURES: Tuple[str, ...] = ("browser_e2e",)
+
+
+def unrunnable_descope_needles(
+        requested_features: Tuple[str, ...]) -> Tuple[str, ...]:
+    """Keyword needles for sandbox-unrunnable capabilities the goal skipped.
+
+    Returns the union of :data:`_FEATURE_KEYWORDS` needles for every
+    :data:`SANDBOX_UNRUNNABLE_FEATURES` capability *not* in
+    ``requested_features`` -- the substrings DECOMPOSE matches against a
+    manifest file's path/description to flag it for de-scoping. Empty when
+    every unrunnable capability was explicitly requested.
+    """
+    needles: List[str] = []
+    for feature in SANDBOX_UNRUNNABLE_FEATURES:
+        if feature not in requested_features:
+            needles.extend(_FEATURE_KEYWORDS[feature])
+    return tuple(needles)
 
 
 def _detect_features(goal: str) -> Tuple[str, ...]:

@@ -455,6 +455,46 @@ def update_requirements(project_root: str, new_packages: List[str]) -> None:
                 len(to_add), to_add)
 
 
+def remove_from_requirements(project_root: str,
+                             packages: List[str]) -> List[str]:
+    """Drop ``packages`` from requirements.txt -- the symmetric counterpart
+    to :func:`update_requirements` (P1.4).
+
+    Removes only the lines whose distribution name matches one of
+    ``packages`` (normalised case-/dash-insensitively, mirroring
+    :func:`_read_requirements`); comments, ``-r``/``-c`` includes, blank
+    lines, and the version specifiers on kept lines are preserved verbatim.
+    Idempotent: a package already absent is a no-op, so repeated runs are
+    safe. Returns the distribution names actually removed.
+    """
+    if not packages:
+        return []
+    req_path = Path(project_root) / "requirements.txt"
+    if not req_path.exists():
+        return []
+    targets = {p.lower().replace("-", "_") for p in packages}
+    kept: List[str] = []
+    removed: List[str] = []
+    for line in req_path.read_text(encoding="utf-8").splitlines():
+        stripped = line.split("#")[0].strip()
+        if stripped and not stripped.startswith("-"):
+            name = re.split(r"[>=<!;\[]", stripped)[0].strip() \
+                .lower().replace("-", "_")
+            if name in targets:
+                removed.append(name)
+                continue
+        kept.append(line)
+    if not removed:
+        return []
+    text = "\n".join(kept)
+    if text and not text.endswith("\n"):
+        text += "\n"
+    req_path.write_text(text, encoding="utf-8")
+    logger.info("env_manager: removed %d package(s) from requirements.txt: %s",
+                len(removed), removed)
+    return removed
+
+
 # Marker recording that requirements.txt on disk is env-managed -- a
 # repair re-pinned it to a self-consistent, conflict-free set, so a later
 # whole-tree regenerate must carry it forward verbatim instead of
