@@ -12787,6 +12787,72 @@ def test_runner_scaffold_crash_resumes_from_checkpoint(tmp_path, store):
     assert ckpt.content["complete"] is False
 
 
+def test_ast_scaffold_parses_unified_skeleton_string(store):
+    """AST_REGENERATE handles the unified ``project_skeleton`` string.
+
+    ``generate_project_skeleton`` stores ``contracts['project_skeleton']``
+    as a single unified script delimited by ``# --- <path> ---`` markers,
+    not a per-path dict. The executor must split it back into per-file
+    sections instead of crashing with ``AttributeError`` on ``str.get``.
+    """
+    import re as _re
+    from cgx.session.models import SessionMode
+    from cgx.session.tasks.ast_scaffold import run_ast_scaffold
+
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+
+    skeleton = (
+        "# --- backend/app.py ---\n"
+        "def create_app():\n"
+        "    pass\n"
+        "\n"
+        "# --- backend/models.py ---\n"
+        "class User:\n"
+        "    pass\n"
+    )
+    plan = Artifact.new(
+        session.session_id, "task_x", ArtifactKind.WORK_PLAN, {
+            "prior_goal": "g",
+            "composed_goal": "build a flask api",
+            "contracts": {"project_skeleton": skeleton},
+            "layers": [{"name": "app", "files": [
+                {"path": "backend/app.py", "description": "entry"},
+                {"path": "backend/models.py", "description": "models"}]}],
+        })
+    store.save_artifact(plan)
+
+    class _AstProvider:
+        def chat(self, messages=None, **kwargs):
+            user = ""
+            for m in (messages or []):
+                if m.get("role") == "user":
+                    user = m.get("content", "")
+            if "file header" in user:
+                return {"content": "import os\n"}
+            match = _re.search(r"named `([^`]+)`", user)
+            name = match.group(1) if match else "impl"
+            return {"content": f"def {name}():\n    return 1\n"}
+
+    t = TaskNode.new(
+        session.session_id, TaskKind.AST_REGENERATE, "ast",
+        inputs={"work_plan_artifact_id": plan.artifact_id,
+                "composed_goal": "build a flask api"})
+    store.save_task(t)
+    result = run_ast_scaffold(
+        t, ExecutorDeps(provider=_AstProvider(), store=store))
+
+    assert result.failure is None
+    content = result.artifact.content
+    assert content["failed"] == []
+    generated = {g["file"]: g["content"] for g in content["generated"]}
+    assert set(generated) == {"backend/app.py", "backend/models.py"}
+    # The per-file skeleton section was parsed and its symbol regenerated,
+    # proving the unified string was split by path rather than mis-read.
+    assert "def create_app" in generated["backend/app.py"]
+    assert "def User" in generated["backend/models.py"]
+
+
 def test_scaffold_augments_goal_with_regenerate_constraints(
         store, monkeypatch):
     """SCAFFOLD with regenerate_constraints injects them into the goal."""
