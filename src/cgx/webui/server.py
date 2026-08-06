@@ -76,15 +76,26 @@ def _route_template(request: Request, fallback: str) -> str:
     tmpl = getattr(route, "path", None)
     if tmpl:
         tmpl = str(tmpl)
-        # Depending on the FastAPI/Starlette version, a route registered on a
-        # sub-router mounted with ``prefix="/api"`` exposes ``route.path`` either
-        # as the full template (``/api/status``) or as the router-relative one
-        # (``/status``) with the prefix carried in ``root_path``. Rejoin them so
-        # the metric label is the full template in both regimes.
-        root = str(request.scope.get("root_path") or "")
-        if root and not tmpl.startswith(root):
-            tmpl = root.rstrip("/") + tmpl
-        return tmpl
+        # The SPA catch-all uses a ``:path`` converter that swallows an
+        # arbitrary number of segments; bucket it coarsely rather than emit a
+        # misleading per-request template.
+        if ":path}" not in tmpl:
+            # Newer FastAPI/Starlette mount sub-routers registered with
+            # ``prefix="/api"`` instead of flattening them, so ``route.path``
+            # is the router-relative template (``/status``) while the mount
+            # prefix lives only in the request path (``/api/status``). Recover
+            # the prefix by counting how many leading segments of the request
+            # path precede the matched template's segments, so the label is the
+            # full ``/api/...`` template on every supported version.
+            full = request.url.path
+            tmpl_segs = [s for s in tmpl.split("/") if s]
+            full_segs = [s for s in full.split("/") if s]
+            n_prefix = len(full_segs) - len(tmpl_segs)
+            if n_prefix > 0:
+                prefix = "/" + "/".join(full_segs[:n_prefix])
+                if not tmpl.startswith(prefix + "/"):
+                    tmpl = prefix + tmpl
+            return tmpl
     if fallback.startswith("/api/"):
         return "/api/_unmatched"
     return "/_spa"
