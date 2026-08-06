@@ -473,21 +473,23 @@ def _run_verify_collection_error_escalation(
     ``can_apply=False`` so the router's terminal guard halts the loop with
     the captured collection error surfaced for manual inspection.
     """
-    from cgx.session.repair.classify import failure_text  # dep direction
+    from cgx.session.repair.classify import failure_text, traceback_source_files  # dep direction
 
     error_text = failure_text(content)
+    target_files = traceback_source_files(content)
     rationale = (
         "pytest could not collect the test suite (collection_error) and no "
         "mechanical repair classifier matched the failure -- typically a "
-        "broken conftest, a pytest CLI/setup error, or an import error "
-        "outside the generated first-party modules. A re-scaffold cannot "
-        "fix this, so the loop halts for manual inspection instead of "
-        "regenerating code that was never the cause.")
+        "broken conftest, a pytest CLI/setup error, or an import error. "
+        "Attempting to regenerate the offending files automatically.")
     extra_constraints: Dict[str, Any] = {
         "kind": "collection_error",
         "rationale": rationale,
         "collection_error": error_text,
     }
+    if target_files:
+        extra_constraints["target_files"] = list(target_files)
+    strategy = "regenerate" if target_files else "escalate"
     plan = Artifact.new(
         session_id=task.session_id,
         produced_by_task_id=task.task_id,
@@ -499,7 +501,7 @@ def _run_verify_collection_error_escalation(
             "repair_attempt": attempt,
             "rationale": rationale,
             "diffs": [],
-            "strategy": "escalate",
+            "strategy": strategy,
             "extra_constraints": extra_constraints,
         },
     )
@@ -511,7 +513,7 @@ def _run_verify_collection_error_escalation(
             "repair_attempt": attempt,
             "diff_count": 0,
             "can_apply": False,
-            "strategy": "escalate",
+            "strategy": strategy,
             "rationale": rationale,
             "extra_constraints": extra_constraints,
         },
@@ -644,6 +646,7 @@ def _run_smoke_repair(task: TaskNode, deps: ExecutorDeps,
         # the router regenerates only these files against the prior scaffold
         # (reusing every prior-good diff) instead of re-authoring the tree.
         extra_constraints["target_files"] = list(target_files)
+    strategy = "install_deps" if failed else "regenerate"
     artifact = Artifact.new(
         session_id=task.session_id,
         produced_by_task_id=task.task_id,
@@ -659,23 +662,26 @@ def _run_smoke_repair(task: TaskNode, deps: ExecutorDeps,
             "rationale": rationale,
             "failed_modules": failed,
             "diffs": [],
-            "strategy": "regenerate",
+            "strategy": strategy,
             "extra_constraints": extra_constraints,
             "mode": task.inputs.get("mode"),
         },
     )
+    outputs = {
+        "repair_artifact_id": artifact.artifact_id,
+        "classification": classification,
+        "failure_signature": signature,
+        "repair_attempt": attempt,
+        "diff_count": 0,
+        "can_apply": False,
+        "strategy": strategy,
+        "extra_constraints": extra_constraints,
+        "scaffold_artifact_id": content.get("scaffold_artifact_id"),
+    }
+    if failed:
+        outputs["missing_modules"] = failed
     return ExecutorResult(
-        outputs={
-            "repair_artifact_id": artifact.artifact_id,
-            "classification": classification,
-            "failure_signature": signature,
-            "repair_attempt": attempt,
-            "diff_count": 0,
-            "can_apply": False,
-            "strategy": "regenerate",
-            "extra_constraints": extra_constraints,
-            "scaffold_artifact_id": content.get("scaffold_artifact_id"),
-        },
+        outputs=outputs,
         artifact=artifact,
     )
 
