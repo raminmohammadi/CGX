@@ -961,7 +961,7 @@ def _scaffold_resume_actions(
     """
     from cgx.session.repair.propose import propose_regenerate  # dep direction
 
-    if failed.kind not in (TaskKind.SCAFFOLD, TaskKind.AST_REGENERATE):
+    if failed.kind is not TaskKind.SCAFFOLD:
         return []
     resume_id = str(resume_scaffold_artifact_id or "").strip()
     if not resume_id:
@@ -1188,6 +1188,22 @@ def _verify_lesson_actions(completed: TaskNode,
         scaffold_task_id=scaffold.task_id if scaffold else None,
     )]
 
+
+def _find_ancestor_by_kind(start: TaskNode, tasks: List[TaskNode],
+                           kind: TaskKind) -> Optional[TaskNode]:
+    """Walk up ``parent_task_id`` chain to the nearest task of ``kind``."""
+    by_id = {t.task_id: t for t in tasks}
+    visited: set = set()
+    cur_id = start.parent_task_id
+    while cur_id and cur_id not in visited:
+        visited.add(cur_id)
+        cur = by_id.get(cur_id)
+        if cur is None:
+            return None
+        if cur.kind is kind:
+            return cur
+        cur_id = cur.parent_task_id
+    return None
 
 def _find_ancestor_by_kinds(start: TaskNode, tasks: List[TaskNode],
                             kinds: set) -> Optional[TaskNode]:
