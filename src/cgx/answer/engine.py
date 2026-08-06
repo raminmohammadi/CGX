@@ -2780,6 +2780,96 @@ def extract_endpoint_contracts(
     return normalized.get("endpoints") or []
 
 
+_MANIFEST_CRITIQUE_SYSTEM = (
+    "You are a scope reviewer for a proposed project file manifest. Given a "
+    "project goal, a minimal-viable-stack ceiling, and the list of planned "
+    "files, identify files that are SPECULATIVE -- not required to satisfy "
+    "the goal at the stated scope (e.g. a database layer, auth module, "
+    "migrations, a frontend, or E2E tests the goal never asked for).\n\n"
+    "Return strict JSON only:\n"
+    "{\n"
+    '  "remove": ["path/one.py", "path/two.py"]\n'
+    "}\n\n"
+    "Rules:\n"
+    "- Only list paths that appear verbatim in the provided manifest.\n"
+    "- NEVER remove the program's entry point, its core module, its unit "
+    "tests, or a file another kept file depends on.\n"
+    "- When in doubt, KEEP the file -- an empty \"remove\" list is the "
+    "correct answer for an already-minimal plan.\n"
+    "- No prose outside the JSON object.\n"
+)
+
+
+@traced("llm")
+def critique_scaffold_manifest(
+    goal: str,
+    layers: List[Dict[str, Any]],
+    provider: Any,
+    *,
+    scope_constraint: Optional[str] = None,
+) -> List[str]:
+    """Bounded LLM self-critique of a file manifest (P1.2): flag speculative files.
+
+    Runs one temperature-0 pass over the goal + scope ceiling + file list and
+    returns the manifest paths the model judged speculative (not traceable to
+    the goal). Deterministic-safe: a missing provider, a provider/parse error,
+    or an unparseable reply all degrade to ``[]`` so the caller keeps the full
+    manifest -- exactly today's behaviour. The caller owns the safety
+    guardrails (never drop an entry point / the last source file / a
+    ``depends_on`` target) before it actually removes anything.
+    """
+    if provider is None:
+        return []
+    listed: List[str] = []
+    manifest_paths: set = set()
+    for layer in (layers or []):
+        for f in (layer.get("files") or []):
+            if not isinstance(f, dict):
+                continue
+            path = str(f.get("path") or "").strip()
+            if not path:
+                continue
+            manifest_paths.add(path)
+            desc = str(f.get("description") or "").strip()
+            listed.append(f"- {path}: {desc}" if desc else f"- {path}")
+    if not listed:
+        return []
+    manifest_txt = "\n".join(listed[:60])
+    parts = [f"PROJECT GOAL:\n{(goal or '').strip()}"]
+    sc = (scope_constraint or "").strip()
+    if sc:
+        parts.append(sc)
+    parts.append(f"PROPOSED FILE MANIFEST:\n{manifest_txt}")
+    parts.append("List the speculative files to remove as strict JSON.")
+    user = "\n\n".join(parts)
+    try:
+        resp = provider.chat(
+            messages=[
+                {"role": "system", "content": _MANIFEST_CRITIQUE_SYSTEM},
+                {"role": "user", "content": user},
+            ],
+            temperature=0.0,
+            max_tokens=800,
+            force_json=True,
+        )
+        raw = (resp or {}).get("content", "") if isinstance(resp, dict) else ""
+    except Exception:  # pragma: no cover - defensive: critique is best-effort
+        logger.exception("critique_scaffold_manifest: provider call failed")
+        return []
+    parsed = _extract_json_object(raw) or {}
+    flagged = parsed.get("remove")
+    if not isinstance(flagged, list):
+        return []
+    out: List[str] = []
+    seen: set = set()
+    for p in flagged:
+        s = str(p or "").strip()
+        if s and s in manifest_paths and s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
+
+
 def _compact_json_fragment(value: Any, max_chars: int = 300) -> str:
     """Render a contract sub-value (schema fields, request body) compactly.
 

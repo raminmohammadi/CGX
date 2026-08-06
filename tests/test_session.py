@@ -4130,6 +4130,131 @@ def test_scope_estimate_traced_to_agent_log_when_enabled(tmp_path):
     assert scope_events[0]["complexity"] == "trivial"
 
 
+# ------------- P1.2: bounded plan self-critique -------------
+
+def _bloated_manifest():
+    """A calculator manifest carrying a speculative DB + auth layer."""
+    return {"plan_md": "p", "layers": [{"name": "core", "files": [
+        {"path": "calculator.py", "description": "core arithmetic"},
+        {"path": "database.py", "description": "speculative persistence"},
+        {"path": "auth.py", "description": "speculative auth"},
+        {"path": "tests/test_calculator.py", "description": "unit tests",
+         "depends_on": ["calculator.py"]}]}]}
+
+
+def test_critique_scaffold_manifest_flags_only_manifest_paths():
+    """The engine helper returns flagged paths present in the manifest and
+    drops hallucinated ones; a missing provider is a no-op."""
+    import json as _json
+    from cgx.answer.engine import critique_scaffold_manifest
+    layers = _bloated_manifest()["layers"]
+    provider = _StubProvider(_json.dumps(
+        {"remove": ["database.py", "auth.py", "ghost.py"]}))
+    flagged = critique_scaffold_manifest(
+        "build a small calculator", layers, provider,
+        scope_constraint="SCOPE CEILING")
+    assert flagged == ["database.py", "auth.py"]
+    assert critique_scaffold_manifest("g", layers, None) == []
+
+
+def test_critique_scaffold_manifest_degrades_on_bad_reply():
+    """A non-JSON / error reply yields no removals (today's behaviour)."""
+    from cgx.answer.engine import critique_scaffold_manifest
+    layers = _bloated_manifest()["layers"]
+    assert critique_scaffold_manifest(
+        "g", layers, _StubProvider("not json at all")) == []
+
+    class _Boom:
+        def chat(self, **kw):
+            raise RuntimeError("model down")
+
+    assert critique_scaffold_manifest("g", layers, _Boom()) == []
+
+
+def test_decompose_applies_plan_critique_drops_speculative_files(
+        store, monkeypatch):
+    """DECOMPOSE folds the critique's safe removals out of the WORK_PLAN."""
+    from cgx.session.tasks.decompose import run_decompose
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    monkeypatch.setattr("cgx.answer.engine.plan_scaffold_manifest",
+                        lambda *a, **kw: _bloated_manifest())
+    monkeypatch.setattr("cgx.answer.engine.critique_scaffold_manifest",
+                        lambda *a, **kw: ["database.py", "auth.py"])
+    t = TaskNode.new(session.session_id, TaskKind.DECOMPOSE, "d",
+                     inputs={"prior_goal": "build a calculator", "answers": {}})
+    result = run_decompose(
+        t, ExecutorDeps(provider=_StubProvider(""), store=store))
+    assert result.failure is None
+    paths = {f["path"] for lay in result.artifact.content["layers"]
+             for f in lay["files"]}
+    assert "database.py" not in paths and "auth.py" not in paths
+    assert "calculator.py" in paths
+    assert "tests/test_calculator.py" in paths
+    assert result.outputs["critique_removed"] == 2
+
+
+def test_decompose_critique_guardrail_protects_depends_on_and_source(
+        store, monkeypatch):
+    """A critique that would drop the core module (a depends_on target and
+    the only source file) is refused wholesale."""
+    from cgx.session.tasks.decompose import run_decompose
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    monkeypatch.setattr("cgx.answer.engine.plan_scaffold_manifest",
+                        lambda *a, **kw: _bloated_manifest())
+    # The model over-reaches and flags the core module the tests depend on.
+    monkeypatch.setattr("cgx.answer.engine.critique_scaffold_manifest",
+                        lambda *a, **kw: ["calculator.py"])
+    t = TaskNode.new(session.session_id, TaskKind.DECOMPOSE, "d",
+                     inputs={"prior_goal": "build a calculator", "answers": {}})
+    result = run_decompose(
+        t, ExecutorDeps(provider=_StubProvider(""), store=store))
+    assert result.failure is None
+    paths = {f["path"] for lay in result.artifact.content["layers"]
+             for f in lay["files"]}
+    assert "calculator.py" in paths
+    assert result.outputs["critique_removed"] == 0
+
+
+def test_plan_critique_traced_to_agent_log_when_enabled(
+        store, monkeypatch, tmp_path):
+    """With tracing on, the critique outcome lands as a trace record."""
+    from cgx.session.tasks.decompose import run_decompose
+    from cgx.session import agent_log
+    from cgx import trace as trace_mod
+
+    agent_log.reset_for_tests()
+    trace_mod.reset_for_tests()
+    if trace_mod.is_trace_enabled():  # env-pinned: nothing to assert against
+        return
+    monkeypatch.setattr("cgx.answer.engine.plan_scaffold_manifest",
+                        lambda *a, **kw: _bloated_manifest())
+    monkeypatch.setattr("cgx.answer.engine.critique_scaffold_manifest",
+                        lambda *a, **kw: ["database.py"])
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    trace_mod.set_trace_enabled(True)
+    token = trace_mod.set_trace_context(
+        session_id=session.session_id, task_id="task_dec",
+        project_root=str(tmp_path))
+    try:
+        t = TaskNode.new(session.session_id, TaskKind.DECOMPOSE, "d",
+                         inputs={"prior_goal": "build a calculator",
+                                 "answers": {}})
+        run_decompose(t, ExecutorDeps(provider=_StubProvider(""), store=store))
+    finally:
+        trace_mod.reset_trace_context(token)
+        trace_mod.set_trace_enabled(False)
+
+    records = _read_agent_log(tmp_path)
+    events = [r for r in records if r.get("event") == "plan_critique"]
+    assert events, "plan_critique should be traced when enabled"
+    assert events[0]["stage"] == "decompose"
+    assert events[0]["removed"] == ["database.py"]
+    assert events[0]["removed_count"] == 1
+
+
 # ------------- P0a: mandatory cross-seam endpoint contracts -------------
 
 def test_is_client_server_manifest_detects_and_abstains():

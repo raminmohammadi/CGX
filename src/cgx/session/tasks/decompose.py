@@ -85,6 +85,16 @@ def run_decompose(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             failure="DECOMPOSE: planner returned an empty manifest",
             retryable=True)
 
+    # Plan self-critique (P1.2): one bounded LLM pass reviews the manifest
+    # against the scope ceiling and drops speculative files (a DB layer,
+    # auth module, or E2E suite the goal never asked for). Advisory and
+    # deterministic-safe -- a provider miss leaves the manifest untouched
+    # (today's behaviour) -- and the removals are gated by guardrails that
+    # refuse to drop an entry point, the last source/test file, or a
+    # depends_on target.
+    layers, critique_removed = _apply_plan_critique(
+        layers, composed_goal, scope, deps)
+
     # Deterministic coherence gate: repair what can be repaired in place
     # (missing stack entry points, dangling depends_on, dependency cycles
     # -- the latter two only ordering hints), fail early only when the
@@ -149,12 +159,99 @@ def run_decompose(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             "contract_count": _contract_entry_count(contracts),
             "project_complexity": scope.complexity,
             "scope_max_files": scope.max_files,
+            "critique_removed": len(critique_removed),
         },
         artifact=artifact,
     )
 
 
 # --------------------- helpers ---------------------
+
+def _apply_plan_critique(layers: List[Dict[str, Any]], goal: str, scope: Any,
+                         deps: ExecutorDeps) -> tuple:
+    """Run the bounded plan self-critique (P1.2) and apply safe removals.
+
+    Returns ``(layers, removed_paths)``. The critique is advisory: the model
+    proposes speculative files, but the deterministic :func:`_safe_removals`
+    guardrails decide what is actually dropped. Any provider/parse failure
+    yields no removals so the manifest is unchanged (today's behaviour). A
+    ``plan_critique`` trace record is emitted when tracing is on.
+    """
+    from cgx.answer.engine import critique_scaffold_manifest
+    try:
+        flagged = critique_scaffold_manifest(
+            goal, layers, deps.provider,
+            scope_constraint=getattr(scope, "constraint", None))
+    except Exception:  # pragma: no cover - defensive: critique is best-effort
+        logger.exception("DECOMPOSE: plan self-critique crashed")
+        flagged = []
+    removed = _safe_removals(layers, flagged)
+    if removed:
+        layers = _drop_files(layers, removed)
+    emit_trace("plan_critique", stage="decompose",
+               flagged=list(flagged), removed=removed,
+               removed_count=len(removed))
+    return layers, removed
+
+
+def _safe_removals(layers: List[Dict[str, Any]],
+                   flagged: List[str]) -> List[str]:
+    """Filter the critique's flagged paths down to what is safe to drop.
+
+    Refuses to drop a file another kept file ``depends_on`` (an import a
+    sibling needs) and preserves at least one source file and one test file:
+    a critique that would gut every source file is rejected wholesale, and
+    test files are never dropped when they are the only tests. Order is
+    preserved, duplicates removed.
+    """
+    if not flagged:
+        return []
+    files = _manifest_files(layers)
+    all_paths = [str(f.get("path") or "") for f in files]
+    depended: set = set()
+    for f in files:
+        for d in (f.get("depends_on") or []):
+            depended.add(str(d))
+    candidates = [p for p in flagged if p and p not in depended]
+    if not candidates:
+        return []
+    had_src = any(_is_source_file(p) and not _is_test_file(p)
+                  for p in all_paths)
+    had_test = any(_is_test_file(p) for p in all_paths)
+    remove_set = set(candidates)
+    src_left = any(_is_source_file(p) and not _is_test_file(p)
+                   for p in all_paths if p not in remove_set)
+    if had_src and not src_left:
+        return []  # would gut every source file -- refuse the critique
+    test_left = any(_is_test_file(p) for p in all_paths
+                    if p not in remove_set)
+    if had_test and not test_left:
+        candidates = [p for p in candidates if not _is_test_file(p)]
+    return candidates
+
+
+def _drop_files(layers: List[Dict[str, Any]],
+                removed: List[str]) -> List[Dict[str, Any]]:
+    """Return ``layers`` with ``removed`` paths (and any dangling
+    ``depends_on`` references to them) scrubbed out."""
+    remove_set = set(removed)
+    out: List[Dict[str, Any]] = []
+    for layer in layers:
+        kept: List[Dict[str, Any]] = []
+        for f in (layer.get("files") or []):
+            if str(f.get("path") or "").strip() in remove_set:
+                continue
+            deps_list = f.get("depends_on")
+            if deps_list:
+                pruned = [d for d in deps_list if str(d) not in remove_set]
+                if pruned:
+                    f["depends_on"] = pruned
+                else:
+                    f.pop("depends_on", None)
+            kept.append(f)
+        out.append({"name": layer.get("name", "project"), "files": kept})
+    return out
+
 
 def _load_questions(task: TaskNode,
                     deps: ExecutorDeps) -> List[Dict[str, Any]]:
