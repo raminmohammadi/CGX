@@ -8801,6 +8801,236 @@ def test_failure_context_to_dict_is_json_friendly():
     assert d["gate"] == "verify"
 
 
+# --------------------- DIAGNOSE executor (P2.3) -------------------
+
+def _runtime_boot_report(session, produced_by, tail):
+    """A failing RUNTIME_REPORT whose probe carries a boot traceback."""
+    return Artifact.new(
+        session_id=session.session_id, produced_by_task_id=produced_by,
+        kind=ArtifactKind.RUNTIME_REPORT,
+        content={"outcome": "failed",
+                 "probes": [{"file": "app.py", "kind": "import",
+                             "ok": False, "stderr_tail": tail}]})
+
+
+def _smoke_fail_report(session, produced_by):
+    """A failing SMOKE_REPORT -- classifies to the reasoning token ``unknown``."""
+    return Artifact.new(
+        session_id=session.session_id, produced_by_task_id=produced_by,
+        kind=ArtifactKind.SMOKE_REPORT,
+        content={"outcome": "failed",
+                 "modules": [{"module": "app", "ok": False,
+                              "stderr_tail": "ImportError: no module flask"}]})
+
+
+def test_diagnose_deterministic_runtime_failure_targets_traceback_file(
+        store, tmp_path: Path):
+    """runtime_failure with a localized traceback -> model-free targeted regen."""
+    from cgx.session.tasks.diagnose import run_diagnose
+    (tmp_path / "app.py").write_text("import missing\n", encoding="utf-8")
+    session = Session.new("build a flask app", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    art = _runtime_boot_report(
+        session, "t_run",
+        'Traceback (most recent call last):\n'
+        '  File "app.py", line 1, in <module>\n'
+        "ModuleNotFoundError: No module named 'missing'\n")
+    store.save_artifact(art)
+    t = TaskNode.new(session.session_id, TaskKind.DIAGNOSE, "diagnose",
+                     inputs={"runtime_artifact_id": art.artifact_id})
+    result = run_diagnose(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    assert result.failure is None
+    assert result.artifact is not None
+    assert result.artifact.kind is ArtifactKind.DIAGNOSIS
+    assert result.outputs["minimal_action"] == "regenerate_files"
+    assert result.outputs["target_files"] == ["app.py"]
+    assert result.outputs["used_model"] is False
+    assert result.artifact.content["confidence"] == 0.8
+
+
+def test_diagnose_runtime_failure_without_disk_file_falls_back(
+        store, tmp_path: Path):
+    """A traceback file absent on disk is not deterministic -> ReAct/escalate."""
+    from cgx.session.tasks.diagnose import run_diagnose
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    art = _runtime_boot_report(
+        session, "t_run",
+        'File "ghost.py", line 1, in <module>\nRuntimeError: boom\n')
+    store.save_artifact(art)
+    t = TaskNode.new(session.session_id, TaskKind.DIAGNOSE, "diagnose",
+                     inputs={"runtime_artifact_id": art.artifact_id})
+    result = run_diagnose(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    # No provider + no on-disk target -> the additive escalate fallback.
+    assert result.outputs["minimal_action"] == "escalate"
+    assert result.outputs["used_model"] is False
+
+
+def test_diagnose_react_loop_emits_model_verdict(store, tmp_path: Path):
+    """An ambiguous SMOKE failure + a provider verdict -> that minimal_action."""
+    import json
+    from cgx.session.tasks.diagnose import run_diagnose
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    art = _smoke_fail_report(session, "t_smoke")
+    store.save_artifact(art)
+    provider = _StubProvider(json.dumps({
+        "minimal_action": "add_dependency", "root_cause": "flask not installed",
+        "add_dependencies": ["flask"], "rationale": "import fails",
+        "confidence": 0.9}))
+    t = TaskNode.new(session.session_id, TaskKind.DIAGNOSE, "diagnose",
+                     inputs={"smoke_artifact_id": art.artifact_id})
+    result = run_diagnose(t, ExecutorDeps(
+        project_root=str(tmp_path), store=store, provider=provider))
+    assert result.failure is None
+    assert result.outputs["minimal_action"] == "add_dependency"
+    assert result.outputs["used_model"] is True
+    assert result.artifact.content["add_dependencies"] == ["flask"]
+    assert result.artifact.content["confidence"] == 0.9
+
+
+def test_diagnose_react_runs_tool_then_verdict(store, tmp_path: Path):
+    """The loop may call a read-only tool, fold the observation, then decide."""
+    import json
+    from cgx.session.tasks.diagnose import run_diagnose
+
+    class _ScriptedProvider:
+        def __init__(self, replies):
+            self._replies = list(replies)
+            self.calls: list = []
+
+        def chat(self, **kwargs):
+            self.calls.append(kwargs)
+            return {"content": self._replies.pop(0)}
+
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    art = _smoke_fail_report(session, "t_smoke")
+    store.save_artifact(art)
+    provider = _ScriptedProvider([
+        json.dumps({"tool": "inspect_packages"}),
+        json.dumps({"minimal_action": "escalate", "root_cause": "unclear",
+                    "rationale": "not enough signal", "confidence": 0.1}),
+    ])
+    t = TaskNode.new(session.session_id, TaskKind.DIAGNOSE, "diagnose",
+                     inputs={"smoke_artifact_id": art.artifact_id})
+    result = run_diagnose(t, ExecutorDeps(
+        project_root=str(tmp_path), store=store, provider=provider))
+    assert result.failure is None
+    assert len(provider.calls) == 2
+    assert result.outputs["minimal_action"] == "escalate"
+    assert result.outputs["used_model"] is True
+
+
+def test_diagnose_no_provider_degrades_to_escalate(store, tmp_path: Path):
+    """An ambiguous failure with no provider hands off to the regenerate path."""
+    from cgx.session.tasks.diagnose import run_diagnose
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    art = _smoke_fail_report(session, "t_smoke")
+    store.save_artifact(art)
+    t = TaskNode.new(session.session_id, TaskKind.DIAGNOSE, "diagnose",
+                     inputs={"smoke_artifact_id": art.artifact_id})
+    result = run_diagnose(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    assert result.outputs["minimal_action"] == "escalate"
+    assert result.outputs["used_model"] is False
+    assert result.artifact.content["confidence"] == 0.0
+
+
+def test_diagnose_garbled_output_degrades_to_escalate(store, tmp_path: Path):
+    """A provider that returns non-JSON prose degrades cleanly to escalate."""
+    from cgx.session.tasks.diagnose import run_diagnose
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    art = _smoke_fail_report(session, "t_smoke")
+    store.save_artifact(art)
+    t = TaskNode.new(session.session_id, TaskKind.DIAGNOSE, "diagnose",
+                     inputs={"smoke_artifact_id": art.artifact_id})
+    result = run_diagnose(t, ExecutorDeps(
+        project_root=str(tmp_path), store=store,
+        provider=_StubProvider("no json here, just prose")))
+    assert result.outputs["minimal_action"] == "escalate"
+    assert result.outputs["used_model"] is True
+
+
+def test_diagnose_missing_source_report_fails(store, tmp_path: Path):
+    """No runtime/api/smoke/verify id in inputs -> a clear hard failure."""
+    from cgx.session.tasks.diagnose import run_diagnose
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    t = TaskNode.new(session.session_id, TaskKind.DIAGNOSE, "diagnose",
+                     inputs={})
+    result = run_diagnose(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    assert result.failure
+    assert "source report" in result.failure
+
+
+def test_diagnose_wrong_artifact_kind_fails(store, tmp_path: Path):
+    """A source id pointing at the wrong artifact kind -> a hard failure."""
+    from cgx.session.tasks.diagnose import run_diagnose
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    art = Artifact.new(
+        session_id=session.session_id, produced_by_task_id="t_x",
+        kind=ArtifactKind.WORK_PLAN, content={})
+    store.save_artifact(art)
+    t = TaskNode.new(session.session_id, TaskKind.DIAGNOSE, "diagnose",
+                     inputs={"runtime_artifact_id": art.artifact_id})
+    result = run_diagnose(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    assert result.failure
+    assert "missing or wrong" in result.failure
+
+
+def test_diagnose_verdict_traced_to_agent_log_when_enabled(
+        store, tmp_path: Path):
+    """With tracing on, the verdict + tool step land as agent-log records."""
+    import json
+    from cgx.session.tasks.diagnose import run_diagnose
+    from cgx import trace as trace_mod
+
+    class _ToolThenVerdict:
+        def __init__(self):
+            self._replies = [
+                json.dumps({"tool": "inspect_packages"}),
+                json.dumps({"minimal_action": "escalate",
+                            "root_cause": "unclear", "confidence": 0.0}),
+            ]
+
+        def chat(self, **kwargs):
+            return {"content": self._replies.pop(0)}
+
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    art = _smoke_fail_report(session, "t_smoke")
+    store.save_artifact(art)
+    trace_mod.set_trace_enabled(True)
+    token = trace_mod.set_trace_context(
+        session_id=session.session_id, task_id="task_diag",
+        project_root=str(tmp_path))
+    try:
+        t = TaskNode.new(session.session_id, TaskKind.DIAGNOSE, "diagnose",
+                         inputs={"smoke_artifact_id": art.artifact_id})
+        run_diagnose(t, ExecutorDeps(
+            project_root=str(tmp_path), store=store,
+            provider=_ToolThenVerdict()))
+    finally:
+        trace_mod.reset_trace_context(token)
+        trace_mod.set_trace_enabled(False)
+
+    records = _read_agent_log(tmp_path)
+    verdicts = [r for r in records if r.get("event") == "diagnose_verdict"]
+    steps = [r for r in records if r.get("event") == "diagnose_step"]
+    assert verdicts, "diagnose_verdict should be traced when enabled"
+    assert verdicts[0]["minimal_action"] == "escalate"
+    assert verdicts[0]["used_model"] is True
+    assert steps and steps[0]["tool"] == "inspect_packages"
+
+
 def test_locate_unittest_pytest_mix_finds_offending_class(tmp_path: Path):
     from cgx.session.repair.locate import locate_unittest_pytest_mix
     rel = "tests/test_app.py"

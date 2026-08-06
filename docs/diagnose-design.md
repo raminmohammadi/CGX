@@ -1,8 +1,15 @@
 # DIAGNOSE — the adaptive recovery rung (design)
 
-**Status:** draft for sign-off · **Owner:** agent team · **Phase:** 2
+**Status:** in progress · **Owner:** agent team · **Phase:** 2
 (prereq design for [`docs/Agent.md`](Agent.md) and the autonomous repair
 loop in [`docs/flowcharts.md`](flowcharts.md)).
+
+**Implementation status:** the typed model additions (§3), the
+`FailureContext` normalizer (§4), and the `DIAGNOSE` executor itself (§6)
+have landed in `src/cgx/session/tasks/diagnose.py`. The `RepairLedger`
+working memory (§7) and the router wiring (§8) are the remaining Phase 2
+tasks; until §8 lands the executor is unit-tested in isolation and not
+yet reachable from the greenfield edges.
 
 This document specifies `DIAGNOSE`, a new **reasoning executor** inserted
 between the mechanical `REPAIR` patch and the nuclear whole-tree
@@ -113,15 +120,19 @@ def run_diagnose(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult
 
 - **Input** (`task.inputs`): the source report artifact id, the
   `LoopBudget` repair-chain keys, and the `REPAIR_LEDGER` fact id.
-- **Behavior — deterministic-first:** the executor *always* runs the
-  existing deterministic path first (`classify.py` token +
-  `locate.py`/`propose.py`). When that yields an actionable fix it emits
-  the corresponding `minimal_action` **with no model call at all**. The
+- **Behavior — deterministic-first:** the executor runs a model-free
+  check first. An import/boot failure (`runtime_failure`) whose
+  `FailureContext.traceback_files` already localize to on-disk first-party
+  `.py` files is resolved with **no model call at all** — a *targeted*
+  `regenerate_files` over exactly those files (implementation first, the
+  test that surfaced it only as a fallback). The genuinely ambiguous
+  classes (`assertion_drift`, `collection_error`, `unknown`, plus a
+  `runtime_failure` that localized nothing on disk) fall through to the
   **bounded ReAct loop** (read a file, grep a symbol, list installed
-  packages from `BUILD_REPORT.installed_packages`) runs *only* when the
-  deterministic path is empty/ambiguous, for at most `DIAGNOSE_STEPS`
-  iterations, then emits exactly one `DIAGNOSIS`. Read-only tools only —
-  the executor proposes; `APPLY`/`BOOTSTRAP_ENV`/`SCAFFOLD` mutate.
+  packages from `BUILD_REPORT.installed_packages`) for at most
+  `DIAGNOSE_STEPS` tool calls, then emit exactly one `DIAGNOSIS`.
+  Read-only tools only — the executor proposes;
+  `APPLY`/`BOOTSTRAP_ENV`/`SCAFFOLD` mutate.
 - **Provider-agnostic:** the LLM is whatever the user configured (small
   or large). The executor makes no tier assumptions — it uses a tight,
   schema-constrained request and is tolerant of terse outputs, so a
@@ -132,9 +143,11 @@ def run_diagnose(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult
   loop yields nothing, emit `minimal_action="escalate"` with the
   classifier token as `root_cause` — i.e. exactly today's regenerate
   path. `DIAGNOSE` is strictly additive.
-- **Output:** `ExecutorResult(outputs={"diagnosis_artifact_id", ...,
-  "minimal_action", "failure_signature", "repair_attempt"},
-  artifact=<DIAGNOSIS>, facts=[<updated REPAIR_LEDGER>])`.
+- **Output:** `ExecutorResult(outputs={"diagnosis_artifact_id",
+  "minimal_action", "failure_signature", "repair_attempt", "confidence",
+  "target_files", "used_model", <source-report id>, ...},
+  artifact=<DIAGNOSIS>)`. The `facts=[<updated REPAIR_LEDGER>]` append is
+  the pending §7 task; today the executor emits only the artifact.
 - **Tracing:** the executor is auto-wrapped by `register_executor`'s
   `traced("executor")`; every model call goes through the session
   `TracingProvider` so it surfaces as an `llm_call` record. The ReAct
@@ -218,7 +231,7 @@ Two deterministic changes, both table/guard-driven and LLM-free:
 flowchart LR
     F["gate failure<br/>(VERIFY/SMOKE/API_CHECK/RUNTIME)"] --> CLS{"classify.py"}
     CLS -- "mechanical token" --> REP["REPAIR (patch)"] --> APP["APPLY"]
-    CLS -- "assertion_drift / collection_error /<br/>unknown / runtime_failure" --> DIAG["DIAGNOSE<br/>FailureContext + repo + RepairLedger<br/>bounded ReAct (read-only)"]
+    CLS -- "assertion_drift / collection_error /<br/>unknown / runtime_failure" --> DIAG["DIAGNOSE<br/>FailureContext + repo + RepairLedger<br/>deterministic-first, then bounded ReAct (read-only)"]
     DIAG --> V{"minimal_action"}
     V -- patch_files --> REP
     V -- add_dependency --> BE["BOOTSTRAP_ENV (install)"]
