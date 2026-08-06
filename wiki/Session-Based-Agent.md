@@ -89,7 +89,7 @@ CLARIFY_REQUIREMENTS -> ASK_USER(clarify_answers)
 A failed `VERIFY` spawns a `REPAIR` task that first tries deterministic,
 LLM-free classifiers — a test class missing `unittest.TestCase`, a
 `ModuleNotFoundError` for a project module, a missing fixture, a
-third-party import break fixed via a PyPI version pin. For ordinary
+third-party import break fixed via a PyPI version pin or auto-installation of missing packages. It also parses generic frontend build errors (Webpack/TypeScript/ESLint) to extract filenames for highly targeted repairs, safely escalating untargetable build breaks to save tokens. For ordinary
 logic/assertion failures with no mechanical fix, it falls back to a
 **bounded LLM repair** that rewrites the smallest set of files (≤5) and
 re-validates their syntax before applying.
