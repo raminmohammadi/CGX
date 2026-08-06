@@ -96,6 +96,14 @@ These hold across the codebase; respect them when contributing:
   scope ceiling, self-critiqued, and de-scoped of speculative /
   sandbox-unrunnable work at `DECOMPOSE` / `BOOTSTRAP_ENV` time, so the
   recovery ladder has less to fix downstream. See **[[Session Based Agent]]**.
+- **Diagnose before you regenerate.** A mechanical failure still takes an
+  instant `REPAIR` fast path, but a *reasoning-class* failure routes to a
+  `DIAGNOSE` rung that reasons over the failure, the repo, and a
+  `REPAIR_LEDGER` of already-tried actions, then emits a single
+  `minimal_action` verdict the pure router maps to a targeted fix (patch,
+  dependency install/de-scope, or a **scoped** regenerate) instead of
+  nuking the whole tree. Deterministic-first: it degrades to `escalate`
+  on any provider outage. See **[[Session Based Agent]]**.
 - **Additive persistence.** Index/record writers are add-only and
   degrade gracefully when optional deps (FAISS, ML stack) are absent.
 - **Skills add no agent-layer edits.** New technology support is a

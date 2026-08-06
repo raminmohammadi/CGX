@@ -65,7 +65,9 @@ CLARIFY_REQUIREMENTS -> ASK_USER(clarify_answers)
              |-(on failure)-> AST_REGENERATE -> APPLY
              -> BOOTSTRAP_ENV -> API_CHECK -> SMOKE -> VERIFY
                   -> (passed) RUNTIME_VERIFY -> COMPLETED
-                  -> (fixable failure) REPAIR --> APPLY (re-enters loop)
+                  -> (mechanical failure) REPAIR --> APPLY (re-enters loop)
+                  -> (reasoning-class failure) DIAGNOSE
+                        --> {REPAIR | BOOTSTRAP_ENV | scoped SCAFFOLD | regenerate}
 ```
 
 - **CLARIFY_REQUIREMENTS** asks 3–6 questions about stack, storage,
@@ -101,6 +103,25 @@ third-party import break fixed via a PyPI version pin or auto-installation of mi
 logic/assertion failures with no mechanical fix, it falls back to a
 **bounded LLM repair** that rewrites the smallest set of files (≤5) and
 re-validates their syntax before applying.
+
+**The DIAGNOSE reasoning rung (Phase 2).** Mechanical fixes still take an
+instant `REPAIR` fast path, but a *reasoning-class* failure
+(`assertion_drift` / `collection_error` / `unknown` / `runtime_failure`)
+— exactly the cases that used to jump straight to a whole-tree
+regenerate — is first handed to a **DIAGNOSE** task, the reasoning rung
+between a mechanical patch and a full regenerate. It normalizes the
+upstream report into one `FailureContext`, runs a **bounded, read-only
+ReAct loop** (`DIAGNOSE_STEPS=3` — read file / grep / inspect installed
+packages) under the shared `REPAIR_BUDGET`, and consults a
+`REPAIR_LEDGER` of already-tried actions so it never repeats a prior
+round. It emits a typed `DIAGNOSIS` carrying a single `minimal_action`
+verdict — `patch_files`, `add_dependency`, `remove_dependency`,
+`adjust_manifest`, `regenerate_files`, or `escalate` — that the **pure**
+router maps to exactly one successor (`REPAIR`, a `BOOTSTRAP_ENV`
+install/de-scope, a **scoped** `SCAFFOLD` that regenerates only the named
+files, or today's whole-tree regenerate / re-plan). It is
+**deterministic-first**: a provider outage or garbled reply degrades
+cleanly to `escalate`, so the rung is never worse than before.
 
 The loop continues **only while the failing-test count strictly drops**
 (absolute ceiling of 4 rounds) and is gated by a failure-signature hash,
