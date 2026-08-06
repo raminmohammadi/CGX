@@ -184,6 +184,7 @@ def run_bootstrap_env(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     requested = [str(m).strip()
                  for m in (task.inputs.get("missing_modules") or [])
                  if str(m).strip()]
+    unresolved_requested: List[str] = []
     if requested:
         from cgx.codegen.env_manager import (
             find_missing_python_packages, install_packages)
@@ -207,6 +208,20 @@ def run_bootstrap_env(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
                 "BOOTSTRAP_ENV: missing_modules install raised %s", exc)
             if not pip_log_tail:
                 pip_log_tail = f"{type(exc).__name__}: {exc}"
+        # Loop breaker: a root this repair round explicitly asked pip for
+        # that is *still* unimportable can never be satisfied by another
+        # install pass -- typically a hallucinated first-party-looking
+        # module (``app``). Record it as uninstallable so API_CHECK
+        # classifies the next probe failure as a hallucination and routes
+        # to a regenerate, instead of re-emitting the same install_deps
+        # plan against a byte-identical failure signature.
+        unresolved_requested = _unresolved_requested_roots(
+            requested, python_exe)
+        if unresolved_requested:
+            logger.warning(
+                "BOOTSTRAP_ENV: %d requested module(s) remain unimportable "
+                "after install (deferred to API_CHECK): %s",
+                len(unresolved_requested), unresolved_requested)
 
     # Transitive test-client extra: fastapi/starlette's TestClient needs
     # httpx at import time, but no first-party file imports httpx
@@ -274,8 +289,9 @@ def run_bootstrap_env(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     fatal_installs = {
         pkg: ok for pkg, ok in failed_installs.items()
         if pkg.lower().replace("-", "_") in declared_names}
-    uninstallable = sorted(p for p in failed_installs
-                           if p not in fatal_installs)
+    uninstallable = sorted(
+        {p for p in failed_installs if p not in fatal_installs}
+        | set(unresolved_requested))
     if uninstallable:
         logger.warning(
             "BOOTSTRAP_ENV: %d undeclared import(s) could not be "
@@ -698,6 +714,33 @@ def _import_roots_for(pypi_names: List[str]) -> frozenset:
             if dist.lower().replace("-", "_") == norm:
                 roots.add(imp.lower().replace("-", "_"))
     return frozenset(roots)
+
+
+def _unresolved_requested_roots(requested: List[str],
+                                python_exe: Optional[str]) -> List[str]:
+    """Import roots an ``install_deps`` round asked for but cannot import.
+
+    The repair strategy names the roots API_CHECK reported missing. If a
+    root is still unimportable once pip has been given its chance, no
+    further install can satisfy it -- the name is hallucinated (or maps
+    to nothing on PyPI), and the caller records it as ``uninstallable``
+    so API_CHECK routes the next probe failure to a regenerate. Roots are
+    compared dotless, matching the probe's own granularity.
+    Best-effort: any probe error yields ``[]`` so a transient hiccup never
+    demotes a real dependency to a hallucination.
+    """
+    roots = sorted({str(m).strip().split(".")[0] for m in requested
+                    if str(m).strip()})
+    if not roots or not python_exe:
+        return []
+    try:
+        from cgx.codegen.env_manager import _probe_importable
+        importable = _probe_importable(roots, python_exe)
+    except Exception as exc:
+        logger.warning(
+            "BOOTSTRAP_ENV: requested-root re-probe raised %s", exc)
+        return []
+    return [r for r in roots if r not in importable]
 
 
 # Substrings that mark a file as using the fastapi/starlette test
