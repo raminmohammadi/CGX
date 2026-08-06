@@ -72,11 +72,15 @@ def _log_path(project_root: Optional[str]) -> Path:
         return fallback_trace_log_path()
     for known in _known_project_roots():
         try:
-            if os.path.realpath(known) == want:
-                # Trailing components are compile-time constants.
-                return Path(want) / ".cgx" / "agent.log"
+            real_known = os.path.realpath(known)
         except OSError:  # pragma: no cover - defensive
             continue
+        if real_known == want:
+            # Build the path from the trusted, activity-store-derived root
+            # (never the caller-supplied value) so no request data reaches
+            # the filesystem read. Trailing components are compile-time
+            # constants.
+            return Path(real_known) / ".cgx" / "agent.log"
     logger.warning("admin log path rejected (unknown project root): %s", safe)
     return fallback_trace_log_path()
 
@@ -164,14 +168,20 @@ def delete_logs(
                 targets.append(root)
     elif project_root:
         want = os.path.realpath(os.fspath(project_root))
-        known = any(os.path.realpath(r) == want for r in _known_project_roots())
-        if not known:
+        # Resolve to the matching trusted root from the activity store and
+        # delete via *that* value, never the raw request string, so no
+        # caller-supplied data reaches the filesystem unlink.
+        match = next(
+            (r for r in _known_project_roots() if os.path.realpath(r) == want),
+            None,
+        )
+        if match is None:
             safe = project_root.replace("\r", "\\r").replace("\n", "\\n")
             logger.warning("admin delete rejected (unknown project root): %s", safe)
             return JSONResponse({"deleted": 0, "scope": "single",
                                  "targets": [], "rejected": True})
-        removed += delete_project_trace_log(project_root)
-        targets.append(project_root)
+        removed += delete_project_trace_log(match)
+        targets.append(match)
     else:
         removed += delete_fallback_trace_log()
         targets.append("fallback")

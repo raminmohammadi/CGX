@@ -162,8 +162,11 @@ def compute_local_fit(hw: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any
 
 # Size hint embedded in a model tag / repo id, e.g. ``7b``, ``1.5B``,
 # ``e4b`` (→ 4), ``qwen2.5-coder:7b-instruct`` (→ 7). A trailing ``b`` word
-# boundary keeps it from matching version numbers like ``qwen2.5``.
-_SIZE_HINT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*b\b", re.IGNORECASE)
+# boundary keeps it from matching version numbers like ``qwen2.5``. Digit
+# runs are bounded (no real param count exceeds four integer digits) so the
+# pattern stays linear on hostile input like ``"0" * 100000`` instead of
+# backtracking quadratically.
+_SIZE_HINT_RE = re.compile(r"(\d{1,4}(?:\.\d{1,3})?)\s*b\b", re.IGNORECASE)
 
 
 def params_from_name(name: str) -> float:
@@ -184,7 +187,9 @@ def parse_parameter_size(value: Optional[str]) -> float:
     """
     if not value:
         return 0.0
-    m = re.search(r"(\d+(?:\.\d+)?)\s*([bmk])?", str(value).strip(), re.IGNORECASE)
+    # Bounded digit runs (mirrors ``_SIZE_HINT_RE``) keep the match linear on
+    # a hostile ``parameter_size`` value instead of backtracking quadratically.
+    m = re.search(r"(\d{1,4}(?:\.\d{1,3})?)\s*([bmk])?", str(value).strip(), re.IGNORECASE)
     if not m:
         return 0.0
     n = float(m.group(1))
