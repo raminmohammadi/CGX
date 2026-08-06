@@ -60,6 +60,7 @@ your machine unless you explicitly opt into a cloud model.
   Providers, or any self-hosted server with a custom IP, path, and
   optional auth-bypass -- switchable from the Settings page with a live
   **Ping** latency check. API keys live in your OS keyring.
+- **Robust Code Scaffolding.** Features an AST-based symbol-level generation fallback. When scaffolding files fail repeatedly, CGX dynamically parses the expected project skeleton and uses the LLM to generate functions and classes individually, bypassing tricky file-level syntax errors.
 - **Hybrid retrieval.** Two-view semantic + BM25 + graph expansion,
   fused with Reciprocal Rank Fusion and an optional cross-encoder
   rerank.

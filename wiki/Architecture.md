@@ -38,7 +38,7 @@ Two surfaces sit on top: the **CLI** (`cli/`) and the **web UI**
 | `graph/` | Import/call graph construction (`build_graph`, `backend`, `aggregation`) used for graph-expansion during retrieval. |
 | `retrieval/` | Hybrid search: FAISS ANN (`index`), lexical/BM25 (`lexical`), RRF fusion (`rrf`), optional cross-encoder (`reranker`), all wired by the `orchestrator`. |
 | `answer/` | LLM provider abstraction (`providers`), the answer/plan `engine`, prompt/context assembly (`context_map`, `repo_map`), profiles, rate limiting, hardware matrix. |
-| `codegen/` | Diff parsing/apply (`diff_apply`, `disk_apply`), validation (`validate`), self-test loop (`pipeline`, `test_runner(s)`), dynamic deps (`env_manager`), AST insertion (`ast_insert`). |
+| `codegen/` | Diff parsing/apply (`diff_apply`, `disk_apply`), validation (`validate`), self-test loop (`pipeline`, `test_runner(s)`), dynamic deps (`env_manager`), AST insertion (`ast_insert`), AST scaffolding fallback (`ast_gluer`). |
 | `session/` | The persistent agent orchestrator: `router` (pure state machine), `runner`, `store`, `tasks/` (executors), `repair/`, `budget`, `mode`. |
 | `pipeline/` | High-level entry points that wire parsing → embedding → indexing (`auto.run_index_auto`, `run`). |
 | `webui/` | FastAPI app (`server`), `routes/`, SSE (`sse`), task store, and the launcher (`launch`). Serves the built SPA from `static/`. |

@@ -66,14 +66,14 @@ carrying the **full redacted prompt and response** plus `model` / `latency_ms`
 `pipeline`, `executor`, `repair.*`). The agent loop produces these natively,
 and the web-UI **Ask** / **Plan** paths do too: they set `project_root` on the
 trace context and wrap their provider with the tracing shim, so a traced
-ask/plan writes the same records into that project's `agent.log`.
+ask/plan writes the same records into that project's `agent.log`. In addition to standard spans, long-running tasks like the AST symbol-level generator (`ast_scaffold`) emit live progress beats under the `ast_fallback` layer directly to the dashboard.
 
 ### Trace explorer + delete (Ops hub)
 
 The **Ops hub** (`/ops` → **Trace**) is the UI over the admin read API. A
 **source** selector switches between the Global fallback (HTTP / CLI records)
 and any project's `agent.log` (the rich LLM / router / codegen / scaffold /
-repair records); records are newest-first, redacted server-side, filterable by
+ast_fallback / repair records); records are newest-first, redacted server-side, filterable by
 event and category, and each opens to its full prompt/response. The section
 also exposes **Delete** (current source) and **Delete all** controls backed by
 `DELETE /api/admin/logs`.

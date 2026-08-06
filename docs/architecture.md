@@ -7,7 +7,7 @@ typed task at a time. Each section below opens as a collapsible block.
 
 **Contents:** [Layers](#layers) · [Data flow](#data-flow) ·
 [Tiered context (Code Map)](#tiered-slm-context-code-map) ·
-[Self-test loop](#self-test-loop) · [AST insertion](#structured-ast-insertion) ·
+[Self-test loop](#self-test-loop) · [AST insertion](#structured-ast-insertion) · [AST scaffolding fallback](#ast-based-symbol-level-scaffolding-fallback) ·
 [LLM providers](#llm-providers) ·
 [Dependency management](#dynamic-dependency-management) ·
 [Session-shaped agent](#session-shaped-agent-cgxsession) ·
@@ -354,6 +354,41 @@ The module is purely additive: it does not modify any existing
 signature in `diff_apply`, `validate`, `disk_apply`, or
 `orchestrator`. Callers can keep using the text-diff path; the AST
 path is opt-in via the entry points above.
+
+</details>
+<details>
+<summary>
+
+## AST-based symbol-level scaffolding fallback
+</summary>
+
+When the traditional file-level scaffolding (which prompts the LLM for the entire file content) fails repeatedly on the same files—often due to syntax or layout churn when generating complex logic—the router transitions to the `AST_REGENERATE` task. This acts as a robust, symbol-by-symbol fallback mechanism built into `cgx.session.tasks.ast_scaffold`:
+
+1. **Skeleton parsing:** Instead of prompting for the entire file, the task extracts the expected file structure from the `project_skeleton` in the `WORK_PLAN` artifact.
+2. **AST traversal:** It uses Python's `ast` module to dynamically parse this skeleton and extract all defined `FunctionDef` and `ClassDef` symbols.
+3. **Symbol-level generation:** It first generates the file header (imports and module-level constants), and then asks the LLM to generate the implementation for *only* one symbol at a time.
+4. **Assembly:** The `ASTAssembler` (`cgx.codegen.ast_gluer`) securely injects each symbol into the syntax tree, avoiding regex-based manipulation and guaranteeing well-formed code at every step.
+5. **Observability:** Each symbol generated emits an `ast_fallback` progress beat to the MLOps dashboard in real time.
+
+```mermaid
+flowchart TD
+    SCAFFOLD[SCAFFOLD<br>Repeated file failures] --> AST_REGENERATE([AST_REGENERATE Task])
+    AST_REGENERATE --> SKELETON[Extract project_skeleton<br>from WORK_PLAN]
+    SKELETON --> PARSE[Parse skeleton using<br>Python's ast module]
+    PARSE --> HEADER[LLM: Generate file header<br>Imports & Module-level constants]
+    HEADER --> ASSEMBLER[Initialize ASTAssembler<br>with header]
+    ASSEMBLER --> LOOP{For each Class/Function}
+    LOOP -- next symbol --> GEN[LLM: Generate single symbol implementation]
+    GEN --> INJECT[ASTAssembler: securely inject<br>symbol into syntax tree]
+    INJECT --> OBSERVE[Emit ast_fallback live progress<br>to MLOps dashboard]
+    OBSERVE --> LOOP
+    LOOP -- all symbols complete --> OUT([Produce SCAFFOLD_PATCHES artifact])
+    
+    classDef step fill:#3b6ea5,stroke:#274c73,color:#fff;
+    classDef doc fill:#0f172a,stroke:#38bdf8,color:#fff;
+    class SCAFFOLD,AST_REGENERATE,OUT doc;
+    class SKELETON,PARSE,HEADER,ASSEMBLER,LOOP,GEN,INJECT,OBSERVE step;
+```
 
 </details>
 <details>

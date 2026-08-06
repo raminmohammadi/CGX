@@ -494,8 +494,11 @@ store; the React UI renders each as a node in the task tree.
    (filtered by the WORK_PLAN's stack + the goal's keyword
    tokeniser) and folds the top-3 hits into the per-file generator
    goal under a `Lessons from prior sessions to apply:` header so
-   cross-session knowledge influences this run before the first
-   token is generated (**Phase 7.1**). Output: a `SCAFFOLD_PATCHES`
+   the first token is generated (**Phase 7.1**). If the scaffold repeatedly
+   fails for the same files (or repeats the exact same mistakes), the router
+   transitions to an `AST_REGENERATE` fallback task, which extracts symbols
+   from the `project_skeleton` and prompts the LLM to generate code
+   symbol-by-symbol instead of whole-file. Output: a `SCAFFOLD_PATCHES`
    artifact (`diffs`, `generated`, `failed`).
 
 6. `APPLY` consumes the `SCAFFOLD_PATCHES` artifact -- the
@@ -937,7 +940,7 @@ same 404 on every mount.
 | Project-local agent log (Phase 1.3) | `src/cgx/session/agent_log.py`, `src/cgx/logging_setup.py` |
 | Curated function-call trace (Phase TR) | `src/cgx/trace.py`, `src/cgx/webui/routes/settings.py`, `frontend/src/store/trace.ts` |
 | Explore-mode executors            | `src/cgx/session/tasks/{explore,investigate,recommend,plan_change}.py` |
-| Greenfield executors              | `src/cgx/session/tasks/{clarify_requirements,decompose,scaffold,bootstrap_env,api_check,smoke,runtime_verify,repair}.py` |
+| Greenfield executors              | `src/cgx/session/tasks/{clarify_requirements,decompose,scaffold,ast_scaffold,bootstrap_env,api_check,smoke,runtime_verify,repair}.py` |
 | Shared write executors            | `src/cgx/session/tasks/{apply,verify,ask}.py` |
 | Repair classify / locate / propose | `src/cgx/session/repair/{classify,locate,propose}.py` |
 | PyPI client + cache (Phases 3.2 / 4.1) | `src/cgx/session/repair/pypi_client.py` |

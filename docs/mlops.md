@@ -78,6 +78,8 @@ shim (`_traced_provider`), so a traced ask/plan writes the same rich `llm_call`
 records into that project's `agent.log`. With tracing on, every LLM interaction
 across agent, ask, and plan is therefore reviewable end to end.
 
+In addition to standard traces, specialized long-running tasks like the AST symbol-level generator (`ast_scaffold`) emit live progress beats (via `_emit_scaffold_progress`) under the `ast_fallback` layer. This provides real-time granularity—down to individual parsed classes and functions—straight to the MLOps ops dashboard.
+
 `cgx.redact` masks credential-shaped literals (API keys, bearer tokens,
 `key=value` pairs, provider key prefixes) before any text reaches a log, a
 trace, a store, or the admin API -- defence-in-depth so a secret echoed into a
