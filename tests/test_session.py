@@ -3959,6 +3959,7 @@ def test_decompose_executor_happy_path_emits_work_plan(
     result = run_decompose(
         t, ExecutorDeps(provider=_StubProvider(""), store=store))
     assert result.failure is None
+    assert result.artifact is not None
     assert result.artifact.kind is ArtifactKind.WORK_PLAN
     layers = result.artifact.content["layers"]
     # _order_manifest_layers regroups files into strict pipeline buckets
@@ -4558,6 +4559,7 @@ def test_scaffold_executor_happy_path_accumulates_context(
     result = run_scaffold(
         t, ExecutorDeps(provider=_StubProvider(""), store=store))
     assert result.failure is None
+    assert result.artifact is not None
     assert result.artifact.kind is ArtifactKind.SCAFFOLD_PATCHES
     diffs = result.artifact.content["diffs"]
     assert [d["file"] for d in diffs] == ["app.py", "README.md"]
@@ -5948,6 +5950,7 @@ def test_bootstrap_env_skips_non_python_project(tmp_path, store):
     assert result.failure is None
     assert result.outputs["outcome"] == "skipped"
     assert result.outputs["project_type"] == "unknown"
+    assert result.artifact is not None
     assert result.artifact.kind is ArtifactKind.BUILD_REPORT
     assert result.artifact.content["venv_path"] is None
     assert result.artifact.content["resolved_packages"] == []
@@ -6840,6 +6843,7 @@ def test_smoke_skipped_when_no_python_exe(tmp_path, store):
         t, ExecutorDeps(project_root=str(tmp_path), store=store))
     assert result.failure is None
     assert result.outputs["outcome"] == "skipped"
+    assert result.artifact is not None
     assert result.artifact.kind is ArtifactKind.SMOKE_REPORT
     assert result.artifact.content["modules"] == []
 
@@ -7073,6 +7077,7 @@ def test_api_check_skipped_when_no_python_exe(tmp_path, store):
         t, ExecutorDeps(project_root=str(tmp_path), store=store))
     assert result.failure is None
     assert result.outputs["outcome"] == "skipped"
+    assert result.artifact is not None
     assert result.artifact.kind is ArtifactKind.API_CHECK_REPORT
 
 
@@ -8730,6 +8735,7 @@ def test_repair_executor_emits_smoke_repair_plan(store, tmp_path: Path):
     from cgx.session.tasks.base import _REGISTRY
     result = _REGISTRY[TaskKind.REPAIR](repair_task, deps)
     assert result.failure is None
+    assert result.artifact is not None
     assert result.artifact.kind is ArtifactKind.REPAIR_PLAN
     assert result.outputs["classification"] == "smoke_import_failure"
     assert result.outputs["can_apply"] is False
