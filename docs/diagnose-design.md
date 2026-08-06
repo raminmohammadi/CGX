@@ -147,7 +147,14 @@ def run_diagnose(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult
 - **Deterministic fallback (E2):** if the provider is unavailable or the
   loop yields nothing, emit `minimal_action="escalate"` with the
   classifier token as `root_cause` — i.e. exactly today's regenerate
-  path. `DIAGNOSE` is strictly additive.
+  path. `DIAGNOSE` is strictly additive. This floor is **gate-enforced**:
+  the provider-free recovery eval (`cgx.eval.recovery`, P4.1/P4.2)
+  resolves every golden failure through the same deterministic surface and
+  the release gate checks `never_worse_rate == 1.0` (no resolved action,
+  escalate included, costs more than a whole-tree nuke) and
+  `determinism_ok == 1.0` (re-resolving the corpus is byte-identical), so
+  a regression that degrades the fallback or makes the router
+  nondeterministic fails CI.
 - **Output:** `ExecutorResult(outputs={"diagnosis_artifact_id",
   "minimal_action", "failure_signature", "repair_attempt", "confidence",
   "target_files", "used_model", "repair_ledger_fact_id", <source-report
@@ -277,6 +284,10 @@ Two deterministic changes, both table/guard-driven and LLM-free:
   `escalate` fallback on provider error.
 - **`FailureContext`/ledger:** pure unit tests.
 - **Budget:** assert `DIAGNOSE` spends `REPAIR_BUDGET` and terminates.
+- **Guardrail gate (E2):** the offline recovery eval asserts
+  `never_worse_rate` and `determinism_ok` are both `1.0` over the golden
+  corpus (`tests/test_eval.py`), locking the degradation floor and router
+  purity to CI rather than a one-off unit test.
 
 ## 11. The adaptive loop (chart)
 

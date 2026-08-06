@@ -140,6 +140,43 @@ def test_evaluate_recovery_over_golden_corpus():
 
 
 # --------------------------------------------------------------------------
+# Determinism + degradation guardrails (E2): the provider-free recovery floor
+# must be pure and never cost more than the old whole-tree ladder.
+# --------------------------------------------------------------------------
+def test_recovery_never_worse_than_whole_tree_baseline():
+    golden = _load_recovery_golden()
+    out = RC.evaluate_recovery(golden)
+    # Degradation guardrail: no resolved action -- scoped fix or the
+    # provider-outage escalate fallback -- may cost more than a whole-tree nuke.
+    assert out["aggregate"]["never_worse_rate"] == pytest.approx(1.0)
+    assert all(r["never_worse"] for r in out["per_item"])
+
+
+def test_recovery_never_worse_flag_trips_on_costlier_action(monkeypatch):
+    # Inject an action strictly costlier than the whole-tree baseline and prove
+    # the guardrail flags it (so a future regression can't slip past the gate).
+    baseline = RC._WHOLE_TREE_BASELINE
+    costly = {"rounds": baseline["rounds"] + 1, "tokens": baseline["tokens"] + 1}
+    monkeypatch.setitem(RC._ACTION_COST, "regenerate_whole_tree", costly)
+    row = RC.score_case({"id": "x", "gate": "verify", "content": {
+        "outcome": "collection_error", "failures": [{
+            "type": "ImportError",
+            "message": ("cannot import name 'db' from partially initialized "
+                        "module 'app.models' (most likely due to a circular "
+                        "import)"),
+            "traceback": "app/models.py:1: in <module>"}]}})
+    assert row["action"] == "regenerate_whole_tree"
+    assert row["never_worse"] is False
+
+
+def test_recovery_resolution_is_deterministic():
+    golden = _load_recovery_golden()
+    assert RC.check_recovery_determinism(golden, repeats=5) is True
+    # The pure resolver produces an identical signature every run.
+    assert RC._resolution_signature(golden) == RC._resolution_signature(golden)
+
+
+# --------------------------------------------------------------------------
 # Full gate: codegen + recovery always run; retrieval only when faiss present.
 # --------------------------------------------------------------------------
 def test_run_gate_passes_on_repo_golden():
@@ -148,7 +185,10 @@ def test_run_gate_passes_on_repo_golden():
     assert "codegen" in report["sections"]
     assert report["sections"]["codegen"]["aggregate"]["expectation_match_rate"] == 1.0
     assert "recovery" in report["sections"]
-    assert report["sections"]["recovery"]["aggregate"]["action_match_rate"] == 1.0
+    rc_agg = report["sections"]["recovery"]["aggregate"]
+    assert rc_agg["action_match_rate"] == 1.0
+    assert rc_agg["never_worse_rate"] == 1.0
+    assert rc_agg["determinism_ok"] == 1.0
 
 
 def test_retrieval_end_to_end_over_sample_repo(tmp_path):

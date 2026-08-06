@@ -16,6 +16,14 @@ resolved action here and the gate fails. It is intentionally provider-free (no
 LLM), so it runs in every CI job alongside the codegen eval. ``rounds`` /
 ``tokens`` come from a transparent per-action cost model so the gate can track
 the scoped-vs-whole-tree savings the overhaul was built to deliver.
+
+Because the whole eval is provider-free, it also doubles as the **degradation
+floor** for the DIAGNOSE reasoning rung (E2): it measures exactly the behavior
+the agent guarantees when the LLM is unavailable. Two guardrails lock that
+floor to the release gate -- ``never_worse_rate`` (every resolved action,
+including the provider-outage ``escalate`` fallback, costs no more than the old
+whole-tree ladder) and ``determinism_ok`` (the resolver is pure, so re-running
+the corpus yields byte-identical verdicts and the router stays replayable).
 """
 
 from __future__ import annotations
@@ -141,6 +149,12 @@ def score_case(case: Dict[str, Any]) -> Dict[str, Any]:
     action = resolved["action"]
     cost = _ACTION_COST.get(action, _WHOLE_TREE_BASELINE)
     expected = str(case.get("expect_action") or "").strip()
+    # Degradation guardrail (E2): a recovery path must never cost *more* than
+    # the old nuke-and-regenerate ladder. The whole-tree action is the
+    # baseline, so every resolved action -- including the provider-free
+    # ``escalate`` fallback -- has to converge in no more rounds/tokens.
+    never_worse = (cost["rounds"] <= _WHOLE_TREE_BASELINE["rounds"]
+                   and cost["tokens"] <= _WHOLE_TREE_BASELINE["tokens"])
     return {
         "id": case.get("id"),
         "gate": case.get("gate"),
@@ -149,6 +163,7 @@ def score_case(case: Dict[str, Any]) -> Dict[str, Any]:
         "scoped": action in SCOPED_ACTIONS,
         "expected_action": expected,
         "matched_action": (not expected) or action == expected,
+        "never_worse": never_worse,
         "rounds": cost["rounds"],
         "tokens": cost["tokens"],
     }
@@ -173,7 +188,27 @@ def aggregate_recovery(per_item: Sequence[Dict[str, Any]]) -> Dict[str, float]:
             (base_rounds - mean_rounds) / base_rounds if base_rounds else 0.0,
         "tokens_saved_rate":
             (base_tokens - mean_tokens) / base_tokens if base_tokens else 0.0,
+        "never_worse_rate":
+            M.mean([1.0 if r["never_worse"] else 0.0 for r in per_item]),
     }
+
+
+def _resolution_signature(golden: Sequence[Dict[str, Any]]) -> tuple:
+    """A hashable projection of every case's resolved verdict + cost."""
+    return tuple(
+        (r["id"], r["classification"], r["action"], r["rounds"], r["tokens"])
+        for r in (score_case(c) for c in golden)
+    )
+
+
+def check_recovery_determinism(
+        golden: Sequence[Dict[str, Any]], repeats: int = 3) -> bool:
+    """Determinism guardrail: the resolver is pure -- re-running the corpus
+    yields byte-identical verdicts every time (no LLM, no ordering leak, no
+    hidden state), so the router's dispatch stays replayable and testable.
+    """
+    first = _resolution_signature(golden)
+    return all(_resolution_signature(golden) == first for _ in range(max(0, repeats - 1)))
 
 
 def evaluate_recovery(golden: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
@@ -181,12 +216,18 @@ def evaluate_recovery(golden: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     per_item = [score_case(c) for c in golden]
     for r in per_item:
         logger.info(
-            "eval.recovery: id=%s class=%s action=%s scoped=%s matched=%s",
+            "eval.recovery: id=%s class=%s action=%s scoped=%s matched=%s "
+            "never_worse=%s",
             r["id"], r["classification"], r["action"], r["scoped"],
-            r["matched_action"],
+            r["matched_action"], r["never_worse"],
         )
+    aggregate = aggregate_recovery(per_item)
+    # Determinism is a gate-checked invariant, surfaced as a 0/1 metric so a
+    # regression that introduces nondeterminism fails the release gate.
+    aggregate["determinism_ok"] = (
+        1.0 if check_recovery_determinism(golden) else 0.0)
     return {
         "n_items": len(per_item),
         "per_item": per_item,
-        "aggregate": aggregate_recovery(per_item),
+        "aggregate": aggregate,
     }

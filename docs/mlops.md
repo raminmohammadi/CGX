@@ -189,6 +189,16 @@ fixed by a scoped patch / install / targeted regenerate rather than a whole-tree
 nuke), plus a transparent per-action `rounds` / `tokens` cost model so the gate
 tracks the scoped-vs-whole-tree savings the overhaul was built to deliver.
 
+Because the section is provider-free, it doubles as the **degradation floor**
+for the `DIAGNOSE` reasoning rung: it measures exactly what the agent
+guarantees with the LLM unavailable. Two guardrails (E2) lock that floor to the
+gate: `never_worse_rate` (every resolved action -- including the provider-outage
+`escalate` fallback -- costs no more than the old whole-tree ladder, floored at
+`1.0`) and `determinism_ok` (`check_recovery_determinism` re-resolves the corpus
+and asserts byte-identical verdicts, so the router stays pure and replayable;
+floored at `1.0`). A change that makes recovery nondeterministic or costlier
+than a nuke-and-regenerate fails the build.
+
 The CI workflow runs the harness against the golden sets and fails the build
 when a metric regresses below its threshold, so retrieval / codegen / recovery
 quality is gated the same way tests are.
