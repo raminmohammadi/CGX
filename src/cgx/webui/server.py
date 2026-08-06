@@ -75,7 +75,16 @@ def _route_template(request: Request, fallback: str) -> str:
     route = request.scope.get("route")
     tmpl = getattr(route, "path", None)
     if tmpl:
-        return str(tmpl)
+        tmpl = str(tmpl)
+        # Depending on the FastAPI/Starlette version, a route registered on a
+        # sub-router mounted with ``prefix="/api"`` exposes ``route.path`` either
+        # as the full template (``/api/status``) or as the router-relative one
+        # (``/status``) with the prefix carried in ``root_path``. Rejoin them so
+        # the metric label is the full template in both regimes.
+        root = str(request.scope.get("root_path") or "")
+        if root and not tmpl.startswith(root):
+            tmpl = root.rstrip("/") + tmpl
+        return tmpl
     if fallback.startswith("/api/"):
         return "/api/_unmatched"
     return "/_spa"
