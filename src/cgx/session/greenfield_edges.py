@@ -187,6 +187,15 @@ def _repair_regenerate_actions(completed: TaskNode,
     chain) so a regenerated tree that fails on the identical signature
     is stopped by the flap detector instead of looping until the
     regenerate budget is spent.
+
+    **C1 -- targeted regenerate as the default.** The regenerate is
+    file-scoped whenever a file was named: first the classifier's own
+    ``extra_constraints['target_files']`` (e.g. a build-smoke importer),
+    then, when a REPAIR was reached from a DIAGNOSE ``patch_files`` verdict
+    whose bounded patch could not apply, the diagnosed ``target_files``
+    threaded into this REPAIR's inputs. A whole-tree regenerate is the
+    rare fallback, taken only when neither the classifier nor DIAGNOSE
+    implicated a file (or the prior SCAFFOLD_PATCHES id is unresolvable).
     """
     from cgx.session.repair.propose import propose_regenerate  # local import: dep direction
 
@@ -229,6 +238,17 @@ def _repair_regenerate_actions(completed: TaskNode,
     target_files = extra_constraints.get("target_files")
     if not isinstance(target_files, list) or not target_files:
         target_files = None
+    # C1: file-scoped regenerate as the default. A REPAIR reached from a
+    # DIAGNOSE ``patch_files`` verdict carries the diagnosed implicated
+    # file(s) in its inputs; when the bounded patch could not apply and this
+    # falls back to a regenerate, reuse those DIAGNOSIS ``target_files`` so
+    # the fix stays scoped to what the reasoning rung implicated instead of
+    # re-authoring the whole tree. Whole-tree stays the fallback only when
+    # neither the classifier nor DIAGNOSE named a file.
+    if target_files is None:
+        diagnosed = (completed.inputs or {}).get("target_files")
+        if isinstance(diagnosed, list) and diagnosed:
+            target_files = diagnosed
     prior_scaffold_id = str(
         (completed.outputs or {}).get("scaffold_artifact_id") or "").strip()
     new_scaffold = propose_regenerate(

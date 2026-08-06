@@ -12657,6 +12657,48 @@ def test_router_repair_regenerate_targets_build_smoke_importer():
     assert new_scaffold.inputs["prior_scaffold_artifact_id"] == "art_scaf"
 
 
+def test_router_repair_regenerate_reuses_diagnosed_target_files():
+    """C1: a diagnosed REPAIR that falls back to regenerate stays file-scoped.
+
+    A REPAIR reached from a DIAGNOSE ``patch_files`` verdict carries the
+    diagnosed implicated file(s) in its inputs. When the bounded patch is a
+    no-op and the executor emits ``strategy=regenerate`` *without* the
+    classifier naming ``target_files``, the router must reuse the diagnosed
+    ``target_files`` for a scoped regenerate instead of nuking the tree.
+    """
+    session, _scaffold, tasks, rep = _build_regenerate_chain()
+    rep.inputs = dict(rep.inputs)
+    rep.inputs["target_files"] = ["src/handlers.py"]
+    rep.outputs = dict(rep.outputs)
+    rep.outputs["classification"] = "assertion_drift"
+    rep.outputs["scaffold_artifact_id"] = "art_scaf"
+    # The classifier named no file this round (whole-tree today).
+    rep.outputs["extra_constraints"] = {"kind": "assertion_drift",
+                                        "rationale": "drift"}
+    plan = Router().on_task_completed(
+        session=session, completed=rep, tasks=tasks)
+    new_scaffold = [a.task for a in plan.actions
+                    if isinstance(a, CreateTask)][0]
+    assert new_scaffold.inputs["regenerate_files"] == ["src/handlers.py"]
+    assert new_scaffold.inputs["prior_scaffold_artifact_id"] == "art_scaf"
+
+
+def test_router_repair_regenerate_whole_tree_when_nothing_named():
+    """Whole-tree stays the fallback when neither classifier nor DIAGNOSE
+    named a file (no diagnosed inputs, no classifier target_files)."""
+    session, _scaffold, tasks, rep = _build_regenerate_chain()
+    rep.outputs = dict(rep.outputs)
+    rep.outputs["classification"] = "unknown"
+    rep.outputs["scaffold_artifact_id"] = "art_scaf"
+    rep.outputs["extra_constraints"] = {"kind": "unknown"}
+    plan = Router().on_task_completed(
+        session=session, completed=rep, tasks=tasks)
+    new_scaffold = [a.task for a in plan.actions
+                    if isinstance(a, CreateTask)][0]
+    assert not new_scaffold.inputs.get("regenerate_files")
+    assert not new_scaffold.inputs.get("prior_scaffold_artifact_id")
+
+
 def test_router_repair_regenerate_preserves_failure_signatures():
     """The failed chain's flap ledger survives into the new SCAFFOLD.
 
