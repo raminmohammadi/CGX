@@ -99,11 +99,19 @@ def run_diagnose(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult
 
 - **Input** (`task.inputs`): the source report artifact id, the
   `LoopBudget` repair-chain keys, and the `REPAIR_LEDGER` fact id.
-- **Behavior:** build `FailureContext`; run a **bounded ReAct loop**
-  (read a file, grep a symbol, list installed packages from
-  `BUILD_REPORT.installed_packages`) for at most `DIAGNOSE_STEPS`
-  iterations, then emit exactly one `DIAGNOSIS`. Read-only tools only —
+- **Behavior — deterministic-first:** the executor *always* runs the
+  existing deterministic path first (`classify.py` token +
+  `locate.py`/`propose.py`). When that yields an actionable fix it emits
+  the corresponding `minimal_action` **with no model call at all**. The
+  **bounded ReAct loop** (read a file, grep a symbol, list installed
+  packages from `BUILD_REPORT.installed_packages`) runs *only* when the
+  deterministic path is empty/ambiguous, for at most `DIAGNOSE_STEPS`
+  iterations, then emits exactly one `DIAGNOSIS`. Read-only tools only —
   the executor proposes; `APPLY`/`BOOTSTRAP_ENV`/`SCAFFOLD` mutate.
+- **Provider-agnostic:** the LLM is whatever the user configured (small
+  or large). The executor makes no tier assumptions — it uses a tight,
+  schema-constrained request and is tolerant of terse outputs, so a
+  small local model degrades to `escalate` rather than misbehaving.
 - **Bound:** the loop is charged against the shared `REPAIR_BUDGET` via
   `LoopBudget.spend_repair`, so termination is preserved.
 - **Deterministic fallback (E2):** if the provider is unavailable or the
@@ -213,14 +221,19 @@ flowchart LR
     DIAG -. ledger append every round .-> LED[("REPAIR_LEDGER fact")]
 ```
 
-## 12. Open questions for sign-off
+## 12. Resolved design decisions (signed off)
 
-1. **`DIAGNOSE_STEPS` bound** — start at 3 read-only tool calls per
-   round? Higher = smarter but more tokens.
-2. **Provider tier** — do we target the local small model
-   (qwen2.5-coder) or a larger hosted one for `DIAGNOSE`? This decides
-   how much we lean on the ReAct loop vs. a tighter schema-constrained
-   single call.
-3. **Where the "needs reasoning" gate lives** — extend
-   `_REGENERATE_CLASSES` into an explicit `_DIAGNOSE_CLASSES` set, or add
-   a `needs_reasoning` flag to the classifier registry?
+1. **Deterministic-first, LLM-second.** `DIAGNOSE` never reaches for the
+   model until the existing deterministic classifiers/locators have been
+   tried and produced no actionable fix. The LLM is the fallback rung,
+   not the default. This keeps the cheap, instant path primary and bounds
+   token cost.
+2. **Provider-agnostic.** The configured LLM may be small or large; the
+   executor makes no tier assumptions and uses a tight schema-constrained
+   request so a small model degrades cleanly to `escalate`.
+3. **`DIAGNOSE_STEPS` = 3** read-only tool calls per round as the default
+   bound (revisit in the Phase 4 eval harness).
+4. **The "needs reasoning" gate** is an explicit `_DIAGNOSE_CLASSES` set
+   (a subset of today's `_REGENERATE_CLASSES`), so the mechanical tokens
+   keep their fast path and only the genuinely ambiguous ones route to
+   `DIAGNOSE`.
