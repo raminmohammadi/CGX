@@ -471,12 +471,29 @@ def _session_from_json(blob: str) -> Session:
     )
 
 
+def _task_kind(value: Any) -> TaskKind:
+    """Decode a persisted task kind, tolerating one this build retired.
+
+    A kind removed from the enum (or written by a newer build) used to
+    raise ``ValueError`` on every read, so a single stale row made the
+    whole session -- snapshot endpoint, SSE stream and all -- permanently
+    unreadable. Degrade to :attr:`TaskKind.UNKNOWN` instead: the row
+    stays visible and inert.
+    """
+    try:
+        return TaskKind(value)
+    except ValueError:
+        logger.warning("session store: unknown task kind %r, "
+                       "reading it as UNKNOWN", value)
+        return TaskKind.UNKNOWN
+
+
 def _task_from_json(blob: str) -> TaskNode:
     d = json.loads(blob)
     return TaskNode(
         task_id=d["task_id"],
         session_id=d["session_id"],
-        kind=TaskKind(d["kind"]),
+        kind=_task_kind(d["kind"]),
         name=d.get("name", ""),
         description=d.get("description", ""),
         parent_task_id=d.get("parent_task_id"),

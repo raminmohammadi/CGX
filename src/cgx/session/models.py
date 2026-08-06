@@ -111,6 +111,11 @@ class TaskKind(str, enum.Enum):
     REPAIR = "repair"
     DIAGNOSE = "diagnose"
     AST_REGENERATE = "ast_regenerate"
+    # Read-only placeholder for a persisted row whose kind this build no
+    # longer knows (a retired kind, or a database written by a newer
+    # build). The router never spawns it and no executor is registered;
+    # it exists so one legacy row cannot make a whole session unreadable.
+    UNKNOWN = "unknown"
 
 
 class FactKind(str, enum.Enum):
