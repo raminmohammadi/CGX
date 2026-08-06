@@ -74,6 +74,50 @@ def test_record_run_swallows_errors():
 
 
 # --------------------------------------------------------------------------
+# Agent-turn recorder: aggregate LLM_CALL facts into a kind="agent" run
+# --------------------------------------------------------------------------
+def test_record_agent_turn_aggregates_llm_facts():
+    from cgx.activity import record_agent_turn
+    from cgx.session.models import Fact, FactKind, Session
+
+    store = _mem_store()
+    session = Session.new(original_objective="add tests",
+                          project_root="/tmp/proj")
+    facts = [
+        Fact.new(session.session_id, FactKind.LLM_CALL,
+                 {"model": "qwen", "tokens_in": 10, "tokens_out": 5,
+                  "tokens_total": 15, "cost_usd": 0.001}),
+        Fact.new(session.session_id, FactKind.LLM_CALL,
+                 {"model": "qwen", "tokens_in": 20, "tokens_out": 7,
+                  "tokens_total": 27, "cost_usd": 0.002}),
+    ]
+    record_agent_turn(session=session, run_id="turn-1", facts=facts,
+                      latency_ms=42.0, store=store)
+
+    rows = store.recent(kind="agent")
+    assert len(rows) == 1
+    got = rows[0]
+    assert got["kind"] == "agent" and got["run_id"] == "turn-1"
+    assert got["project_root"] == "/tmp/proj" and got["model"] == "qwen"
+    assert got["tokens_total"] == 42 and got["tokens_in"] == 30
+    assert abs(got["cost_usd"] - 0.003) < 1e-9
+    assert got["labels"]["mode"] == "explore"
+
+
+def test_record_agent_turn_no_facts_is_zeroed_and_safe():
+    from cgx.activity import record_agent_turn
+    from cgx.session.models import Session
+
+    store = _mem_store()
+    session = Session.new(original_objective="noop", project_root="/tmp/p")
+    record_agent_turn(session=session, run_id="turn-empty", facts=[],
+                      store=store)
+    got = store.get("turn-empty")
+    assert got and got["kind"] == "agent"
+    assert got["tokens_total"] == 0 and got["cost_usd"] == 0.0
+
+
+# --------------------------------------------------------------------------
 # API routes
 # --------------------------------------------------------------------------
 async def _asgi(app, method, path):

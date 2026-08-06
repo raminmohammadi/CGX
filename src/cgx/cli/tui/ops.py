@@ -313,6 +313,7 @@ def _drive_session(state: Any, runner: Any, sid: str, deps: Any, *,
     """
     import queue as queue_mod
     import threading
+    import time
 
     from cgx.session.events import get_default_bus
     from cgx.session.tasks.ask import build_decision
@@ -321,6 +322,11 @@ def _drive_session(state: Any, runner: Any, sid: str, deps: Any, *,
     bus_q: "queue_mod.Queue[Any]" = queue_mod.Queue()
     unsubscribe = get_default_bus().subscribe(
         "*", lambda ev: bus_q.put(ev) if ev.session_id == sid else None)
+    # Snapshot the session's LLM_CALL facts up front so the epilogue records
+    # only this turn's calls as a kind="agent" activity run (Subsystem C),
+    # mirroring the webui drain. Best-effort; never affects the drive.
+    t0 = time.perf_counter()
+    seen_before = _llm_fact_ids(store, sid)
     try:
         for _ in range(64):
             if cancel_event is not None and cancel_event.is_set():
@@ -377,6 +383,38 @@ def _drive_session(state: Any, runner: Any, sid: str, deps: Any, *,
         yield from _session_epilogue(store, sid)
     finally:
         unsubscribe()
+        _record_agent_turn(store, sid, seen_before, t0)
+
+
+def _llm_fact_ids(store: Any, sid: str) -> set:
+    """Ids of the session's current ``LLM_CALL`` facts (best-effort)."""
+    try:
+        from cgx.session.models import FactKind
+        return {f.fact_id for f in
+                store.load_kb(sid).of_kind(FactKind.LLM_CALL)}
+    except Exception:  # pragma: no cover - defensive
+        return set()
+
+
+def _record_agent_turn(store: Any, sid: str, seen_before: set,
+                       t0: float) -> None:
+    """Record this turn's freshly-drained LLM_CALL facts as an activity run."""
+    import time
+
+    try:
+        from cgx.activity import record_agent_turn
+        from cgx.session.models import FactKind
+        session = store.get_session(sid)
+        if session is None:
+            return
+        new_facts = [f for f in store.load_kb(sid).of_kind(FactKind.LLM_CALL)
+                     if f.fact_id not in seen_before]
+        record_agent_turn(
+            session=session, run_id=f"{sid}:{int(t0 * 1000)}",
+            facts=new_facts,
+            latency_ms=(time.perf_counter() - t0) * 1000.0)
+    except Exception:  # pragma: no cover - activity is non-critical
+        pass
 
 
 def _bus_to_tui(ev: Any) -> Iterator[Event]:
