@@ -18,8 +18,8 @@ covers the provider types and the hardware-aware model picker.
 | **Hugging Face**       | `huggingface`               | `router.huggingface.co` (OpenAI-compatible Inference Providers) |
 | **Custom server**      | `custom`                    | Your self-hosted endpoint (custom path, optional auth-bypass) |
 
-Choose a provider from the **Setup** tab's *Provider Type* dropdown, or
-pass `--provider` on the CLI. A **Ping** button (and
+Choose a provider under **Settings → Active Provider** from the *Provider
+Type* dropdown, or pass `--provider` on the CLI. A **Ping** button (and
 `POST /api/provider/ping`) runs a live connection test that reports
 latency or the exact error.
 
@@ -73,23 +73,54 @@ model is set, or falls back to the public model list otherwise.
 ### Browse Hugging Face → pull GGUFs locally
 
 The **Settings → Browse Hugging Face** panel lists GGUF repositories from
-the Hub (`huggingface.co/api/models?filter=gguf`) with live search, sort
-(trending / downloads / likes / recently updated), download and like
-counts, and detected quantization labels. **Pull** hands the tag to your
-local Ollama daemon via the existing `hf.co/<repo>[:<quant>]` mechanism
-and streams progress through the shared `PullProgress` bar — no HF token
-required, since the download goes through Ollama.
+the Hub and pulls any one of them straight into your local Ollama daemon.
+No HF token is required to browse or to pull — the download goes through
+Ollama's `hf.co/<repo>` mechanism.
 
-Once the download completes, the model is **re-aliased to a clean local
-name** so it isn't stored under the full `hf.co/…` web address:
-`hf.co/ornith-ai/Ornith-1.0-9B-GGUF` becomes `Ornith-1.0-9B-GGUF` (with
-the chosen quant as the tag, e.g. `…:q4_k_m`). The panel derives this
-name from the repo id and passes it as the optional `local_name` on
+**Panel controls, element by element:**
+
+| Element | What it is |
+|---------|------------|
+| **Search box** | Free-text Hub search (`llama`, `qwen`, `gemma`, …). Submitting the form (or **Refresh**) reloads the list. |
+| **Sort** dropdown | **Trending** (default) · **Most downloaded** · **Most liked** · **Recently updated**. Changing it reloads immediately. |
+| **Refresh** | Re-runs the current search/sort. |
+
+**Each model row shows:** the repo id (a link to `huggingface.co/<repo>`),
+a **downloads** count and a **likes** count (compacted, e.g. `12.3k`), and a
+**gated** pill when the repo requires access approval. On the right sit up to
+four controls:
+
+| Control | Behaviour |
+|---------|-----------|
+| **quant** select | Lists the quantization labels detected in the repo (`q4_k_m`, `q8_0`, …) plus **default quant**. The choice becomes the Ollama tag suffix. |
+| **Check fit** | Sizes the model against your detected hardware **without downloading** — calls `GET /hardware/hf_fit`. Renders the [fit result](#the-fit-verdict) inline. |
+| **Pull** | Downloads via Ollama and re-aliases to a clean local name (below). |
+| **Cancel** | Appears while that repo is pulling; aborts the in-flight download. |
+
+A **PullProgress** bar streams the download beneath the row.
+
+**Clean local naming.** Once the download completes, the model is
+**re-aliased** so it isn't stored under the full `hf.co/…` web address:
+`hf.co/ornith-ai/Ornith-1.0-9B-GGUF` becomes `ornith-1.0-9b-gguf` (with the
+chosen quant as the tag, e.g. `…:q4_k_m`). The panel derives this name from
+the repo id and passes it as the optional `local_name` on
 `POST /api/ollama/pull`; the backend then runs Ollama's `POST /api/copy`
-followed by `DELETE /api/delete` (instant — no re-download) and reports
-the final name back over the progress stream ("Download complete — saved
-as `<name>`"). The re-alias is best-effort: if it fails, the original tag
-is kept and the download is never reported as an error.
+followed by `DELETE /api/delete` (instant — no re-download) and reports the
+final name back over the progress stream ("Download complete — saved as
+`<name>`"). The re-alias is best-effort: if it fails, the original tag is
+kept and the download is never reported as an error.
+
+```mermaid
+flowchart LR
+    S["Search + Sort<br/>the Hub"] --> ROW["Model row<br/>downloads · likes · quants"]
+    ROW -->|Check fit| FIT["GET /hardware/hf_fit<br/>verdict vs your budget"]
+    ROW -->|Pull| DL["Ollama pulls hf.co/&lt;repo&gt;"]
+    DL --> ALIAS["copy → delete<br/>clean local name"]
+    ALIAS --> DONE["Saved as &lt;name&gt;"]
+    classDef n fill:#0e2a4a,stroke:#38bdf8,color:#eaf6ff;
+    classDef g fill:#123a2a,stroke:#34d399,color:#eafff5;
+    class S,ROW,FIT n; class DL,ALIAS,DONE g;
+```
 
 ## Custom server (OpenAI-compatible)
 
@@ -151,33 +182,125 @@ profile with `rate_limit` (req/sec) and `max_retries`. Setting
 
 ---
 
-## Hardware-aware model picker
+## Hardware detection & the fit matrix
 
-The **Hardware** tab annotates a static catalogue of **21**
-locally-runnable models (families: `coder`, `reasoning`, `general`)
-against the RAM/VRAM detected by `detect_hardware()`. Each row reports:
+**Settings → Hardware** is the *Hardware-Aware Local Catalog*: it detects
+what your machine can run and cross-references a curated catalogue of
+locally-runnable models against those limits. It is **pure-offline for the
+catalogue** — annotating rows fires no network call (only the optional
+Hugging Face fit checker below reaches the Hub).
+
+### What "Detect Hardware Budget" probes
+
+The **Detect Hardware Budget** button (top-right; shows *Detecting…* while it
+runs) calls `GET /hardware/matrix`, which re-runs `detect_hardware()` on every
+request. That probe is best-effort and dependency-light:
+
+| Signal | How it's measured |
+|--------|-------------------|
+| **System RAM** | Reads `MemTotal` from `/proc/meminfo`. |
+| **GPU VRAM** | Runs `nvidia-smi --query-gpu=memory.total`; takes the largest GPU. Absent → "no GPU". |
+| **torch / CUDA** | Imports `torch` once (cached) to check `torch.cuda.is_available()`. |
+
+If an NVIDIA GPU is present but `torch.cuda` is unavailable (a common
+CUDA-wheel/driver mismatch), the probe returns a **`torch_cuda_warning`** —
+embeddings would silently fall back to CPU (~10× slower), and the message
+tells you which `cu1XX` torch wheel to reinstall.
+
+### The four stat cards
+
+| Card | Meaning |
+|------|---------|
+| **System RAM** | Detected RAM in GB. |
+| **GPU VRAM** | Detected VRAM in GB, or `--` when no GPU is found. |
+| **Catalog rows** | Number of models in the annotated table. |
+| **Installed** | How many of those you've already pulled into Ollama. |
+
+### The catalogue table
+
+One row per model. **Rows you've already pulled are highlighted** and carry a
+green **Downloaded** pill in the *Status* column; hovering a row shows the fit
+`reason` as a tooltip. The matrix endpoint merges your installed Ollama tags
+(`GET /api/tags`) into the static catalogue, appending any installed-only
+model that isn't curated.
 
 | Column | Meaning |
 |--------|---------|
-| `name`                | Ollama tag (e.g. `qwen2.5-coder:3b`) |
-| `params_b`            | Approx parameter count (billions) |
-| `min_ram_gb`          | Lower bound for 4-bit quantised inference |
-| `recommended_vram_gb` | VRAM for smooth throughput |
-| `ctx_window`          | Max advertised prompt window |
-| `family`              | `coder` / `reasoning` / `general` |
-| `fit`                 | ✅ fits / ⚠️ tight / ❌ won't fit |
-| `reason`              | The numeric comparison behind the verdict |
+| **Model** | Ollama tag (e.g. `qwen2.5-coder:3b`). |
+| **Params** | Approx parameter count (billions). |
+| **Min RAM** | Lower bound for 4-bit quantised inference. |
+| **Rec VRAM** | VRAM for smooth throughput. |
+| **Family** | `coder` / `general` / `reasoning` (rows group in that order). |
+| **Status** | **Downloaded** pill when installed locally, else `—`. |
+| **Fit** | ✅ **fits** / ⚠️ **tight** / ❌ **won't fit**, with the `reason` and any `notes`. |
 
-A second table shows the editorial **local-vs-cloud trade-off** across
-privacy, cost, quality ceiling, latency, offline use, setup effort, and
-operational risk. Everything is computed locally — opening this tab makes
-**no network call**. The same data is exported to
-[`docs/hardware_matrix.json`](https://github.com/raminmohammadi/Averix/blob/main/docs/hardware_matrix.json) and documented
-in [`docs/hardware_matrix.md`](https://github.com/raminmohammadi/Averix/blob/main/docs/hardware_matrix.md).
+### The fit verdict
+
+Both the table and the Hugging Face checker share one scorer. First a single
+**budget** number is derived — VRAM dominates when a GPU is present, else RAM:
+
+```
+budget_gb = max(ram, vram * 2)   if a GPU is present
+          = ram                  otherwise
+```
+
+Then the verdict ladder (min-RAM and rec-VRAM come from the catalogue, or are
+estimated for arbitrary models — see below):
+
+| Verdict | Condition |
+|---------|-----------|
+| **unknown** | budget is 0 (probe returned nothing) or params can't be determined |
+| **won't fit** | `budget < min_ram × 0.9` |
+| **tight** | GPU present and `vram < rec_vram × 0.75`, **or** `budget < min_ram × 1.2` |
+| **fits** | otherwise |
+
+For models not in the catalogue (installed-only tags, or any Hugging Face
+repo), requirements are estimated from the parameter count for a 4-bit quant:
+`rec_vram ≈ params×1.1 + 0.7` and `min_ram ≈ params×1.3 + 2.5` GB.
+
+```mermaid
+flowchart TD
+    HW["detect_hardware()<br/>RAM · VRAM · torch/CUDA"] --> BUD["budget = max(ram, vram×2)"]
+    MODEL["model params_b<br/>→ min_ram, rec_vram"] --> VER
+    BUD --> VER{"verdict ladder"}
+    VER -->|budget &lt; min×0.9| WF["won't fit"]:::r
+    VER -->|vram &lt; rec×0.75<br/>or budget &lt; min×1.2| TG["tight"]:::a
+    VER -->|else| OK["fits"]:::g
+    classDef r fill:#3a1220,stroke:#fb7185,color:#ffeaf0;
+    classDef a fill:#3a2410,stroke:#fbbf24,color:#fff7e6;
+    classDef g fill:#123a2a,stroke:#34d399,color:#eafff5;
+```
+
+### Test a Hugging Face model
+
+Below the table, the **Test a Hugging Face model** card takes any Hub repo id
+(e.g. `Qwen/Qwen2.5-Coder-7B-Instruct`) and runs the same **Check fit** as the
+Browse panel. It calls `GET /hardware/hf_fit`, which fetches the repo's public
+metadata and resolves the parameter count from the exact **`safetensors.total`**
+when the Hub reports it, otherwise from the **size hint in the repo name**
+(shown as `(est.)`). Repo ids are validated to a strict `owner/name` pattern
+and only ever used as a path segment against a fixed host (an SSRF barrier); an
+unresolvable repo degrades to an **unknown** verdict rather than erroring.
+
+The **fit result** panel (shared with the Browse panel) shows the colour-coded
+verdict and reason, plus four spec tiles: **Params**, **Min RAM**, **Rec
+VRAM**, and **Your budget** (your detected `RAM / VRAM`).
+
+### Local-First vs Cloud trade-offs
+
+The final card is an editorial comparison — a grid of decision dimensions
+(privacy/egress, marginal cost, quality ceiling, cold/warm latency, offline
+use, setup effort, operational risk). Each tile states the **Local** and
+**Cloud** position and a **winner** badge (emerald `local`, purple `cloud`, or
+`tie`). It is pure guidance — no live numbers. The same data is exported to
+[`docs/hardware_matrix.json`](https://github.com/raminmohammadi/Averix/blob/main/docs/hardware_matrix.json)
+and documented in
+[`docs/hardware_matrix.md`](https://github.com/raminmohammadi/Averix/blob/main/docs/hardware_matrix.md).
 
 ---
 
 ## See also
 
+- **[[Ops and Observability]]** — the observability hub and its Metrics tab.
 - **[[Configuration and Tuning]]** — sampling, rate limits, embeddings.
 - **[[Privacy and Security]]** — where credentials live and egress paths.

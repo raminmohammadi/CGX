@@ -19,6 +19,7 @@
 - [[Configuration and Tuning]]
 
 **Operate & deploy**
+- [[Ops and Observability]]
 - [[MLOps and Production]]
 
 **Trust & internals**

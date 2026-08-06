@@ -58,7 +58,7 @@ your machine unless you explicitly opt into a cloud model.
 - **Universal LLM provider.** Ollama (local), OpenAI-compatible
   endpoints, native **Google Gemini**, **Hugging Face** Inference
   Providers, or any self-hosted server with a custom IP, path, and
-  optional auth-bypass -- switchable from the Settings tab with a live
+  optional auth-bypass -- switchable from the Settings page with a live
   **Ping** latency check. API keys live in your OS keyring.
 - **Hybrid retrieval.** Two-view semantic + BM25 + graph expansion,
   fused with Reciprocal Rank Fusion and an optional cross-encoder
@@ -98,8 +98,8 @@ your machine unless you explicitly opt into a cloud model.
   for the full table and [docs/architecture.md](docs/architecture.md#skills)
   for the protocol.
 - **Persistent chat sessions.** Conversations are saved as JSONL
-  threads under `~/.cgx/sessions/`; resume them later from the Ask
-  tab's session sidebar.
+  threads under `~/.cgx/sessions/`; resume them later from the
+  Contextual Ask page's session sidebar.
 - **Self-testing code generation.** Diffs are parsed, syntax-checked,
   and optionally run against impacted pytest tests in a sandbox before
   being surfaced. The sandbox now auto-installs missing Python packages
@@ -112,9 +112,10 @@ your machine unless you explicitly opt into a cloud model.
 - **Incremental indexing.** A content-addressed embedding cache
   (per-view `.npz` keyed on sha256 of the corpus text) makes
   re-indexing a touched-only-a-few-files repo nearly instant.
-- **Hardware-aware model picker.** The Hardware tab reports
-  ✅/⚠️/❌ verdicts for 21 local models against your detected RAM/VRAM
-  and shows a local-vs-cloud trade-off table.
+- **Hardware-aware model picker.** The **Settings → Hardware** panel
+  reports ✅/⚠️/❌ verdicts for 21 curated local models against your
+  detected RAM/VRAM (merging any you've already pulled), sizes arbitrary
+  Hugging Face repos, and shows a local-vs-cloud trade-off table.
 - **Client-side rate limiting + 429 retry** on every provider, with
   per-profile budgets persisted alongside the model config.
 - **Thought-process panel.** Live streaming of the model's reasoning
@@ -124,9 +125,9 @@ your machine unless you explicitly opt into a cloud model.
 - **Task registry & cancel.** Every operation is tracked in
   `~/.cgx/tasks.db`; cancel any running task with
   `DELETE /api/tasks/{id}` or the in-UI Cancel button.
-- **Cancel button on every tab.** Stop a streaming request mid-flight
+- **Cancel button on every page.** Stop a streaming request mid-flight
   from Ask (Stop), Plan, Agent, or Index (Cancel).
-- **Tab persistence.** Switching between tabs mid-task no longer loses
+- **Page persistence.** Switching between pages mid-task no longer loses
   the running view -- state is held in a session-scoped Zustand store
   (`frontend/src/store/tasks.ts`) and the SSE stream continues in the
   background via `frontend/src/lib/connections.ts`.
@@ -282,34 +283,21 @@ non-loopback address only on a trusted LAN/VPN (Tailscale, WireGuard,
 auth, oauth2-proxy, …). Do not expose port 8765 directly to the
 public internet.
 
-Tabs (left → right):
+Navigation is a grouped left **sidebar** (not a flat tab row). The
+**Overview** (`/`) landing page shows provider, index and session status at a
+glance; the groups below hold the working pages:
 
-1. **Setup** -- choose a **Provider Type** (Ollama, OpenAI, Google
-   Gemini, Hugging Face, or Custom Server), fill in the model and
-   credentials, and click **Ping** to verify the connection with a live
-   latency check. Detect hardware (RAM + GPU VRAM) and tune sampling
-   parameters. Save named profiles; API keys are stored in your OS keyring.
-   A **Browse Hugging Face** panel lists GGUF repositories from the Hub
-   and pulls them straight into your local Ollama daemon, re-aliasing each
-   download to a clean local name (e.g. `Ornith-1.0-9B-GGUF`) instead of
-   the full `hf.co/<repo>` web address.
-2. **Index** -- point at a project root or upload a `.zip`. Honours
-   `.gitignore` and a 1 MB file-size cap; emits `indices/`,
-   `records.jsonl`, `chunks.jsonl`, `graph.json` and per-view
-   `emb_cache_<view>.npz` for incremental re-indexing. Intent and impl
-   views are indexed in parallel. A **Cancel** button is available while
-   indexing is in progress.
-3. **Ask** -- natural-language question with a streaming "thought
-   process" panel and a final grounded answer. Sidebar holds the
-   **session list** (➕ New / 🗑️ Delete / dropdown to resume an existing
-   thread). A **Stop** button halts the stream mid-flight; switching
-   tabs preserves the answer in progress.
-4. **Plan** -- request a change plan; optionally tick *Validate diffs*
-   and *Run impacted tests* to have CGX self-check its own output
-   before returning. The full self-test report renders inline. A
-   **Cancel** button is available while planning is in progress; tab
-   switching is non-destructive.
-5. **Agent** (`/agent`) -- the **session-based** view. Start a
+1. **Converse → Contextual Ask** (`/ask`) -- natural-language question with a
+   streaming "thought process" panel and a final grounded answer. The sidebar
+   holds the **session list** (➕ New / 🗑️ Delete / dropdown to resume an
+   existing thread). A **Stop** button halts the stream mid-flight; switching
+   pages preserves the answer in progress.
+2. **Build → Self-Testing Plan** (`/plan`) -- request a change plan; optionally
+   tick *Validate diffs* and *Run impacted tests* to have CGX self-check its own
+   output before returning. The full self-test report renders inline. A
+   **Cancel** button is available while planning is in progress; page switching
+   is non-destructive.
+3. **Build → Agent Loop** (`/agent`) -- the **session-based** view. Start a
    session with an objective, pick a **mode** (auto / explore /
    greenfield -- *auto* defers to `detect_mode`), and watch the
    agent walk the appropriate chain. Explore mode runs
@@ -326,25 +314,47 @@ Tabs (left → right):
    you tick the approval checkpoint, and an `Undo` button rolls
    the run back via `POST /api/rollback`. Session state is
    persisted to `<project_root>/.cgx/sessions.db`; the active
-   session id and selection are persisted client-side so a tab
+   session id and selection are persisted client-side so a page
    switch / reload resumes the same view. The same loop backs the
    `cgx agent` CLI, which runs a single unattended turn (clarify /
    approval questions answered with sensible defaults) for one-shot
    goals. A **Cancel** button is surfaced on long-running tasks.
-6. **Hardware** -- click **Detect hardware** to annotate the local
-   model catalogue with ✅/⚠️/❌ fit verdicts against your machine. The
-   second table shows the editorial local-vs-cloud trade-off across
-   privacy, cost, quality ceiling, latency, offline use, setup effort,
-   and operational risk. Pure-offline; no network calls fire from this
-   tab.
-7. **Profiles** -- save provider configurations for any supported
-   provider kind (`ollama`, `openai-compat`, `gemini`, `huggingface`,
-   `custom`). Custom
-   profiles expose an **Endpoint Path** field and a **Skip auth** toggle
-   for private-subnet servers. API keys are persisted in the OS keyring
-   when available, otherwise in a `0600`-permissioned file under
-   `~/.cgx/`. Optional per-profile `rate_limit` (req/sec) and
-   `max_retries` apply automatically to every call made by that profile.
+4. **Retrieval → Incremental Index** (`/index`) -- point at a project root or
+   upload a `.zip`. Honours `.gitignore` and a 1 MB file-size cap; emits
+   `indices/`, `records.jsonl`, `chunks.jsonl`, `graph.json` and per-view
+   `emb_cache_<view>.npz` for incremental re-indexing. Intent and impl views
+   are indexed in parallel. A **Cancel** button is available while indexing is
+   in progress.
+5. **Observability → Ops & Observability** (`/ops`) -- the unified MLOps hub:
+   ten tabs of live metrics, per-run activity, AIOps alerts, cost & quota,
+   feedback, data governance, health probes, and a **Trace** explorer that
+   browses each project's redacted `@traced` log (full prompt + response per LLM
+   call). Every card, chart and button is documented in the
+   [Ops & Observability](wiki/Ops-and-Observability.md) wiki page. See also
+   [MLOps & production](#mlops--production).
+6. **System → Profiles & Setup** (`/settings`) -- a searchable category list:
+   - **Active Provider** -- choose a **Provider Type** (Ollama, OpenAI, Google
+     Gemini, Hugging Face, or Custom Server), fill in the model and credentials,
+     and click **Ping** to verify the connection with a live latency check. API
+     keys are stored in your OS keyring.
+   - **Saved Profiles** -- save/use/edit provider configurations for any
+     supported kind (`ollama`, `openai-compat`, `gemini`, `huggingface`,
+     `custom`). Custom profiles expose an **Endpoint Path** field and a **Skip
+     auth** toggle for private-subnet servers; optional per-profile `rate_limit`
+     (req/sec) and `max_retries` apply automatically to every call.
+   - **Browse Hugging Face** -- lists GGUF repositories from the Hub, sizes them
+     against your hardware with **Check fit**, and **Pull**s them straight into
+     your local Ollama daemon, re-aliasing each download to a clean local name
+     (e.g. `ornith-1.0-9b-gguf`) instead of the full `hf.co/<repo>` web address.
+   - **Observability** -- a single **tracing toggle** (equivalent to
+     `CGX_TRACE=1`) that turns on the rich `@traced` records read by the Ops
+     hub's Trace tab.
+   - **Hardware** -- click **Detect Hardware Budget** to probe RAM + GPU VRAM
+     and annotate the local model catalogue with ✅/⚠️/❌ fit verdicts, flag
+     already-downloaded models, size any Hugging Face repo, and show the
+     editorial local-vs-cloud trade-off across privacy, cost, quality ceiling,
+     latency, offline use, setup effort, and operational risk. The catalogue is
+     pure-offline; no network call fires from annotating it.
 
 ### CLI
 
@@ -689,10 +699,12 @@ run_index_auto(project_root="./", out_dir="/tmp/cgx_index", incremental=False)
 
 ## Hardware-aware model picker
 
-The **📊 Hardware** tab annotates a static catalogue of 21
+The **Settings → 📊 Hardware** panel annotates a static catalogue of 21
 locally-runnable models (families: `coder`, `reasoning`, `general`)
 against the RAM/VRAM detected by
-`cgx.answer.ollama_discovery.detect_hardware()`. Each row reports:
+`cgx.answer.ollama_discovery.detect_hardware()`, merging in any models you
+have already pulled into Ollama so the table matches what's on disk. Each
+row reports:
 
 | Column        | Meaning                                                                                        |
 |---------------|------------------------------------------------------------------------------------------------|
@@ -708,8 +720,9 @@ against the RAM/VRAM detected by
 The second table shows the editorial local-vs-cloud trade-off across
 **privacy, marginal cost, quality ceiling, cold/warm latency,
 offline use, setup effort, and operational risk**. Every number is
-computed locally -- opening this tab does **not** make any network
-call. The same data is exported as
+computed locally -- annotating the catalogue does **not** make any network
+call (only the optional Hugging Face fit check reaches the Hub). The same
+data is exported as
 [`docs/hardware_matrix.json`](docs/hardware_matrix.json) for downstream
 tooling and documented in
 [`docs/hardware_matrix.md`](docs/hardware_matrix.md).

@@ -8,7 +8,10 @@ SQLite (WAL, `$CGX_CONFIG_DIR`-aware), metrics are collected in-process, and
 every recorder is best-effort so an observability failure can never break an
 ask/plan/agent request.
 
-The exhaustive operator guide (endpoints, env vars, store layout) is
+This page is the subsystem-level reference. For a field guide to the **`/ops`
+web hub** — every tab, stat card, donut, gauge, bar list and button, and the
+subsystem each maps to — see **[[Ops and Observability]]**. The exhaustive
+operator guide (endpoints, env vars, store layout) is
 [`docs/mlops.md`](https://github.com/raminmohammadi/Averix/blob/main/docs/mlops.md);
 deployment specifics live in
 [`deploy/README.md`](https://github.com/raminmohammadi/Averix/blob/main/deploy/README.md).
@@ -128,6 +131,7 @@ Helm chart with the probes, a PVC for the config volume, and an optional
 
 ## See also
 
+- **[[Ops and Observability]]** — the `/ops` hub, tab by tab.
 - [`docs/mlops.md`](https://github.com/raminmohammadi/Averix/blob/main/docs/mlops.md) — the full operator reference.
 - [`deploy/README.md`](https://github.com/raminmohammadi/Averix/blob/main/deploy/README.md) — build / run / scale.
 - **[[Configuration and Tuning]]** — the MLOps environment variables.
