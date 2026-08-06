@@ -5,11 +5,12 @@
 loop in [`docs/flowcharts.md`](flowcharts.md)).
 
 **Implementation status:** the typed model additions (§3), the
-`FailureContext` normalizer (§4), and the `DIAGNOSE` executor itself (§6)
-have landed in `src/cgx/session/tasks/diagnose.py`. The `RepairLedger`
-working memory (§7) and the router wiring (§8) are the remaining Phase 2
-tasks; until §8 lands the executor is unit-tested in isolation and not
-yet reachable from the greenfield edges.
+`FailureContext` normalizer (§4), the `DIAGNOSE` executor itself (§6), and
+the `RepairLedger` working memory (§7) have landed
+(`src/cgx/session/tasks/diagnose.py`, `src/cgx/session/repair/ledger.py`).
+The router wiring (§8) is the remaining Phase 2 task; until it lands the
+executor is unit-tested in isolation and not yet reachable from the
+greenfield edges.
 
 This document specifies `DIAGNOSE`, a new **reasoning executor** inserted
 between the mechanical `REPAIR` patch and the nuclear whole-tree
@@ -145,9 +146,10 @@ def run_diagnose(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult
   path. `DIAGNOSE` is strictly additive.
 - **Output:** `ExecutorResult(outputs={"diagnosis_artifact_id",
   "minimal_action", "failure_signature", "repair_attempt", "confidence",
-  "target_files", "used_model", <source-report id>, ...},
-  artifact=<DIAGNOSIS>)`. The `facts=[<updated REPAIR_LEDGER>]` append is
-  the pending §7 task; today the executor emits only the artifact.
+  "target_files", "used_model", "repair_ledger_fact_id", <source-report
+  id>, ...}, facts=[<appended REPAIR_LEDGER>], artifact=<DIAGNOSIS>)`. The
+  new ledger fact id rides `repair_ledger_fact_id` so the next round reads
+  the same working memory (§7).
 - **Tracing:** the executor is auto-wrapped by `register_executor`'s
   `traced("executor")`; every model call goes through the session
   `TracingProvider` so it surfaces as an `llm_call` record. The ReAct
@@ -174,6 +176,32 @@ appended to on every round:
 reason "patch X didn't work, the real issue is Y". The ledger id rides
 `LoopBudget.repair_chain_inputs()` so it survives every hop without the
 router understanding its contents (router stays pure).
+
+**Implemented (`src/cgx/session/repair/ledger.py`).** `RepairLedger` is a
+pure, frozen value type (a tuple of `RepairAttempt`s) with four operations
+the executor drives each round:
+
+- `finalize_pending(signature)` — the previous round left its proposal as
+  `outcome="pending"`. Now that the executor is back at `DIAGNOSE` the
+  outcome is known: an *unchanged* live signature marks it
+  `still_failing` (a proven dead end); a moved one marks it `changed`.
+- `has_attempted(action, targets)` — the repeat guard. A candidate verdict
+  (deterministic or model) whose `(action, targets)` already carries a
+  `still_failing` outcome is coerced to `escalate` rather than re-run.
+  Targets are normalized (sorted, de-duped) so attempt identity is
+  order-insensitive.
+- `append(action, targets, signature, rationale)` — records this round's
+  proposal as a fresh `pending` attempt.
+- `render()` — a bounded (`LEDGER_RENDER_LIMIT`) summary folded into the
+  ReAct prompt so the model also sees what was already tried.
+
+The executor is append-only against the store: it emits the appended
+ledger as a **new** `REPAIR_LEDGER` fact (`facts=[…]`, persisted by the
+runner) and marks the superseded fact `stale=True`, so the facts view
+shows exactly one live ledger per chain. The new fact id is threaded via
+`outputs["repair_ledger_fact_id"]`; `LoopBudget` carries it on
+`repair_ledger_fact_id` (emitted by `repair_chain_inputs` only when set,
+so a chain that never opened a ledger keeps the identical wire shape).
 
 ## 8. Router wiring (pure; `router.py` + `greenfield_edges.py`)
 

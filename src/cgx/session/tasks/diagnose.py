@@ -25,7 +25,14 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from cgx.session.budget import LoopBudget
-from cgx.session.models import Artifact, ArtifactKind, TaskKind, TaskNode
+from cgx.session.models import (
+    Artifact,
+    ArtifactKind,
+    Fact,
+    FactKind,
+    TaskKind,
+    TaskNode,
+)
 from cgx.session.repair.context import (
     GATE_API_CHECK,
     GATE_RUNTIME,
@@ -33,6 +40,7 @@ from cgx.session.repair.context import (
     GATE_VERIFY,
     FailureContext,
 )
+from cgx.session.repair.ledger import RepairLedger
 from cgx.session.tasks.base import ExecutorDeps, ExecutorResult, register_executor
 from cgx.trace import emit_trace
 
@@ -109,13 +117,22 @@ def run_diagnose(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     if isinstance(loaded, ExecutorResult):
         return loaded
     fc, source_key, source_id, scaffold_artifact_id = loaded
-    attempt = LoopBudget.from_inputs(task.inputs).repair_attempt or 1
+    budget = LoopBudget.from_inputs(task.inputs)
+    attempt = budget.repair_attempt or 1
     root = Path(deps.project_root)
+
+    # Working memory: what earlier rounds on this chain already tried. The
+    # trailing proposal's outcome is resolved now the current signature is
+    # known, so a fix that left the identical failure standing is a proven
+    # dead end DIAGNOSE will not re-propose (design §7).
+    ledger, prior_ledger_id = _load_ledger(task, deps, budget)
+    ledger = ledger.finalize_pending(fc.failure_signature)
 
     diagnosis = _deterministic_diagnosis(fc, root)
     used_model = False
     if diagnosis is None:
-        diagnosis, used_model = _react_diagnose(fc, deps, root, task)
+        diagnosis, used_model = _react_diagnose(fc, deps, root, task, ledger)
+    diagnosis = _guard_repeat(diagnosis, ledger, fc)
 
     diagnosis.setdefault("failure_signature", fc.failure_signature)
     action = str(diagnosis.get("minimal_action") or "escalate")
@@ -123,7 +140,8 @@ def run_diagnose(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         "diagnose_verdict", minimal_action=action,
         confidence=diagnosis.get("confidence"),
         signature=fc.failure_signature, used_model=used_model,
-        gate=fc.gate, classification=fc.classification)
+        gate=fc.gate, classification=fc.classification,
+        prior_attempts=len(ledger.attempts))
 
     artifact = Artifact.new(
         session_id=task.session_id,
@@ -131,6 +149,8 @@ def run_diagnose(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         kind=ArtifactKind.DIAGNOSIS,
         content=diagnosis,
     )
+    ledger_fact = _append_ledger(
+        task, deps, ledger, prior_ledger_id, diagnosis, fc, action)
     return ExecutorResult(
         outputs={
             "diagnosis_artifact_id": artifact.artifact_id,
@@ -140,9 +160,11 @@ def run_diagnose(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             "confidence": diagnosis.get("confidence"),
             "target_files": list(diagnosis.get("target_files") or []),
             "used_model": used_model,
+            "repair_ledger_fact_id": ledger_fact.fact_id,
             source_key: source_id,
             "scaffold_artifact_id": scaffold_artifact_id,
         },
+        facts=[ledger_fact],
         artifact=artifact,
     )
 
@@ -240,6 +262,96 @@ def _installed_packages(
     return names
 
 
+# --------------------- repair ledger (working memory) ---------------------
+
+def _load_ledger(
+        task: TaskNode, deps: ExecutorDeps, budget: LoopBudget,
+) -> Tuple[RepairLedger, Optional[str]]:
+    """Load the repair chain's ledger, returning ``(ledger, prior_id)``.
+
+    Prefers the fact id threaded on the chain
+    (``LoopBudget.repair_ledger_fact_id``); on a fresh chain -- or a
+    persisted-then-resumed session where the id was lost -- it falls back to
+    the newest non-stale ``REPAIR_LEDGER`` fact. Returns an empty ledger
+    (and ``None`` id) when none exists yet, so the first round starts clean.
+    """
+    if deps.store is None:
+        return RepairLedger(), None
+    try:
+        kb = deps.store.load_kb(task.session_id)
+    except Exception:  # pragma: no cover - defensive: store hiccup
+        logger.exception("DIAGNOSE: load_kb failed resolving repair ledger")
+        return RepairLedger(), budget.repair_ledger_fact_id
+    fid = budget.repair_ledger_fact_id
+    if fid and fid in kb.facts and kb.facts[fid].kind is FactKind.REPAIR_LEDGER:
+        return RepairLedger.from_content(kb.facts[fid].content), fid
+    ledgers = [f for f in kb.of_kind(FactKind.REPAIR_LEDGER) if not f.stale]
+    if ledgers:
+        latest = max(ledgers, key=lambda f: f.created_at)
+        return RepairLedger.from_content(latest.content), latest.fact_id
+    return RepairLedger(), None
+
+
+def _attempt_targets(diagnosis: Dict[str, Any], action: str) -> List[str]:
+    """The concrete targets a verdict acts on, keyed by ``minimal_action``."""
+    if action == "add_dependency":
+        return list(diagnosis.get("add_dependencies") or [])
+    if action == "remove_dependency":
+        return list(diagnosis.get("remove_dependencies") or [])
+    return list(diagnosis.get("target_files") or [])
+
+
+def _guard_repeat(diagnosis: Dict[str, Any], ledger: RepairLedger,
+                  fc: FailureContext) -> Dict[str, Any]:
+    """Degrade a verdict that repeats a proven dead end to ``escalate``.
+
+    The single biggest win of the ledger: if this exact
+    ``(action, targets)`` already left the identical failure standing,
+    proposing it again would just churn the loop, so hand off to the
+    existing whole-tree regenerate / re-plan path instead.
+    """
+    action = str(diagnosis.get("minimal_action") or "")
+    if action in ("", "escalate"):
+        return diagnosis
+    if ledger.has_attempted(action, _attempt_targets(diagnosis, action)):
+        escalated = _escalate(fc)
+        escalated["root_cause"] = (
+            f"{fc.classification or 'unknown'}: prior {action} on the same "
+            "targets already left this failure standing")
+        escalated["rationale"] = (
+            "The repair ledger shows this action + targets was already tried "
+            "and did not change the failure; escalating rather than repeating "
+            "a proven dead end.")
+        return escalated
+    return diagnosis
+
+
+def _append_ledger(
+        task: TaskNode, deps: ExecutorDeps, ledger: RepairLedger,
+        prior_ledger_id: Optional[str], diagnosis: Dict[str, Any],
+        fc: FailureContext, action: str) -> Fact:
+    """Append this round's proposal and return the fresh ledger fact.
+
+    Append-only: a new ``REPAIR_LEDGER`` fact carries the whole (finalized
+    prior + newly-proposed) chain, and the superseded fact is marked stale
+    so the facts view shows one live ledger per chain. The runner persists
+    the returned fact; the new id is threaded forward via outputs.
+    """
+    updated = ledger.append(
+        action, _attempt_targets(diagnosis, action), fc.failure_signature,
+        rationale=str(diagnosis.get("rationale") or ""))
+    fact = Fact.new(
+        session_id=task.session_id, kind=FactKind.REPAIR_LEDGER,
+        content=updated.to_content(), surfaced_in_task_id=task.task_id)
+    if prior_ledger_id and prior_ledger_id != fact.fact_id \
+            and deps.store is not None:
+        try:
+            deps.store.mark_facts_stale(task.session_id, [prior_ledger_id])
+        except Exception:  # pragma: no cover - defensive: store hiccup
+            logger.exception("DIAGNOSE: superseding prior ledger fact failed")
+    return fact
+
+
 # --------------------- deterministic-first ---------------------
 
 def _deterministic_diagnosis(
@@ -319,7 +431,7 @@ _SYSTEM_PROMPT = (
 
 def _react_diagnose(
         fc: FailureContext, deps: ExecutorDeps, root: Path,
-        task: TaskNode) -> Tuple[Dict[str, Any], bool]:
+        task: TaskNode, ledger: RepairLedger) -> Tuple[Dict[str, Any], bool]:
     """Run the bounded read-only ReAct loop; return ``(diagnosis, used_model)``.
 
     Degrades to an ``escalate`` verdict on a missing provider, a provider
@@ -330,7 +442,7 @@ def _react_diagnose(
         return _escalate(fc), False
     messages = [
         {"role": "system", "content": _SYSTEM_PROMPT},
-        {"role": "user", "content": _render_context(fc)},
+        {"role": "user", "content": _render_context(fc, ledger)},
     ]
     for tool_calls in range(DIAGNOSE_STEPS + 1):
         parsed = _diagnose_call(deps.provider, messages)
@@ -351,7 +463,7 @@ def _react_diagnose(
     return _escalate(fc), True
 
 
-def _render_context(fc: FailureContext) -> str:
+def _render_context(fc: FailureContext, ledger: RepairLedger) -> str:
     manifest = ", ".join(fc.manifest_files[:_MANIFEST_SHOWN]) or "(unknown)"
     pkgs = ", ".join(fc.installed_packages) or "(none recorded)"
     tb = ", ".join(fc.traceback_files) or "(none localized)"
@@ -362,7 +474,9 @@ def _render_context(fc: FailureContext) -> str:
         f"FAILURE SIGNATURE: {fc.failure_signature}\n"
         f"TRACEBACK FILES: {tb}\n"
         f"INSTALLED PACKAGES: {pkgs}\n"
-        f"FILE MANIFEST: {manifest}\n\n"
+        f"FILE MANIFEST: {manifest}\n"
+        f"PRIOR REPAIR ATTEMPTS (do NOT repeat a still_failing action):\n"
+        f"{ledger.render()}\n\n"
         f"FAILURE OUTPUT:\n{fc.failure_text}"
     )
 

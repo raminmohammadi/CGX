@@ -8801,6 +8801,73 @@ def test_failure_context_to_dict_is_json_friendly():
     assert d["gate"] == "verify"
 
 
+# --------------------- RepairLedger working memory (P2.4) -------------------
+
+def test_repair_ledger_round_trips_content_and_normalizes_targets():
+    """``from_content``/``to_content`` survive a store round trip; targets
+    are de-duped and sorted so attempt identity is order-insensitive."""
+    from cgx.session.repair.ledger import RepairLedger
+    led = RepairLedger().append(
+        "regenerate_files", ["b.py", "a.py", "a.py"], "sig1",
+        rationale="try regen")
+    content = led.to_content()
+    assert content["attempts"][0]["targets"] == ["a.py", "b.py"]
+    assert content["attempts"][0]["outcome"] == "pending"
+    # Re-hydrating an equivalent (differently-ordered) targets list yields the
+    # same normalized attempt.
+    rebuilt = RepairLedger.from_content(
+        {"attempts": [{"action": "regenerate_files",
+                       "targets": ["b.py", "a.py"], "outcome": "pending",
+                       "signature": "sig1"}]})
+    assert rebuilt.attempts[0].targets == ("a.py", "b.py")
+
+
+def test_repair_ledger_finalize_pending_resolves_by_signature():
+    """The trailing pending attempt becomes ``still_failing`` when the live
+    signature is unchanged, ``changed`` when it moved."""
+    from cgx.session.repair.ledger import RepairLedger
+    led = RepairLedger().append("add_dependency", ["flask"], "sigA")
+    same = led.finalize_pending("sigA")
+    assert same.attempts[-1].outcome == "still_failing"
+    moved = led.finalize_pending("sigB")
+    assert moved.attempts[-1].outcome == "changed"
+    # A ledger with no pending tail is returned untouched.
+    assert same.finalize_pending("sigZ") is same
+
+
+def test_repair_ledger_has_attempted_only_blocks_dead_ends():
+    """Only an identical ``(action, targets)`` with a ``still_failing``
+    outcome blocks a re-proposal; pending / changed do not."""
+    from cgx.session.repair.ledger import RepairLedger
+    led = RepairLedger.from_content({"attempts": [
+        {"action": "add_dependency", "targets": ["flask"],
+         "outcome": "still_failing", "signature": "s"},
+        {"action": "patch_files", "targets": ["a.py"],
+         "outcome": "changed", "signature": "s"},
+        {"action": "regenerate_files", "targets": ["b.py"],
+         "outcome": "pending", "signature": "s"},
+    ]})
+    assert led.has_attempted("add_dependency", ["flask"]) is True
+    # order-insensitive + a non-dead-end outcome does not block
+    assert led.has_attempted("patch_files", ["a.py"]) is False
+    assert led.has_attempted("regenerate_files", ["b.py"]) is False
+    # a never-tried action is free
+    assert led.has_attempted("remove_dependency", ["flask"]) is False
+
+
+def test_loop_budget_threads_repair_ledger_fact_id():
+    """The ledger id rides ``repair_chain_inputs`` and re-hydrates; a chain
+    that never opened a ledger keeps the identical wire shape as before."""
+    from cgx.session.budget import LoopBudget
+    empty = LoopBudget.from_inputs({"repair_attempt": 1})
+    assert empty.repair_ledger_fact_id is None
+    assert "repair_ledger_fact_id" not in empty.repair_chain_inputs()
+    threaded = empty.with_repair_ledger("fact_123")
+    chain = threaded.repair_chain_inputs()
+    assert chain["repair_ledger_fact_id"] == "fact_123"
+    assert LoopBudget.from_inputs(chain).repair_ledger_fact_id == "fact_123"
+
+
 # --------------------- DIAGNOSE executor (P2.3) -------------------
 
 def _runtime_boot_report(session, produced_by, tail):
@@ -9029,6 +9096,95 @@ def test_diagnose_verdict_traced_to_agent_log_when_enabled(
     assert verdicts[0]["minimal_action"] == "escalate"
     assert verdicts[0]["used_model"] is True
     assert steps and steps[0]["tool"] == "inspect_packages"
+
+
+# --------------------- DIAGNOSE repair ledger (P2.4) -------------------
+
+def test_diagnose_emits_repair_ledger_fact_recording_the_proposal(
+        store, tmp_path: Path):
+    """Every round appends its proposed action to a REPAIR_LEDGER fact and
+    threads that fact id forward via outputs."""
+    import json
+    from cgx.session.tasks.diagnose import run_diagnose
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    art = _smoke_fail_report(session, "t_smoke")
+    store.save_artifact(art)
+    provider = _StubProvider(json.dumps({
+        "minimal_action": "add_dependency", "root_cause": "flask missing",
+        "add_dependencies": ["flask"], "rationale": "import fails",
+        "confidence": 0.9}))
+    t = TaskNode.new(session.session_id, TaskKind.DIAGNOSE, "diagnose",
+                     inputs={"smoke_artifact_id": art.artifact_id})
+    result = run_diagnose(t, ExecutorDeps(
+        project_root=str(tmp_path), store=store, provider=provider))
+    ledgers = [f for f in result.facts if f.kind is FactKind.REPAIR_LEDGER]
+    assert len(ledgers) == 1
+    attempts = ledgers[0].content["attempts"]
+    assert len(attempts) == 1
+    assert attempts[0]["action"] == "add_dependency"
+    assert attempts[0]["targets"] == ["flask"]
+    assert attempts[0]["outcome"] == "pending"
+    assert result.outputs["repair_ledger_fact_id"] == ledgers[0].fact_id
+
+
+def test_diagnose_never_repeats_a_still_failing_action(store, tmp_path: Path):
+    """A prior attempt that left the failure standing is a proven dead end:
+    re-proposing it degrades to the additive escalate hand-off."""
+    import json
+    from cgx.session.tasks.diagnose import run_diagnose
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    art = _smoke_fail_report(session, "t_smoke")
+    store.save_artifact(art)
+    prior = Fact.new(session.session_id, FactKind.REPAIR_LEDGER, {"attempts": [
+        {"action": "add_dependency", "targets": ["flask"],
+         "outcome": "still_failing", "signature": "old"}]})
+    store.add_fact(prior)
+    provider = _StubProvider(json.dumps({
+        "minimal_action": "add_dependency", "add_dependencies": ["flask"],
+        "root_cause": "flask missing", "confidence": 0.9}))
+    t = TaskNode.new(session.session_id, TaskKind.DIAGNOSE, "diagnose",
+                     inputs={"smoke_artifact_id": art.artifact_id,
+                             "repair_ledger_fact_id": prior.fact_id})
+    result = run_diagnose(t, ExecutorDeps(
+        project_root=str(tmp_path), store=store, provider=provider))
+    assert result.outputs["minimal_action"] == "escalate"
+    # the prior ledger is superseded (stale) and a fresh one threaded forward
+    assert store.load_kb(session.session_id).facts[prior.fact_id].stale is True
+    assert result.outputs["repair_ledger_fact_id"] != prior.fact_id
+
+
+def test_diagnose_finalizes_prior_pending_attempt_across_rounds(
+        store, tmp_path: Path):
+    """Round 2 resolves round 1's pending proposal: an unchanged signature
+    marks it ``still_failing`` and supersedes the old ledger fact."""
+    import json
+    from cgx.session.tasks.diagnose import run_diagnose
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    art = _smoke_fail_report(session, "t_smoke")
+    store.save_artifact(art)
+    provider = _StubProvider(json.dumps({
+        "minimal_action": "add_dependency", "add_dependencies": ["flask"],
+        "root_cause": "flask missing", "confidence": 0.9}))
+    deps = ExecutorDeps(
+        project_root=str(tmp_path), store=store, provider=provider)
+    t1 = TaskNode.new(session.session_id, TaskKind.DIAGNOSE, "diagnose",
+                      inputs={"smoke_artifact_id": art.artifact_id})
+    r1 = run_diagnose(t1, deps)
+    for f in r1.facts:
+        store.add_fact(f)
+    ledger_id = r1.outputs["repair_ledger_fact_id"]
+    # Round 2 sees the same failure signature and the threaded ledger id.
+    t2 = TaskNode.new(session.session_id, TaskKind.DIAGNOSE, "diagnose",
+                      inputs={"smoke_artifact_id": art.artifact_id,
+                              "repair_ledger_fact_id": ledger_id})
+    r2 = run_diagnose(t2, deps)
+    new_ledger = [f for f in r2.facts if f.kind is FactKind.REPAIR_LEDGER][0]
+    outcomes = [a["outcome"] for a in new_ledger.content["attempts"]]
+    assert outcomes[0] == "still_failing"
+    assert store.load_kb(session.session_id).facts[ledger_id].stale is True
 
 
 def test_locate_unittest_pytest_mix_finds_offending_class(tmp_path: Path):

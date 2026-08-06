@@ -111,6 +111,12 @@ class LoopBudget:
     them: ``regenerate_attempt`` / ``repair_regenerate_attempt`` /
     ``replan_attempt`` on SCAFFOLD nodes, ``decompose_retry`` (plus
     ``replan_attempt``) on DECOMPOSE nodes.
+
+    ``repair_ledger_fact_id`` is not a counter but rides the same chain:
+    it points at the ``FactKind.REPAIR_LEDGER`` working-memory fact so
+    ``DIAGNOSE`` can read what was already tried and never re-propose a
+    proven dead end. The router only threads the id -- it never reads the
+    fact's contents, so it stays pure (see docs/diagnose-design.md §7).
     """
 
     repair_attempt: int = 0
@@ -121,6 +127,7 @@ class LoopBudget:
     repair_regenerate_attempt: int = 0
     replan_attempt: int = 0
     decompose_retry: int = 0
+    repair_ledger_fact_id: Optional[str] = None
 
     # --------------- construction / serialization ---------------
 
@@ -152,21 +159,38 @@ class LoopBudget:
                 src.get("repair_regenerate_attempt")) or 0,
             replan_attempt=_coerce_int(src.get("replan_attempt")) or 0,
             decompose_retry=_coerce_int(src.get("decompose_retry")) or 0,
+            repair_ledger_fact_id=(
+                str(src["repair_ledger_fact_id"]).strip() or None
+                if src.get("repair_ledger_fact_id") else None),
         )
 
     def repair_chain_inputs(self) -> Dict[str, Any]:
         """Serialize the repair-chain fields as successor-task inputs.
 
         Every edge on the repair chain threads exactly this dict, so a
-        counter can no longer be dropped by an edge that forgot one key.
-        The keys match the historical flat wire format.
+        counter (or the ledger id) can no longer be dropped by an edge that
+        forgot one key. The keys match the historical flat wire format;
+        ``repair_ledger_fact_id`` is emitted only when set so a chain that
+        never opened a ledger keeps the identical wire shape as before.
         """
-        return {
+        chain: Dict[str, Any] = {
             "repair_attempt": self.repair_attempt,
             "prior_failure_signatures": list(self.prior_failure_signatures),
             "prior_failing_counts": list(self.prior_failing_counts),
             "prior_passing_counts": list(self.prior_passing_counts),
         }
+        if self.repair_ledger_fact_id:
+            chain["repair_ledger_fact_id"] = self.repair_ledger_fact_id
+        return chain
+
+    def with_repair_ledger(self, fact_id: Optional[str]) -> "LoopBudget":
+        """Return a copy pointing at the repair chain's ledger fact.
+
+        Threaded on the edge out of DIAGNOSE so the ledger the executor
+        just appended survives the hop to the next repair round.
+        """
+        fid = str(fact_id).strip() if fact_id else None
+        return replace(self, repair_ledger_fact_id=fid or None)
 
     # --------------- exhaustion predicates ---------------
 
