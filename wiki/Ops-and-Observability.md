@@ -377,7 +377,7 @@ repair spans.
 
 | Control | What it does |
 |---------|--------------|
-| **Source** select | Switches between **Global (HTTP · CLI)** and any project's `agent.log`. Project roots are drawn from recent activity runs. |
+| **Source** select | Switches between **Global (HTTP · CLI)** and any project's `agent.log`. Project roots are drawn from recent activity runs — an agent turn records to `activity.db` when it quiesces, which is what puts its project root on this list. If you have run an agent but the project is missing here, its turns never reached `activity.db` (see **[[Troubleshooting and FAQ]]**). If the project's local `agent.log` is gone (a re-scaffolded greenfield tree takes it along), the reader automatically falls back to the durable **session-stable mirror** (`~/.cgx/agent-sessions/<session_id>/agent.log`) for that project's agent runs, so the trace still resolves. |
 | **filter event/fn…** | Free-text filter on the event or function name. |
 | **HTTP hidden / shown** | Hides the high-volume HTTP request spans (on by default) so agent/LLM records stand out. |
 | **Delete** | Removes the current source's log file only. Confirmed. |

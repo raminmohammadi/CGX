@@ -15,19 +15,29 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Query
 from fastapi.responses import JSONResponse
 
 from cgx import metrics as _metrics
 from cgx.redact import redact_mapping
-from cgx.session.agent_log import delete_project_trace_log
+from cgx.session.agent_log import (
+    delete_project_trace_log,
+    stable_trace_log_path,
+)
 from cgx.trace import delete_fallback_trace_log, fallback_trace_log_path
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["admin"])
+
+# Session ids come from the activity store's agent run_ids (``<sid>:<ms>``),
+# never from request input, but they are still validated against this strict
+# charset before being used to build a session-stable mirror path so nothing
+# that could escape the mirror directory reaches the filesystem.
+_SAFE_SESSION_ID = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
 def _known_project_roots() -> List[str]:
@@ -85,6 +95,77 @@ def _log_path(project_root: Optional[str]) -> Path:
     return fallback_trace_log_path()
 
 
+def _session_ids_for_root(project_root: str) -> List[str]:
+    """Session ids whose ``kind="agent"`` runs recorded ``project_root``.
+
+    Drawn from the activity store -- the same closed, CGX-produced allow-list
+    that backs :func:`_known_project_roots` -- never from request input. An
+    agent run's ``run_id`` is ``<session_id>:<ms>``, so the prefix is the
+    session id; it is used only to locate the durable session-stable trace
+    mirror when the project-local ``agent.log`` is gone (e.g. a re-scaffolded
+    greenfield tree). Ids are canonicalised against a strict charset so
+    nothing that could escape the mirror directory reaches the filesystem.
+    """
+    try:
+        want = os.path.realpath(os.fspath(project_root))
+    except OSError:  # pragma: no cover - defensive
+        return []
+    out: List[str] = []
+    seen = set()
+    try:
+        from cgx.activity import get_default_run_store
+        for run in get_default_run_store().recent(limit=1000, kind="agent"):
+            root = run.get("project_root")
+            if not root:
+                continue
+            try:
+                if os.path.realpath(root) != want:
+                    continue
+            except OSError:  # pragma: no cover - defensive
+                continue
+            sid = str(run.get("run_id") or "").split(":", 1)[0]
+            if sid and sid not in seen and _SAFE_SESSION_ID.match(sid):
+                seen.add(sid)
+                out.append(sid)
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning("admin: session-id enumeration failed: %s", e)
+    return out
+
+
+def _row_ts(rec: Dict[str, Any]) -> float:
+    try:
+        return float(rec.get("ts", 0.0))
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        return 0.0
+
+
+def _read_stable_mirrors(project_root: str, *, limit: int,
+                         event: Optional[str], since: Optional[float]
+                         ) -> Tuple[List[Dict[str, Any]], str]:
+    """Read the durable session-stable trace mirror(s) for ``project_root``.
+
+    Fallback source for the trace explorer: consulted only when the
+    project-local ``agent.log`` yields nothing (a re-scaffolded greenfield
+    tree takes its ``<root>/.cgx/agent.log`` with it, but the mirror under
+    ``<config>/agent-sessions/<session_id>/`` survives). Session ids are
+    resolved from the trusted activity allow-list, so no request data reaches
+    the filesystem read. Returns ``(rows_newest_first, source_label)``.
+    """
+    merged: List[Dict[str, Any]] = []
+    used: List[Path] = []
+    for sid in _session_ids_for_root(project_root):
+        chunk = _read_jsonl(stable_trace_log_path(sid), limit=limit,
+                            event=event, since=since)
+        if chunk:
+            merged.extend(chunk)
+            used.append(stable_trace_log_path(sid))
+    if not merged:
+        return [], ""
+    merged.sort(key=_row_ts, reverse=True)
+    source = str(used[0]) if len(used) == 1 else f"{len(used)} session mirrors"
+    return merged[:limit], source
+
+
 def _read_jsonl(path: Path, *, limit: int, event: Optional[str],
                 since: Optional[float]) -> List[Dict[str, Any]]:
     """Parse a JSONL trace file, newest first, redacted and filtered."""
@@ -128,10 +209,23 @@ def admin_logs(
     since: Optional[float] = Query(None),
     project_root: Optional[str] = Query(None),
 ) -> JSONResponse:
-    """Newest-first, server-side-redacted slice of the JSONL trace log."""
+    """Newest-first, server-side-redacted slice of the JSONL trace log.
+
+    Reads the project-local ``<root>/.cgx/agent.log`` first. When that yields
+    nothing -- the common case after a greenfield project tree is
+    re-scaffolded and its local log goes with it -- it falls back to the
+    durable session-stable mirror(s) for that project's agent runs so the
+    trace still resolves.
+    """
     path = _log_path(project_root)
     rows = _read_jsonl(path, limit=limit, event=event, since=since)
-    return JSONResponse({"source": str(path), "logs": rows, "count": len(rows)})
+    source = str(path)
+    if not rows and project_root:
+        mirror_rows, mirror_source = _read_stable_mirrors(
+            project_root, limit=limit, event=event, since=since)
+        if mirror_rows:
+            rows, source = mirror_rows, mirror_source
+    return JSONResponse({"source": source, "logs": rows, "count": len(rows)})
 
 
 @router.delete("/admin/logs")

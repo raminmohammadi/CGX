@@ -26,6 +26,7 @@ import json
 import logging
 import os
 import threading
+import time
 from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Optional
 
@@ -148,7 +149,15 @@ async def _drain_ready(runner: SessionRunner, session_id: str,
     signature guards), so the total per drive is bounded well under the
     cap; the previous default of 6 cut the very first repair cycle off
     mid-pipeline and left the regenerated APPLY stuck at READY.
+
+    When the drain quiesces (nothing READY / paused on ASK_USER) the turn's
+    freshly-drained ``LLM_CALL`` facts are recorded as a ``kind="agent"``
+    activity run (Subsystem C) so agent turns surface in the Ops Activity
+    dashboard and register their project root on the trace-explorer
+    allow-list. Recording is best-effort and never affects the drain.
     """
+    t0 = time.perf_counter()
+    seen_before = _llm_fact_ids(runner, session_id)
     for _ in range(max_steps):
         # Cooperative cancel (P2.2): honour a stop request *between* tasks
         # so the in-flight task finishes cleanly and no further READY task
@@ -185,11 +194,43 @@ async def _drain_ready(runner: SessionRunner, session_id: str,
                 return
             raise
         if task is None:
+            _record_agent_turn(runner, session_id, seen_before, t0)
             return
+    _record_agent_turn(runner, session_id, seen_before, t0)
     logger.warning(
         "drain: hit max_steps=%d for session %s without quiescing; "
         "a READY task may remain undispatched", max_steps,
         sanitize_for_log(session_id))
+
+
+def _llm_fact_ids(runner: SessionRunner, session_id: str) -> set[str]:
+    """Ids of the session's current ``LLM_CALL`` facts (best-effort, may be empty)."""
+    try:
+        from cgx.session.models import FactKind
+        return {f.fact_id for f in
+                runner.store.load_kb(session_id).of_kind(FactKind.LLM_CALL)}
+    except Exception:  # pragma: no cover - defensive
+        return set()
+
+
+def _record_agent_turn(runner: SessionRunner, session_id: str,
+                       seen_before: set[str], t0: float) -> None:
+    """Record this turn's freshly-drained LLM_CALL facts as an activity run."""
+    try:
+        from cgx.activity import record_agent_turn
+        from cgx.session.models import FactKind
+        session = runner.store.get_session(session_id)
+        if session is None:
+            return
+        new_facts = [f for f in
+                     runner.store.load_kb(session_id).of_kind(FactKind.LLM_CALL)
+                     if f.fact_id not in seen_before]
+        record_agent_turn(
+            session=session, run_id=f"{session_id}:{int(t0 * 1000)}",
+            facts=new_facts,
+            latency_ms=(time.perf_counter() - t0) * 1000.0)
+    except Exception as e:  # pragma: no cover - activity is non-critical
+        logger.warning("agent-turn activity recording failed: %s", e)
 
 
 # --------------------- background drain ---------------------

@@ -140,6 +140,51 @@ def test_admin_logs_unknown_root_falls_back_to_global(tmp_path, monkeypatch):
     assert str(tmp_path / "evil") not in body["source"]
 
 
+def test_admin_logs_falls_back_to_session_stable_mirror(tmp_path, monkeypatch):
+    """When a project's local agent.log is gone (a re-scaffolded greenfield
+    tree takes it along), the reader falls back to the durable session-stable
+    mirror for that project's agent runs, drawn from the activity allow-list."""
+    from urllib.parse import quote
+
+    import cgx.activity.store as store_mod
+    from cgx.webui.server import create_app
+
+    # Config dir hosts the session-stable mirror (<config>/agent-sessions/...).
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("CGX_CONFIG_DIR", str(config_dir))
+
+    # A project root whose local <root>/.cgx/agent.log does NOT exist.
+    proj = tmp_path / "Calculator"
+
+    # Register an agent run for that root; run_id is "<session_id>:<ms>".
+    sid = "ses_testabc123"
+    store = RunStore(":memory:")
+    store.record(RunRecord(kind="agent", run_id=f"{sid}:170",
+                           project_root=str(proj)))
+    monkeypatch.setattr(store_mod, "_DEFAULT", store)
+
+    # Seed the durable mirror with a couple of trace lines.
+    mirror = config_dir / "agent-sessions" / sid / "agent.log"
+    mirror.parent.mkdir(parents=True)
+    mirror.write_text(
+        json.dumps({"event": "llm_call", "ts": 100.0,
+                    "api_key": "sk-ABCDEFGHIJKLMNOP1234"}) + "\n" +
+        json.dumps({"event": "task_started", "ts": 200.0}) + "\n",
+        encoding="utf-8",
+    )
+
+    app = create_app()
+    q = quote(str(proj))
+    r = asyncio.run(_asgi(app, "GET", f"/api/admin/logs?project_root={q}"))
+    body = json.loads(r["body"])
+    assert r["status"] == 200 and body["count"] == 2
+    # Newest first, redacted, and sourced from the session-stable mirror.
+    assert [x["event"] for x in body["logs"]] == ["task_started", "llm_call"]
+    assert body["logs"][1]["api_key"] == "<redacted>"
+    assert "sk-ABCDEFGHIJKLMNOP1234" not in r["body"].decode()
+    assert body["source"].endswith(f"agent-sessions/{sid}/agent.log")
+
+
 # --------------------------------------------------------------------------
 # DELETE /api/admin/logs: purges a project's agent.log (+ backups), only
 # --------------------------------------------------------------------------

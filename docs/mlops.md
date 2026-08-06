@@ -87,13 +87,22 @@ prompt/response preview never persists.
 
 ## User activity
 
-**Subsystem C.** `cgx.activity` persists one `RunRecord` per ask/plan run to
-`activity.db`: the provenance keys, the grounding signals already computed by
-the answer pipeline (sources / citations / confidence / grounded), and the
-token / cost / latency accounting. `record_run` is the best-effort recorder
-the web handlers call once a run's `meta` is assembled; stored text passes
-through the data-governance policy (PII scrub + preview cap) first. The
-Activity page reads:
+**Subsystem C.** `cgx.activity` persists one `RunRecord` per ask/plan run
+**and one per agent turn** to `activity.db`: the provenance keys, the grounding
+signals already computed by the answer pipeline (sources / citations /
+confidence / grounded), and the token / cost / latency accounting. `record_run`
+is the best-effort recorder the web handlers call once a run's `meta` is
+assembled; stored text passes through the data-governance policy (PII scrub +
+preview cap) first. Agent turns take a parallel path: when a drive quiesces
+(nothing READY / paused on an ASK_USER), `record_agent_turn` aggregates that
+turn's freshly-drained `LLM_CALL` facts into a `kind="agent"` record keyed on
+the session's `project_root` -- wired into both the web drain
+(`webui.routes.agent_session._drain_ready`) and the CLI drive
+(`cli.tui.ops._drive_session`). Besides surfacing agent runs on the Activity
+page, this registers the session's project root on the trace explorer's
+project allow-list (`admin._known_project_roots`, derived from `activity.db`),
+which is what lets the Trace tab's **Source** dropdown offer that project's
+`agent.log`. The Activity page reads:
 
 - `GET /api/activity/runs` -- filterable list of runs.
 - `GET /api/activity/runs/{run_id}` -- one run joined to its feedback + alerts.
@@ -113,7 +122,13 @@ through `cgx.redact.redact_mapping` before it leaves the process.
   read the global fallback (`~/.cgx/cgx-trace.log`, i.e. HTTP / CLI records),
   or pass a project root to read that project's `<root>/.cgx/agent.log` with
   the rich `llm_call` (full prompt + response), router, executor, codegen,
-  scaffold, and repair records.
+  scaffold, and repair records. When that project-local log is missing or
+  empty -- the common case after a greenfield tree is re-scaffolded and its
+  `.cgx/agent.log` goes with it -- the reader falls back to the durable
+  **session-stable mirror** (`<config>/agent-sessions/<session_id>/agent.log`,
+  written alongside the project-local log by `agent_log.log_event`). The
+  session ids are resolved from the same trusted activity allow-list, so no
+  request data reaches the filesystem read.
 - `GET /api/admin/metrics` -- a structured snapshot of the metrics registry.
 - `GET /api/admin/overview` -- an audit-lite health view folding activity (C),
   alerts (G) and feedback (H) into one payload.
@@ -315,7 +330,7 @@ All live under `$CGX_CONFIG_DIR` (SQLite, WAL):
 
 | File | Subsystem | Contents |
 |------|-----------|----------|
-| `activity.db` | C | One `RunRecord` per ask/plan run. |
+| `activity.db` | C | One `RunRecord` per ask/plan run and per agent turn. |
 | `monitor.db` | G / K | AIOps + guardrail `Alert` records. |
 | `feedback.db` | H | Thumbs up/down + comments. |
 | `usage.db` | I | Per-owner / per-day token + cost meter. |

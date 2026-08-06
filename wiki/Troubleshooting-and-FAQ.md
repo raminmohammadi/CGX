@@ -121,6 +121,34 @@ step. Curated `trace_enter` / `trace_exit` / `trace_error` records
 project-local `agent.log` (or `~/.cgx/cgx-trace.log` outside a session).
 Only redacted previews are recorded — never full secrets.
 
+### My agent runs but the Ops Activity and Trace tabs stay empty
+Agent turns are recorded to `activity.db` when a drive **quiesces** — the
+turn finishes with nothing READY, or it pauses on an ASK_USER. Only then
+does the Activity tab show the run and does the project appear in the Trace
+tab's **Source** dropdown (the dropdown's project list is drawn from
+`activity.db`). So:
+
+- Let a turn reach a natural stop; a drive that is still executing tasks
+  has not recorded yet.
+- The Trace records themselves also need tracing **on** (`CGX_TRACE=1` or
+  the settings toggle) — without it the `agent.log` is empty even though
+  the project now appears in the dropdown.
+- If you select the project but the trace stays empty, its local
+  `agent.log` may be gone — a greenfield tree that was re-scaffolded takes
+  its `<root>/.cgx/agent.log` along. The reader then falls back to the
+  durable **session-stable mirror** at
+  `~/.cgx/agent-sessions/<session_id>/agent.log`, so the trace still
+  resolves as long as tracing was on when the turn ran.
+- Recording is best-effort and never breaks a run, so a telemetry failure
+  is logged and swallowed rather than surfaced.
+
+### Why does the Cost tab show $0.00 for my model?
+The estimated cost is `0.0` when the model is not in the price table
+(`cost_source="unknown"`) — typically a local model. Provide rates via the
+`CGX_MODEL_PRICING` env var (a JSON map of USD per 1M tokens, e.g.
+`{"my-local-model": {"in": 1.0, "out": 2.0}}`) to get a non-zero figure.
+See **[[Configuration and Tuning]]**.
+
 ---
 
 ## See also

@@ -94,6 +94,47 @@ def record_run(*, kind: str, run_id: str,
         logger.warning("record_run failed: %s", e)
 
 
+def record_agent_turn(*, session: Any, run_id: str,
+                      facts: Optional[List[Any]] = None,
+                      latency_ms: Optional[float] = None,
+                      status: str = "ok",
+                      store: Optional[RunStore] = None) -> None:
+    """Persist one agent *turn* as a ``kind="agent"`` run observation.
+
+    The session agent loop has no per-request ``meta`` like ask/plan; its
+    token/cost accounting lives on the ``LLM_CALL`` facts the runner drained
+    during the turn. ``facts`` is the list of :class:`~cgx.session.models.Fact`
+    produced *this turn* (the caller diffs the KB before/after the drain so
+    prior turns are not double-counted). Their per-call ``content`` totals are
+    summed into the ``meta`` shape :func:`record_run` already understands, so
+    agent turns surface in the Activity dashboard and register their project
+    root on the trace-explorer allow-list. Best-effort: any failure is
+    swallowed so recording can never break the agent loop.
+    """
+    try:
+        tokens_in = tokens_out = tokens_total = 0
+        cost_usd = 0.0
+        model: Optional[str] = None
+        for fact in facts or []:
+            content = getattr(fact, "content", None) or {}
+            tokens_in += _as_int(content.get("tokens_in")) or 0
+            tokens_out += _as_int(content.get("tokens_out")) or 0
+            tokens_total += _as_int(content.get("tokens_total")) or 0
+            cost_usd += _as_float(content.get("cost_usd")) or 0.0
+            if model is None and content.get("model"):
+                model = str(content.get("model"))
+        meta = {"tokens_in": tokens_in, "tokens_out": tokens_out,
+                "tokens_total": tokens_total, "cost_usd": cost_usd,
+                "mode": getattr(getattr(session, "mode", None), "value", None)}
+        record_run(
+            kind="agent", run_id=run_id, meta=meta, model=model,
+            project_root=getattr(session, "project_root", None),
+            question=getattr(session, "original_objective", "") or "",
+            latency_ms=latency_ms, status=status, store=store)
+    except Exception as e:  # pragma: no cover - activity is non-critical
+        logger.warning("record_agent_turn failed: %s", e)
+
+
 __all__ = [
     "KINDS",
     "RunRecord",
@@ -101,4 +142,5 @@ __all__ = [
     "default_run_db_path",
     "get_default_run_store",
     "record_run",
+    "record_agent_turn",
 ]
