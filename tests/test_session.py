@@ -12363,12 +12363,14 @@ def test_router_scaffold_failed_files_regenerates_within_budget():
         _scaffold_failure_signature(scaffold.outputs["failed"])]
 
 
-def test_router_scaffold_failed_files_repeat_failure_skips_regenerate():
-    """A retry that reproduces the identical drop is not worth a slot.
+def test_router_scaffold_failed_files_repeat_failure_falls_back_to_ast():
+    """A retry that reproduces the identical drop switches strategy.
 
-    Budget remains, but three more generation passes cannot produce a
-    different outcome for the same files failing the same gate, so the
-    router escalates to the manifest instead.
+    Budget remains, but re-running the same file-level generator on the
+    same files failing the same gate only reproduces the drop, so the
+    router escalates to a symbol-level AST regenerate -- a genuinely
+    different strategy -- rather than spending another identical pass or
+    prematurely re-planning the manifest.
     """
     from cgx.session.greenfield_edges import _scaffold_failure_signature
     session, _parent, scaffold, tasks = _build_scaffold_failed_chain()
@@ -12378,8 +12380,24 @@ def test_router_scaffold_failed_files_repeat_failure_skips_regenerate():
         session=session, completed=scaffold, tasks=tasks)
     creates = [a for a in plan.actions if isinstance(a, CreateTask)]
     assert len(creates) == 1
-    assert creates[0].task.kind is TaskKind.DECOMPOSE
-    assert creates[0].task.inputs["replan_attempt"] == 1
+    ast_regen = creates[0].task
+    assert ast_regen.kind is TaskKind.AST_REGENERATE
+    # Targeted at exactly the dropped files, reusing the prior scaffold's
+    # good diffs rather than rebuilding the tree.
+    assert set(ast_regen.inputs["regenerate_files"]) == {
+        "src/components/Calculator.jsx", "backend/main.py"}
+    assert ast_regen.inputs["prior_scaffold_artifact_id"] == "art_scaffold"
+    # The AST fallback carries the flap signature so a repeat under the new
+    # strategy is still detectable downstream.
+    assert ast_regen.inputs["prior_failure_signatures"] == [
+        _scaffold_failure_signature(scaffold.outputs["failed"])]
+    # No re-plan and no terminal failure while the AST fallback is untried.
+    assert not [a for a in plan.actions if isinstance(a, UpdateSessionStatus)]
+    # The live APPLY child is abandoned so the stale subtree cannot run.
+    abandoned = {a.task_id for a in plan.actions
+                 if isinstance(a, UpdateTaskStatus)}
+    pending = [t for t in tasks if t.status is TaskNodeStatus.READY]
+    assert {p.task_id for p in pending} <= abandoned
 
 
 def test_scaffold_failure_signature_ignores_the_hallucinated_name():
