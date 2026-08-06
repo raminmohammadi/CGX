@@ -518,6 +518,7 @@ def propose_regenerate(
     prior_scaffold_artifact_id: Optional[str] = None,
     resume_scaffold_artifact_id: Optional[str] = None,
     prior_failure_signatures: Optional[Sequence[str]] = None,
+    kind: TaskKind = TaskKind.SCAFFOLD,
 ) -> TaskNode:
     """Return a sibling SCAFFOLD task with ``new_constraints`` folded in.
 
@@ -615,7 +616,7 @@ def propose_regenerate(
         inputs["prior_failure_signatures"] = merged
     return TaskNode.new(
         session_id=scaffold_task.session_id,
-        kind=TaskKind.SCAFFOLD,
+        kind=kind,
         name=f"{scaffold_task.name} (regenerated)",
         description=scaffold_task.description,
         parent_task_id=scaffold_task.parent_task_id,

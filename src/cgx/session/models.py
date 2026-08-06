@@ -92,6 +92,7 @@ class TaskKind(str, enum.Enum):
     API_CHECK = "api_check"
     SMOKE = "smoke"
     REPAIR = "repair"
+    AST_REGENERATE = "ast_regenerate"
 
 
 class FactKind(str, enum.Enum):

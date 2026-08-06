@@ -937,6 +937,7 @@ TASK_SUCCESSOR = {
     TaskKind.CLARIFY_REQUIREMENTS: _clarify_requirements_to_ask,
     TaskKind.DECOMPOSE: _decompose_to_ask,
     TaskKind.SCAFFOLD: _scaffold_to_apply,
+    TaskKind.AST_REGENERATE: _scaffold_to_apply,
     TaskKind.BOOTSTRAP_ENV: _bootstrap_to_api_check,
     TaskKind.API_CHECK: _api_check_to_smoke_or_repair,
     TaskKind.SMOKE: _smoke_to_verify_or_repair,
