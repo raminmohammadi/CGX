@@ -85,22 +85,51 @@ Return ONLY the code for `{symbol_name}`. Do NOT include imports. Do not wrap in
         return ""
 
 
+def _resolve_goal(task: TaskNode, deps: ExecutorDeps,
+                  plan_content: Dict[str, Any]) -> str:
+    """The project goal to prompt with, from the first source that has one.
+
+    SCAFFOLD reads ``composed_goal``/``prior_goal`` off the WORK_PLAN; the
+    router threads ``prior_goal`` through the regenerate inputs. Reading
+    only ``composed_goal`` from ``task.inputs`` -- a key the router never
+    sets -- left every fallback prompt with an empty goal, so the model
+    invented an unrelated stack. Fall back to the session's objective so
+    the prompt is never goal-less.
+    """
+    for candidate in (task.inputs.get("composed_goal"),
+                      task.inputs.get("prior_goal"),
+                      plan_content.get("composed_goal"),
+                      plan_content.get("prior_goal")):
+        text = str(candidate or "").strip()
+        if text:
+            return text
+    if deps.store is None:
+        return ""
+    try:
+        session = deps.store.get_session(task.session_id)
+    except Exception:  # pragma: no cover - defensive: store hiccup
+        return ""
+    return str(getattr(session, "original_objective", "") or "").strip()
+
+
 @register_executor(TaskKind.AST_REGENERATE)
 @traced("ast_scaffold.run")
 def run_ast_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     """Fallback executor that builds Python files piece-by-piece via AST."""
     if deps.provider is None:
         return ExecutorResult(failure="AST_REGENERATE requires an LLM provider")
-    
+
     regen_files = task.inputs.get("regenerate_files", [])
     work_plan_id = str(task.inputs.get("work_plan_artifact_id") or "").strip()
-    
+
     work_plan = None
     contracts = {}
+    plan_content: Dict[str, Any] = {}
     if work_plan_id and deps.store:
         work_plan = deps.store.get_artifact(work_plan_id)
         if work_plan:
             content = work_plan.content or {}
+            plan_content = content
             contracts = content.get("contracts") or {}
             if not regen_files:
                 # Full-tree regeneration
@@ -131,10 +160,12 @@ def run_ast_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     else:
         skeleton = {}
 
+    goal = _resolve_goal(task, deps, plan_content)
+
     diffs = []
     generated = []
     failed = []
-    
+
     prior_scaffold_id = str(task.inputs.get("prior_scaffold_artifact_id") or "").strip()
     if prior_scaffold_id and deps.store:
         prior_scaffold = deps.store.get_artifact(prior_scaffold_id)
@@ -178,13 +209,15 @@ def run_ast_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             status="start", failed_count=progress_failed)
         
         started = time.time()
-        
-        # 1. Generate Header (Imports + Globals)
-        header = _generate_header(path, deps.provider, str(task.inputs.get("composed_goal", "")), "")
-        
-        assembler = ASTAssembler(header)
-        
         skeleton_code = skeleton.get(path, "")
+
+        # 1. Generate Header (Imports + Globals). The file's own skeleton
+        # is the context: without it the header is authored blind and its
+        # imports contradict the symbols generated below.
+        header = _generate_header(path, deps.provider, goal, skeleton_code)
+
+        assembler = ASTAssembler(header)
+
         symbols = []
         try:
             import ast
@@ -200,7 +233,7 @@ def run_ast_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             logger.warning("Failed to parse skeleton for %s: %s", path, parse_e)
             
         for sym_name, sym_type in symbols:
-            symbol_code = _generate_symbol(path, sym_name, sym_type, deps.provider, str(task.inputs.get("composed_goal", "")), header, skeleton_code)
+            symbol_code = _generate_symbol(path, sym_name, sym_type, deps.provider, goal, header, skeleton_code)
             if symbol_code:
                 assembler.add_component(symbol_code)
         
