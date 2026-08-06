@@ -3,8 +3,9 @@
 """Orchestrate the offline evals and enforce release-gate thresholds.
 
 ``run_gate`` loads the golden datasets + thresholds from an ``evals/``
-directory, runs the codegen eval (always -- no heavy deps) and the retrieval
-eval (only when faiss is importable), then checks every configured threshold.
+directory, runs the codegen and recovery evals (always -- no heavy deps) and
+the retrieval eval (only when faiss is importable), then checks every
+configured threshold.
 It returns ``(report, ok)`` where ``ok`` is False if any *ran* metric fell
 below its floor; a metric whose section was skipped never fails the gate.
 """
@@ -17,6 +18,7 @@ import tempfile
 from typing import Any, Dict, List, Tuple
 
 from cgx.eval import codegen as _codegen
+from cgx.eval import recovery as _recovery
 from cgx.eval import retrieval as _retrieval
 from cgx.logging_setup import get_logger
 
@@ -77,7 +79,13 @@ def run_gate(evals_dir: str) -> Tuple[Dict[str, Any], bool]:
         "codegen", cg["aggregate"], thresholds.get("codegen", {}),
     )
 
-    # --- Retrieval (only when faiss is present) ----------------------------
+    # --- Recovery (always runs; deterministic, provider-free) --------------
+    rc_golden = _load_jsonl(os.path.join(evals_dir, "recovery_golden.jsonl"))
+    rc = _recovery.evaluate_recovery(rc_golden)
+    report["sections"]["recovery"] = rc
+    report["failures"] += _check_thresholds(
+        "recovery", rc["aggregate"], thresholds.get("recovery", {}),
+    )
     if _faiss_available():
         rt_golden = _load_jsonl(os.path.join(evals_dir, "retrieval_golden.jsonl"))
         embedder = _retrieval.DeterministicEmbedder(dim=32)

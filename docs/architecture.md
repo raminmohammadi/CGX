@@ -81,7 +81,7 @@ cgx.registry            -- prompt fingerprint + run_id + index lineage (provenan
 cgx.usage               -- truthful token + cost accounting (CGX_MODEL_PRICING)
 cgx.health              -- liveness / readiness probes backing /healthz + /readyz
 cgx.activity            -- per-run observation store (activity.db) + record_run recorder
-cgx.eval                -- offline retrieval + codegen eval harness + CI quality gate
+cgx.eval                -- offline retrieval + codegen + recovery eval harness + CI quality gate
 cgx.monitor             -- AIOps drift/quality/cost checks → Alert store (monitor.db)
 cgx.feedback            -- thumbs up/down + comments (feedback.db) + eval-candidate flywheel
 cgx.governance          -- per-owner cost/quota budgets (usage.db) + GovernedProvider choke-point

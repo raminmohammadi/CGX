@@ -8,10 +8,17 @@ import pytest
 
 from cgx.eval import metrics as M
 from cgx.eval import codegen as CG
+from cgx.eval import recovery as RC
 from cgx.eval import retrieval as RT
 from cgx.eval.harness import run_gate
 
 EVALS_DIR = str(Path(__file__).resolve().parents[1] / "evals")
+
+
+def _load_recovery_golden():
+    import json
+    path = Path(EVALS_DIR) / "recovery_golden.jsonl"
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
 
 # --------------------------------------------------------------------------
@@ -86,13 +93,62 @@ def test_evaluate_codegen_over_golden_cases():
 
 
 # --------------------------------------------------------------------------
-# Full gate: codegen always runs; retrieval runs only when faiss is present.
+# Recovery scoring (pure, provider-free -- mirrors the real router dispatch)
+# --------------------------------------------------------------------------
+def test_resolve_recovery_scopes_mechanical_and_localized_failures():
+    # A unittest/pytest mix is a mechanical patch, never a regenerate.
+    patch = RC.resolve_recovery({
+        "gate": "verify",
+        "content": {"outcome": "assertions_failed", "failures": [{
+            "type": "AttributeError",
+            "message": "'T' object has no attribute 'assertEqual'",
+            "traceback": "tests/test_calc.py:11: in test_add"}]}})
+    assert patch["action"] == "patch_files"
+    # Assertion drift localizes to the impl file (test frames are filtered out).
+    drift = RC.resolve_recovery({
+        "gate": "verify",
+        "content": {"outcome": "assertions_failed", "failures": [{
+            "type": "AssertionError", "message": "assert 200 == 201",
+            "traceback": ("tests/test_api.py:15: in test_create\n"
+                          "app/api.py:42: in create_item")}]}})
+    assert drift["action"] == "regenerate_files"
+    assert drift["targets"] == ["app/api.py"]
+
+
+def test_resolve_recovery_falls_back_to_whole_tree_without_impl():
+    # Only the test frame is named -> honest whole-tree fallback.
+    out = RC.resolve_recovery({
+        "gate": "verify",
+        "content": {"outcome": "assertions_failed", "failures": [{
+            "type": "AssertionError", "message": "assert False",
+            "traceback": "tests/test_logic.py:20: in test_invariant"}]}})
+    assert out["action"] == "regenerate_whole_tree"
+    assert out["action"] not in RC.SCOPED_ACTIONS
+
+
+def test_evaluate_recovery_over_golden_corpus():
+    golden = _load_recovery_golden()
+    out = RC.evaluate_recovery(golden)
+    assert out["n_items"] == len(golden)
+    agg = out["aggregate"]
+    # Every golden case must resolve to its pinned expected action.
+    assert agg["action_match_rate"] == pytest.approx(1.0)
+    # Scoped recovery must dominate, and cost must beat the whole-tree baseline.
+    assert agg["scoped_recovery_rate"] >= 0.7
+    assert agg["mean_rounds_to_green"] < agg["baseline_mean_rounds"]
+    assert agg["mean_tokens"] < agg["baseline_mean_tokens"]
+
+
+# --------------------------------------------------------------------------
+# Full gate: codegen + recovery always run; retrieval only when faiss present.
 # --------------------------------------------------------------------------
 def test_run_gate_passes_on_repo_golden():
     report, ok = run_gate(EVALS_DIR)
     assert ok, f"gate failed: {report['failures']}"
     assert "codegen" in report["sections"]
     assert report["sections"]["codegen"]["aggregate"]["expectation_match_rate"] == 1.0
+    assert "recovery" in report["sections"]
+    assert report["sections"]["recovery"]["aggregate"]["action_match_rate"] == 1.0
 
 
 def test_retrieval_end_to_end_over_sample_repo(tmp_path):
