@@ -963,7 +963,7 @@ def _scaffold_resume_actions(
 
     if failed.kind is not TaskKind.SCAFFOLD:
         return []
-    resume_id = str(resume_scaffold_artifact_id or "").strip()
+    resume_id = (resume_scaffold_artifact_id or "").strip()
     if not resume_id:
         return []
     if LoopBudget.from_inputs(failed.inputs).regenerate_exhausted:
