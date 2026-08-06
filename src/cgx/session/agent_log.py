@@ -225,6 +225,20 @@ def delete_project_trace_log(project_root: str) -> int:
     return sum(1 for p in candidates if _unlink_log_file(p))
 
 
+def stable_trace_log_path(session_id: str) -> Path:
+    """Return the session-stable trace mirror for ``session_id``.
+
+    The mirror at ``<config>/agent-sessions/<session_id>/agent.log`` is
+    written alongside the project-local log whenever a ``session_id`` is in
+    scope (see :func:`log_event`) and survives the project directory being
+    regenerated / trashed on a re-scaffold. The trace explorer falls back to
+    it when the project-local ``agent.log`` is gone. ``session_id`` is only
+    ever an id CGX itself minted (never raw request input); the caller is
+    responsible for validating it before using the returned path.
+    """
+    return _stable_path(str(session_id))
+
+
 def reset_for_tests() -> None:
     """Close + drop every cached handler. Test-only."""
     with _handlers_lock:

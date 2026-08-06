@@ -122,7 +122,13 @@ through `cgx.redact.redact_mapping` before it leaves the process.
   read the global fallback (`~/.cgx/cgx-trace.log`, i.e. HTTP / CLI records),
   or pass a project root to read that project's `<root>/.cgx/agent.log` with
   the rich `llm_call` (full prompt + response), router, executor, codegen,
-  scaffold, and repair records.
+  scaffold, and repair records. When that project-local log is missing or
+  empty -- the common case after a greenfield tree is re-scaffolded and its
+  `.cgx/agent.log` goes with it -- the reader falls back to the durable
+  **session-stable mirror** (`<config>/agent-sessions/<session_id>/agent.log`,
+  written alongside the project-local log by `agent_log.log_event`). The
+  session ids are resolved from the same trusted activity allow-list, so no
+  request data reaches the filesystem read.
 - `GET /api/admin/metrics` -- a structured snapshot of the metrics registry.
 - `GET /api/admin/overview` -- an audit-lite health view folding activity (C),
   alerts (G) and feedback (H) into one payload.

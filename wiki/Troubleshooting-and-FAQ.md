@@ -133,6 +133,12 @@ tab's **Source** dropdown (the dropdown's project list is drawn from
 - The Trace records themselves also need tracing **on** (`CGX_TRACE=1` or
   the settings toggle) — without it the `agent.log` is empty even though
   the project now appears in the dropdown.
+- If you select the project but the trace stays empty, its local
+  `agent.log` may be gone — a greenfield tree that was re-scaffolded takes
+  its `<root>/.cgx/agent.log` along. The reader then falls back to the
+  durable **session-stable mirror** at
+  `~/.cgx/agent-sessions/<session_id>/agent.log`, so the trace still
+  resolves as long as tracing was on when the turn ran.
 - Recording is best-effort and never breaks a run, so a telemetry failure
   is logged and swallowed rather than surfaced.
 
