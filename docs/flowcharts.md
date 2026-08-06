@@ -288,7 +288,7 @@ once the load stops getting lighter.
 
 ```mermaid
 flowchart LR
-    U([goal]) --> CQ(["CLARIFY_REQUIREMENTS"]) --> DEC(["DECOMPOSE<br/>contracts + layers<br/>(P0a: mandatory cross-seam endpoints)"])
+    U([goal]) --> CQ(["CLARIFY_REQUIREMENTS<br/>+ scope calibration (P1.1)"]) --> DEC(["DECOMPOSE<br/>scope ceiling + self-critique + de-scope + coherence re-ask<br/>+ contracts + layers<br/>(P0a: mandatory cross-seam endpoints)"])
     DEC --> SCA(["SCAFFOLD<br/>coherence + contract gates"]) --> APP(["APPLY"])
     APP --> BS(["BOOTSTRAP_ENV"]) --> AC(["API_CHECK"]) --> SM(["SMOKE"]) --> VER(["VERIFY"])
     VER --> IC{"router"}
@@ -431,6 +431,11 @@ flowchart TB
                             |               + contracts; P0a fails closed
                             |               if a client/server seam has
                             |               no endpoints contract)
+                            |              prevention passes:
+                            |               scope ceiling (P1.1) +
+                            |               self-critique (P1.2) +
+                            |               de-scope unrunnable (P1.4) +
+                            |               coherence re-ask (P1.3)
                             v
               +------------------------------+
               |  ASK_USER(approve_plan)      |  <-- [Approve & Scaffold |
@@ -455,6 +460,8 @@ flowchart TB
                   | BOOTSTRAP_ENV   |  create/refresh .venv, install
                   +-----------------+  requirements.txt, preflight
                             |          undeclared imports;
+                            |          de-scope dead browser/E2E dep
+                            |           (P1.4) before install;
                             |          `pip freeze --all` parsed into
                             |          `installed_packages` (Phase 1.1);
                             |          polyglot: also `npm install` ->

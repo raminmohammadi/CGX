@@ -4477,6 +4477,37 @@ def test_bootstrap_keeps_imported_e2e_dependency(tmp_path):
         encoding="utf-8").lower()
 
 
+def test_dependency_descope_traced_to_agent_log_when_enabled(tmp_path):
+    """With tracing on, the dead-dependency scrub lands as a trace record."""
+    from cgx.session.tasks.bootstrap_env import _descope_dead_e2e_requirements
+    from cgx.session import agent_log
+    from cgx import trace as trace_mod
+
+    agent_log.reset_for_tests()
+    trace_mod.reset_for_tests()
+    if trace_mod.is_trace_enabled():  # env-pinned: nothing to assert against
+        return
+    (tmp_path / "requirements.txt").write_text(
+        "flask==2.1\nselenium>=4.0\n", encoding="utf-8")
+    (tmp_path / "app.py").write_text("import flask\n", encoding="utf-8")
+    trace_mod.set_trace_enabled(True)
+    token = trace_mod.set_trace_context(
+        session_id="s", task_id="task_boot", project_root=str(tmp_path))
+    try:
+        removed = _descope_dead_e2e_requirements(tmp_path, ["app.py"])
+    finally:
+        trace_mod.reset_trace_context(token)
+        trace_mod.set_trace_enabled(False)
+
+    assert removed == ["selenium"]
+    records = _read_agent_log(tmp_path)
+    events = [r for r in records if r.get("event") == "dependency_descope"]
+    assert events, "dependency_descope should be traced when enabled"
+    assert events[0]["stage"] == "bootstrap_env"
+    assert events[0]["removed"] == ["selenium"]
+    assert events[0]["removed_count"] == 1
+
+
 # ------------- P0a: mandatory cross-seam endpoint contracts -------------
 
 def test_is_client_server_manifest_detects_and_abstains():

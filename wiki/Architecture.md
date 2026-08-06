@@ -92,6 +92,10 @@ These hold across the codebase; respect them when contributing:
 - **Local-first.** No new default egress path; cloud calls are always
   opt-in. See **[[Privacy and Security]]**.
 - **Pure router.** All LLM/I/O stays in executors, never in routing.
+- **Prevent, don't just recover.** Greenfield plans are calibrated to a
+  scope ceiling, self-critiqued, and de-scoped of speculative /
+  sandbox-unrunnable work at `DECOMPOSE` / `BOOTSTRAP_ENV` time, so the
+  recovery ladder has less to fix downstream. See **[[Session Based Agent]]**.
 - **Additive persistence.** Index/record writers are add-only and
   degrade gracefully when optional deps (FAISS, ML stack) are absent.
 - **Skills add no agent-layer edits.** New technology support is a
