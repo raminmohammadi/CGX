@@ -15395,10 +15395,16 @@ def test_api_check_probe_resolves_lazy_submodules(tmp_path):
     reported as a hallucinated attribute. ``concurrent.futures`` is the
     stdlib-only reproduction of the same shape.
     """
-    import concurrent
+    import subprocess
     import sys
     from cgx.session.tasks.api_check import _probe_references
-    assert not hasattr(concurrent, "futures"), (
+    # The precondition holds in a *fresh* interpreter: this one may have
+    # imported concurrent.futures already, which binds the attribute.
+    pre = subprocess.run(
+        [sys.executable, "-I", "-c",
+         "import concurrent; print(hasattr(concurrent, 'futures'))"],
+        capture_output=True, text=True, timeout=30)
+    assert pre.stdout.strip() == "False", (
         "precondition: concurrent.futures must be lazily bound")
     rows, probe_error = _probe_references(
         sys.executable,
