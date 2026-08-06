@@ -63,17 +63,29 @@ def run_ast_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         return ExecutorResult(failure="AST_REGENERATE requires an LLM provider")
     
     regen_files = task.inputs.get("regenerate_files", [])
-    if not regen_files:
-        return ExecutorResult(failure="AST_REGENERATE requires regenerate_files input")
-        
+    work_plan_id = str(task.inputs.get("work_plan_artifact_id") or "").strip()
+    
+    work_plan = None
+    contracts = {}
+    if work_plan_id and deps.store:
+        work_plan = deps.store.get_artifact(work_plan_id)
+        if work_plan:
+            content = work_plan.content or {}
+            contracts = content.get("contracts") or {}
+            if not regen_files:
+                # Full-tree regeneration
+                layers = content.get("layers") or []
+                regen_files = []
+                for lyr in layers:
+                    for f in lyr.get("files", []):
+                        if "path" in f:
+                            regen_files.append(f["path"])
+                            
+    skeleton = contracts.get("project_skeleton", {})
+
     diffs = []
     generated = []
     failed = []
-    
-    # In a full implementation, we'd parse the skeleton to find required symbols.
-    # For now, we perform a naive decomposition fallback (asking LLM for symbols)
-    # or just generating dummy symbols for demonstration. Since this is an architectural
-    # feature we'll outline the AST generation sequence:
     
     total_files = len(regen_files)
     progress_done = 0
@@ -110,11 +122,26 @@ def run_ast_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         
         assembler = ASTAssembler(header)
         
-        # 2. In a complete integration, we extract required symbols from `contracts`
-        # Here we simulate the process for the architecture:
-        # Example: we might need a function called `main`
-        # symbol_code = _generate_symbol(path, "main", "function", deps.provider, str(task.inputs.get("composed_goal", "")), header, "")
-        # assembler.add_component(symbol_code)
+        file_skeleton = skeleton.get(path, {}).get("content", [])
+        skeleton_code = "\n".join(file_skeleton)
+        symbols = []
+        try:
+            import ast
+            parsed = ast.parse(skeleton_code)
+            for node in parsed.body:
+                if isinstance(node, ast.FunctionDef):
+                    symbols.append((node.name, "function"))
+                elif isinstance(node, ast.AsyncFunctionDef):
+                    symbols.append((node.name, "async function"))
+                elif isinstance(node, ast.ClassDef):
+                    symbols.append((node.name, "class"))
+        except Exception as parse_e:
+            logger.warning("Failed to parse skeleton for %s: %s", path, parse_e)
+            
+        for sym_name, sym_type in symbols:
+            symbol_code = _generate_symbol(path, sym_name, sym_type, deps.provider, str(task.inputs.get("composed_goal", "")), header, skeleton_code)
+            if symbol_code:
+                assembler.add_component(symbol_code)
         
         # Unparse the final assembled AST
         try:
