@@ -39,6 +39,7 @@ from cgx.session.tasks import bootstrap_env as _bootstrap_env  # noqa: F401
 from cgx.session.tasks import api_check as _api_check  # noqa: F401
 from cgx.session.tasks import smoke as _smoke  # noqa: F401
 from cgx.session.tasks import repair as _repair  # noqa: F401
+from cgx.session.tasks import ast_scaffold as _ast_scaffold  # noqa: F401
 
 __all__ = [
     "ExecutorDeps",

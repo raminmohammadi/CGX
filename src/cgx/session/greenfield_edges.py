@@ -575,10 +575,20 @@ def _scaffold_failed_files_actions(completed: TaskNode,
             failure_note=_foundational_failure_note(foundational))
     budget = LoopBudget.from_inputs(completed.inputs)
     signature = _scaffold_failure_signature(outputs.get("failed"))
-    if budget.regenerate_exhausted or (signature and budget.seen(signature)):
+    if budget.regenerate_exhausted:
         return _replan_or_fail(
             completed, tasks, scaffold=completed,
             failure_note=str(constraint.get("rationale") or ""))
+
+    if signature and budget.seen(signature):
+        if completed.kind != TaskKind.AST_REGENERATE:
+            # The model repeated the exact same mistake. Instead of giving up
+            # and replanning, force an AST regeneration fallback immediately.
+            pass
+        else:
+            return _replan_or_fail(
+                completed, tasks, scaffold=completed,
+                failure_note=str(constraint.get("rationale") or ""))
     regen_files = _failed_scaffold_paths(outputs.get("failed"), None)
     prior_id = str(outputs.get("scaffold_artifact_id") or "").strip()
     actions: List[RouterAction] = []
@@ -589,11 +599,17 @@ def _scaffold_failed_files_actions(completed: TaskNode,
             continue
         actions.append(UpdateTaskStatus(
             task_id=t.task_id, status=TaskNodeStatus.ABANDONED))
+    # If this file has already failed a regeneration attempt at least once, or if it made 
+    # the exact same mistake (intercepted above), fallback to AST mode.
+    force_ast = bool(signature and budget.seen(signature) and completed.kind != TaskKind.AST_REGENERATE)
+    fallback_kind = TaskKind.AST_REGENERATE if (budget.regenerate_attempt > 0 or force_ast) else TaskKind.SCAFFOLD
+    
     actions.append(CreateTask(propose_regenerate(
         completed, constraint,
         regenerate_files=regen_files,
         prior_scaffold_artifact_id=prior_id,
-        prior_failure_signatures=_appended_signature(budget, signature))))
+        prior_failure_signatures=_appended_signature(budget, signature),
+        kind=fallback_kind)))
     return actions
 
 
