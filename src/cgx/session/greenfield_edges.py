@@ -961,7 +961,7 @@ def _scaffold_resume_actions(
     """
     from cgx.session.repair.propose import propose_regenerate  # dep direction
 
-    if failed.kind is not TaskKind.SCAFFOLD:
+    if failed.kind not in (TaskKind.SCAFFOLD, TaskKind.AST_REGENERATE):
         return []
     resume_id = str(resume_scaffold_artifact_id or "").strip()
     if not resume_id:
@@ -1177,7 +1177,7 @@ def _verify_lesson_actions(completed: TaskNode,
             break
         if repair is None and cur.kind is TaskKind.REPAIR:
             repair = cur
-        if scaffold is None and cur.kind is TaskKind.SCAFFOLD:
+        if scaffold is None and cur.kind in (TaskKind.SCAFFOLD, TaskKind.AST_REGENERATE):
             scaffold = cur
         cur_id = cur.parent_task_id
     if repair is None:
@@ -1189,9 +1189,9 @@ def _verify_lesson_actions(completed: TaskNode,
     )]
 
 
-def _find_ancestor_by_kind(start: TaskNode, tasks: List[TaskNode],
-                           kind: TaskKind) -> Optional[TaskNode]:
-    """Walk up ``parent_task_id`` chain to the nearest task of ``kind``."""
+def _find_ancestor_by_kinds(start: TaskNode, tasks: List[TaskNode],
+                            kinds: set) -> Optional[TaskNode]:
+    """Walk up ``parent_task_id`` chain to the nearest task of any given ``kinds``."""
     by_id = {t.task_id: t for t in tasks}
     visited: set = set()
     cur_id = start.parent_task_id
@@ -1200,7 +1200,7 @@ def _find_ancestor_by_kind(start: TaskNode, tasks: List[TaskNode],
         cur = by_id.get(cur_id)
         if cur is None:
             return None
-        if cur.kind is kind:
+        if cur.kind in kinds:
             return cur
         cur_id = cur.parent_task_id
     return None
@@ -1208,8 +1208,8 @@ def _find_ancestor_by_kind(start: TaskNode, tasks: List[TaskNode],
 
 def _find_scaffold_ancestor(start: TaskNode,
                             tasks: List[TaskNode]) -> Optional[TaskNode]:
-    """Walk up ``parent_task_id`` chain to the nearest SCAFFOLD task."""
-    return _find_ancestor_by_kind(start, tasks, TaskKind.SCAFFOLD)
+    """Walk up ``parent_task_id`` chain to the nearest SCAFFOLD or AST_REGENERATE task."""
+    return _find_ancestor_by_kinds(start, tasks, {TaskKind.SCAFFOLD, TaskKind.AST_REGENERATE})
 
 
 def _collect_descendants(root_task_id: str,
