@@ -19,8 +19,12 @@ Project Goal: {goal}
 Context: {context}
 Return ONLY valid Python code containing imports and module-level constants. No functions or classes."""
     try:
-        res = provider.generate(prompt=prompt, system_prompt="You are a strict code generator.")
-        return res.text
+        messages = [
+            {"role": "system", "content": "You are a strict code generator."},
+            {"role": "user", "content": prompt}
+        ]
+        res = provider.chat(messages=messages, force_json=False)
+        return res.get("content", "")
     except Exception as e:
         logger.error("Failed to generate AST header for %s: %s", path, e)
         return ""
@@ -39,8 +43,13 @@ The file currently has the following imports and globals:
 
 Return ONLY the code for `{symbol_name}`. Do NOT include imports. Do not wrap in markdown, output raw python code."""
     try:
-        res = provider.generate(prompt=prompt, system_prompt="You are a strict code generator.")
-        return res.text.replace("```python", "").replace("```", "").strip()
+        messages = [
+            {"role": "system", "content": "You are a strict code generator."},
+            {"role": "user", "content": prompt}
+        ]
+        res = provider.chat(messages=messages, force_json=False)
+        text = res.get("content", "")
+        return text.replace("```python", "").replace("```", "").strip()
     except Exception as e:
         logger.error("Failed to generate AST symbol %s for %s: %s", symbol_name, path, e)
         return ""
