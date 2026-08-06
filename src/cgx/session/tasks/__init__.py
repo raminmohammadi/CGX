@@ -32,6 +32,7 @@ from cgx.session.tasks import plan_change as _plan_change  # noqa: F401
 from cgx.session.tasks import apply as _apply  # noqa: F401
 from cgx.session.tasks import verify as _verify  # noqa: F401
 from cgx.session.tasks import runtime_verify as _runtime_verify  # noqa: F401
+from cgx.session.tasks import re_verify as _re_verify  # noqa: F401
 from cgx.session.tasks import clarify_requirements as _clarify_requirements  # noqa: F401
 from cgx.session.tasks import decompose as _decompose  # noqa: F401
 from cgx.session.tasks import scaffold as _scaffold  # noqa: F401
@@ -39,6 +40,7 @@ from cgx.session.tasks import bootstrap_env as _bootstrap_env  # noqa: F401
 from cgx.session.tasks import api_check as _api_check  # noqa: F401
 from cgx.session.tasks import smoke as _smoke  # noqa: F401
 from cgx.session.tasks import repair as _repair  # noqa: F401
+from cgx.session.tasks import diagnose as _diagnose  # noqa: F401
 from cgx.session.tasks import ast_scaffold as _ast_scaffold  # noqa: F401
 
 __all__ = [

@@ -164,7 +164,17 @@ def _apply_to_verify(parent: TaskNode) -> List[TaskNode]:
     REPAIR carries the prior ``build_artifact_id`` forward through
     APPLY.inputs. Re-bootstrapping would just spend time reinstalling
     the same packages.
+
+    A DIAGNOSE-driven scoped patch carries a ``reverify_origin_gate``
+    marker (design §C2): the venv is already live and every other gate
+    already passed, so instead of VERIFY we splice RE_VERIFY to re-run
+    only the origin report's failing test file(s).
     """
+    inputs = parent.inputs or {}
+    if str(inputs.get("reverify_origin_gate") or "").strip():
+        return _re_verify_node(
+            parent, build_artifact_id=inputs.get("build_artifact_id"),
+            apply_artifact_id=parent.produced_artifact_id)
     mode = str(parent.inputs.get("mode") or "").strip()
     has_build_artifact = bool(
         str(parent.inputs.get("build_artifact_id") or "").strip())
@@ -215,7 +225,17 @@ def _bootstrap_to_api_check(parent: TaskNode) -> List[TaskNode]:
     aliased ``pkg.attr`` access under the bootstrapped venv. Its
     successor (see :func:`_api_check_to_smoke_or_repair`) then chains
     SMOKE on pass / skip, or REPAIR on a hallucinated symbol.
+
+    A DIAGNOSE-driven dependency fix (add/remove) carries a
+    ``reverify_origin_gate`` marker (design §C2): the re-provisioned venv
+    is all the fix needed, so instead of re-probing API_CHECK/SMOKE we
+    splice RE_VERIFY to re-run only the origin report's failing test(s).
     """
+    inputs = parent.inputs or {}
+    if str(inputs.get("reverify_origin_gate") or "").strip():
+        return _re_verify_node(
+            parent, build_artifact_id=parent.produced_artifact_id,
+            apply_artifact_id=inputs.get("apply_artifact_id"))
     return [TaskNode.new(
         session_id=parent.session_id,
         kind=TaskKind.API_CHECK,
@@ -666,6 +686,50 @@ def _verify_successors(parent: TaskNode) -> List[TaskNode]:
     return _verify_to_repair_or_terminal(parent)
 
 
+def _re_verify_node(parent: TaskNode, *, build_artifact_id: Optional[str],
+                    apply_artifact_id: Optional[str]) -> List[TaskNode]:
+    """Spawn the incremental RE_VERIFY gate for a scoped fix (design §C2).
+
+    Carries the origin ``reverify_report_id`` (the failing VERIFY_REPORT
+    whose recorded test file(s) get re-run) plus the artifact ids the
+    executor needs to resolve the venv python and stamp provenance. The
+    shared loop budget threads verbatim so a still-failing re-run keeps
+    the same attempt/flap accounting the full VERIFY path uses.
+    """
+    inputs = parent.inputs or {}
+    budget = LoopBudget.from_inputs(inputs)
+    return [TaskNode.new(
+        session_id=parent.session_id,
+        kind=TaskKind.RE_VERIFY,
+        name="Re-verify the scoped fix",
+        description=("Re-run pytest against only the test file(s) the origin "
+                     "VERIFY report recorded as failing, skipping the full "
+                     "bootstrap -> API-check -> smoke -> verify chain."),
+        parent_task_id=parent.task_id,
+        inputs={
+            "reverify_report_id": inputs.get("reverify_report_id"),
+            "reverify_origin_gate": inputs.get("reverify_origin_gate"),
+            "build_artifact_id": build_artifact_id,
+            "apply_artifact_id": apply_artifact_id,
+            "scaffold_artifact_id": inputs.get("scaffold_artifact_id"),
+            "plan_artifact_id": inputs.get("plan_artifact_id"),
+            "prior_goal": inputs.get("prior_goal"),
+            "mode": inputs.get("mode") or SessionMode.GREENFIELD.value,
+            **budget.repair_chain_inputs(),
+        },
+    )]
+
+
+def _re_verify_successors(parent: TaskNode) -> List[TaskNode]:
+    """Dispatch a finished RE_VERIFY exactly like VERIFY (design §C2).
+
+    RE_VERIFY emits a VERIFY_REPORT identical in shape, so the same
+    green -> RUNTIME_VERIFY / still-failing -> DIAGNOSE-or-REPAIR edges
+    apply unchanged.
+    """
+    return _verify_successors(parent)
+
+
 def _runtime_verify_node(parent: TaskNode) -> List[TaskNode]:
     """Spawn the RUNTIME_VERIFY gate carrying the upstream artifact ids."""
     return [TaskNode.new(
@@ -791,8 +855,14 @@ def _repair_to_apply_or_ask(parent: TaskNode) -> List[TaskNode]:
         inputs={
             "plan_artifact_id": parent.produced_artifact_id,
             "build_artifact_id": parent.inputs.get("build_artifact_id"),
+            "scaffold_artifact_id": parent.inputs.get("scaffold_artifact_id"),
             "prior_goal": parent.inputs.get("prior_goal"),
             "mode": parent.inputs.get("mode"),
+            # A DIAGNOSE-scoped patch threads its C2 re-verify markers on to
+            # APPLY so its successor (:func:`_apply_to_verify`) can splice
+            # RE_VERIFY; a mechanical repair leaves these unset (safe no-op).
+            "reverify_report_id": parent.inputs.get("reverify_report_id"),
+            "reverify_origin_gate": parent.inputs.get("reverify_origin_gate"),
             **budget.repair_chain_inputs(),
         },
     )]
@@ -1003,6 +1073,7 @@ TASK_SUCCESSOR = {
     TaskKind.API_CHECK: _api_check_to_smoke_or_repair,
     TaskKind.SMOKE: _smoke_to_verify_or_repair,
     TaskKind.VERIFY: _verify_successors,
+    TaskKind.RE_VERIFY: _re_verify_successors,
     TaskKind.RUNTIME_VERIFY: _runtime_verify_to_repair_or_terminal,
     TaskKind.REPAIR: _repair_to_apply_or_ask,
 }
@@ -1100,7 +1171,7 @@ class Router:
             if override:
                 plan.actions.extend(override)
                 return plan
-        if completed.kind is TaskKind.VERIFY:
+        if completed.kind in (TaskKind.VERIFY, TaskKind.RE_VERIFY):
             plan.actions.extend(_verify_lesson_actions(completed, tasks))
         spawn = TASK_SUCCESSOR.get(completed.kind)
         if spawn is None:
@@ -1108,7 +1179,8 @@ class Router:
         children = spawn(completed)
         for child in children:
             plan.actions.append(CreateTask(child))
-        if completed.kind is TaskKind.VERIFY and not children:
+        if (completed.kind in (TaskKind.VERIFY, TaskKind.RE_VERIFY)
+                and not children):
             plan.actions.extend(
                 _verify_terminal_session_actions(completed))
         if completed.kind is TaskKind.RUNTIME_VERIFY and not children:

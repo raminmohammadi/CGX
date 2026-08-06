@@ -15132,3 +15132,171 @@ def test_router_runtime_verify_reasoning_class_routes_to_diagnose():
     assert diag.inputs["runtime_artifact_id"] == "art_runtime"
     assert diag.inputs["classification"] == "runtime_failure"
     assert diag.inputs["repair_attempt"] == 1
+
+
+# --------------------- P3.2: incremental RE_VERIFY (C2) ---------------------
+
+
+def test_re_verify_kind_registered_and_executor_wired():
+    """RE_VERIFY exists with the exact value and a discoverable executor."""
+    import cgx.session.tasks  # noqa: F401 (populates the executor registry)
+    from cgx.session.tasks.base import get_executor
+    assert TaskKind.RE_VERIFY.value == "re_verify"
+    assert TaskKind("re_verify") is TaskKind.RE_VERIFY
+    assert get_executor(TaskKind.RE_VERIFY) is not None
+
+
+def test_reverify_markers_only_for_verify_origin():
+    """Only a VERIFY-origin diagnosis yields C2 markers; others run full chain."""
+    from cgx.session.greenfield_edges import _reverify_markers
+    session = Session.new("g")
+    diag = TaskNode.new(session.session_id, TaskKind.DIAGNOSE, "d", inputs={})
+    diag.outputs = {"smoke_artifact_id": "art_smoke"}
+    assert _reverify_markers(diag) == {}
+    diag.outputs = {"verify_artifact_id": "art_verify"}
+    assert _reverify_markers(diag) == {
+        "reverify_origin_gate": "verify", "reverify_report_id": "art_verify"}
+
+
+def test_diagnose_patch_threads_reverify_markers_to_repair():
+    """A VERIFY-origin patch verdict rides the C2 markers on to REPAIR."""
+    session, diag, tasks = _diagnose_completed(
+        minimal_action="patch_files",
+        extra_outputs={"target_files": ["src/x.py"]})
+    plan = Router().on_task_completed(
+        session=session, completed=diag, tasks=tasks)
+    rep = [a.task for a in plan.actions if isinstance(a, CreateTask)][0]
+    assert rep.kind is TaskKind.REPAIR
+    assert rep.inputs["reverify_origin_gate"] == "verify"
+    assert rep.inputs["reverify_report_id"] == "art_verify"
+
+
+def test_diagnose_add_dependency_threads_reverify_markers_to_bootstrap():
+    """A VERIFY-origin add_dependency verdict rides the C2 markers on to boot."""
+    session, diag, tasks = _diagnose_completed(
+        minimal_action="add_dependency",
+        extra_outputs={"add_dependencies": ["flask"]})
+    plan = Router().on_task_completed(
+        session=session, completed=diag, tasks=tasks)
+    boot = [a.task for a in plan.actions if isinstance(a, CreateTask)][0]
+    assert boot.kind is TaskKind.BOOTSTRAP_ENV
+    assert boot.inputs["reverify_origin_gate"] == "verify"
+    assert boot.inputs["reverify_report_id"] == "art_verify"
+
+
+def test_repair_to_apply_threads_reverify_markers():
+    """A REPAIR carrying C2 markers threads them (and scaffold id) on to APPLY."""
+    session = Session.new("g")
+    rep = TaskNode.new(
+        session.session_id, TaskKind.REPAIR, "repair",
+        inputs={"mode": "greenfield", "build_artifact_id": "art_build",
+                "scaffold_artifact_id": "art_scaffold",
+                "reverify_origin_gate": "verify",
+                "reverify_report_id": "art_verify"})
+    rep.produced_artifact_id = "art_plan"
+    rep.outputs = {"can_apply": True, "failure_signature": "s",
+                   "repair_attempt": 1}
+    rep.status = TaskNodeStatus.DONE
+    plan = Router().on_task_completed(
+        session=session, completed=rep, tasks=[rep])
+    apply_t = [a.task for a in plan.actions if isinstance(a, CreateTask)][0]
+    assert apply_t.kind is TaskKind.APPLY
+    assert apply_t.inputs["reverify_origin_gate"] == "verify"
+    assert apply_t.inputs["reverify_report_id"] == "art_verify"
+    assert apply_t.inputs["scaffold_artifact_id"] == "art_scaffold"
+
+
+def test_apply_with_reverify_marker_spawns_re_verify():
+    """A DIAGNOSE-scoped patch's APPLY splices RE_VERIFY, not BOOTSTRAP/VERIFY."""
+    session = Session.new("g")
+    apply_t = TaskNode.new(
+        session.session_id, TaskKind.APPLY, "apply",
+        inputs={"mode": "greenfield", "build_artifact_id": "art_build",
+                "scaffold_artifact_id": "art_scaffold",
+                "reverify_origin_gate": "verify",
+                "reverify_report_id": "art_verify"})
+    apply_t.produced_artifact_id = "art_applied"
+    apply_t.status = TaskNodeStatus.DONE
+    plan = Router().on_task_completed(
+        session=session, completed=apply_t, tasks=[apply_t])
+    rv = [a.task for a in plan.actions if isinstance(a, CreateTask)][0]
+    assert rv.kind is TaskKind.RE_VERIFY
+    assert rv.inputs["reverify_report_id"] == "art_verify"
+    assert rv.inputs["build_artifact_id"] == "art_build"
+    assert rv.inputs["apply_artifact_id"] == "art_applied"
+
+
+def test_bootstrap_with_reverify_marker_spawns_re_verify():
+    """A DIAGNOSE dependency fix's BOOTSTRAP_ENV splices RE_VERIFY, not API_CHECK."""
+    session = Session.new("g")
+    boot = TaskNode.new(
+        session.session_id, TaskKind.BOOTSTRAP_ENV, "bootstrap",
+        inputs={"mode": "greenfield", "apply_artifact_id": "art_applied",
+                "scaffold_artifact_id": "art_scaffold",
+                "reverify_origin_gate": "verify",
+                "reverify_report_id": "art_verify"})
+    boot.produced_artifact_id = "art_build"
+    boot.status = TaskNodeStatus.DONE
+    plan = Router().on_task_completed(
+        session=session, completed=boot, tasks=[boot])
+    rv = [a.task for a in plan.actions if isinstance(a, CreateTask)][0]
+    assert rv.kind is TaskKind.RE_VERIFY
+    assert rv.inputs["build_artifact_id"] == "art_build"
+    assert rv.inputs["apply_artifact_id"] == "art_applied"
+    assert rv.inputs["reverify_report_id"] == "art_verify"
+
+
+def test_re_verify_pass_hands_off_like_verify():
+    """A green RE_VERIFY dispatches to RUNTIME_VERIFY exactly like VERIFY."""
+    from cgx.session.models import SessionMode
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    rv = TaskNode.new(
+        session.session_id, TaskKind.RE_VERIFY, "reverify",
+        inputs={"mode": SessionMode.GREENFIELD.value})
+    rv.produced_artifact_id = "art_reverify"
+    rv.outputs = {"outcome": "passed"}
+    rv.status = TaskNodeStatus.DONE
+    plan = Router().on_task_completed(
+        session=session, completed=rv, tasks=[rv])
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    assert len(creates) == 1
+    assert creates[0].task.kind is TaskKind.RUNTIME_VERIFY
+
+
+def test_re_verify_still_failing_reasoning_class_routes_to_diagnose():
+    """A still-failing reasoning-class RE_VERIFY routes back to DIAGNOSE."""
+    from cgx.session.models import SessionMode
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    rv = TaskNode.new(
+        session.session_id, TaskKind.RE_VERIFY, "reverify",
+        inputs={"mode": SessionMode.GREENFIELD.value})
+    rv.produced_artifact_id = "art_reverify"
+    rv.outputs = {"outcome": "assertions_failed",
+                  "failure_signature": "sig_new",
+                  "classification": "assertion_drift",
+                  "returncode": 1, "tests_selected_count": 3,
+                  "failing_count": 1}
+    rv.status = TaskNodeStatus.DONE
+    plan = Router().on_task_completed(
+        session=session, completed=rv, tasks=[rv])
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    assert len(creates) == 1
+    diag = creates[0].task
+    assert diag.kind is TaskKind.DIAGNOSE
+    assert diag.inputs["verify_artifact_id"] == "art_reverify"
+
+
+def test_re_verify_failing_test_files_selects_only_failed():
+    """_failing_test_files narrows the selected set to the failing file(s)."""
+    from cgx.session.tasks.re_verify import _failing_test_files
+    content = {
+        "tests_selected": ["tests/test_a.py", "tests/test_b.py"],
+        "failures": [{"nodeid": "tests.test_b.TestX::test_it"}]}
+    assert _failing_test_files(content) == ["tests/test_b.py"]
+
+
+def test_re_verify_failing_test_files_falls_back_to_all_when_unresolved():
+    """No resolvable failure file -> re-run the full selected set, never zero."""
+    from cgx.session.tasks.re_verify import _failing_test_files
+    content = {"tests_selected": ["tests/test_a.py"], "failures": []}
+    assert _failing_test_files(content) == ["tests/test_a.py"]

@@ -82,6 +82,14 @@ class TaskKind(str, enum.Enum):
     once the unit suite the model wrote passes, it boots the scaffolded
     app / import-and-call smokes the entry modules so "the tests pass"
     becomes "the app actually runs".
+
+    RE_VERIFY is the incremental re-verification gate (design §C2):
+    after a DIAGNOSE-driven scoped fix it re-runs only the *affected*
+    gate -- the failing pytest file(s) named by the origin VERIFY_REPORT
+    -- instead of the full ``BOOTSTRAP_ENV -> API_CHECK -> SMOKE ->
+    VERIFY`` chain. It emits a VERIFY_REPORT identical in shape to VERIFY
+    so the same classifier + pure-router edges apply unchanged (a
+    runtime-origin fix re-runs RUNTIME_VERIFY directly instead).
     """
     EXPLORE = "explore"
     INVESTIGATE = "investigate"
@@ -90,6 +98,7 @@ class TaskKind(str, enum.Enum):
     APPLY = "apply"
     VERIFY = "verify"
     RUNTIME_VERIFY = "runtime_verify"
+    RE_VERIFY = "re_verify"
     ASK_USER = "ask_user"
     SEARCH = "search"
     SUMMARIZE = "summarize"

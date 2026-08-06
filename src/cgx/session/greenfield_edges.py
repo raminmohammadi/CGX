@@ -37,6 +37,7 @@ from cgx.session.models import (
     TaskNode,
     TaskNodeStatus,
 )
+from cgx.session.repair.context import GATE_VERIFY
 
 
 def _make_budget_ask(over_task: TaskNode, reason: str) -> TaskNode:
@@ -312,6 +313,24 @@ _DIAGNOSE_SOURCE_KEYS = (
 )
 
 
+def _reverify_markers(completed: TaskNode) -> Dict[str, str]:
+    """Markers that route a scoped fix to incremental re-verification (C2).
+
+    Only a VERIFY-origin failure supports it today: the venv is already
+    provisioned upstream, so after the diagnosed fix the router re-runs
+    just the failing pytest file(s) via RE_VERIFY instead of the full
+    ``BOOTSTRAP_ENV -> API_CHECK -> SMOKE -> VERIFY`` chain. Other origins
+    return ``{}`` so the normal full chain runs -- behavior is never worse
+    than before. The markers ride ``inputs`` through the fix chain
+    (REPAIR/BOOTSTRAP_ENV -> APPLY) to the edge that spawns the re-run.
+    """
+    source_key, source_id = _diagnose_source_report(completed)
+    if source_key != "verify_artifact_id" or not source_id:
+        return {}
+    return {"reverify_origin_gate": GATE_VERIFY,
+            "reverify_report_id": source_id}
+
+
 def _diagnose_dispatch_actions(completed: TaskNode,
                                tasks: List[TaskNode]) -> List[RouterAction]:
     """Map a completed DIAGNOSE verdict to its deterministic successor.
@@ -395,6 +414,7 @@ def _diagnose_patch_actions(completed: TaskNode,
             "prior_goal": inputs.get("prior_goal"),
             "mode": inputs.get("mode") or SessionMode.GREENFIELD.value,
             "target_files": list(outputs.get("target_files") or []),
+            **_reverify_markers(completed),
             **budget.repair_chain_inputs(),
         },
     )
@@ -425,6 +445,7 @@ def _diagnose_add_dependency_actions(
             "prior_goal": inputs.get("prior_goal"),
             "mode": inputs.get("mode") or SessionMode.GREENFIELD.value,
             "missing_modules": packages,
+            **_reverify_markers(completed),
             **_diagnose_chain_budget(completed).repair_chain_inputs(),
         },
     )
@@ -463,6 +484,7 @@ def _diagnose_remove_dependency_actions(
             "prior_goal": inputs.get("prior_goal"),
             "mode": inputs.get("mode") or SessionMode.GREENFIELD.value,
             "descope_packages": packages,
+            **_reverify_markers(completed),
             **_diagnose_chain_budget(completed).repair_chain_inputs(),
         },
     )
