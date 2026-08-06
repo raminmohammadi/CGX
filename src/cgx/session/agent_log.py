@@ -81,6 +81,22 @@ class _JsonlFormatter(logging.Formatter):
             return json.dumps({"ts": out["ts"], "event": "log_format_error"})
 
 
+class _QuietRotatingFileHandler(RotatingFileHandler):
+    """RotatingFileHandler that never floods stderr on emit failures.
+
+    The stock handler routes emit exceptions to ``logging.Handler.handleError``,
+    which (with ``logging.raiseExceptions`` on, the default) prints the full
+    traceback to stderr. When a re-scaffold trashes the log directory out from
+    under an open handler, every subsequent emit -- one per traced call --
+    prints a fresh traceback, drowning the console. Routing the failure to our
+    own WARNING logger keeps the diagnostic without the flood; the stale handler
+    is rebuilt on the next :func:`_emit_to` via the directory-liveness check.
+    """
+
+    def handleError(self, record: logging.LogRecord) -> None:  # noqa: D401
+        logger.warning("agent_log: emit failed for %s", getattr(record, "msg", ""))
+
+
 def _resolve_path(project_root: str) -> Path:
     return Path(project_root).resolve() / _LOG_DIR_NAME / _LOG_FILE_NAME
 
@@ -101,7 +117,7 @@ def _handler_for_path(path: Path) -> Optional[RotatingFileHandler]:
             return h
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            h = RotatingFileHandler(
+            h = _QuietRotatingFileHandler(
                 str(path), maxBytes=_MAX_BYTES,
                 backupCount=_BACKUP_COUNT, encoding="utf-8")
             h.setFormatter(_JsonlFormatter())
@@ -115,10 +131,36 @@ def _handler_for_path(path: Path) -> Optional[RotatingFileHandler]:
             return None
 
 
+def _handler_dir_alive(handler: RotatingFileHandler) -> bool:
+    """True when the cached handler's log directory still exists.
+
+    A re-scaffold trashes / regenerates the project tree, taking the
+    project-local ``.cgx`` directory (and the open ``agent.log``) with it.
+    The cached ``RotatingFileHandler`` still points at that dead path, so
+    its next ``emit`` -> ``shouldRollover`` -> ``_open`` raises
+    ``FileNotFoundError`` deep inside stdlib logging, where ``handleError``
+    swallows it and floods stderr instead of letting our ``try/except``
+    react. Checking the parent directory up front lets us rebuild the
+    handler (which re-creates the directory) before that happens.
+    """
+    try:
+        return Path(handler.baseFilename).parent.is_dir()
+    except Exception:  # pragma: no cover - defensive
+        return False
+
+
 def _emit_to(path: Path, event: str, ts: float, fields: Dict[str, Any]) -> None:
     handler = _handler_for_path(path)
     if handler is None:
         return
+    # If the log directory vanished under the cached handler (project tree
+    # re-scaffolded / trashed), evict the stale handler so _handler_for_path
+    # re-creates the directory and re-opens a fresh file below.
+    if not _handler_dir_alive(handler):
+        _drop_handler_for(path)
+        handler = _handler_for_path(path)
+        if handler is None:
+            return
     record = logging.LogRecord(
         name="cgx.session.agent_log", level=logging.INFO, pathname=__file__,
         lineno=0, msg=event, args=None, exc_info=None)

@@ -3299,6 +3299,41 @@ def test_agent_log_no_stable_mirror_without_session_id(tmp_path, monkeypatch):
     assert not (cfg / "agent-sessions").exists()
 
 
+def test_agent_log_survives_project_dir_removed_under_handler(tmp_path, capfd):
+    """A re-scaffold that trashes ``.cgx`` must not flood stderr or crash.
+
+    Regression: the cached RotatingFileHandler kept a descriptor for the
+    project-local ``agent.log``; when the project tree was regenerated the
+    ``.cgx`` directory vanished, and every subsequent emit raised
+    FileNotFoundError inside stdlib logging -- flooding stderr with
+    ``--- Logging error ---`` tracebacks. ``_emit_to`` now detects the dead
+    directory, rebuilds the handler (re-creating ``.cgx``), and keeps logging.
+    """
+    import shutil
+    from cgx.session.agent_log import log_event
+
+    proj = tmp_path / "proj"
+    log_event(str(proj), "task_started", session_id="ses_r", kind="apply")
+    assert _read_agent_log(proj)
+
+    # Simulate the re-scaffold: the whole project tree (incl. .cgx) is trashed
+    # while the rotating handler is still cached and pointing at the old path.
+    shutil.rmtree(proj)
+    assert not (proj / ".cgx").exists()
+
+    _ = capfd.readouterr()  # drop anything emitted so far
+    # The next emit must neither raise nor print a stdlib logging traceback.
+    log_event(str(proj), "task_completed", session_id="ses_r", kind="apply")
+    err = capfd.readouterr().err
+    assert "--- Logging error ---" not in err
+    assert "FileNotFoundError" not in err
+
+    # The handler was rebuilt: the directory + log exist again and the second
+    # record landed (the first was lost with the trashed tree, as expected).
+    records = _read_agent_log(proj)
+    assert [r["event"] for r in records] == ["task_completed"]
+
+
 def test_runner_emits_task_lifecycle_events_to_agent_log(tmp_path, store):
     """A happy stub task produces task_started + task_completed lines."""
     @register_executor(TaskKind.EXPLORE)
