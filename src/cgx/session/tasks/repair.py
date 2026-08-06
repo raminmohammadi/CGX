@@ -45,6 +45,7 @@ from cgx.session.repair.classify import (
     classify_runtime_report,
     classify_verify_report,
     failure_signature,
+    generic_build_error_files,
     import_name_breaks,
     missing_fixture_names,
     missing_module_names,
@@ -535,7 +536,15 @@ def _build_smoke_target_files(build_stderr: str,
     """
     root = Path(project_root)
     out: List[str] = []
-    for imp in unresolved_import_sources(build_stderr):
+    
+    # First, try to extract files from specific import resolution failures.
+    # If that yields nothing, fall back to parsing filenames directly
+    # from generic build errors (e.g., TypeScript or ESLint errors).
+    sources = unresolved_import_sources(build_stderr)
+    if not sources:
+        sources = generic_build_error_files(build_stderr)
+        
+    for imp in sources:
         rel = imp
         p = Path(imp)
         if p.is_absolute():

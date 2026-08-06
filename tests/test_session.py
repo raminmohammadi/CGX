@@ -8738,12 +8738,12 @@ def test_repair_executor_emits_smoke_repair_plan(store, tmp_path: Path):
     assert "werkzeug" in result.artifact.content["rationale"]
 
 
-def test_repair_executor_emits_escalate_for_build_smoke_failure(
+def test_repair_executor_emits_regenerate_for_build_smoke_failure(
         store, tmp_path: Path):
-    """A JS build-smoke break -> strategy=escalate to save tokens.
+    """A JS build-smoke break -> strategy=regenerate with targeted files.
     
-    Untargetable build breaks should escalate rather than wasting tokens
-    on a doomed full-tree regeneration.
+    If the error names a file (e.g. TS2345 in App.jsx), it should be extracted
+    and used for a targeted AST regeneration instead of escalating.
     """
     from cgx.session.tasks import repair as _repair_module  # noqa: F401
     session = Session.new("g", mode=SessionMode.GREENFIELD)
@@ -8768,13 +8768,20 @@ def test_repair_executor_emits_escalate_for_build_smoke_failure(
         inputs={"smoke_artifact_id": smoke_artifact.artifact_id,
                 "mode": SessionMode.GREENFIELD.value,
                 "repair_attempt": 1})
+    
+    # Touch the file so the target file extractor confirms it exists
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    (src_dir / "App.jsx").touch()
+    
     deps = ExecutorDeps(project_root=str(tmp_path), store=store)
     from cgx.session.tasks.base import _REGISTRY
     result = _REGISTRY[TaskKind.REPAIR](repair_task, deps)
     assert result.failure is None
-    assert result.outputs["strategy"] == "escalate"
+    assert result.outputs["strategy"] == "regenerate"
     constraints = result.outputs["extra_constraints"]
     assert constraints["kind"] == "invalid_build_smoke"
+    assert constraints["target_files"] == ["src/App.jsx"]
     assert "TS2345" in constraints["build_error"]
     assert "build" in result.artifact.content["rationale"].lower()
 

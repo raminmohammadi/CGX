@@ -178,6 +178,16 @@ _UNRESOLVED_IMPORT_RE = re.compile(
     r"[\"']([^\"']+)[\"']",
 )
 
+# A generic JS/TS build error (Vite/TypeScript/Webpack) that names the
+# failing file but isn't a specific unresolved import:
+# ``src/App.jsx: TS2345`` or ``[eslint] src/main.jsx: Error``.
+# Group 1 is the file path.
+_GENERIC_BUILD_ERROR_RE = re.compile(
+    r"([A-Za-z0-9_./\\-]+?\.(?:js|jsx|ts|tsx)):\s*(?:[0-9]+:[0-9]+:)?\s*(?:TS[0-9]+|error|warning|line|column|syntax)",
+    re.IGNORECASE,
+)
+
+
 # A name a generated module uses but never binds -- ``class
 # Operation(str, enum.Enum)`` with no ``import enum``, a constant
 # referenced in an f-string that was never assigned. The file parses,
@@ -422,7 +432,7 @@ def unresolved_entry_paths(text: str) -> Tuple[str, ...]:
     for something the scaffold never generated.
     """
     out: List[str] = []
-    for m in _UNRESOLVED_ENTRY_RE.finditer(str(text or "")):
+    for m in _UNRESOLVED_ENTRY_RE.finditer(text or ""):
         path = m.group(1).replace("\\", "/").strip().lstrip("./")
         if path and path not in out:
             out.append(path)
@@ -443,7 +453,7 @@ def unresolved_import_sources(text: str) -> Tuple[str, ...]:
     against the project root.
     """
     out: List[str] = []
-    for m in _UNRESOLVED_IMPORT_RE.finditer(str(text or "")):
+    for m in _UNRESOLVED_IMPORT_RE.finditer(text or ""):
         path = m.group(2).replace("\\", "/").strip()
         if not path.startswith("/"):
             path = path.lstrip("./")
@@ -583,6 +593,22 @@ def _failure_text(content: Dict[str, Any]) -> str:
         if isinstance(v, str) and v:
             parts.append(v)
     return "\n".join(parts)
+
+
+def generic_build_error_files(build_stderr: str) -> Tuple[str, ...]:
+    """Return the frontend files named in generic build errors.
+
+    Used when a build fails with a generic Webpack/Vite/TypeScript error
+    (e.g., 'src/App.jsx: TS2345') that isn't a specific module-resolution
+    failure, so the router can still perform a targeted AST regeneration.
+    Order-preserving and de-duplicated.
+    """
+    out: List[str] = []
+    for m in _GENERIC_BUILD_ERROR_RE.finditer(build_stderr):
+        path = m.group(1).replace("\\", "/")
+        if path and path not in out:
+            out.append(path)
+    return tuple(out)
 
 
 def _first_error_line(blob: str) -> str:
