@@ -850,10 +850,16 @@ def _run_api_check_repair(task: TaskNode, deps: ExecutorDeps,
         rationale = (
             "API_CHECK reported a failure but no failed references were "
             "recorded.")
+    target_files = sorted(list({
+        str(ref.get("file"))
+        for f in failed for ref in (f.get("references") or [])
+        if isinstance(ref, dict) and ref.get("file")
+    }))
     extra_constraints = {
         "kind": "api_check_failure",
         "failed_references": failed,
         "rationale": rationale,
+        "target_files": target_files,
     }
     plan = Artifact.new(
         session_id=task.session_id,
