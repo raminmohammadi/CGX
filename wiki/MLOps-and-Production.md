@@ -35,7 +35,7 @@ grounding signals to the thumbs-down that later became an eval candidate.
 | **Observability** | `cgx.metrics`, `cgx.trace`, `cgx.redact` | Prometheus text at `GET /api/metrics`; `@traced` tracer (`CGX_TRACE`) with secret redaction |
 | **User activity** | `cgx.activity` (`activity.db`) | `GET /api/activity/{runs,runs/{id},summary}` |
 | **Admin explorer** | `cgx.webui.routes.admin` | `GET /api/admin/{logs,metrics,overview}` + `DELETE /api/admin/logs` (server-side redacted) |
-| **Evaluation** | `cgx.eval`, `evals/` | `python -m cgx.eval`; CI quality gate |
+| **Evaluation** | `cgx.eval`, `evals/` | `python -m cgx.eval`; CI quality gate (retrieval + codegen + **recovery** golden sets) |
 | **Lineage** | `cgx.registry` | prompt fingerprint / `run_id` / index lineage |
 | **AIOps monitoring** | `cgx.monitor` (`monitor.db`) | drift/quality/cost `Alert`s at `GET /api/monitor/alerts` |
 | **Feedback** | `cgx.feedback` (`feedback.db`) | `GET/POST /api/feedback`, `/api/feedback/stats` |
@@ -94,6 +94,20 @@ retrieval drift, cost anomalies, repair-loop health — tunable with `CGX_MON_*`
 Down-votes captured by `cgx.feedback` flow through the **flywheel** into
 candidate rows for the offline **eval** golden sets under `evals/`, which the
 CI job gates on so retrieval / codegen quality can't silently regress.
+
+The gate also carries a **recovery** section (`cgx.eval.recovery`,
+`recovery_golden.jsonl`): a provider-free regression guard for the recovery
+ladder. Each case pins a real gate failure and is resolved through the *same*
+deterministic decision surface the router uses (`cgx.session.repair.classify`
+plus its traceback / build-error extractors), so a change that makes a
+scoped-fixable failure fall back to a whole-tree regenerate flips the resolved
+action and fails the build. Because it is LLM-free it doubles as the
+**degradation floor** for the `DIAGNOSE` rung and enforces two guardrails:
+`never_worse_rate` (no resolved action — including the provider-outage
+`escalate` fallback — costs more than the old whole-tree ladder) and
+`determinism_ok` (re-resolving the corpus is byte-identical, so the router
+stays pure). Both are floored at `1.0`. See **[[Session Based Agent]]** for the
+ladder itself.
 
 ---
 

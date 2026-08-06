@@ -765,6 +765,51 @@ Where to look in the repo:
 | Frontend page            | `frontend/src/pages/AgentPage.tsx` + `frontend/src/components/agent/` |
 | Integration tests        | `tests/test_webui_agent_session.py`, `tests/test_session.py` |
 
+### The recovery evaluation gate (Phase 4, E1/E2)
+
+The recovery ladder above is locked to CI by a provider-free offline eval
+(`cgx.eval.recovery`). Every `recovery_golden.jsonl` case is resolved through
+the **same** deterministic decision surface the router uses -- so the eval
+cannot drift from production behavior -- and the release gate fails if a
+scoped-fixable failure regresses to a whole-tree nuke (E1), if any resolved
+action costs more than the old whole-tree ladder (`never_worse_rate`, E2), or
+if re-resolving the corpus is not byte-identical (`determinism_ok`, E2):
+
+```mermaid
+flowchart LR
+    GC[("recovery_golden.jsonl<br/>real gate failures")] --> RES["resolve_recovery<br/>classify + extractors<br/>(same surface as router)"]
+    RES --> ACT{"resolved action"}
+    ACT -- "scoped patch / install / de-scope / targeted regen" --> SCOPED["scoped recovery<br/>cheap: ~1 round"]
+    ACT -- "escalate / whole-tree" --> WHOLE["whole-tree baseline<br/>expensive: 3 rounds"]
+    SCOPED --> AGG["aggregate_recovery"]
+    WHOLE --> AGG
+    AGG --> M1["action_match_rate == 1.0<br/>scoped_recovery_rate ≥ 0.7"]
+    AGG --> M2["never_worse_rate == 1.0<br/>(E2 degradation floor)"]
+    AGG --> M3["determinism_ok == 1.0<br/>(E2 router purity)"]
+    M1 --> GATE{"run_gate vs<br/>thresholds.json"}
+    M2 --> GATE
+    M3 --> GATE
+    GATE -- "all met" --> PASS((PASS))
+    GATE -- "any regressed" --> FAILB((FAIL build))
+
+    classDef road fill:#3b6ea5,stroke:#274c73,color:#fff;
+    classDef gate fill:#7d5ba6,stroke:#4c3575,color:#fff;
+    classDef term fill:#4c956c,stroke:#2c6e49,color:#fff;
+    classDef bad fill:#bc4749,stroke:#7f2d2f,color:#fff;
+    class GC,RES,SCOPED,WHOLE,AGG,M1,M2,M3 road;
+    class ACT,GATE gate;
+    class PASS term;
+    class FAILB bad;
+```
+
+Because the resolver is LLM-free, the eval *is* the DIAGNOSE degradation floor:
+it measures exactly what the agent guarantees when the provider is unavailable
+(everything collapses to `escalate`), and the two E2 guardrails prove that even
+that worst case is no worse than the pre-overhaul whole-tree ladder. Code map:
+`src/cgx/eval/recovery.py` (resolver + cost model + guardrails),
+`src/cgx/eval/harness.py :: run_gate` (wiring), `evals/thresholds.json` (floors),
+`tests/test_eval.py` (guardrail tests).
+
 ---
 
 </details>
