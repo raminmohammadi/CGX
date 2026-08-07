@@ -116,6 +116,9 @@ class TaskKind(str, enum.Enum):
     # build). The router never spawns it and no executor is registered;
     # it exists so one legacy row cannot make a whole session unreadable.
     UNKNOWN = "unknown"
+    SWARM_TECH_LEAD = "swarm_tech_lead"
+    SWARM_DEVELOPER = "swarm_developer"
+    SWARM_VERIFY = "swarm_verify"
 
 
 class FactKind(str, enum.Enum):
@@ -150,6 +153,8 @@ class ArtifactKind(str, enum.Enum):
     # closed ``minimal_action`` the pure router dispatches (see
     # docs/diagnose-design.md §5).
     DIAGNOSIS = "diagnosis"
+    SWARM_STATE = "swarm_state"
+    SWARM_VERIFY_REPORT = "swarm_verify_report"
 
 
 class DecisionKind(str, enum.Enum):
@@ -330,6 +335,7 @@ class SessionMode(str, enum.Enum):
     """
     EXPLORE = "explore"
     GREENFIELD = "greenfield"
+    SWARM = "swarm"
 
 
 @dataclass

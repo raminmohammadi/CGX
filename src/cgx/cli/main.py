@@ -223,7 +223,7 @@ def _cmd_agent(args: argparse.Namespace) -> None:
     goal = " ".join(args.goal)
     _run_cli_stream(lambda ce: ops.agent_events(
         state, goal, index_dir=args.index_dir, records=args.records,
-        auto=True, cancel_event=ce))
+        auto=True, mode=getattr(args, "mode", None), cancel_event=ce))
 
 
 def _cmd_status(args: argparse.Namespace) -> None:
@@ -249,6 +249,8 @@ def _add_provider_flags(p: argparse.ArgumentParser) -> None:
                    help="Override auto-discovered index dir (<project>/.cgx/index).")
     p.add_argument("--records", default=None,
                    help="Override auto-discovered records.jsonl.")
+    p.add_argument("--mode", default=None, choices=["explore", "greenfield", "swarm"],
+                   help="Override auto-detected session mode.")
 
 
 def main(argv: list[str] | None = None) -> None:

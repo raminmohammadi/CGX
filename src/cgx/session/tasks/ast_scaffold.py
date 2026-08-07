@@ -102,22 +102,154 @@ def _generate_code(path: str, what: str, provider: Any, prompt: str) -> str:
     return ""
 
 
+def _symbol_name_from_signature(signature: str) -> str:
+    """The leading identifier of a ``name(args) -> ret`` contract signature."""
+    m = re.match(r"\s*(?:async\s+)?(?:def\s+)?([A-Za-z_][A-Za-z0-9_]*)",
+                 str(signature or ""))
+    return m.group(1) if m else ""
+
+
+def _symbols_from_skeleton(skeleton_code: str) -> List[Tuple[str, str]]:
+    """Top-level functions/classes declared in a file's skeleton section."""
+    out: List[Tuple[str, str]] = []
+    try:
+        parsed = ast.parse(skeleton_code)
+    except Exception:
+        return out
+    for node in parsed.body:
+        if isinstance(node, ast.AsyncFunctionDef):
+            out.append((node.name, "async function"))
+        elif isinstance(node, ast.FunctionDef):
+            out.append((node.name, "function"))
+        elif isinstance(node, ast.ClassDef):
+            out.append((node.name, "class"))
+    return out
+
+
+def _symbols_from_contracts(
+        path: str, contracts: Dict[str, Any]) -> List[Tuple[str, str]]:
+    """Required symbols for ``path`` taken from the plan contracts.
+
+    The safety net for a skeleton section that will not ``ast.parse``: without
+    it the assembler builds only a header and the file is rejected for
+    defining none of its required symbols. Functions contracted for this
+    module become symbols to generate; schemas bound to it become classes.
+    """
+    norm = str(path or "").replace("\\", "/")
+    out: List[Tuple[str, str]] = []
+    seen: set = set()
+    for fn in (contracts.get("functions") or []):
+        if not isinstance(fn, dict):
+            continue
+        if str(fn.get("module") or "").replace("\\", "/") != norm:
+            continue
+        name = (str(fn.get("name") or "").strip()
+                or _symbol_name_from_signature(fn.get("signature", "")))
+        if name and name not in seen:
+            seen.add(name)
+            out.append((name, "function"))
+    for sc in (contracts.get("schemas") or []):
+        if not isinstance(sc, dict):
+            continue
+        if str(sc.get("module") or "").replace("\\", "/") != norm:
+            continue
+        name = str(sc.get("name") or "").strip()
+        if name and name not in seen:
+            seen.add(name)
+            out.append((name, "class"))
+    return out
+
+
+def _required_symbols(skeleton_code: str, path: str,
+                      contracts: Dict[str, Any]) -> List[Tuple[str, str]]:
+    """Symbols the AST fallback must (re)build for ``path``.
+
+    Prefer the skeleton (authoritative when it parses); fall back to the plan
+    contracts so a malformed skeleton no longer guarantees an empty file.
+    """
+    symbols = _symbols_from_skeleton(skeleton_code)
+    return symbols if symbols else _symbols_from_contracts(path, contracts)
+
+
+def _public_signatures(code: str) -> str:
+    """A compact signature view (def/class headers + first docstring line)."""
+    try:
+        parsed = ast.parse(code)
+    except Exception:
+        return ""
+    lines: List[str] = []
+    for node in parsed.body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                 ast.ClassDef)):
+            continue
+        if isinstance(node, ast.ClassDef):
+            header = f"class {node.name}"
+        else:
+            kw = "async def" if isinstance(
+                node, ast.AsyncFunctionDef) else "def"
+            try:
+                header = f"{kw} {node.name}({ast.unparse(node.args)})"
+            except Exception:
+                header = f"{kw} {node.name}(...)"
+        lines.append(header)
+        doc = ast.get_docstring(node)
+        if doc:
+            lines.append(f"    # {doc.splitlines()[0].strip()}")
+    return "\n".join(lines)
+
+
+def _dependency_paths(path: str, plan_content: Dict[str, Any]) -> List[str]:
+    """The ``depends_on`` paths declared for ``path`` in the work plan."""
+    for lay in (plan_content.get("layers") or []):
+        for f in (lay.get("files") or []):
+            if isinstance(f, dict) and str(f.get("path") or "") == path:
+                return [str(d) for d in (f.get("depends_on") or []) if str(d)]
+    return []
+
+
+def _grounding_block(dep_paths: List[str], skeleton: Dict[str, str],
+                     generated_by_path: Dict[str, str],
+                     limit: int = 1600) -> str:
+    """Public signatures of a file's dependencies, to prompt against.
+
+    Prefer a dependency already (re)generated this run -- its *real*
+    signatures -- and fall back to the dependency's skeleton section. Bounded
+    so the prompt stays small even for a widely-depended-upon module.
+    """
+    parts: List[str] = []
+    for dep in dep_paths:
+        if dep in generated_by_path:
+            sig = _public_signatures(generated_by_path[dep])
+        else:
+            sig = str(skeleton.get(dep, "") or "").strip()
+        if sig:
+            parts.append(f"# From {dep}:\n{sig}")
+    block = "\n\n".join(parts).strip()
+    if len(block) > limit:
+        block = block[:limit] + "\n# ... (truncated)"
+    return block
+
+
 @traced("ast_scaffold.generate_header")
-def _generate_header(path: str, provider: Any, goal: str, context: str) -> str:
+def _generate_header(path: str, provider: Any, goal: str, context: str,
+                     grounding: str = "") -> str:
     """Prompt the LLM for just the imports and globals of the file."""
+    ground = (f"\nSignatures available from dependencies (import from these, "
+              f"do not redefine them):\n{grounding}\n" if grounding else "")
     prompt = f"""You are generating ONLY the file header (imports and global variables) for {path}.
 Project Goal: {goal}
-Context: {context}
+Context: {context}{ground}
 Return ONLY valid Python code containing imports and module-level constants. No functions or classes."""
     return _generate_code(path, "header", provider, prompt)
 
 @traced("ast_scaffold.generate_symbol")
-def _generate_symbol(path: str, symbol_name: str, symbol_type: str, provider: Any, goal: str, header: str, context: str) -> str:
+def _generate_symbol(path: str, symbol_name: str, symbol_type: str, provider: Any, goal: str, header: str, context: str, grounding: str = "") -> str:
     """Prompt the LLM for a specific function or class."""
+    ground = (f"\nSignatures available from dependencies (call these; do not "
+              f"reimplement them):\n{grounding}\n" if grounding else "")
     prompt = f"""You are generating exactly ONE {symbol_type} named `{symbol_name}` for {path}.
 Project Goal: {goal}
-Context: {context}
-
+Context: {context}{ground}
 The file currently has the following imports and globals:
 ```python
 {header}
@@ -303,6 +435,14 @@ def run_ast_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
                 if isinstance(diff_entry, dict) and diff_entry.get("file") not in regen_set:
                     diffs.append(diff_entry)
 
+    # Real content of everything already on the tree, keyed by path: the
+    # grounding source so a file is authored against its dependencies' actual
+    # signatures rather than blind (the root cause of hallucinated imports).
+    generated_by_path: Dict[str, str] = {
+        e["file"]: e["content"] for e in generated
+        if isinstance(e, dict) and e.get("file")
+        and isinstance(e.get("content"), str)}
+
     total_files = len(regen_files)
     progress_done = 0
     progress_failed = 0
@@ -333,29 +473,26 @@ def run_ast_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         
         started = time.time()
         skeleton_code = skeleton.get(path, "")
+        dep_paths = _dependency_paths(path, plan_content)
+        grounding = _grounding_block(dep_paths, skeleton, generated_by_path)
 
-        # 1. Generate Header (Imports + Globals). The file's own skeleton
-        # is the context: without it the header is authored blind and its
-        # imports contradict the symbols generated below.
-        header = _generate_header(path, deps.provider, goal, skeleton_code)
+        # 1. Generate Header (Imports + Globals). The file's own skeleton is
+        # the context; the dependency signatures ground its imports so they
+        # name symbols that actually exist instead of hallucinated ones.
+        header = _generate_header(
+            path, deps.provider, goal, skeleton_code, grounding=grounding)
 
         assembler = ASTAssembler(header)
 
-        symbols = []
-        try:
-            parsed = ast.parse(skeleton_code)
-            for node in parsed.body:
-                if isinstance(node, ast.FunctionDef):
-                    symbols.append((node.name, "function"))
-                elif isinstance(node, ast.AsyncFunctionDef):
-                    symbols.append((node.name, "async function"))
-                elif isinstance(node, ast.ClassDef):
-                    symbols.append((node.name, "class"))
-        except Exception as parse_e:
-            logger.warning("Failed to parse skeleton for %s: %s", path, parse_e)
-            
+        # Required symbols come from the skeleton when it parses, else from the
+        # plan contracts -- a malformed skeleton must not silently yield an
+        # empty file (every required symbol then reported missing).
+        symbols = _required_symbols(skeleton_code, path, contracts)
+
         for sym_name, sym_type in symbols:
-            symbol_code = _generate_symbol(path, sym_name, sym_type, deps.provider, goal, header, skeleton_code)
+            symbol_code = _generate_symbol(
+                path, sym_name, sym_type, deps.provider, goal, header,
+                skeleton_code, grounding=grounding)
             if symbol_code:
                 assembler.add_component(symbol_code)
         
@@ -395,6 +532,8 @@ def run_ast_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
                 "content": final_content,
                 "bytes": len(final_content)
             })
+            # Ground later files in this run against what was just built.
+            generated_by_path[path] = final_content
             progress_done += 1
             _emit_scaffold_progress(
                 deps, task, file=path, layer="ast_fallback",

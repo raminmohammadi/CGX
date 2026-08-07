@@ -494,6 +494,28 @@ def _assign_names(target: ast.AST) -> List[str]:
     return []
 
 
+def _class_methods(content: str) -> Optional[Dict[str, Set[str]]]:
+    """Map each top-level class to the method names it defines, or ``None``.
+
+    ``None`` signals an unparsable module so the caller abstains. A declared
+    ``Class.method`` contract resolves against this map, so a correctly
+    authored method is not mistaken for a missing module-level function.
+    """
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        return None
+    out: Dict[str, Set[str]] = {}
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef):
+            methods: Set[str] = set()
+            for sub in node.body:
+                if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    methods.add(sub.name)
+            out[node.name] = methods
+    return out
+
+
 def _resolve_from_target(node: ast.ImportFrom, importer: str,
                          is_pkg_init: bool) -> Optional[str]:
     """Dotted target module of a ``from ... import`` (absolute or relative)."""
@@ -621,7 +643,8 @@ def check_contract_compliance(
       generated Python module;
     * ``functions`` -- a function named ``name`` must be defined, in the
       declared ``module`` when it is a generated Python file, otherwise in
-      any generated module;
+      any generated module; a dotted ``Class.method`` name resolves against
+      the method set of the generated class rather than a module-level name;
     * ``constants`` -- a module-level name ``name`` must be assigned in
       some generated Python module.
 
@@ -641,6 +664,10 @@ def check_contract_compliance(
     # module, excluding names merely re-exported via an import. Constants must
     # be assigned, not just imported, to satisfy their contract.
     assigned_symbols: Set[str] = set()
+    # Union of ``class name -> method names`` across every module, so a
+    # declared ``Class.method`` function contract resolves against the method
+    # rather than being sought as a (nonexistent) module-level symbol.
+    class_methods: Dict[str, Set[str]] = {}
     for path, content in file_contents.items():
         if not isinstance(content, str):
             continue
@@ -654,6 +681,10 @@ def check_contract_compliance(
         defined = _top_level_symbols(content, include_imports=False)
         if defined is not None:
             assigned_symbols |= defined
+        cms = _class_methods(content)
+        if cms:
+            for cls, ms in cms.items():
+                class_methods.setdefault(cls, set()).update(ms)
 
     have_python = bool(per_module)
     haystack = "\n".join(
@@ -698,6 +729,26 @@ def check_contract_compliance(
             if not name:
                 continue
             module = str(fn.get("module") or "").strip().replace("\\", "/")
+            # A dotted ``Class.method`` contract names a method on a class,
+            # not a module-level function; when the owning class is a known
+            # generated class, resolve the member against its methods and
+            # skip the flat symbol scan (which would never find the dotted
+            # name). A dotted name whose owner is *not* a known class falls
+            # through so a genuinely missing class is still reported.
+            if "." in name:
+                owner, _, member = name.rpartition(".")
+                methods = class_methods.get(owner)
+                if methods is not None:
+                    if member not in methods:
+                        warnings.append({
+                            "kind": "function",
+                            "name": name,
+                            "module": module or None,
+                            "reason": (f"declared method {name!r} not defined "
+                                       f"on class {owner!r} in any generated "
+                                       "module"),
+                        })
+                    continue
             scope = per_module.get(module)
             if scope is not None:
                 if name not in scope:

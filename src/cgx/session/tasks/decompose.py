@@ -984,54 +984,52 @@ def _validate_manifest_coherence(
     return None
 
 
-def _order_manifest_layers(
-        layers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Topologically sort files by hard-coding the pipeline into 4 strict layers
-    (Models -> Core -> API -> Tests) and sorting within each layer.
+# The pipeline rank a path occupies in the generated tree. Kept identical to
+# the historical keyword buckets so re-grouping after the global sort yields
+# the same layer partition greenfield already relies on (models/configs/utils
+# first, then core logic, then API/entrypoints, then tests last).
+_BUCKET_NAMES = {
+    1: "models_configs_utils",
+    2: "core_logic_auth",
+    3: "api_routes_main",
+    4: "tests",
+}
+
+
+def _bucket_rank(path: str) -> int:
+    """Return the pipeline rank (1..4) a file path belongs to.
+
+    Rank is a *heuristic tiebreaker* for the global topological sort, never a
+    substitute for it: an explicit ``depends_on`` edge always wins over rank.
     """
-    out: List[Dict[str, Any]] = []
-    all_files: List[Dict[str, Any]] = []
-    
-    for lay in layers:
-        if isinstance(lay, dict):
-            for f in (lay.get("files") or []):
-                if isinstance(f, dict) and f.get("path"):
-                    all_files.append(f)
-                    
-    layer1, layer2, layer3, layer4 = [], [], [], []
-    for f in all_files:
-        path = str(f.get("path", "")).lower()
-        if "test" in path:
-            layer4.append(f)
-        elif any(kw in path for kw in ["model", "config", "util", "schema"]):
-            layer1.append(f)
-        elif any(kw in path for kw in ["main", "app", "route", "api", "server"]):
-            layer3.append(f)
-        else:
-            layer2.append(f)
-            
-    buckets = [
-        {"name": "models_configs_utils", "files": layer1},
-        {"name": "core_logic_auth", "files": layer2},
-        {"name": "api_routes_main", "files": layer3},
-        {"name": "tests", "files": layer4},
-    ]
-    
-    for lay in buckets:
-        if lay["files"]:
-            out.append({**lay, "files": _toposort_files(lay["files"])})
-            
-    return out
+    p = str(path or "").lower()
+    if "test" in p:
+        return 4
+    if any(kw in p for kw in ("model", "config", "util", "schema")):
+        return 1
+    if any(kw in p for kw in ("main", "app", "route", "api", "server")):
+        return 3
+    return 2
 
 
-def _toposort_files(
+def toposort_manifest_files(
         files: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Globally order files so every dependency precedes its consumers.
+
+    A single Kahn sort over the *whole* manifest -- not per-bucket -- so a
+    ``depends_on`` edge that crosses pipeline ranks is honoured instead of
+    silently lost (the old per-bucket sort could invert such an edge). Among
+    files with no ordering constraint between them, ties break by
+    ``(bucket_rank, declared_index)`` so the historical models -> core -> api
+    -> tests flow is preserved. Residual nodes from a cycle that slipped past
+    validation are appended in the same tiebreak order -- never dropped.
+    """
     if len(files) < 2:
         return list(files)
     paths = [f["path"] for f in files]
-    order_index = {p: i for i, p in enumerate(paths)}
     path_set = set(paths)
     by_path = {f["path"]: f for f in files}
+    tiebreak = {p: (_bucket_rank(p), i) for i, p in enumerate(paths)}
     indeg = {p: 0 for p in paths}
     adj: Dict[str, List[str]] = {p: [] for p in paths}
     for f in files:
@@ -1040,7 +1038,7 @@ def _toposort_files(
                 adj[dep].append(f["path"])
                 indeg[f["path"]] += 1
     ready = sorted((p for p in paths if indeg[p] == 0),
-                   key=lambda p: order_index[p])
+                   key=lambda p: tiebreak[p])
     ordered: List[str] = []
     while ready:
         p = ready.pop(0)
@@ -1052,8 +1050,45 @@ def _toposort_files(
                 newly.append(nxt)
         if newly:
             ready.extend(newly)
-            ready.sort(key=lambda p: order_index[p])
+            ready.sort(key=lambda p: tiebreak[p])
     if len(ordered) != len(paths):
-        # A cycle slipped past validation -- keep declared order.
-        return list(files)
+        # A cycle slipped past validation: append the unresolved remainder in
+        # tiebreak order rather than discarding it, so no planned file is lost.
+        seen = set(ordered)
+        ordered.extend(sorted((p for p in paths if p not in seen),
+                              key=lambda p: tiebreak[p]))
     return [by_path[p] for p in ordered]
+
+
+def _order_manifest_layers(
+        layers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Re-group manifest files into the 4 pipeline layers, dependency-first.
+
+    Files are globally topologically sorted (:func:`toposort_manifest_files`)
+    and then bucketed by :func:`_bucket_rank`, preserving the global order
+    within each bucket. Buckets are emitted in rank order so a dependency in an
+    earlier layer is always generated before its consumer.
+    """
+    all_files: List[Dict[str, Any]] = []
+    for lay in layers:
+        if isinstance(lay, dict):
+            for f in (lay.get("files") or []):
+                if isinstance(f, dict) and f.get("path"):
+                    all_files.append(f)
+
+    ordered = toposort_manifest_files(all_files)
+    grouped: Dict[int, List[Dict[str, Any]]] = {1: [], 2: [], 3: [], 4: []}
+    for f in ordered:
+        grouped[_bucket_rank(str(f.get("path", "")))].append(f)
+
+    out: List[Dict[str, Any]] = []
+    for rank in (1, 2, 3, 4):
+        if grouped[rank]:
+            out.append({"name": _BUCKET_NAMES[rank], "files": grouped[rank]})
+    return out
+
+
+def _toposort_files(
+        files: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Backwards-compatible alias for the global manifest toposort."""
+    return toposort_manifest_files(files)

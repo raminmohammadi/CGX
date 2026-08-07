@@ -184,7 +184,7 @@ export type EmbedModelsResponse = {
 
 // --- session-shaped agent types (mirror cgx.session models) ---
 
-export type SessionModeValue = "explore" | "greenfield";
+export type SessionModeValue = "explore" | "greenfield" | "swarm";
 
 export type TaskKind =
   | "explore"

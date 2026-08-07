@@ -42,6 +42,9 @@ from cgx.session.tasks import smoke as _smoke  # noqa: F401
 from cgx.session.tasks import repair as _repair  # noqa: F401
 from cgx.session.tasks import diagnose as _diagnose  # noqa: F401
 from cgx.session.tasks import ast_scaffold as _ast_scaffold  # noqa: F401
+from cgx.session.tasks import swarm_tech_lead as _swarm_tech_lead  # noqa: F401
+from cgx.session.tasks import swarm_developer as _swarm_developer  # noqa: F401
+from cgx.session.tasks import swarm_verify as _swarm_verify  # noqa: F401
 
 __all__ = [
     "ExecutorDeps",

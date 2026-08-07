@@ -36,6 +36,7 @@ from sse_starlette.sse import EventSourceResponse
 # Importing the tasks package side-effect-registers Phase 1 executors.
 from cgx.session import tasks as _tasks  # noqa: F401
 from cgx.session import SessionRunner, SessionStore
+from cgx.session.budget import drain_step_ceiling
 from cgx.session.events import Event, EventType, get_default_bus
 from cgx.session.llm_trace import TracingProvider
 from cgx.session.mode import detect_mode
@@ -190,6 +191,9 @@ async def _drain_ready(runner: SessionRunner, session_id: str,
     is only a safety valve against a router bug that spawns READY tasks
     without end; it must not double as a functional limit, or a task
     created READY past the cap is stranded with no request to re-drive it.
+    For a SWARM session the ceiling is raised per-loop to the plan's file
+    count (:func:`drain_step_ceiling`) so a large one-file-per-task build
+    is not truncated mid-chain; explore/greenfield keep the flat default.
 
     The greenfield write pipeline is SCAFFOLD -> APPLY -> BOOTSTRAP_ENV ->
     API_CHECK -> SMOKE -> VERIFY (6 tasks on the happy path). An
@@ -209,7 +213,13 @@ async def _drain_ready(runner: SessionRunner, session_id: str,
     """
     t0 = time.perf_counter()
     seen_before = _llm_fact_ids(runner, session_id)
-    for _ in range(max_steps):
+    steps = 0
+    # Recompute the ceiling each loop: a SWARM plan's DEVELOPER tasks are
+    # spawned *during* the drain, so the plan-aware bound only grows once
+    # the Tech Lead's WORK_PLAN lands.
+    ceiling = max_steps
+    while steps < ceiling:
+        steps += 1
         # Cooperative cancel (P2.2): honour a stop request *between* tasks
         # so the in-flight task finishes cleanly and no further READY task
         # is dispatched. The flag is consumed here so a later message can
@@ -247,10 +257,12 @@ async def _drain_ready(runner: SessionRunner, session_id: str,
         if task is None:
             _record_agent_turn(runner, session_id, seen_before, t0)
             return
+        ceiling = drain_step_ceiling(runner.store, session_id,
+                                     default=max_steps)
     _record_agent_turn(runner, session_id, seen_before, t0)
     logger.warning(
-        "drain: hit max_steps=%d for session %s without quiescing; "
-        "a READY task may remain undispatched", max_steps,
+        "drain: hit ceiling=%d for session %s without quiescing; "
+        "a READY task may remain undispatched", ceiling,
         sanitize_for_log(session_id))
 
 

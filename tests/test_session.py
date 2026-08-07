@@ -12246,6 +12246,40 @@ def test_contract_check_function_falls_back_to_any_module():
     assert [w["name"] for w in warns] == ["compute"]
 
 
+def test_contract_check_resolves_dotted_class_method():
+    """A ``Class.method`` contract resolves against the class's methods.
+
+    The ses false-negative: the Tech Lead declared ``Circle.area`` (a method)
+    but the checker sought a module-level ``Circle.area`` symbol, never found
+    it, and flagged the tree even though the method exists and tests pass.
+    A dotted name must resolve against the generated class's method set.
+    """
+    from cgx.session.scaffold_validate import check_contract_compliance
+    contracts = {"functions": [{"name": "Circle.area", "module": "s/shapes.py"}]}
+    ok = {"s/shapes.py": (
+        "class Circle:\n"
+        "    def __init__(self, radius):\n        self.radius = radius\n\n"
+        "    def area(self):\n        return 3.14159 * self.radius ** 2\n")}
+    assert check_contract_compliance(ok, contracts) == []
+    # The class exists but the method does not -> one function warning that
+    # names the missing member on its owning class.
+    bad = {"s/shapes.py": "class Circle:\n    def perimeter(self):\n        return 0\n"}
+    warns = check_contract_compliance(bad, contracts)
+    assert [w["kind"] for w in warns] == ["function"]
+    assert warns[0]["name"] == "Circle.area"
+    assert "Circle" in warns[0]["reason"]
+
+
+def test_contract_check_dotted_unknown_owner_still_flagged():
+    """A dotted name whose owner class is absent still warns (missing class)."""
+    from cgx.session.scaffold_validate import check_contract_compliance
+    contracts = {"functions": [{"name": "Circle.area", "module": "s/shapes.py"}]}
+    contents = {"s/shapes.py": "def unrelated():\n    return 1\n"}
+    warns = check_contract_compliance(contents, contracts)
+    assert [w["kind"] for w in warns] == ["function"]
+    assert warns[0]["name"] == "Circle.area"
+
+
 def test_contract_check_abstains_without_python_and_on_empty():
     """No Python files -> symbol checks abstain; empty contracts -> []."""
     from cgx.session.scaffold_validate import check_contract_compliance

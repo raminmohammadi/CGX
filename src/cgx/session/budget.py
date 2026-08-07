@@ -83,6 +83,47 @@ DECOMPOSE_RETRY_BUDGET = 1
 GREENFIELD_MAX_TASK_RUNS = 60
 GREENFIELD_MAX_WALL_SECONDS = 3600.0
 
+# Default safety-valve ceiling on the number of tasks a single drain pass
+# dispatches. Explore/greenfield task graphs are small and bounded well
+# under it, so the flat cap only ever fires on a router bug. A SWARM
+# session instead spawns one DEVELOPER task per planned file followed by a
+# VERIFY, so a large plan legitimately needs more; :func:`drain_step_ceiling`
+# scales the ceiling to the plan's file count for SWARM sessions only.
+DRAIN_STEP_CEILING = 64
+
+
+def drain_step_ceiling(store: Any, session_id: str, *,
+                       default: int = DRAIN_STEP_CEILING) -> int:
+    """Plan-aware ceiling for a session drain loop.
+
+    Returns ``default`` for explore/greenfield sessions, whose task
+    graphs stay well under it. A SWARM session dispatches one DEVELOPER
+    task per planned file then a VERIFY, so a plan with more than ~20
+    files would be truncated mid-chain by the flat default; scale the
+    ceiling to the plan's file count -- with headroom for one regenerate
+    retry per file plus planning/verify/terminal overhead -- so a large
+    build runs to quiescence while a runaway is still bounded. The file
+    count is read from the WORK_PLAN artifact, falling back to the number
+    of DEVELOPER tasks already spawned before the plan lands. Best-effort:
+    any lookup failure falls back to ``default`` so the drain never blocks.
+    """
+    try:
+        from cgx.session.models import ArtifactKind, SessionMode, TaskKind
+        session = store.get_session(session_id)
+        if session is None or session.mode is not SessionMode.SWARM:
+            return default
+        file_count = 0
+        for art in store.list_artifacts(session_id):
+            if art.kind is ArtifactKind.WORK_PLAN and art.content:
+                paths = art.content.get("paths") or []
+                file_count = max(file_count, len(paths))
+        dev = sum(1 for t in store.list_tasks(session_id)
+                  if t.kind is TaskKind.SWARM_DEVELOPER)
+        file_count = max(file_count, dev)
+        return max(default, file_count * 3 + 16)
+    except Exception:  # pragma: no cover - defensive; never block a drain
+        return default
+
 
 def _coerce_int(value: Any) -> Optional[int]:
     """Best-effort ``int`` coercion; returns ``None`` for missing/garbage."""

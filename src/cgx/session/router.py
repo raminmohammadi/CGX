@@ -1069,6 +1069,109 @@ def _scaffold_to_apply(parent: TaskNode) -> List[TaskNode]:
     )]
 
 
+def _swarm_dev_inputs(parent: TaskNode, outputs: Dict[str, Any],
+                      file_index: int) -> Dict[str, Any]:
+    """Assemble the SWARM_DEVELOPER inputs for the ``file_index``-th file.
+
+    The plan reference, file count, goal, and project root are threaded
+    verbatim down the chain; ``failed_paths`` accumulates across turns so
+    the terminal edge can decide COMPLETED vs FAILED once every file has
+    been attempted.
+    """
+    return {
+        "work_plan_artifact_id": outputs.get("work_plan_artifact_id"),
+        "file_index": file_index,
+        "file_count": outputs.get("file_count"),
+        "failed_paths": outputs.get("failed_paths") or [],
+        "goal": outputs.get("goal") or parent.inputs.get("goal"),
+        "project_root": (outputs.get("project_root")
+                         or parent.inputs.get("project_root")),
+    }
+
+
+def _swarm_tech_lead_to_successors(parent: TaskNode) -> List[TaskNode]:
+    """Spawn the first Developer file-task, or finish (unbuildable plan)."""
+    outputs = parent.outputs or {}
+    if int(outputs.get("file_count") or 0) <= 0:
+        # No buildable plan -- no Developer chain; the terminal edge in
+        # ``on_task_completed`` ends the session FAILED.
+        return []
+    return [TaskNode.new(
+        session_id=parent.session_id,
+        kind=TaskKind.SWARM_DEVELOPER,
+        name="Generate file 1",
+        description="Generate the first planned file.",
+        parent_task_id=parent.task_id,
+        inputs=_swarm_dev_inputs(parent, outputs, 0),
+    )]
+
+
+def _swarm_verify_inputs(parent: TaskNode,
+                         outputs: Dict[str, Any]) -> Dict[str, Any]:
+    """Assemble the SWARM_VERIFY inputs from the last Developer's outputs."""
+    return {
+        "work_plan_artifact_id": outputs.get("work_plan_artifact_id"),
+        "failed_paths": outputs.get("failed_paths") or [],
+        "goal": outputs.get("goal"),
+        "project_root": outputs.get("project_root"),
+    }
+
+
+def _swarm_developer_to_successors(parent: TaskNode) -> List[TaskNode]:
+    """Spawn the next Developer file-task, or the tree-level VERIFY at the end."""
+    outputs = parent.outputs or {}
+    file_index = int(outputs.get("file_index") or 0)
+    file_count = int(outputs.get("file_count") or 0)
+    next_index = file_index + 1
+    if next_index >= file_count:
+        # Every file attempted -- hand off to the tree-level verification
+        # ladder, which owns the terminal edge in ``on_task_completed``.
+        return [TaskNode.new(
+            session_id=parent.session_id,
+            kind=TaskKind.SWARM_VERIFY,
+            name="Verify generated tree",
+            description="Structural + environment verification of the tree.",
+            parent_task_id=parent.task_id,
+            inputs=_swarm_verify_inputs(parent, outputs),
+        )]
+    return [TaskNode.new(
+        session_id=parent.session_id,
+        kind=TaskKind.SWARM_DEVELOPER,
+        name=f"Generate file {next_index + 1}",
+        description="Generate the next planned file.",
+        parent_task_id=parent.task_id,
+        inputs=_swarm_dev_inputs(parent, outputs, next_index),
+    )]
+
+
+def _swarm_verify_to_successors(parent: TaskNode) -> List[TaskNode]:
+    """SWARM_VERIFY is terminal -- it owns the session's final status."""
+    return []
+
+
+def _swarm_terminal_session_actions(
+        completed: TaskNode) -> List[RouterAction]:
+    """Set the swarm session's terminal status once the chain ends.
+
+    A Tech Lead that produced no buildable plan (no Developer successor) is a
+    definitive ``FAILED``. When the chain reaches VERIFY, its ``verify_ok``
+    (structurally clean, no unwritten files, tests not red) decides the
+    outcome. A Developer that ends the chain without a VERIFY successor (a
+    degenerate single-file plan edge) falls back to its ``failed_paths``.
+    Mirrors :func:`_verify_terminal_session_actions`.
+    """
+    outputs = completed.outputs or {}
+    if completed.kind is TaskKind.SWARM_TECH_LEAD:
+        green = False
+    elif completed.kind is TaskKind.SWARM_VERIFY:
+        green = bool(outputs.get("verify_ok"))
+    else:
+        green = not (outputs.get("failed_paths") or [])
+    status = SessionStatus.COMPLETED if green else SessionStatus.FAILED
+    return [UpdateSessionStatus(session_id=completed.session_id,
+                                status=status)]
+
+
 # Maps the parent's kind to a function that produces the successor
 # tasks. Greenfield kinds (CLARIFY_REQUIREMENTS, DECOMPOSE, SCAFFOLD,
 # BOOTSTRAP_ENV) chain to ASK_USER / APPLY / VERIFY respectively. A
@@ -1092,6 +1195,9 @@ TASK_SUCCESSOR = {
     TaskKind.RE_VERIFY: _re_verify_successors,
     TaskKind.RUNTIME_VERIFY: _runtime_verify_to_repair_or_terminal,
     TaskKind.REPAIR: _repair_to_apply_or_ask,
+    TaskKind.SWARM_TECH_LEAD: _swarm_tech_lead_to_successors,
+    TaskKind.SWARM_DEVELOPER: _swarm_developer_to_successors,
+    TaskKind.SWARM_VERIFY: _swarm_verify_to_successors,
 }
 
 
@@ -1206,6 +1312,12 @@ class Router:
                 and not children):
             plan.actions.extend(
                 _preverify_gate_terminal_actions(completed))
+        if (completed.kind in (TaskKind.SWARM_TECH_LEAD,
+                               TaskKind.SWARM_DEVELOPER,
+                               TaskKind.SWARM_VERIFY)
+                and not children):
+            plan.actions.extend(
+                _swarm_terminal_session_actions(completed))
         return plan
 
     @traced("router")
@@ -1250,11 +1362,19 @@ class Router:
         is already in a terminal status.
         """
         plan = RouterPlan()
-        if session.mode is not SessionMode.GREENFIELD:
-            return plan
         if session.status in (SessionStatus.COMPLETED,
                               SessionStatus.FAILED,
                               SessionStatus.ABANDONED):
+            return plan
+        # A swarm executor that crashed or errored has no automated recovery;
+        # end the session FAILED so it reaches a terminal status instead of
+        # hanging in ``active`` with a dead leaf (mirrors greenfield).
+        if session.mode is SessionMode.SWARM:
+            plan.actions.append(UpdateSessionStatus(
+                session_id=session.session_id,
+                status=SessionStatus.FAILED))
+            return plan
+        if session.mode is not SessionMode.GREENFIELD:
             return plan
         resume_actions = _scaffold_resume_actions(
             failed, tasks, resume_scaffold_artifact_id)
@@ -1339,9 +1459,23 @@ class Router:
 
 def _make_root(session: Session, message: str) -> TaskNode:
     """Pick the root task kind based on the session's mode."""
+    if session.mode is SessionMode.SWARM:
+        return _make_root_swarm_tech_lead(session, message)
     if session.mode is SessionMode.GREENFIELD:
         return _make_root_clarify(session, message)
     return _make_root_explore(session, message)
+
+
+def _make_root_swarm_tech_lead(session: Session, message: str) -> TaskNode:
+    return TaskNode.new(
+        session_id=session.session_id,
+        kind=TaskKind.SWARM_TECH_LEAD,
+        name="Tech Lead Planning",
+        description="Reason over the objective and delegate tasks.",
+        inputs={"goal": message,
+                "original_objective": session.original_objective,
+                "project_root": session.project_root},
+    )
 
 
 def _make_root_explore(session: Session, message: str) -> TaskNode:

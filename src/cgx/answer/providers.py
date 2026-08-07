@@ -257,6 +257,10 @@ class OllamaProvider(LLMProvider):
             payload["format"] = "json"
         if self.keep_alive is not None:
             payload["keep_alive"] = self.keep_alive
+            
+        with open("ollama_payload.json", "w") as f:
+            json.dump(payload, f, indent=2)
+            
         try:
             with requests.post(url, json=payload, timeout=self.timeout, stream=True) as resp:
                 resp.raise_for_status()

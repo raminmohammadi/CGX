@@ -68,6 +68,9 @@ _LLM_TASK_KINDS = {
     TaskKind.CLARIFY_REQUIREMENTS,
     TaskKind.DECOMPOSE,
     TaskKind.SCAFFOLD,
+    TaskKind.SWARM_TECH_LEAD,
+    TaskKind.SWARM_DEVELOPER,
+    TaskKind.SWARM_VERIFY,
 }
 
 # GPU inference throttle: serialise heavy LLM generation tasks to protect

@@ -412,8 +412,12 @@ function LiveProgress({ p }: { p: TaskProgress }) {
 function ModeBadge({ mode }: { mode: SessionModeValue | undefined }) {
   const tone = mode === "greenfield"
     ? "border-emerald-500/30 bg-emerald-950/40 text-emerald-300"
+    : mode === "swarm"
+    ? "border-amber-500/30 bg-amber-950/40 text-amber-300"
     : "border-indigo-500/30 bg-indigo-950/40 text-indigo-300";
-  const label = mode === "greenfield" ? "greenfield" : "explore";
+  const label = mode === "greenfield"
+    ? "greenfield"
+    : mode === "swarm" ? "swarm" : "explore";
   return (
     <span className={cn(
       "text-[9px] font-mono uppercase tracking-wider px-1.5 py-0.5 rounded border",
