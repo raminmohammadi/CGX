@@ -195,6 +195,18 @@ _UNRESOLVED_IMPORT_RE = re.compile(
     r"[\"']([^\"']+)[\"']",
 )
 
+# Vite's HTML entry plugin reporting a script the entry document points at
+# that was never generated: ``[plugin vite:build-html] /root/index.html
+# Error: Failed to resolve /src/main.jsx from /root/index.html``. The spec
+# is unquoted and root-absolute, so neither shape above matches it, yet the
+# fix is the entry-module one -- the script has to be *added*, not
+# re-authored (live: ses_877e1b15a9b34994). Group 1 is the unresolved spec,
+# group 2 the importing document.
+_UNRESOLVED_HTML_SPEC_RE = re.compile(
+    r"Failed to resolve\s+([A-Za-z0-9_.@/\\-]+)\s+from\s+"
+    r"([A-Za-z0-9_.@/\\-]+)",
+)
+
 # A generic JS/TS build error (Vite/TypeScript/Webpack) that names the
 # failing file but isn't a specific unresolved import:
 # ``src/App.jsx: TS2345`` or ``[eslint] src/main.jsx: Error``.
@@ -450,6 +462,26 @@ def unresolved_entry_paths(text: str) -> Tuple[str, ...]:
     """
     out: List[str] = []
     for m in _UNRESOLVED_ENTRY_RE.finditer(text or ""):
+        path = m.group(1).replace("\\", "/").strip().lstrip("./")
+        if path and path not in out:
+            out.append(path)
+    return tuple(out)
+
+
+def unresolved_html_entry_specs(text: str) -> Tuple[str, ...]:
+    """Return the script paths an HTML entry references but cannot resolve.
+
+    Matches Vite's ``vite:build-html`` shape (``Failed to resolve
+    /src/main.jsx from <root>/index.html``), which the quoted
+    relative-import and ``entry module`` patterns both miss. The document
+    exists, so re-authoring it is not the fix -- the script it names is
+    absent and must be added, exactly like an unresolved entry module.
+    Paths are normalised to forward slashes and stripped of a leading
+    ``/`` or ``./``; order-preserving and de-duplicated. Callers filter
+    out specs that do exist on disk (those are a real resolution bug).
+    """
+    out: List[str] = []
+    for m in _UNRESOLVED_HTML_SPEC_RE.finditer(text or ""):
         path = m.group(1).replace("\\", "/").strip().lstrip("./")
         if path and path not in out:
             out.append(path)

@@ -22,8 +22,10 @@ content to plan a remediation.
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import logging
+import re
 import shutil
 import subprocess
 import sys
@@ -117,7 +119,7 @@ def run_smoke(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
 
     sig_parts = list(failed)
     if build_smoke is not None and not build_smoke["ok"]:
-        sig_parts.append(build_smoke["label"])
+        sig_parts.append(_build_smoke_signature_part(build_smoke))
     signature = _signature(sig_parts) if outcome == "failed" else ""
     content: Dict[str, Any] = {
         "build_artifact_id": task.inputs.get("build_artifact_id"),
@@ -289,6 +291,50 @@ def _probe_import(python_exe: str, pkg: str,
 def _signature(failed_modules: List[str]) -> str:
     """A stable string keyed on the failing modules for loop detection."""
     return "smoke_import|" + ",".join(sorted(failed_modules))
+
+
+# Stack frames, ANSI colour codes and build timings are the parts of a
+# bundler's stderr that vary between two runs of the *same* failure.
+_BUILD_FRAME_RE = re.compile(r"^\s*at\s")
+_BUILD_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+_BUILD_TIMING_RE = re.compile(r"\b\d+(?:\.\d+)?\s*m?s\b")
+_BUILD_DIGEST_LINES = 12
+
+
+def _build_smoke_signature_part(build_smoke: Dict[str, Any]) -> str:
+    """The signature term for a failing build-smoke: label plus error digest.
+
+    The label alone (``npm run build --silent``) is identical for every
+    frontend build failure, so two genuinely different errors -- a
+    missing entry module, then a module the newly-added entry imports --
+    collapse to one signature and the router's flap guard terminates a
+    loop that was in fact making progress. Hashing the error text keeps
+    the two apart while a repeat of the *same* error still matches.
+    """
+    label = str(build_smoke.get("label") or "npm run build")
+    digest = _build_error_digest(str(build_smoke.get("stderr_tail") or ""))
+    return f"{label}#{digest}" if digest else label
+
+
+def _build_error_digest(stderr_tail: str) -> str:
+    """A short stable hash of *which* build error a bundler reported.
+
+    Drops stack frames, ANSI colour codes and wall-clock timings -- the
+    parts that differ run to run -- then hashes the leading error lines,
+    so the same failure hashes the same across repair attempts.
+    """
+    lines: List[str] = []
+    for raw in (stderr_tail or "").splitlines():
+        line = _BUILD_ANSI_RE.sub("", raw).strip()
+        if not line or _BUILD_FRAME_RE.match(raw):
+            continue
+        lines.append(_BUILD_TIMING_RE.sub("<t>", line))
+        if len(lines) >= _BUILD_DIGEST_LINES:
+            break
+    if not lines:
+        return ""
+    blob = "\n".join(lines).encode("utf-8")
+    return hashlib.sha1(blob).hexdigest()[:8]
 
 
 def _npm_build_command(root: Path) -> Optional[List[str]]:

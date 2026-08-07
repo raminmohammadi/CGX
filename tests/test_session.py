@@ -7550,6 +7550,63 @@ def test_smoke_node_build_failure_is_failed(tmp_path, store, monkeypatch):
     assert "npm run build" in result.outputs["failure_signature"]
 
 
+def _node_smoke_signature(store, tmp_path, monkeypatch, task,
+                          stderr: str) -> str:
+    """Run the SMOKE build-smoke against ``stderr`` and return its signature."""
+    from cgx.session.tasks import smoke as smoke_mod
+
+    class _P:
+        returncode = 1
+        stdout = ""
+
+    _P.stderr = stderr
+    monkeypatch.setattr(smoke_mod.shutil, "which", lambda name: "/usr/bin/npm")
+    monkeypatch.setattr(smoke_mod.subprocess, "run", lambda *a, **k: _P())
+    result = smoke_mod.run_smoke(
+        task, ExecutorDeps(project_root=str(tmp_path), store=store))
+    return result.outputs["failure_signature"]
+
+
+def test_smoke_build_signature_distinguishes_distinct_build_errors(
+        tmp_path, store, monkeypatch):
+    """Two different build errors must not collapse to one signature.
+
+    The label is identical for every frontend build failure, so keying the
+    signature on it alone made the router's flap guard kill a loop that was
+    progressing: ses_877e1b15a9b34994 fixed the unresolved entry module and
+    was terminated on the *next*, different error.
+    """
+    t = _node_smoke_task(store, tmp_path)
+    first = _node_smoke_signature(
+        store, tmp_path, monkeypatch, t,
+        "error during build:\n"
+        "[UNRESOLVED_ENTRY] Cannot resolve entry module index.html.\n")
+    second = _node_smoke_signature(
+        store, tmp_path, monkeypatch, t,
+        "error during build:\n"
+        "[plugin vite:build-html] /p/index.html\n"
+        "Error: Failed to resolve /src/main.jsx from /p/index.html\n")
+    assert first.startswith("smoke_import|npm run build --silent#")
+    assert first != second
+
+
+def test_smoke_build_signature_stable_across_timings_and_frames(
+        tmp_path, store, monkeypatch):
+    """The same build error hashes the same despite run-to-run noise."""
+    head = ("\u2717 Build failed in 46ms\nerror during build:\n"
+            "\x1b[31m[UNRESOLVED_ENTRY] \x1b[0mCannot resolve entry "
+            "module index.html.\n")
+    t = _node_smoke_task(store, tmp_path)
+    first = _node_smoke_signature(
+        store, tmp_path, monkeypatch, t,
+        head + "    at buildEnvironment (vite/dist/node/chunks/node.js:1:1)\n")
+    second = _node_smoke_signature(
+        store, tmp_path, monkeypatch, t,
+        head.replace("46ms", "1.2s")
+        + "    at Object.build (vite/dist/node/chunks/node.js:9:9)\n")
+    assert first == second
+
+
 def test_smoke_node_build_error_head_survives_truncation(
         tmp_path, store, monkeypatch):
     """Vite/rolldown print the cause at the HEAD then a long generic stack.
@@ -9999,6 +10056,108 @@ def test_unresolved_entry_paths_parses_rollup_and_vite_wordings():
         "Cannot resolve entry module index.html\n"
         "Cannot resolve entry module index.html\n") == ("index.html",)
     assert unresolved_entry_paths("src/App.jsx: TS2345") == ()
+
+
+def test_unresolved_html_entry_specs_parses_vite_build_html_plugin():
+    from cgx.session.repair.classify import unresolved_html_entry_specs
+    assert unresolved_html_entry_specs(
+        "[plugin vite:build-html] /p/index.html\n"
+        "Error: Failed to resolve /src/main.jsx from /p/index.html\n") == (
+            "src/main.jsx",)
+    # Deduplicated, and the quoted relative-import shape stays out of it.
+    assert unresolved_html_entry_specs(
+        "Failed to resolve /src/main.jsx from /p/index.html\n"
+        "Failed to resolve /src/main.jsx from /p/index.html\n") == (
+            "src/main.jsx",)
+    assert unresolved_html_entry_specs(
+        'Could not resolve "./index.css" from "src/main.jsx"') == ()
+
+
+def test_repair_executor_names_absent_html_script_entry_as_missing_file(
+        store, tmp_path: Path):
+    """index.html pointing at an ungenerated script -> add it, don't re-author.
+
+    The document exists, so the resolution error is not a defect *in* it;
+    the script it names was never generated (live: ses_877e1b15a9b34994,
+    where the bare regenerate reproduced the miss and burned the budget).
+    """
+    from cgx.session.tasks import repair as _repair_module  # noqa: F401
+    (tmp_path / "index.html").write_text("<html></html>", encoding="utf-8")
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    smoke_task = TaskNode.new(
+        session.session_id, TaskKind.SMOKE, "smoke", inputs={})
+    smoke_artifact = Artifact.new(
+        session_id=session.session_id,
+        produced_by_task_id=smoke_task.task_id,
+        kind=ArtifactKind.SMOKE_REPORT,
+        content={"outcome": "failed",
+                 "failed_modules": [],
+                 "failure_signature": "smoke_import|npm run build --silent#ab",
+                 "modules": [],
+                 "build_smoke": {
+                     "label": "npm run build --silent",
+                     "ok": False,
+                     "stderr_tail": (
+                         "error during build:\n"
+                         f"[plugin vite:build-html] {tmp_path}/index.html\n"
+                         f"Error: Failed to resolve /src/main.jsx from "
+                         f"{tmp_path}/index.html\n")}})
+    store.save_task(smoke_task)
+    store.save_artifact(smoke_artifact)
+    repair_task = TaskNode.new(
+        session.session_id, TaskKind.REPAIR, "repair",
+        inputs={"smoke_artifact_id": smoke_artifact.artifact_id,
+                "mode": SessionMode.GREENFIELD.value,
+                "repair_attempt": 1})
+    deps = ExecutorDeps(project_root=str(tmp_path), store=store)
+    from cgx.session.tasks.base import _REGISTRY
+    result = _REGISTRY[TaskKind.REPAIR](repair_task, deps)
+    assert result.failure is None
+    assert result.outputs["strategy"] == "regenerate"
+    constraints = result.outputs["extra_constraints"]
+    assert constraints["kind"] == "missing_entry_module"
+    assert [f["path"] for f in constraints["missing_files"]] == [
+        "src/main.jsx"]
+
+
+def test_repair_executor_skips_html_entry_spec_that_exists_on_disk(
+        store, tmp_path: Path):
+    """A resolvable-on-disk spec is a resolution bug, not a missing file."""
+    from cgx.session.tasks import repair as _repair_module  # noqa: F401
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "main.jsx").write_text("export {}", encoding="utf-8")
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    smoke_task = TaskNode.new(
+        session.session_id, TaskKind.SMOKE, "smoke", inputs={})
+    smoke_artifact = Artifact.new(
+        session_id=session.session_id,
+        produced_by_task_id=smoke_task.task_id,
+        kind=ArtifactKind.SMOKE_REPORT,
+        content={"outcome": "failed",
+                 "failed_modules": [],
+                 "failure_signature": "smoke_import|npm run build --silent#cd",
+                 "modules": [],
+                 "build_smoke": {
+                     "label": "npm run build --silent",
+                     "ok": False,
+                     "stderr_tail": (
+                         "Error: Failed to resolve /src/main.jsx from "
+                         f"{tmp_path}/index.html\n")}})
+    store.save_task(smoke_task)
+    store.save_artifact(smoke_artifact)
+    repair_task = TaskNode.new(
+        session.session_id, TaskKind.REPAIR, "repair",
+        inputs={"smoke_artifact_id": smoke_artifact.artifact_id,
+                "mode": SessionMode.GREENFIELD.value,
+                "repair_attempt": 1})
+    deps = ExecutorDeps(project_root=str(tmp_path), store=store)
+    from cgx.session.tasks.base import _REGISTRY
+    result = _REGISTRY[TaskKind.REPAIR](repair_task, deps)
+    constraints = result.outputs["extra_constraints"]
+    assert constraints["kind"] != "missing_entry_module"
+    assert "missing_files" not in constraints
 
 
 def test_unresolved_import_sources_parses_rollup_resolution_error():

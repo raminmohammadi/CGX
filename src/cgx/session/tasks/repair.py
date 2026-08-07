@@ -55,6 +55,7 @@ from cgx.session.repair.classify import (
     traceback_source_files,
     undefined_names,
     unresolved_entry_paths,
+    unresolved_html_entry_specs,
     unresolved_import_sources,
 )
 from cgx.session.repair.locate import (
@@ -557,6 +558,28 @@ def _build_smoke_target_files(build_stderr: str,
     return tuple(out)
 
 
+def _absent_html_entry_specs(build_stderr: str,
+                             project_root: str) -> Tuple[str, ...]:
+    """HTML-entry scripts the bundler cannot resolve and that are absent.
+
+    Vite's ``vite:build-html`` plugin reports ``Failed to resolve
+    /src/main.jsx from <root>/index.html`` when the generated entry
+    document points at a script the manifest never contained. The
+    document itself exists, so this is not a re-author target -- the
+    script has to be *added*, exactly like an unresolved entry module.
+    Specs that do exist on disk are dropped: those are a genuine
+    resolution bug the regenerate edge handles. Order-preserving and
+    de-duplicated.
+    """
+    root = Path(project_root)
+    out: List[str] = []
+    for spec in unresolved_html_entry_specs(build_stderr):
+        if spec in out or (root / spec).exists():
+            continue
+        out.append(spec)
+    return tuple(out)
+
+
 def _run_smoke_repair(task: TaskNode, deps: ExecutorDeps,
                       smoke_artifact_id: str) -> ExecutorResult:
     """Emit a REPAIR_PLAN from a SMOKE_REPORT.
@@ -605,6 +628,11 @@ def _run_smoke_repair(task: TaskNode, deps: ExecutorDeps,
         # which case no amount of re-authoring helps: the file is absent
         # from the manifest, so the regenerate has to add it.
         missing_entries = unresolved_entry_paths(build_stderr)
+        if not missing_entries:
+            # Same class of defect one level in: the entry document
+            # resolved but names a script that was never generated.
+            missing_entries = _absent_html_entry_specs(
+                build_stderr, str(deps.project_root))
         if missing_entries:
             rationale = (
                 f"The JS/TS build-smoke (`{label}`) could not resolve its "
