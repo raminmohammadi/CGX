@@ -199,10 +199,16 @@ def run_repair(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     if classification == "missing_dependency":
         # The failure names the exact pip package it needs (e.g.
         # starlette's TestClient guard for httpx). Route straight to
-        # install_deps -- no source rewrite can install a package.
-        return _run_verify_missing_dependency_repair(
-            task, verify_artifact_id, content,
-            list(required_package_names(content)), signature)
+        # install_deps -- no source rewrite can install a package...
+        packages = list(required_package_names(content))
+        escalation = _coerce_escalation(task.inputs.get("repair_escalation"))
+        if not escalation:
+            return _run_verify_missing_dependency_repair(
+                task, verify_artifact_id, content, packages, signature)
+        # ... unless that install already ran and the signature came back
+        # unchanged, which proves the name is not a distributable package.
+        return _run_uninstallable_dependency_regenerate(
+            task, verify_artifact_id, content, packages, signature, attempt)
 
     if classification == "collection_error":
         # An unrecognized collection failure: pytest could not import the
@@ -236,8 +242,15 @@ def run_repair(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             pip_roots = _pip_installable_roots(
                 Path(deps.project_root), content)
             if pip_roots:
-                return _run_verify_missing_dependency_repair(
-                    task, verify_artifact_id, content, pip_roots, signature)
+                escalation = _coerce_escalation(
+                    task.inputs.get("repair_escalation"))
+                if not escalation:
+                    return _run_verify_missing_dependency_repair(
+                        task, verify_artifact_id, content, pip_roots,
+                        signature)
+                return _run_uninstallable_dependency_regenerate(
+                    task, verify_artifact_id, content, pip_roots, signature,
+                    attempt)
 
             # The top-level package exists in the project but the leaf does
             # not (e.g. src.config). This is a missing first-party file the
@@ -1188,6 +1201,79 @@ def _run_verify_missing_dependency_repair(
             "can_apply": False,
             "strategy": "install_deps",
             "missing_modules": mods,
+            "extra_constraints": extra_constraints,
+        },
+        artifact=plan,
+    )
+
+
+def _run_uninstallable_dependency_regenerate(
+        task: TaskNode,
+        verify_artifact_id: str,
+        content: Dict[str, Any],
+        missing_modules: List[str],
+        signature: str,
+        attempt: int) -> ExecutorResult:
+    """Regenerate away an import pip has already proven it cannot satisfy.
+
+    Second rung of the VERIFY missing-dependency ladder. The first round
+    routed to install_deps and the identical signature came back, so the
+    name is not a real distributable package (live: a generated test
+    importing ``httpx2``). Installing it again cannot work and the loop
+    would otherwise terminate on the flap guard, so name the offending
+    file(s) and re-author them without the invented import.
+    """
+    mods = sorted(dict.fromkeys(m for m in missing_modules if m))
+    if not signature:
+        signature = "verify|missing:" + ",".join(mods)
+    classification = "uninstallable_dependency"
+    listed = ", ".join(mods) or "the missing package(s)"
+    rationale = (
+        f"Installing {listed} was already attempted and test collection "
+        "still cannot import it, so it is not a real distributable "
+        "package -- most likely an invented name. Re-author the offending "
+        "file(s) to use the correct package (for example `httpx`, not "
+        "`httpx2`) or to drop the import entirely; do not reference "
+        "packages that do not exist on PyPI.")
+    extra_constraints: Dict[str, Any] = {
+        "kind": classification,
+        "missing_modules": mods,
+        "rationale": rationale,
+    }
+    target_files = [p for p in traceback_source_files(content)
+                    if p.endswith(".py")]
+    if target_files:
+        extra_constraints["target_files"] = target_files
+    plan = Artifact.new(
+        session_id=task.session_id,
+        produced_by_task_id=task.task_id,
+        kind=ArtifactKind.REPAIR_PLAN,
+        content={
+            "verify_artifact_id": verify_artifact_id,
+            "build_artifact_id": content.get("build_artifact_id"),
+            "apply_artifact_id": content.get("apply_artifact_id"),
+            "classification": classification,
+            "failure_signature": signature,
+            "repair_attempt": attempt,
+            "rationale": rationale,
+            "missing_modules": mods,
+            "diffs": [],
+            "strategy": "regenerate",
+            "extra_constraints": extra_constraints,
+            "mode": content.get("mode") or task.inputs.get("mode"),
+        },
+    )
+    return ExecutorResult(
+        outputs={
+            "repair_artifact_id": plan.artifact_id,
+            "classification": classification,
+            "failure_signature": signature,
+            "repair_attempt": attempt,
+            "diff_count": 0,
+            "can_apply": False,
+            "strategy": "regenerate",
+            "missing_modules": mods,
+            "rationale": rationale,
             "extra_constraints": extra_constraints,
         },
         artifact=plan,
