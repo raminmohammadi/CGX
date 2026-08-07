@@ -237,7 +237,7 @@ def run_repair(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             if pip_roots:
                 return _run_verify_missing_dependency_repair(
                     task, verify_artifact_id, content, pip_roots, signature)
-            
+
             # The top-level package exists in the project but the leaf does
             # not (e.g. src.config). This is a missing first-party file the
             # scaffold never generated. Carry the paths so the router
@@ -536,14 +536,14 @@ def _build_smoke_target_files(build_stderr: str,
     """
     root = Path(project_root)
     out: List[str] = []
-    
+
     # First, try to extract files from specific import resolution failures.
     # If that yields nothing, fall back to parsing filenames directly
     # from generic build errors (e.g., TypeScript or ESLint errors).
     sources = unresolved_import_sources(build_stderr)
     if not sources:
         sources = generic_build_error_files(build_stderr)
-        
+
     for imp in sources:
         rel = imp
         p = Path(imp)
@@ -784,6 +784,14 @@ def _run_runtime_repair(task: TaskNode, deps: ExecutorDeps,
     )
 
 
+def _coerce_escalation(value: Any) -> int:
+    """Rung of the router's failure-signature ladder, 0 when absent."""
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _run_api_check_repair(task: TaskNode, deps: ExecutorDeps,
                           api_check_artifact_id: str) -> ExecutorResult:
     """Emit a REPAIR_PLAN from an API_CHECK_REPORT.
@@ -812,7 +820,13 @@ def _run_api_check_repair(task: TaskNode, deps: ExecutorDeps,
     missing_modules = [str(m).strip()
                        for m in content.get("missing_modules") or []
                        if str(m).strip()]
-    if missing_modules:
+    # An escalated round is one whose failure signature the previous
+    # round already saw: whatever it chose did not move the loop. For a
+    # missing module that means the install was a no-op (pip cannot
+    # satisfy a hallucinated name), so the second round rewrites the code
+    # instead of asking for the same install again.
+    escalation = _coerce_escalation(task.inputs.get("repair_escalation"))
+    if missing_modules and not escalation:
         return _run_missing_dependency_repair(
             task, api_check_artifact_id, content, missing_modules)
     conflict_packages = [str(p).strip()
@@ -871,6 +885,12 @@ def _run_api_check_repair(task: TaskNode, deps: ExecutorDeps,
         rationale = (
             "API_CHECK reported a failure but no failed references were "
             "recorded.")
+    if escalation and missing_modules:
+        mods = ", ".join(sorted(dict.fromkeys(missing_modules)))
+        rationale = (
+            f"Installing {mods} was already attempted and did not make the "
+            "module importable, so it is not a real distributable package. "
+            + rationale)
     target_files = sorted(list({
         str(ref.get("file"))
         for f in failed for ref in (f.get("references") or [])

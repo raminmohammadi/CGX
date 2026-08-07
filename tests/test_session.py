@@ -1276,28 +1276,46 @@ def test_router_api_check_failed_spawns_repair():
         "prior_failure_signatures"]
 
 
-def test_router_api_check_failed_skips_repair_when_flapping():
-    """API_CHECK whose signature already appears in priors -> no spawn."""
+def test_router_api_check_repeated_signature_escalates_then_stops():
+    """A repeated signature buys one escalated round, then terminates.
+
+    Terminating on the first repeat gave the loop no way out of a
+    strategy that no-opped (install_deps for a hallucinated module, in
+    session ses_fa6f72a9d3da4217). The rung is passed to REPAIR as
+    ``repair_escalation`` so it abandons that strategy.
+    """
     from cgx.session.models import SessionMode
     session = Session.new("g", mode=SessionMode.GREENFIELD)
     sig = "api_check|werkzeug.urls.url_quote"
-    api = TaskNode.new(
-        session.session_id, TaskKind.API_CHECK, "api",
-        inputs={"build_artifact_id": "art_build",
-                "mode": SessionMode.GREENFIELD.value,
-                "repair_attempt": 1,
-                "prior_failure_signatures": [sig]})
-    api.produced_artifact_id = "art_api"
-    api.outputs = {"outcome": "failed", "failed_count": 1,
-                   "checked_count": 3, "failure_signature": sig}
-    api.status = TaskNodeStatus.DONE
+
+    def _completed(priors):
+        api = TaskNode.new(
+            session.session_id, TaskKind.API_CHECK, "api",
+            inputs={"build_artifact_id": "art_build",
+                    "mode": SessionMode.GREENFIELD.value,
+                    "repair_attempt": 1,
+                    "prior_failure_signatures": list(priors)})
+        api.produced_artifact_id = "art_api"
+        api.outputs = {"outcome": "failed", "failed_count": 1,
+                       "checked_count": 3, "failure_signature": sig}
+        api.status = TaskNodeStatus.DONE
+        return api
+
+    api = _completed([sig])
     plan = Router().on_task_completed(
         session=session, completed=api, tasks=[api])
     creates = [a for a in plan.actions if isinstance(a, CreateTask)]
-    assert creates == []
+    assert len(creates) == 1
+    assert creates[0].task.kind is TaskKind.REPAIR
+    assert creates[0].task.inputs["repair_escalation"] == 1
+
+    api2 = _completed([sig, sig])
+    plan2 = Router().on_task_completed(
+        session=session, completed=api2, tasks=[api2])
+    assert [a for a in plan2.actions if isinstance(a, CreateTask)] == []
     # C: a failed gate that declines to spawn REPAIR must resolve the
     # session terminally rather than leave the drain loop idle.
-    status = [a for a in plan.actions if isinstance(a, UpdateSessionStatus)]
+    status = [a for a in plan2.actions if isinstance(a, UpdateSessionStatus)]
     assert len(status) == 1
     assert status[0].status is SessionStatus.FAILED
 
@@ -8055,6 +8073,47 @@ def test_repair_api_check_missing_dependency_installs(tmp_path, store):
     assert plan.content["missing_modules"] == ["flask", "flask_cors"]
     assert "flask" in plan.content["rationale"]
     assert plan.content["diffs"] == []
+
+
+def test_repair_api_check_escalated_missing_dependency_regenerates(
+        tmp_path, store):
+    """A second round on the same signature stops asking for the install.
+
+    ``app`` is not on PyPI, so install_deps was a no-op and the identical
+    signature came straight back. On the escalated rung REPAIR rewrites
+    the code that imports it instead.
+    """
+    from cgx.session.tasks.repair import run_repair
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    report = Artifact.new(
+        session_id=session.session_id, produced_by_task_id="t_api",
+        kind=ArtifactKind.API_CHECK_REPORT,
+        content={
+            "outcome": "failed",
+            "failed_references": [
+                {"module": "app", "name": "create_app",
+                 "error": "ModuleNotFoundError: No module named 'app'"},
+            ],
+            "missing_modules": ["app"],
+            "hallucinated_references": [],
+            "failure_signature": "api_check|app.create_app",
+        })
+    store.save_artifact(report)
+    t = TaskNode.new(
+        session.session_id, TaskKind.REPAIR, "repair",
+        inputs={"api_check_artifact_id": report.artifact_id,
+                "repair_attempt": 2,
+                "repair_escalation": 1,
+                "mode": SessionMode.GREENFIELD.value})
+    result = run_repair(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    assert result.failure is None
+    assert result.outputs["strategy"] == "regenerate"
+    assert result.outputs["classification"] == "api_check_failure"
+    rationale = result.artifact.content["rationale"]
+    assert "already attempted" in rationale
+    assert "app" in rationale
 
 
 def test_repair_api_check_dependency_conflict_resolves(tmp_path, store):

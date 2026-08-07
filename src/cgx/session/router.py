@@ -262,6 +262,13 @@ def _bootstrap_to_api_check(parent: TaskNode) -> List[TaskNode]:
 # chain to SMOKE.
 _REPAIRABLE_API_CHECK_OUTCOMES = frozenset({"failed"})
 
+# How many times one API_CHECK failure signature may repeat before the
+# loop is a proven dead end. Two rungs: the first repeat re-enters REPAIR
+# with ``repair_escalation`` set so it abandons the strategy that just
+# no-opped, the second gives up. The shared ``repair_attempt`` cap still
+# bounds the loop independently.
+_API_CHECK_SIGNATURE_LADDER = 2
+
 
 def _api_check_to_smoke_or_repair(parent: TaskNode) -> List[TaskNode]:
     """Spawn SMOKE on a clean API_CHECK; REPAIR on a hallucinated symbol.
@@ -304,7 +311,15 @@ def _api_check_to_smoke_or_repair(parent: TaskNode) -> List[TaskNode]:
     if not new_signature:
         failed = outputs.get("failed_count")
         new_signature = f"api_check_failed|count={failed}"
-    if budget.seen(new_signature):
+    # A repeated signature used to end the session outright. One rung of
+    # escalation first: the first round may pick install_deps, and when
+    # pip cannot satisfy the name (session ses_fa6f72a9d3da4217 asked it
+    # for a hallucinated ``app``) that round is a no-op that reproduces
+    # the identical signature. REPAIR reads ``repair_escalation`` and
+    # switches to a regenerate that removes the offending import; a
+    # second repeat is a genuine dead end.
+    escalation = budget.signature_repeats(new_signature)
+    if escalation >= _API_CHECK_SIGNATURE_LADDER:
         return []
     return [TaskNode.new(
         session_id=parent.session_id,
@@ -321,6 +336,7 @@ def _api_check_to_smoke_or_repair(parent: TaskNode) -> List[TaskNode]:
             "apply_artifact_id": parent.inputs.get("apply_artifact_id"),
             "prior_goal": parent.inputs.get("prior_goal"),
             "mode": mode,
+            "repair_escalation": escalation,
             **budget.spend_repair(new_signature).repair_chain_inputs(),
         },
     )]

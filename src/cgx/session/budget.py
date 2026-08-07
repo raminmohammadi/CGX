@@ -223,6 +223,16 @@ class LoopBudget:
         """True when ``signature`` already appears in the flap ledger."""
         return signature in self.prior_failure_signatures
 
+    def signature_repeats(self, signature: str) -> int:
+        """How many times ``signature`` already appears in the flap ledger.
+
+        A gate that only asks *whether* a signature repeated has one
+        response left -- stop. Callers that can escalate their strategy
+        instead (API_CHECK: install_deps, then a regenerate that removes
+        the offending import) read the count to pick the next rung.
+        """
+        return self.prior_failure_signatures.count(str(signature))
+
     # --------------- spending (each returns a new copy) ---------------
 
     def spend_repair(self, signature: str,
