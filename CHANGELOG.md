@@ -65,6 +65,50 @@ failures instead of patched-over symptoms.
   method set instead of being sought as a (nonexistent) module-level symbol --
   fixing a false negative that failed a passing, correct tree.
 
+### Structural completeness + code-quality gates
+
+Turning "the model usually remembers" into deterministic guarantees, so a run
+produces a complete, installable, testable project rather than a bag of source
+files -- validated against four divergent fresh projects (URL-shortener,
+CSV-stats CLI, task scheduler, unit converter), each built in its own wiped
+folder.
+
+* **Deterministic scaffolding injection** (`swarm_plan.ensure_scaffolding`).
+  After normalization, any missing `README.md`, dependency manifest
+  (`requirements.txt` / `pyproject.toml`), and -- for a `src/` layout -- a root
+  `conftest.py` is appended to the plan directly, with `README.md` and
+  `requirements.txt` made to depend on every `.py` so they generate last.
+  `verify_plan` additionally re-asks (`_scaffolding_problems`) when any of
+  these are still absent.
+* **Test-coverage guarantee** (`swarm_plan.ensure_test_coverage`). A
+  `tests/test_<module>.py` (depending on that module) is injected for every
+  source module no planned test covers, so a plan can never ship with zero or
+  partial coverage (fixes the "no tests ran" failure).
+* **Non-Python generation path** (`swarm_generate.generate_file`). Non-`.py`
+  planned files are routed off the Python ladder: deterministic source-derived
+  templates for `requirements.txt` / `conftest.py`, a grounded free-form call
+  for `README.md`, so scaffolding no longer has to survive an `ast.parse` gate.
+* **No-stub generation gate** (`engine._contract_stub_symbols` /
+  `_body_is_stub`). A generated module whose contract functions/methods have
+  placeholder bodies (`pass` / `...` / docstring-only / `raise
+  NotImplementedError`) is rejected with a hardened re-ask naming the
+  offenders, so a stub such as `encode()->pass` can no longer clear the
+  structural gates and ship.
+* **Test-authoring discipline** (`_SINGLE_FILE_SYSTEM`). General (non-symptom)
+  rules: call imported code only with values it accepts, construct all inputs
+  inline / via `tmp_path` (never read an external data file), and assert
+  invariants and round-trips rather than fabricated magic literals.
+* **Failure-driven test regeneration** (`swarm_verify` +
+  `engine.generate_repair_files` / `_LOGIC_REPAIR_SYSTEM`). The repair loop may
+  now rewrite the offending *test* -- not only source -- when the test is the
+  broken artifact (a fabricated literal, or a call the API does not accept),
+  asserting an invariant/round-trip against the real interface. Soft contract
+  warnings no longer suppress this pytest-driven repair.
+* **De-brittled single-file prompt** (`_SINGLE_FILE_SYSTEM`). Example-specific
+  negative directives accreted from individual runs were demoted toward general
+  principles, leaning on the verify+repair (real pytest) loop as the
+  generalizable correctness mechanism instead of per-hallucination patches.
+
 ## Unreleased -- Hugging Face integration (Inference Providers + GGUF browse)
 
 Two additive, low-risk features that make CGX Hugging Face-friendly.

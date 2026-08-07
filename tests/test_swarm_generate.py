@@ -119,3 +119,109 @@ def test_phantom_import_triggers_reask(monkeypatch):
         goal="demo", root=".", provider=StubProvider())
     assert out.ok and calls["n"] == 2
     assert out.content == "y = 2\n"
+
+
+def test_requirements_generated_from_real_imports(tmp_path):
+    # requirements.txt is source-derived: scan the manifest's .py files, drop
+    # stdlib (os) and first-party (app) roots, map yaml -> PyYAML, and always
+    # pin pytest. The AST ladder is never consulted for it.
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "app.py").write_text(
+        "import os\nimport yaml\nimport app\n", encoding="utf-8")
+    out = sg.generate_file(
+        path="requirements.txt", description="deps", depends_on=[],
+        contracts={}, goal="demo", root=str(tmp_path),
+        provider=StubProvider(), manifest_paths=["src/app.py"])
+    assert out.ok and out.method == "template"
+    lines = out.content.split()
+    assert "PyYAML" in lines and "pytest" in lines
+    assert "os" not in lines and "app" not in lines
+
+
+def test_conftest_is_deterministic_template():
+    out = sg.generate_file(
+        path="conftest.py", description="pytest setup", depends_on=[],
+        contracts={}, goal="demo", root=".", provider=StubProvider())
+    assert out.ok and out.method == "template"
+    assert out.content == sg._CONFTEST_TEMPLATE
+    # A valid, importable module (no hallucinated symbols).
+    import ast as _ast
+    _ast.parse(out.content)
+
+
+def test_readme_uses_freeform_model_then_falls_back(monkeypatch):
+    # A responsive provider authors the README free-form (no AST ladder).
+    class _Doc:
+        def chat(self, messages=None, force_json=False, **kw):
+            return {"content": "# Title\n\nGreat project."}
+    out = sg.generate_file(
+        path="README.md", description="overview", depends_on=[], contracts={},
+        goal="demo", root=".", provider=_Doc(), manifest_paths=["src/app.py"])
+    assert out.ok and out.method == "freeform"
+    assert out.content.startswith("# Title")
+
+    # A crashing provider degrades to the deterministic fallback README.
+    class _Broken:
+        def chat(self, *a, **k):
+            raise RuntimeError("down")
+    out2 = sg.generate_file(
+        path="README.md", description="overview", depends_on=[], contracts={},
+        goal="Build a widget", root=".", provider=_Broken(),
+        manifest_paths=["src/app.py"])
+    assert out2.ok and out2.method == "freeform"
+    assert "# Build a widget" in out2.content
+    assert "pip install -r requirements.txt" in out2.content
+
+
+def test_non_source_routing_leaves_other_source_on_the_ladder(monkeypatch):
+    # A .js file is real source, not scaffolding: it must stay on the code
+    # ladder (full-file then AST fallback), not be diverted to freeform docs.
+    assert sg._is_non_source("README.md")
+    assert sg._is_non_source("requirements.txt")
+    assert sg._is_non_source("conftest.py")
+    assert not sg._is_non_source("src/app.js")
+    assert not sg._is_non_source("src/app.py")
+
+
+# --------------------- no-stub contract gate (engine) ---------------------
+
+def test_contract_stub_symbols_flags_placeholder_bodies():
+    # A module-level function, a dotted method, and a bare-name method, each
+    # with a placeholder body (pass / ... / docstring-only / NotImplemented),
+    # are all flagged; the one with a real body is not.
+    src = (
+        "def encode(u):\n    pass\n\n"
+        "def real(u):\n    return u[::-1]\n\n"
+        "class Store:\n"
+        "    def put(self, k, v):\n        ...\n"
+        "    def get(self, k):\n        raise NotImplementedError\n")
+    contracts = {"functions": [
+        {"name": "encode", "module": "src/app.py"},
+        {"name": "real", "module": "src/app.py"},
+        {"name": "Store.put", "module": "src/app.py"},
+        {"name": "get", "module": "src/app.py"}]}
+    stubs = engine._contract_stub_symbols(src, "src/app.py", contracts)
+    assert set(stubs) == {"encode", "Store.put", "get"}
+
+
+def test_contract_stub_symbols_ignores_other_modules_and_bad_syntax():
+    src = "def encode(u):\n    pass\n"
+    # A contract pinned to a different module never matches this file.
+    assert engine._contract_stub_symbols(
+        src, "src/app.py",
+        {"functions": [{"name": "encode", "module": "src/other.py"}]}) == []
+    # Unparseable content abstains rather than raising.
+    assert engine._contract_stub_symbols(
+        "def broken(:\n", "src/app.py",
+        {"functions": [{"name": "broken", "module": "src/app.py"}]}) == []
+
+
+def test_body_is_stub_true_and_false():
+    import ast
+    stub = ast.parse('def f():\n    """doc"""\n    pass\n').body[0]
+    real = ast.parse("def g():\n    x = 1\n    return x\n").body[0]
+    docstring_only = ast.parse('def h():\n    """just a doc"""\n').body[0]
+    assert engine._body_is_stub(stub)
+    assert engine._body_is_stub(docstring_only)
+    assert not engine._body_is_stub(real)

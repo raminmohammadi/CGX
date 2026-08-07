@@ -22,7 +22,8 @@ from cgx.session.tasks.base import (
     ExecutorDeps, ExecutorResult, TaskNode, register_executor)
 from cgx.session.tasks.swarm_log import swarm_beat
 from cgx.session.tasks.swarm_plan import (
-    normalize_plan, ordered_paths, parse_plan_reply, verify_plan)
+    ensure_scaffolding, ensure_test_coverage, normalize_plan, ordered_paths,
+    parse_plan_reply, verify_plan)
 
 # Bounded re-asks: the model gets one corrective retry per failure mode
 # (unparseable / not buildable) before the plan is declared a dead end.
@@ -64,6 +65,13 @@ _SYSTEM_PROMPT = (
     "every source module under 'src/' OR every module at the top level, never\n"
     "a mix -- and give each test file a depends_on edge to the module it\n"
     "exercises so imports stay consistent.\n"
+    "SCAFFOLDING IS MANDATORY: every plan MUST also include, as first-class\n"
+    "files with their own descriptions, a top-level 'README.md' (project\n"
+    "overview, install, and usage) and a top-level 'requirements.txt' (the\n"
+    "runtime and test dependencies, e.g. 'pytest'). When you use a 'src/'\n"
+    "layout, ALSO include a root 'conftest.py' so pytest can import the\n"
+    "package. These are real deliverables, not source code -- give them a\n"
+    "'description' but do NOT put them in 'contracts'.\n"
     "CONTRACTS ARE MANDATORY AND BINDING: every function, method, and class the\n"
     "objective requires MUST appear in contracts with a \"module\" naming the\n"
     "EXACT planned path that defines it. Name a method as \"ClassName.method\".\n"
@@ -108,7 +116,14 @@ def swarm_tech_lead(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     problems: List[str] = []
     for attempt in range(1, _MAX_PLAN_ATTEMPTS + 1):
         draft = _ask_for_plan(deps.provider, goal, correction)
-        plan = normalize_plan(draft)
+        # Test coverage and scaffolding are injected deterministically rather
+        # than re-asked: a pytest module is added for every uncovered source
+        # module, and the README / dependency manifest / conftest the Developer
+        # synthesises from source-derived templates or a grounded free-form
+        # call are appended, so a weak model dropping either can no longer ship
+        # an untested tree or abort planning over missing boilerplate. Coverage
+        # runs first so the manifest the scaffolding scans includes the tests.
+        plan = ensure_scaffolding(ensure_test_coverage(normalize_plan(draft)))
         paths = ordered_paths(plan)
         swarm_beat(project_root, "tech_lead", "normalize",
                    attempt=attempt, file_count=len(paths))

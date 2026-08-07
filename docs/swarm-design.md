@@ -28,6 +28,7 @@ stateDiagram-v2
     SWARM_TECH_LEAD --> [*] : no buildable plan (FAILED)
     SWARM_DEVELOPER --> SWARM_DEVELOPER : next file (i -> i+1)
     SWARM_DEVELOPER --> SWARM_VERIFY : all files attempted
+    SWARM_VERIFY --> SWARM_VERIFY : red suite -> targeted regen / failure-driven repair (bounded)
     SWARM_VERIFY --> [*] : report (COMPLETED / FAILED)
 ```
 
@@ -47,7 +48,23 @@ stateDiagram-v2
 2. `normalize_plan` (dedupe + prune dangling edges) -> `ordered_paths`
    (shared Kahn toposort, `toposort_manifest_files`) -> `plan_is_buildable`
    gate, with a bounded **3-attempt** corrective re-ask on an unbuildable draft.
-3. Persists a `WORK_PLAN` artifact (`goal`, `layers`, `contracts`, ordered
+3. **Deterministic completeness injection** (`swarm_plan.py`) runs *after*
+   normalization, so structural completeness is a guarantee rather than a
+   request a weak model may decline:
+   - `ensure_scaffolding` appends any missing `README.md`, dependency manifest
+     (`requirements.txt` / `pyproject.toml`), and -- for a `src/` layout -- a
+     root `conftest.py`. `README.md` and `requirements.txt` are given a
+     `depends_on` of every planned `.py` so they are generated last, after the
+     sources they describe and scan exist on disk.
+   - `ensure_test_coverage` injects a `tests/test_<module>.py` (depending on
+     that module) for every source module no planned test already covers, so a
+     plan can never ship with zero or partial test coverage.
+4. `verify_plan` is the final pre-flight gate: it rejects unsafe/absolute/
+   escaping paths, a plan with no buildable source, a dependency cycle, an
+   orphan test with no target module, and (via `_scaffolding_problems`) a plan
+   still missing README / manifest / conftest. Concrete problems are appended
+   to the re-ask; an empty list means the plan is fit for the Developer chain.
+5. Persists a `WORK_PLAN` artifact (`goal`, `layers`, `contracts`, ordered
    `paths`, `project_root`) and emits `{work_plan_artifact_id, swarm_paths,
    file_count}`.
 
@@ -58,14 +75,25 @@ Each Developer task implements exactly one file (`file_index` into the plan):
 1. **Ground** the file's `depends_on` from their *real on-disk content*
    (`swarm_ground`: `describe_file` / `file_skeleton` / `list_symbols` /
    `get_signature`), so generation sees the actual sibling symbols.
-2. **Generate ladder** (`generate_file`): full-file
+2. **Route by kind** (`generate_file`): a non-source planned file is not put on
+   the Python ladder. `requirements.txt` and `conftest.py` are emitted from
+   deterministic, source-derived templates and `README.md` from a grounded
+   free-form call, so scaffolding never has to survive an `ast.parse` gate.
+3. **Generate ladder** (source `.py` only): full-file
    (`generate_single_scaffold_file`, gated on `ast.parse` / `syntax_ok`, one
    re-ask) -> deterministic `ASTAssembler` header + per-symbol path, with the
    required symbols derived from the plan `contracts`; empty / symbol-less
-   modules are rejected.
-3. **Write**: `edit_file` for a greenfield (new) file; `patch_file` +
+   modules are rejected. Two additional hard gates run on the parsed source:
+   - **Phantom-import gate** (`import_audit.py`): a provably-unused, non-side-
+     effecting import fails the file (re-ask, then strip as a last resort).
+   - **No-stub gate** (`_contract_stub_symbols` / `_body_is_stub`): a contract
+     function or method pinned to this module whose body is a placeholder
+     (`pass` / `...` / docstring-only / `raise NotImplementedError`) is
+     rejected with a hardened re-ask naming the offenders, so a stub such as
+     `encode()->pass` can no longer clear the structural gates and ship.
+4. **Write**: `edit_file` for a greenfield (new) file; `patch_file` +
    `query_codebase` seeding for a brownfield (existing) edit.
-4. Emits per-file progress beats and a structured per-turn log; outputs
+5. Emits per-file progress beats and a structured per-turn log; outputs
    `{file_index, path, file_ok, failed_paths}`. `failed_paths` is threaded
    along the chain into `SWARM_VERIFY`.
 
@@ -73,15 +101,49 @@ Each Developer task implements exactly one file (`file_index` into the plan):
 **File:** `src/cgx/session/tasks/swarm_verify.py`
 
 The ladder moves from fast static analysis to slow dynamic execution:
-1. **Static structural checks** (via `scaffold_validate` helpers): first-party
-   import coherence, contract compliance, and JS/Python payload coherence.
-2. **Environment dry-run** (only when static checks pass): `preflight_install`
-   to satisfy missing dependencies, then `run_tests_on_disk` over the impacted
-   tests.
+1. **Static structural checks** (via `scaffold_validate` helpers): coverage
+   gaps (a planned test module that parses but defines no collectible test is a
+   gap), first-party import coherence, and contract compliance. Named files
+   drive a bounded targeted regeneration (`_MAX_VERIFY_ROUNDS`) before the
+   dynamic step.
+2. **Environment dry-run** (only when hard structural checks pass):
+   `preflight_install` to satisfy missing dependencies, then
+   `run_tests_on_disk` over the impacted tests.
+3. **Failure-driven repair** for a structurally-clean tree whose suite is
+   nonetheless red -- the defect the static gates cannot see:
+   - `ImportError` / `ModuleNotFoundError` are parsed from the pytest output
+     and mapped to the *planned* file expected to provide the missing module
+     (`_dynamic_regen_targets`), never widening the blast radius to a stray
+     dependency frame.
+   - The red suite's own output plus the implicated file bodies are threaded
+     through `generate_repair_files`, which diagnoses the concrete failure and
+     returns corrected complete files -- the step that turns "detected the
+     failure" into "produced working code". Only files it actually rewrote and
+     that pass a per-language syntax check are written back; if it declines, a
+     single blind regeneration of the import targets is the fallback.
+   - The repair prompt is allowed to fix **either side** of the contract: when
+     a test asserts a fabricated magic literal the goal never specified, or
+     calls the source with arguments/attributes it does not accept, the
+     repairer rewrites *that test* (asserting an invariant or round-trip
+     against the real API) instead of forcing the source to emit an impossible
+     value.
+   - `check_contract_compliance` resolves a dotted `Class.method` contract
+     against the generated class's method set, so a passing, correct tree is no
+     longer failed by a false "not defined" warning. Contract warnings are
+     *soft*: they never suppress the pytest-driven repair loop.
 
-It writes a `SWARM_VERIFY_REPORT` artifact identifying the specific files
-implicated by any static or dynamic failure (candidates for targeted
-regeneration under budget).
+Test authoring is disciplined at the source: `_SINGLE_FILE_SYSTEM` instructs
+the model to call imported code only with argument values it accepts,
+construct all inputs inline / via `tmp_path` (never read an external data file
+that will not exist when the suite runs), and assert invariants and
+round-trips (`decode(encode(x)) == x`, length/ordering properties, idempotence)
+rather than fabricated magic literals -- a general discipline, not a
+symptom-specific negative directive.
+
+It writes a `SWARM_VERIFY_REPORT` artifact (`coverage_gaps`, `import_warnings`,
+`contract_warnings`, `regen_rounds`, `dynamic_regen_rounds`, the env dry-run
+outcome, and `verify_ok`) identifying the specific files implicated by any
+static or dynamic failure.
 
 ## Plan-aware drain ceiling
 A drain pass carries a flat 64-step safety valve for explore/greenfield. A

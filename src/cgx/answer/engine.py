@@ -2914,7 +2914,16 @@ def _format_function_contract(fn: Dict[str, Any]) -> str:
             if isinstance(p, dict):
                 pn = str(p.get("name") or "").strip()
                 pt = str(p.get("type") or "").strip()
-                if pn:
+                if not pn:
+                    continue
+                # Never annotate the implicit receiver: a Tech Lead that
+                # declares ``self`` with the enclosing class type would render
+                # ``def __init__(self: Account, ...)``, whose annotation is
+                # evaluated at class-definition time -- before the name is
+                # bound -- and raises NameError at import. Emit the bare name.
+                if pn in ("self", "cls"):
+                    parts.append(pn)
+                else:
                     parts.append(f"{pn}: {pt}" if pt else pn)
             elif isinstance(p, str) and p.strip():
                 parts.append(p.strip())
@@ -3547,13 +3556,11 @@ _SINGLE_FILE_SYSTEM = (
     "(`app.test_client()` for Flask, `TestClient(app)` for FastAPI / "
     "Starlette, `Client()` for Django) -- never bind a real port or use "
     "`requests` / `httpx.Client(base_url='http://localhost:...')` in a test.\n"
-    "- For Flask specifically: obtain the client ONLY from the app object, "
-    "via `client = app.test_client()` (typically wrapped in a "
-    "`@pytest.fixture`). Do NOT import a test client class from werkzeug. "
-    "There is NO `werkzeug.test.TestClient` -- that symbol does not exist "
-    "and raises AttributeError. `TestClient(app)` is a FastAPI/Starlette "
-    "construct imported from `fastapi.testclient` / `starlette.testclient`, "
-    "NOT something you import for a Flask app.\n"
+    "- Obtain the client ONLY from the framework's own documented entry "
+    "point for the app under test (e.g. wrap `app.test_client()` in a "
+    "`@pytest.fixture`); never import a test-client symbol the framework "
+    "does not actually export, and never pair one framework's client with "
+    "another framework's app.\n"
     "- Import the application factory or app instance from the project's "
     "own source files (e.g. `from app import app` or `from main import "
     "create_app`); do not stub or reimplement the framework inline.\n"
@@ -3597,6 +3604,16 @@ _SINGLE_FILE_SYSTEM = (
     "usefixtures). Do NOT apply a custom @pytest.mark.* unless it is "
     "registered in pytest.ini/pyproject -- unregistered marks fail under "
     "strict-markers.\n"
+    "- Construct every input the test needs INSIDE the test: literals, small "
+    "in-test objects, or the `tmp_path` fixture for any files. NEVER read an "
+    "external data file, fixture file, or a path the project does not itself "
+    "create in the test -- it will not exist when the suite runs.\n"
+    "- Assert INVARIANTS and ROUND-TRIPS derivable from the code's documented "
+    "behaviour -- e.g. `decode(encode(x)) == x`, a length or ordering "
+    "property, idempotence, or a value you compute in-test from the same "
+    "inputs -- rather than a specific magic literal you cannot know the "
+    "function will return. Only assert an exact literal when the goal itself "
+    "fixes that value (a documented constant or a stated formula result).\n"
 )
 
 _SINGLE_FILE_FREEFORM_SYSTEM = (
@@ -4413,6 +4430,38 @@ def generate_single_scaffold_file(
                     "assigned, or defined anywhere in this file. YOU MUST IMPORT IT AT THE TOP OF THE FILE. Regenerate the file with the missing imports added.")
                 content = ""
 
+    # No-stub gate: a file can parse cleanly and import only names it defines
+    # yet still ship a required symbol whose body is a placeholder (`pass` /
+    # `...` / docstring-only / `raise NotImplementedError`). Such a stub clears
+    # every structural gate but fails the suite the instant a test calls it
+    # (the `encode()->pass` failure). When the WORK_PLAN contracts pin function
+    # symbols to this module, verify each has a real body and retry once with a
+    # hardened instruction naming the offenders before failing the file.
+    if content and syntax_ok and ext == "py" and contracts:
+        stubs = _contract_stub_symbols(content, path, contracts)
+        if stubs:
+            retry = _regenerate_scaffold_file(
+                provider, system, context, budget,
+                _stub_retry_instruction(stubs))
+            retry_ok = False
+            if retry:
+                import ast as _ast
+                try:
+                    _ast.parse(retry)
+                    retry_ok = not _contract_stub_symbols(
+                        retry, path, contracts)
+                except SyntaxError:
+                    retry_ok = False
+            if retry_ok:
+                content = retry
+            else:
+                syntax_ok = False
+                syntax_error = (
+                    "stub-only body for required contract symbol(s) "
+                    f"{stubs}: implement each with real logic (no pass / ... "
+                    "/ NotImplementedError)")
+                content = ""
+
     # Test-collectability gate: a pytest module that parses cleanly but
     # defines no module-top-level `def test_*` collects zero tests (pytest
     # exit 5) and stalls the verify->repair->regenerate loop -- the single
@@ -4756,6 +4805,117 @@ def _has_collectable_pytest_test(content: str) -> bool:
                         and _is_test_name(item.name)):
                     return True
     return False
+
+
+def _body_is_stub(node: Any) -> bool:
+    """True when a def/method body is a placeholder, not an implementation.
+
+    A body counts as a stub when, after dropping a leading docstring, every
+    remaining statement is ``pass``, a bare ``...`` expression, or ``raise
+    NotImplementedError`` -- the shapes a weak model emits when it declares a
+    contract symbol but never fills it in. A docstring-only body is a stub too.
+    """
+    import ast as _ast
+    body = list(getattr(node, "body", []) or [])
+    if (body and isinstance(body[0], _ast.Expr)
+            and isinstance(body[0].value, _ast.Constant)
+            and isinstance(body[0].value.value, str)):
+        body = body[1:]
+    if not body:
+        return True
+    for stmt in body:
+        if isinstance(stmt, _ast.Pass):
+            continue
+        if (isinstance(stmt, _ast.Expr)
+                and isinstance(stmt.value, _ast.Constant)
+                and stmt.value.value is Ellipsis):
+            continue
+        if isinstance(stmt, _ast.Raise):
+            exc = stmt.exc
+            fname = None
+            if isinstance(exc, _ast.Name):
+                fname = exc.id
+            elif isinstance(exc, _ast.Call) and isinstance(exc.func, _ast.Name):
+                fname = exc.func.id
+            if fname == "NotImplementedError":
+                continue
+        return False
+    return True
+
+
+def _contract_stub_symbols(content: str, path: str,
+                           contracts: Optional[Dict[str, Any]]) -> List[str]:
+    """Contract functions/methods pinned to ``path`` whose body is a stub.
+
+    Parses ``content`` and, for each ``functions`` contract whose ``module``
+    is this path, resolves the matching def (a module-level ``name``, a dotted
+    ``Class.method``, or a bare method name defined on one of the module's
+    classes) and flags it when :func:`_body_is_stub` holds. Schemas are not
+    checked -- a dataclass legitimately carries no body. Returns the flagged
+    contract names so the caller can re-ask naming the offenders.
+    """
+    if not isinstance(contracts, dict) or not contracts:
+        return []
+    import ast as _ast
+    try:
+        tree = _ast.parse(content)
+    except SyntaxError:
+        return []
+    funcs: Dict[str, Any] = {}
+    classes: Dict[str, Any] = {}
+    for node in tree.body:
+        if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+            funcs[node.name] = node
+        elif isinstance(node, _ast.ClassDef):
+            classes[node.name] = node
+
+    def _method(cls: Any, name: str) -> Optional[Any]:
+        for sub in cls.body:
+            if (isinstance(sub, (_ast.FunctionDef, _ast.AsyncFunctionDef))
+                    and sub.name == name):
+                return sub
+        return None
+
+    norm = str(path or "").replace("\\", "/")
+    stubs: List[str] = []
+    for fn in (contracts.get("functions") or []):
+        if not isinstance(fn, dict):
+            continue
+        if str(fn.get("module") or "").replace("\\", "/") != norm:
+            continue
+        name = str(fn.get("name") or "").strip()
+        if not name:
+            continue
+        node = None
+        if "." in name:
+            owner, _, member = name.rpartition(".")
+            cls = classes.get(owner)
+            if cls is not None:
+                node = _method(cls, member)
+        else:
+            node = funcs.get(name)
+            if node is None:
+                for cls in classes.values():
+                    node = _method(cls, name)
+                    if node is not None:
+                        break
+        if node is not None and _body_is_stub(node):
+            stubs.append(name)
+    return stubs
+
+
+def _stub_retry_instruction(names: List[str]) -> str:
+    """A hardened re-ask naming the contract symbols left unimplemented."""
+    listed = ", ".join(names)
+    return (
+        "\n\nCRITICAL RETRY -- YOUR PREVIOUS ATTEMPT WAS REJECTED:\n"
+        f"These required functions/methods had a placeholder body: {listed}. "
+        "A placeholder is a body that is only `pass`, `...`, a docstring, or "
+        "`raise NotImplementedError`. They are binding contract symbols this "
+        "file MUST implement. Regenerate the COMPLETE file with a real, "
+        "working implementation for every one of them -- compute and return "
+        "the documented result. Do NOT emit stubs, TODOs, placeholders, or "
+        "`NotImplementedError`.")
 
 
 _TEST_RETRY_INSTR = (
@@ -5324,9 +5484,13 @@ _LOGIC_REPAIR_SYSTEM = (
     '{"files": [{"path": "<relative/path>", "content": "<complete new '
     'file>"}]}\n\n'
     "Rules:\n"
-    "- Prefer fixing the SOURCE code so the EXISTING tests pass. Only edit a "
-    "test file when the test itself is clearly wrong (asserts behaviour the "
-    "goal never asked for).\n"
+    "- Prefer fixing the SOURCE code so the EXISTING tests pass. BUT the test "
+    "is sometimes the broken artifact: when a test asserts a fabricated magic "
+    "literal the goal never specified (so no correct source could satisfy "
+    "it), or calls the source with arguments/attributes it does not accept, "
+    "rewrite THAT test instead -- assert an invariant or round-trip against "
+    "the real API rather than forcing the source to emit an impossible value. "
+    "Return the corrected test file's complete content.\n"
     "- Output the COMPLETE file content for every file you return -- no "
     "stubs, placeholders, ellipsis, or unified-diff markers.\n"
     "- Only return files that appear in the provided file list, and only "

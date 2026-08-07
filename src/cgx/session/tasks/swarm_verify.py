@@ -343,31 +343,43 @@ def swarm_verify(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
 
     env = _run_env_dryrun(paths, project_root)
     structural_ok = not (gaps or import_w or contract_w)
+    # Contract warnings are *soft*: they are advisory (a declared interface a
+    # file does not obviously satisfy) and, unlike coverage gaps and import
+    # breaks, name no file the regeneration loop can act on. They must not gate
+    # the pytest-driven repair -- a red suite on a tree with only contract
+    # warnings still deserves failure-driven repair, so key that loop on the
+    # *hard* structural signals alone.
+    hard_structural_ok = not (gaps or import_w)
 
     # A structurally-clean tree whose suite is nonetheless red is exactly the
     # case the static gates cannot see: an import that resolves on paper but
     # breaks at runtime. Parse the failure, regenerate only the implicated
     # source files, and dry-run once more before the stage goes terminal.
     dyn_rounds = 0
-    if structural_ok and env.get("outcome") == "failed":
+    if hard_structural_ok and env.get("outcome") == "failed":
+        # Import-style failures localize to the file expected to provide the
+        # missing module; other red suites (a wrong assertion, a runtime
+        # TypeError) name no such file but are still exactly what failure-driven
+        # repair exists to fix, so a red suite always earns one repair round --
+        # the import targets, when present, merely seed the localization hint.
         dyn_targets = _dynamic_regen_targets(env, paths)
-        if dyn_targets:
-            dyn_rounds = 1
-            swarm_beat(project_root, "verify", "dynamic_regenerate",
-                       targets=dyn_targets)
-            # Prefer failure-driven repair (fed the red suite's output); fall
-            # back to blind regeneration only when the repairer declines, so a
-            # missing-module case still gets its provider regenerated.
-            repaired = _dynamic_repair(env, dyn_targets, contents, goal,
-                                       project_root, deps.provider, paths)
-            if not repaired:
-                _regenerate(dyn_targets, specs, contracts, goal, project_root,
-                            deps.provider, paths)
-            contents = _collect_contents(paths, project_root)
-            gaps, import_w, contract_w = _structural_scan(
-                paths, contents, contracts)
-            structural_ok = not (gaps or import_w or contract_w)
-            env = _run_env_dryrun(paths, project_root)
+        dyn_rounds = 1
+        swarm_beat(project_root, "verify", "dynamic_regenerate",
+                   targets=dyn_targets)
+        # Prefer failure-driven repair (fed the red suite's output); fall back
+        # to blind regeneration of the import targets only when the repairer
+        # declines, so a missing-module case still gets its provider
+        # regenerated even if the repair pass produced nothing.
+        repaired = _dynamic_repair(env, dyn_targets, contents, goal,
+                                   project_root, deps.provider, paths)
+        if not repaired and dyn_targets:
+            _regenerate(dyn_targets, specs, contracts, goal, project_root,
+                        deps.provider, paths)
+        contents = _collect_contents(paths, project_root)
+        gaps, import_w, contract_w = _structural_scan(
+            paths, contents, contracts)
+        structural_ok = not (gaps or import_w or contract_w)
+        env = _run_env_dryrun(paths, project_root)
 
     tests_red = env.get("outcome") == "failed"
     verify_ok = structural_ok and not failed_paths and not tests_red

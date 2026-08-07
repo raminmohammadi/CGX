@@ -249,3 +249,47 @@ def test_dynamic_repair_feeds_failure_back_and_heals(tmp_path, monkeypatch):
     assert res.artifact.content["dynamic_regen_rounds"] == 1
     assert res.outputs["verify_ok"] is True
     assert (tmp_path / "test_app.py").read_text() == fixed
+
+
+def test_soft_contract_warning_does_not_suppress_repair(tmp_path, monkeypatch):
+    # The tree parses and its imports resolve, but a WORK_PLAN contract names a
+    # function the file does not yet define -> a *soft* contract warning. The
+    # suite is red with a plain assertion failure (no import error, so no
+    # import-style regen target). Previously the contract warning kept
+    # structural_ok False and suppressed the pytest-driven repair entirely;
+    # now a red suite always earns one failure-driven repair round, which fed
+    # the failure output rewrites the file to satisfy the contract and pass.
+    (tmp_path / "app.py").write_text(
+        "def add(a, b):\n    return a - b\n", encoding="utf-8")
+
+    calls = {"env": 0}
+
+    def fake_env(paths, root):
+        calls["env"] += 1
+        if calls["env"] == 1:
+            return {"ran": True, "outcome": "failed",
+                    "output": ("test_app.py:2: in test_add\n"
+                               "    assert add(1, 1) == 2\n"
+                               "AssertionError: assert 0 == 2")}
+        return {"ran": True, "outcome": "passed", "output": ""}
+    monkeypatch.setattr(sv, "_run_env_dryrun", fake_env)
+
+    fixed = "def add(a, b):\n    return a + b\n\n\ndef sub(a, b):\n    return a - b\n"
+
+    def fake_repair(provider, *, goal, failure_text, files,
+                    localized_files=None):
+        assert "AssertionError" in failure_text
+        return {"app.py": fixed}
+    monkeypatch.setattr("cgx.answer.engine.generate_repair_files", fake_repair)
+
+    def _no_blind(**kw):
+        raise AssertionError("blind regeneration should not run after repair")
+    monkeypatch.setattr(sv, "generate_file", _no_blind)
+
+    # ``sub`` is declared as a bare-name function contract app.py must satisfy.
+    plan = _plan(tmp_path, ["app.py"],
+                 contracts={"functions": [{"name": "sub", "module": "app.py"}]})
+    res = _run(tmp_path, plan)
+    assert res.artifact.content["dynamic_regen_rounds"] == 1
+    assert res.outputs["verify_ok"] is True
+    assert (tmp_path / "app.py").read_text() == fixed

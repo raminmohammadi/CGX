@@ -12323,6 +12323,35 @@ def test_contract_check_dotted_unknown_owner_still_flagged():
     assert warns[0]["name"] == "Circle.area"
 
 
+def test_contract_check_resolves_bare_name_method():
+    """A bare-name contract resolves against a class method it names.
+
+    The Tech Lead routinely declares a method by its bare name (``__init__``,
+    ``deposit``) whose ``self`` receiver makes the class membership obvious,
+    with no ``Class.`` prefix. Such a name must resolve against the method the
+    module's classes define rather than being flagged as a missing module-level
+    function, both when the declared module matches and via the any-module
+    fallback.
+    """
+    from cgx.session.scaffold_validate import check_contract_compliance
+    contracts = {"functions": [
+        {"name": "deposit", "module": "src/account.py"},
+        {"name": "__init__", "module": "src/account.py"}]}
+    ok = {"src/account.py": (
+        "class Account:\n"
+        "    def __init__(self, balance=0):\n        self.balance = balance\n\n"
+        "    def deposit(self, amount):\n        self.balance += amount\n")}
+    assert check_contract_compliance(ok, contracts) == []
+    # The any-module fallback resolves the same bare name when the declared
+    # module was not generated but another module defines the method.
+    fallback = {"functions": [{"name": "deposit", "module": "src/missing.py"}]}
+    assert check_contract_compliance(ok, fallback) == []
+    # A bare name no class defines is still flagged.
+    bad = {"src/account.py": "class Account:\n    def close(self):\n        pass\n"}
+    warns = check_contract_compliance(bad, contracts)
+    assert sorted(w["name"] for w in warns) == ["__init__", "deposit"]
+
+
 def test_contract_check_abstains_without_python_and_on_empty():
     """No Python files -> symbol checks abstain; empty contracts -> []."""
     from cgx.session.scaffold_validate import check_contract_compliance

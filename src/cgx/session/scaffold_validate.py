@@ -668,6 +668,13 @@ def check_contract_compliance(
     # declared ``Class.method`` function contract resolves against the method
     # rather than being sought as a (nonexistent) module-level symbol.
     class_methods: Dict[str, Set[str]] = {}
+    # Method names per module (union across the module's classes) and across
+    # every module, so a bare-name method contract (e.g. ``__init__`` or
+    # ``deposit`` declared with a ``self`` receiver but no ``Class.`` prefix)
+    # resolves against the class method it names instead of being flagged as a
+    # missing module-level function.
+    per_module_methods: Dict[str, Set[str]] = {}
+    all_method_names: Set[str] = set()
     for path, content in file_contents.items():
         if not isinstance(content, str):
             continue
@@ -683,8 +690,12 @@ def check_contract_compliance(
             assigned_symbols |= defined
         cms = _class_methods(content)
         if cms:
+            module_methods: Set[str] = set()
             for cls, ms in cms.items():
                 class_methods.setdefault(cls, set()).update(ms)
+                module_methods |= ms
+            per_module_methods[path.replace("\\", "/")] = module_methods
+            all_method_names |= module_methods
 
     have_python = bool(per_module)
     haystack = "\n".join(
@@ -751,7 +762,13 @@ def check_contract_compliance(
                     continue
             scope = per_module.get(module)
             if scope is not None:
-                if name not in scope:
+                # A bare-name contract is satisfied either by a module-level
+                # definition or by a method the module's classes define -- a
+                # Tech Lead routinely declares ``__init__``/``deposit`` (a
+                # method) without the ``Class.`` prefix, so resolving only
+                # against module-level symbols would false-flag every method.
+                methods = per_module_methods.get(module, set())
+                if name not in scope and name not in methods:
                     warnings.append({
                         "kind": "function",
                         "name": name,
@@ -759,7 +776,7 @@ def check_contract_compliance(
                         "reason": (f"declared function {name!r} not defined "
                                    f"in {module}"),
                     })
-            elif name not in all_symbols:
+            elif name not in all_symbols and name not in all_method_names:
                 warnings.append({
                     "kind": "function",
                     "name": name,

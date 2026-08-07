@@ -177,14 +177,159 @@ def _has_dependency_cycle(files: List[FileSpec]) -> bool:
     return any(color[p] == 0 and visit(p) for p in path_set)
 
 
+def _scaffolding_problems(plan: Dict[str, Any]) -> List[str]:
+    """Missing project-scaffolding files a complete project must ship.
+
+    Structural completeness is a plan-level invariant, not a per-run patch: a
+    project the user can read, install, and test needs a ``README.md`` and a
+    dependency manifest, and a ``src/`` layout additionally needs a root
+    ``conftest.py`` so pytest inserts the project root onto ``sys.path`` and
+    ``import src.pkg`` resolves. Each absence is returned as a concrete,
+    re-askable problem rather than being silently accepted.
+    """
+    files = _flatten_files(plan)
+    paths = [(f.get("path") or "").replace("\\", "/") for f in files]
+    bases = {p.rsplit("/", 1)[-1].lower() for p in paths}
+    problems: List[str] = []
+    if "readme.md" not in bases:
+        problems.append(
+            "no README.md is planned; add a top-level README.md describing "
+            "the project, its install steps, and its usage")
+    if not ({"requirements.txt", "pyproject.toml"} & bases):
+        problems.append(
+            "no dependency manifest is planned; add a top-level "
+            "requirements.txt (or pyproject.toml) listing the runtime and "
+            "test dependencies")
+    under_src = any(p.startswith("src/") for p in _source_paths(plan))
+    if under_src and "conftest.py" not in paths:
+        problems.append(
+            "a 'src/' layout needs a root conftest.py so pytest can import "
+            "the package; add a conftest.py at the project root")
+    return problems
+
+
+def ensure_scaffolding(plan: Dict[str, Any]) -> Dict[str, Any]:
+    """Inject any missing README / dependency manifest / conftest into the plan.
+
+    Structural completeness is a deterministic guarantee, not a request the
+    model may decline. The verifier requires a ``README.md``, a dependency
+    manifest, and -- for a ``src/`` layout -- a root ``conftest.py``; rather
+    than reject the plan and re-ask a weak model that routinely re-omits
+    boilerplate, the missing entries are appended directly. The Developer
+    already knows how to emit each one (source-derived templates for
+    ``requirements.txt``/``conftest.py``, a grounded free-form call for
+    ``README.md``), so the plan only has to declare them. ``README.md`` and
+    ``requirements.txt`` depend on every planned ``.py`` file so they are
+    generated last, after the sources they describe and scan exist on disk.
+    """
+    files = _flatten_files(plan)
+    raw_paths = [f.get("path") or "" for f in files]
+    bases = {p.replace("\\", "/").rsplit("/", 1)[-1].lower()
+             for p in raw_paths}
+    py_paths = [p for p in raw_paths if p.endswith(".py")]
+    under_src = any(p.startswith("src/") for p in _source_paths(plan))
+
+    injected: List[FileSpec] = []
+    if not ({"requirements.txt", "pyproject.toml"} & bases):
+        injected.append({
+            "path": "requirements.txt",
+            "description": ("Runtime and test dependencies for the project, "
+                            "one pip requirement per line."),
+            "depends_on": list(py_paths)})
+    if under_src and "conftest.py" not in bases:
+        injected.append({
+            "path": "conftest.py",
+            "description": ("Pytest bootstrap that puts the project root and "
+                            "src/ on sys.path so tests import the package."),
+            "depends_on": []})
+    if "readme.md" not in bases:
+        injected.append({
+            "path": "README.md",
+            "description": ("Top-level project README: summary, install steps "
+                            "(pip install -r requirements.txt), usage, and how "
+                            "to run the tests (pytest)."),
+            "depends_on": list(py_paths)})
+
+    if injected:
+        layers = list(plan.get("layers") or [])
+        layers = layers + [{"name": "scaffolding", "files": injected}]
+        plan = {**plan, "layers": layers}
+    return plan
+
+
+def ensure_test_coverage(plan: Dict[str, Any]) -> Dict[str, Any]:
+    """Inject a pytest module for every source module no planned test covers.
+
+    A plan that ships zero tests -- or tests only some of its modules --
+    leaves the verifier with nothing to run for the uncovered code (the
+    "no tests ran" failure). Coverage is therefore a deterministic plan
+    invariant, not a request the weak Tech Lead may drop: every non-test
+    ``.py`` source module (excluding package ``__init__.py`` markers) that no
+    planned ``test_*`` / ``*_test.py`` file already ``depends_on`` gets a
+    ``tests/test_<module>.py`` entry injected, depending on that module so it
+    is generated after -- and grounded against -- the code it exercises. The
+    description carries the test-authoring discipline (construct inputs
+    in-test, assert invariants/round-trips) so the Developer writes a real
+    suite rather than a placeholder.
+    """
+    src_py = [p for p in _source_paths(plan) if p.endswith(".py")]
+    if not src_py:
+        return plan
+    files = _flatten_files(plan)
+    covered: set = set()
+    existing_paths: set = set()
+    for f in files:
+        p = (f.get("path") or "").replace("\\", "/")
+        existing_paths.add(p)
+        base = p.rsplit("/", 1)[-1].lower()
+        if base.startswith("test_") or base.endswith("_test.py"):
+            for d in (f.get("depends_on") or []):
+                covered.add(d.replace("\\", "/"))
+
+    injected: List[FileSpec] = []
+    chosen: set = set()
+    for src in src_py:
+        if src in covered:
+            continue
+        base = src.rsplit("/", 1)[-1]
+        if base.lower() == "__init__.py":
+            continue
+        mod = base[:-3]  # strip the '.py' suffix
+        test_path = f"tests/test_{mod}.py"
+        if test_path in existing_paths or test_path in chosen:
+            parent = src.rsplit("/", 1)[0].rsplit("/", 1)[-1] if "/" in src \
+                else ""
+            test_path = f"tests/test_{parent}_{mod}.py"
+        if test_path in existing_paths or test_path in chosen:
+            continue
+        chosen.add(test_path)
+        injected.append({
+            "path": test_path,
+            "description": (
+                f"Pytest tests for {src!r}. Import its public functions and "
+                "classes and exercise them with inputs constructed inside the "
+                "test (use the tmp_path fixture for any files); assert "
+                "documented invariants and round-trips rather than fabricated "
+                "literal values."),
+            "depends_on": [src]})
+
+    if injected:
+        layers = list(plan.get("layers") or [])
+        layers = layers + [{"name": "tests", "files": injected}]
+        plan = {**plan, "layers": layers}
+    return plan
+
+
 def verify_plan(plan: Dict[str, Any]) -> List[str]:
     """Return concrete, actionable problems with a normalised plan.
 
     A plan that survives this gate is *coherent enough to build*: its paths
     are safe and relative, it commits to a single import rooting, its
-    dependency graph is acyclic, and every test has a module to exercise. An
-    empty list means the plan is fit for the Developer chain; otherwise the
-    Tech Lead re-asks the model with the exact problems appended.
+    dependency graph is acyclic, every test has a module to exercise, and it
+    ships the project scaffolding (README, dependency manifest, and -- for a
+    ``src/`` layout -- a root conftest.py) that makes it a complete, runnable
+    project. An empty list means the plan is fit for the Developer chain;
+    otherwise the Tech Lead re-asks the model with the exact problems appended.
     """
     files = _flatten_files(plan)
     problems: List[str] = []
@@ -212,9 +357,16 @@ def verify_plan(plan: Dict[str, Any]) -> List[str]:
     if src:
         for f in files:
             p = (f.get("path") or "").replace("\\", "/")
-            if (p.endswith(".py") and "test" in p.lower()
+            base = p.rsplit("/", 1)[-1].lower()
+            # Only pytest *test modules* need a target; conftest.py carries
+            # fixtures/path setup and legitimately declares no depends_on even
+            # though its name contains the substring "test".
+            is_test_module = (base.startswith("test_")
+                              or base.endswith("_test.py"))
+            if (p.endswith(".py") and is_test_module
                     and not (f.get("depends_on") or [])):
                 problems.append(
                     f"test file {p!r} declares no depends_on, so it has no "
                     "target module to import")
+    problems.extend(_scaffolding_problems(plan))
     return list(dict.fromkeys(problems))
