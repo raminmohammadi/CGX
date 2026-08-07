@@ -6594,6 +6594,26 @@ def test_bootstrap_env_python_takes_priority_over_package_json(tmp_path):
     assert _detect_project_type(tmp_path) == "python"
 
 
+def test_bootstrap_env_python_sources_without_manifest_are_python(tmp_path):
+    """A .py source beside package.json still provisions a venv.
+
+    Live (Calculator5): the scaffold emitted a FastAPI backend and a
+    package.json but no requirements.txt, so the node-only path ran,
+    ``venv_path`` stayed None and VERIFY collected the generated tests
+    under the ambient interpreter instead of an isolated project venv.
+    """
+    from cgx.session.tasks.bootstrap_env import _detect_project_type
+    (tmp_path / "package.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "node_modules" / "pkg").mkdir(parents=True)
+    (tmp_path / "node_modules" / "pkg" / "setup.py").write_text(
+        "", encoding="utf-8")
+    assert _detect_project_type(tmp_path) == "node"
+    (tmp_path / "backend").mkdir()
+    (tmp_path / "backend" / "main.py").write_text(
+        "from fastapi import FastAPI\n", encoding="utf-8")
+    assert _detect_project_type(tmp_path) == "python"
+
+
 def test_pin_transitive_caps_werkzeug_for_flask_22(tmp_path):
     """B: Flask 2.2.x without a Werkzeug pin gets ``werkzeug<2.3`` appended."""
     from cgx.session.tasks.bootstrap_env import _pin_transitive_constraints

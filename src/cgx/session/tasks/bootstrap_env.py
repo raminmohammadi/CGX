@@ -466,6 +466,12 @@ def _detect_project_type(root: Path) -> str:
     the *primary* type, so a polyglot repo keeps its richer venv
     provisioning + preflight path and the Python-only gates (API_CHECK /
     SMOKE / RUNTIME_VERIFY) still key off ``project_type == "python"``.
+    A tree that carries Python *sources* but no dependency manifest counts
+    as Python too: a scaffold that emitted a FastAPI backend beside a
+    ``package.json`` but forgot ``requirements.txt`` would otherwise route
+    to the node-only path, leaving ``venv_path=None`` -- VERIFY then runs
+    pytest under whatever ambient interpreter launched the agent instead
+    of an isolated project venv.
     :func:`run_bootstrap_env` additionally provisions ``node_modules`` in
     the same pass whenever a ``package.json`` is present (see
     :func:`_provision_node_modules`), so the JS stack is verified against
@@ -478,9 +484,32 @@ def _detect_project_type(root: Path) -> str:
                  "setup.py", "setup.cfg"):
         if (root / name).is_file():
             return "python"
+    if _has_python_sources(root):
+        return "python"
     if (root / "package.json").is_file():
         return "node"
     return "unknown"
+
+
+# Directories that never carry first-party sources; skipped when looking
+# for the ``.py`` files that mark a manifest-less Python tree.
+_NON_SOURCE_DIRS = frozenset({
+    ".git", ".cgx", ".cgx-backups", ".venv", "venv", "node_modules",
+    "__pycache__", ".pytest_cache", ".mypy_cache", "dist", "build",
+})
+
+
+def _has_python_sources(root: Path) -> bool:
+    """True when the tree carries a first-party ``.py`` file."""
+    for path in root.rglob("*.py"):
+        try:
+            parts = path.relative_to(root).parts
+        except ValueError:  # pragma: no cover - rglob yields under root
+            continue
+        if any(p in _NON_SOURCE_DIRS for p in parts[:-1]):
+            continue
+        return True
+    return False
 
 
 # Known transitive incompatibilities a scaffold routinely pins without a
