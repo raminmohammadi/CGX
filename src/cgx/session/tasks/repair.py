@@ -201,14 +201,15 @@ def run_repair(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         # starlette's TestClient guard for httpx). Route straight to
         # install_deps -- no source rewrite can install a package...
         packages = list(required_package_names(content))
-        escalation = _coerce_escalation(task.inputs.get("repair_escalation"))
-        if not escalation:
+        unsatisfiable = _pip_proven_unsatisfiable(task, deps, packages)
+        if not unsatisfiable:
             return _run_verify_missing_dependency_repair(
                 task, verify_artifact_id, content, packages, signature)
-        # ... unless that install already ran and the signature came back
-        # unchanged, which proves the name is not a distributable package.
+        # ... unless pip already tried and *failed* on the name, which is
+        # the only proof that no install can satisfy it.
         return _run_uninstallable_dependency_regenerate(
-            task, verify_artifact_id, content, packages, signature, attempt)
+            task, verify_artifact_id, content, unsatisfiable, signature,
+            attempt)
 
     if classification == "collection_error":
         # An unrecognized collection failure: pytest could not import the
@@ -242,15 +243,15 @@ def run_repair(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             pip_roots = _pip_installable_roots(
                 Path(deps.project_root), content)
             if pip_roots:
-                escalation = _coerce_escalation(
-                    task.inputs.get("repair_escalation"))
-                if not escalation:
+                unsatisfiable = _pip_proven_unsatisfiable(
+                    task, deps, pip_roots)
+                if not unsatisfiable:
                     return _run_verify_missing_dependency_repair(
                         task, verify_artifact_id, content, pip_roots,
                         signature)
                 return _run_uninstallable_dependency_regenerate(
-                    task, verify_artifact_id, content, pip_roots, signature,
-                    attempt)
+                    task, verify_artifact_id, content, unsatisfiable,
+                    signature, attempt)
 
             # The top-level package exists in the project but the leaf does
             # not (e.g. src.config). This is a missing first-party file the
@@ -1114,6 +1115,46 @@ def _run_dependency_conflict_repair(
     )
 
 
+def _pip_proven_unsatisfiable(task: TaskNode, deps: ExecutorDeps,
+                              packages: List[str]) -> List[str]:
+    """Subset of ``packages`` pip has already tried and failed to install.
+
+    A repeated failure signature is *not* evidence that a package name is
+    invented: the install may never have run at all (a BOOTSTRAP_ENV that
+    resolved the tree as non-Python provisions no venv, so ``install_deps``
+    is silently skipped and the identical signature comes straight back).
+    Re-authoring source on that basis tells the model to drop a legitimate
+    dependency.
+
+    The only sound evidence is the upstream ``BUILD_REPORT``'s own record
+    of what pip attempted: ``failed_installs`` (a declared requirement that
+    would not resolve) and ``uninstallable`` (a scan-discovered import
+    whose install failed). Matching is on the normalized distribution name,
+    mirroring :func:`cgx.session.tasks.bootstrap_env._import_roots_for`.
+    Best-effort: an unreadable report yields the empty list, which keeps
+    the loop on the install path.
+    """
+    if not packages or deps.store is None:
+        return []
+    build_id = str(task.inputs.get("build_artifact_id") or "").strip()
+    if not build_id:
+        return []
+    art = deps.store.get_artifact(build_id)
+    if art is None or art.kind is not ArtifactKind.BUILD_REPORT:
+        return []
+    content = art.content or {}
+    attempted: List[str] = []
+    for key in ("failed_installs", "uninstallable"):
+        value = content.get(key)
+        if isinstance(value, list):
+            attempted.extend(str(v) for v in value)
+    if not attempted:
+        return []
+    proven = {n.strip().lower().replace("-", "_") for n in attempted}
+    return [p for p in packages
+            if p.strip().lower().replace("-", "_") in proven]
+
+
 def _pip_installable_roots(project_root: Path,
                            content: Dict[str, Any]) -> List[str]:
     """Missing-import roots that are pip problems, not authoring problems.
@@ -1216,12 +1257,11 @@ def _run_uninstallable_dependency_regenerate(
         attempt: int) -> ExecutorResult:
     """Regenerate away an import pip has already proven it cannot satisfy.
 
-    Second rung of the VERIFY missing-dependency ladder. The first round
-    routed to install_deps and the identical signature came back, so the
-    name is not a real distributable package (live: a generated test
-    importing ``httpx2``). Installing it again cannot work and the loop
-    would otherwise terminate on the flap guard, so name the offending
-    file(s) and re-author them without the invented import.
+    Reached only when the upstream ``BUILD_REPORT`` recorded the package
+    under ``failed_installs`` / ``uninstallable`` -- pip ran and could not
+    resolve the name, so no further install can succeed and only a source
+    change can clear the import. Names the offending file(s) so the
+    regenerate stays scoped instead of re-authoring the whole tree.
     """
     mods = sorted(dict.fromkeys(m for m in missing_modules if m))
     if not signature:
@@ -1229,12 +1269,10 @@ def _run_uninstallable_dependency_regenerate(
     classification = "uninstallable_dependency"
     listed = ", ".join(mods) or "the missing package(s)"
     rationale = (
-        f"Installing {listed} was already attempted and test collection "
-        "still cannot import it, so it is not a real distributable "
-        "package -- most likely an invented name. Re-author the offending "
-        "file(s) to use the correct package (for example `httpx`, not "
-        "`httpx2`) or to drop the import entirely; do not reference "
-        "packages that do not exist on PyPI.")
+        f"pip could not install {listed} (the install was attempted and "
+        "failed), so test collection cannot import it and no further "
+        "install will help. Re-author the offending file(s) to use a "
+        "package that resolves on PyPI, or to drop the import entirely.")
     extra_constraints: Dict[str, Any] = {
         "kind": classification,
         "missing_modules": mods,

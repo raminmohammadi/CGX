@@ -1670,53 +1670,6 @@ def test_router_greenfield_verify_failure_spawns_repair():
     assert "abc123" in rep.inputs["prior_failure_signatures"]
 
 
-def test_router_verify_repeated_missing_dependency_escalates_once():
-    """A repeated missing_dependency signature buys one escalated rung.
-
-    The first round installs; when pip cannot satisfy the name the
-    signature *and* the failing count come back unchanged, so both the
-    stall gate and the flap backstop would kill a loop that never tried
-    a real fix. One more REPAIR runs, flagged ``repair_escalation``.
-    """
-    session = Session.new("g", mode=SessionMode.GREENFIELD)
-    ver = _greenfield_failed_verify(
-        signature="dep1", outcome="collection_error", repair_attempt=1,
-        prior=["dep1"], failing_count=1, prior_counts=[1], session=session)
-    ver.outputs["classification"] = "missing_dependency"
-    plan = Router().on_task_completed(
-        session=session, completed=ver, tasks=[ver])
-    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
-    assert len(creates) == 1
-    rep = creates[0].task
-    assert rep.kind is TaskKind.REPAIR
-    assert rep.inputs["repair_escalation"] == 1
-
-
-def test_router_verify_missing_dependency_ladder_is_two_rungs():
-    """A second repeat of the same dependency signature is terminal."""
-    session = Session.new("g", mode=SessionMode.GREENFIELD)
-    ver = _greenfield_failed_verify(
-        signature="dep1", outcome="collection_error", repair_attempt=2,
-        prior=["dep1", "dep1"], failing_count=1, prior_counts=[1, 1],
-        session=session)
-    ver.outputs["classification"] = "missing_dependency"
-    plan = Router().on_task_completed(
-        session=session, completed=ver, tasks=[ver])
-    assert [a for a in plan.actions if isinstance(a, CreateTask)] == []
-
-
-def test_router_verify_repeated_other_classification_still_stops():
-    """The escalation rung is missing_dependency-only; others still halt."""
-    session = Session.new("g", mode=SessionMode.GREENFIELD)
-    ver = _greenfield_failed_verify(
-        signature="dep1", outcome="collection_error", repair_attempt=1,
-        prior=["dep1"], failing_count=1, prior_counts=[1], session=session)
-    ver.outputs["classification"] = "import_name_break"
-    plan = Router().on_task_completed(
-        session=session, completed=ver, tasks=[ver])
-    assert [a for a in plan.actions if isinstance(a, CreateTask)] == []
-
-
 def test_router_greenfield_verify_failed_outcome_spawns_repair():
     """A non-pytest ``failed`` VERIFY (e.g. npm build) -> REPAIR too."""
     session = Session.new("g", mode=SessionMode.GREENFIELD)
@@ -10791,15 +10744,10 @@ def test_repair_verify_missing_dependency_routes_to_install_deps(
     assert "httpx" in plan.content["rationale"]
 
 
-def test_repair_verify_escalated_missing_dependency_regenerates(
-        store, tmp_path: Path):
-    """A second round on the same signature stops asking for the install.
-
-    ``httpx2`` is not on PyPI, so install_deps was a no-op and the
-    identical signature came straight back (live: Calculator4). On the
-    escalated rung REPAIR re-authors the file that imports it.
-    """
+def _missing_dep_repair(store, tmp_path: Path, *, build_content=None):
+    """Drive REPAIR on a VERIFY missing-module error, optional BUILD_REPORT."""
     from cgx.session.tasks import repair as _repair_module  # noqa: F401
+    from cgx.session.tasks.base import _REGISTRY
     session = Session.new("g", mode=SessionMode.GREENFIELD)
     store.save_session(session)
     verify_task = TaskNode.new(
@@ -10814,32 +10762,75 @@ def test_repair_verify_escalated_missing_dependency_regenerates(
             "returncode": 2,
             "stdout": (
                 "tests/test_api.py:3: in <module>\n"
-                "    import httpx2\n"
-                "E   ModuleNotFoundError: No module named 'httpx2'\n"),
+                "    import nosuchpkg\n"
+                "E   ModuleNotFoundError: No module named 'nosuchpkg'\n"),
             "stderr": "",
         })
     verify_task.produced_artifact_id = verify_artifact.artifact_id
     verify_task.status = TaskNodeStatus.DONE
     store.save_task(verify_task)
     store.save_artifact(verify_artifact)
+    inputs = {"verify_artifact_id": verify_artifact.artifact_id,
+              "mode": SessionMode.GREENFIELD.value,
+              "repair_attempt": 2}
+    if build_content is not None:
+        build = Artifact.new(
+            session_id=session.session_id,
+            produced_by_task_id=verify_task.task_id,
+            kind=ArtifactKind.BUILD_REPORT, content=build_content)
+        store.save_artifact(build)
+        inputs["build_artifact_id"] = build.artifact_id
     repair_task = TaskNode.new(
-        session.session_id, TaskKind.REPAIR, "repair",
-        inputs={"verify_artifact_id": verify_artifact.artifact_id,
-                "mode": SessionMode.GREENFIELD.value,
-                "repair_attempt": 2,
-                "repair_escalation": 1})
+        session.session_id, TaskKind.REPAIR, "repair", inputs=inputs)
     deps = ExecutorDeps(project_root=str(tmp_path), store=store)
-    from cgx.session.tasks.base import _REGISTRY
-    result = _REGISTRY[TaskKind.REPAIR](repair_task, deps)
+    return _REGISTRY[TaskKind.REPAIR](repair_task, deps)
+
+
+def test_repair_verify_missing_dependency_installs_without_pip_evidence(
+        store, tmp_path: Path):
+    """No BUILD_REPORT record of a failed install -> still install_deps.
+
+    A repeated failure signature is not evidence a package is invented:
+    the install may never have run (live Calculator5 -- BOOTSTRAP_ENV
+    resolved the tree as node, provisioned no venv, and silently skipped
+    it). Absent proof pip tried and failed, the loop keeps installing.
+    """
+    result = _missing_dep_repair(
+        store, tmp_path,
+        build_content={"failed_installs": [], "uninstallable": []})
+    assert result.failure is None
+    assert result.outputs["classification"] == "missing_dependency"
+    assert result.outputs["strategy"] == "install_deps"
+
+
+def test_repair_verify_pip_proven_unsatisfiable_regenerates(
+        store, tmp_path: Path):
+    """A BUILD_REPORT naming the failed install -> scoped regenerate.
+
+    pip ran and could not resolve the name, so no further install can
+    help and only a source change clears the import.
+    """
+    result = _missing_dep_repair(
+        store, tmp_path,
+        build_content={"failed_installs": ["nosuchpkg"],
+                       "uninstallable": []})
     assert result.failure is None
     assert result.outputs["classification"] == "uninstallable_dependency"
     assert result.outputs["strategy"] == "regenerate"
-    assert result.outputs["missing_modules"] == ["httpx2"]
-    rationale = result.artifact.content["rationale"]
-    assert "already attempted" in rationale
-    assert "httpx2" in rationale
+    assert result.outputs["missing_modules"] == ["nosuchpkg"]
+    assert "pip could not install" in result.artifact.content["rationale"]
     assert (result.outputs["extra_constraints"]["target_files"]
             == ["tests/test_api.py"])
+
+
+def test_repair_verify_pip_evidence_matches_normalized_name(
+        store, tmp_path: Path):
+    """``uninstallable`` entries match case-insensitively."""
+    result = _missing_dep_repair(
+        store, tmp_path,
+        build_content={"failed_installs": [], "uninstallable": ["NoSuchPkg"]})
+    assert result.outputs["classification"] == "uninstallable_dependency"
+    assert result.outputs["missing_modules"] == ["nosuchpkg"]
 
 
 def test_repair_verify_pip_installable_missing_module_installs(

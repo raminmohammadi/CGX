@@ -535,12 +535,6 @@ _REPAIRABLE_VERIFY_OUTCOMES = frozenset({
 # it fails honestly instead of reporting a false green.
 _VERIFY_SUCCESS_OUTCOMES = frozenset({"passed", "skipped"})
 
-# How many times one VERIFY failure signature may repeat before the loop
-# is a proven dead end. Mirrors :data:`_API_CHECK_SIGNATURE_LADDER`, and
-# applies only to the one classification whose first round can legitimately
-# no-op (``missing_dependency`` -> install_deps).
-_VERIFY_SIGNATURE_LADDER = 2
-
 
 def _verify_to_repair_or_terminal(parent: TaskNode) -> List[TaskNode]:
     """Spawn REPAIR after a fixable VERIFY failure; otherwise terminal.
@@ -606,6 +600,9 @@ def _verify_to_repair_or_terminal(parent: TaskNode) -> List[TaskNode]:
     new_passing = (_coerce_count(outputs.get("passing_count"))
                    if outcome == "assertions_failed" else None)
     prior_passing = list(budget.prior_passing_counts)
+    if _repair_progress_stalled(
+            new_count, prior_counts, new_passing, prior_passing):
+        return []
     # Read the VERIFY_REPORT's failure_signature lazily by deferring to
     # the classifier; the router stays free of I/O by using a precomputed
     # signature stashed by the runner-style ``outputs``. Falls back to a
@@ -614,25 +611,9 @@ def _verify_to_repair_or_terminal(parent: TaskNode) -> List[TaskNode]:
     new_signature = str(outputs.get("failure_signature") or "").strip()
     if not new_signature:
         new_signature = f"{outcome}|rc={outputs.get('returncode')}"
+    if budget.seen(new_signature):
+        return []
     classification = str(outputs.get("classification") or "").strip()
-    # A repeated signature (and a flat failing count) normally ends the
-    # loop. One exception, one rung: a ``missing_dependency`` round routes
-    # to install_deps, and when pip cannot satisfy the name (a hallucinated
-    # ``httpx2``) that round is a no-op reproducing the identical signature
-    # *and* the identical count -- both guards fire on a failure the loop
-    # has never actually attempted to fix. REPAIR reads
-    # ``repair_escalation`` and switches to a regenerate that drops the
-    # un-installable import; a second repeat is a genuine dead end. Every
-    # other classification keeps the strict guards.
-    escalation = budget.signature_repeats(new_signature)
-    dependency_rung = (classification == "missing_dependency"
-                       and 0 < escalation < _VERIFY_SIGNATURE_LADDER)
-    if not dependency_rung:
-        if _repair_progress_stalled(
-                new_count, prior_counts, new_passing, prior_passing):
-            return []
-        if escalation:
-            return []
     spent = budget.spend_repair(
         new_signature, failing_count=new_count, passing_count=new_passing)
     verify_artifact_id = parent.produced_artifact_id
@@ -659,7 +640,6 @@ def _verify_to_repair_or_terminal(parent: TaskNode) -> List[TaskNode]:
             "apply_artifact_id": parent.inputs.get("apply_artifact_id"),
             "prior_goal": parent.inputs.get("prior_goal"),
             "mode": mode,
-            "repair_escalation": escalation,
             **spent.repair_chain_inputs(),
         },
     )]
