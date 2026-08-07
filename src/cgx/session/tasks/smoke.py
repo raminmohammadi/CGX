@@ -103,8 +103,11 @@ def run_smoke(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     # build`` (buildability only); VERIFY's ``NpmRunner`` then runs the
     # ``test`` script. Gated on a provisioned ``node_modules`` (see
     # BOOTSTRAP_ENV) so an offline box that never installed deps skips
-    # rather than fabricating a build failure.
-    build_smoke = _npm_build_smoke(root, task)
+    # rather than fabricating a build failure -- unless the install failed
+    # because npm rejected the manifest, which is a real defect this gate
+    # owns reporting.
+    build_smoke = _npm_build_smoke(
+        root, task, node_report=_resolve_node_report(task, deps))
 
     failed = [m["name"] for m in modules if not m["ok"]]
     part_outcomes = [py_outcome]
@@ -337,6 +340,43 @@ def _build_error_digest(stderr_tail: str) -> str:
     return hashlib.sha1(blob).hexdigest()[:8]
 
 
+def _resolve_node_report(task: TaskNode,
+                         deps: ExecutorDeps) -> Optional[Dict[str, Any]]:
+    """The upstream BUILD_REPORT's ``node`` provisioning sub-report.
+
+    ``None`` when there is no build artifact, it is the wrong kind, or the
+    bootstrap recorded no JS pass -- every one of which means this task
+    has no evidence about npm and must fall back to its own probing.
+    """
+    build_id = str(task.inputs.get("build_artifact_id") or "").strip()
+    if not build_id:
+        return None
+    art = deps.store.get_artifact(build_id)
+    if art is None or art.kind is not ArtifactKind.BUILD_REPORT:
+        return None
+    report = (art.content or {}).get("node")
+    return report if isinstance(report, dict) else None
+
+
+def _failed_node_install_smoke(
+        node_report: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """A build-smoke entry standing in for an npm install npm itself refused.
+
+    ``None`` unless the bootstrap's node sub-report says ``failed`` -- the
+    outcome reserved for a manifest npm rejected (``EINVALIDTAGNAME`` on
+    an unsubstituted ``"{version}"``, ``E404`` on a package that does not
+    exist). An environmental ``skipped`` still yields ``None`` so an
+    offline box does not fabricate a failure.
+    """
+    if not node_report or str(node_report.get("outcome")) != "failed":
+        return None
+    detail = (str(node_report.get("log_tail") or "").strip()
+              or str(node_report.get("note") or "").strip()
+              or "npm install failed")
+    return {"label": "npm install", "ok": False,
+            "stderr_tail": _clip_output(detail)}
+
+
 def _npm_build_command(root: Path) -> Optional[List[str]]:
     """Return the ``npm run build`` invocation, or ``None`` when absent.
 
@@ -357,22 +397,29 @@ def _npm_build_command(root: Path) -> Optional[List[str]]:
     return None
 
 
-def _npm_build_smoke(root: Path, task: TaskNode) -> Optional[Dict[str, Any]]:
+def _npm_build_smoke(
+        root: Path, task: TaskNode,
+        node_report: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
     """Run ``npm run build`` as a fast buildability gate for JS/TS projects.
 
     Returns ``None`` (skip) when there is no ``package.json``, no ``npm``
     binary, no ``build`` script, or no provisioned ``node_modules`` --
     the last guard keeps an offline box (deps never installed) from
-    fabricating a build failure. Otherwise returns
-    ``{"label", "ok", "stderr_tail"}`` so a broken build surfaces as a
-    real ``failed`` outcome that routes into REPAIR/REGENERATE.
+    fabricating a build failure. The one exception is a ``node_report``
+    whose outcome is ``failed``: BOOTSTRAP_ENV ran npm and npm rejected
+    the generated manifest, so the absent ``node_modules`` *is* the
+    failure and reporting it here is what puts it in front of REPAIR.
+    Otherwise returns ``{"label", "ok", "stderr_tail"}`` so a broken build
+    surfaces as a real ``failed`` outcome that routes into
+    REPAIR/REGENERATE.
     """
     if not (root / "package.json").is_file():
         return None
     if shutil.which("npm") is None:
         return None
     if not (root / "node_modules").is_dir():
-        return None
+        return _failed_node_install_smoke(node_report)
     cmd = _npm_build_command(root)
     if cmd is None:
         return None

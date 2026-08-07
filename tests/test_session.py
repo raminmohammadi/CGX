@@ -5452,6 +5452,53 @@ def test_reconcile_js_dependencies_noop_without_package_json():
         diffs=diffs, existing_with_content=existing) == []
 
 
+def test_reconcile_js_dep_placeholders_relaxes_unsubstituted_versions():
+    """``"{version}"`` in every section is rewritten to the ``*`` range.
+
+    npm parses each value as a range and aborts the whole install on the
+    first it cannot read, so one placeholder leaves the tree with no
+    node_modules at all (live: Calculator5).
+    """
+    import json
+    from cgx.answer.engine import _content_to_new_file_patch
+    from cgx.session.tasks.scaffold import (
+        _content_from_new_file_patch,
+        _reconcile_js_dep_placeholders,
+    )
+
+    pkg = json.dumps({
+        "dependencies": {"react": "{version}", "axios": "^1.7.2"},
+        "devDependencies": {"vite": "<version>"},
+    })
+    diffs = [{"file": "package.json",
+              "patch": _content_to_new_file_patch("package.json", pkg)}]
+    existing = [{"path": "package.json", "content": pkg}]
+    relaxed = _reconcile_js_dep_placeholders(
+        diffs=diffs, existing_with_content=existing)
+    assert sorted(relaxed) == ["react", "vite"]
+    rewritten = json.loads(_content_from_new_file_patch(diffs[0]["patch"]))
+    assert rewritten["dependencies"]["react"] == "*"
+    assert rewritten["devDependencies"]["vite"] == "*"
+    # A real specifier is left exactly as authored.
+    assert rewritten["dependencies"]["axios"] == "^1.7.2"
+    # The context copy is updated in place so later gates see the repair.
+    assert json.loads(existing[0]["content"])["dependencies"]["react"] == "*"
+
+
+def test_reconcile_js_dep_placeholders_noop_on_real_specifiers():
+    """A manifest with only resolvable ranges is left untouched."""
+    import json
+    from cgx.answer.engine import _content_to_new_file_patch
+    from cgx.session.tasks.scaffold import _reconcile_js_dep_placeholders
+    pkg = json.dumps({"dependencies": {"react": ">=18.0.0"}})
+    diffs = [{"file": "package.json",
+              "patch": _content_to_new_file_patch("package.json", pkg)}]
+    existing = [{"path": "package.json", "content": pkg}]
+    assert _reconcile_js_dep_placeholders(
+        diffs=diffs, existing_with_content=existing) == []
+    assert existing[0]["content"] == pkg
+
+
 def test_synthesize_missing_frontend_stylesheet_stub():
     """An entry point importing an ungenerated ./index.css gets a stub."""
     from cgx.answer.engine import _content_to_new_file_patch
@@ -6565,6 +6612,41 @@ def test_bootstrap_env_python_sources_without_manifest_are_python(tmp_path):
     (tmp_path / "backend" / "main.py").write_text(
         "from fastapi import FastAPI\n", encoding="utf-8")
     assert _detect_project_type(tmp_path) == "python"
+
+
+def test_provision_node_modules_failed_on_rejected_manifest(
+        tmp_path, monkeypatch):
+    """npm rejecting package.json -> ``failed`` (repairable), not ``skipped``.
+
+    Live (Calculator5): every version in the generated package.json was
+    the literal ``"{version}"`` and npm aborted with ``EINVALIDTAGNAME``.
+    Reporting that as ``skipped`` hid the only actionable error in the run.
+    """
+    from cgx.session.tasks import bootstrap_env as be
+    (tmp_path / "package.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(be.shutil, "which", lambda name: "/usr/bin/npm")
+    monkeypatch.setattr(
+        be, "_run_npm_install",
+        lambda root, timeout: (
+            1, 'npm error code EINVALIDTAGNAME\n'
+               'npm error Invalid tag name "{version}"'))
+    report = be._provision_node_modules(tmp_path, 60.0)
+    assert report["outcome"] == "failed"
+    assert report["error_code"] == "EINVALIDTAGNAME"
+
+
+def test_provision_node_modules_skipped_on_environmental_failure(
+        tmp_path, monkeypatch):
+    """An unreachable registry (no manifest code) stays non-fatal ``skipped``."""
+    from cgx.session.tasks import bootstrap_env as be
+    (tmp_path / "package.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(be.shutil, "which", lambda name: "/usr/bin/npm")
+    monkeypatch.setattr(
+        be, "_run_npm_install",
+        lambda root, timeout: (1, "npm error network ETIMEDOUT"))
+    report = be._provision_node_modules(tmp_path, 60.0)
+    assert report["outcome"] == "skipped"
+    assert report["error_code"] is None
 
 
 def test_pin_transitive_caps_werkzeug_for_flask_22(tmp_path):
@@ -7687,6 +7769,66 @@ def test_smoke_node_skips_without_node_modules(tmp_path, store, monkeypatch):
     monkeypatch.setattr(smoke_mod.shutil, "which", lambda name: "/usr/bin/npm")
     monkeypatch.setattr(smoke_mod.subprocess, "run", _no_run)
 
+    result = smoke_mod.run_smoke(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    assert result.outputs["outcome"] == "skipped"
+    assert result.artifact.content["build_smoke"] is None
+
+
+def _node_build_report(store, session_id, *, node_outcome, log_tail=""):
+    """Persist a BUILD_REPORT carrying a node provisioning sub-report."""
+    art = Artifact.new(
+        session_id=session_id, produced_by_task_id="t_boot",
+        kind=ArtifactKind.BUILD_REPORT,
+        content={"project_type": "node",
+                 "node": {"outcome": node_outcome, "note": "n",
+                          "log_tail": log_tail, "error_code": None}})
+    store.save_artifact(art)
+    return art
+
+
+def test_smoke_reports_rejected_manifest_as_build_failure(
+        tmp_path, store, monkeypatch):
+    """A node bootstrap npm rejected surfaces as a real SMOKE failure.
+
+    BOOTSTRAP_ENV ran npm and npm refused the generated package.json
+    (``EINVALIDTAGNAME`` on an unsubstituted ``"{version}"``), so there is
+    no node_modules -- but the absence is the defect, not an offline box.
+    SMOKE must fail rather than skip so the loop can repair the manifest.
+    """
+    from cgx.session.tasks import smoke as smoke_mod
+    t = _node_smoke_task(store, tmp_path, node_modules=False)
+    build = _node_build_report(
+        store, t.session_id, node_outcome="failed",
+        log_tail="npm error code EINVALIDTAGNAME\n"
+                 'npm error Invalid tag name "{version}"')
+    t.inputs["build_artifact_id"] = build.artifact_id
+
+    def _no_run(*a, **k):
+        raise AssertionError("build-smoke must not spawn npm for this path")
+
+    monkeypatch.setattr(smoke_mod.shutil, "which", lambda name: "/usr/bin/npm")
+    monkeypatch.setattr(smoke_mod.subprocess, "run", _no_run)
+
+    result = smoke_mod.run_smoke(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    assert result.outputs["outcome"] == "failed"
+    bs = result.artifact.content["build_smoke"]
+    assert bs["ok"] is False
+    assert "EINVALIDTAGNAME" in bs["stderr_tail"]
+
+
+def test_smoke_still_skips_on_environmental_node_skip(
+        tmp_path, store, monkeypatch):
+    """An environmental ``skipped`` node bootstrap keeps SMOKE skipping."""
+    from cgx.session.tasks import smoke as smoke_mod
+    t = _node_smoke_task(store, tmp_path, node_modules=False)
+    build = _node_build_report(store, t.session_id, node_outcome="skipped")
+    t.inputs["build_artifact_id"] = build.artifact_id
+    monkeypatch.setattr(smoke_mod.shutil, "which", lambda name: "/usr/bin/npm")
+    monkeypatch.setattr(smoke_mod.subprocess, "run",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("must not run")))
     result = smoke_mod.run_smoke(
         t, ExecutorDeps(project_root=str(tmp_path), store=store))
     assert result.outputs["outcome"] == "skipped"
@@ -10061,6 +10203,50 @@ def test_repair_executor_names_unresolved_entry_module_as_missing_file(
     assert constraints["kind"] == "missing_entry_module"
     assert [f["path"] for f in constraints["missing_files"]] == ["index.html"]
     assert constraints["missing_files"][0]["description"]
+
+
+def test_repair_executor_routes_rejected_manifest_to_package_json(
+        store, tmp_path: Path):
+    """A build-smoke break npm caused targets package.json, not source.
+
+    The install never ran (npm rejected the manifest), so the bundler
+    heuristics -- which would guess an arbitrary source file or the whole
+    tree -- must not run; the regenerate has to fix package.json itself.
+    """
+    from cgx.session.tasks import repair as _repair_module  # noqa: F401
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    smoke_task = TaskNode.new(
+        session.session_id, TaskKind.SMOKE, "smoke", inputs={})
+    smoke_artifact = Artifact.new(
+        session_id=session.session_id,
+        produced_by_task_id=smoke_task.task_id,
+        kind=ArtifactKind.SMOKE_REPORT,
+        content={"outcome": "failed",
+                 "failed_modules": [],
+                 "failure_signature": "smoke_import|npm install",
+                 "modules": [],
+                 "build_smoke": {
+                     "label": "npm install",
+                     "ok": False,
+                     "stderr_tail": (
+                         "npm error code EINVALIDTAGNAME\n"
+                         'npm error Invalid tag name "{version}"')}})
+    store.save_task(smoke_task)
+    store.save_artifact(smoke_artifact)
+    repair_task = TaskNode.new(
+        session.session_id, TaskKind.REPAIR, "repair",
+        inputs={"smoke_artifact_id": smoke_artifact.artifact_id,
+                "mode": SessionMode.GREENFIELD.value,
+                "repair_attempt": 1})
+    deps = ExecutorDeps(project_root=str(tmp_path), store=store)
+    from cgx.session.tasks.base import _REGISTRY
+    result = _REGISTRY[TaskKind.REPAIR](repair_task, deps)
+    assert result.failure is None
+    assert result.outputs["strategy"] == "regenerate"
+    constraints = result.outputs["extra_constraints"]
+    assert constraints["target_files"] == ["package.json"]
+    assert "package.json" in result.artifact.content["rationale"]
 
 
 def test_unresolved_entry_paths_parses_rollup_and_vite_wordings():

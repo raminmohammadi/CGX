@@ -315,9 +315,11 @@ def run_bootstrap_env(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     # ``package.json`` (a Python backend beside a JS/TS frontend) needs its
     # ``node_modules`` provisioned in the same pass so VERIFY's NpmRunner
     # exercises the JS stack against real dependencies rather than relying
-    # on its own best-effort install. Non-fatal, mirroring the node-only
-    # path: a missing npm / offline registry degrades to ``skipped`` and
-    # never fails the Python bootstrap or its outcome.
+    # on its own best-effort install. Mirrors the node-only path: a missing
+    # npm / offline registry degrades to ``skipped``, a manifest npm
+    # rejected reports ``failed``. Either way the JS result never changes
+    # the *Python* outcome -- it travels in the ``node`` sub-report, which
+    # SMOKE reads to surface a rejected manifest as a build failure.
     node_report: Optional[Dict[str, Any]] = None
     if (root / "package.json").is_file():
         node_report = _provision_node_modules(root, timeout)
@@ -583,16 +585,16 @@ def _pin_transitive_constraints(root: Path) -> List[str]:
 def _bootstrap_node(task: TaskNode, root: Path,
                     applied_files: List[str],
                     timeout: float) -> ExecutorResult:
-    """Provision ``node_modules`` for a JS/TS project (best-effort).
+    """Provision ``node_modules`` for a JS/TS project.
 
     Runs a bounded ``npm install`` so VERIFY's ``NpmRunner`` build/test
-    smoke has its dependencies. Provisioning is deliberately non-fatal:
-    an offline box (no ``npm``, or an install that cannot reach the
-    registry) degrades to ``skipped`` rather than failing the session --
-    the real build/test signal is produced downstream by VERIFY, and
-    hard-failing here would deny the loop that signal entirely. Emits a
-    ``BUILD_REPORT`` with ``project_type=node`` and no ``python_exe`` so
-    the Python-only API_CHECK / SMOKE gates skip cleanly.
+    smoke has its dependencies. An environment the session does not
+    control -- no ``npm`` binary, an unreachable registry -- degrades to
+    ``skipped``; a manifest npm itself rejected is reported as ``failed``
+    so the loop can repair the generated package.json (see
+    :func:`_provision_node_modules`). Emits a ``BUILD_REPORT`` with
+    ``project_type=node`` and no ``python_exe`` so the Python-only
+    API_CHECK / SMOKE gates skip cleanly.
     """
     report = _provision_node_modules(root, timeout)
     outcome = report["outcome"]
@@ -602,11 +604,13 @@ def _bootstrap_node(task: TaskNode, root: Path,
         outcome=outcome, pip_log_tail=report["log_tail"],
         applied_files=applied_files, style_issues=[],
         resolved_packages=[], pip_freeze_text="", note=report["note"],
+        node_report=report,
     )
     return ExecutorResult(
         outputs={
             "build_artifact_id": artifact.artifact_id,
             "outcome": outcome,
+            "node_outcome": outcome,
             "project_type": "node",
             "venv_path": None,
             "python_exe": None,
@@ -639,35 +643,81 @@ def _run_npm_install(root: Path, timeout: float) -> Tuple[int, str]:
     return proc.returncode, (proc.stderr or proc.stdout or "")[-800:]
 
 
+# npm error codes that indict the *manifest*, not the environment: the
+# registry was reachable and npm refused what the generated package.json
+# declares (an unparseable version range, a package that does not exist, a
+# malformed JSON body, an unsatisfiable peer tree). These are repairable by
+# rewriting the manifest, so they must not be reported as ``skipped``.
+# Everything else -- DNS, refused connections, timeouts -- is the sandbox's
+# problem and stays non-fatal.
+_NPM_MANIFEST_ERROR_CODES = (
+    "EINVALIDTAGNAME", "EINVALIDPACKAGENAME", "EJSONPARSE", "ERESOLVE",
+    "E404", "EUNSUPPORTEDPROTOCOL", "ENOVERSIONS", "ETARGET",
+)
+
+
+def _npm_manifest_error_code(log_tail: str) -> Optional[str]:
+    """The npm error code in ``log_tail`` that indicts the manifest, if any.
+
+    Returns the first :data:`_NPM_MANIFEST_ERROR_CODES` member present in
+    npm's output, or ``None`` when the failure is environmental (or npm
+    reported nothing recognisable).
+    """
+    text = (log_tail or "").upper()
+    for code in _NPM_MANIFEST_ERROR_CODES:
+        if code in text:
+            return code
+    return None
+
+
 def _provision_node_modules(root: Path, timeout: float) -> Dict[str, Any]:
-    """Provision ``node_modules`` (best-effort); return a node sub-report.
+    """Provision ``node_modules``; return a node sub-report.
 
     Shared by the node-only path (:func:`_bootstrap_node`) and the polyglot
-    Python path so both agree on what "provisioned" means. Deliberately
-    non-fatal: a missing ``npm`` binary or an install that cannot
-    materialise ``node_modules`` (offline registry) degrades to ``skipped``
-    rather than raising -- VERIFY's ``NpmRunner`` still produces the real
-    build/test signal, and hard-failing here would deny the loop that
-    signal entirely.
+    Python path so both agree on what "provisioned" means.
 
-    Returns ``{"outcome", "note", "log_tail"}`` where ``outcome`` is one of
-    ``succeeded`` / ``skipped`` and ``note`` is a human-readable reason (or
-    ``None`` on a clean install).
+    Two failure classes, deliberately distinguished. An environment the
+    session does not control -- no ``npm`` binary, an unreachable registry,
+    a timeout -- degrades to ``skipped``: VERIFY's ``NpmRunner`` still
+    produces the real build/test signal and hard-failing here would deny
+    the loop that signal entirely. A manifest npm itself rejected (live: a
+    generated package.json whose every version was the literal
+    ``"{version}"``, ``EINVALIDTAGNAME``) is a defect in generated code, so
+    it returns ``failed`` and SMOKE surfaces it as a build failure the
+    repair loop can act on. Reporting that as ``skipped`` hid the only
+    actionable error in the run while four repair rounds churned elsewhere.
+
+    Returns ``{"outcome", "note", "log_tail", "error_code"}`` where
+    ``outcome`` is ``succeeded`` / ``skipped`` / ``failed``.
     """
     node_modules = root / "node_modules"
     if shutil.which("npm") is None:
         return {"outcome": "skipped", "note": "npm not installed",
-                "log_tail": ""}
+                "log_tail": "", "error_code": None}
     if node_modules.is_dir():
         return {"outcome": "succeeded",
-                "note": "node_modules already present", "log_tail": ""}
+                "note": "node_modules already present",
+                "log_tail": "", "error_code": None}
     rc, log_tail = _run_npm_install(root, timeout)
     if node_modules.is_dir():
-        return {"outcome": "succeeded", "note": None, "log_tail": log_tail}
+        return {"outcome": "succeeded", "note": None,
+                "log_tail": log_tail, "error_code": None}
+    code = _npm_manifest_error_code(log_tail)
+    if code:
+        logger.warning(
+            "BOOTSTRAP_ENV: npm rejected package.json (%s); reporting a "
+            "repairable node bootstrap failure", code)
+        return {
+            "outcome": "failed",
+            "note": f"npm install rejected package.json ({code})",
+            "log_tail": log_tail,
+            "error_code": code,
+        }
     return {
         "outcome": "skipped",
         "note": f"npm install did not provision node_modules (rc={rc})",
         "log_tail": log_tail,
+        "error_code": None,
     }
 
 

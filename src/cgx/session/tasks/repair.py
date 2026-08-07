@@ -537,6 +537,23 @@ def _run_verify_collection_error_escalation(
     )
 
 
+def _npm_manifest_reject_code(build_stderr: str) -> str:
+    """npm's error code when it refused the manifest, else ``""``.
+
+    BOOTSTRAP_ENV reports a manifest npm rejected as a ``failed`` node
+    provisioning outcome and SMOKE surfaces it as a build-smoke break, so
+    the same log reaches here. Such a break names no source file -- the
+    defect is package.json itself -- and must not be routed at the
+    bundler-error heuristics, which would target an arbitrary file or the
+    whole tree.
+    """
+    try:
+        from cgx.session.tasks.bootstrap_env import _npm_manifest_error_code
+    except Exception:  # pragma: no cover - defensive
+        return ""
+    return _npm_manifest_error_code(build_stderr) or ""
+
+
 def _build_smoke_target_files(build_stderr: str,
                               project_root: str) -> Tuple[str, ...]:
     """Project-relative importer files a build-smoke resolution error names.
@@ -638,16 +655,29 @@ def _run_smoke_repair(task: TaskNode, deps: ExecutorDeps,
         # only fix, so fold the build error into the regenerate feedback.
         build_stderr = str(build_smoke_dict.get("stderr_tail") or "")
         label = str(build_smoke_dict.get("label") or "npm run build")
+        npm_reject = _npm_manifest_reject_code(build_stderr)
         # ... unless the bundler could not resolve its *entry module*, in
         # which case no amount of re-authoring helps: the file is absent
         # from the manifest, so the regenerate has to add it.
         missing_entries = unresolved_entry_paths(build_stderr)
-        if not missing_entries:
+        if not missing_entries and not npm_reject:
             # Same class of defect one level in: the entry document
             # resolved but names a script that was never generated.
             missing_entries = _absent_html_entry_specs(
                 build_stderr, str(deps.project_root))
-        if missing_entries:
+        if npm_reject:
+            # npm never installed anything: it rejected package.json
+            # itself, so no source file is at fault and the regenerate has
+            # to target the manifest.
+            target_files = ("package.json",)
+            rationale = (
+                f"npm refused to install the project ({npm_reject}) -- the "
+                "generated package.json is not valid, so no dependency was "
+                "provisioned and nothing downstream can build. Re-author "
+                "package.json with real, resolvable version ranges for "
+                "every dependency (no template placeholders) and package "
+                "names that exist on the npm registry.")
+        elif missing_entries:
             rationale = (
                 f"The JS/TS build-smoke (`{label}`) could not resolve its "
                 f"entry module(s) {', '.join(missing_entries)}: the "
