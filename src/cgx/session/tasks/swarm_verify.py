@@ -48,6 +48,11 @@ from cgx.session.tasks.swarm_plan import plan_specs
 from cgx.session.tasks.swarm_tools import edit_file
 
 _MAX_VERIFY_ROUNDS = 2
+# Failure-driven repair re-runs against the *current* red suite each round, so
+# a defect unmasked only after an earlier fix (a logic bug hidden behind an
+# import error that aborted collection) earns its own targeted repair rather
+# than being stranded by a single pass.
+_MAX_DYNAMIC_REPAIR_ROUNDS = 3
 
 
 def _load_plan(deps: ExecutorDeps, artifact_id: str) -> Dict[str, Any]:
@@ -238,9 +243,38 @@ _MODULE_ERR_RE = re.compile(
     r"(?:ModuleNotFoundError|ImportError):[^\n]*?['\"]([\w.]+)['\"]")
 
 
+def _repair_context_paths(localized: List[str], paths: List[str],
+                          specs: Dict[str, Any]) -> List[str]:
+    """The focused ``.py`` set to offer the repairer, localized files first.
+
+    A weak local model declines (returns ``{"files": []}``) when handed the
+    whole planned tree as context -- the signal drowns in unrelated files, so a
+    one-line ``import`` fix in a single module is never made. When the
+    traceback localized one or more files, offer *only* those plus their direct
+    ``depends_on`` (the sibling API the failing frame calls), so the prompt is
+    small and centred on the defect. With no localization (a runtime failure
+    naming no file) fall back to every planned ``.py`` -- there is no better
+    hint and small trees still fit. Order is localized-first so
+    ``generate_repair_files``' own ``max_files`` cap never drops a target.
+    """
+    py = [p for p in paths if p.endswith(".py")]
+    if not localized:
+        return py
+    keep: List[str] = []
+    for t in localized:
+        if t in py and t not in keep:
+            keep.append(t)
+        for dep in (specs.get(t, {}) or {}).get("depends_on") or []:
+            dep = str(dep)
+            if dep in py and dep not in keep:
+                keep.append(dep)
+    return keep or py
+
+
 def _dynamic_repair(env: Dict[str, Any], localized: List[str],
                     contents: Dict[str, str], goal: str, root: str,
-                    provider: Any, paths: List[str]) -> List[str]:
+                    provider: Any, paths: List[str],
+                    specs: Dict[str, Any]) -> List[str]:
     """Failure-driven repair of a red-but-structurally-clean tree.
 
     Blind regeneration re-asks with the same description and contracts, so a
@@ -248,18 +282,20 @@ def _dynamic_repair(env: Dict[str, Any], localized: List[str],
     off-by-one assertion). This instead threads the red suite's own output and
     the implicated file bodies into :func:`generate_repair_files`, which
     diagnoses the concrete failure and returns corrected content -- the step
-    that turns "detected the failure" into "produced working code". Every
-    planned ``.py`` is offered for context; ``localized`` (the traceback-
-    pointed paths) is flagged so the model starts at the failing frames. Only
-    files the repairer actually rewrote (and that pass its own source
-    validation) are written back. Returns the paths it changed.
+    that turns "detected the failure" into "produced working code". The context
+    is focused via :func:`_repair_context_paths` (the localized files plus
+    their dependencies, not the whole tree) so a weak model does not decline on
+    an over-large prompt; ``localized`` is flagged so it starts at the failing
+    frames. Only files the repairer actually rewrote (and that pass its own
+    source validation) are written back. Returns the paths it changed.
     """
     from cgx.answer.engine import generate_repair_files
     failure_text = str(env.get("output") or "")
     if not failure_text:
         return []
+    context_paths = _repair_context_paths(localized, paths, specs)
     files = [{"path": p, "content": contents[p]}
-             for p in paths if p.endswith(".py") and p in contents]
+             for p in context_paths if p in contents]
     if not files:
         return []
     try:
@@ -356,22 +392,27 @@ def swarm_verify(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     # breaks at runtime. Parse the failure, regenerate only the implicated
     # source files, and dry-run once more before the stage goes terminal.
     dyn_rounds = 0
-    if hard_structural_ok and env.get("outcome") == "failed":
+    while (hard_structural_ok and env.get("outcome") == "failed"
+           and dyn_rounds < _MAX_DYNAMIC_REPAIR_ROUNDS):
+        # Re-localize against the *current* failure each round: a red suite is
+        # exactly the defect the static gates cannot see, and a bug exposed
+        # only once an earlier import error is cleared (collection aborts at the
+        # first broken module, masking the rest) must get its own targeted pass.
         # Import-style failures localize to the file expected to provide the
         # missing module; other red suites (a wrong assertion, a runtime
-        # TypeError) name no such file but are still exactly what failure-driven
-        # repair exists to fix, so a red suite always earns one repair round --
-        # the import targets, when present, merely seed the localization hint.
+        # TypeError) name no such file but are still fair game -- the import
+        # targets, when present, merely seed the localization hint.
+        prev_output = str(env.get("output") or "")
         dyn_targets = _dynamic_regen_targets(env, paths)
-        dyn_rounds = 1
+        dyn_rounds += 1
         swarm_beat(project_root, "verify", "dynamic_regenerate",
-                   targets=dyn_targets)
+                   round=dyn_rounds, targets=dyn_targets)
         # Prefer failure-driven repair (fed the red suite's output); fall back
         # to blind regeneration of the import targets only when the repairer
         # declines, so a missing-module case still gets its provider
         # regenerated even if the repair pass produced nothing.
         repaired = _dynamic_repair(env, dyn_targets, contents, goal,
-                                   project_root, deps.provider, paths)
+                                   project_root, deps.provider, paths, specs)
         if not repaired and dyn_targets:
             _regenerate(dyn_targets, specs, contracts, goal, project_root,
                         deps.provider, paths)
@@ -379,7 +420,15 @@ def swarm_verify(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         gaps, import_w, contract_w = _structural_scan(
             paths, contents, contracts)
         structural_ok = not (gaps or import_w or contract_w)
+        hard_structural_ok = not (gaps or import_w)
         env = _run_env_dryrun(paths, project_root)
+        # Stop early when a round cannot make progress: nothing to act on (no
+        # repair and no regen target), or the failure is byte-for-byte
+        # unchanged -- another identical pass would only burn a round.
+        if not repaired and not dyn_targets:
+            break
+        if str(env.get("output") or "") == prev_output:
+            break
 
     tests_red = env.get("outcome") == "failed"
     verify_ok = structural_ok and not failed_paths and not tests_red

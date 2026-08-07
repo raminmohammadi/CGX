@@ -293,3 +293,64 @@ def test_soft_contract_warning_does_not_suppress_repair(tmp_path, monkeypatch):
     assert res.artifact.content["dynamic_regen_rounds"] == 1
     assert res.outputs["verify_ok"] is True
     assert (tmp_path / "app.py").read_text() == fixed
+
+
+def test_dynamic_repair_loops_until_green(tmp_path, monkeypatch):
+    # A collection-time import error aborts pytest at the first broken module,
+    # masking a logic bug behind it. The first repair clears the import; the
+    # second round -- keyed on the *now-visible* failure -- fixes the logic bug.
+    # A single-pass loop would strand the tree red; assert both rounds ran and
+    # the suite ends green.
+    (tmp_path / "app.py").write_text("x = 1\n", encoding="utf-8")
+
+    calls = {"env": 0}
+
+    def fake_env(paths, root):
+        calls["env"] += 1
+        if calls["env"] == 1:
+            return {"ran": True, "outcome": "failed",
+                    "output": ("app.py:1: in <module>\n"
+                               "NameError: name 'threading' is not defined")}
+        if calls["env"] == 2:
+            return {"ran": True, "outcome": "failed",
+                    "output": ("app.py:9: in shorten\n"
+                               "AttributeError: no attribute '_store'")}
+        return {"ran": True, "outcome": "passed", "output": ""}
+    monkeypatch.setattr(sv, "_run_env_dryrun", fake_env)
+
+    def fake_repair(provider, *, goal, failure_text, files,
+                    localized_files=None):
+        if "threading" in failure_text:
+            return {"app.py": "import threading\nx = 1\n"}
+        if "_store" in failure_text:
+            return {"app.py": "import threading\nx = 2\n"}
+        return {}
+    monkeypatch.setattr("cgx.answer.engine.generate_repair_files", fake_repair)
+
+    res = _run(tmp_path, _plan(tmp_path, ["app.py"]))
+    assert res.artifact.content["dynamic_regen_rounds"] == 2
+    assert res.outputs["verify_ok"] is True
+
+
+def test_repair_context_is_focused_on_localized_files_and_deps():
+    # A weak model declines when handed the whole tree, so the repair context
+    # must be the localized file(s) plus their direct depends_on -- not every
+    # planned .py. Here the traceback localized only shortener.py; its spec
+    # depends on store.py, so both are offered and the unrelated modules and
+    # tests are excluded.
+    paths = ["src/base62.py", "src/store.py", "src/shortener.py",
+             "tests/test_base62.py", "tests/test_store.py",
+             "tests/test_shortener.py"]
+    specs = {"src/shortener.py": {"path": "src/shortener.py",
+                                  "depends_on": ["src/store.py"]}}
+    ctx = sv._repair_context_paths(["src/shortener.py"], paths, specs)
+    assert ctx == ["src/shortener.py", "src/store.py"]
+
+
+def test_repair_context_falls_back_to_all_py_without_localization():
+    # No traceback localization (a runtime failure naming no file) -> offer
+    # every planned .py, since there is no better hint. Non-.py entries are
+    # excluded either way.
+    paths = ["a.py", "b.py", "README.md", "requirements.txt"]
+    ctx = sv._repair_context_paths([], paths, {})
+    assert ctx == ["a.py", "b.py"]
