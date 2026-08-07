@@ -2892,6 +2892,95 @@ def _compact_json_fragment(value: Any, max_chars: int = 300) -> str:
     return s
 
 
+def _format_function_contract(fn: Dict[str, Any]) -> str:
+    """Best signature string for a function contract entry.
+
+    Prefers an explicit ``signature``; otherwise synthesises one from
+    ``name`` + ``parameters`` (list of ``{name, type}``) + ``return_type`` so
+    a Tech Lead that emits structured fields (but no signature string) still
+    renders a real ``foo(a: int, b: int) -> int`` the model can implement.
+    Returns an empty string when nothing usable is present.
+    """
+    sig = str(fn.get("signature") or "").strip()
+    if sig:
+        return sig
+    name = str(fn.get("name") or "").strip()
+    if not name:
+        return ""
+    params = fn.get("parameters")
+    parts: List[str] = []
+    if isinstance(params, list):
+        for p in params:
+            if isinstance(p, dict):
+                pn = str(p.get("name") or "").strip()
+                pt = str(p.get("type") or "").strip()
+                if pn:
+                    parts.append(f"{pn}: {pt}" if pt else pn)
+            elif isinstance(p, str) and p.strip():
+                parts.append(p.strip())
+    ret = str(fn.get("return_type") or "").strip()
+    rendered = f"{name}({', '.join(parts)})"
+    if ret:
+        rendered += f" -> {ret}"
+    return rendered
+
+
+def _render_required_symbols_for_file(path: str, contracts: Any) -> str:
+    """Imperative directive naming the symbols THIS file must define.
+
+    The project-wide contract block declares shared interfaces but never says
+    which file owns which symbol, so a weak model given a terse per-file
+    purpose can drift into boilerplate (an empty settings class, an unrelated
+    import). This scopes the contract to ``path``: functions whose ``module``
+    is this file, dotted ``Class.method`` names grouped by their class, and
+    schemas bound to this module -- rendered as a hard "MUST define" list so
+    the model implements the plan instead of re-deriving it. Empty when the
+    contract binds nothing to this file.
+    """
+    if not isinstance(contracts, dict) or not path.endswith(".py"):
+        return ""
+    norm = path.replace("\\", "/")
+
+    def _bound_here(item: Dict[str, Any]) -> bool:
+        mod = str(item.get("module") or "").replace("\\", "/").strip()
+        return not mod or mod == norm
+
+    plain: List[str] = []
+    methods_by_class: Dict[str, List[str]] = {}
+    for fn in (contracts.get("functions") or []):
+        if not isinstance(fn, dict) or not _bound_here(fn):
+            continue
+        name = str(fn.get("name") or "").strip()
+        if not name:
+            continue
+        if "." in name:
+            owner, _, member = name.rpartition(".")
+            methods_by_class.setdefault(owner, []).append(member)
+        else:
+            plain.append(_format_function_contract(fn) or name)
+    classes: List[str] = []
+    for sc in (contracts.get("schemas") or []):
+        if not isinstance(sc, dict) or not _bound_here(sc):
+            continue
+        name = str(sc.get("name") or "").strip()
+        if name:
+            classes.append(name)
+
+    lines: List[str] = []
+    for cls in classes:
+        methods = methods_by_class.pop(cls, [])
+        suffix = (" with method(s) " + ", ".join(methods)) if methods else ""
+        lines.append(f"- class {cls}{suffix}")
+    for cls, methods in methods_by_class.items():
+        lines.append(f"- class {cls} with method(s) " + ", ".join(methods))
+    for sig in plain:
+        lines.append(f"- def {sig}")
+    if not lines:
+        return ""
+    return ("THIS FILE MUST DEFINE (implement fully -- no placeholders, no "
+            "unrelated boilerplate):\n" + "\n".join(lines))
+
+
 def _render_contracts_for_prompt(contracts: Any) -> str:
     """Render a normalized ``contracts`` block as a compact prompt fragment.
 
@@ -2964,11 +3053,15 @@ def _render_contracts_for_prompt(contracts: Any) -> str:
         for fn in functions:
             if not isinstance(fn, dict):
                 continue
-            sig = str(fn.get("signature") or fn.get("name") or "").strip()
+            sig = _format_function_contract(fn)
             if not sig:
                 continue
             module = str(fn.get("module") or "").strip()
-            lines.append(f"- {sig}" + (f" (in {module})" if module else ""))
+            desc = str(fn.get("description") or "").strip()
+            line = f"- {sig}" + (f" (in {module})" if module else "")
+            if desc:
+                line += f" -- {desc}"
+            lines.append(line)
         if lines:
             sections.append("Shared functions:\n" + "\n".join(lines))
 
@@ -3421,7 +3514,7 @@ _SINGLE_FILE_SYSTEM = (
     "- Use imports consistent with what already exists in the project.\n"
     "- ONLY import local modules/components if they are explicitly listed in the PROJECT MANIFEST. You are FORBIDDEN from importing ANY local file or component that is not in the PROJECT MANIFEST.\n"
     "- You MUST strictly adhere to the PROJECT CONTRACTS and Project Skeleton. ONLY use symbols, functions, classes, and variables that are explicitly defined there. Do NOT hallucinate undefined variables (e.g. app, API_BASE) if they are not exported by the skeleton.\n"
-    "- You MUST IMPLEMENT every symbol, function, and variable defined for this file in the Project Skeleton. If the skeleton says your file exports 'settings', you MUST define 'settings' in your file. Do NOT omit them!\n"
+    "- You MUST IMPLEMENT every symbol, function, class, and variable listed for this file in the REQUIRED SYMBOLS directive or Project Skeleton, with real working bodies. If a symbol is listed for this file, you MUST define it here; do NOT omit any. Do NOT add unrelated symbols, settings classes, or framework boilerplate the file's stated purpose did not ask for.\n"
     "- Assume the project root is the Python path. All imports must be absolute starting from the root directories: src., backend., or tests.. Never use 'import main', use 'from backend.main import router' (or whatever is explicitly in the skeleton).\n"
     "- Pay close attention to relative import paths (e.g., `./` vs `../`).\n"
     "- Do not repeat or regenerate any already-existing file.\n"
@@ -3432,7 +3525,6 @@ _SINGLE_FILE_SYSTEM = (
     "file, return {\"content\": \"\"} instead.\n"
     "- Satisfy the file's stated purpose exactly.\n"
     "Python import discipline (applies to every .py file in this project):\n"
-    "- We use Pydantic V2. `BaseSettings` MUST be imported from `pydantic_settings`, NOT `pydantic`.\n"
     "- src/ is a sys.path ROOT, NOT a package. There is no src/__init__.py.\n"
     "- Inside files under src/, import sibling modules by their flat name. "
     "RIGHT: `from chat_manager import ChatManager`. "
@@ -3752,6 +3844,35 @@ def _looks_newline_collapsed(content: str) -> bool:
     return any(_line_joins_imports(ln) for ln in body.splitlines())
 
 
+_PYDANTIC_IMPORT_PIN = (
+    "Pydantic import discipline: this project uses Pydantic V2. `BaseSettings` "
+    "MUST be imported from `pydantic_settings`, NOT `pydantic`."
+)
+
+
+def _project_uses_pydantic(
+        goal: str, description: str,
+        existing_files_with_content: Optional[List[Dict[str, str]]],
+        skill_names: str) -> bool:
+    """Whether the pydantic/settings import pin is relevant to this project.
+
+    The pin (``BaseSettings`` comes from ``pydantic_settings``) is essential
+    for FastAPI/pydantic projects but actively harmful on a plain-Python task:
+    a weak model reads an unconditional rule and reaches for a
+    ``pydantic_settings.BaseSettings`` stub it was never asked for. Gate it on
+    a real signal -- the goal/description/skills naming pydantic or FastAPI, or
+    an already-generated file that actually imports pydantic.
+    """
+    needles = ("pydantic", "fastapi", "basesettings", "basemodel")
+    hay = " ".join(t for t in (goal, description, skill_names) if t).lower()
+    if any(n in hay for n in needles):
+        return True
+    for f in (existing_files_with_content or []):
+        if "pydantic" in str(f.get("content") or "").lower():
+            return True
+    return False
+
+
 @traced("llm")
 def generate_single_scaffold_file(
     path: str,
@@ -3890,7 +4011,15 @@ def generate_single_scaffold_file(
             "framework or language than the one declared for this project.\n\n"
         )
         system = _SINGLE_FILE_SYSTEM + header + skill_fragment
-    
+
+    # Append the pydantic import pin only when the project actually uses
+    # pydantic/FastAPI. Kept out of the base prompt because, unconditional, it
+    # seeds a `pydantic_settings.BaseSettings` boilerplate attractor that weak
+    # models over-apply to plain-Python files they were never asked to settle.
+    if _project_uses_pydantic(goal, description,
+                              existing_files_with_content, skill_names_str):
+        system = system + "\n\n" + _PYDANTIC_IMPORT_PIN
+
     emit_trace("scaffold_rules", rules=system)
 
     # Defense-in-depth: hard-pin framework conventions by file extension so
@@ -3931,6 +4060,9 @@ def generate_single_scaffold_file(
     parts.append(f"FILE TO GENERATE:\nPath: {path}\nPurpose: {description}")
     if layer:
         parts.append(f"Layer: {layer}")
+    required_block = _render_required_symbols_for_file(path, contracts)
+    if required_block:
+        parts.append(required_block)
     # Per-call prompt + response budget scaled to the active provider's
     # model context window. Local 8K models get tight caps; cloud
     # models with 200K+ windows get generous ones. See

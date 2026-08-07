@@ -102,6 +102,46 @@ def test_import_break_triggers_regeneration_that_heals(tmp_path, monkeypatch):
     assert (tmp_path / "app.py").read_text() == "from models import User\n"
 
 
+def test_empty_test_file_is_a_coverage_gap(tmp_path, monkeypatch):
+    # A planned pytest module that parses but defines no collectible test is a
+    # coverage hole (the d3 E2E symptom): the plan promised a test the tree
+    # never delivers. When regeneration cannot fill it, verify is red.
+    (tmp_path / "app.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+    (tmp_path / "test_app.py").write_text("", encoding="utf-8")
+    monkeypatch.setattr(
+        sv, "generate_file",
+        lambda **kw: type("O", (), {"ok": False, "content": ""})())
+    res = _run(tmp_path, _plan(tmp_path, ["app.py", "test_app.py"]))
+    assert res.outputs["verify_ok"] is False
+    assert "test_app.py" in res.outputs["coverage_gaps"]
+
+
+def test_empty_test_file_heals_when_regenerated(tmp_path, monkeypatch):
+    (tmp_path / "app.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+    # A test file that parses but only holds an import -> no collectible test.
+    (tmp_path / "test_app.py").write_text("import app\n", encoding="utf-8")
+
+    def _heal(**kw):
+        return type("O", (), {"ok": True,
+                              "content": "def test_f():\n    assert True\n"})()
+    monkeypatch.setattr(sv, "generate_file", _heal)
+    res = _run(tmp_path, _plan(tmp_path, ["app.py", "test_app.py"]))
+    assert res.outputs["verify_ok"] is True
+    assert res.artifact.content["regen_rounds"] >= 1
+
+
+def test_collectible_test_helpers():
+    assert sv._is_pytest_test_path("tests/test_x.py")
+    assert sv._is_pytest_test_path("x_test.py")
+    assert not sv._is_pytest_test_path("tests/conftest.py")
+    assert not sv._is_pytest_test_path("app.py")
+    assert sv._has_collectible_test("def test_a():\n    assert True\n")
+    assert sv._has_collectible_test(
+        "class TestX:\n    def test_a(self):\n        assert True\n")
+    assert not sv._has_collectible_test("import os\n\nx = 1\n")
+    assert not sv._has_collectible_test("")
+
+
 def test_unwritten_developer_file_fails_verify(tmp_path):
     (tmp_path / "app.py").write_text("x = 1\n", encoding="utf-8")
     res = _run(tmp_path, _plan(tmp_path, ["app.py"]), failed_paths=["app.py"])
@@ -161,3 +201,51 @@ def test_dynamic_regen_heals_red_but_structurally_clean_tree(
     assert res.artifact.content["dynamic_regen_rounds"] == 1
     assert healed["n"] == 1
     assert res.outputs["verify_ok"] is True
+
+
+def test_dynamic_repair_feeds_failure_back_and_heals(tmp_path, monkeypatch):
+    # A structurally-clean tree whose test file uses a pytest API wrongly is
+    # red at collection, not at import. Blind regeneration would re-emit the
+    # same broken test; failure-driven repair is fed the pytest output and
+    # rewrites the file correctly. Assert the repair path (not blind regen)
+    # healed it.
+    (tmp_path / "app.py").write_text(
+        "def add(a, b):\n    return a + b\n", encoding="utf-8")
+    (tmp_path / "test_app.py").write_text(
+        "from app import add\nimport pytest\n\n"
+        "@pytest.raises(ValueError)\ndef test_add():\n    add(1, 2)\n",
+        encoding="utf-8")
+
+    calls = {"env": 0}
+
+    def fake_env(paths, root):
+        calls["env"] += 1
+        if calls["env"] == 1:
+            return {"ran": True, "outcome": "failed",
+                    "output": ("tests/test_app.py:4: in <module>\n"
+                               "    @pytest.raises(ValueError)\n"
+                               "TypeError: 'RaisesExc' object is not callable")}
+        return {"ran": True, "outcome": "passed", "output": ""}
+    monkeypatch.setattr(sv, "_run_env_dryrun", fake_env)
+
+    fixed = ("from app import add\nimport pytest\n\n"
+             "def test_add():\n    with pytest.raises(ValueError):\n"
+             "        add(1, 2)\n")
+
+    def fake_repair(provider, *, goal, failure_text, files,
+                    localized_files=None):
+        # The red suite's output must be threaded in for a real repair.
+        assert "RaisesExc" in failure_text
+        assert "test_app.py" in (localized_files or [])
+        return {"test_app.py": fixed}
+    monkeypatch.setattr("cgx.answer.engine.generate_repair_files", fake_repair)
+
+    # Blind regen must NOT be the healer when repair succeeds.
+    def _no_blind(**kw):
+        raise AssertionError("blind regeneration should not run after repair")
+    monkeypatch.setattr(sv, "generate_file", _no_blind)
+
+    res = _run(tmp_path, _plan(tmp_path, ["app.py", "test_app.py"]))
+    assert res.artifact.content["dynamic_regen_rounds"] == 1
+    assert res.outputs["verify_ok"] is True
+    assert (tmp_path / "test_app.py").read_text() == fixed

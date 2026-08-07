@@ -4676,6 +4676,49 @@ def test_render_contracts_declares_success_status_and_message():
     assert "success_status" not in no_status
 
 
+def test_format_function_contract_prefers_and_synthesises_signature():
+    """A signature is used verbatim; else one is built from name/params/return."""
+    from cgx.answer.engine import _format_function_contract
+    assert _format_function_contract(
+        {"signature": "foo(a: int) -> int"}) == "foo(a: int) -> int"
+    synth = _format_function_contract({
+        "name": "total_area",
+        "parameters": [{"name": "circles", "type": "list"}],
+        "return_type": "float"})
+    assert synth == "total_area(circles: list) -> float"
+    # A bare string parameter and a missing type still render.
+    assert _format_function_contract({
+        "name": "g", "parameters": ["x"]}) == "g(x)"
+    # Nothing usable -> empty string.
+    assert _format_function_contract({}) == ""
+
+
+def test_render_required_symbols_scopes_contract_to_file():
+    """The per-file directive lists only symbols bound to that path."""
+    from cgx.answer.engine import _render_required_symbols_for_file
+    contracts = {
+        "functions": [
+            {"name": "total_area", "module": "src/geo.py",
+             "parameters": [{"name": "circles", "type": "list"}],
+             "return_type": "float"},
+            {"name": "Circle.area", "module": "src/geo.py",
+             "parameters": [], "return_type": "float"},
+            {"name": "other", "module": "src/elsewhere.py"},
+        ],
+        "schemas": [{"name": "Circle", "module": "src/geo.py",
+                     "fields": {"radius": "float"}}],
+    }
+    block = _render_required_symbols_for_file("src/geo.py", contracts)
+    assert "class Circle with method(s) area" in block
+    assert "def total_area(circles: list) -> float" in block
+    # A symbol bound to another module is not leaked into this file.
+    assert "other" not in block
+    # A file the contract binds nothing to gets no directive.
+    assert _render_required_symbols_for_file("src/empty.py", contracts) == ""
+    # Non-Python paths never receive the directive.
+    assert _render_required_symbols_for_file("README.md", contracts) == ""
+
+
 def _cross_seam_manifest():
     return {"plan_md": "p", "layers": [{"name": "app", "files": [
         {"path": "backend/app.py",

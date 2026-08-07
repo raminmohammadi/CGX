@@ -5,7 +5,10 @@ verifies the *whole* tree once every file has been attempted, mirroring the
 graded checks the greenfield chain runs after SCAFFOLD:
 
 1. **Skeleton coverage** -- every planned path exists on disk and (for ``.py``)
-   parses; a missing or unparseable file is a coverage gap.
+   parses; a missing or unparseable file is a coverage gap. A planned pytest
+   module (``test_*.py`` / ``*_test.py``) that parses but defines no
+   collectible test is also a gap -- an empty test file is a promised test the
+   tree does not deliver, not a satisfied one.
 2. **Import coherence** -- :func:`cross_check_first_party_imports` flags a
    ``from <first-party> import <name>`` whose ``name`` no generated file
    defines (a phantom/misrooted import).
@@ -16,9 +19,13 @@ Coverage gaps and import breaks name a concrete file, so a bounded
 regeneration loop re-runs the :mod:`swarm_generate` ladder on just those files
 (``_MAX_VERIFY_ROUNDS`` rounds) before giving up. Finally an environment
 dry-run installs any missing imports (:func:`preflight_install`) and runs the
-project's tests (:func:`run_tests_on_disk`) so a red suite is visible. The
-merged result is persisted as a ``SWARM_VERIFY_REPORT`` artifact and the router
-ends the session COMPLETED only when the tree is structurally clean.
+project's tests (:func:`run_tests_on_disk`) so a red suite is visible. When the
+tree is structurally clean but the suite is nonetheless red -- a defect the
+static gates cannot see -- the failure output is fed back through
+:func:`generate_repair_files` (failure-driven repair) so the model corrects the
+specific error rather than blindly re-emitting the same broken file. The merged
+result is persisted as a ``SWARM_VERIFY_REPORT`` artifact and the router ends
+the session COMPLETED only when the tree is structurally clean.
 """
 
 from __future__ import annotations
@@ -61,8 +68,52 @@ def _collect_contents(paths: List[str], root: str) -> Dict[str, str]:
     return out
 
 
+def _is_pytest_test_path(path: str) -> bool:
+    """True when ``path`` is a ``.py`` file pytest collects as a test module.
+
+    Matches pytest's default naming (``test_*.py`` / ``*_test.py``); a helper
+    or fixtures module under ``tests/`` that does not follow the convention is
+    not collected, so it is excluded here too.
+    """
+    p = (path or "").strip().lower()
+    if not p.endswith(".py"):
+        return False
+    base = p.rsplit("/", 1)[-1]
+    return base.startswith("test_") or base.endswith("_test.py")
+
+
+def _has_collectible_test(src: str) -> bool:
+    """True when a parsed test module defines at least one pytest test.
+
+    A ``test_*`` function at module level, or a ``Test*`` class containing a
+    ``test_*`` method -- pytest's default collection. Assumes ``src`` parses
+    (the caller flags a syntax error as a gap first), so a green ``ast.parse``
+    on an empty ``test_*.py`` no longer masks a file with nothing to run.
+    """
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:  # pragma: no cover - caller already flagged this
+        return False
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name.startswith("test"):
+                return True
+        elif isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
+            for sub in node.body:
+                if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                        and sub.name.startswith("test"):
+                    return True
+    return False
+
+
 def _coverage_gaps(paths: List[str], contents: Dict[str, str]) -> List[str]:
-    """Planned paths missing from disk, or ``.py`` files that will not parse."""
+    """Planned paths missing from disk, unparsable ``.py``, or empty tests.
+
+    A planned pytest module that parses but defines no collectible test is a
+    coverage hole -- the plan promised a test the tree does not deliver -- so
+    it is named as a gap and drives a targeted regenerate, rather than being
+    silently accepted because the (empty) file happened to parse.
+    """
     gaps: List[str] = []
     for p in paths:
         src = contents.get(p)
@@ -73,6 +124,9 @@ def _coverage_gaps(paths: List[str], contents: Dict[str, str]) -> List[str]:
             try:
                 ast.parse(src)
             except SyntaxError:
+                gaps.append(p)
+                continue
+            if _is_pytest_test_path(p) and not _has_collectible_test(src):
                 gaps.append(p)
     return gaps
 
@@ -184,6 +238,43 @@ _MODULE_ERR_RE = re.compile(
     r"(?:ModuleNotFoundError|ImportError):[^\n]*?['\"]([\w.]+)['\"]")
 
 
+def _dynamic_repair(env: Dict[str, Any], localized: List[str],
+                    contents: Dict[str, str], goal: str, root: str,
+                    provider: Any, paths: List[str]) -> List[str]:
+    """Failure-driven repair of a red-but-structurally-clean tree.
+
+    Blind regeneration re-asks with the same description and contracts, so a
+    weak model reproduces the same runtime defect (a misused pytest API, an
+    off-by-one assertion). This instead threads the red suite's own output and
+    the implicated file bodies into :func:`generate_repair_files`, which
+    diagnoses the concrete failure and returns corrected content -- the step
+    that turns "detected the failure" into "produced working code". Every
+    planned ``.py`` is offered for context; ``localized`` (the traceback-
+    pointed paths) is flagged so the model starts at the failing frames. Only
+    files the repairer actually rewrote (and that pass its own source
+    validation) are written back. Returns the paths it changed.
+    """
+    from cgx.answer.engine import generate_repair_files
+    failure_text = str(env.get("output") or "")
+    if not failure_text:
+        return []
+    files = [{"path": p, "content": contents[p]}
+             for p in paths if p.endswith(".py") and p in contents]
+    if not files:
+        return []
+    try:
+        repaired = generate_repair_files(
+            provider, goal=goal, failure_text=failure_text,
+            files=files, localized_files=localized)
+    except Exception:  # pragma: no cover - repair is best-effort
+        return []
+    written: List[str] = []
+    for path, content in (repaired or {}).items():
+        edit_file(path, content, root)
+        written.append(path)
+    return written
+
+
 def _dynamic_regen_targets(env: Dict[str, Any], paths: List[str]) -> List[str]:
     """Planned source files implicated by a red suite's import failures.
 
@@ -264,8 +355,14 @@ def swarm_verify(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             dyn_rounds = 1
             swarm_beat(project_root, "verify", "dynamic_regenerate",
                        targets=dyn_targets)
-            _regenerate(dyn_targets, specs, contracts, goal, project_root,
-                        deps.provider, paths)
+            # Prefer failure-driven repair (fed the red suite's output); fall
+            # back to blind regeneration only when the repairer declines, so a
+            # missing-module case still gets its provider regenerated.
+            repaired = _dynamic_repair(env, dyn_targets, contents, goal,
+                                       project_root, deps.provider, paths)
+            if not repaired:
+                _regenerate(dyn_targets, specs, contracts, goal, project_root,
+                            deps.provider, paths)
             contents = _collect_contents(paths, project_root)
             gaps, import_w, contract_w = _structural_scan(
                 paths, contents, contracts)

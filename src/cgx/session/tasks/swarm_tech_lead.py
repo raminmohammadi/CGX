@@ -42,14 +42,34 @@ _SYSTEM_PROMPT = (
     '        "depends_on": ["src/bar.py"]}\n'
     "     ]}\n"
     "  ],\n"
-    '  "contracts": {"functions": [], "schemas": []}\n'
+    '  "contracts": {\n'
+    '    "functions": [\n'
+    '      {"name": "total_area", "module": "src/foo.py",\n'
+    '       "parameters": [{"name": "circles", "type": "list"}],\n'
+    '       "return_type": "float",\n'
+    '       "description": "sum of each circle area"},\n'
+    '      {"name": "Circle.area", "module": "src/foo.py",\n'
+    '       "parameters": [], "return_type": "float",\n'
+    '       "description": "area of this circle"}\n'
+    "    ],\n"
+    '    "schemas": [\n'
+    '      {"name": "Circle", "module": "src/foo.py",\n'
+    '       "fields": {"radius": "float"}}\n'
+    "    ]\n"
+    "  }\n"
     "}\n\n"
     "Rules: every file has a unique relative path; depends_on lists ONLY\n"
     "other planned paths; order files so dependencies come first; include at\n"
     "least one runnable non-test source file. Commit to ONE layout -- put\n"
     "every source module under 'src/' OR every module at the top level, never\n"
     "a mix -- and give each test file a depends_on edge to the module it\n"
-    "exercises so imports stay consistent. Output ONLY the JSON."
+    "exercises so imports stay consistent.\n"
+    "CONTRACTS ARE MANDATORY AND BINDING: every function, method, and class the\n"
+    "objective requires MUST appear in contracts with a \"module\" naming the\n"
+    "EXACT planned path that defines it. Name a method as \"ClassName.method\".\n"
+    "Give each function real \"parameters\" and a \"return_type\". Do not invent\n"
+    "symbols, files, or dependencies the objective did not ask for.\n"
+    "Output ONLY the JSON."
 )
 
 
