@@ -28,7 +28,9 @@ from cgx.session.models import (
 )
 from cgx.session.scaffold_validate import (missing_stack_entry_files,
                                            stack_entry_description)
-from cgx.session.scope import estimate_scope, unrunnable_descope_needles
+from cgx.session.scope import (estimate_scope, feature_label,
+                               unmet_requested_features,
+                               unrunnable_descope_needles)
 from cgx.session.tasks.base import (
     ExecutorDeps,
     ExecutorResult,
@@ -142,6 +144,13 @@ def run_decompose(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
 
     layers = _order_manifest_layers(layers)
 
+    # Scope-loss warning (P2.3): the critique and the de-scope can between
+    # them delete every file backing a capability the goal explicitly
+    # asked for -- ses_fa6f72a9d3da4217 lost package.json and shipped a
+    # plan with no React frontend at all, silently. Advisory only: name
+    # the loss so it is visible in the log, the trace, and the plan.
+    unmet = _unmet_features(layers, scope)
+
     # Mandatory endpoint contracts for a cross-language client/server manifest
     # (P0a). A JSX/TSX/Vue client beside a Python backend route talks over
     # HTTP, so a request-key rename (client sends ``operator`` while the
@@ -184,6 +193,7 @@ def run_decompose(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             "contracts": contracts,
             "project_complexity": scope.complexity,
             "scope": scope.as_dict(),
+            "unmet_features": list(unmet),
         },
     )
     return ExecutorResult(
@@ -197,12 +207,40 @@ def run_decompose(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             "critique_removed": len(critique_removed),
             "descoped_files": len(descope_removed),
             "coherence_surgery": report.surgery_score,
+            "unmet_features": list(unmet),
         },
         artifact=artifact,
     )
 
 
 # --------------------- helpers ---------------------
+
+def _unmet_features(layers: List[Dict[str, Any]], scope: Any) -> List[str]:
+    """Capabilities the goal asked for that no manifest file backs.
+
+    Best-effort and non-blocking: it warns, records a ``plan_coverage``
+    trace record, and returns the feature names for the plan artifact.
+    """
+    try:
+        entries = [
+            (str(f.get("path") or ""),
+             " ".join(str(v) for k, v in f.items()
+                      if k != "depends_on" and isinstance(v, str)))
+            for f in _manifest_files(layers)]
+        unmet = list(unmet_requested_features(
+            tuple(getattr(scope, "requested_features", ()) or ()), entries))
+    except Exception:  # pragma: no cover - defensive: advisory signal only
+        logger.exception("DECOMPOSE: feature coverage check crashed")
+        return []
+    if unmet:
+        logger.warning(
+            "DECOMPOSE: the goal asks for %s but no file in the plan "
+            "provides it; the objective is not achievable as planned",
+            "; ".join(feature_label(f) for f in unmet))
+    emit_trace("plan_coverage", stage="decompose", unmet=unmet,
+               requested=list(getattr(scope, "requested_features", ()) or ()))
+    return unmet
+
 
 def _apply_plan_critique(layers: List[Dict[str, Any]], goal: str, scope: Any,
                          deps: ExecutorDeps) -> tuple:

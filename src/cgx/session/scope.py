@@ -116,6 +116,49 @@ def unrunnable_descope_needles(
     return tuple(needles)
 
 
+# Filename suffixes that can only belong to a given capability, used as
+# evidence that it survived the plan critique. Checked alongside the
+# capability's own keyword needles.
+_FEATURE_EVIDENCE_SUFFIXES: Dict[str, Tuple[str, ...]] = {
+    "frontend": (".jsx", ".tsx", ".vue", ".svelte", ".js", ".ts", ".html",
+                 ".css", "package.json"),
+    "containerization": ("dockerfile", "docker-compose.yml",
+                         "docker-compose.yaml"),
+}
+
+
+def unmet_requested_features(
+        requested_features: Tuple[str, ...],
+        entries: List[Tuple[str, str]]) -> Tuple[str, ...]:
+    """Requested capabilities that no surviving manifest file evidences.
+
+    ``entries`` are ``(path, description)`` pairs from the post-critique
+    manifest. A capability counts as covered when some file's path ends
+    in one of its :data:`_FEATURE_EVIDENCE_SUFFIXES` or when its own
+    keyword needles appear in a path/description. Advisory only: the
+    match is a heuristic, so callers warn rather than block.
+    """
+    unmet: List[str] = []
+    haystacks = [(str(path or "").lower(),
+                  f" {str(path or '')} {str(text or '')} ".lower())
+                 for path, text in entries]
+    for feature in requested_features:
+        suffixes = _FEATURE_EVIDENCE_SUFFIXES.get(feature, ())
+        needles = _FEATURE_KEYWORDS.get(feature, ())
+        covered = any(
+            any(path.endswith(sfx) for sfx in suffixes)
+            or any(needle in blob for needle in needles)
+            for path, blob in haystacks)
+        if not covered:
+            unmet.append(feature)
+    return tuple(unmet)
+
+
+def feature_label(feature: str) -> str:
+    """Human-readable name for a capability, for log/warning text."""
+    return _FEATURE_LABELS.get(feature, feature)
+
+
 def _detect_features(goal: str) -> Tuple[str, ...]:
     padded = f" {(goal or '').lower()} "
     found = [

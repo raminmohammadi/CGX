@@ -4452,6 +4452,70 @@ def test_decompose_keeps_explicitly_requested_e2e(store, monkeypatch):
     assert result.outputs["descoped_files"] == 0
 
 
+def test_decompose_warns_when_a_requested_feature_has_no_files(
+        store, monkeypatch, caplog):
+    """A goal asking for React whose plan is Python-only is reported.
+
+    The critique dropped package.json in ses_fa6f72a9d3da4217 and no JS
+    file survived, so the stated objective was unreachable from the plan
+    onwards with nothing said about it.
+    """
+    import logging
+    from cgx.session.tasks.decompose import run_decompose
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    monkeypatch.setattr(
+        "cgx.answer.engine.plan_scaffold_manifest",
+        lambda *a, **kw: {"plan_md": "p", "layers": [{"name": "api", "files": [
+            {"path": "app/main.py", "description": "FastAPI app"},
+            {"path": "tests/test_main.py", "description": "unit tests",
+             "depends_on": ["app/main.py"]}]}]})
+    t = TaskNode.new(
+        session.session_id, TaskKind.DECOMPOSE, "d",
+        inputs={"prior_goal":
+                "create a calculator app using fast-api and react frontend",
+                "answers": {}})
+    with caplog.at_level(logging.WARNING):
+        result = run_decompose(
+            t, ExecutorDeps(provider=_StubProvider(""), store=store))
+    assert result.failure is None
+    assert result.outputs["unmet_features"] == ["frontend"]
+    assert result.artifact.content["unmet_features"] == ["frontend"]
+    assert "frontend framework" in caplog.text
+    # Advisory only: the plan still ships.
+    assert result.artifact.content["layers"]
+
+
+def test_decompose_reports_no_gap_when_the_frontend_survives(
+        store, monkeypatch):
+    """A surviving JSX file counts as coverage -- no false positive."""
+    from cgx.session.tasks.decompose import run_decompose
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    monkeypatch.setattr(
+        "cgx.answer.engine.plan_scaffold_manifest",
+        lambda *a, **kw: {
+            "plan_md": "p",
+            "layers": [{"name": "app", "files": [
+                {"path": "app/main.py", "description": "FastAPI app"},
+                {"path": "web/src/App.jsx", "description": "calculator UI"}]}],
+            # The cross-seam gate is a separate concern; satisfy it so the
+            # coverage assertion is what this case exercises.
+            "contracts": {"endpoints": [
+                {"method": "POST", "path": "/calc",
+                 "request": {"expression": "str"},
+                 "response": {"result": "float"}}]}})
+    t = TaskNode.new(
+        session.session_id, TaskKind.DECOMPOSE, "d",
+        inputs={"prior_goal":
+                "create a calculator app using fast-api and react frontend",
+                "answers": {}})
+    result = run_decompose(
+        t, ExecutorDeps(provider=_StubProvider(""), store=store))
+    assert result.failure is None
+    assert result.outputs["unmet_features"] == []
+
+
 def test_plan_descope_traced_to_agent_log_when_enabled(
         store, monkeypatch, tmp_path):
     """With tracing on, the de-scope outcome lands as a trace record."""
