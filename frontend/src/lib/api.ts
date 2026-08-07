@@ -200,7 +200,10 @@ export type TaskKind =
   | "scaffold"
   | "bootstrap_env"
   | "repair"
-  | "summarize";
+  | "summarize"
+  | "swarm_tech_lead"
+  | "swarm_developer"
+  | "swarm_verify";
 
 export type TaskNodeStatus =
   | "pending"

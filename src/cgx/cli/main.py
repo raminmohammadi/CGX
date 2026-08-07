@@ -219,6 +219,9 @@ def _cmd_agent(args: argparse.Namespace) -> None:
     """Run one unattended turn of the session agent loop."""
     from cgx.cli.tui import ops
 
+    if getattr(args, "target_dir", None):
+        args.project_root = args.target_dir
+
     state = _state_from_args(args)
     goal = " ".join(args.goal)
     _run_cli_stream(lambda ce: ops.agent_events(
@@ -342,6 +345,8 @@ def main(argv: list[str] | None = None) -> None:
     p_ag = sub.add_parser(
         "agent", help="Run the session agent loop toward a goal.")
     p_ag.add_argument("goal", nargs="+", help="The goal for the agent.")
+    p_ag.add_argument("--target-dir", default=None,
+                      help="Explicit target directory for swarm outputs (overrides project-root).")
     _add_provider_flags(p_ag)
     p_ag.set_defaults(func=_cmd_agent)
 

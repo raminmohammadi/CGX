@@ -149,10 +149,31 @@ def _merge_import_warnings(*groups: List[Dict[str, Any]]) -> List[Dict[str, Any]
             merged.append(w)
     return merged
 
+def _check_phantom_third_party_imports(paths: List[str], contents: Dict[str, str], allowed: List[str], root: str) -> List[Dict[str, Any]]:
+    from cgx.codegen.env_manager import _extract_imports_python, _is_local_package, _STDLIB_TOP
+    warnings = []
+    allowed_set = set(allowed)
+    for p in paths:
+        if not p.endswith(".py"): continue
+        src = contents.get(p)
+        if not src: continue
+        imports = _extract_imports_python(src)
+        for imp in imports:
+            if imp in _STDLIB_TOP or _is_local_package(root, imp):
+                continue
+            if imp not in allowed_set:
+                warnings.append({
+                    "kind": "phantom_third_party",
+                    "file": p,
+                    "module": imp,
+                    "reason": f"Imported third-party module '{imp}' is not in the plan's allowed third_party_dependencies."
+                })
+    return warnings
+
 
 def _structural_scan(
         paths: List[str], contents: Dict[str, str],
-        contracts: Dict[str, Any]) -> Tuple[List[str], List[Dict[str, Any]],
+        contracts: Dict[str, Any], root: str) -> Tuple[List[str], List[Dict[str, Any]],
                                             List[Dict[str, Any]]]:
     """Run the three structural checks; never raises (each gate is defensive).
 
@@ -171,7 +192,11 @@ def _structural_scan(
         resolve_w = resolve_first_party_imports(contents, paths)
     except Exception:  # pragma: no cover - the gate is best-effort
         resolve_w = []
-    imports = _merge_import_warnings(symbol_w, resolve_w)
+    try:
+        phantom_3p_w = _check_phantom_third_party_imports(paths, contents, contracts.get("third_party_dependencies") or [], root)
+    except Exception:
+        phantom_3p_w = []
+    imports = _merge_import_warnings(symbol_w, resolve_w, phantom_3p_w)
     try:
         contract = check_contract_compliance(contents, contracts)
     except Exception:  # pragma: no cover - the gate is best-effort
@@ -367,7 +392,7 @@ def swarm_verify(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     while True:
         contents = _collect_contents(paths, project_root)
         gaps, import_w, contract_w = _structural_scan(paths, contents,
-                                                      contracts)
+                                                      contracts, project_root)
         targets = _regen_targets(gaps, import_w)
         if not targets or rounds >= _MAX_VERIFY_ROUNDS:
             break
@@ -418,7 +443,7 @@ def swarm_verify(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
                         deps.provider, paths)
         contents = _collect_contents(paths, project_root)
         gaps, import_w, contract_w = _structural_scan(
-            paths, contents, contracts)
+            paths, contents, contracts, project_root)
         structural_ok = not (gaps or import_w or contract_w)
         hard_structural_ok = not (gaps or import_w)
         env = _run_env_dryrun(paths, project_root)

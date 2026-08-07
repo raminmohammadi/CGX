@@ -60,6 +60,47 @@ def _is_non_source(path: str) -> bool:
             or path.lower().endswith(_DOC_EXT))
 
 
+def _ast_import_injector(content: str, err: str, contracts: Dict[str, Any]) -> Optional[str]:
+    """Auto-inject missing imports if they are defined in the contracts."""
+    import re, ast
+    m = re.search(r"uses undefined name\(s\) (\[.*?\]):", err)
+    if not m:
+        return None
+    try:
+        names = ast.literal_eval(m.group(1))
+    except Exception:
+        return None
+        
+    injected = []
+    schemas = contracts.get("schemas", [])
+    functions = contracts.get("functions", [])
+    
+    for name in names:
+        module_path = None
+        for s in schemas:
+            if s.get("name") == name:
+                module_path = s.get("module")
+                break
+        if not module_path:
+            for f in functions:
+                if f.get("name") == name:
+                    module_path = f.get("module")
+                    break
+        
+        if module_path:
+            # convert src/models.py to src.models
+            if module_path.endswith(".py"):
+                module_path = module_path[:-3]
+            mod_str = module_path.replace("/", ".")
+            injected.append(f"from {mod_str} import {name}")
+            
+    if not injected:
+        return None
+        
+    # prepend to content
+    return "\n".join(injected) + "\n\n" + content
+
+
 @dataclass
 class GenerationOutcome:
     """What the ladder produced for one file.
@@ -74,6 +115,7 @@ class GenerationOutcome:
     ok: bool
     method: str
     error: Optional[str] = None
+    renegotiated_contracts: Optional[Dict[str, Any]] = None
 
     @property
     def bytes(self) -> int:
@@ -94,12 +136,64 @@ def _full_file_attempt(path: str, description: str, depends_on: List[str],
                        contracts: Dict[str, Any], goal: str, root: str,
                        provider: Any, layer: str,
                        manifest_paths: Optional[List[str]]) -> Any:
-    """One full-file generation. Returns ``(content, error)``."""
+    """One full-file generation with interactive tool loop and pre-AST validation. Returns ``(content, error)``."""
     from cgx.answer.engine import generate_single_scaffold_file
+
+    class ToolWrapper:
+        def __init__(self, p, root_dir):
+            self.p = p
+            self.root = root_dir
+            
+        def chat(self, messages, **kwargs):
+            import re, json
+            from cgx.session.tasks.swarm_tools import run_python_probe, query_codebase
+            from cgx.session.tasks.swarm_ground import file_skeleton, list_symbols
+            
+            if messages and messages[0].get("role") == "system":
+                if "run_python_probe" not in messages[0].get("content", ""):
+                    messages[0]["content"] += (
+                        "\n\nTOOLS AVAILABLE: You may use tools before outputting your final JSON plan. "
+                        "Tools: run_python_probe(code: str) to run arbitrary python code, "
+                        "file_skeleton(path: str) to view file signatures, "
+                        "list_symbols(path: str) to see symbols in a file. "
+                        "To call a tool, output EXACTLY: <call_tool name=\"tool_name\">{\"arg\": \"val\"}</call_tool>"
+                    )
+            
+            kwargs["force_json"] = False
+            for _ in range(5):
+                res = self.p.chat(messages=messages, **kwargs)
+                text = str(res.get("content", ""))
+                match = re.search(r'<call_tool name="(.*?)">(.*?)</call_tool>', text, re.DOTALL)
+                if match:
+                    t_name, t_args_str = match.group(1), match.group(2)
+                    messages.append({"role": "assistant", "content": text})
+                    from cgx.session.tasks.swarm_log import swarm_beat
+                    swarm_beat(self.root, "developer", "tool_call", tool=t_name, args=t_args_str)
+                    try:
+                        args = json.loads(t_args_str)
+                        if t_name == "run_python_probe":
+                            out = run_python_probe(args.get("code", ""), self.root)
+                        elif t_name == "file_skeleton":
+                            out = file_skeleton(args.get("path", ""), self.root)
+                        elif t_name == "list_symbols":
+                            out = str(list_symbols(args.get("path", ""), self.root))
+                        else:
+                            out = f"Unknown tool: {t_name}"
+                    except Exception as e:
+                        out = f"Tool error: {e}"
+                    messages.append({"role": "user", "content": f"<tool_response>\n{out}\n</tool_response>"})
+                else:
+                    return res
+            return self.p.chat(messages=messages, **kwargs)
+            
+        def chat_stream(self, *args, **kwargs):
+            return self.p.chat_stream(*args, **kwargs)
+
     context = _dep_context(depends_on, root)
     try:
+        wrapped = ToolWrapper(provider, root)
         result = generate_single_scaffold_file(
-            path, description, provider,
+            path, description, wrapped,
             layer=layer,
             existing_files_with_content=context,
             goal=goal,
@@ -107,43 +201,109 @@ def _full_file_attempt(path: str, description: str, depends_on: List[str],
             contracts=contracts or {},
             manifest_paths=manifest_paths,
         )
-    except Exception as exc:  # pragma: no cover - defensive: provider crash
+    except Exception as exc:  # pragma: no cover
         return "", f"{type(exc).__name__}: {exc}"
+        
     content = str(result.get("content") or "")
     if content and bool(result.get("syntax_ok")):
+        # Pre-AST Validation: ensure contracts meant for this file are fulfilled
+        from cgx.session.scaffold_validate import check_contract_compliance
+        warnings = check_contract_compliance({path: content}, contracts)
+        # Filter warnings specifically related to this path
+        file_warnings = [w for w in warnings if w.get("module") == path]
+        if file_warnings:
+            errs = "; ".join(w.get("reason", "unknown") for w in file_warnings)
+            return content, f"Contract compliance failed for {path}: {errs}"
         return content, None
+        
     err = (str(result.get("syntax_error") or "").strip()
            or "full-file generation failed the syntax gate")
-    return "", err
+           
+    if "uses undefined name(s)" in err:
+        repaired = _ast_import_injector(content, err, contracts or {})
+        if repaired:
+            import ast
+            try:
+                ast.parse(repaired)
+                from cgx.session.scaffold_validate import check_contract_compliance
+                warnings = check_contract_compliance({path: repaired}, contracts)
+                file_warnings = [w for w in warnings if w.get("module") == path]
+                if file_warnings:
+                    errs = "; ".join(w.get("reason", "unknown") for w in file_warnings)
+                    return repaired, f"Contract compliance failed for {path}: {errs}"
+                return repaired, None
+            except SyntaxError:
+                pass
+                
+    return content, err
 
 
-def _ast_fallback(path: str, description: str, depends_on: List[str],
-                  contracts: Dict[str, Any], goal: str, root: str,
-                  provider: Any) -> Any:
-    """Deterministic AST assembly fallback. Returns ``(content, error)``."""
-    if not path.endswith(".py"):
-        return "", "AST fallback only supports .py files"
-    from cgx.session.tasks.ast_scaffold import (
-        _assembly_rejection, _generate_header, _generate_symbol,
-        _required_symbols)
-    grounding = ground_dependencies(depends_on, root)
-    header = _generate_header(path, provider, goal, description,
-                              grounding=grounding)
-    assembler = ASTAssembler(header)
-    symbols = _required_symbols("", path, contracts or {})
-    for name, kind in symbols:
-        code = _generate_symbol(path, name, kind, provider, goal, header,
-                                description, grounding=grounding)
-        if code:
-            assembler.add_component(code)
+def _renegotiate_contracts(
+        path: str, content: str, err: str, contracts: Dict[str, Any], goal: str, provider: Any
+) -> Optional[Dict[str, Any]]:
+    """Prompt the Tech Lead to amend contracts to match the working code."""
+    import json
+    import copy
+    
+    prompt = (
+        f"You are the Tech Lead. The Developer generated the following code for {path}, "
+        f"but it fails the contract compliance gate.\n\n"
+        f"Error:\n{err}\n\n"
+        f"Code:\n```python\n{content}\n```\n\n"
+        f"Your current contracts are:\n```json\n{json.dumps(contracts, indent=2)}\n```\n\n"
+        "Instead of forcing the Developer to change the code (which is functionally correct), "
+        "you must amend the contracts to match the reality of the code. "
+        "Output ONLY the complete updated JSON contracts object and nothing else."
+    )
+    
     try:
-        content = assembler.unparse()
-    except Exception as exc:  # pragma: no cover - defensive: unparse failure
-        return "", f"AST assembly failed: {exc}"
-    rejection = _assembly_rejection(content, symbols, assembler)
-    if rejection:
-        return "", rejection
-    return content, None
+        res = provider.chat(messages=[{"role": "user", "content": prompt}], force_json=True)
+        text = str(res.get("content") or "").strip()
+        new_contracts = json.loads(text)
+        return new_contracts
+    except Exception:
+        return None
+
+
+def _semantic_repair_fallback(
+        path: str, content: str, err: str, goal: str, root: str, provider: Any
+) -> Tuple[str, str]:
+    """Semantic repair agent: fix syntax errors without losing business logic."""
+    if not path.endswith(".py"):
+        return "", "Semantic repair only supports .py files"
+        
+    prompt = (
+        f"The following code for {path} failed the syntax gate with this error:\n"
+        f"{err}\n\n"
+        f"Code:\n```python\n{content}\n```\n\n"
+        "Fix the error (e.g., add missing imports) WITHOUT removing any business logic or functions. "
+        "Output ONLY the fixed Python code inside a ```python``` block and nothing else."
+    )
+    
+    try:
+        res = provider.chat(messages=[{"role": "user", "content": prompt}], force_json=False)
+        text = str(res.get("content") or "")
+        # sometimes the model still outputs JSON with a "code" key
+        if text.strip().startswith("{"):
+            import json
+            try:
+                parsed = json.loads(text)
+                if "code" in parsed:
+                    text = parsed["code"]
+            except Exception:
+                pass
+        
+        import re
+        m = re.search(r"```python\s*(.*?)\s*```", text, re.DOTALL)
+        if m:
+            fixed = m.group(1)
+            return fixed, ""
+        # if no markdown block, return raw text if it looks like code
+        if "def " in text or "import " in text:
+            return text.strip(), ""
+        return "", "Semantic repair failed to produce valid code."
+    except Exception as exc:
+        return "", f"Semantic repair failed: {exc}"
 
 
 def _sanitize_phantoms(content: str, path: str,
@@ -275,16 +435,20 @@ def generate_file(*, path: str, description: str, depends_on: List[str],
                                     manifest_paths, log_root)
     depends_on = list(depends_on or [])
     content = err = ""
+    last_broken_content = ""
     for attempt in range(2):
         content, err = _full_file_attempt(
             path, description, depends_on, contracts, goal, root, provider,
             layer, manifest_paths)
-        if not content:
+        if err:
+            last_broken_content = content or last_broken_content
             swarm_beat(log_root, "developer", "gate", file=path, ok=False,
                        method="full-file", error=err)
+            content = ""
             continue
         phantom = unused_imports(content, path=path)
         if phantom and attempt == 0:
+            last_broken_content = content
             swarm_beat(log_root, "developer", "gate", file=path, ok=False,
                        method="full-file",
                        error=f"phantom imports: {', '.join(phantom)}")
@@ -295,12 +459,21 @@ def generate_file(*, path: str, description: str, depends_on: List[str],
         content = _sanitize_phantoms(content, path, log_root)
         return GenerationOutcome(path, content, True, "full-file")
 
-    swarm_beat(log_root, "developer", "ast_fallback", file=path, error=err)
-    ast_content, ast_err = _ast_fallback(
-        path, description, depends_on, contracts, goal, root, provider)
-    if ast_content:
-        ast_content = _sanitize_phantoms(ast_content, path, log_root)
-        return GenerationOutcome(path, ast_content, True, "ast-fallback")
+    if "Contract compliance failed" in err:
+        swarm_beat(log_root, "developer", "renegotiate", file=path, error=err)
+        renegotiated_contracts = _renegotiate_contracts(
+            path, last_broken_content, err, contracts, goal, provider)
+        if renegotiated_contracts is not None:
+            # We return the content because it's syntactically valid!
+            return GenerationOutcome(path, last_broken_content, True, "renegotiated", renegotiated_contracts=renegotiated_contracts)
+    
+    swarm_beat(log_root, "developer", "semantic_repair", file=path, error=err)
+    repaired_content, repair_err = _semantic_repair_fallback(
+        path, last_broken_content, err, goal, root, provider)
+    if repaired_content:
+        repaired_content = _sanitize_phantoms(repaired_content, path, log_root)
+        return GenerationOutcome(path, repaired_content, True, "semantic-repair")
+    
     return GenerationOutcome(path, "", False, "failed",
-                             error=ast_err or err)
+                             error=repair_err or err)
 

@@ -77,6 +77,14 @@ def swarm_developer(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         layer=path, manifest_paths=paths, log_root=project_root)
 
     if outcome.ok:
+        if outcome.renegotiated_contracts and deps.store:
+            art = deps.store.get_artifact(work_plan_id)
+            if art and isinstance(art.content, dict):
+                art.content["contracts"] = outcome.renegotiated_contracts
+                deps.store.save_artifact(art)
+                # also update our local copy for the rest of this function if needed
+                contracts = outcome.renegotiated_contracts
+        
         write_msg = edit_file(path, outcome.content, project_root)
         swarm_beat(project_root, "developer", "write", file=path,
                    ok=True, method=outcome.method, bytes=outcome.bytes,

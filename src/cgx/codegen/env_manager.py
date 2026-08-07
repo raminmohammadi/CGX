@@ -396,6 +396,10 @@ def find_missing_python_packages(
     return missing
 
 
+def _has_uv() -> bool:
+    import shutil
+    return shutil.which("uv") is not None
+
 def install_packages(
     packages: List[str],
     python: Optional[str] = None,
@@ -404,27 +408,39 @@ def install_packages(
 
     ``python`` is the interpreter path (defaults to the running one).
     This is designed to install into the SANDBOX's Python environment.
+    Gracefully falls back to `uv pip` if standard pip fails or is unavailable.
     """
     if not packages:
         return {}
     py = python or sys.executable
     results: Dict[str, bool] = {}
+    has_uv = _has_uv()
+    
     for pkg in packages:
         logger.info("env_manager: installing missing package %r", pkg)
         try:
-            proc = subprocess.run(
-                [py, "-m", "pip", "install", "--quiet", "--no-input", pkg],
-                capture_output=True, text=True, timeout=120,
+            # Try pip first
+            cmd = [py, "-m", "pip", "install", "--quiet", "--no-input", pkg]
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            if proc.returncode == 0:
+                results[pkg] = True
+                continue
+                
+            # If pip failed (maybe missing), try uv if available
+            if has_uv:
+                cmd = ["uv", "pip", "install", "--python", py, "--quiet", pkg]
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+                if proc.returncode == 0:
+                    results[pkg] = True
+                    continue
+                    
+            logger.warning(
+                "env_manager: install %r failed (rc=%d): %s",
+                pkg, proc.returncode, proc.stderr[:200],
             )
-            ok = proc.returncode == 0
-            results[pkg] = ok
-            if not ok:
-                logger.warning(
-                    "env_manager: pip install %r failed (rc=%d): %s",
-                    pkg, proc.returncode, proc.stderr[:200],
-                )
+            results[pkg] = False
         except Exception as exc:
-            logger.warning("env_manager: pip install %r raised %s", pkg, exc)
+            logger.warning("env_manager: install %r raised %s", pkg, exc)
             results[pkg] = False
     return results
 
@@ -602,8 +618,13 @@ def _pip_freeze_versions(python: Optional[str] = None) -> Dict[str, str]:
             [py, "-m", "pip", "freeze"],
             capture_output=True, text=True, timeout=120,
         )
+        if proc.returncode != 0 and _has_uv():
+            proc = subprocess.run(
+                ["uv", "pip", "freeze", "--python", py],
+                capture_output=True, text=True, timeout=120,
+            )
     except Exception as exc:
-        logger.warning("env_manager: pip freeze raised %s", exc)
+        logger.warning("env_manager: freeze raised %s", exc)
         return out
     if proc.returncode != 0:
         return out

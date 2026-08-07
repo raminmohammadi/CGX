@@ -86,3 +86,58 @@ def patch_file(path: str, find: str, replace: str, cwd: str) -> str:
         return f"Successfully patched {path}"
     except Exception as e:
         return f"Error patching file: {e}"
+
+def run_python_probe(code: str, cwd: str) -> str:
+    """Run a Python snippet in a sandbox REPL to introspect libraries.
+    
+    Useful for checking if a module, class, or method exists (e.g. using dir() or help()).
+    This runs in a temporary virtual environment or subprocess.
+    """
+    import tempfile
+    
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        f.write(code)
+        temp_path = f.name
+        
+    try:
+        # Run the code using the project's venv python if available, else system python
+        python_exe = os.path.join(cwd, ".venv", "bin", "python")
+        if not os.path.exists(python_exe):
+            python_exe = "python3"
+            
+        result = subprocess.run(
+            [python_exe, temp_path],
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=20
+        )
+        return result.stdout or "Success (no output)"
+    except subprocess.TimeoutExpired:
+        return "Error: Probe timed out after 20 seconds."
+    except Exception as e:
+        return f"Error executing probe: {e}"
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+def search_web(query: str) -> str:
+    """A simple web search tool for the Tech Lead to fetch API documentation snippets."""
+    import urllib.request
+    import urllib.parse
+    import re
+    
+    url = 'https://html.duckduckgo.com/html/?q=' + urllib.parse.quote(query)
+    req = urllib.request.Request(
+        url, 
+        headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+    )
+    try:
+        response = urllib.request.urlopen(req, timeout=10)
+        html = response.read().decode('utf-8')
+        snippets = re.findall(r'<a class=\"result__snippet[^>]*>(.*?)</a>', html, re.IGNORECASE | re.DOTALL)
+        clean_snippets = [re.sub(r'<[^>]+>', '', s).strip() for s in snippets]
+        return '\\n\\n'.join(clean_snippets[:3]) if clean_snippets else "No relevant snippets found."
+    except Exception as e:
+        return f"Search failed: {e}"

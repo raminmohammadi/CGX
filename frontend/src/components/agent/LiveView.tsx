@@ -155,7 +155,7 @@ export function LiveView({
             )}
             {focused && progress?.[focused.task_id]
               && focused.status === "in_progress" && (
-              <LiveProgress p={progress[focused.task_id]} />
+              <LiveProgress p={progress[focused.task_id]} taskKind={focused.kind} />
             )}
             <ErrorBoundary label="active-task">
               <ActiveTaskPanel
@@ -366,18 +366,23 @@ export function PriorSessions({
 // A ``failed`` beat is rendered distinctly (amber) and the running
 // failed tally is always shown so a failed file is never mistaken for a
 // silent counter reset (on failure ``index`` does not advance).
-function LiveProgress({ p }: { p: TaskProgress }) {
+function LiveProgress({ p, taskKind }: { p: TaskProgress; taskKind?: string }) {
   const pct = p.total > 0
     ? Math.min(100, Math.round((p.index / p.total) * 100)) : 0;
   const failedCount = p.failed_count ?? 0;
   const isFailed = p.status === "failed";
+  
+  let prefix = "Generating";
+  if (taskKind === "SWARM_TECH_LEAD") prefix = "Planning";
+  if (taskKind === "SWARM_VERIFY") prefix = "Verifying";
+  
   return (
     <div className={`mb-3 rounded-lg border p-3 ${isFailed
       ? "border-amber-500/40 bg-amber-950/20"
       : "border-emerald-500/30 bg-emerald-950/20"}`}>
       <div className={`flex items-center justify-between text-[11px] font-mono ${isFailed ? "text-amber-300" : "text-emerald-300"}`}>
         <span>
-          Generating {p.index}/{p.total}
+          {prefix} {p.index}/{p.total}
           {failedCount > 0 && (
             <span className="ml-2 text-amber-400">
               · {failedCount} failed

@@ -44,6 +44,10 @@ _SYSTEM_PROMPT = (
     "     ]}\n"
     "  ],\n"
     '  "contracts": {\n'
+    '    "endpoints": [\n'
+    '      {"path": "/ping", "method": "GET",\n'
+    '       "description": "Returns pong"}\n'
+    '    ],\n'
     '    "functions": [\n'
     '      {"name": "total_area", "module": "src/foo.py",\n'
     '       "parameters": [{"name": "circles", "type": "list"}],\n'
@@ -56,7 +60,8 @@ _SYSTEM_PROMPT = (
     '    "schemas": [\n'
     '      {"name": "Circle", "module": "src/foo.py",\n'
     '       "fields": {"radius": "float"}}\n'
-    "    ]\n"
+    "    ],\n"
+    '    "third_party_dependencies": ["fastapi", "pydantic", "pytest"]\n'
     "  }\n"
     "}\n\n"
     "Rules: every file has a unique relative path; depends_on lists ONLY\n"
@@ -77,13 +82,21 @@ _SYSTEM_PROMPT = (
     "EXACT planned path that defines it. Name a method as \"ClassName.method\".\n"
     "Give each function real \"parameters\" and a \"return_type\". Do not invent\n"
     "symbols, files, or dependencies the objective did not ask for.\n"
-    "Output ONLY the JSON."
+    "THIRD-PARTY LIBRARIES: If you use third-party libraries (e.g. FastAPI, Pydantic), you MUST "
+    "actively search the web to retrieve their latest API signatures and include them in the contracts.\n"
+    "You can use tools by outputting: <call_tool name=\"search_web\">{\"query\": \"...\"}</call_tool>.\n"
+    "If you call a tool, wait for the response before outputting the final JSON.\n"
+    "Output ONLY the JSON when you are ready to finalize the plan."
 )
 
 
 def _ask_for_plan(provider: Any, goal: str,
                   correction: str) -> Dict[str, Any]:
-    """Prompt the model for a draft plan JSON (empty dict on failure)."""
+    """Prompt the model for a draft plan JSON (empty dict on failure), supporting tool calls."""
+    from cgx.session.tasks.swarm_tools import search_web
+    import re
+    import json
+    
     user = f"Objective:\n{goal}\n"
     if correction:
         user += f"\nYour previous plan was rejected: {correction}\nFix it."
@@ -91,12 +104,63 @@ def _ask_for_plan(provider: Any, goal: str,
         {"role": "system", "content": _SYSTEM_PROMPT},
         {"role": "user", "content": user},
     ]
-    try:
-        res = provider.chat(messages=messages, force_json=True)
-    except Exception:  # pragma: no cover - defensive: provider crash
-        return {}
-    parsed = parse_plan_reply(str(res.get("content", "")))
-    return parsed or {}
+    for _ in range(5):
+        try:
+            # We don't force_json=True here immediately because we allow tool tags.
+            # Some providers fail if force_json is True and it outputs a tool tag instead of JSON.
+            # Actually, we can use force_json=False.
+            res = provider.chat(messages=messages, force_json=False)
+        except Exception:  # pragma: no cover
+            return {}
+        
+        text = str(res.get("content", ""))
+        tool_match = re.search(r'<call_tool name="(.*?)">(.*?)</call_tool>', text, re.DOTALL)
+        if tool_match:
+            tool_name = tool_match.group(1)
+            tool_args_str = tool_match.group(2)
+            messages.append({"role": "assistant", "content": text})
+            from cgx.session.tasks.swarm_log import swarm_beat
+            swarm_beat(None, "tech_lead", "tool_call", tool=tool_name, args=tool_args_str)
+            if tool_name == "search_web":
+                try:
+                    args = json.loads(tool_args_str)
+                    tool_res = search_web(args.get("query", ""))
+                except Exception as e:
+                    tool_res = f"Tool error: {e}"
+            else:
+                tool_res = f"Unknown tool: {tool_name}"
+            messages.append({"role": "user", "content": f"<tool_response>{tool_res}</tool_response>"})
+        else:
+            parsed = parse_plan_reply(text)
+            return parsed or {}
+    return {}
+
+
+def _auto_repair_plan_dependencies(plan: Dict[str, Any]) -> Dict[str, Any]:
+    """Auto-inject depends_on for test files if the model forgot."""
+    source_map = {}
+    for layer in plan.get("layers", []):
+        for f in layer.get("files", []):
+            path = f.get("path", "")
+            base = path.split("/")[-1]
+            if path.endswith(".py") and not (base.startswith("test_") or base.endswith("_test.py")):
+                source_map[base[:-3]] = path
+
+    for layer in plan.get("layers", []):
+        for f in layer.get("files", []):
+            path = f.get("path", "")
+            base = path.split("/")[-1]
+            is_test = base.startswith("test_") or base.endswith("_test.py")
+            if path.endswith(".py") and is_test and not f.get("depends_on"):
+                target_base = None
+                if base.startswith("test_"):
+                    target_base = base[5:-3]
+                elif base.endswith("_test.py"):
+                    target_base = base[:-8]
+                
+                if target_base and target_base in source_map:
+                    f["depends_on"] = [source_map[target_base]]
+    return plan
 
 
 @register_executor(TaskKind.SWARM_TECH_LEAD)
@@ -106,8 +170,13 @@ def swarm_tech_lead(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         return ExecutorResult(
             failure="No provider configured for Swarm mode.", retryable=False)
 
+    import os
     goal = str(task.inputs.get("goal") or "")
     project_root = task.inputs.get("project_root") or deps.project_root or "."
+    project_root = os.path.abspath(project_root)
+    if not os.path.exists(project_root):
+        os.makedirs(project_root, exist_ok=True)
+        
     swarm_beat(project_root, "tech_lead", "plan", goal=goal[:200])
 
     correction = ""
@@ -124,6 +193,7 @@ def swarm_tech_lead(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         # an untested tree or abort planning over missing boilerplate. Coverage
         # runs first so the manifest the scaffolding scans includes the tests.
         plan = ensure_scaffolding(ensure_test_coverage(normalize_plan(draft)))
+        plan = _auto_repair_plan_dependencies(plan)
         paths = ordered_paths(plan)
         swarm_beat(project_root, "tech_lead", "normalize",
                    attempt=attempt, file_count=len(paths))
