@@ -27,6 +27,9 @@ stateDiagram-v2
     SWARM_TECH_LEAD --> SWARM_DEVELOPER : buildable plan (file 0)
     SWARM_TECH_LEAD --> [*] : no buildable plan (FAILED)
     SWARM_DEVELOPER --> SWARM_DEVELOPER : next file (i -> i+1)
+    SWARM_DEVELOPER --> AutoRepair : compilation error
+    AutoRepair --> SWARM_DEVELOPER : AST Inject / Renegotiate / Semantic Repair
+    AutoRepair --> [*] : unrecoverable error
     SWARM_DEVELOPER --> SWARM_VERIFY : all files attempted
     SWARM_VERIFY --> SWARM_VERIFY : red suite -> targeted regen / failure-driven repair (bounded)
     SWARM_VERIFY --> [*] : report (COMPLETED / FAILED)
@@ -83,14 +86,19 @@ Each Developer task implements exactly one file (`file_index` into the plan):
    (`generate_single_scaffold_file`, gated on `ast.parse` / `syntax_ok`, one
    re-ask) -> deterministic `ASTAssembler` header + per-symbol path, with the
    required symbols derived from the plan `contracts`; empty / symbol-less
-   modules are rejected. Two additional hard gates run on the parsed source:
+   modules are rejected. Three additional auto-repair mechanisms run here:
+   - **AST Import Injector**: Identifies missing standard library or first-party
+     imports and injects them directly into the AST, bypassing the LLM.
+   - **Contract Renegotiation**: If a signature changes during implementation,
+     the contract is dynamically renegotiated rather than failing the build.
+   - **Semantic Repair Fallback**: For more complex logical errors, a targeted
+     fallback repair is attempted.
    - **Phantom-import gate** (`import_audit.py`): a provably-unused, non-side-
      effecting import fails the file (re-ask, then strip as a last resort).
    - **No-stub gate** (`_contract_stub_symbols` / `_body_is_stub`): a contract
      function or method pinned to this module whose body is a placeholder
      (`pass` / `...` / docstring-only / `raise NotImplementedError`) is
-     rejected with a hardened re-ask naming the offenders, so a stub such as
-     `encode()->pass` can no longer clear the structural gates and ship.
+     rejected with a hardened re-ask naming the offenders.
 4. **Write**: `edit_file` for a greenfield (new) file; `patch_file` +
    `query_codebase` seeding for a brownfield (existing) edit.
 5. Emits per-file progress beats and a structured per-turn log; outputs

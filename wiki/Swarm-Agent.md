@@ -37,7 +37,13 @@ Implements **exactly one planned file per turn**, in dependency order.
 - Runs a generation ladder for source files: full-file generation (gated on a
   real `ast.parse`, one re-ask) falling back to a deterministic AST assembler
   that builds the module header + each required symbol from the plan
-  contracts.
+  contracts. It features advanced auto-repair mechanisms:
+  - **AST Import Injector**: Identifies missing standard library or first-party
+    imports and injects them directly into the AST, bypassing the LLM.
+  - **Contract Renegotiation**: If a signature changes during implementation,
+    the contract is dynamically renegotiated rather than failing the build.
+  - **Semantic Repair Fallback**: For more complex logical errors, a targeted
+    fallback repair is attempted.
 - Applies two hard code-quality gates on the parsed source: a **phantom-import
   gate** (a provably-unused import fails the file) and a **no-stub gate** (a
   contract function or method whose body is just `pass` / `...` / a docstring /

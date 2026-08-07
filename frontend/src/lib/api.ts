@@ -231,7 +231,7 @@ export type ArtifactKind =
   | "api_check_report";
 
 export type FactKind =
-  | "file" | "symbol" | "parameter" | "anchor" | "llm_call";
+  | "file" | "symbol" | "parameter" | "anchor" | "llm_call" | "swarm_beat";
 
 export type DecisionKind =
   | "choose_path"

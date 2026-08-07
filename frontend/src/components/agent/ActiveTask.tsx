@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { Brain, Check, ChevronDown, ChevronRight, Loader2 } from "lucide-react";
+import { Brain, Check, ChevronDown, ChevronRight, Loader2, Activity, CheckCircle2, XCircle, Globe, Wrench } from "lucide-react";
 import type {
   ArtifactDTO, DecisionDTO, FactDTO, TaskNodeDTO,
 } from "../../lib/api";
@@ -25,6 +25,14 @@ export function ActiveTaskPanel(props: ActiveTaskProps) {
     () => (task && facts
       ? facts.filter(
           (f) => f.kind === "llm_call" && f.surfaced_in_task_id === task.task_id,
+        )
+      : []),
+    [task, facts],
+  );
+  const swarmBeats = useMemo(
+    () => (task && facts
+      ? facts.filter(
+          (f) => f.kind === "swarm_beat" && f.surfaced_in_task_id === task.task_id,
         )
       : []),
     [task, facts],
@@ -69,6 +77,11 @@ export function ActiveTaskPanel(props: ActiveTaskProps) {
       {llmFacts.length > 0 && (
         <ErrorBoundary label="llm-traces">
           <LLMTraces facts={llmFacts} />
+        </ErrorBoundary>
+      )}
+      {swarmBeats.length > 0 && (
+        <ErrorBoundary label="swarm-beats">
+          <SwarmBeats beats={swarmBeats} />
         </ErrorBoundary>
       )}
     </div>
@@ -224,3 +237,122 @@ function resolveLinkedArtifact(task: TaskNodeDTO, artifacts: ArtifactDTO[]): Art
 }
 
 
+function SwarmBeats({ beats }: { beats: FactDTO[] }) {
+  const sorted = useMemo(
+    () => [...beats].sort((a, b) => a.created_at - b.created_at),
+    [beats],
+  );
+  return (
+    <details className="rounded-xl border border-sky-500/20 bg-sky-950/10 shadow-lg overflow-hidden transition-all duration-300 open:bg-sky-950/20" open>
+      <summary className="cursor-pointer select-none px-4 py-3 flex items-center gap-2 hover:bg-sky-900/30 transition-colors">
+        <Activity className="h-4 w-4 text-sky-400" />
+        <span className="text-[11px] font-semibold uppercase tracking-widest text-sky-300">
+          Swarm Operations
+        </span>
+        <span className="ml-auto text-[10px] font-mono bg-sky-900/50 text-sky-300 px-2 py-0.5 rounded-full">
+          {sorted.length} events
+        </span>
+      </summary>
+      <div className="px-4 pb-4 pt-2">
+        <div className="relative border-l-2 border-sky-900/50 ml-3 pl-4 space-y-4">
+          {sorted.map((b, i) => (
+            <SwarmBeatRow key={b.fact_id} beat={b} index={i + 1} />
+          ))}
+        </div>
+      </div>
+    </details>
+  );
+}
+
+function SwarmBeatRow({ beat, index }: { beat: FactDTO; index: number }) {
+  const [open, setOpen] = useState(false);
+  const c = beat.content || {};
+  
+  const isTool = c.phase === "tool_call";
+  const isSuccess = c.ok === true;
+  const isFail = c.ok === false || !!c.error;
+  
+  const Icon = isTool ? (c.tool === "search_web" ? Globe : Wrench) : 
+               isSuccess ? CheckCircle2 : 
+               isFail ? XCircle : Activity;
+               
+  const iconColor = isFail ? "text-red-400 bg-red-950" :
+                    isSuccess ? "text-emerald-400 bg-emerald-950" :
+                    isTool ? "text-amber-400 bg-amber-950" :
+                    "text-sky-400 bg-sky-950";
+
+  return (
+    <div className="relative group">
+      {/* Timeline Dot */}
+      <div className={`absolute -left-[25px] top-1.5 h-5 w-5 rounded-full border-2 border-slate-900 flex items-center justify-center ${iconColor} z-10 transition-transform group-hover:scale-110`}>
+        <Icon className="h-2.5 w-2.5" />
+      </div>
+      
+      <div className="rounded-lg border border-white/5 bg-slate-950/60 transition-colors hover:border-white/10">
+        <button
+          type="button"
+          onClick={() => setOpen((v) => !v)}
+          className="w-full flex flex-wrap items-center gap-2 px-3 py-2 text-left"
+        >
+          <span className="text-[10px] font-mono text-slate-500 uppercase">#{index}</span>
+          <span className="text-[12px] font-medium text-slate-200">
+            {c.role || "agent"} <span className="text-slate-500">·</span> {c.phase || "step"}
+          </span>
+          
+          {c.tool && (
+            <span className="text-[10px] font-mono bg-amber-950/50 text-amber-300 px-1.5 py-0.5 rounded ml-2 border border-amber-500/20">
+              {c.tool}
+            </span>
+          )}
+          
+          {isFail && (
+            <span className="text-[10px] font-mono text-red-400 ml-auto flex items-center gap-1">
+              FAILED
+            </span>
+          )}
+          
+          {open ? <ChevronDown className="h-3 w-3 text-slate-500 ml-auto" />
+                : <ChevronRight className="h-3 w-3 text-slate-500 ml-auto" />}
+        </button>
+        
+        {open && (
+          <div className="border-t border-white/5 px-3 py-3 space-y-3 text-[11px] font-mono bg-slate-950/40">
+            {c.file && (
+              <div className="flex items-center gap-2 text-slate-400">
+                <span className="uppercase tracking-wider text-[10px]">Target</span>
+                <span className="text-sky-300">{c.file}</span>
+              </div>
+            )}
+            
+            {c.args && (
+              <div>
+                <div className="text-[10px] uppercase tracking-wider text-slate-500 mb-1">Arguments</div>
+                <pre className="bg-slate-950/80 border border-slate-800 rounded p-2 text-amber-200 whitespace-pre-wrap break-words">
+                  {c.args}
+                </pre>
+              </div>
+            )}
+            
+            {c.error && (
+              <div>
+                <div className="text-[10px] uppercase tracking-wider text-red-400 mb-1">Error</div>
+                <pre className="bg-red-950/30 border border-red-900/50 rounded p-2 text-red-300 whitespace-pre-wrap break-words">
+                  {String(c.error)}
+                </pre>
+              </div>
+            )}
+            
+            {!c.args && !c.error && (
+              <div>
+                <div className="text-[10px] uppercase tracking-wider text-slate-500 mb-1">Payload</div>
+                <pre className="bg-slate-950/80 border border-slate-800 rounded p-2 text-slate-300 whitespace-pre-wrap break-words max-h-48 overflow-auto">
+                  {JSON.stringify(c, null, 2)}
+                </pre>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}

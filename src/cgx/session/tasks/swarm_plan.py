@@ -236,7 +236,7 @@ def ensure_scaffolding(plan: Dict[str, Any]) -> Dict[str, Any]:
             "description": ("Runtime and test dependencies for the project, "
                             "one pip requirement per line."),
             "depends_on": list(py_paths)})
-    if under_src and "conftest.py" not in bases:
+    if under_src and "conftest.py" not in raw_paths:
         injected.append({
             "path": "conftest.py",
             "description": ("Pytest bootstrap that puts the project root and "

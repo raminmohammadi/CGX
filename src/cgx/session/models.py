@@ -131,6 +131,7 @@ class FactKind(str, enum.Enum):
     # threaded along one repair chain, so DIAGNOSE never repeats a
     # failed action (see docs/diagnose-design.md §7).
     REPAIR_LEDGER = "repair_ledger"
+    SWARM_BEAT = "swarm_beat"
 
 
 class ArtifactKind(str, enum.Enum):

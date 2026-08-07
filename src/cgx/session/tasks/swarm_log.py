@@ -37,3 +37,29 @@ def swarm_beat(project_root: Optional[str], role: str, phase: str,
         emit_trace("swarm_beat", **payload)
     except Exception:  # pragma: no cover - tracing is best-effort
         pass
+    
+    # Also write to the SessionStore as a Fact so the UI dashboard can read it!
+    try:
+        if project_root:
+            from cgx.trace import trace_context
+            from cgx.session.store import SessionStore
+            from cgx.session.models import Fact, FactKind
+            import time
+            import uuid
+            ctx = trace_context.get()
+            session_id = ctx.get("session_id")
+            task_id = ctx.get("task_id")
+            if session_id and task_id:
+                store = SessionStore(project_root)
+                fact = Fact(
+                    fact_id="fact_" + uuid.uuid4().hex[:16],
+                    session_id=session_id,
+                    kind=FactKind.SWARM_BEAT,
+                    content=payload,
+                    surfaced_in_task_id=task_id,
+                    created_at=int(time.time()),
+                    updated_at=int(time.time())
+                )
+                store.add_fact(fact)
+    except Exception:  # pragma: no cover - DB write is best-effort here
+        pass
