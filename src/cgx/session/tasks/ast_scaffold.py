@@ -41,6 +41,67 @@ def _split_skeleton_by_path(skeleton: str) -> Dict[str, str]:
             sections[current].append(line)
     return {p: "\n".join(lines).strip() for p, lines in sections.items()}
 
+_FENCE = re.compile(r"```(?:python|py)?\s*\n(?P<body>.*?)(?:```|\Z)",
+                    re.DOTALL)
+
+
+def _extract_python(text: str) -> Tuple[str, Optional[str]]:
+    """The parseable Python in an LLM reply, or the reason there is none.
+
+    Stripping fence markers and keeping the rest left any surrounding
+    prose in the string: ``ASTAssembler`` then dropped the whole piece
+    (or emptied itself, for a header) with no signal to the caller, and
+    the file collapsed to a byte. Prefer the fenced block(s), fall back
+    to the bare reply, and require the result to ``ast.parse``.
+    """
+    raw = str(text or "")
+    blocks = [m.group("body") for m in _FENCE.finditer(raw)]
+    candidate = "\n".join(b.strip() for b in blocks) if blocks else raw.strip()
+    candidate = candidate.strip()
+    if not candidate:
+        return "", "model returned no code"
+    try:
+        ast.parse(candidate)
+    except SyntaxError as exc:
+        return "", f"{type(exc).__name__}: {exc}"
+    return candidate, None
+
+
+def _generate_code(path: str, what: str, provider: Any, prompt: str) -> str:
+    """Prompt for a Python fragment, re-prompting once if it does not parse.
+
+    The retry quotes the parse error, which is the single most effective
+    correction for the failure mode seen in ``ses_fa6f72a9d3da4217`` (a
+    reply that trailed off into English). A second failure yields ``""``
+    so the caller's output gate reports the file as failed.
+    """
+    messages = [
+        {"role": "system", "content": "You are a strict code generator."},
+        {"role": "user", "content": prompt},
+    ]
+    for attempt in (1, 2):
+        try:
+            res = provider.chat(messages=messages, force_json=False)
+        except Exception as exc:
+            logger.error("Failed to generate AST %s for %s: %s",
+                         what, path, exc)
+            return ""
+        code, error = _extract_python(res.get("content", ""))
+        if error is None:
+            return code
+        logger.warning("AST %s for %s did not parse (attempt %d): %s",
+                       what, path, attempt, error)
+        if attempt == 2:
+            return ""
+        messages = messages + [
+            {"role": "assistant", "content": str(res.get("content", ""))},
+            {"role": "user", "content":
+                f"That reply is not valid Python: {error}. "
+                "Return ONLY raw Python source, no prose and no commentary."},
+        ]
+    return ""
+
+
 @traced("ast_scaffold.generate_header")
 def _generate_header(path: str, provider: Any, goal: str, context: str) -> str:
     """Prompt the LLM for just the imports and globals of the file."""
@@ -48,17 +109,7 @@ def _generate_header(path: str, provider: Any, goal: str, context: str) -> str:
 Project Goal: {goal}
 Context: {context}
 Return ONLY valid Python code containing imports and module-level constants. No functions or classes."""
-    try:
-        messages = [
-            {"role": "system", "content": "You are a strict code generator."},
-            {"role": "user", "content": prompt}
-        ]
-        res = provider.chat(messages=messages, force_json=False)
-        text = res.get("content", "")
-        return text.replace("```python", "").replace("```", "").strip()
-    except Exception as e:
-        logger.error("Failed to generate AST header for %s: %s", path, e)
-        return ""
+    return _generate_code(path, "header", provider, prompt)
 
 @traced("ast_scaffold.generate_symbol")
 def _generate_symbol(path: str, symbol_name: str, symbol_type: str, provider: Any, goal: str, header: str, context: str) -> str:
@@ -73,17 +124,7 @@ The file currently has the following imports and globals:
 ```
 
 Return ONLY the code for `{symbol_name}`. Do NOT include imports. Do not wrap in markdown, output raw python code."""
-    try:
-        messages = [
-            {"role": "system", "content": "You are a strict code generator."},
-            {"role": "user", "content": prompt}
-        ]
-        res = provider.chat(messages=messages, force_json=False)
-        text = res.get("content", "")
-        return text.replace("```python", "").replace("```", "").strip()
-    except Exception as e:
-        logger.error("Failed to generate AST symbol %s for %s: %s", symbol_name, path, e)
-        return ""
+    return _generate_code(path, f"symbol {symbol_name}", provider, prompt)
 
 
 def _resolve_goal(task: TaskNode, deps: ExecutorDeps,
@@ -115,7 +156,7 @@ def _resolve_goal(task: TaskNode, deps: ExecutorDeps,
 
 def _assembly_rejection(content: str,
                         symbols: List[Tuple[str, str]],
-                        module: ast.Module) -> Optional[str]:
+                        assembler: ASTAssembler) -> Optional[str]:
     """Why the assembled file must not be handed to APPLY, if it must not.
 
     ``ASTAssembler`` degrades to an empty module when the header does not
@@ -126,9 +167,11 @@ def _assembly_rejection(content: str,
     assembly, or one missing a symbol the skeleton requires, is a failed
     regeneration and must be reported as such.
     """
+    if assembler.base_error:
+        return f"AST fallback header did not parse: {assembler.base_error}"
     if not content.strip():
         return "AST fallback produced an empty file"
-    defined = {node.name for node in module.body
+    defined = {node.name for node in assembler.module.body
                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
                                     ast.ClassDef))}
     missing = [name for name, _ in symbols if name not in defined]
@@ -320,7 +363,7 @@ def run_ast_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         try:
             final_content = assembler.unparse()
             rejection = _assembly_rejection(
-                final_content, symbols, assembler.module)
+                final_content, symbols, assembler)
             if rejection:
                 logger.warning("AST fallback rejected %s: %s", path, rejection)
                 failed.append({"file": path, "error": rejection})

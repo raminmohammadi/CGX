@@ -15,10 +15,16 @@ class ASTAssembler:
     """
 
     def __init__(self, base_source: str = ""):
+        #: Parse error of the base source, or ``None`` when it parsed.
+        #: Degrading to an empty module is silent from the caller's side,
+        #: and the resulting file looked like a successful (1-byte)
+        #: generation; callers read this to tell the two apart.
+        self.base_error: Optional[str] = None
         try:
             self.module = ast.parse(base_source)
         except SyntaxError as e:
             logger.error("Failed to parse base source for AST Assembler: %s", e)
+            self.base_error = str(e)
             # Fallback to an empty module if the base source is entirely broken
             self.module = ast.parse("")
 

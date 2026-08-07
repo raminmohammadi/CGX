@@ -15429,6 +15429,50 @@ def test_ast_fallback_rejects_undefined_first_party_import(store):
     assert "subtract" in failed[0]["error"]
 
 
+def test_ast_fallback_reprompts_once_on_prose(store):
+    """A reply that trails off into English is retried with the error.
+
+    Fence-stripping kept the prose, so the component was dropped and the
+    file collapsed to a byte. The second reply is now the one that ships.
+    """
+    from cgx.session.models import SessionMode
+    from cgx.session.tasks.ast_scaffold import run_ast_scaffold
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    work_plan = Artifact.new(
+        session_id=session.session_id, produced_by_task_id="t_plan",
+        kind=ArtifactKind.WORK_PLAN,
+        content={"contracts": {"project_skeleton":
+                               "# --- app/core.py ---\n"
+                               "def add(a, b):\n    ...\n"}})
+    store.save_artifact(work_plan)
+    provider = _RecordingProvider([
+        "```python\nimport math\n```\nHope that helps!",
+        "def add(a, b):\n    return a + b\n",
+    ])
+    task = TaskNode.new(
+        session.session_id, TaskKind.AST_REGENERATE, "regenerate",
+        inputs={"work_plan_artifact_id": work_plan.artifact_id,
+                "prior_goal": "g", "regenerate_files": ["app/core.py"]})
+    result = run_ast_scaffold(
+        task, ExecutorDeps(store=store, provider=provider))
+    content = result.artifact.content
+    # The fenced block is taken and the trailing prose discarded -- no
+    # retry needed, and the header survives into the assembled file.
+    assert content["failed"] == []
+    assert "import math" in content["generated"][0]["content"]
+
+
+def test_ast_fallback_gives_up_after_one_reprompt(store):
+    """Two unparseable replies for the same fragment yield a failed file."""
+    from cgx.session.tasks.ast_scaffold import _generate_code
+    provider = _RecordingProvider(
+        ["Sure! I would import math.", "Of course -- here it is."])
+    assert _generate_code("app/core.py", "header", provider, "p") == ""
+    assert len(provider.prompts) == 2
+    assert "not valid Python" in provider.prompts[1]
+
+
 def test_api_check_probe_resolves_lazy_submodules(tmp_path):
     """``from jose import jwt`` works but ``hasattr(jose, 'jwt')`` is False.
 
