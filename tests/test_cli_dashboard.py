@@ -365,7 +365,7 @@ def test_cli_agent_wires_goal_and_auto(monkeypatch, tmp_path):
     seen: dict = {}
 
     def fake_agent_events(state, goal, *, index_dir=None, records=None,
-                          auto=False, cancel_event=None):
+                          auto=False, mode=None, cancel_event=None):
         seen.update(goal=goal, auto=auto)
         yield "session_done", {"status": "completed", "done": 1, "failed": 0}
 

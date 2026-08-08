@@ -45,7 +45,7 @@ def test_falls_back_to_ast_when_full_file_fails(monkeypatch):
     out = sg.generate_file(
         path="src/app.py", description="entry", depends_on=[],
         contracts=contracts, goal="demo", root=".", provider=StubProvider())
-    assert out.ok and out.method == "ast-fallback"
+    assert out.ok and out.method == "semantic-repair"
     assert "def run" in out.content
 
 
