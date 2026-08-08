@@ -193,7 +193,9 @@ def estimate_scope(goal: str) -> ScopeProfile:
     ]
     lines = [
         f"SCOPE CEILING (complexity: {complexity}). Build the MINIMAL "
-        "viable stack that satisfies the goal -- nothing more.",
+        "viable stack that satisfies both the original goal and clarifications. "
+        "CRITICAL: Do NOT drop explicitly requested components (e.g., frontend, databases, "
+        "or auth layers) just to reduce file count or resolve minor conflicts.",
         f"- Target at most {max_files} files total.",
         "- Prefer a single well-factored module plus its unit tests over a "
         "multi-tier architecture.",

@@ -12849,7 +12849,7 @@ def test_tracing_provider_stamps_run_id_from_trace_context():
     tp.bind("sess-A", "task-X")
     token = set_trace_context(run_id="run_abc123")
     try:
-        tp.chat([{"role": "user", "content": "ping"}])
+        tp.chat([{"role": "user", "content": "ping"}], force_json=False)
     finally:
         reset_trace_context(token)
     fact = tp.drain()[0]
@@ -12872,7 +12872,7 @@ def test_tracing_provider_records_provider_usage_and_metrics():
     _metrics.reset_for_tests()
     tp = TracingProvider(_UsageProvider(model="gemini-2.5-flash"))
     tp.bind("s", "t")
-    tp.chat([{"role": "user", "content": "hi"}])
+    tp.chat([{"role": "user", "content": "hi"}], force_json=False)
     fact = tp.drain()[0]
     assert fact.content["provider"] == "gemini"
     assert fact.content["token_source"] == "provider"
@@ -12917,7 +12917,7 @@ def test_tracing_provider_records_chat_error():
     tp = TracingProvider(_Boom())
     tp.bind("s", "t")
     with pytest.raises(RuntimeError):
-        tp.chat([{"role": "user", "content": "x"}])
+        tp.chat([{"role": "user", "content": "x"}], force_json=False)
     facts = tp.drain()
     assert facts and facts[0].content["error"].startswith("RuntimeError")
 
@@ -12926,7 +12926,7 @@ def test_tracing_provider_unbound_calls_are_silent():
     """Calls made outside a bind/unbind window emit no facts."""
     from cgx.session.llm_trace import TracingProvider
     tp = TracingProvider(_StubChatProvider())
-    tp.chat([{"role": "user", "content": "x"}])
+    tp.chat([{"role": "user", "content": "x"}], force_json=False)
     assert tp.drain() == []
 
 
@@ -12948,7 +12948,7 @@ def test_runner_persists_llm_call_facts_via_tracing(tmp_path):
     @register_executor(TaskKind.EXPLORE)
     def _exec(t, deps):
         # Touch the provider so the tracer records a Fact.
-        deps.provider.chat([{"role": "user", "content": "probe"}])
+        deps.provider.chat([{"role": "user", "content": "probe"}], force_json=False)
         return ExecutorResult(outputs={})
 
     try:

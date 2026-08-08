@@ -376,7 +376,7 @@ def _readme_content(description: str, goal: str, provider: Any,
             f"Planned files:\n{listing}\n")
     try:
         res = provider.chat(messages=[{"role": "system", "content": system},
-                                      {"role": "user", "content": user}])
+                                        {"role": "user", "content": user}], force_json=False)
         content = str((res or {}).get("content") or "").strip()
     except Exception:  # pragma: no cover - defensive: provider crash
         content = ""

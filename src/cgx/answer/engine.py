@@ -1431,7 +1431,7 @@ def answer_with_llm(
         {"role": "user", "content": prep["context"]},
     ]
 
-    resp = provider.chat(messages, temperature=0.2)
+    resp = provider.chat(messages, temperature=0.2, force_json=True)
     content = (resp.get("content") or "").strip()
 
     parsed: Dict[str, Any] = _extract_json_object(content)
@@ -1444,7 +1444,7 @@ def answer_with_llm(
             messages.append({"role": "user", "content": "Reformat to strict JSON only. "
                                                        "Ensure non-empty 'answer_md' grounded in SOURCES with citations. "
                                                        "Keep the same content; do not add external knowledge."})
-            resp2 = provider.chat(messages, temperature=0)
+            resp2 = provider.chat(messages, temperature=0, force_json=True)
             parsed = _extract_json_object((resp2.get("content") or "")) or {"answer_md": (resp2.get("content") or content), "citations": []}
 
     ans = parsed.get("answer_md")
@@ -2499,7 +2499,7 @@ def generate_project_skeleton(paths: List[str], provider: Any, goal: str) -> str
         {"role": "system", "content": system},
         {"role": "user", "content": user_msg},
     ]
-    resp = provider.chat(messages=messages, max_tokens=4000, temperature=0.0)
+    resp = provider.chat(messages=messages, max_tokens=4000, temperature=0.0, force_json=False)
     text = (resp or {}).get("content", "") if isinstance(resp, dict) else ""
     skeleton = _first_fenced_block_body(text) or text
     emit_trace("project_skeleton", skeleton=skeleton)

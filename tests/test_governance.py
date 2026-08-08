@@ -98,9 +98,9 @@ def test_governed_provider_meters_chat_and_stream():
     assert gp.model == "test-model"
     assert gp.parallel_scaffold_capable is True  # __getattr__ passthrough
 
-    resp = gp.chat([{"role": "user", "content": "a question here"}])
+    resp = gp.chat([{"role": "user", "content": "a question here"}], force_json=False)
     assert resp["content"] == "hello world response"
-    assert "".join(gp.chat_stream([{"role": "user", "content": "hi"}])) == "abc"
+    assert "".join(gp.chat_stream([{"role": "user", "content": "hi"}], force_json=False)) == "abc"
 
     totals = mgr.meter.totals("default")
     assert totals["calls"] == 2 and totals["tokens_total"] > 0
@@ -111,7 +111,7 @@ def test_governed_provider_hard_stop():
     mgr.meter.record("default", tokens_in=10, tokens_out=0, cost_usd=0.0)
     gp = GovernedProvider(FakeProvider(), manager=mgr)
     with pytest.raises(BudgetExceeded):
-        gp.chat([{"role": "user", "content": "x"}])
+        gp.chat([{"role": "user", "content": "x"}], force_json=False)
 
 
 def test_govern_gating_and_idempotency():

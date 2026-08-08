@@ -52,7 +52,8 @@ class GovernedProvider:
     def chat(self, messages: List[Dict[str, str]],
              temperature: float = 0.2,
              max_tokens: Optional[int] = None,
-             force_json: bool = True,
+             *,
+             force_json: bool,
              **kwargs: Any) -> Dict[str, Any]:
         owner = resolve_owner()
         self._manager.check(owner)  # hard-stop before spending, may raise
@@ -65,7 +66,8 @@ class GovernedProvider:
     def chat_stream(self, messages: List[Dict[str, str]],
                     temperature: float = 0.2,
                     max_tokens: Optional[int] = None,
-                    force_json: bool = False,
+                    *,
+                    force_json: bool,
                     **kwargs: Any) -> Iterator[str]:
         owner = resolve_owner()
         self._manager.check(owner)  # hard-stop before spending, may raise
