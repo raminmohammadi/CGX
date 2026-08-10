@@ -399,7 +399,9 @@ export type ActivitySummary = {
   cost_usd: number;
   tokens_total: number;
   errors: number;
+  overall_tps?: number;
   by_kind: Record<string, { runs: number; cost_usd: number; tokens_total: number; errors: number }>;
+  by_model?: Record<string, { runs: number; tokens_total: number; tps: number }>;
 };
 
 export type RunDetail = {
