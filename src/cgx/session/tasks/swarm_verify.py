@@ -154,6 +154,8 @@ def _check_phantom_third_party_imports(paths: List[str], contents: Dict[str, str
     from cgx.codegen.env_manager import _extract_imports_python, _is_local_package, _STDLIB_TOP
     warnings = []
     allowed_set = set(allowed)
+    allowed_set.add("pytest")
+    allowed_set.add("typing")
     for p in paths:
         if not p.endswith(".py"): continue
         src = contents.get(p)
@@ -187,20 +189,24 @@ def _structural_scan(
     gaps = _coverage_gaps(paths, contents)
     try:
         symbol_w = cross_check_first_party_imports(contents)
-    except Exception:  # pragma: no cover - the gate is best-effort
+    except Exception as e:
+        print(f"Exception in dynamic repair: {repr(e)}")  # pragma: no cover - the gate is best-effort
         symbol_w = []
     try:
         resolve_w = resolve_first_party_imports(contents, paths)
-    except Exception:  # pragma: no cover - the gate is best-effort
+    except Exception as e:
+        print(f"Exception in dynamic repair: {repr(e)}")  # pragma: no cover - the gate is best-effort
         resolve_w = []
     try:
         phantom_3p_w = _check_phantom_third_party_imports(paths, contents, contracts.get("third_party_dependencies") or [], root)
-    except Exception:
+    except Exception as e:
+        print(f"Exception in dynamic repair: {repr(e)}")
         phantom_3p_w = []
     imports = _merge_import_warnings(symbol_w, resolve_w, phantom_3p_w)
     try:
         contract = check_contract_compliance(contents, contracts)
-    except Exception:  # pragma: no cover - the gate is best-effort
+    except Exception as e:
+        print(f"Exception in dynamic repair: {repr(e)}")  # pragma: no cover - the gate is best-effort
         contract = []
     return gaps, imports, contract
 
@@ -321,7 +327,8 @@ def _auto_fix_missing_imports(env: Dict[str, Any], root: str, provider: Any) -> 
     
     try:
         reply = provider.chat([{"role": "user", "content": prompt}], force_json=False).get("content", "").strip()
-    except Exception:
+    except Exception as e:
+        print(f"Exception in dynamic repair: {repr(e)}")
         return False
         
     reply = reply.replace("```python", "").replace("```", "").strip()
@@ -412,7 +419,8 @@ def _auto_fix_function_logic(env: Dict[str, Any], root: str, provider: Any, dyn_
     
     try:
         reply = provider.chat([{"role": "user", "content": prompt}], force_json=False, temperature=repair_temp).get("content", "").strip()
-    except Exception:
+    except Exception as e:
+        print(f"Exception in dynamic repair: {repr(e)}")
         return False
         
     import re as re_mod
@@ -473,7 +481,8 @@ def _dynamic_repair(env: Dict[str, Any], localized: List[str],
         repaired = generate_repair_files(
             wrapped_provider, goal=goal, failure_text=failure_text,
             files=files, localized_files=localized)
-    except Exception:  # pragma: no cover - repair is best-effort
+    except Exception as e:
+        print(f"Exception in dynamic repair: {repr(e)}")  # pragma: no cover - repair is best-effort
         return []
     written: List[str] = []
     for path, content in (repaired or {}).items():
