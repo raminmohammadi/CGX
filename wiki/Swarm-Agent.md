@@ -22,7 +22,7 @@ Authors and validates the build plan.
   `src/` layout -- a root `conftest.py` are injected if missing, and a
   `tests/test_<module>.py` is injected for every source module that has no
   test. A final `verify_plan` gate rejects unsafe paths, dependency cycles,
-  orphan tests, and any still-missing scaffolding.
+  orphan tests, and inconsistent routing structures (all modules must uniformly live under `src/` or top-level), along with any still-missing scaffolding.
 - Persists a `WORK_PLAN` artifact and hands the ordered file list to the
   Developer chain. If no buildable plan can be produced, the session ends
   FAILED rather than spawning empty work.
@@ -61,9 +61,10 @@ Runs a graded verification ladder over the finished tree.
   compliance. Named files drive a bounded targeted regeneration.
 - **Dynamic** dry-run only if static passes: install missing dependencies,
   then run the impacted tests.
-- **Failure-driven repair** when the tree is clean but the suite is red: the
-  pytest output and the implicated files are fed back to the model, which
-  returns corrected complete files (validated before they are written). The
+- **Failure-driven repair** when the tree is clean but the suite is red: 
+  - **AST-Driven Auto Repair**: Missing imports and specific logical bugs are isolated via Python's AST and repaired using surgical string-injections (bypassing the strict JSON response format which smaller models struggle with).
+  - **Dynamic Repair**: For complex structural issues, the pytest output and implicated files are fed back to the model which returns corrected complete files.
+  - **Dynamic Temperature**: All iterative repair loops scale the LLM's temperature incrementally (0.2 -> 0.8) on each round to prevent infinite repetitive output cycles.
   repair may fix **either side** -- when a test asserts a value the goal never
   specified or calls the API wrongly, the *test* is rewritten to assert an
   invariant or round-trip instead of forcing impossible source. Tests

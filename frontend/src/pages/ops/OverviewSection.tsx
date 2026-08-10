@@ -53,10 +53,15 @@ export default function OverviewSection({ refreshKey, goto }: SectionProps) {
   return (
     <div className="space-y-6">
       <ErrorLine error={error} />
-      <div className="grid grid-cols-4 gap-4">
+      <div className="grid grid-cols-5 gap-4">
         <StatCard label="Runs" value={fmtNum(act?.total)} tone="neon" />
         <StatCard label="Cost recorded" value={fmtCost(act?.cost_usd)} caption="all runs" />
         <StatCard label="Tokens" value={fmtNum(act?.tokens_total)} />
+        <StatCard
+          label="Overall TPS"
+          value={act?.overall_tps ? `${act.overall_tps} T/s` : "--"}
+          caption="avg throughput"
+        />
         <StatCard
           label="Errors"
           value={fmtNum(act?.errors)}
@@ -92,19 +97,37 @@ export default function OverviewSection({ refreshKey, goto }: SectionProps) {
         </Card>
       </div>
 
-      <Card padded>
-        <CardHeader
-          eyebrow="Cost & quota (I)"
-          title="Spend by owner (today)"
-          description="Metered per-owner cost for the current UTC day."
-          right={
-            <button className="av-btn-ghost" onClick={() => goto?.("cost")}>
-              Details
-            </button>
-          }
-        />
-        <BarList data={costByOwner} format={(v) => fmtCost(v)} />
-      </Card>
+      <div className="grid grid-cols-2 gap-4">
+        <Card padded>
+          <CardHeader
+            eyebrow="Cost & quota (I)"
+            title="Spend by owner (today)"
+            description="Metered per-owner cost for the current UTC day."
+            right={
+              <button className="av-btn-ghost" onClick={() => goto?.("cost")}>
+                Details
+              </button>
+            }
+          />
+          <BarList data={costByOwner} format={(v) => fmtCost(v)} />
+        </Card>
+
+        <Card padded>
+          <CardHeader
+            eyebrow="Performance"
+            title="Throughput by model"
+            description="Tokens per second per model."
+          />
+          <BarList 
+            data={Object.entries(act?.by_model ?? {}).map(([model, stats]: any) => ({
+              label: model,
+              value: stats.tps,
+              sub: `${stats.runs} runs`
+            }))}
+            format={(v) => `${v} T/s`}
+          />
+        </Card>
+      </div>
     </div>
   );
 }

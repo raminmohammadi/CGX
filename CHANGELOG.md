@@ -12,8 +12,9 @@ propose-then-validate: the model proposes, deterministic invariants
 * **Tech Lead planner** (`swarm_tech_lead.py`). Prompts for a draft JSON plan,
   then normalizes it (dedupe + prune dangling `depends_on` edges), topologically
   orders the files with the shared Kahn toposort, and gates on buildability
-  with a bounded 3-attempt corrective re-ask. Persists a `WORK_PLAN` artifact
-  (`goal`, `layers`, `contracts`, ordered `paths`, `project_root`). An
+  with a bounded 3-attempt corrective re-ask. Includes structural rooting checks (`_inconsistent_rooting`)
+  to guarantee all modules are consistently placed (e.g., all under `src/` or all top-level). 
+  Persists a `WORK_PLAN` artifact (`goal`, `layers`, `contracts`, ordered `paths`, `project_root`). An
   unbuildable plan ends the session FAILED instead of spawning empty work.
 * **Incremental Developer** (`swarm_developer.py`, `swarm_generate.py`,
   `swarm_ground.py`). One planned file per turn, in dependency order, grounded
@@ -27,6 +28,11 @@ propose-then-validate: the model proposes, deterministic invariants
   coherence) followed, only on success, by an environment dry-run
   (`preflight_install` + `run_tests_on_disk`). Emits a `SWARM_VERIFY_REPORT`
   artifact pinpointing files implicated by any failure.
+  * **AST-driven auto-repair** (`_auto_fix_missing_imports`, `_auto_fix_function_logic`):
+    Intercepts `NameError` and logic errors, isolates the failing block via AST,
+    and asks the LLM to rewrite only the broken function in raw markdown (bypassing JSON schema).
+  * **Dynamic Temperature Scaling**: The verification loop now scales LLM temperature dynamically 
+    (from 0.2 to 0.8) during iterative repair rounds to prevent infinite loops of identical code.
 * **Wrapper-tolerant plan parsing** (`swarm_parse.py`) + a typed `SwarmPlan`
   schema (`swarm_plan.py`), so a small local model wrapping JSON in prose or
   code fences still yields a validated plan.

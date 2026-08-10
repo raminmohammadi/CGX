@@ -40,6 +40,8 @@ stateDiagram-v2
   for file 0; an empty/unbuildable plan (`file_count == 0`) goes terminal FAILED.
 - `_swarm_developer_to_successors`: chains file *i* -> *i+1* until every planned
   file is attempted, then spawns a single `SWARM_VERIFY`.
+- `SWARM_VERIFY`: executes AST-driven AutoRepair (missing imports and logic errors)
+  using dynamic temperature scaling, and falls back to dynamic regeneration for structural logic.
 - Terminal session actions set COMPLETED when no `failed_paths` remain, else
   FAILED; `on_task_failed` ends a SWARM session FAILED.
 

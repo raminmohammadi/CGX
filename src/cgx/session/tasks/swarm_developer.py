@@ -70,11 +70,47 @@ def swarm_developer(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
                             status="start", failed_count=len(failed_paths))
 
     started = time.time()
-    outcome = generate_file(
-        path=path, description=str(spec.get("description") or ""),
-        depends_on=list(spec.get("depends_on") or []), contracts=contracts,
-        goal=goal, root=project_root, provider=deps.provider,
-        layer=path, manifest_paths=paths, log_root=project_root)
+    is_debate = deps.extra.get("multi_agent_debate", False)
+    
+    if is_debate:
+        swarm_beat(project_root, "developer", "debate_generation", file=path)
+        outcome1 = generate_file(
+            path=path, description=str(spec.get("description") or ""),
+            depends_on=list(spec.get("depends_on") or []), contracts=contracts,
+            goal=goal, root=project_root, provider=deps.provider,
+            layer=path, manifest_paths=paths, log_root=project_root)
+        
+        outcome2 = generate_file(
+            path=path, description=str(spec.get("description") or ""),
+            depends_on=list(spec.get("depends_on") or []), contracts=contracts,
+            goal=goal, root=project_root, provider=deps.provider,
+            layer=path, manifest_paths=paths, log_root=project_root)
+            
+        if outcome1.ok and outcome2.ok:
+            judge_prompt = (
+                "You are the Lead Code Reviewer. Two developers have written code for the following file:\n"
+                f"FILE: {path}\n"
+                f"OBJECTIVE: {spec.get('description')}\n\n"
+                f"CODE A:\n```python\n{outcome1.content}\n```\n\n"
+                f"CODE B:\n```python\n{outcome2.content}\n```\n\n"
+                "Evaluate both implementations based on correctness, simplicity, and adherence to the objective. "
+                "Output ONLY 'A' or 'B'."
+            )
+            try:
+                res = deps.provider.chat([{"role": "user", "content": judge_prompt}])
+                decision = str(res.get("content", "")).strip().upper()
+            except Exception:
+                decision = "A"
+            outcome = outcome1 if decision == "A" else outcome2
+            swarm_beat(project_root, "developer", "debate_decision", file=path, decision=decision)
+        else:
+            outcome = outcome1 if outcome1.ok else outcome2
+    else:
+        outcome = generate_file(
+            path=path, description=str(spec.get("description") or ""),
+            depends_on=list(spec.get("depends_on") or []), contracts=contracts,
+            goal=goal, root=project_root, provider=deps.provider,
+            layer=path, manifest_paths=paths, log_root=project_root)
 
     if outcome.ok:
         if outcome.renegotiated_contracts and deps.store:

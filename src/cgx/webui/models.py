@@ -40,6 +40,9 @@ class ProviderConfig(BaseModel):
     # sketch before the grounded answer; otherwise it answers directly. Kept
     # False by default so ASK stays fast unless the user asks for thinking.
     think: bool = False
+    # Multi-Agent Debate mode: If enabled, runs a tournament (2 generators, 1 judge)
+    # for complex reasoning tasks to improve quality at the cost of time/tokens.
+    multi_agent_debate: bool = False
 
 
 class IndexLocation(BaseModel):

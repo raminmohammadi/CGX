@@ -181,20 +181,41 @@ class RunStore:
             rows = self._conn.execute(
                 "SELECT kind, COUNT(*), COALESCE(SUM(cost_usd),0), "
                 "COALESCE(SUM(tokens_total),0), "
-                "SUM(CASE WHEN status='ok' THEN 0 ELSE 1 END) "
+                "SUM(CASE WHEN status='ok' THEN 0 ELSE 1 END), "
+                "COALESCE(SUM(latency_ms),0) "
                 "FROM runs" + where + " GROUP BY kind", params).fetchall()
+                
+            model_rows = self._conn.execute(
+                "SELECT model, COUNT(*), COALESCE(SUM(tokens_total),0), COALESCE(SUM(latency_ms),0) "
+                "FROM runs" + where + " WHERE model IS NOT NULL GROUP BY model", params).fetchall()
+                
         by_kind: Dict[str, Dict[str, Any]] = {}
         total = errors = tokens = 0
         cost = 0.0
-        for kind, n, c, tk, err in rows:
+        total_latency = 0.0
+        for kind, n, c, tk, err, lat in rows:
             by_kind[kind] = {"runs": int(n), "cost_usd": round(float(c), 6),
                              "tokens_total": int(tk), "errors": int(err or 0)}
             total += int(n)
             cost += float(c)
             tokens += int(tk)
             errors += int(err or 0)
+            total_latency += float(lat)
+            
+        by_model: Dict[str, Dict[str, Any]] = {}
+        for m_model, m_n, m_tk, m_lat in model_rows:
+            tps = (int(m_tk) / (float(m_lat) / 1000.0)) if float(m_lat) > 0 else 0.0
+            by_model[m_model] = {
+                "runs": int(m_n),
+                "tokens_total": int(m_tk),
+                "tps": round(tps, 2)
+            }
+            
+        overall_tps = (tokens / (total_latency / 1000.0)) if total_latency > 0 else 0.0
+        
         return {"total": total, "cost_usd": round(cost, 6),
-                "tokens_total": tokens, "errors": errors, "by_kind": by_kind}
+                "tokens_total": tokens, "errors": errors, "by_kind": by_kind,
+                "by_model": by_model, "overall_tps": round(overall_tps, 2)}
 
     # --- data lifecycle (Subsystem M): retention + right-to-erasure --------
     def purge(self, *, before: float) -> int:

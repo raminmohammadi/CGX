@@ -21,6 +21,9 @@ export type ProviderConfig = {
   // when the selected model is reasoning-capable; otherwise it answers
   // directly. Undefined is treated as false.
   think?: boolean;
+  // Multi-Agent Debate mode: If enabled, runs a tournament (2 generators, 1 judge)
+  // for complex reasoning tasks to improve quality at the cost of time/tokens.
+  multi_agent_debate?: boolean;
 };
 
 export type IndexLocation = {

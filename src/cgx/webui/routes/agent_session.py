@@ -161,6 +161,7 @@ def _build_deps(req_provider, req_index, project_root: Optional[str],
         embed_model=req_index.embed_model,
         provider=provider,
         store=store,
+        extra={"multi_agent_debate": getattr(req_provider, "multi_agent_debate", False)},
     )
 
 

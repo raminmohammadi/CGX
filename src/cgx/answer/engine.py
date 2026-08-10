@@ -3546,10 +3546,9 @@ _SINGLE_FILE_SYSTEM = (
     "packages with their own __init__.py and are imported without the "
     "src. prefix: `from models.user import User`, never "
     "`from src.models.user import User`.\n"
-    "- Relative imports (`from .foo import bar`) are OK between modules in "
-    "the same subpackage, but NEVER use them inside a script that may be "
-    "launched directly (streamlit run, python src/app.py, etc.) -- those "
-    "scripts run as __main__ and have no parent package.\n"
+    "- DO NOT USE RELATIVE IMPORTS. NEVER use `from .foo import bar` or `from ..foo import bar`. "
+    "Relative imports cause `ImportError: attempted relative import with no known parent package` when the test suite runs. "
+    "You MUST use absolute imports for all local modules (e.g., `from routers import tasks` or `from models import Task`).\n"
     "Python web-framework test discipline (when the requested file is a "
     "pytest test under tests/ for a Flask / FastAPI / Starlette / Django app):\n"
     "- Exercise the application via the framework's in-process client "
@@ -4359,7 +4358,7 @@ def generate_single_scaffold_file(
                 if "".join(ec.split()) == norm_new:
                     syntax_ok = False
                     syntax_error = f"duplicate content of {ep}"
-                    content = ""
+                    content = retry or content
                     break
 
     # First-party symbol-consistency gate: a regenerated file (typically
@@ -4368,6 +4367,39 @@ def generate_single_scaffold_file(
     # `from auth import generate_jwt` when auth.py has no `generate_jwt`).
     # API_CHECK would flag it as a hallucinated attribute, but the
     # regenerate loop can't fix it without knowing what the module really
+    # Relative import gate: forbid relative imports. If the LLM generates a relative import, retry once.
+    if content and syntax_ok and ext == "py":
+        import ast as _ast
+        has_relative = False
+        try:
+            tree = _ast.parse(content)
+            for node in _ast.walk(tree):
+                if isinstance(node, _ast.ImportFrom) and getattr(node, "level", 0) > 0:
+                    has_relative = True
+                    break
+        except Exception:
+            pass
+            
+        if has_relative:
+            retry = _regenerate_scaffold_file(
+                provider, system, context, budget,
+                "CRITICAL ERROR: You used a relative import (from . or from ..). This is strictly forbidden. Rewrite the file using ONLY absolute imports (e.g. from models import Task)."
+            )
+            retry_ok = False
+            if retry:
+                try:
+                    tree2 = _ast.parse(retry)
+                    retry_ok = not any(isinstance(n, _ast.ImportFrom) and getattr(n, "level", 0) > 0 for n in _ast.walk(tree2))
+                except SyntaxError:
+                    pass
+            if retry_ok:
+                content = retry
+            else:
+                syntax_ok = False
+                syntax_error = "File rejected for containing forbidden relative imports."
+                content = retry or content
+
+    # Phantom-symbol gate: the baseline system prompt does not pass a flat
     # exports. Retry once with the real symbol inventory; otherwise fail
     # the file so APPLY drops it rather than persisting a broken import.
     if content and syntax_ok and ext == "py" and existing_files_with_content:
@@ -4396,7 +4428,7 @@ def generate_single_scaffold_file(
                     f"imports undefined first-party symbol(s) "
                     f"{first['missing']} from module '{first['module']}'. "
                     f"Available symbols in '{first['module']}' are: [{avail}]")
-                content = ""
+                content = retry or content
 
     # Undefined-name gate: a file can parse cleanly, import only modules
     # that really exist, and still die the instant anything touches it
@@ -4428,7 +4460,7 @@ def generate_single_scaffold_file(
                 syntax_error = (
                     f"uses undefined name(s) {unbound}: never imported, "
                     "assigned, or defined anywhere in this file. YOU MUST IMPORT IT AT THE TOP OF THE FILE. Regenerate the file with the missing imports added.")
-                content = ""
+                content = retry or content
 
     # No-stub gate: a file can parse cleanly and import only names it defines
     # yet still ship a required symbol whose body is a placeholder (`pass` /
@@ -4460,7 +4492,7 @@ def generate_single_scaffold_file(
                     "stub-only body for required contract symbol(s) "
                     f"{stubs}: implement each with real logic (no pass / ... "
                     "/ NotImplementedError)")
-                content = ""
+                content = retry or content
 
     # Test-collectability gate: a pytest module that parses cleanly but
     # defines no module-top-level `def test_*` collects zero tests (pytest
@@ -5593,7 +5625,8 @@ def generate_repair_files(
         failure_text: str,
         files: List[Dict[str, str]],
         max_files: int = 8,
-        localized_files: Optional[List[str]] = None) -> Dict[str, str]:
+        localized_files: Optional[List[str]] = None,
+        temperature: float = 0.0) -> Dict[str, str]:
     """Propose corrected file contents for a logic/assertion failure.
 
     ``files`` is a list of ``{"path", "content"}`` for the on-disk
@@ -5675,7 +5708,7 @@ def generate_repair_files(
         try:
             raw = provider.chat(
                 messages=messages,
-                temperature=0.0,
+                temperature=temperature,
                 max_tokens=budget["output_tokens"],
                 force_json=True,
                 json_schema=REPAIR_FILES_SCHEMA,

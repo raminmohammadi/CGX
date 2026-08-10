@@ -82,6 +82,7 @@ _SYSTEM_PROMPT = (
     "EXACT planned path that defines it. Name a method as \"ClassName.method\".\n"
     "Give each function real \"parameters\" and a \"return_type\". Do not invent\n"
     "symbols, files, or dependencies the objective did not ask for.\n"
+    "ENTRYPOINT IS MANDATORY: If the objective is an application or API (e.g. FastAPI), you MUST include a main entrypoint file (like 'src/main.py' or 'main.py') that initializes the application instance (e.g. 'app = FastAPI()'). Do NOT expect tests to run without a main application instance to import.\n"
     "THIRD-PARTY LIBRARIES: If you use third-party libraries (e.g. FastAPI, Pydantic), you MUST "
     "actively search the web to retrieve their latest API signatures and include them in the contracts.\n"
     "You can use tools by outputting: <call_tool name=\"search_web\">{\"query\": \"...\"}</call_tool>.\n"
@@ -132,7 +133,13 @@ def _ask_for_plan(provider: Any, goal: str,
             messages.append({"role": "user", "content": f"<tool_response>{tool_res}</tool_response>"})
         else:
             parsed = parse_plan_reply(text)
-            return parsed or {}
+            if parsed:
+                with open("last_plan_parsed.json", "w") as f:
+                    import json as _json
+                    _json.dump(parsed, f, indent=2)
+                return parsed
+            messages.append({"role": "assistant", "content": text})
+            messages.append({"role": "user", "content": "<tool_response>Tool error: invalid JSON generated. Ensure your output is purely JSON without markdown formatting.</tool_response>"})
     return {}
 
 
@@ -183,8 +190,35 @@ def swarm_tech_lead(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     plan: Dict[str, Any] = {}
     paths: List[str] = []
     problems: List[str] = []
+    
+    is_debate = deps.extra.get("multi_agent_debate", False)
+    
     for attempt in range(1, _MAX_PLAN_ATTEMPTS + 1):
-        draft = _ask_for_plan(deps.provider, goal, correction)
+        if is_debate:
+            swarm_beat(project_root, "tech_lead", "debate_generation", attempt=attempt)
+            draft1 = _ask_for_plan(deps.provider, goal, correction)
+            draft2 = _ask_for_plan(deps.provider, goal, correction)
+            
+            # Judge decides
+            judge_prompt = (
+                "You are the Lead Architect. Two developers have proposed plans for the following objective:\n"
+                f"OBJECTIVE: {goal}\n\n"
+                f"PLAN A: {draft1}\n\n"
+                f"PLAN B: {draft2}\n\n"
+                "Evaluate both plans based on completeness, modularity, and adherence to the objective. "
+                "Output ONLY 'A' or 'B'."
+            )
+            try:
+                res = deps.provider.chat([{"role": "user", "content": judge_prompt}])
+                decision = str(res.get("content", "")).strip().upper()
+            except Exception:
+                decision = "A"
+            
+            draft = draft1 if decision == "A" else draft2
+            swarm_beat(project_root, "tech_lead", "debate_decision", decision=decision)
+        else:
+            draft = _ask_for_plan(deps.provider, goal, correction)
+            
         # Test coverage and scaffolding are injected deterministically rather
         # than re-asked: a pytest module is added for every uncovered source
         # module, and the README / dependency manifest / conftest the Developer

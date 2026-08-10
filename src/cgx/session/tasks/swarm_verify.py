@@ -31,6 +31,7 @@ the session COMPLETED only when the tree is structurally clean.
 from __future__ import annotations
 
 import ast
+import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -159,7 +160,7 @@ def _check_phantom_third_party_imports(paths: List[str], contents: Dict[str, str
         if not src: continue
         imports = _extract_imports_python(src)
         for imp in imports:
-            if imp in _STDLIB_TOP or _is_local_package(root, imp):
+            if imp in _STDLIB_TOP or _is_local_package(imp, root):
                 continue
             if imp not in allowed_set:
                 warnings.append({
@@ -237,10 +238,11 @@ def _regenerate(targets: List[str], specs: Dict[str, Any],
 def _run_env_dryrun(paths: List[str], root: str) -> Dict[str, Any]:
     """Install missing imports then run the project's tests (best-effort)."""
     py = [p for p in paths if p.endswith(".py")]
+    py_abs = [os.path.join(root, p) for p in py]
     report: Dict[str, Any] = {"ran": False, "outcome": "skipped"}
     try:
         from cgx.codegen.env_manager import preflight_install
-        missing, results = preflight_install(py, root)
+        missing, results = preflight_install(py_abs, root)
         report["missing_installed"] = missing
         report["install_results"] = results
     except Exception as exc:  # pragma: no cover - install is best-effort
@@ -296,10 +298,148 @@ def _repair_context_paths(localized: List[str], paths: List[str],
     return keep or py
 
 
+def _auto_fix_missing_imports(env: Dict[str, Any], root: str, provider: Any) -> bool:
+    """Parse output for NameError and safely inject missing imports using AST."""
+    output = str(env.get("output") or "")
+    match = re.search(r"NameError: name '(\w+)' is not defined", output)
+    if not match:
+        return False
+    
+    missing_name = match.group(1)
+    file_match = re.search(r"^([^:\n]+):[0-9]+: NameError", output, re.MULTILINE)
+    if not file_match:
+        return False
+    
+    failed_file = file_match.group(1).strip()
+    if not failed_file.endswith(".py"):
+        return False
+        
+    prompt = (f"The name '{missing_name}' is undefined in a Python project. "
+              f"What is the standard import statement for this? "
+              f"Reply with ONLY the single import line, e.g. 'from fastapi import {missing_name}'. "
+              "Do not use markdown fences.")
+    
+    try:
+        reply = provider.chat([{"role": "user", "content": prompt}], force_json=False).get("content", "").strip()
+    except Exception:
+        return False
+        
+    reply = reply.replace("```python", "").replace("```", "").strip()
+    if not (reply.startswith("import ") or reply.startswith("from ")):
+        return False
+        
+    path = os.path.join(root, failed_file)
+    if not os.path.exists(path):
+        return False
+        
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+        
+    if reply in content:
+        return False
+        
+    new_content = reply + "\n" + content
+    from cgx.session.tasks.swarm_tools import edit_file
+    edit_file(failed_file, new_content, root)
+    return True
+
+
+def _auto_fix_function_logic(env: Dict[str, Any], root: str, provider: Any, dyn_rounds: int = 0) -> bool:
+    """Parse output for logic errors, extract the broken function via AST, and ask LLM to rewrite it."""
+    import ast
+    output = str(env.get("output") or "")
+    
+    matches = list(re.finditer(r"^([^:\n]+):([0-9]+): ([a-zA-Z0-9_]+Error)", output, re.MULTILINE))
+    if not matches:
+        return False
+        
+    last_match = matches[-1]
+    failed_file = last_match.group(1).strip()
+    line_number = int(last_match.group(2).strip())
+    error_type = last_match.group(3).strip()
+    
+    if not failed_file.endswith(".py"):
+        return False
+        
+    error_msg_match = re.search(r"E\s+(.*?\n)\n" + re.escape(last_match.group(0)), output)
+    if not error_msg_match:
+        error_msg_match = re.search(r"E\s+(.*?)\n", output[output.rfind('E '):])
+        
+    error_message = error_msg_match.group(1).strip() if error_msg_match else error_type
+    
+    path = os.path.join(root, failed_file)
+    if not os.path.exists(path):
+        return False
+        
+    with open(path, "r", encoding="utf-8") as f:
+        source_code = f.read()
+        
+    try:
+        tree = ast.parse(source_code)
+    except SyntaxError:
+        return False
+        
+    target_node = None
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if hasattr(node, "lineno") and hasattr(node, "end_lineno"):
+                if node.lineno <= line_number <= node.end_lineno:
+                    # In python 3.8+, decorators are included in lineno, but let's be safe
+                    target_node = node
+                    break
+                    
+    if not target_node:
+        return False
+        
+    lines = source_code.split("\n")
+    start_idx = target_node.lineno - 1
+    if hasattr(target_node, "decorator_list") and target_node.decorator_list:
+        start_idx = min(start_idx, target_node.decorator_list[0].lineno - 1)
+        
+    end_idx = target_node.end_lineno
+    old_function_code = "\n".join(lines[start_idx:end_idx])
+    
+    prompt = (
+        f"The following Python code failed with this error:\n"
+        f"ERROR: {error_message}\n\n"
+        f"CODE:\n```python\n{old_function_code}\n```\n\n"
+        f"Rewrite this specific code block to fix the logic error. "
+        f"Return ONLY the raw rewritten code inside a markdown block. Do not include JSON."
+    )
+    
+    # Dynamically scale temperature: starts at 0.2, increases by 0.2 each round up to 0.8
+    repair_temp = min(0.2 + (dyn_rounds * 0.2), 0.8)
+    
+    try:
+        reply = provider.chat([{"role": "user", "content": prompt}], force_json=False, temperature=repair_temp).get("content", "").strip()
+    except Exception:
+        return False
+        
+    import re as re_mod
+    code_match = re_mod.search(r"```python\s*(.*?)\s*```", reply, re_mod.DOTALL)
+    if code_match:
+        new_function_code = code_match.group(1).strip()
+    else:
+        new_function_code = reply.replace("```python", "").replace("```", "").strip()
+        
+    if not new_function_code:
+        return False
+        
+    # verify it parses as valid python
+    try:
+        ast.parse(new_function_code)
+    except SyntaxError:
+        return False
+        
+    new_content = "\n".join(lines[:start_idx]) + "\n" + new_function_code + "\n" + "\n".join(lines[end_idx:])
+    
+    from cgx.session.tasks.swarm_tools import edit_file
+    edit_file(failed_file, new_content, root)
+    return True
 def _dynamic_repair(env: Dict[str, Any], localized: List[str],
                     contents: Dict[str, str], goal: str, root: str,
                     provider: Any, paths: List[str],
-                    specs: Dict[str, Any]) -> List[str]:
+                    specs: Dict[str, Any], dyn_rounds: int = 0) -> List[str]:
     """Failure-driven repair of a red-but-structurally-clean tree.
 
     Blind regeneration re-asks with the same description and contracts, so a
@@ -315,6 +455,11 @@ def _dynamic_repair(env: Dict[str, Any], localized: List[str],
     source validation) are written back. Returns the paths it changed.
     """
     from cgx.answer.engine import generate_repair_files
+    from cgx.session.tasks.swarm_generate import ToolWrapper
+    
+    # Dynamically scale temperature based on the repair round
+    repair_temp = min(0.2 + (dyn_rounds * 0.2), 0.8)
+    
     failure_text = str(env.get("output") or "")
     if not failure_text:
         return []
@@ -324,8 +469,9 @@ def _dynamic_repair(env: Dict[str, Any], localized: List[str],
     if not files:
         return []
     try:
+        wrapped_provider = ToolWrapper(provider, root)
         repaired = generate_repair_files(
-            provider, goal=goal, failure_text=failure_text,
+            wrapped_provider, goal=goal, failure_text=failure_text,
             files=files, localized_files=localized)
     except Exception:  # pragma: no cover - repair is best-effort
         return []
@@ -353,8 +499,15 @@ def _dynamic_regen_targets(env: Dict[str, Any], paths: List[str]) -> List[str]:
         return []
     targets: List[str] = []
     for p in paths:
-        if p and p in text and p not in targets:
-            targets.append(p)
+        rel_p = p
+        if "/src/" in p:
+            rel_p = "src/" + p.split("/src/", 1)[-1]
+        elif "/tests/" in p:
+            rel_p = "tests/" + p.split("/tests/", 1)[-1]
+        
+        if (p and p in text) or (rel_p and rel_p in text):
+            if p not in targets:
+                targets.append(p)
     wanted = set(_MODULE_ERR_RE.findall(text))
     if wanted:
         for p in paths:
@@ -416,8 +569,11 @@ def swarm_verify(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     # case the static gates cannot see: an import that resolves on paper but
     # breaks at runtime. Parse the failure, regenerate only the implicated
     # source files, and dry-run once more before the stage goes terminal.
+    # UPDATE: We also allow dynamic repair even if there are static import warnings,
+    # because static warnings are sometimes false positives (e.g. valid relative imports)
+    # and the test traceback is a much stronger repair signal.
     dyn_rounds = 0
-    while (hard_structural_ok and env.get("outcome") == "failed"
+    while (env.get("outcome") == "failed"
            and dyn_rounds < _MAX_DYNAMIC_REPAIR_ROUNDS):
         # Re-localize against the *current* failure each round: a red suite is
         # exactly the defect the static gates cannot see, and a bug exposed
@@ -436,8 +592,19 @@ def swarm_verify(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         # to blind regeneration of the import targets only when the repairer
         # declines, so a missing-module case still gets its provider
         # regenerated even if the repair pass produced nothing.
-        repaired = _dynamic_repair(env, dyn_targets, contents, goal,
-                                   project_root, deps.provider, paths, specs)
+        
+        # Try lightweight AST-based auto-fix for missing imports first!
+        auto_fixed = _auto_fix_missing_imports(env, project_root, deps.provider)
+        if auto_fixed:
+            repaired = {"auto_fixed": True}
+        else:
+            # Next try AST-based function logic repair
+            auto_fixed_logic = _auto_fix_function_logic(env, project_root, deps.provider, dyn_rounds)
+            if auto_fixed_logic:
+                repaired = {"auto_fixed_logic": True}
+            else:
+                repaired = _dynamic_repair(env, dyn_targets, contents, goal,
+                                           project_root, deps.provider, paths, specs, dyn_rounds)
         if not repaired and dyn_targets:
             _regenerate(dyn_targets, specs, contracts, goal, project_root,
                         deps.provider, paths)

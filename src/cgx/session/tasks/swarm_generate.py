@@ -23,6 +23,60 @@ from typing import Any, Dict, List, Optional
 from cgx.codegen.ast_gluer import ASTAssembler
 from cgx.session.import_audit import strip_unused_imports, unused_imports
 from cgx.session.tasks.swarm_ground import _safe_read, ground_dependencies
+
+class ToolWrapper:
+    def __init__(self, p, root_dir):
+        self.p = p
+        self.root = root_dir
+        
+    def chat(self, messages, **kwargs):
+        import re, json
+        from cgx.session.tasks.swarm_tools import run_python_probe, query_codebase
+        from cgx.session.tasks.swarm_ground import file_skeleton, list_symbols
+        
+        if messages and messages[0].get("role") == "system":
+            if "run_python_probe" not in messages[0].get("content", ""):
+                messages[0]["content"] += (
+                    "\n\nCRITICAL INSTRUCTION: BEFORE outputting your final code JSON, you MUST verify the "
+                    "API signatures, class names, and exports of ANY local file you plan to import from. "
+                    "You do this by calling tools. DO NOT GUESS OR HALLUCINATE imported names. "
+                    "Tools available: \n"
+                    "- run_python_probe(code: str) to run arbitrary python code.\n"
+                    "- file_skeleton(path: str) to view the exact classes/functions defined in a file.\n"
+                    "- list_symbols(path: str) to see symbols in a file.\n"
+                    "To call a tool, output EXACTLY: <call_tool name=\"tool_name\">{\"arg\": \"val\"}</call_tool>\n"
+                    "Wait for the tool response. Once you have verified the necessary imports, output your final JSON response."
+                )
+        
+        kwargs["force_json"] = False
+        for _ in range(5):
+            res = self.p.chat(messages=messages, **kwargs)
+            text = str(res.get("content", ""))
+            match = re.search(r'<call_tool name="(.*?)">(.*?)</call_tool>', text, re.DOTALL)
+            if match:
+                t_name, t_args_str = match.group(1), match.group(2)
+                messages.append({"role": "assistant", "content": text})
+                from cgx.session.tasks.swarm_log import swarm_beat
+                swarm_beat(self.root, "developer", "tool_call", tool=t_name, args=t_args_str)
+                try:
+                    args = json.loads(t_args_str)
+                    if t_name == "run_python_probe":
+                        out = run_python_probe(args.get("code", ""), self.root)
+                    elif t_name == "file_skeleton":
+                        out = file_skeleton(args.get("path", ""), self.root)
+                    elif t_name == "list_symbols":
+                        out = str(list_symbols(args.get("path", ""), self.root))
+                    else:
+                        out = f"Unknown tool: {t_name}"
+                except Exception as e:
+                    out = f"Tool error: {e}"
+                messages.append({"role": "user", "content": f"<tool_response>\n{out}\n</tool_response>"})
+            else:
+                return res
+        return self.p.chat(messages=messages, **kwargs)
+        
+    def chat_stream(self, *args, **kwargs):
+        return self.p.chat_stream(*args, **kwargs)
 from cgx.session.tasks.swarm_log import swarm_beat
 
 # A pytest bootstrap that makes an un-installed project importable from its own
@@ -93,6 +147,8 @@ def _ast_import_injector(content: str, err: str, contracts: Dict[str, Any]) -> O
                 module_path = module_path[:-3]
             mod_str = module_path.replace("/", ".")
             injected.append(f"from {mod_str} import {name}")
+        elif name in contracts.get("third_party_dependencies", []) or name in ["os", "json", "sys", "pytest", "typing"]:
+            injected.append(f"import {name}")
             
     if not injected:
         return None
@@ -136,58 +192,7 @@ def _full_file_attempt(path: str, description: str, depends_on: List[str],
                        contracts: Dict[str, Any], goal: str, root: str,
                        provider: Any, layer: str,
                        manifest_paths: Optional[List[str]]) -> Any:
-    """One full-file generation with interactive tool loop and pre-AST validation. Returns ``(content, error)``."""
     from cgx.answer.engine import generate_single_scaffold_file
-
-    class ToolWrapper:
-        def __init__(self, p, root_dir):
-            self.p = p
-            self.root = root_dir
-            
-        def chat(self, messages, **kwargs):
-            import re, json
-            from cgx.session.tasks.swarm_tools import run_python_probe, query_codebase
-            from cgx.session.tasks.swarm_ground import file_skeleton, list_symbols
-            
-            if messages and messages[0].get("role") == "system":
-                if "run_python_probe" not in messages[0].get("content", ""):
-                    messages[0]["content"] += (
-                        "\n\nTOOLS AVAILABLE: You may use tools before outputting your final JSON plan. "
-                        "Tools: run_python_probe(code: str) to run arbitrary python code, "
-                        "file_skeleton(path: str) to view file signatures, "
-                        "list_symbols(path: str) to see symbols in a file. "
-                        "To call a tool, output EXACTLY: <call_tool name=\"tool_name\">{\"arg\": \"val\"}</call_tool>"
-                    )
-            
-            kwargs["force_json"] = False
-            for _ in range(5):
-                res = self.p.chat(messages=messages, **kwargs)
-                text = str(res.get("content", ""))
-                match = re.search(r'<call_tool name="(.*?)">(.*?)</call_tool>', text, re.DOTALL)
-                if match:
-                    t_name, t_args_str = match.group(1), match.group(2)
-                    messages.append({"role": "assistant", "content": text})
-                    from cgx.session.tasks.swarm_log import swarm_beat
-                    swarm_beat(self.root, "developer", "tool_call", tool=t_name, args=t_args_str)
-                    try:
-                        args = json.loads(t_args_str)
-                        if t_name == "run_python_probe":
-                            out = run_python_probe(args.get("code", ""), self.root)
-                        elif t_name == "file_skeleton":
-                            out = file_skeleton(args.get("path", ""), self.root)
-                        elif t_name == "list_symbols":
-                            out = str(list_symbols(args.get("path", ""), self.root))
-                        else:
-                            out = f"Unknown tool: {t_name}"
-                    except Exception as e:
-                        out = f"Tool error: {e}"
-                    messages.append({"role": "user", "content": f"<tool_response>\n{out}\n</tool_response>"})
-                else:
-                    return res
-            return self.p.chat(messages=messages, **kwargs)
-            
-        def chat_stream(self, *args, **kwargs):
-            return self.p.chat_stream(*args, **kwargs)
 
     context = _dep_context(depends_on, root)
     try:
@@ -209,10 +214,32 @@ def _full_file_attempt(path: str, description: str, depends_on: List[str],
         # Pre-AST Validation: ensure contracts meant for this file are fulfilled
         from cgx.session.scaffold_validate import check_contract_compliance
         warnings = check_contract_compliance({path: content}, contracts)
+        
+        # New Feature: AST-based Import Path Validation
+        # Automatically verify if the local modules imported actually exist in the plan
+        if manifest_paths:
+            from cgx.session.import_audit import resolve_first_party_imports
+            from cgx.session.tasks.swarm_verify import _check_phantom_third_party_imports
+            import_warnings = resolve_first_party_imports({path: content}, manifest_paths, root)
+            allowed_3p = contracts.get("third_party_dependencies", [])
+            phantom_warnings = _check_phantom_third_party_imports([path], {path: content}, allowed_3p, root)
+            warnings.extend(import_warnings)
+            warnings.extend(phantom_warnings)
+
         # Filter warnings specifically related to this path
-        file_warnings = [w for w in warnings if w.get("module") == path]
+        file_warnings = [w for w in warnings if w.get("file") == path or w.get("module") == path]
         if file_warnings:
             errs = "; ".join(w.get("reason", "unknown") for w in file_warnings)
+            
+            # Hint to the LLM what paths actually exist!
+            is_import_err = False
+            if manifest_paths and any(w.get("kind") == "phantom_third_party" or "resolves against neither" in w.get("reason", "") for w in file_warnings):
+                available = ", ".join(manifest_paths)
+                errs += f". IMPORTANT: You imported a non-existent local file! Available local files in the project are: {available}. Use the correct dotted path (e.g. if the file is src/api.py, use 'from src.api import ...')."
+                is_import_err = True
+                
+            if is_import_err:
+                return content, f"AST Import validation failed for {path}: {errs}"
             return content, f"Contract compliance failed for {path}: {errs}"
         return content, None
         
@@ -227,9 +254,26 @@ def _full_file_attempt(path: str, description: str, depends_on: List[str],
                 ast.parse(repaired)
                 from cgx.session.scaffold_validate import check_contract_compliance
                 warnings = check_contract_compliance({path: repaired}, contracts)
-                file_warnings = [w for w in warnings if w.get("module") == path]
+                
+                if manifest_paths:
+                    from cgx.session.import_audit import resolve_first_party_imports
+                    from cgx.session.tasks.swarm_verify import _check_phantom_third_party_imports
+                    import_warnings = resolve_first_party_imports({path: repaired}, manifest_paths, root)
+                    allowed_3p = contracts.get("third_party_dependencies", [])
+                    phantom_warnings = _check_phantom_third_party_imports([path], {path: repaired}, allowed_3p, root)
+                    warnings.extend(import_warnings)
+                    warnings.extend(phantom_warnings)
+                    
+                file_warnings = [w for w in warnings if w.get("file") == path or w.get("module") == path]
                 if file_warnings:
                     errs = "; ".join(w.get("reason", "unknown") for w in file_warnings)
+                    is_import_err = False
+                    if manifest_paths and any(w.get("kind") == "phantom_third_party" or "resolves against neither" in w.get("reason", "") for w in file_warnings):
+                        available = ", ".join(manifest_paths)
+                        errs += f". IMPORTANT: You imported a non-existent local file! Available local files in the project are: {available}. Use the correct dotted path (e.g. if the file is src/api.py, use 'from src.api import ...')."
+                        is_import_err = True
+                    if is_import_err:
+                        return repaired, f"AST Import validation failed for {path}: {errs}"
                     return repaired, f"Contract compliance failed for {path}: {errs}"
                 return repaired, None
             except SyntaxError:
