@@ -70,10 +70,26 @@ class TaskKind(str, enum.Enum):
     mismatch). It emits a typed plan; the existing APPLY executor
     consumes it like any other diff source.
 
+    DIAGNOSE is the reasoning rung between the mechanical REPAIR patch
+    and the whole-tree regenerate: spawned for the ambiguous
+    ``_DIAGNOSE_CLASSES`` failures, it runs the deterministic
+    classifiers first and only falls back to a bounded, read-only ReAct
+    loop over the failure + repo + repair ledger. It emits a typed
+    DIAGNOSIS artifact whose ``minimal_action`` the pure router
+    dispatches to an existing successor.
+
     RUNTIME_VERIFY is the post-VERIFY runtime gate (greenfield only):
     once the unit suite the model wrote passes, it boots the scaffolded
     app / import-and-call smokes the entry modules so "the tests pass"
     becomes "the app actually runs".
+
+    RE_VERIFY is the incremental re-verification gate (design §C2):
+    after a DIAGNOSE-driven scoped fix it re-runs only the *affected*
+    gate -- the failing pytest file(s) named by the origin VERIFY_REPORT
+    -- instead of the full ``BOOTSTRAP_ENV -> API_CHECK -> SMOKE ->
+    VERIFY`` chain. It emits a VERIFY_REPORT identical in shape to VERIFY
+    so the same classifier + pure-router edges apply unchanged (a
+    runtime-origin fix re-runs RUNTIME_VERIFY directly instead).
     """
     EXPLORE = "explore"
     INVESTIGATE = "investigate"
@@ -82,6 +98,7 @@ class TaskKind(str, enum.Enum):
     APPLY = "apply"
     VERIFY = "verify"
     RUNTIME_VERIFY = "runtime_verify"
+    RE_VERIFY = "re_verify"
     ASK_USER = "ask_user"
     SEARCH = "search"
     SUMMARIZE = "summarize"
@@ -92,7 +109,16 @@ class TaskKind(str, enum.Enum):
     API_CHECK = "api_check"
     SMOKE = "smoke"
     REPAIR = "repair"
+    DIAGNOSE = "diagnose"
     AST_REGENERATE = "ast_regenerate"
+    # Read-only placeholder for a persisted row whose kind this build no
+    # longer knows (a retired kind, or a database written by a newer
+    # build). The router never spawns it and no executor is registered;
+    # it exists so one legacy row cannot make a whole session unreadable.
+    UNKNOWN = "unknown"
+    SWARM_TECH_LEAD = "swarm_tech_lead"
+    SWARM_DEVELOPER = "swarm_developer"
+    SWARM_VERIFY = "swarm_verify"
 
 
 class FactKind(str, enum.Enum):
@@ -101,6 +127,11 @@ class FactKind(str, enum.Enum):
     PARAMETER = "parameter"
     ANCHOR = "anchor"
     LLM_CALL = "llm_call"
+    # Durable working memory of attempted repair actions + outcomes
+    # threaded along one repair chain, so DIAGNOSE never repeats a
+    # failed action (see docs/diagnose-design.md §7).
+    REPAIR_LEDGER = "repair_ledger"
+    SWARM_BEAT = "swarm_beat"
 
 
 class ArtifactKind(str, enum.Enum):
@@ -119,6 +150,12 @@ class ArtifactKind(str, enum.Enum):
     API_CHECK_REPORT = "api_check_report"
     SMOKE_REPORT = "smoke_report"
     REPAIR_PLAN = "repair_plan"
+    # Typed output of the DIAGNOSE executor: a one-line root cause plus a
+    # closed ``minimal_action`` the pure router dispatches (see
+    # docs/diagnose-design.md §5).
+    DIAGNOSIS = "diagnosis"
+    SWARM_STATE = "swarm_state"
+    SWARM_VERIFY_REPORT = "swarm_verify_report"
 
 
 class DecisionKind(str, enum.Enum):
@@ -299,6 +336,7 @@ class SessionMode(str, enum.Enum):
     """
     EXPLORE = "explore"
     GREENFIELD = "greenfield"
+    SWARM = "swarm"
 
 
 @dataclass

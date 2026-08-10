@@ -7,5 +7,11 @@
   "codegen": {
     "expectation_match_rate": 1.0,
     "parse_rate": 0.6
+  },
+  "recovery": {
+    "action_match_rate": 1.0,
+    "scoped_recovery_rate": 0.7,
+    "never_worse_rate": 1.0,
+    "determinism_ok": 1.0
   }
 }

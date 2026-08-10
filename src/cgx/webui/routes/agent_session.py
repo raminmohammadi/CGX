@@ -36,6 +36,7 @@ from sse_starlette.sse import EventSourceResponse
 # Importing the tasks package side-effect-registers Phase 1 executors.
 from cgx.session import tasks as _tasks  # noqa: F401
 from cgx.session import SessionRunner, SessionStore
+from cgx.session.budget import drain_step_ceiling
 from cgx.session.events import Event, EventType, get_default_bus
 from cgx.session.llm_trace import TracingProvider
 from cgx.session.mode import detect_mode
@@ -63,16 +64,67 @@ router = APIRouter(tags=["agent-session"], prefix="/agent-session")
 _RUNNERS: Dict[str, SessionRunner] = {}
 _RUNNERS_LOCK = threading.Lock()
 _SESSION_TO_RUNNER: Dict[str, SessionRunner] = {}
+# (st_dev, st_ino) of each cached store's DB at the time it was opened.
+_RUNNER_DB_IDS: Dict[str, Any] = {}
+
+
+def _db_identity(store: SessionStore) -> Any:
+    """Device+inode of ``store``'s DB file, or ``None`` when it is gone.
+
+    In-memory stores have no file and report a fixed sentinel so they
+    are never treated as stale.
+    """
+    path = store.path
+    if str(path) == ":memory:":
+        return ":memory:"
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino)
+
+
+def _discard_runner(key: str, runner: SessionRunner) -> None:
+    """Drop a stale runner from both caches and close its connection."""
+    _RUNNERS.pop(key, None)
+    _RUNNER_DB_IDS.pop(key, None)
+    for sid in [s for s, r in _SESSION_TO_RUNNER.items() if r is runner]:
+        _SESSION_TO_RUNNER.pop(sid, None)
+    try:
+        runner.store.close()
+    except Exception:
+        logger.debug("closing stale session store failed", exc_info=True)
+
+
+def _refresh_stale_runners() -> None:
+    """Re-open every cached store whose DB file moved or vanished."""
+    with _RUNNERS_LOCK:
+        stale = [key for key, runner in _RUNNERS.items()
+                 if _db_identity(runner.store) != _RUNNER_DB_IDS.get(key)]
+    for key in stale:
+        _get_runner(None if key == "__default__" else key)
 
 
 def _get_runner(project_root: Optional[str]) -> SessionRunner:
     key = str(project_root or "__default__")
     with _RUNNERS_LOCK:
         runner = _RUNNERS.get(key)
+        if runner is not None:
+            # The cached connection holds an fd, so it keeps writing into
+            # a DB that was deleted or moved (e.g. the project folder was
+            # sent to the trash) with no error. Re-open when the path no
+            # longer resolves to the file the store was opened on.
+            if _db_identity(runner.store) != _RUNNER_DB_IDS.get(key):
+                logger.info(
+                    "session DB for %s changed on disk; reopening store",
+                    sanitize_for_log(key))
+                _discard_runner(key, runner)
+                runner = None
         if runner is None:
             store = SessionStore(project_root=project_root)
             runner = SessionRunner(store)
             _RUNNERS[key] = runner
+            _RUNNER_DB_IDS[key] = _db_identity(store)
         return runner
 
 
@@ -109,6 +161,7 @@ def _build_deps(req_provider, req_index, project_root: Optional[str],
         embed_model=req_index.embed_model,
         provider=provider,
         store=store,
+        extra={"multi_agent_debate": getattr(req_provider, "multi_agent_debate", False)},
     )
 
 
@@ -139,6 +192,9 @@ async def _drain_ready(runner: SessionRunner, session_id: str,
     is only a safety valve against a router bug that spawns READY tasks
     without end; it must not double as a functional limit, or a task
     created READY past the cap is stranded with no request to re-drive it.
+    For a SWARM session the ceiling is raised per-loop to the plan's file
+    count (:func:`drain_step_ceiling`) so a large one-file-per-task build
+    is not truncated mid-chain; explore/greenfield keep the flat default.
 
     The greenfield write pipeline is SCAFFOLD -> APPLY -> BOOTSTRAP_ENV ->
     API_CHECK -> SMOKE -> VERIFY (6 tasks on the happy path). An
@@ -158,7 +214,13 @@ async def _drain_ready(runner: SessionRunner, session_id: str,
     """
     t0 = time.perf_counter()
     seen_before = _llm_fact_ids(runner, session_id)
-    for _ in range(max_steps):
+    steps = 0
+    # Recompute the ceiling each loop: a SWARM plan's DEVELOPER tasks are
+    # spawned *during* the drain, so the plan-aware bound only grows once
+    # the Tech Lead's WORK_PLAN lands.
+    ceiling = max_steps
+    while steps < ceiling:
+        steps += 1
         # Cooperative cancel (P2.2): honour a stop request *between* tasks
         # so the in-flight task finishes cleanly and no further READY task
         # is dispatched. The flag is consumed here so a later message can
@@ -196,10 +258,12 @@ async def _drain_ready(runner: SessionRunner, session_id: str,
         if task is None:
             _record_agent_turn(runner, session_id, seen_before, t0)
             return
+        ceiling = drain_step_ceiling(runner.store, session_id,
+                                     default=max_steps)
     _record_agent_turn(runner, session_id, seen_before, t0)
     logger.warning(
-        "drain: hit max_steps=%d for session %s without quiescing; "
-        "a READY task may remain undispatched", max_steps,
+        "drain: hit ceiling=%d for session %s without quiescing; "
+        "a READY task may remain undispatched", ceiling,
         sanitize_for_log(session_id))
 
 
@@ -553,6 +617,7 @@ def _resolve_runner_for(sid: str) -> SessionRunner:
     Falls back to the default (project_root=None) runner if nothing
     matches -- typical for sessions created without a project_root.
     """
+    _refresh_stale_runners()
     with _RUNNERS_LOCK:
         runner = _SESSION_TO_RUNNER.get(sid)
         if runner is not None:

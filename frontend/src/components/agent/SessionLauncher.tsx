@@ -60,7 +60,7 @@ export function SessionLauncher({
       </Field>
       <Field label="Mode" hint="Auto picks greenfield for empty / unindexed projects; explore otherwise.">
         <div className="flex gap-1.5">
-          {(["auto", "explore", "greenfield"] as const).map((m) => (
+          {(["auto", "explore", "greenfield", "swarm"] as const).map((m) => (
             <button
               key={m} type="button" disabled={pending}
               onClick={() => setMode(m)}

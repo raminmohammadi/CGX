@@ -45,3 +45,11 @@ def test_ast_assembler_bad_header():
     final_code = assembler.unparse()
     assert "def ok_func():" in final_code
     assert "bad syntax here" not in final_code
+    # The degradation must be visible: a caller that cannot tell an empty
+    # module from a parsed one shipped a 1-byte file as a success.
+    assert assembler.base_error
+
+
+def test_ast_assembler_reports_no_error_for_a_valid_header():
+    assert ASTAssembler("import os\n").base_error is None
+    assert ASTAssembler("").base_error is None

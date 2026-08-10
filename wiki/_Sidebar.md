@@ -11,6 +11,7 @@
 - [[Web UI Guide]]
 - [[CLI Reference]]
 - [[Session Based Agent]]
+- [[Swarm Agent]]
 - [[Self Testing Code Generation]]
 
 **Configure & extend**

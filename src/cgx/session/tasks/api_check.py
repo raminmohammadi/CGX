@@ -266,8 +266,16 @@ for module_path, name in specs:
     elif hasattr(mod, name):
         row["ok"] = True
     else:
-        row["error"] = "AttributeError: module '{}' has no attribute '{}'".format(
-            module_path, name)
+        # A submodule the package binds lazily (``from jose import jwt``
+        # works, yet ``hasattr(jose, 'jwt')`` is False until something
+        # imports it). Importing it is exactly what the referencing code
+        # does, so resolve it the same way before calling it missing.
+        try:
+            importlib.import_module(module_path + "." + name)
+            row["ok"] = True
+        except Exception:
+            row["error"] = "AttributeError: module '{}' has no attribute '{}'".format(
+                module_path, name)
     out.append(row)
 print(json.dumps(out))
 """

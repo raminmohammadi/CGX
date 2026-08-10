@@ -49,8 +49,25 @@ from cgx.session.tasks.base import (
     ExecutorResult,
     register_executor,
 )
+from cgx.trace import emit_trace
 
 logger = logging.getLogger(__name__)
+
+
+# Browser/E2E automation distributions that need a real display the
+# unattended sandbox lacks, mapped to the import root a test would use.
+# A package is only scrubbed when NO applied file imports that root, so a
+# dependency the code actually uses is never removed. Restricted to
+# libraries imported directly in test code -- pytest plugins
+# (pytest-selenium / pytest-playwright), which activate via requirements
+# without an explicit import, are deliberately excluded so an in-use plugin
+# is never mistaken for dead.
+_BROWSER_E2E_PACKAGES: Dict[str, str] = {
+    "selenium": "selenium",
+    "playwright": "playwright",
+    "splinter": "splinter",
+    "helium": "helium",
+}
 
 
 @register_executor(TaskKind.BOOTSTRAP_ENV)
@@ -110,6 +127,22 @@ def run_bootstrap_env(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     # (survives re-bootstrap) and model-independent.
     _pin_transitive_constraints(root)
 
+    # De-scope a dead browser/E2E dependency (P1.4): the symmetric *remove*
+    # counterpart to the preflight *add* path below. A selenium/playwright
+    # distribution requirements.txt declares but no applied file imports
+    # cannot run in the headless sandbox and only bloats the install, so
+    # scrub it before the venv resolves. Deterministic and self-contained
+    # (no router/ledger change); gated on "declared but imported by nothing"
+    # so a package the code uses is untouched -- never worse than today.
+    descoped_deps = _descope_dead_e2e_requirements(root, applied_files)
+    # De-scope a dependency a DIAGNOSE ``remove_dependency`` verdict named
+    # unrunnable (Workstream C3): the router threads the distribution names
+    # via ``descope_packages``. Symmetric to the scan-driven scrub above and
+    # to the ``missing_modules`` *add* path below, applied before the venv
+    # resolves so the fix is durable and model-independent.
+    descoped_deps = descoped_deps + _descope_verdict_requirements(
+        root, task.inputs.get("descope_packages"))
+
     try:
         python_exe = ensure_project_venv(str(root), timeout=timeout)
     except Exception as exc:
@@ -151,6 +184,7 @@ def run_bootstrap_env(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     requested = [str(m).strip()
                  for m in (task.inputs.get("missing_modules") or [])
                  if str(m).strip()]
+    unresolved_requested: List[str] = []
     if requested:
         from cgx.codegen.env_manager import (
             find_missing_python_packages, install_packages)
@@ -174,6 +208,20 @@ def run_bootstrap_env(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
                 "BOOTSTRAP_ENV: missing_modules install raised %s", exc)
             if not pip_log_tail:
                 pip_log_tail = f"{type(exc).__name__}: {exc}"
+        # Loop breaker: a root this repair round explicitly asked pip for
+        # that is *still* unimportable can never be satisfied by another
+        # install pass -- typically a hallucinated first-party-looking
+        # module (``app``). Record it as uninstallable so API_CHECK
+        # classifies the next probe failure as a hallucination and routes
+        # to a regenerate, instead of re-emitting the same install_deps
+        # plan against a byte-identical failure signature.
+        unresolved_requested = _unresolved_requested_roots(
+            requested, python_exe)
+        if unresolved_requested:
+            logger.warning(
+                "BOOTSTRAP_ENV: %d requested module(s) remain unimportable "
+                "after install (deferred to API_CHECK): %s",
+                len(unresolved_requested), unresolved_requested)
 
     # Transitive test-client extra: fastapi/starlette's TestClient needs
     # httpx at import time, but no first-party file imports httpx
@@ -241,8 +289,9 @@ def run_bootstrap_env(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     fatal_installs = {
         pkg: ok for pkg, ok in failed_installs.items()
         if pkg.lower().replace("-", "_") in declared_names}
-    uninstallable = sorted(p for p in failed_installs
-                           if p not in fatal_installs)
+    uninstallable = sorted(
+        {p for p in failed_installs if p not in fatal_installs}
+        | set(unresolved_requested))
     if uninstallable:
         logger.warning(
             "BOOTSTRAP_ENV: %d undeclared import(s) could not be "
@@ -266,9 +315,11 @@ def run_bootstrap_env(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     # ``package.json`` (a Python backend beside a JS/TS frontend) needs its
     # ``node_modules`` provisioned in the same pass so VERIFY's NpmRunner
     # exercises the JS stack against real dependencies rather than relying
-    # on its own best-effort install. Non-fatal, mirroring the node-only
-    # path: a missing npm / offline registry degrades to ``skipped`` and
-    # never fails the Python bootstrap or its outcome.
+    # on its own best-effort install. Mirrors the node-only path: a missing
+    # npm / offline registry degrades to ``skipped``, a manifest npm
+    # rejected reports ``failed``. Either way the JS result never changes
+    # the *Python* outcome -- it travels in the ``node`` sub-report, which
+    # SMOKE reads to surface a rejected manifest as a build failure.
     node_report: Optional[Dict[str, Any]] = None
     if (root / "package.json").is_file():
         node_report = _provision_node_modules(root, timeout)
@@ -328,6 +379,7 @@ def run_bootstrap_env(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             "uninstallable_count": len(uninstallable),
             "missing_import_count": len(missing_runtime),
             "style_issue_count": len(style_issues),
+            "descoped_dep_count": len(descoped_deps),
         },
         artifact=artifact,
         failure=failure,
@@ -335,6 +387,78 @@ def run_bootstrap_env(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
 
 
 # --------------------- helpers ---------------------
+
+def _descope_dead_e2e_requirements(root: Path,
+                                   applied_files: List[str]) -> List[str]:
+    """Scrub a dead browser/E2E dependency from requirements.txt (P1.4).
+
+    A :data:`_BROWSER_E2E_PACKAGES` distribution that requirements.txt
+    declares but whose import root no applied file uses cannot run in the
+    unattended sandbox (no display) and only slows the venv install. Remove
+    it via :func:`cgx.codegen.env_manager.remove_from_requirements`, keeping
+    the flow symmetric to the preflight *add*. Gated on "declared but
+    imported by no applied file", so an E2E suite that is actually present
+    (its tests import selenium) keeps its dependency. Best-effort: any
+    failure leaves requirements.txt untouched. Emits a ``dependency_descope``
+    trace record and returns the distribution names removed.
+    """
+    try:
+        from cgx.codegen.env_manager import (
+            _read_requirements, remove_from_requirements, scan_imports)
+        declared = _read_requirements(str(root))
+        candidates = {
+            pkg: imp for pkg, imp in _BROWSER_E2E_PACKAGES.items()
+            if pkg.replace("-", "_") in declared}
+        if not candidates:
+            return []
+        py_files = [str(root / p) for p in applied_files
+                    if str(p).lower().endswith(".py")]
+        imported = {r.split(".")[0] for r in scan_imports(py_files)}
+        dead = sorted(pkg for pkg, imp in candidates.items()
+                      if imp not in imported)
+        if not dead:
+            return []
+        removed = remove_from_requirements(str(root), dead)
+    except Exception as exc:  # pragma: no cover - best-effort scrub
+        logger.warning("BOOTSTRAP_ENV: E2E de-scope scrub raised %s", exc)
+        return []
+    if removed:
+        emit_trace("dependency_descope", stage="bootstrap_env",
+                   removed=removed, removed_count=len(removed))
+        logger.info("BOOTSTRAP_ENV: de-scoped %d dead browser/E2E "
+                    "dependency(ies): %s", len(removed), removed)
+    return removed
+
+
+def _descope_verdict_requirements(root: Path, packages: Any) -> List[str]:
+    """Scrub the distribution(s) a DIAGNOSE ``remove_dependency`` named (C3).
+
+    The router threads the verdict's ``remove_dependencies`` through the
+    BOOTSTRAP_ENV node's ``descope_packages`` input; drop each from
+    requirements.txt via
+    :func:`cgx.codegen.env_manager.remove_from_requirements`, the same
+    idempotent remove path the scan-driven E2E scrub uses. Best-effort: any
+    failure leaves requirements.txt untouched so a de-scope never blocks the
+    build. Emits a ``dependency_descope`` trace record and returns the
+    distribution names actually removed.
+    """
+    names = [str(p).strip() for p in (packages or []) if str(p).strip()]
+    if not names:
+        return []
+    try:
+        from cgx.codegen.env_manager import remove_from_requirements
+        removed = remove_from_requirements(str(root), names)
+    except Exception as exc:  # pragma: no cover - best-effort scrub
+        logger.warning("BOOTSTRAP_ENV: verdict de-scope scrub raised %s", exc)
+        return []
+    if removed:
+        emit_trace("dependency_descope", stage="bootstrap_env",
+                   source="diagnose_verdict",
+                   removed=removed, removed_count=len(removed))
+        logger.info("BOOTSTRAP_ENV: de-scoped %d verdict "
+                    "dependency(ies): %s", len(removed), removed)
+    return removed
+
 
 def _detect_project_type(root: Path) -> str:
     """Return ``python`` / ``node`` for a known stack, else ``unknown``.
@@ -344,6 +468,12 @@ def _detect_project_type(root: Path) -> str:
     the *primary* type, so a polyglot repo keeps its richer venv
     provisioning + preflight path and the Python-only gates (API_CHECK /
     SMOKE / RUNTIME_VERIFY) still key off ``project_type == "python"``.
+    A tree that carries Python *sources* but no dependency manifest counts
+    as Python too: a scaffold that emitted a FastAPI backend beside a
+    ``package.json`` but forgot ``requirements.txt`` would otherwise route
+    to the node-only path, leaving ``venv_path=None`` -- VERIFY then runs
+    pytest under whatever ambient interpreter launched the agent instead
+    of an isolated project venv.
     :func:`run_bootstrap_env` additionally provisions ``node_modules`` in
     the same pass whenever a ``package.json`` is present (see
     :func:`_provision_node_modules`), so the JS stack is verified against
@@ -356,9 +486,32 @@ def _detect_project_type(root: Path) -> str:
                  "setup.py", "setup.cfg"):
         if (root / name).is_file():
             return "python"
+    if _has_python_sources(root):
+        return "python"
     if (root / "package.json").is_file():
         return "node"
     return "unknown"
+
+
+# Directories that never carry first-party sources; skipped when looking
+# for the ``.py`` files that mark a manifest-less Python tree.
+_NON_SOURCE_DIRS = frozenset({
+    ".git", ".cgx", ".cgx-backups", ".venv", "venv", "node_modules",
+    "__pycache__", ".pytest_cache", ".mypy_cache", "dist", "build",
+})
+
+
+def _has_python_sources(root: Path) -> bool:
+    """True when the tree carries a first-party ``.py`` file."""
+    for path in root.rglob("*.py"):
+        try:
+            parts = path.relative_to(root).parts
+        except ValueError:  # pragma: no cover - rglob yields under root
+            continue
+        if any(p in _NON_SOURCE_DIRS for p in parts[:-1]):
+            continue
+        return True
+    return False
 
 
 # Known transitive incompatibilities a scaffold routinely pins without a
@@ -432,16 +585,16 @@ def _pin_transitive_constraints(root: Path) -> List[str]:
 def _bootstrap_node(task: TaskNode, root: Path,
                     applied_files: List[str],
                     timeout: float) -> ExecutorResult:
-    """Provision ``node_modules`` for a JS/TS project (best-effort).
+    """Provision ``node_modules`` for a JS/TS project.
 
     Runs a bounded ``npm install`` so VERIFY's ``NpmRunner`` build/test
-    smoke has its dependencies. Provisioning is deliberately non-fatal:
-    an offline box (no ``npm``, or an install that cannot reach the
-    registry) degrades to ``skipped`` rather than failing the session --
-    the real build/test signal is produced downstream by VERIFY, and
-    hard-failing here would deny the loop that signal entirely. Emits a
-    ``BUILD_REPORT`` with ``project_type=node`` and no ``python_exe`` so
-    the Python-only API_CHECK / SMOKE gates skip cleanly.
+    smoke has its dependencies. An environment the session does not
+    control -- no ``npm`` binary, an unreachable registry -- degrades to
+    ``skipped``; a manifest npm itself rejected is reported as ``failed``
+    so the loop can repair the generated package.json (see
+    :func:`_provision_node_modules`). Emits a ``BUILD_REPORT`` with
+    ``project_type=node`` and no ``python_exe`` so the Python-only
+    API_CHECK / SMOKE gates skip cleanly.
     """
     report = _provision_node_modules(root, timeout)
     outcome = report["outcome"]
@@ -451,11 +604,13 @@ def _bootstrap_node(task: TaskNode, root: Path,
         outcome=outcome, pip_log_tail=report["log_tail"],
         applied_files=applied_files, style_issues=[],
         resolved_packages=[], pip_freeze_text="", note=report["note"],
+        node_report=report,
     )
     return ExecutorResult(
         outputs={
             "build_artifact_id": artifact.artifact_id,
             "outcome": outcome,
+            "node_outcome": outcome,
             "project_type": "node",
             "venv_path": None,
             "python_exe": None,
@@ -488,35 +643,81 @@ def _run_npm_install(root: Path, timeout: float) -> Tuple[int, str]:
     return proc.returncode, (proc.stderr or proc.stdout or "")[-800:]
 
 
+# npm error codes that indict the *manifest*, not the environment: the
+# registry was reachable and npm refused what the generated package.json
+# declares (an unparseable version range, a package that does not exist, a
+# malformed JSON body, an unsatisfiable peer tree). These are repairable by
+# rewriting the manifest, so they must not be reported as ``skipped``.
+# Everything else -- DNS, refused connections, timeouts -- is the sandbox's
+# problem and stays non-fatal.
+_NPM_MANIFEST_ERROR_CODES = (
+    "EINVALIDTAGNAME", "EINVALIDPACKAGENAME", "EJSONPARSE", "ERESOLVE",
+    "E404", "EUNSUPPORTEDPROTOCOL", "ENOVERSIONS", "ETARGET",
+)
+
+
+def _npm_manifest_error_code(log_tail: str) -> Optional[str]:
+    """The npm error code in ``log_tail`` that indicts the manifest, if any.
+
+    Returns the first :data:`_NPM_MANIFEST_ERROR_CODES` member present in
+    npm's output, or ``None`` when the failure is environmental (or npm
+    reported nothing recognisable).
+    """
+    text = (log_tail or "").upper()
+    for code in _NPM_MANIFEST_ERROR_CODES:
+        if code in text:
+            return code
+    return None
+
+
 def _provision_node_modules(root: Path, timeout: float) -> Dict[str, Any]:
-    """Provision ``node_modules`` (best-effort); return a node sub-report.
+    """Provision ``node_modules``; return a node sub-report.
 
     Shared by the node-only path (:func:`_bootstrap_node`) and the polyglot
-    Python path so both agree on what "provisioned" means. Deliberately
-    non-fatal: a missing ``npm`` binary or an install that cannot
-    materialise ``node_modules`` (offline registry) degrades to ``skipped``
-    rather than raising -- VERIFY's ``NpmRunner`` still produces the real
-    build/test signal, and hard-failing here would deny the loop that
-    signal entirely.
+    Python path so both agree on what "provisioned" means.
 
-    Returns ``{"outcome", "note", "log_tail"}`` where ``outcome`` is one of
-    ``succeeded`` / ``skipped`` and ``note`` is a human-readable reason (or
-    ``None`` on a clean install).
+    Two failure classes, deliberately distinguished. An environment the
+    session does not control -- no ``npm`` binary, an unreachable registry,
+    a timeout -- degrades to ``skipped``: VERIFY's ``NpmRunner`` still
+    produces the real build/test signal and hard-failing here would deny
+    the loop that signal entirely. A manifest npm itself rejected (live: a
+    generated package.json whose every version was the literal
+    ``"{version}"``, ``EINVALIDTAGNAME``) is a defect in generated code, so
+    it returns ``failed`` and SMOKE surfaces it as a build failure the
+    repair loop can act on. Reporting that as ``skipped`` hid the only
+    actionable error in the run while four repair rounds churned elsewhere.
+
+    Returns ``{"outcome", "note", "log_tail", "error_code"}`` where
+    ``outcome`` is ``succeeded`` / ``skipped`` / ``failed``.
     """
     node_modules = root / "node_modules"
     if shutil.which("npm") is None:
         return {"outcome": "skipped", "note": "npm not installed",
-                "log_tail": ""}
+                "log_tail": "", "error_code": None}
     if node_modules.is_dir():
         return {"outcome": "succeeded",
-                "note": "node_modules already present", "log_tail": ""}
+                "note": "node_modules already present",
+                "log_tail": "", "error_code": None}
     rc, log_tail = _run_npm_install(root, timeout)
     if node_modules.is_dir():
-        return {"outcome": "succeeded", "note": None, "log_tail": log_tail}
+        return {"outcome": "succeeded", "note": None,
+                "log_tail": log_tail, "error_code": None}
+    code = _npm_manifest_error_code(log_tail)
+    if code:
+        logger.warning(
+            "BOOTSTRAP_ENV: npm rejected package.json (%s); reporting a "
+            "repairable node bootstrap failure", code)
+        return {
+            "outcome": "failed",
+            "note": f"npm install rejected package.json ({code})",
+            "log_tail": log_tail,
+            "error_code": code,
+        }
     return {
         "outcome": "skipped",
         "note": f"npm install did not provision node_modules (rc={rc})",
         "log_tail": log_tail,
+        "error_code": None,
     }
 
 
@@ -592,6 +793,33 @@ def _import_roots_for(pypi_names: List[str]) -> frozenset:
             if dist.lower().replace("-", "_") == norm:
                 roots.add(imp.lower().replace("-", "_"))
     return frozenset(roots)
+
+
+def _unresolved_requested_roots(requested: List[str],
+                                python_exe: Optional[str]) -> List[str]:
+    """Import roots an ``install_deps`` round asked for but cannot import.
+
+    The repair strategy names the roots API_CHECK reported missing. If a
+    root is still unimportable once pip has been given its chance, no
+    further install can satisfy it -- the name is hallucinated (or maps
+    to nothing on PyPI), and the caller records it as ``uninstallable``
+    so API_CHECK routes the next probe failure to a regenerate. Roots are
+    compared dotless, matching the probe's own granularity.
+    Best-effort: any probe error yields ``[]`` so a transient hiccup never
+    demotes a real dependency to a hallucination.
+    """
+    roots = sorted({str(m).strip().split(".")[0] for m in requested
+                    if str(m).strip()})
+    if not roots or not python_exe:
+        return []
+    try:
+        from cgx.codegen.env_manager import _probe_importable
+        importable = _probe_importable(roots, python_exe)
+    except Exception as exc:
+        logger.warning(
+            "BOOTSTRAP_ENV: requested-root re-probe raised %s", exc)
+        return []
+    return [r for r in roots if r not in importable]
 
 
 # Substrings that mark a file as using the fastapi/starlette test

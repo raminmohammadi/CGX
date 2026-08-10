@@ -34,6 +34,7 @@ const defaultProvider: ProviderConfig = {
   endpoint_path: "/v1/chat/completions",
   allow_no_auth: false,
   think: false,
+  multi_agent_debate: false,
 };
 
 const defaultIndex: IndexLocation = {

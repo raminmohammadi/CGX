@@ -219,11 +219,14 @@ def _cmd_agent(args: argparse.Namespace) -> None:
     """Run one unattended turn of the session agent loop."""
     from cgx.cli.tui import ops
 
+    if getattr(args, "target_dir", None):
+        args.project_root = args.target_dir
+
     state = _state_from_args(args)
     goal = " ".join(args.goal)
     _run_cli_stream(lambda ce: ops.agent_events(
         state, goal, index_dir=args.index_dir, records=args.records,
-        auto=True, cancel_event=ce))
+        auto=True, mode=getattr(args, "mode", None), cancel_event=ce))
 
 
 def _cmd_status(args: argparse.Namespace) -> None:
@@ -249,6 +252,8 @@ def _add_provider_flags(p: argparse.ArgumentParser) -> None:
                    help="Override auto-discovered index dir (<project>/.cgx/index).")
     p.add_argument("--records", default=None,
                    help="Override auto-discovered records.jsonl.")
+    p.add_argument("--mode", default=None, choices=["explore", "greenfield", "swarm"],
+                   help="Override auto-detected session mode.")
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -340,6 +345,8 @@ def main(argv: list[str] | None = None) -> None:
     p_ag = sub.add_parser(
         "agent", help="Run the session agent loop toward a goal.")
     p_ag.add_argument("goal", nargs="+", help="The goal for the agent.")
+    p_ag.add_argument("--target-dir", default=None,
+                      help="Explicit target directory for swarm outputs (overrides project-root).")
     _add_provider_flags(p_ag)
     p_ag.set_defaults(func=_cmd_agent)
 

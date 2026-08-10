@@ -223,6 +223,7 @@ def _session_deps(state: Any, *, index_dir: Optional[str],
 
 def agent_events(state: Any, text: str, *, index_dir: Optional[str] = None,
                  records: Optional[str] = None, auto: bool = False,
+                 mode: Optional[str] = None,
                  cancel_event=None) -> Iterator[Event]:
     """Drive one turn of the session agent loop and stream its events.
 
@@ -256,13 +257,17 @@ def agent_events(state: Any, text: str, *, index_dir: Optional[str] = None,
 
     if session is None:
         state.pending_ask = None
-        mode = detect_mode(project_root=state.project_root,
-                           index_dir=deps.index_dir,
-                           records_path=deps.records_path)
+        if mode:
+            from cgx.session.models import SessionMode
+            session_mode = SessionMode(mode)
+        else:
+            session_mode = detect_mode(project_root=state.project_root,
+                                       index_dir=deps.index_dir,
+                                       records_path=deps.records_path)
         session = runner.start_session(
-            objective=text, project_root=state.project_root, mode=mode)
+            objective=text, project_root=state.project_root, mode=session_mode)
         state.agent_session_id = session.session_id
-        yield "status", {"message": f"session started ({mode.value})"}
+        yield "status", {"message": f"session started ({session_mode.value})"}
     else:
         pending = getattr(state, "pending_ask", None)
         if pending:
@@ -309,12 +314,16 @@ def _drive_session(state: Any, runner: Any, sid: str, deps: Any, *,
     ``run_next`` blocks for the duration of a task, so it runs on an
     inner thread while this generator forwards the session's bus
     events (task lifecycle, scaffold file progress) as they happen.
-    The 64-step ceiling mirrors the webui drain's safety valve.
+    The step ceiling mirrors the webui drain's safety valve: a flat 64
+    for explore/greenfield, raised per-loop to the plan's file count for
+    a SWARM session (:func:`drain_step_ceiling`) so a large one-file-per-
+    task build is not truncated mid-chain.
     """
     import queue as queue_mod
     import threading
     import time
 
+    from cgx.session.budget import drain_step_ceiling
     from cgx.session.events import get_default_bus
     from cgx.session.tasks.ask import build_decision
 
@@ -328,7 +337,9 @@ def _drive_session(state: Any, runner: Any, sid: str, deps: Any, *,
     t0 = time.perf_counter()
     seen_before = _llm_fact_ids(store, sid)
     try:
-        for _ in range(64):
+        steps = 0
+        while steps < drain_step_ceiling(store, sid, default=64):
+            steps += 1
             if cancel_event is not None and cancel_event.is_set():
                 yield "cancelled", {}
                 return

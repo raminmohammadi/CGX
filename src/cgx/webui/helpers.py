@@ -74,7 +74,9 @@ def build_provider(
 
     if kind == "ollama":
         base = (base_url or "http://localhost:11434").replace("/v1", "").rstrip("/")
-        ollama_opts["num_ctx"] = _effective_ollama_num_ctx(model, num_ctx)
+        ctx = _effective_ollama_num_ctx(model, num_ctx)
+        if ctx is not None:
+            ollama_opts["num_ctx"] = ctx
         return OllamaProvider(model=model, base_url=base,
                               extra_options=ollama_opts, **rl_kwargs)
 

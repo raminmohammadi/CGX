@@ -21,6 +21,9 @@ export type ProviderConfig = {
   // when the selected model is reasoning-capable; otherwise it answers
   // directly. Undefined is treated as false.
   think?: boolean;
+  // Multi-Agent Debate mode: If enabled, runs a tournament (2 generators, 1 judge)
+  // for complex reasoning tasks to improve quality at the cost of time/tokens.
+  multi_agent_debate?: boolean;
 };
 
 export type IndexLocation = {
@@ -184,7 +187,7 @@ export type EmbedModelsResponse = {
 
 // --- session-shaped agent types (mirror cgx.session models) ---
 
-export type SessionModeValue = "explore" | "greenfield";
+export type SessionModeValue = "explore" | "greenfield" | "swarm";
 
 export type TaskKind =
   | "explore"
@@ -200,7 +203,10 @@ export type TaskKind =
   | "scaffold"
   | "bootstrap_env"
   | "repair"
-  | "summarize";
+  | "summarize"
+  | "swarm_tech_lead"
+  | "swarm_developer"
+  | "swarm_verify";
 
 export type TaskNodeStatus =
   | "pending"
@@ -228,7 +234,7 @@ export type ArtifactKind =
   | "api_check_report";
 
 export type FactKind =
-  | "file" | "symbol" | "parameter" | "anchor" | "llm_call";
+  | "file" | "symbol" | "parameter" | "anchor" | "llm_call" | "swarm_beat";
 
 export type DecisionKind =
   | "choose_path"
@@ -393,7 +399,9 @@ export type ActivitySummary = {
   cost_usd: number;
   tokens_total: number;
   errors: number;
+  overall_tps?: number;
   by_kind: Record<string, { runs: number; cost_usd: number; tokens_total: number; errors: number }>;
+  by_model?: Record<string, { runs: number; tokens_total: number; tps: number }>;
 };
 
 export type RunDetail = {

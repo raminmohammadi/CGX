@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import logging
 import re
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from cgx.session.budget import LoopBudget
 from cgx.session.models import (
     Artifact,
     ArtifactKind,
@@ -26,12 +28,16 @@ from cgx.session.models import (
 )
 from cgx.session.scaffold_validate import (missing_stack_entry_files,
                                            stack_entry_description)
+from cgx.session.scope import (estimate_scope, feature_label,
+                               unmet_requested_features,
+                               unrunnable_descope_needles)
 from cgx.session.tasks.base import (
     ExecutorDeps,
     ExecutorResult,
     register_executor,
     session_skills,
 )
+from cgx.trace import emit_trace
 
 logger = logging.getLogger(__name__)
 
@@ -58,10 +64,18 @@ def run_decompose(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     # Lazy import: the answer engine drags retrieval + prompt builders.
     from cgx.answer.engine import plan_scaffold_manifest
 
+    # Deterministic scope calibration (P1.1): derive a complexity tier and
+    # a "minimal viable stack" ceiling from the composed goal so the planner
+    # cannot over-scope a simple objective (a calculator dragging in a DB,
+    # migrations, auth, a frontend framework, and Selenium E2E tests).
+    scope = estimate_scope(composed_goal)
+    emit_trace("scope_estimate", stage="decompose", **scope.as_dict())
+
     skills = session_skills(task, deps)
     try:
         result = plan_scaffold_manifest(
-            composed_goal, deps.provider, goal=composed_goal, skills=skills)
+            composed_goal, deps.provider, goal=composed_goal, skills=skills,
+            scope_constraint=scope.constraint)
     except Exception as exc:
         logger.exception("DECOMPOSE: plan_scaffold_manifest crashed")
         return ExecutorResult(
@@ -75,17 +89,67 @@ def run_decompose(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             failure="DECOMPOSE: planner returned an empty manifest",
             retryable=True)
 
+    # Plan self-critique (P1.2): one bounded LLM pass reviews the manifest
+    # against the scope ceiling and drops speculative files (a DB layer,
+    # auth module, or E2E suite the goal never asked for). Advisory and
+    # deterministic-safe -- a provider miss leaves the manifest untouched
+    # (today's behaviour) -- and the removals are gated by guardrails that
+    # refuse to drop an entry point, the last source/test file, or a
+    # depends_on target.
+    layers, critique_removed = _apply_plan_critique(
+        layers, composed_goal, scope, deps)
+
+    # Dependency/test de-scoping (P1.4): deterministically drop manifest
+    # files for a sandbox-unrunnable capability the goal never requested --
+    # browser/E2E tests (Selenium/Playwright/Cypress) that need a real
+    # display the unattended agent sandbox lacks, so they can only ever fail
+    # at VERIFY. Gated by the same _safe_removals guardrails as the critique,
+    # so a de-scope can never drop an entry point, the last source/test file,
+    # or a depends_on target; an explicitly requested E2E suite is kept.
+    layers, descope_removed = _descope_unrunnable(layers, scope)
+
     # Deterministic coherence gate: repair what can be repaired in place
     # (missing stack entry points, dangling depends_on, dependency cycles
     # -- the latter two only ordering hints), fail early only when the
     # manifest is logically unbuildable, then topologically order files by
     # dependency hints so SCAFFOLD generates dependencies before their
     # consumers.
-    _inject_stack_entry_files(layers)
-    coherence_error = _validate_manifest_coherence(layers)
+    report = CoherenceReport()
+    _inject_stack_entry_files(layers, report)
+    coherence_error = _validate_manifest_coherence(layers, report)
     if coherence_error:
         return ExecutorResult(failure=coherence_error, retryable=True)
+
+    # Coherence surgery as a plan-quality signal (P1.3). The gate above
+    # repairs an incoherent manifest in place, but a plan that needed
+    # *heavy* structural surgery (a misfiled entry point, cross-language
+    # depends_on no import can express, a dependency cycle) is one the
+    # planner got wrong at the source -- scaffolding it drags that churn
+    # downstream. When the surgery score clears the threshold and a
+    # DECOMPOSE_RETRY_BUDGET re-ask is still available, fold the surgery
+    # summary into the goal and re-plan once. On the retry (budget spent)
+    # we proceed with the repaired manifest, so this is never worse than
+    # today's behaviour.
+    emit_trace("plan_coherence", stage="decompose", **report.as_dict())
+    budget = LoopBudget.from_inputs(task.inputs)
+    if (report.surgery_score >= COHERENCE_MUTATION_THRESHOLD
+            and not budget.decompose_retry_exhausted):
+        logger.warning(
+            "DECOMPOSE: coherence gate performed heavy surgery "
+            "(score=%d, %s); re-asking the planner for a coherent manifest",
+            report.surgery_score, report.as_dict())
+        return ExecutorResult(
+            failure=_coherence_reask_constraint(report),
+            retryable=True)
+
     layers = _order_manifest_layers(layers)
+
+    # Scope-loss warning (P2.3): the critique and the de-scope can between
+    # them delete every file backing a capability the goal explicitly
+    # asked for -- ses_fa6f72a9d3da4217 lost package.json and shipped a
+    # plan with no React frontend at all, silently. Advisory only: name
+    # the loss so it is visible in the log, the trace, and the plan.
+    unmet = _unmet_features(layers, scope)
 
     # Mandatory endpoint contracts for a cross-language client/server manifest
     # (P0a). A JSX/TSX/Vue client beside a Python backend route talks over
@@ -127,6 +191,9 @@ def run_decompose(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             "plan_md": plan_md,
             "layers": layers,
             "contracts": contracts,
+            "project_complexity": scope.complexity,
+            "scope": scope.as_dict(),
+            "unmet_features": list(unmet),
         },
     )
     return ExecutorResult(
@@ -135,12 +202,165 @@ def run_decompose(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             "file_count": _layer_file_count(layers),
             "layer_count": len(layers),
             "contract_count": _contract_entry_count(contracts),
+            "project_complexity": scope.complexity,
+            "scope_max_files": scope.max_files,
+            "critique_removed": len(critique_removed),
+            "descoped_files": len(descope_removed),
+            "coherence_surgery": report.surgery_score,
+            "unmet_features": list(unmet),
         },
         artifact=artifact,
     )
 
 
 # --------------------- helpers ---------------------
+
+def _unmet_features(layers: List[Dict[str, Any]], scope: Any) -> List[str]:
+    """Capabilities the goal asked for that no manifest file backs.
+
+    Best-effort and non-blocking: it warns, records a ``plan_coverage``
+    trace record, and returns the feature names for the plan artifact.
+    """
+    try:
+        entries = [
+            (str(f.get("path") or ""),
+             " ".join(str(v) for k, v in f.items()
+                      if k != "depends_on" and isinstance(v, str)))
+            for f in _manifest_files(layers)]
+        unmet = list(unmet_requested_features(
+            tuple(getattr(scope, "requested_features", ()) or ()), entries))
+    except Exception:  # pragma: no cover - defensive: advisory signal only
+        logger.exception("DECOMPOSE: feature coverage check crashed")
+        return []
+    if unmet:
+        logger.warning(
+            "DECOMPOSE: the goal asks for %s but no file in the plan "
+            "provides it; the objective is not achievable as planned",
+            "; ".join(feature_label(f) for f in unmet))
+    emit_trace("plan_coverage", stage="decompose", unmet=unmet,
+               requested=list(getattr(scope, "requested_features", ()) or ()))
+    return unmet
+
+
+def _apply_plan_critique(layers: List[Dict[str, Any]], goal: str, scope: Any,
+                         deps: ExecutorDeps) -> tuple:
+    """Run the bounded plan self-critique (P1.2) and apply safe removals.
+
+    Returns ``(layers, removed_paths)``. The critique is advisory: the model
+    proposes speculative files, but the deterministic :func:`_safe_removals`
+    guardrails decide what is actually dropped. Any provider/parse failure
+    yields no removals so the manifest is unchanged (today's behaviour). A
+    ``plan_critique`` trace record is emitted when tracing is on.
+    """
+    from cgx.answer.engine import critique_scaffold_manifest
+    try:
+        flagged = critique_scaffold_manifest(
+            goal, layers, deps.provider,
+            scope_constraint=getattr(scope, "constraint", None))
+    except Exception:  # pragma: no cover - defensive: critique is best-effort
+        logger.exception("DECOMPOSE: plan self-critique crashed")
+        flagged = []
+    removed = _safe_removals(layers, flagged)
+    if removed:
+        layers = _drop_files(layers, removed)
+    emit_trace("plan_critique", stage="decompose",
+               flagged=list(flagged), removed=removed,
+               removed_count=len(removed))
+    return layers, removed
+
+
+def _safe_removals(layers: List[Dict[str, Any]],
+                   flagged: List[str]) -> List[str]:
+    """Filter the critique's flagged paths down to what is safe to drop.
+
+    Refuses to drop a file another kept file ``depends_on`` (an import a
+    sibling needs) and preserves at least one source file and one test file:
+    a critique that would gut every source file is rejected wholesale, and
+    test files are never dropped when they are the only tests. Order is
+    preserved, duplicates removed.
+    """
+    if not flagged:
+        return []
+    files = _manifest_files(layers)
+    all_paths = [str(f.get("path") or "") for f in files]
+    depended: set = set()
+    for f in files:
+        for d in (f.get("depends_on") or []):
+            depended.add(str(d))
+    candidates = [p for p in flagged if p and p not in depended]
+    if not candidates:
+        return []
+    had_src = any(_is_source_file(p) and not _is_test_file(p)
+                  for p in all_paths)
+    had_test = any(_is_test_file(p) for p in all_paths)
+    remove_set = set(candidates)
+    src_left = any(_is_source_file(p) and not _is_test_file(p)
+                   for p in all_paths if p not in remove_set)
+    if had_src and not src_left:
+        return []  # would gut every source file -- refuse the critique
+    test_left = any(_is_test_file(p) for p in all_paths
+                    if p not in remove_set)
+    if had_test and not test_left:
+        candidates = [p for p in candidates if not _is_test_file(p)]
+    return candidates
+
+
+def _descope_unrunnable(layers: List[Dict[str, Any]], scope: Any) -> tuple:
+    """De-scope (P1.4) a sandbox-unrunnable capability the goal didn't ask for.
+
+    Drops manifest files for a heavy capability that is categorically
+    unrunnable in the unattended agent sandbox -- browser/E2E tests
+    (Selenium/Playwright/Cypress), which need a real display -- but only when
+    the goal did not explicitly request it (``scope.requested_features``). A
+    file is flagged when its path or any string field (description/purpose)
+    names one of the capability's keywords. The deterministic
+    :func:`_safe_removals` guardrails decide what is actually dropped, so a
+    de-scope can never gut every source file or drop the only tests. Returns
+    ``(layers, removed_paths)`` and emits a ``plan_descope`` trace record.
+    """
+    needles = unrunnable_descope_needles(
+        getattr(scope, "requested_features", ()) or ())
+    removed: List[str] = []
+    if needles:
+        flagged: List[str] = []
+        for f in _manifest_files(layers):
+            path = str(f.get("path") or "")
+            haystack = " ".join(
+                [path] + [str(v) for k, v in f.items()
+                          if k != "depends_on" and isinstance(v, str)]).lower()
+            if any(needle in haystack for needle in needles):
+                flagged.append(path)
+        removed = _safe_removals(layers, flagged)
+        if removed:
+            layers = _drop_files(layers, removed)
+    emit_trace("plan_descope", stage="decompose",
+               unrunnable=list(needles), removed=removed,
+               removed_count=len(removed))
+    return layers, removed
+
+
+def _drop_files(layers: List[Dict[str, Any]],
+                removed: List[str]) -> List[Dict[str, Any]]:
+    """Return ``layers`` with ``removed`` paths (and any dangling
+    ``depends_on`` references to them) scrubbed out."""
+    remove_set = set(removed)
+    out: List[Dict[str, Any]] = []
+    for layer in layers:
+        kept: List[Dict[str, Any]] = []
+        for f in (layer.get("files") or []):
+            if str(f.get("path") or "").strip() in remove_set:
+                continue
+            deps_list = f.get("depends_on")
+            if deps_list:
+                pruned = [d for d in deps_list if str(d) not in remove_set]
+                if pruned:
+                    f["depends_on"] = pruned
+                else:
+                    f.pop("depends_on", None)
+            kept.append(f)
+        out.append({"name": layer.get("name", "project"), "files": kept})
+    return out
+
 
 def _load_questions(task: TaskNode,
                     deps: ExecutorDeps) -> List[Dict[str, Any]]:
@@ -400,6 +620,75 @@ def _manifest_files(layers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             if isinstance(f, dict) and f.get("path")]
 
 
+# Number of *heavyweight* structural repairs (relocated entry points,
+# cut cross-language edges, broken cycles) above which DECOMPOSE stops
+# trusting its own plan and re-asks the planner once (P1.3). Three was
+# chosen from the calculator run that motivated this work: that manifest
+# tripped exactly one of each defect, so the third repair is the point
+# where "a slip" becomes "an incoherent plan". Kept deliberately high so
+# a single routine repair never burns the DECOMPOSE_RETRY_BUDGET.
+COHERENCE_MUTATION_THRESHOLD = 3
+
+
+@dataclass
+class CoherenceReport:
+    """Tally of the in-place repairs the coherence gate performed.
+
+    Populated by :func:`_inject_stack_entry_files` and
+    :func:`_validate_manifest_coherence` when a report is threaded in, and
+    read back in :func:`run_decompose` as a plan-quality signal. Only the
+    three heavyweight structural defects feed :attr:`surgery_score` (the
+    re-ask trigger); ``injected`` and ``dangling_pruned`` are recorded for
+    observability but are routine and cheap, so they never inflate it.
+    """
+    relocated: List[str] = field(default_factory=list)
+    injected: List[str] = field(default_factory=list)
+    dangling_pruned: List[str] = field(default_factory=list)
+    cross_language_cut: List[str] = field(default_factory=list)
+    broken_cycles: List[str] = field(default_factory=list)
+
+    @property
+    def surgery_score(self) -> int:
+        return (len(self.relocated)
+                + len(self.cross_language_cut)
+                + len(self.broken_cycles))
+
+    def as_dict(self) -> Dict[str, int]:
+        return {
+            "relocated": len(self.relocated),
+            "injected": len(self.injected),
+            "dangling_pruned": len(self.dangling_pruned),
+            "cross_language_cut": len(self.cross_language_cut),
+            "broken_cycles": len(self.broken_cycles),
+            "surgery_score": self.surgery_score,
+        }
+
+
+def _coherence_reask_constraint(report: "CoherenceReport") -> str:
+    """Explain, for the DECOMPOSE re-ask, why the prior plan was rejected.
+
+    Folded into ``prior_goal`` by :func:`_fold_failure_into_goal` so the
+    planner LLM sees the concrete defects (not a bare "try again") and can
+    fix them at the source.
+    """
+    parts: List[str] = []
+    if report.relocated:
+        parts.append("misfiled required entry file(s): "
+                     + ", ".join(report.relocated))
+    if report.cross_language_cut:
+        parts.append("declared cross-language depends_on no import can "
+                     "express on: " + ", ".join(report.cross_language_cut))
+    if report.broken_cycles:
+        parts.append("introduced dependency cycle(s): "
+                     + ", ".join(report.broken_cycles))
+    detail = "; ".join(parts) or "required heavy structural repair"
+    return ("DECOMPOSE: the prior manifest needed heavy structural repair "
+            f"({detail}). Re-plan a coherent manifest -- place entry files "
+            "where the toolchain resolves them, only declare depends_on "
+            "between files of the same language, and avoid dependency "
+            "cycles.")
+
+
 # Source extensions grouped by the runtime that imports them. Only
 # families whose members can import each other are listed: a file's
 # ``depends_on`` is an import hint, so an edge between two families is
@@ -427,7 +716,7 @@ def _lang_family(path: str) -> Optional[str]:
 
 def _repair_cross_language_deps(
         files: List[Dict[str, Any]],
-        layers: List[Dict[str, Any]]) -> None:
+        layers: List[Dict[str, Any]]) -> List[str]:
     """Drop ``depends_on`` edges no import statement could express.
 
     A planner that lays out a React frontend beside a Python backend
@@ -450,7 +739,11 @@ def _repair_cross_language_deps(
     anyway just relocates the hallucination from the import list to the
     test bodies. Non-test files are never dropped -- a mislinked module
     is still buildable, and losing one silently could gut the project.
+
+    Returns the paths whose cross-language edges were cut, so the caller
+    can tally the repair as a plan-quality signal (P1.3).
     """
+    touched: List[str] = []
     doomed: set = set()
     for f in files:
         deps = [str(d) for d in (f.get("depends_on") or [])]
@@ -465,13 +758,14 @@ def _repair_cross_language_deps(
             continue
         kept = [d for d in deps if d not in alien]
         f["depends_on"] = kept
+        touched.append(f["path"])
         logger.warning(
             "DECOMPOSE: dropping cross-language depends_on %s from %r "
             "(%s cannot import them)", alien, f["path"], own)
         if not kept and _is_test_file(f["path"]):
             doomed.add(f["path"])
     if not doomed:
-        return
+        return touched
     logger.warning(
         "DECOMPOSE: dropping unsatisfiable test file(s) %s -- every file "
         "they were planned to cover is in another language",
@@ -486,6 +780,7 @@ def _repair_cross_language_deps(
         surviving = f.get("depends_on")
         if isinstance(surviving, list) and surviving:
             f["depends_on"] = [d for d in surviving if d not in doomed]
+    return touched
 
 
 def _find_dependency_cycle(
@@ -564,7 +859,9 @@ def _relocate_misplaced_stack_entries(
     return moved
 
 
-def _inject_stack_entry_files(layers: List[Dict[str, Any]]) -> List[str]:
+def _inject_stack_entry_files(
+        layers: List[Dict[str, Any]],
+        report: Optional["CoherenceReport"] = None) -> List[str]:
     """Add toolchain-mandated entry files the planner left out.
 
     A manifest that declares ``vite.config.js`` but no root
@@ -574,6 +871,9 @@ def _inject_stack_entry_files(layers: List[Dict[str, Any]]) -> List[str]:
     is re-authored. Appending the entry to the layer that carries its
     trigger turns a guaranteed dead end into a normally-generated file.
     Mutates ``layers`` in place and returns the paths that were added.
+
+    When ``report`` is supplied, relocated and injected entry paths are
+    tallied on it as a plan-quality signal (P1.3).
     """
     files = _manifest_files(layers)
     paths = [f["path"] for f in files]
@@ -582,6 +882,8 @@ def _inject_stack_entry_files(layers: List[Dict[str, Any]]) -> List[str]:
         return []
     moved = _relocate_misplaced_stack_entries(files, missing)
     if moved:
+        if report is not None:
+            report.relocated.extend(moved)
         logger.warning(
             "DECOMPOSE: manifest misfiled required entry file(s) %s; "
             "moving them to where the toolchain resolves them", moved)
@@ -608,6 +910,8 @@ def _inject_stack_entry_files(layers: List[Dict[str, Any]]) -> List[str]:
         target["files"].append(node)
         added.append(entry["path"])
     if added:
+        if report is not None:
+            report.injected.extend(added)
         logger.warning(
             "DECOMPOSE: manifest omitted required entry file(s) %s; "
             "injecting them so the project can build", added)
@@ -615,7 +919,8 @@ def _inject_stack_entry_files(layers: List[Dict[str, Any]]) -> List[str]:
 
 
 def _validate_manifest_coherence(
-        layers: List[Dict[str, Any]]) -> Optional[str]:
+        layers: List[Dict[str, Any]],
+        report: Optional["CoherenceReport"] = None) -> Optional[str]:
     """Deterministic manifest sanity check.
 
     Fails DECOMPOSE early only when the plan is logically unbuildable:
@@ -640,6 +945,8 @@ def _validate_manifest_coherence(
         kept = [d for d in deps if d in path_set]
         if len(kept) != len(deps):
             dropped = [d for d in deps if d not in path_set]
+            if report is not None:
+                report.dangling_pruned.append(f["path"])
             logger.warning(
                 "DECOMPOSE: pruning dangling depends_on %s from %r",
                 dropped, f["path"])
@@ -648,7 +955,9 @@ def _validate_manifest_coherence(
     # Runs after the dangling prune so a phantom path is reported as
     # phantom rather than as a foreign language, and before the cycle
     # search so a dropped node cannot leave a half-lit cycle behind.
-    _repair_cross_language_deps(files, layers)
+    cut = _repair_cross_language_deps(files, layers)
+    if report is not None:
+        report.cross_language_cut.extend(cut)
     files = _manifest_files(layers)
     by_path = {f["path"]: f for f in files}
 
@@ -659,6 +968,8 @@ def _validate_manifest_coherence(
         entry = by_path[src]
         entry["depends_on"] = [d for d in (entry.get("depends_on") or [])
                                if d != dst]
+        if report is not None:
+            report.broken_cycles.append(f"{src} -> {dst}")
         logger.warning(
             "DECOMPOSE: breaking dependency cycle %s by dropping edge "
             "%r -> %r", " -> ".join(cycle), src, dst)
@@ -673,54 +984,52 @@ def _validate_manifest_coherence(
     return None
 
 
-def _order_manifest_layers(
-        layers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Topologically sort files by hard-coding the pipeline into 4 strict layers
-    (Models -> Core -> API -> Tests) and sorting within each layer.
+# The pipeline rank a path occupies in the generated tree. Kept identical to
+# the historical keyword buckets so re-grouping after the global sort yields
+# the same layer partition greenfield already relies on (models/configs/utils
+# first, then core logic, then API/entrypoints, then tests last).
+_BUCKET_NAMES = {
+    1: "models_configs_utils",
+    2: "core_logic_auth",
+    3: "api_routes_main",
+    4: "tests",
+}
+
+
+def _bucket_rank(path: str) -> int:
+    """Return the pipeline rank (1..4) a file path belongs to.
+
+    Rank is a *heuristic tiebreaker* for the global topological sort, never a
+    substitute for it: an explicit ``depends_on`` edge always wins over rank.
     """
-    out: List[Dict[str, Any]] = []
-    all_files: List[Dict[str, Any]] = []
-    
-    for lay in layers:
-        if isinstance(lay, dict):
-            for f in (lay.get("files") or []):
-                if isinstance(f, dict) and f.get("path"):
-                    all_files.append(f)
-                    
-    layer1, layer2, layer3, layer4 = [], [], [], []
-    for f in all_files:
-        path = str(f.get("path", "")).lower()
-        if "test" in path:
-            layer4.append(f)
-        elif any(kw in path for kw in ["model", "config", "util", "schema"]):
-            layer1.append(f)
-        elif any(kw in path for kw in ["main", "app", "route", "api", "server"]):
-            layer3.append(f)
-        else:
-            layer2.append(f)
-            
-    buckets = [
-        {"name": "models_configs_utils", "files": layer1},
-        {"name": "core_logic_auth", "files": layer2},
-        {"name": "api_routes_main", "files": layer3},
-        {"name": "tests", "files": layer4},
-    ]
-    
-    for lay in buckets:
-        if lay["files"]:
-            out.append({**lay, "files": _toposort_files(lay["files"])})
-            
-    return out
+    p = str(path or "").lower()
+    if "test" in p:
+        return 4
+    if any(kw in p for kw in ("model", "config", "util", "schema")):
+        return 1
+    if any(kw in p for kw in ("main", "app", "route", "api", "server")):
+        return 3
+    return 2
 
 
-def _toposort_files(
+def toposort_manifest_files(
         files: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Globally order files so every dependency precedes its consumers.
+
+    A single Kahn sort over the *whole* manifest -- not per-bucket -- so a
+    ``depends_on`` edge that crosses pipeline ranks is honoured instead of
+    silently lost (the old per-bucket sort could invert such an edge). Among
+    files with no ordering constraint between them, ties break by
+    ``(bucket_rank, declared_index)`` so the historical models -> core -> api
+    -> tests flow is preserved. Residual nodes from a cycle that slipped past
+    validation are appended in the same tiebreak order -- never dropped.
+    """
     if len(files) < 2:
         return list(files)
     paths = [f["path"] for f in files]
-    order_index = {p: i for i, p in enumerate(paths)}
     path_set = set(paths)
     by_path = {f["path"]: f for f in files}
+    tiebreak = {p: (_bucket_rank(p), i) for i, p in enumerate(paths)}
     indeg = {p: 0 for p in paths}
     adj: Dict[str, List[str]] = {p: [] for p in paths}
     for f in files:
@@ -729,7 +1038,7 @@ def _toposort_files(
                 adj[dep].append(f["path"])
                 indeg[f["path"]] += 1
     ready = sorted((p for p in paths if indeg[p] == 0),
-                   key=lambda p: order_index[p])
+                   key=lambda p: tiebreak[p])
     ordered: List[str] = []
     while ready:
         p = ready.pop(0)
@@ -741,8 +1050,45 @@ def _toposort_files(
                 newly.append(nxt)
         if newly:
             ready.extend(newly)
-            ready.sort(key=lambda p: order_index[p])
+            ready.sort(key=lambda p: tiebreak[p])
     if len(ordered) != len(paths):
-        # A cycle slipped past validation -- keep declared order.
-        return list(files)
+        # A cycle slipped past validation: append the unresolved remainder in
+        # tiebreak order rather than discarding it, so no planned file is lost.
+        seen = set(ordered)
+        ordered.extend(sorted((p for p in paths if p not in seen),
+                              key=lambda p: tiebreak[p]))
     return [by_path[p] for p in ordered]
+
+
+def _order_manifest_layers(
+        layers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Re-group manifest files into the 4 pipeline layers, dependency-first.
+
+    Files are globally topologically sorted (:func:`toposort_manifest_files`)
+    and then bucketed by :func:`_bucket_rank`, preserving the global order
+    within each bucket. Buckets are emitted in rank order so a dependency in an
+    earlier layer is always generated before its consumer.
+    """
+    all_files: List[Dict[str, Any]] = []
+    for lay in layers:
+        if isinstance(lay, dict):
+            for f in (lay.get("files") or []):
+                if isinstance(f, dict) and f.get("path"):
+                    all_files.append(f)
+
+    ordered = toposort_manifest_files(all_files)
+    grouped: Dict[int, List[Dict[str, Any]]] = {1: [], 2: [], 3: [], 4: []}
+    for f in ordered:
+        grouped[_bucket_rank(str(f.get("path", "")))].append(f)
+
+    out: List[Dict[str, Any]] = []
+    for rank in (1, 2, 3, 4):
+        if grouped[rank]:
+            out.append({"name": _BUCKET_NAMES[rank], "files": grouped[rank]})
+    return out
+
+
+def _toposort_files(
+        files: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Backwards-compatible alias for the global manifest toposort."""
+    return toposort_manifest_files(files)

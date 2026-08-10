@@ -45,6 +45,7 @@ from cgx.session.repair.classify import (
     classify_runtime_report,
     classify_verify_report,
     failure_signature,
+    generic_build_error_files,
     import_name_breaks,
     missing_fixture_names,
     missing_module_names,
@@ -54,6 +55,7 @@ from cgx.session.repair.classify import (
     traceback_source_files,
     undefined_names,
     unresolved_entry_paths,
+    unresolved_html_entry_specs,
     unresolved_import_sources,
 )
 from cgx.session.repair.locate import (
@@ -197,10 +199,17 @@ def run_repair(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     if classification == "missing_dependency":
         # The failure names the exact pip package it needs (e.g.
         # starlette's TestClient guard for httpx). Route straight to
-        # install_deps -- no source rewrite can install a package.
-        return _run_verify_missing_dependency_repair(
-            task, verify_artifact_id, content,
-            list(required_package_names(content)), signature)
+        # install_deps -- no source rewrite can install a package...
+        packages = list(required_package_names(content))
+        unsatisfiable = _pip_proven_unsatisfiable(task, deps, packages)
+        if not unsatisfiable:
+            return _run_verify_missing_dependency_repair(
+                task, verify_artifact_id, content, packages, signature)
+        # ... unless pip already tried and *failed* on the name, which is
+        # the only proof that no install can satisfy it.
+        return _run_uninstallable_dependency_regenerate(
+            task, verify_artifact_id, content, unsatisfiable, signature,
+            attempt)
 
     if classification == "collection_error":
         # An unrecognized collection failure: pytest could not import the
@@ -234,9 +243,16 @@ def run_repair(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             pip_roots = _pip_installable_roots(
                 Path(deps.project_root), content)
             if pip_roots:
-                return _run_verify_missing_dependency_repair(
-                    task, verify_artifact_id, content, pip_roots, signature)
-            
+                unsatisfiable = _pip_proven_unsatisfiable(
+                    task, deps, pip_roots)
+                if not unsatisfiable:
+                    return _run_verify_missing_dependency_repair(
+                        task, verify_artifact_id, content, pip_roots,
+                        signature)
+                return _run_uninstallable_dependency_regenerate(
+                    task, verify_artifact_id, content, unsatisfiable,
+                    signature, attempt)
+
             # The top-level package exists in the project but the leaf does
             # not (e.g. src.config). This is a missing first-party file the
             # scaffold never generated. Carry the paths so the router
@@ -473,21 +489,23 @@ def _run_verify_collection_error_escalation(
     ``can_apply=False`` so the router's terminal guard halts the loop with
     the captured collection error surfaced for manual inspection.
     """
-    from cgx.session.repair.classify import failure_text  # dep direction
+    from cgx.session.repair.classify import failure_text, traceback_source_files  # dep direction
 
     error_text = failure_text(content)
+    target_files = traceback_source_files(content)
     rationale = (
         "pytest could not collect the test suite (collection_error) and no "
         "mechanical repair classifier matched the failure -- typically a "
-        "broken conftest, a pytest CLI/setup error, or an import error "
-        "outside the generated first-party modules. A re-scaffold cannot "
-        "fix this, so the loop halts for manual inspection instead of "
-        "regenerating code that was never the cause.")
+        "broken conftest, a pytest CLI/setup error, or an import error. "
+        "Attempting to regenerate the offending files automatically.")
     extra_constraints: Dict[str, Any] = {
         "kind": "collection_error",
         "rationale": rationale,
         "collection_error": error_text,
     }
+    if target_files:
+        extra_constraints["target_files"] = list(target_files)
+    strategy = "regenerate" if target_files else "escalate"
     plan = Artifact.new(
         session_id=task.session_id,
         produced_by_task_id=task.task_id,
@@ -499,7 +517,7 @@ def _run_verify_collection_error_escalation(
             "repair_attempt": attempt,
             "rationale": rationale,
             "diffs": [],
-            "strategy": "escalate",
+            "strategy": strategy,
             "extra_constraints": extra_constraints,
         },
     )
@@ -511,12 +529,29 @@ def _run_verify_collection_error_escalation(
             "repair_attempt": attempt,
             "diff_count": 0,
             "can_apply": False,
-            "strategy": "escalate",
+            "strategy": strategy,
             "rationale": rationale,
             "extra_constraints": extra_constraints,
         },
         artifact=plan,
     )
+
+
+def _npm_manifest_reject_code(build_stderr: str) -> str:
+    """npm's error code when it refused the manifest, else ``""``.
+
+    BOOTSTRAP_ENV reports a manifest npm rejected as a ``failed`` node
+    provisioning outcome and SMOKE surfaces it as a build-smoke break, so
+    the same log reaches here. Such a break names no source file -- the
+    defect is package.json itself -- and must not be routed at the
+    bundler-error heuristics, which would target an arbitrary file or the
+    whole tree.
+    """
+    try:
+        from cgx.session.tasks.bootstrap_env import _npm_manifest_error_code
+    except Exception:  # pragma: no cover - defensive
+        return ""
+    return _npm_manifest_error_code(build_stderr) or ""
 
 
 def _build_smoke_target_files(build_stderr: str,
@@ -533,7 +568,15 @@ def _build_smoke_target_files(build_stderr: str,
     """
     root = Path(project_root)
     out: List[str] = []
-    for imp in unresolved_import_sources(build_stderr):
+
+    # First, try to extract files from specific import resolution failures.
+    # If that yields nothing, fall back to parsing filenames directly
+    # from generic build errors (e.g., TypeScript or ESLint errors).
+    sources = unresolved_import_sources(build_stderr)
+    if not sources:
+        sources = generic_build_error_files(build_stderr)
+
+    for imp in sources:
         rel = imp
         p = Path(imp)
         if p.is_absolute():
@@ -543,6 +586,28 @@ def _build_smoke_target_files(build_stderr: str,
                 continue
         if (root / rel).exists() and rel not in out:
             out.append(rel)
+    return tuple(out)
+
+
+def _absent_html_entry_specs(build_stderr: str,
+                             project_root: str) -> Tuple[str, ...]:
+    """HTML-entry scripts the bundler cannot resolve and that are absent.
+
+    Vite's ``vite:build-html`` plugin reports ``Failed to resolve
+    /src/main.jsx from <root>/index.html`` when the generated entry
+    document points at a script the manifest never contained. The
+    document itself exists, so this is not a re-author target -- the
+    script has to be *added*, exactly like an unresolved entry module.
+    Specs that do exist on disk are dropped: those are a genuine
+    resolution bug the regenerate edge handles. Order-preserving and
+    de-duplicated.
+    """
+    root = Path(project_root)
+    out: List[str] = []
+    for spec in unresolved_html_entry_specs(build_stderr):
+        if spec in out or (root / spec).exists():
+            continue
+        out.append(spec)
     return tuple(out)
 
 
@@ -566,7 +631,8 @@ def _run_smoke_repair(task: TaskNode, deps: ExecutorDeps,
     content = dict(smoke_artifact.content or {})
     failed = [str(m) for m in content.get("failed_modules") or []]
     build_smoke = content.get("build_smoke")
-    build_broke = isinstance(build_smoke, dict) and not build_smoke.get("ok")
+    build_smoke_dict = build_smoke if isinstance(build_smoke, dict) else {}
+    build_broke = bool(build_smoke_dict) and not build_smoke_dict.get("ok")
     signature = str(content.get("failure_signature") or "").strip()
     if not signature:
         signature = "smoke_import|" + ",".join(sorted(failed))
@@ -587,13 +653,31 @@ def _run_smoke_repair(task: TaskNode, deps: ExecutorDeps,
         # JS/TS build-smoke break: the frontend does not build. There is
         # no dependency to pin; re-authoring the offending files is the
         # only fix, so fold the build error into the regenerate feedback.
-        build_stderr = str(build_smoke.get("stderr_tail") or "")
-        label = str(build_smoke.get("label") or "npm run build")
+        build_stderr = str(build_smoke_dict.get("stderr_tail") or "")
+        label = str(build_smoke_dict.get("label") or "npm run build")
+        npm_reject = _npm_manifest_reject_code(build_stderr)
         # ... unless the bundler could not resolve its *entry module*, in
         # which case no amount of re-authoring helps: the file is absent
         # from the manifest, so the regenerate has to add it.
         missing_entries = unresolved_entry_paths(build_stderr)
-        if missing_entries:
+        if not missing_entries and not npm_reject:
+            # Same class of defect one level in: the entry document
+            # resolved but names a script that was never generated.
+            missing_entries = _absent_html_entry_specs(
+                build_stderr, str(deps.project_root))
+        if npm_reject:
+            # npm never installed anything: it rejected package.json
+            # itself, so no source file is at fault and the regenerate has
+            # to target the manifest.
+            target_files = ("package.json",)
+            rationale = (
+                f"npm refused to install the project ({npm_reject}) -- the "
+                "generated package.json is not valid, so no dependency was "
+                "provisioned and nothing downstream can build. Re-author "
+                "package.json with real, resolvable version ranges for "
+                "every dependency (no template placeholders) and package "
+                "names that exist on the npm registry.")
+        elif missing_entries:
             rationale = (
                 f"The JS/TS build-smoke (`{label}`) could not resolve its "
                 f"entry module(s) {', '.join(missing_entries)}: the "
@@ -606,7 +690,7 @@ def _run_smoke_repair(task: TaskNode, deps: ExecutorDeps,
             # instead of re-authoring the whole tree -- which reproduced the
             # identical miss in ses_aa99f1fb6914488d.
             target_files = _build_smoke_target_files(
-                build_stderr, deps.project_root)
+                build_stderr, str(deps.project_root))
             if target_files:
                 rationale = (
                     f"The JS/TS build-smoke (`{label}`) failed: "
@@ -644,6 +728,12 @@ def _run_smoke_repair(task: TaskNode, deps: ExecutorDeps,
         # the router regenerates only these files against the prior scaffold
         # (reusing every prior-good diff) instead of re-authoring the tree.
         extra_constraints["target_files"] = list(target_files)
+    if failed:
+        strategy = "install_deps"
+    elif missing_entries or target_files:
+        strategy = "regenerate"
+    else:
+        strategy = "escalate"
     artifact = Artifact.new(
         session_id=task.session_id,
         produced_by_task_id=task.task_id,
@@ -659,23 +749,26 @@ def _run_smoke_repair(task: TaskNode, deps: ExecutorDeps,
             "rationale": rationale,
             "failed_modules": failed,
             "diffs": [],
-            "strategy": "regenerate",
+            "strategy": strategy,
             "extra_constraints": extra_constraints,
             "mode": task.inputs.get("mode"),
         },
     )
+    outputs = {
+        "repair_artifact_id": artifact.artifact_id,
+        "classification": classification,
+        "failure_signature": signature,
+        "repair_attempt": attempt,
+        "diff_count": 0,
+        "can_apply": False,
+        "strategy": strategy,
+        "extra_constraints": extra_constraints,
+        "scaffold_artifact_id": content.get("scaffold_artifact_id"),
+    }
+    if failed:
+        outputs["missing_modules"] = failed
     return ExecutorResult(
-        outputs={
-            "repair_artifact_id": artifact.artifact_id,
-            "classification": classification,
-            "failure_signature": signature,
-            "repair_attempt": attempt,
-            "diff_count": 0,
-            "can_apply": False,
-            "strategy": "regenerate",
-            "extra_constraints": extra_constraints,
-            "scaffold_artifact_id": content.get("scaffold_artifact_id"),
-        },
+        outputs=outputs,
         artifact=artifact,
     )
 
@@ -763,6 +856,14 @@ def _run_runtime_repair(task: TaskNode, deps: ExecutorDeps,
     )
 
 
+def _coerce_escalation(value: Any) -> int:
+    """Rung of the router's failure-signature ladder, 0 when absent."""
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _run_api_check_repair(task: TaskNode, deps: ExecutorDeps,
                           api_check_artifact_id: str) -> ExecutorResult:
     """Emit a REPAIR_PLAN from an API_CHECK_REPORT.
@@ -791,7 +892,13 @@ def _run_api_check_repair(task: TaskNode, deps: ExecutorDeps,
     missing_modules = [str(m).strip()
                        for m in content.get("missing_modules") or []
                        if str(m).strip()]
-    if missing_modules:
+    # An escalated round is one whose failure signature the previous
+    # round already saw: whatever it chose did not move the loop. For a
+    # missing module that means the install was a no-op (pip cannot
+    # satisfy a hallucinated name), so the second round rewrites the code
+    # instead of asking for the same install again.
+    escalation = _coerce_escalation(task.inputs.get("repair_escalation"))
+    if missing_modules and not escalation:
         return _run_missing_dependency_repair(
             task, api_check_artifact_id, content, missing_modules)
     conflict_packages = [str(p).strip()
@@ -850,10 +957,22 @@ def _run_api_check_repair(task: TaskNode, deps: ExecutorDeps,
         rationale = (
             "API_CHECK reported a failure but no failed references were "
             "recorded.")
+    if escalation and missing_modules:
+        mods = ", ".join(sorted(dict.fromkeys(missing_modules)))
+        rationale = (
+            f"Installing {mods} was already attempted and did not make the "
+            "module importable, so it is not a real distributable package. "
+            + rationale)
+    target_files = sorted(list({
+        str(ref.get("file"))
+        for f in failed for ref in (f.get("references") or [])
+        if isinstance(ref, dict) and ref.get("file")
+    }))
     extra_constraints = {
         "kind": "api_check_failure",
         "failed_references": failed,
         "rationale": rationale,
+        "target_files": target_files,
     }
     plan = Artifact.new(
         session_id=task.session_id,
@@ -1026,6 +1145,46 @@ def _run_dependency_conflict_repair(
     )
 
 
+def _pip_proven_unsatisfiable(task: TaskNode, deps: ExecutorDeps,
+                              packages: List[str]) -> List[str]:
+    """Subset of ``packages`` pip has already tried and failed to install.
+
+    A repeated failure signature is *not* evidence that a package name is
+    invented: the install may never have run at all (a BOOTSTRAP_ENV that
+    resolved the tree as non-Python provisions no venv, so ``install_deps``
+    is silently skipped and the identical signature comes straight back).
+    Re-authoring source on that basis tells the model to drop a legitimate
+    dependency.
+
+    The only sound evidence is the upstream ``BUILD_REPORT``'s own record
+    of what pip attempted: ``failed_installs`` (a declared requirement that
+    would not resolve) and ``uninstallable`` (a scan-discovered import
+    whose install failed). Matching is on the normalized distribution name,
+    mirroring :func:`cgx.session.tasks.bootstrap_env._import_roots_for`.
+    Best-effort: an unreadable report yields the empty list, which keeps
+    the loop on the install path.
+    """
+    if not packages or deps.store is None:
+        return []
+    build_id = str(task.inputs.get("build_artifact_id") or "").strip()
+    if not build_id:
+        return []
+    art = deps.store.get_artifact(build_id)
+    if art is None or art.kind is not ArtifactKind.BUILD_REPORT:
+        return []
+    content = art.content or {}
+    attempted: List[str] = []
+    for key in ("failed_installs", "uninstallable"):
+        value = content.get(key)
+        if isinstance(value, list):
+            attempted.extend(str(v) for v in value)
+    if not attempted:
+        return []
+    proven = {n.strip().lower().replace("-", "_") for n in attempted}
+    return [p for p in packages
+            if p.strip().lower().replace("-", "_") in proven]
+
+
 def _pip_installable_roots(project_root: Path,
                            content: Dict[str, Any]) -> List[str]:
     """Missing-import roots that are pip problems, not authoring problems.
@@ -1113,6 +1272,76 @@ def _run_verify_missing_dependency_repair(
             "can_apply": False,
             "strategy": "install_deps",
             "missing_modules": mods,
+            "extra_constraints": extra_constraints,
+        },
+        artifact=plan,
+    )
+
+
+def _run_uninstallable_dependency_regenerate(
+        task: TaskNode,
+        verify_artifact_id: str,
+        content: Dict[str, Any],
+        missing_modules: List[str],
+        signature: str,
+        attempt: int) -> ExecutorResult:
+    """Regenerate away an import pip has already proven it cannot satisfy.
+
+    Reached only when the upstream ``BUILD_REPORT`` recorded the package
+    under ``failed_installs`` / ``uninstallable`` -- pip ran and could not
+    resolve the name, so no further install can succeed and only a source
+    change can clear the import. Names the offending file(s) so the
+    regenerate stays scoped instead of re-authoring the whole tree.
+    """
+    mods = sorted(dict.fromkeys(m for m in missing_modules if m))
+    if not signature:
+        signature = "verify|missing:" + ",".join(mods)
+    classification = "uninstallable_dependency"
+    listed = ", ".join(mods) or "the missing package(s)"
+    rationale = (
+        f"pip could not install {listed} (the install was attempted and "
+        "failed), so test collection cannot import it and no further "
+        "install will help. Re-author the offending file(s) to use a "
+        "package that resolves on PyPI, or to drop the import entirely.")
+    extra_constraints: Dict[str, Any] = {
+        "kind": classification,
+        "missing_modules": mods,
+        "rationale": rationale,
+    }
+    target_files = [p for p in traceback_source_files(content)
+                    if p.endswith(".py")]
+    if target_files:
+        extra_constraints["target_files"] = target_files
+    plan = Artifact.new(
+        session_id=task.session_id,
+        produced_by_task_id=task.task_id,
+        kind=ArtifactKind.REPAIR_PLAN,
+        content={
+            "verify_artifact_id": verify_artifact_id,
+            "build_artifact_id": content.get("build_artifact_id"),
+            "apply_artifact_id": content.get("apply_artifact_id"),
+            "classification": classification,
+            "failure_signature": signature,
+            "repair_attempt": attempt,
+            "rationale": rationale,
+            "missing_modules": mods,
+            "diffs": [],
+            "strategy": "regenerate",
+            "extra_constraints": extra_constraints,
+            "mode": content.get("mode") or task.inputs.get("mode"),
+        },
+    )
+    return ExecutorResult(
+        outputs={
+            "repair_artifact_id": plan.artifact_id,
+            "classification": classification,
+            "failure_signature": signature,
+            "repair_attempt": attempt,
+            "diff_count": 0,
+            "can_apply": False,
+            "strategy": "regenerate",
+            "missing_modules": mods,
+            "rationale": rationale,
             "extra_constraints": extra_constraints,
         },
         artifact=plan,

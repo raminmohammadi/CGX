@@ -22,6 +22,9 @@ const KIND_META: Record<TaskKind, { badge: string; label: string }> = {
   scaffold:              { badge: "bg-lime-900/80 text-lime-300",       label: "scaffold" },
   bootstrap_env:         { badge: "bg-amber-900/80 text-amber-300",     label: "bootstrap" },
   repair:                { badge: "bg-rose-900/80 text-rose-300",       label: "repair" },
+  swarm_tech_lead:       { badge: "bg-fuchsia-900/80 text-fuchsia-300", label: "tech lead" },
+  swarm_developer:       { badge: "bg-emerald-900/80 text-emerald-300", label: "developer" },
+  swarm_verify:          { badge: "bg-cyan-900/80 text-cyan-300",       label: "swarm verify" },
 };
 
 function StatusIcon({ status }: { status: TaskNodeStatus }) {

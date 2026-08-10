@@ -92,6 +92,25 @@ These hold across the codebase; respect them when contributing:
 - **Local-first.** No new default egress path; cloud calls are always
   opt-in. See **[[Privacy and Security]]**.
 - **Pure router.** All LLM/I/O stays in executors, never in routing.
+- **Prevent, don't just recover.** Greenfield plans are calibrated to a
+  scope ceiling, self-critiqued, and de-scoped of speculative /
+  sandbox-unrunnable work at `DECOMPOSE` / `BOOTSTRAP_ENV` time, so the
+  recovery ladder has less to fix downstream. See **[[Session Based Agent]]**.
+- **Diagnose before you regenerate.** A mechanical failure still takes an
+  instant `REPAIR` fast path, but a *reasoning-class* failure routes to a
+  `DIAGNOSE` rung that reasons over the failure, the repo, and a
+  `REPAIR_LEDGER` of already-tried actions, then emits a single
+  `minimal_action` verdict the pure router maps to a targeted fix (patch,
+  dependency install/de-scope, or a **scoped** regenerate) instead of
+  nuking the whole tree. Deterministic-first: it degrades to `escalate`
+  on any provider outage. See **[[Session Based Agent]]**.
+- **Re-verify only what broke.** When a diagnosed fix originated from a
+  `VERIFY` failure, the router splices a **RE_VERIFY** task that re-runs
+  pytest against only the failing test file(s) instead of replaying the
+  whole `BOOTSTRAP_ENV → API_CHECK → SMOKE → VERIFY` chain — the venv is
+  already provisioned and every other gate already passed. Non-`VERIFY`
+  origins run the full chain, so behavior is never worse than before. See
+  **[[Session Based Agent]]**.
 - **Additive persistence.** Index/record writers are add-only and
   degrade gracefully when optional deps (FAISS, ML stack) are absent.
 - **Skills add no agent-layer edits.** New technology support is a

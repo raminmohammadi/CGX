@@ -22,8 +22,10 @@ content to plan a remediation.
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import logging
+import re
 import shutil
 import subprocess
 import sys
@@ -101,8 +103,11 @@ def run_smoke(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     # build`` (buildability only); VERIFY's ``NpmRunner`` then runs the
     # ``test`` script. Gated on a provisioned ``node_modules`` (see
     # BOOTSTRAP_ENV) so an offline box that never installed deps skips
-    # rather than fabricating a build failure.
-    build_smoke = _npm_build_smoke(root, task)
+    # rather than fabricating a build failure -- unless the install failed
+    # because npm rejected the manifest, which is a real defect this gate
+    # owns reporting.
+    build_smoke = _npm_build_smoke(
+        root, task, node_report=_resolve_node_report(task, deps))
 
     failed = [m["name"] for m in modules if not m["ok"]]
     part_outcomes = [py_outcome]
@@ -117,7 +122,7 @@ def run_smoke(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
 
     sig_parts = list(failed)
     if build_smoke is not None and not build_smoke["ok"]:
-        sig_parts.append(build_smoke["label"])
+        sig_parts.append(_build_smoke_signature_part(build_smoke))
     signature = _signature(sig_parts) if outcome == "failed" else ""
     content: Dict[str, Any] = {
         "build_artifact_id": task.inputs.get("build_artifact_id"),
@@ -291,6 +296,87 @@ def _signature(failed_modules: List[str]) -> str:
     return "smoke_import|" + ",".join(sorted(failed_modules))
 
 
+# Stack frames, ANSI colour codes and build timings are the parts of a
+# bundler's stderr that vary between two runs of the *same* failure.
+_BUILD_FRAME_RE = re.compile(r"^\s*at\s")
+_BUILD_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+_BUILD_TIMING_RE = re.compile(r"\b\d+(?:\.\d+)?\s*m?s\b")
+_BUILD_DIGEST_LINES = 12
+
+
+def _build_smoke_signature_part(build_smoke: Dict[str, Any]) -> str:
+    """The signature term for a failing build-smoke: label plus error digest.
+
+    The label alone (``npm run build --silent``) is identical for every
+    frontend build failure, so two genuinely different errors -- a
+    missing entry module, then a module the newly-added entry imports --
+    collapse to one signature and the router's flap guard terminates a
+    loop that was in fact making progress. Hashing the error text keeps
+    the two apart while a repeat of the *same* error still matches.
+    """
+    label = str(build_smoke.get("label") or "npm run build")
+    digest = _build_error_digest(str(build_smoke.get("stderr_tail") or ""))
+    return f"{label}#{digest}" if digest else label
+
+
+def _build_error_digest(stderr_tail: str) -> str:
+    """A short stable hash of *which* build error a bundler reported.
+
+    Drops stack frames, ANSI colour codes and wall-clock timings -- the
+    parts that differ run to run -- then hashes the leading error lines,
+    so the same failure hashes the same across repair attempts.
+    """
+    lines: List[str] = []
+    for raw in (stderr_tail or "").splitlines():
+        line = _BUILD_ANSI_RE.sub("", raw).strip()
+        if not line or _BUILD_FRAME_RE.match(raw):
+            continue
+        lines.append(_BUILD_TIMING_RE.sub("<t>", line))
+        if len(lines) >= _BUILD_DIGEST_LINES:
+            break
+    if not lines:
+        return ""
+    blob = "\n".join(lines).encode("utf-8")
+    return hashlib.sha1(blob).hexdigest()[:8]
+
+
+def _resolve_node_report(task: TaskNode,
+                         deps: ExecutorDeps) -> Optional[Dict[str, Any]]:
+    """The upstream BUILD_REPORT's ``node`` provisioning sub-report.
+
+    ``None`` when there is no build artifact, it is the wrong kind, or the
+    bootstrap recorded no JS pass -- every one of which means this task
+    has no evidence about npm and must fall back to its own probing.
+    """
+    build_id = str(task.inputs.get("build_artifact_id") or "").strip()
+    if not build_id:
+        return None
+    art = deps.store.get_artifact(build_id)
+    if art is None or art.kind is not ArtifactKind.BUILD_REPORT:
+        return None
+    report = (art.content or {}).get("node")
+    return report if isinstance(report, dict) else None
+
+
+def _failed_node_install_smoke(
+        node_report: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """A build-smoke entry standing in for an npm install npm itself refused.
+
+    ``None`` unless the bootstrap's node sub-report says ``failed`` -- the
+    outcome reserved for a manifest npm rejected (``EINVALIDTAGNAME`` on
+    an unsubstituted ``"{version}"``, ``E404`` on a package that does not
+    exist). An environmental ``skipped`` still yields ``None`` so an
+    offline box does not fabricate a failure.
+    """
+    if not node_report or str(node_report.get("outcome")) != "failed":
+        return None
+    detail = (str(node_report.get("log_tail") or "").strip()
+              or str(node_report.get("note") or "").strip()
+              or "npm install failed")
+    return {"label": "npm install", "ok": False,
+            "stderr_tail": _clip_output(detail)}
+
+
 def _npm_build_command(root: Path) -> Optional[List[str]]:
     """Return the ``npm run build`` invocation, or ``None`` when absent.
 
@@ -311,22 +397,29 @@ def _npm_build_command(root: Path) -> Optional[List[str]]:
     return None
 
 
-def _npm_build_smoke(root: Path, task: TaskNode) -> Optional[Dict[str, Any]]:
+def _npm_build_smoke(
+        root: Path, task: TaskNode,
+        node_report: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
     """Run ``npm run build`` as a fast buildability gate for JS/TS projects.
 
     Returns ``None`` (skip) when there is no ``package.json``, no ``npm``
     binary, no ``build`` script, or no provisioned ``node_modules`` --
     the last guard keeps an offline box (deps never installed) from
-    fabricating a build failure. Otherwise returns
-    ``{"label", "ok", "stderr_tail"}`` so a broken build surfaces as a
-    real ``failed`` outcome that routes into REPAIR/REGENERATE.
+    fabricating a build failure. The one exception is a ``node_report``
+    whose outcome is ``failed``: BOOTSTRAP_ENV ran npm and npm rejected
+    the generated manifest, so the absent ``node_modules`` *is* the
+    failure and reporting it here is what puts it in front of REPAIR.
+    Otherwise returns ``{"label", "ok", "stderr_tail"}`` so a broken build
+    surfaces as a real ``failed`` outcome that routes into
+    REPAIR/REGENERATE.
     """
     if not (root / "package.json").is_file():
         return None
     if shutil.which("npm") is None:
         return None
     if not (root / "node_modules").is_dir():
-        return None
+        return _failed_node_install_smoke(node_report)
     cmd = _npm_build_command(root)
     if cmd is None:
         return None

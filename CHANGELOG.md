@@ -2,6 +2,119 @@
 
 All notable changes are documented here. Versions follow semver-ish.
 
+## Unreleased -- Swarm mode redesign (plan-driven build engine)
+
+`SessionMode.SWARM` is rebuilt from a brittle free-form Tech Lead/Developer
+loop into a **plan-driven, one-file-at-a-time** engine. Every stage is
+propose-then-validate: the model proposes, deterministic invariants
+(coherence, toposort, contracts, syntax) enforce.
+
+* **Tech Lead planner** (`swarm_tech_lead.py`). Prompts for a draft JSON plan,
+  then normalizes it (dedupe + prune dangling `depends_on` edges), topologically
+  orders the files with the shared Kahn toposort, and gates on buildability
+  with a bounded 3-attempt corrective re-ask. Includes structural rooting checks (`_inconsistent_rooting`)
+  to guarantee all modules are consistently placed (e.g., all under `src/` or all top-level). 
+  Persists a `WORK_PLAN` artifact (`goal`, `layers`, `contracts`, ordered `paths`, `project_root`). An
+  unbuildable plan ends the session FAILED instead of spawning empty work.
+* **Incremental Developer** (`swarm_developer.py`, `swarm_generate.py`,
+  `swarm_ground.py`). One planned file per turn, in dependency order, grounded
+  on the real on-disk content of its dependencies. Generation ladder: full-file
+  (gated on `ast.parse`, one re-ask) falling back to a deterministic
+  `ASTAssembler` header + per-symbol build from the plan contracts; new files
+  via `edit_file`, existing via `patch_file`. Unproducible files are recorded
+  in `failed_paths` and carried forward.
+* **Verification ladder** (`swarm_verify.py`). Static structural checks
+  (first-party import coherence, contract compliance, JS/Python payload
+  coherence) followed, only on success, by an environment dry-run
+  (`preflight_install` + `run_tests_on_disk`). Emits a `SWARM_VERIFY_REPORT`
+  artifact pinpointing files implicated by any failure.
+  * **AST-driven auto-repair** (`_auto_fix_missing_imports`, `_auto_fix_function_logic`):
+    Intercepts `NameError` and logic errors, isolates the failing block via AST,
+    and asks the LLM to rewrite only the broken function in raw markdown (bypassing JSON schema).
+  * **Dynamic Temperature Scaling**: The verification loop now scales LLM temperature dynamically 
+    (from 0.2 to 0.8) during iterative repair rounds to prevent infinite loops of identical code.
+* **Wrapper-tolerant plan parsing** (`swarm_parse.py`) + a typed `SwarmPlan`
+  schema (`swarm_plan.py`), so a small local model wrapping JSON in prose or
+  code fences still yields a validated plan.
+* **Router chain.** `SWARM_TECH_LEAD` -> `SWARM_DEVELOPER` (file 0) ->
+  ... -> `SWARM_DEVELOPER` (file *n*) -> `SWARM_VERIFY` -> terminal
+  (COMPLETED when no `failed_paths`, else FAILED).
+* **Plan-aware drain ceiling.** `drain_step_ceiling` scales a SWARM drain's
+  step budget to the plan's file count (from the flat 64 used by
+  explore/greenfield), so a large one-file-per-task build is not truncated
+  mid-chain. Applied in both the webui drain and the TUI drive, recomputed
+  per loop as the plan's Developer tasks are spawned.
+* **UI.** The objective header's `ModeBadge` now renders a distinct `swarm`
+  badge; swarm tasks and per-file generation progress already surface in the
+  task tree and live progress banner.
+
+### Correctness invariants / hardening
+
+Hard gates that turn silently-tolerated defects into named, actionable
+failures instead of patched-over symptoms.
+
+* **Import safety** (`import_audit.py`). AST tools to detect and strip unused
+  imports (`unused_imports`, `strip_unused_imports`) and to resolve first-party
+  imports against the planned manifest (`resolve_first_party_imports`),
+  accounting for both a top-level and a `src/` layout. Wired into
+  `swarm_generate` as a phantom-import gate (re-ask, then strip as a last
+  resort) and into `swarm_verify` as a path-level coherence check.
+* **Plan verification** (`swarm_plan.verify_plan`). The Tech Lead's plan is
+  validated for internal coherence -- dependency cycles, paths escaping the
+  project root, and orphan tests -- before any Developer task is spawned.
+* **Dynamic targeted regeneration** (`swarm_verify.py`). A structurally-clean
+  tree whose suite is nonetheless red has its `ImportError` /
+  `ModuleNotFoundError` parsed from the pytest output, regenerating only the
+  implicated file before a final dry-run.
+* **Dotted contract resolution** (`scaffold_validate.py`). A declared
+  `Class.method` function contract now resolves against the generated class's
+  method set instead of being sought as a (nonexistent) module-level symbol --
+  fixing a false negative that failed a passing, correct tree.
+
+### Structural completeness + code-quality gates
+
+Turning "the model usually remembers" into deterministic guarantees, so a run
+produces a complete, installable, testable project rather than a bag of source
+files -- validated against four divergent fresh projects (URL-shortener,
+CSV-stats CLI, task scheduler, unit converter), each built in its own wiped
+folder.
+
+* **Deterministic scaffolding injection** (`swarm_plan.ensure_scaffolding`).
+  After normalization, any missing `README.md`, dependency manifest
+  (`requirements.txt` / `pyproject.toml`), and -- for a `src/` layout -- a root
+  `conftest.py` is appended to the plan directly, with `README.md` and
+  `requirements.txt` made to depend on every `.py` so they generate last.
+  `verify_plan` additionally re-asks (`_scaffolding_problems`) when any of
+  these are still absent.
+* **Test-coverage guarantee** (`swarm_plan.ensure_test_coverage`). A
+  `tests/test_<module>.py` (depending on that module) is injected for every
+  source module no planned test covers, so a plan can never ship with zero or
+  partial coverage (fixes the "no tests ran" failure).
+* **Non-Python generation path** (`swarm_generate.generate_file`). Non-`.py`
+  planned files are routed off the Python ladder: deterministic source-derived
+  templates for `requirements.txt` / `conftest.py`, a grounded free-form call
+  for `README.md`, so scaffolding no longer has to survive an `ast.parse` gate.
+* **No-stub generation gate** (`engine._contract_stub_symbols` /
+  `_body_is_stub`). A generated module whose contract functions/methods have
+  placeholder bodies (`pass` / `...` / docstring-only / `raise
+  NotImplementedError`) is rejected with a hardened re-ask naming the
+  offenders, so a stub such as `encode()->pass` can no longer clear the
+  structural gates and ship.
+* **Test-authoring discipline** (`_SINGLE_FILE_SYSTEM`). General (non-symptom)
+  rules: call imported code only with values it accepts, construct all inputs
+  inline / via `tmp_path` (never read an external data file), and assert
+  invariants and round-trips rather than fabricated magic literals.
+* **Failure-driven test regeneration** (`swarm_verify` +
+  `engine.generate_repair_files` / `_LOGIC_REPAIR_SYSTEM`). The repair loop may
+  now rewrite the offending *test* -- not only source -- when the test is the
+  broken artifact (a fabricated literal, or a call the API does not accept),
+  asserting an invariant/round-trip against the real interface. Soft contract
+  warnings no longer suppress this pytest-driven repair.
+* **De-brittled single-file prompt** (`_SINGLE_FILE_SYSTEM`). Example-specific
+  negative directives accreted from individual runs were demoted toward general
+  principles, leaning on the verify+repair (real pytest) loop as the
+  generalizable correctness mechanism instead of per-hallucination patches.
+
 ## Unreleased -- Hugging Face integration (Inference Providers + GGUF browse)
 
 Two additive, low-risk features that make CGX Hugging Face-friendly.

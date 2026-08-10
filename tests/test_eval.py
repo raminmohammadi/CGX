@@ -8,10 +8,17 @@ import pytest
 
 from cgx.eval import metrics as M
 from cgx.eval import codegen as CG
+from cgx.eval import recovery as RC
 from cgx.eval import retrieval as RT
 from cgx.eval.harness import run_gate
 
 EVALS_DIR = str(Path(__file__).resolve().parents[1] / "evals")
+
+
+def _load_recovery_golden():
+    import json
+    path = Path(EVALS_DIR) / "recovery_golden.jsonl"
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
 
 # --------------------------------------------------------------------------
@@ -86,13 +93,102 @@ def test_evaluate_codegen_over_golden_cases():
 
 
 # --------------------------------------------------------------------------
-# Full gate: codegen always runs; retrieval runs only when faiss is present.
+# Recovery scoring (pure, provider-free -- mirrors the real router dispatch)
+# --------------------------------------------------------------------------
+def test_resolve_recovery_scopes_mechanical_and_localized_failures():
+    # A unittest/pytest mix is a mechanical patch, never a regenerate.
+    patch = RC.resolve_recovery({
+        "gate": "verify",
+        "content": {"outcome": "assertions_failed", "failures": [{
+            "type": "AttributeError",
+            "message": "'T' object has no attribute 'assertEqual'",
+            "traceback": "tests/test_calc.py:11: in test_add"}]}})
+    assert patch["action"] == "patch_files"
+    # Assertion drift localizes to the impl file (test frames are filtered out).
+    drift = RC.resolve_recovery({
+        "gate": "verify",
+        "content": {"outcome": "assertions_failed", "failures": [{
+            "type": "AssertionError", "message": "assert 200 == 201",
+            "traceback": ("tests/test_api.py:15: in test_create\n"
+                          "app/api.py:42: in create_item")}]}})
+    assert drift["action"] == "regenerate_files"
+    assert drift["targets"] == ["app/api.py"]
+
+
+def test_resolve_recovery_falls_back_to_whole_tree_without_impl():
+    # Only the test frame is named -> honest whole-tree fallback.
+    out = RC.resolve_recovery({
+        "gate": "verify",
+        "content": {"outcome": "assertions_failed", "failures": [{
+            "type": "AssertionError", "message": "assert False",
+            "traceback": "tests/test_logic.py:20: in test_invariant"}]}})
+    assert out["action"] == "regenerate_whole_tree"
+    assert out["action"] not in RC.SCOPED_ACTIONS
+
+
+def test_evaluate_recovery_over_golden_corpus():
+    golden = _load_recovery_golden()
+    out = RC.evaluate_recovery(golden)
+    assert out["n_items"] == len(golden)
+    agg = out["aggregate"]
+    # Every golden case must resolve to its pinned expected action.
+    assert agg["action_match_rate"] == pytest.approx(1.0)
+    # Scoped recovery must dominate, and cost must beat the whole-tree baseline.
+    assert agg["scoped_recovery_rate"] >= 0.7
+    assert agg["mean_rounds_to_green"] < agg["baseline_mean_rounds"]
+    assert agg["mean_tokens"] < agg["baseline_mean_tokens"]
+
+
+# --------------------------------------------------------------------------
+# Determinism + degradation guardrails (E2): the provider-free recovery floor
+# must be pure and never cost more than the old whole-tree ladder.
+# --------------------------------------------------------------------------
+def test_recovery_never_worse_than_whole_tree_baseline():
+    golden = _load_recovery_golden()
+    out = RC.evaluate_recovery(golden)
+    # Degradation guardrail: no resolved action -- scoped fix or the
+    # provider-outage escalate fallback -- may cost more than a whole-tree nuke.
+    assert out["aggregate"]["never_worse_rate"] == pytest.approx(1.0)
+    assert all(r["never_worse"] for r in out["per_item"])
+
+
+def test_recovery_never_worse_flag_trips_on_costlier_action(monkeypatch):
+    # Inject an action strictly costlier than the whole-tree baseline and prove
+    # the guardrail flags it (so a future regression can't slip past the gate).
+    baseline = RC._WHOLE_TREE_BASELINE
+    costly = {"rounds": baseline["rounds"] + 1, "tokens": baseline["tokens"] + 1}
+    monkeypatch.setitem(RC._ACTION_COST, "regenerate_whole_tree", costly)
+    row = RC.score_case({"id": "x", "gate": "verify", "content": {
+        "outcome": "collection_error", "failures": [{
+            "type": "ImportError",
+            "message": ("cannot import name 'db' from partially initialized "
+                        "module 'app.models' (most likely due to a circular "
+                        "import)"),
+            "traceback": "app/models.py:1: in <module>"}]}})
+    assert row["action"] == "regenerate_whole_tree"
+    assert row["never_worse"] is False
+
+
+def test_recovery_resolution_is_deterministic():
+    golden = _load_recovery_golden()
+    assert RC.check_recovery_determinism(golden, repeats=5) is True
+    # The pure resolver produces an identical signature every run.
+    assert RC._resolution_signature(golden) == RC._resolution_signature(golden)
+
+
+# --------------------------------------------------------------------------
+# Full gate: codegen + recovery always run; retrieval only when faiss present.
 # --------------------------------------------------------------------------
 def test_run_gate_passes_on_repo_golden():
     report, ok = run_gate(EVALS_DIR)
     assert ok, f"gate failed: {report['failures']}"
     assert "codegen" in report["sections"]
     assert report["sections"]["codegen"]["aggregate"]["expectation_match_rate"] == 1.0
+    assert "recovery" in report["sections"]
+    rc_agg = report["sections"]["recovery"]["aggregate"]
+    assert rc_agg["action_match_rate"] == 1.0
+    assert rc_agg["never_worse_rate"] == 1.0
+    assert rc_agg["determinism_ok"] == 1.0
 
 
 def test_retrieval_end_to_end_over_sample_repo(tmp_path):

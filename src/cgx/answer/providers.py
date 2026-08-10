@@ -88,7 +88,8 @@ class LLMProvider:
         messages: List[Dict[str, str]],
         temperature: float = 0.2,
         max_tokens: Optional[int] = None,
-        force_json: bool = True,
+        *,
+        force_json: bool,
         json_schema: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
@@ -99,7 +100,8 @@ class LLMProvider:
         messages: List[Dict[str, str]],
         temperature: float = 0.2,
         max_tokens: Optional[int] = None,
-        force_json: bool = False,
+        *,
+        force_json: bool,
         **kwargs: Any,
     ) -> Iterator[str]:
         """Yield incremental text deltas. Default fallback: call :meth:`chat`
@@ -163,7 +165,8 @@ class OllamaProvider(LLMProvider):
         messages: List[Dict[str, str]],
         temperature: float = 0.2,
         max_tokens: Optional[int] = None,
-        force_json: bool = True,
+        *,
+        force_json: bool,
         json_schema: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
@@ -234,7 +237,8 @@ class OllamaProvider(LLMProvider):
         messages: List[Dict[str, str]],
         temperature: float = 0.2,
         max_tokens: Optional[int] = None,
-        force_json: bool = False,
+        *,
+        force_json: bool,
         **kwargs: Any,
     ) -> Iterator[str]:
         """Stream deltas from Ollama via NDJSON lines on /api/chat.
@@ -257,6 +261,10 @@ class OllamaProvider(LLMProvider):
             payload["format"] = "json"
         if self.keep_alive is not None:
             payload["keep_alive"] = self.keep_alive
+            
+        with open("ollama_payload.json", "w") as f:
+            json.dump(payload, f, indent=2)
+            
         try:
             with requests.post(url, json=payload, timeout=self.timeout, stream=True) as resp:
                 resp.raise_for_status()
@@ -346,7 +354,8 @@ class GeminiProvider(LLMProvider):
         messages: List[Dict[str, str]],
         temperature: float = 0.2,
         max_tokens: Optional[int] = None,
-        force_json: bool = True,
+        *,
+        force_json: bool,
         json_schema: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
@@ -594,7 +603,8 @@ class OpenAICompatProvider(LLMProvider):
         messages: List[Dict[str, str]],
         temperature: float = 0.2,
         max_tokens: Optional[int] = None,
-        force_json: bool = True,
+        *,
+        force_json: bool,
         json_schema: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:

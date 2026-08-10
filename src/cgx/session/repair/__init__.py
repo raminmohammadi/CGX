@@ -15,6 +15,11 @@ VERIFY can be auto-fixed without an LLM call. Three pieces live here:
 * :mod:`propose` -- per-classification diff generators. Each one
   returns a list of ``{"file", "patch"}`` unified diffs that the
   shared APPLY executor can write to disk.
+* :mod:`context` -- :class:`FailureContext`, the single normalized
+  input the DIAGNOSE reasoning rung consumes across all four gates.
+* :mod:`ledger` -- :class:`RepairLedger`, the durable working memory of
+  attempted actions + outcomes threaded along one repair chain so
+  DIAGNOSE never re-proposes a proven dead end.
 
 The split is intentional: classification is the only step that has to
 be conservative across the entire failure surface; location and
@@ -36,10 +41,15 @@ from cgx.session.repair.classify import (
     third_party_import_breaks,
     undefined_names,
 )
+from cgx.session.repair.context import FailureContext
+from cgx.session.repair.ledger import RepairAttempt, RepairLedger
 
 __all__ = [
     "REPAIR_CLASSIFICATIONS",
     "RepairClassification",
+    "FailureContext",
+    "RepairAttempt",
+    "RepairLedger",
     "circular_import_modules",
     "classify_verify_report",
     "failure_signature",

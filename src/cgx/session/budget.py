@@ -83,6 +83,47 @@ DECOMPOSE_RETRY_BUDGET = 1
 GREENFIELD_MAX_TASK_RUNS = 60
 GREENFIELD_MAX_WALL_SECONDS = 3600.0
 
+# Default safety-valve ceiling on the number of tasks a single drain pass
+# dispatches. Explore/greenfield task graphs are small and bounded well
+# under it, so the flat cap only ever fires on a router bug. A SWARM
+# session instead spawns one DEVELOPER task per planned file followed by a
+# VERIFY, so a large plan legitimately needs more; :func:`drain_step_ceiling`
+# scales the ceiling to the plan's file count for SWARM sessions only.
+DRAIN_STEP_CEILING = 64
+
+
+def drain_step_ceiling(store: Any, session_id: str, *,
+                       default: int = DRAIN_STEP_CEILING) -> int:
+    """Plan-aware ceiling for a session drain loop.
+
+    Returns ``default`` for explore/greenfield sessions, whose task
+    graphs stay well under it. A SWARM session dispatches one DEVELOPER
+    task per planned file then a VERIFY, so a plan with more than ~20
+    files would be truncated mid-chain by the flat default; scale the
+    ceiling to the plan's file count -- with headroom for one regenerate
+    retry per file plus planning/verify/terminal overhead -- so a large
+    build runs to quiescence while a runaway is still bounded. The file
+    count is read from the WORK_PLAN artifact, falling back to the number
+    of DEVELOPER tasks already spawned before the plan lands. Best-effort:
+    any lookup failure falls back to ``default`` so the drain never blocks.
+    """
+    try:
+        from cgx.session.models import ArtifactKind, SessionMode, TaskKind
+        session = store.get_session(session_id)
+        if session is None or session.mode is not SessionMode.SWARM:
+            return default
+        file_count = 0
+        for art in store.list_artifacts(session_id):
+            if art.kind is ArtifactKind.WORK_PLAN and art.content:
+                paths = art.content.get("paths") or []
+                file_count = max(file_count, len(paths))
+        dev = sum(1 for t in store.list_tasks(session_id)
+                  if t.kind is TaskKind.SWARM_DEVELOPER)
+        file_count = max(file_count, dev)
+        return max(default, file_count * 3 + 16)
+    except Exception:  # pragma: no cover - defensive; never block a drain
+        return default
+
 
 def _coerce_int(value: Any) -> Optional[int]:
     """Best-effort ``int`` coercion; returns ``None`` for missing/garbage."""
@@ -111,6 +152,12 @@ class LoopBudget:
     them: ``regenerate_attempt`` / ``repair_regenerate_attempt`` /
     ``replan_attempt`` on SCAFFOLD nodes, ``decompose_retry`` (plus
     ``replan_attempt``) on DECOMPOSE nodes.
+
+    ``repair_ledger_fact_id`` is not a counter but rides the same chain:
+    it points at the ``FactKind.REPAIR_LEDGER`` working-memory fact so
+    ``DIAGNOSE`` can read what was already tried and never re-propose a
+    proven dead end. The router only threads the id -- it never reads the
+    fact's contents, so it stays pure (see docs/diagnose-design.md §7).
     """
 
     repair_attempt: int = 0
@@ -121,6 +168,7 @@ class LoopBudget:
     repair_regenerate_attempt: int = 0
     replan_attempt: int = 0
     decompose_retry: int = 0
+    repair_ledger_fact_id: Optional[str] = None
 
     # --------------- construction / serialization ---------------
 
@@ -152,21 +200,38 @@ class LoopBudget:
                 src.get("repair_regenerate_attempt")) or 0,
             replan_attempt=_coerce_int(src.get("replan_attempt")) or 0,
             decompose_retry=_coerce_int(src.get("decompose_retry")) or 0,
+            repair_ledger_fact_id=(
+                str(src["repair_ledger_fact_id"]).strip() or None
+                if src.get("repair_ledger_fact_id") else None),
         )
 
     def repair_chain_inputs(self) -> Dict[str, Any]:
         """Serialize the repair-chain fields as successor-task inputs.
 
         Every edge on the repair chain threads exactly this dict, so a
-        counter can no longer be dropped by an edge that forgot one key.
-        The keys match the historical flat wire format.
+        counter (or the ledger id) can no longer be dropped by an edge that
+        forgot one key. The keys match the historical flat wire format;
+        ``repair_ledger_fact_id`` is emitted only when set so a chain that
+        never opened a ledger keeps the identical wire shape as before.
         """
-        return {
+        chain: Dict[str, Any] = {
             "repair_attempt": self.repair_attempt,
             "prior_failure_signatures": list(self.prior_failure_signatures),
             "prior_failing_counts": list(self.prior_failing_counts),
             "prior_passing_counts": list(self.prior_passing_counts),
         }
+        if self.repair_ledger_fact_id:
+            chain["repair_ledger_fact_id"] = self.repair_ledger_fact_id
+        return chain
+
+    def with_repair_ledger(self, fact_id: Optional[str]) -> "LoopBudget":
+        """Return a copy pointing at the repair chain's ledger fact.
+
+        Threaded on the edge out of DIAGNOSE so the ledger the executor
+        just appended survives the hop to the next repair round.
+        """
+        fid = str(fact_id).strip() if fact_id else None
+        return replace(self, repair_ledger_fact_id=fid or None)
 
     # --------------- exhaustion predicates ---------------
 
@@ -198,6 +263,16 @@ class LoopBudget:
     def seen(self, signature: str) -> bool:
         """True when ``signature`` already appears in the flap ledger."""
         return signature in self.prior_failure_signatures
+
+    def signature_repeats(self, signature: str) -> int:
+        """How many times ``signature`` already appears in the flap ledger.
+
+        A gate that only asks *whether* a signature repeated has one
+        response left -- stop. Callers that can escalate their strategy
+        instead (API_CHECK: install_deps, then a regenerate that removes
+        the offending import) read the count to pick the next rung.
+        """
+        return self.prior_failure_signatures.count(str(signature))
 
     # --------------- spending (each returns a new copy) ---------------
 

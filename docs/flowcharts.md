@@ -126,10 +126,12 @@ their own pace, which is what makes a session resumable after a
 restart.
 
 **Executors** (`cgx.session.tasks.*`) are plain functions registered
-per `TaskKind` via `@register_executor` -- fifteen of them, from
+per `TaskKind` via `@register_executor` -- seventeen of them, from
 EXPLORE and INVESTIGATE through SCAFFOLD, APPLY, the verification
 ladder (BOOTSTRAP_ENV → API_CHECK → SMOKE → VERIFY → RUNTIME_VERIFY),
-and REPAIR. Each returns an `ExecutorResult` carrying typed facts and
+REPAIR, the Phase 2 DIAGNOSE reasoning rung, and the Phase 3.2
+RE_VERIFY incremental gate. Each returns an
+`ExecutorResult` carrying typed facts and
 artifacts plus a `retryable` flag. The apply executor performs a
 **partial apply** (write passing files, record `failed_files`) and a
 **cross-file coherence** check that catches a Python test importing a
@@ -288,15 +290,24 @@ once the load stops getting lighter.
 
 ```mermaid
 flowchart LR
-    U([goal]) --> CQ(["CLARIFY_REQUIREMENTS"]) --> DEC(["DECOMPOSE<br/>contracts + layers<br/>(P0a: mandatory cross-seam endpoints)"])
+    U([goal]) --> CQ(["CLARIFY_REQUIREMENTS<br/>+ scope calibration (P1.1)"]) --> DEC(["DECOMPOSE<br/>scope ceiling + self-critique + de-scope + coherence re-ask<br/>+ contracts + layers<br/>(P0a: mandatory cross-seam endpoints)"])
     DEC --> SCA(["SCAFFOLD<br/>coherence + contract gates"]) --> APP(["APPLY"])
     APP --> BS(["BOOTSTRAP_ENV"]) --> AC(["API_CHECK"]) --> SM(["SMOKE"]) --> VER(["VERIFY"])
     VER --> IC{"router"}
     IC -- "passed" --> RUN(["RUNTIME_VERIFY"])
-    IC -- "fixable failure" --> REP(["REPAIR"])
+    IC -- "mechanical failure" --> REP(["REPAIR"])
+    IC -- "reasoning-class failure" --> DIAG(["DIAGNOSE<br/>reason -> minimal_action"])
+    DIAG --> DISP{"minimal_action"}
+    DISP -- "patch_files" --> REP
+    DISP -- "add / remove_dependency" --> BS
+    DISP -- "adjust / regenerate_files / escalate" --> SCA
+    REP -.->|"verify-origin marker (C2)"| RVF(["RE_VERIFY<br/>only failing test file(s)"])
+    BS -.->|"verify-origin marker (C2)"| RVF
+    RVF --> IC
     RUN --> IC2{"router"}
     IC2 -- "boots / no entry (no coverage gap)" --> DONE((COMPLETED))
-    IC2 -- "boot fails" --> REP
+    IC2 -- "boot fails (mechanical)" --> REP
+    IC2 -- "boot fails (reasoning-class)" --> DIAG
     IC2 -- "coverage gap: JS suite unrun / server entry not booted" --> FAIL((FAILED))
     REP --> APP
     IC -- "budget spent / flap" --> FAIL
@@ -305,8 +316,8 @@ flowchart LR
     classDef road fill:#3b6ea5,stroke:#274c73,color:#fff;
     classDef gate fill:#7d5ba6,stroke:#4c3575,color:#fff;
     classDef term fill:#4c956c,stroke:#2c6e49,color:#fff;
-    class CQ,DEC,SCA,APP,BS,AC,SM,VER,RUN,REP road;
-    class IC,IC2 gate;
+    class CQ,DEC,SCA,APP,BS,AC,SM,VER,RUN,REP,DIAG,RVF road;
+    class IC,IC2,DISP gate;
     class DONE,FAIL term;
 ```
 
@@ -326,6 +337,9 @@ flowchart TB
       VER["tasks/verify.py<br/>pass/collect counts"]
       REP["tasks/repair.py<br/>traceback + retrieval"]
       CLS["repair/classify.py"]
+      DGN["tasks/diagnose.py<br/>FailureContext + bounded ReAct"]
+      LED["repair/ledger.py<br/>REPAIR_LEDGER memory"]
+      RVF["tasks/re_verify.py<br/>scoped pytest re-run (C2)"]
     end
     RUNR --> ROUT
     DEC -->|contracts| SCA
@@ -334,11 +348,16 @@ flowchart TB
     VER -->|counts| ROUT
     RTV -->|boot outcome| ROUT
     CLS -->|classification| REP
+    ROUT -->|"reasoning-class -> DIAGNOSE"| DGN
+    LED -->|tried actions| DGN
+    DGN -->|minimal_action verdict| ROUT
+    ROUT -->|"verify-origin fix -> scoped re-run"| RVF
+    RVF -->|scoped VERIFY_REPORT| ROUT
     ROUT -->|funds a round?| REP
     REP -->|REPAIR_PLAN| RUNR
 
     classDef choc fill:#6f4e37,stroke:#3e2723,color:#fff;
-    class RUNR,ROUT,DEC,SCA,SVAL,RTV,VER,REP,CLS choc;
+    class RUNR,ROUT,DEC,SCA,SVAL,RTV,VER,REP,CLS,DGN,LED choc;
 ```
 
 </details>
@@ -431,6 +450,11 @@ flowchart TB
                             |               + contracts; P0a fails closed
                             |               if a client/server seam has
                             |               no endpoints contract)
+                            |              prevention passes:
+                            |               scope ceiling (P1.1) +
+                            |               self-critique (P1.2) +
+                            |               de-scope unrunnable (P1.4) +
+                            |               coherence re-ask (P1.3)
                             v
               +------------------------------+
               |  ASK_USER(approve_plan)      |  <-- [Approve & Scaffold |
@@ -455,6 +479,8 @@ flowchart TB
                   | BOOTSTRAP_ENV   |  create/refresh .venv, install
                   +-----------------+  requirements.txt, preflight
                             |          undeclared imports;
+                            |          de-scope dead browser/E2E dep
+                            |           (P1.4) before install;
                             |          `pip freeze --all` parsed into
                             |          `installed_packages` (Phase 1.1);
                             |          polyglot: also `npm install` ->
@@ -570,7 +596,40 @@ of only the implementation file(s) the traceback named
 (`_assertion_impl_targets`, carried as `target_files` with test modules
 excluded) so the handler is aligned to the test's asserted contract -- not
 a whole-tree regenerate that re-rolls both sides of the seam and reproduces
-the divergence (ses_a60d67a2f0164dcb):
+the divergence (ses_a60d67a2f0164dcb).
+
+**Phase 2 -- the DIAGNOSE fork.** Everything above is the *mechanical*
+fast path. Before a funded round reaches `REPAIR`, the pure router gates
+on the `classification` token the gate already stamped: a
+*reasoning-class* token (`assertion_drift` / `collection_error` /
+`unknown` / `runtime_failure` -- the shared
+`cgx.session.repair.classify.DIAGNOSE_CLASSIFICATIONS` set) routes to the
+`DIAGNOSE` reasoning rung instead, exactly the cases that used to jump
+straight to a whole-tree regenerate. `DIAGNOSE` normalizes the source
+report into one `FailureContext`, runs a bounded read-only ReAct loop
+(`DIAGNOSE_STEPS=3`) under the same `REPAIR_BUDGET` while consulting the
+`REPAIR_LEDGER` of already-tried actions, and emits a `DIAGNOSIS` whose
+single `minimal_action` verdict `_diagnose_dispatch_actions` maps to one
+successor (`patch_files -> REPAIR`, `add / remove_dependency ->
+BOOTSTRAP_ENV`, `adjust_manifest / regenerate_files -> scoped SCAFFOLD`,
+`escalate -> whole-tree regenerate / _replan`). Mechanical tokens keep
+the fast path below unchanged; a provider outage or garbled reply
+degrades cleanly to `escalate`, so the rung is never worse than today.
+
+**Phase 3.2 -- incremental RE_VERIFY (C2).** When the diagnosed source
+was a `VERIFY` failure, the fix builders stamp a `reverify_origin_gate` +
+`reverify_report_id` marker onto the spawned `REPAIR` / `BOOTSTRAP_ENV`
+node. That marker rides `inputs` down the fix chain, and at the edge that
+would normally re-enter verification (`_apply_to_verify` after a patch,
+`_bootstrap_to_api_check` after a dependency add / de-scope) the router
+splices a `RE_VERIFY` node (`_re_verify_node`) that re-runs pytest against
+**only** the origin report's failing test file(s) instead of the full
+`BOOTSTRAP_ENV → API_CHECK → SMOKE → VERIFY` chain. `RE_VERIFY` emits a
+shape-identical `VERIFY_REPORT`, so `_re_verify_successors` delegates to
+`_verify_successors`: green hands off to `RUNTIME_VERIFY`, a still-failing
+reasoning-class outcome routes back to `DIAGNOSE` under the shared budget.
+Non-`VERIFY` origins (and the scoped-scaffold arm) carry no marker and run
+the full chain, so behavior is never worse than before:
 
 ```mermaid
 flowchart TB
@@ -582,12 +641,22 @@ flowchart TB
 
     GUARD{"LoopBudget.spend_repair<br/>REPAIR_BUDGET=4 + progress ledger<br/>+ signature flap guard"}
     GUARD -- "exhausted / stalled / flap" --> FAIL((terminal FAILED))
-    GUARD -- funded --> REP["REPAIR<br/>classify → locate → propose<br/>(deterministic registry, then bounded<br/>LLM fallback under REPAIR_FILES_SCHEMA)"]
+    GUARD -- "funded (mechanical)" --> REP["REPAIR<br/>classify → locate → propose<br/>(deterministic registry, then bounded<br/>LLM fallback under REPAIR_FILES_SCHEMA)"]
+    GUARD -- "funded (reasoning-class)" --> DIAG["DIAGNOSE<br/>FailureContext + bounded ReAct<br/>(DIAGNOSE_STEPS=3, reads REPAIR_LEDGER)"]
+    DIAG --> DVERD{"minimal_action verdict"}
+    DVERD -- patch_files --> REP
+    DVERD -- "add / remove_dependency" --> BOOT
+    DVERD -- "adjust_manifest / regenerate_files" --> SCA
+    DVERD -- escalate --> RGUARD
 
     REP --> STRAT{"_select_repair_strategy<br/>(Phase 6.1)"}
 
     STRAT -- "patch<br/>(≤5 diffs, patchable class)" --> APP["APPLY<br/>build_artifact_id carried forward,<br/>BOOTSTRAP_ENV skipped"]
-    APP --> VER2["VERIFY"]
+    APP --> AMRK{"verify-origin<br/>marker? (C2)"}
+    AMRK -- "yes" --> RVF["RE_VERIFY<br/>scoped: only failing test file(s)"]
+    AMRK -- "no" --> VER2["VERIFY"]
+    RVF -- passed --> LES
+    RVF -- "still failing" --> GUARD
     VER2 -- passed --> LES["RecordLesson → lessons.jsonl<br/>(Phase 7.1, iff REPAIR on chain)"]
     VER2 -- "still failing" --> GUARD
 
@@ -599,7 +668,9 @@ flowchart TB
     RPL -- exhausted --> SURV(["proceed with surviving files"])
 
     STRAT -- "install_deps<br/>(missing_dependency)" --> BOOT["BOOTSTRAP_ENV re-run:<br/>install missing_modules +<br/>sync requirements.txt"]
-    BOOT --> LOOP2(["re-probes via API_CHECK →<br/>SMOKE → VERIFY"])
+    BOOT --> BMRK{"verify-origin<br/>marker? (C2)"}
+    BMRK -- "yes" --> RVF
+    BMRK -- "no" --> LOOP2(["re-probes via API_CHECK →<br/>SMOKE → VERIFY"])
 
     STRAT -- "empty diffs<br/>(unknown / marker present)" --> ASK["ASK_USER(freeform)<br/>classification + rationale"]
 
@@ -607,8 +678,8 @@ flowchart TB
     classDef gate fill:#7d5ba6,stroke:#4c3575,color:#fff;
     classDef term fill:#4c956c,stroke:#2c6e49,color:#fff;
     classDef bad fill:#bc4749,stroke:#7f2d2f,color:#fff;
-    class AC,SM,VF,RV,SRC,REP,APP,VER2,SCA,DEC,ASK,BOOT road;
-    class GUARD,STRAT,RGUARD,RPL gate;
+    class AC,SM,VF,RV,SRC,REP,APP,VER2,SCA,DEC,ASK,BOOT,DIAG,RVF road;
+    class GUARD,STRAT,RGUARD,RPL,DVERD,AMRK,BMRK gate;
     class LES,LOOP,LOOP2,SURV term;
     class FAIL bad;
 ```
@@ -677,9 +748,12 @@ Where to look in the repo:
 | LLM tracing              | `src/cgx/session/llm_trace.py` (Phase 5.1) |
 | SCAFFOLD pin validator   | `src/cgx/session/scaffold_validate.py` (Phase 4.1) |
 | Repair classify / locate / propose | `src/cgx/session/repair/{classify,locate,propose}.py` |
+| DIAGNOSE reasoning rung  | `src/cgx/session/tasks/diagnose.py` + `src/cgx/session/repair/{context,ledger}.py` (Phase 2) |
+| Reasoning-class gate set | `src/cgx/session/repair/classify.py :: DIAGNOSE_CLASSIFICATIONS` + `src/cgx/session/greenfield_edges.py :: _diagnose_dispatch_actions` |
+| Incremental RE_VERIFY (C2) | `src/cgx/session/tasks/re_verify.py` + `src/cgx/session/router.py :: _re_verify_node`/`_re_verify_successors` (Phase 3.2) |
 | PyPI metadata client     | `src/cgx/session/repair/pypi_client.py` (Phase 3.2) |
 | Explore executors        | `src/cgx/session/tasks/{explore,investigate,recommend,plan_change}.py` |
-| Greenfield executors     | `src/cgx/session/tasks/{clarify_requirements,decompose,scaffold,bootstrap_env,api_check,smoke,runtime_verify,repair}.py` |
+| Greenfield executors     | `src/cgx/session/tasks/{clarify_requirements,decompose,scaffold,bootstrap_env,api_check,smoke,runtime_verify,repair,diagnose,re_verify}.py` |
 | Contract + coherence gates | `src/cgx/session/scaffold_validate.py :: {check_contract_compliance, cross_check_first_party_imports, check_client_server_payload_coherence}` |
 | Frontend coherence passes | `src/cgx/session/tasks/scaffold.py :: {_synthesize_missing_frontend_stylesheets, _js_import_coherence_failures}` |
 | Targeted build-smoke repair | `src/cgx/session/repair/classify.py :: unresolved_import_sources` + `src/cgx/session/tasks/repair.py :: _build_smoke_target_files` |
@@ -690,6 +764,51 @@ Where to look in the repo:
 | Wire models              | `src/cgx/webui/models.py :: AgentSession*` |
 | Frontend page            | `frontend/src/pages/AgentPage.tsx` + `frontend/src/components/agent/` |
 | Integration tests        | `tests/test_webui_agent_session.py`, `tests/test_session.py` |
+
+### The recovery evaluation gate (Phase 4, E1/E2)
+
+The recovery ladder above is locked to CI by a provider-free offline eval
+(`cgx.eval.recovery`). Every `recovery_golden.jsonl` case is resolved through
+the **same** deterministic decision surface the router uses -- so the eval
+cannot drift from production behavior -- and the release gate fails if a
+scoped-fixable failure regresses to a whole-tree nuke (E1), if any resolved
+action costs more than the old whole-tree ladder (`never_worse_rate`, E2), or
+if re-resolving the corpus is not byte-identical (`determinism_ok`, E2):
+
+```mermaid
+flowchart LR
+    GC[("recovery_golden.jsonl<br/>real gate failures")] --> RES["resolve_recovery<br/>classify + extractors<br/>(same surface as router)"]
+    RES --> ACT{"resolved action"}
+    ACT -- "scoped patch / install / de-scope / targeted regen" --> SCOPED["scoped recovery<br/>cheap: ~1 round"]
+    ACT -- "escalate / whole-tree" --> WHOLE["whole-tree baseline<br/>expensive: 3 rounds"]
+    SCOPED --> AGG["aggregate_recovery"]
+    WHOLE --> AGG
+    AGG --> M1["action_match_rate == 1.0<br/>scoped_recovery_rate ≥ 0.7"]
+    AGG --> M2["never_worse_rate == 1.0<br/>(E2 degradation floor)"]
+    AGG --> M3["determinism_ok == 1.0<br/>(E2 router purity)"]
+    M1 --> GATE{"run_gate vs<br/>thresholds.json"}
+    M2 --> GATE
+    M3 --> GATE
+    GATE -- "all met" --> PASS((PASS))
+    GATE -- "any regressed" --> FAILB((FAIL build))
+
+    classDef road fill:#3b6ea5,stroke:#274c73,color:#fff;
+    classDef gate fill:#7d5ba6,stroke:#4c3575,color:#fff;
+    classDef term fill:#4c956c,stroke:#2c6e49,color:#fff;
+    classDef bad fill:#bc4749,stroke:#7f2d2f,color:#fff;
+    class GC,RES,SCOPED,WHOLE,AGG,M1,M2,M3 road;
+    class ACT,GATE gate;
+    class PASS term;
+    class FAILB bad;
+```
+
+Because the resolver is LLM-free, the eval *is* the DIAGNOSE degradation floor:
+it measures exactly what the agent guarantees when the provider is unavailable
+(everything collapses to `escalate`), and the two E2 guardrails prove that even
+that worst case is no worse than the pre-overhaul whole-tree ladder. Code map:
+`src/cgx/eval/recovery.py` (resolver + cost model + guardrails),
+`src/cgx/eval/harness.py :: run_gate` (wiring), `evals/thresholds.json` (floors),
+`tests/test_eval.py` (guardrail tests).
 
 ---
 

@@ -46,6 +46,23 @@ REPAIR_CLASSIFICATIONS: Tuple[str, ...] = (
 RepairClassification = str  # one of REPAIR_CLASSIFICATIONS
 
 
+# The subset of classifications the pure router hands to the DIAGNOSE
+# reasoning rung instead of a mechanical REPAIR (design §8/§12.4). These
+# are exactly the tokens where today's ladder jumps straight to a
+# whole-tree regenerate: an ``assertion_drift`` / ``collection_error`` /
+# ``unknown`` VERIFY failure, or a ``runtime_failure`` boot failure. Every
+# other (mechanical) token keeps its fast path straight to REPAIR. The
+# router only *reads* a gate's emitted ``classification`` and tests
+# membership here -- it never runs the classifier itself, so it stays
+# pure/IO-free. Kept in sync with :data:`RUNTIME_REPAIR_CLASSIFICATION`.
+DIAGNOSE_CLASSIFICATIONS: Tuple[str, ...] = (
+    "assertion_drift",
+    "collection_error",
+    "unknown",
+    "runtime_failure",
+)
+
+
 # Pytest renders AttributeError tracebacks with the offending
 # attribute name in quotes. ``assertLogs`` is the canonical case from
 # the screenshot, but the same shape covers every ``self.assert*``
@@ -177,6 +194,28 @@ _UNRESOLVED_IMPORT_RE = re.compile(
     r"(?:annot|ould not) resolve\s+[\"']([^\"']+)[\"']\s+from\s+"
     r"[\"']([^\"']+)[\"']",
 )
+
+# Vite's HTML entry plugin reporting a script the entry document points at
+# that was never generated: ``[plugin vite:build-html] /root/index.html
+# Error: Failed to resolve /src/main.jsx from /root/index.html``. The spec
+# is unquoted and root-absolute, so neither shape above matches it, yet the
+# fix is the entry-module one -- the script has to be *added*, not
+# re-authored (live: ses_877e1b15a9b34994). Group 1 is the unresolved spec,
+# group 2 the importing document.
+_UNRESOLVED_HTML_SPEC_RE = re.compile(
+    r"Failed to resolve\s+([A-Za-z0-9_.@/\\-]+)\s+from\s+"
+    r"([A-Za-z0-9_.@/\\-]+)",
+)
+
+# A generic JS/TS build error (Vite/TypeScript/Webpack) that names the
+# failing file but isn't a specific unresolved import:
+# ``src/App.jsx: TS2345`` or ``[eslint] src/main.jsx: Error``.
+# Group 1 is the file path.
+_GENERIC_BUILD_ERROR_RE = re.compile(
+    r"([A-Za-z0-9_./\\-]+?\.(?:js|jsx|ts|tsx)):\s*(?:[0-9]+:[0-9]+:)?\s*(?:TS[0-9]+|error|warning|line|column|syntax)",
+    re.IGNORECASE,
+)
+
 
 # A name a generated module uses but never binds -- ``class
 # Operation(str, enum.Enum)`` with no ``import enum``, a constant
@@ -422,7 +461,27 @@ def unresolved_entry_paths(text: str) -> Tuple[str, ...]:
     for something the scaffold never generated.
     """
     out: List[str] = []
-    for m in _UNRESOLVED_ENTRY_RE.finditer(str(text or "")):
+    for m in _UNRESOLVED_ENTRY_RE.finditer(text or ""):
+        path = m.group(1).replace("\\", "/").strip().lstrip("./")
+        if path and path not in out:
+            out.append(path)
+    return tuple(out)
+
+
+def unresolved_html_entry_specs(text: str) -> Tuple[str, ...]:
+    """Return the script paths an HTML entry references but cannot resolve.
+
+    Matches Vite's ``vite:build-html`` shape (``Failed to resolve
+    /src/main.jsx from <root>/index.html``), which the quoted
+    relative-import and ``entry module`` patterns both miss. The document
+    exists, so re-authoring it is not the fix -- the script it names is
+    absent and must be added, exactly like an unresolved entry module.
+    Paths are normalised to forward slashes and stripped of a leading
+    ``/`` or ``./``; order-preserving and de-duplicated. Callers filter
+    out specs that do exist on disk (those are a real resolution bug).
+    """
+    out: List[str] = []
+    for m in _UNRESOLVED_HTML_SPEC_RE.finditer(text or ""):
         path = m.group(1).replace("\\", "/").strip().lstrip("./")
         if path and path not in out:
             out.append(path)
@@ -443,7 +502,7 @@ def unresolved_import_sources(text: str) -> Tuple[str, ...]:
     against the project root.
     """
     out: List[str] = []
-    for m in _UNRESOLVED_IMPORT_RE.finditer(str(text or "")):
+    for m in _UNRESOLVED_IMPORT_RE.finditer(text or ""):
         path = m.group(2).replace("\\", "/").strip()
         if not path.startswith("/"):
             path = path.lstrip("./")
@@ -583,6 +642,22 @@ def _failure_text(content: Dict[str, Any]) -> str:
         if isinstance(v, str) and v:
             parts.append(v)
     return "\n".join(parts)
+
+
+def generic_build_error_files(build_stderr: str) -> Tuple[str, ...]:
+    """Return the frontend files named in generic build errors.
+
+    Used when a build fails with a generic Webpack/Vite/TypeScript error
+    (e.g., 'src/App.jsx: TS2345') that isn't a specific module-resolution
+    failure, so the router can still perform a targeted AST regeneration.
+    Order-preserving and de-duplicated.
+    """
+    out: List[str] = []
+    for m in _GENERIC_BUILD_ERROR_RE.finditer(build_stderr):
+        path = m.group(1).replace("\\", "/")
+        if path and path not in out:
+            out.append(path)
+    return tuple(out)
 
 
 def _first_error_line(blob: str) -> str:

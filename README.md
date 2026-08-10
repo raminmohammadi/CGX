@@ -74,6 +74,7 @@ your machine unless you explicitly opt into a cloud model.
   own). Sessions are saved and resumable. Full walkthrough:
   [Session-based Agent](#session-based-agent-agent) and
   [docs/Agent.md](docs/Agent.md).
+- **Swarm Agent.** A deterministic, plan-driven agent architecture that replaces free-form loops with a Tech Lead (planner), Developer (implementer), and Verifier (tester). Features an advanced **Swarm Operations Dashboard** with live telemetry, and multiple Auto-Repair capabilities (AST Import Injection, AST Function Logic Repair, Contract Renegotiation, Semantic Repair with Dynamic Temperature Scaling) to ensure reliable, compilation-ready code.
 - **New project generation.** Give CGX a plain-language idea
   (*"create a FastAPI todo app"*, *"create a React calculator app"*),
   point it at an empty folder, and the greenfield agent scaffolds a

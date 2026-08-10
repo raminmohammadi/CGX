@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
 from pathlib import Path
 from typing import Any, Awaitable, Iterator, TypeVar
 
@@ -58,6 +59,8 @@ def project_root(tmp_path: Path) -> Path:
 def _reset_runners() -> Iterator[None]:
     """Close + clear the module-level runner cache between cases."""
     routes._RUNNERS.clear()
+    routes._RUNNER_DB_IDS.clear()
+    routes._SESSION_TO_RUNNER.clear()
     yield
     for r in list(routes._RUNNERS.values()):
         try:
@@ -65,6 +68,8 @@ def _reset_runners() -> Iterator[None]:
         except Exception:
             pass
     routes._RUNNERS.clear()
+    routes._RUNNER_DB_IDS.clear()
+    routes._SESSION_TO_RUNNER.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -1135,3 +1140,47 @@ def test_make_stream_beat_throttles_and_emits_stream_status(
     assert prog["path"] == "app/main.py"
     # Cumulative streamed character count grows across deltas.
     assert prog["bytes"] == len("import os\n") + len("def main():\n")
+
+
+def test_get_runner_reopens_store_when_db_file_is_gone(tmp_path: Path) -> None:
+    """A cached store whose DB was moved away is rebuilt, not reused.
+
+    The open fd survives the project folder being sent to the trash, so
+    the live server kept writing session state into the unlinked file
+    with no error (observed for Calculator2.7).
+    """
+    root = tmp_path / "proj"
+    root.mkdir()
+    first = routes._get_runner(str(root))
+    assert Path(first.store.path).exists()
+    routes._SESSION_TO_RUNNER["ses_stale"] = first
+
+    shutil.move(str(root), str(tmp_path / "trashed"))
+    second = routes._get_runner(str(root))
+
+    assert second is not first
+    assert Path(second.store.path).exists()
+    # The session index must not keep pointing at the closed store.
+    assert "ses_stale" not in routes._SESSION_TO_RUNNER
+
+
+def test_get_runner_reuses_store_while_the_db_is_intact(tmp_path: Path) -> None:
+    """The identity check must not defeat the per-root connection cache."""
+    root = tmp_path / "proj"
+    root.mkdir()
+    first = routes._get_runner(str(root))
+    assert routes._get_runner(str(root)) is first
+
+
+def test_resolve_runner_for_rebuilds_a_stale_runner(tmp_path: Path) -> None:
+    """Lookup by session id also goes through the staleness check."""
+    root = tmp_path / "proj"
+    root.mkdir()
+    first = routes._get_runner(str(root))
+    routes._SESSION_TO_RUNNER["ses_stale"] = first
+    shutil.move(str(root), str(tmp_path / "trashed"))
+
+    resolved = routes._resolve_runner_for("ses_stale")
+
+    assert resolved is not first
+    assert Path(resolved.store.path).exists()

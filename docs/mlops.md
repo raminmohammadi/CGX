@@ -168,17 +168,40 @@ what is removed; deletion only ever touches trace/log files.
 gate. The dependency-free metric primitives (`recall_at_k`, `precision_at_k`,
 `reciprocal_rank`, `ndcg_at_k`, `mean`) import eagerly; the retrieval and
 codegen harnesses lazy-load the heavier pipeline. Golden sets live under
-`evals/` (`retrieval_golden.jsonl`, `codegen_golden.jsonl`, and a small
-`sample_repo/`). Run it as a module:
+`evals/` (`retrieval_golden.jsonl`, `codegen_golden.jsonl`,
+`recovery_golden.jsonl`, and a small `sample_repo/`). Run the whole gate as a
+module:
 
 ```bash
-python -m cgx.eval retrieval --golden evals/retrieval_golden.jsonl
-python -m cgx.eval codegen   --golden evals/codegen_golden.jsonl
+python -m cgx.eval          # runs every section + checks thresholds.json
+python -m cgx.eval --json   # emit the full per-item report
 ```
 
+The **recovery** section (`cgx.eval.recovery`) is a provider-free regression
+guard for the Phase 1-3 recovery overhaul: each `recovery_golden.jsonl` case
+pins a real gate failure (a VERIFY / RUNTIME report, a build-smoke stderr, or an
+over-scoped de-scope scenario), and the harness drives it through the *real*
+deterministic decision surface -- `cgx.session.repair.classify` for the
+classification token and its traceback / build-error extractors for the fix
+targets -- to resolve a recovery-action class. It reports `action_match_rate`
+(every case must land on its pinned action) and `scoped_recovery_rate` (share
+fixed by a scoped patch / install / targeted regenerate rather than a whole-tree
+nuke), plus a transparent per-action `rounds` / `tokens` cost model so the gate
+tracks the scoped-vs-whole-tree savings the overhaul was built to deliver.
+
+Because the section is provider-free, it doubles as the **degradation floor**
+for the `DIAGNOSE` reasoning rung: it measures exactly what the agent
+guarantees with the LLM unavailable. Two guardrails (E2) lock that floor to the
+gate: `never_worse_rate` (every resolved action -- including the provider-outage
+`escalate` fallback -- costs no more than the old whole-tree ladder, floored at
+`1.0`) and `determinism_ok` (`check_recovery_determinism` re-resolves the corpus
+and asserts byte-identical verdicts, so the router stays pure and replayable;
+floored at `1.0`). A change that makes recovery nondeterministic or costlier
+than a nuke-and-regenerate fails the build.
+
 The CI workflow runs the harness against the golden sets and fails the build
-when a metric regresses below its threshold, so retrieval / codegen quality is
-gated the same way tests are.
+when a metric regresses below its threshold, so retrieval / codegen / recovery
+quality is gated the same way tests are.
 
 ---
 

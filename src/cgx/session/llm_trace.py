@@ -98,7 +98,8 @@ class TracingProvider:
     def chat(self, messages: List[Dict[str, str]],
              temperature: float = 0.2,
              max_tokens: Optional[int] = None,
-             force_json: bool = True,
+             *,
+             force_json: bool,
              **kwargs: Any) -> Dict[str, Any]:
         t0 = time.perf_counter()
         try:

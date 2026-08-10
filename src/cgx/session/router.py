@@ -40,6 +40,7 @@ from cgx.session.budget import LoopBudget
 from cgx.session.greenfield_edges import (
     _apply_failed_files_actions,
     _decompose_retry_actions,
+    _diagnose_dispatch_actions,
     _make_budget_ask,
     _repair_install_deps_actions,
     _repair_regenerate_actions,
@@ -52,6 +53,7 @@ from cgx.session.greenfield_edges import (
     _scaffold_skill_regenerate_actions,
     _verify_lesson_actions,
 )
+from cgx.session.repair.classify import DIAGNOSE_CLASSIFICATIONS
 from cgx.session.models import (
     Decision,
     DecisionKind,
@@ -162,7 +164,17 @@ def _apply_to_verify(parent: TaskNode) -> List[TaskNode]:
     REPAIR carries the prior ``build_artifact_id`` forward through
     APPLY.inputs. Re-bootstrapping would just spend time reinstalling
     the same packages.
+
+    A DIAGNOSE-driven scoped patch carries a ``reverify_origin_gate``
+    marker (design §C2): the venv is already live and every other gate
+    already passed, so instead of VERIFY we splice RE_VERIFY to re-run
+    only the origin report's failing test file(s).
     """
+    inputs = parent.inputs or {}
+    if str(inputs.get("reverify_origin_gate") or "").strip():
+        return _re_verify_node(
+            parent, build_artifact_id=inputs.get("build_artifact_id"),
+            apply_artifact_id=parent.produced_artifact_id)
     mode = str(parent.inputs.get("mode") or "").strip()
     has_build_artifact = bool(
         str(parent.inputs.get("build_artifact_id") or "").strip())
@@ -213,7 +225,17 @@ def _bootstrap_to_api_check(parent: TaskNode) -> List[TaskNode]:
     aliased ``pkg.attr`` access under the bootstrapped venv. Its
     successor (see :func:`_api_check_to_smoke_or_repair`) then chains
     SMOKE on pass / skip, or REPAIR on a hallucinated symbol.
+
+    A DIAGNOSE-driven dependency fix (add/remove) carries a
+    ``reverify_origin_gate`` marker (design §C2): the re-provisioned venv
+    is all the fix needed, so instead of re-probing API_CHECK/SMOKE we
+    splice RE_VERIFY to re-run only the origin report's failing test(s).
     """
+    inputs = parent.inputs or {}
+    if str(inputs.get("reverify_origin_gate") or "").strip():
+        return _re_verify_node(
+            parent, build_artifact_id=parent.produced_artifact_id,
+            apply_artifact_id=inputs.get("apply_artifact_id"))
     return [TaskNode.new(
         session_id=parent.session_id,
         kind=TaskKind.API_CHECK,
@@ -239,6 +261,13 @@ def _bootstrap_to_api_check(parent: TaskNode) -> List[TaskNode]:
 # report. Only ``failed`` is repairable; ``passed`` and ``skipped``
 # chain to SMOKE.
 _REPAIRABLE_API_CHECK_OUTCOMES = frozenset({"failed"})
+
+# How many times one API_CHECK failure signature may repeat before the
+# loop is a proven dead end. Two rungs: the first repeat re-enters REPAIR
+# with ``repair_escalation`` set so it abandons the strategy that just
+# no-opped, the second gives up. The shared ``repair_attempt`` cap still
+# bounds the loop independently.
+_API_CHECK_SIGNATURE_LADDER = 2
 
 
 def _api_check_to_smoke_or_repair(parent: TaskNode) -> List[TaskNode]:
@@ -282,7 +311,15 @@ def _api_check_to_smoke_or_repair(parent: TaskNode) -> List[TaskNode]:
     if not new_signature:
         failed = outputs.get("failed_count")
         new_signature = f"api_check_failed|count={failed}"
-    if budget.seen(new_signature):
+    # A repeated signature used to end the session outright. One rung of
+    # escalation first: the first round may pick install_deps, and when
+    # pip cannot satisfy the name (session ses_fa6f72a9d3da4217 asked it
+    # for a hallucinated ``app``) that round is a no-op that reproduces
+    # the identical signature. REPAIR reads ``repair_escalation`` and
+    # switches to a regenerate that removes the offending import; a
+    # second repeat is a genuine dead end.
+    escalation = budget.signature_repeats(new_signature)
+    if escalation >= _API_CHECK_SIGNATURE_LADDER:
         return []
     return [TaskNode.new(
         session_id=parent.session_id,
@@ -299,6 +336,7 @@ def _api_check_to_smoke_or_repair(parent: TaskNode) -> List[TaskNode]:
             "apply_artifact_id": parent.inputs.get("apply_artifact_id"),
             "prior_goal": parent.inputs.get("prior_goal"),
             "mode": mode,
+            "repair_escalation": escalation,
             **budget.spend_repair(new_signature).repair_chain_inputs(),
         },
     )]
@@ -575,7 +613,20 @@ def _verify_to_repair_or_terminal(parent: TaskNode) -> List[TaskNode]:
         new_signature = f"{outcome}|rc={outputs.get('returncode')}"
     if budget.seen(new_signature):
         return []
+    classification = str(outputs.get("classification") or "").strip()
+    spent = budget.spend_repair(
+        new_signature, failing_count=new_count, passing_count=new_passing)
     verify_artifact_id = parent.produced_artifact_id
+    # A reasoning-class failure (design §8.1) routes to the DIAGNOSE rung
+    # instead of a mechanical REPAIR: the gate emits a ``classification``
+    # token so the pure router gates by membership test alone. Mechanical
+    # tokens keep the fast path straight to REPAIR. The already-spent budget
+    # (same attempt + flap accounting the REPAIR path uses) threads verbatim.
+    if classification in DIAGNOSE_CLASSIFICATIONS:
+        return [_diagnose_node(
+            parent, source_key="verify_artifact_id",
+            source_id=verify_artifact_id, classification=classification,
+            budget=spent, mode=mode)]
     return [TaskNode.new(
         session_id=parent.session_id,
         kind=TaskKind.REPAIR,
@@ -589,11 +640,48 @@ def _verify_to_repair_or_terminal(parent: TaskNode) -> List[TaskNode]:
             "apply_artifact_id": parent.inputs.get("apply_artifact_id"),
             "prior_goal": parent.inputs.get("prior_goal"),
             "mode": mode,
-            **budget.spend_repair(
-                new_signature, failing_count=new_count,
-                passing_count=new_passing).repair_chain_inputs(),
+            **spent.repair_chain_inputs(),
         },
     )]
+
+
+def _diagnose_node(parent: TaskNode, *, source_key: str, source_id: str,
+                   classification: str, budget: LoopBudget,
+                   mode: str) -> TaskNode:
+    """Spawn the DIAGNOSE reasoning rung for a reasoning-class gate failure.
+
+    A gate failure whose ``classification`` is in
+    :data:`~cgx.session.repair.classify.DIAGNOSE_CLASSIFICATIONS` routes
+    here instead of straight to a mechanical REPAIR. DIAGNOSE reasons over
+    the concrete failure + the real repo + the repair ledger and emits a
+    typed verdict the :func:`_diagnose_dispatch_actions` guard maps to a
+    scoped successor. ``budget`` is the already-spent :class:`LoopBudget`
+    (the gate charged the round on this edge exactly as the REPAIR path
+    would), threaded verbatim so the reasoning rung stays under the shared
+    :data:`~cgx.session.budget.REPAIR_BUDGET` and carries the ledger id
+    forward. ``source_key`` names the report id key DIAGNOSE reads
+    (``verify_artifact_id`` / ``runtime_artifact_id`` / ...).
+    """
+    return TaskNode.new(
+        session_id=parent.session_id,
+        kind=TaskKind.DIAGNOSE,
+        name="Diagnose the gate failure",
+        description=("Reason over the concrete gate failure, the real repo, "
+                     "and what earlier rounds already tried, then emit one "
+                     "minimal-action verdict the pure router dispatches."),
+        parent_task_id=parent.task_id,
+        inputs={
+            source_key: source_id,
+            "classification": classification,
+            "build_artifact_id": parent.inputs.get("build_artifact_id"),
+            "apply_artifact_id": parent.inputs.get("apply_artifact_id"),
+            "scaffold_artifact_id": parent.inputs.get("scaffold_artifact_id"),
+            "plan_artifact_id": parent.inputs.get("plan_artifact_id"),
+            "prior_goal": parent.inputs.get("prior_goal"),
+            "mode": mode,
+            **budget.repair_chain_inputs(),
+        },
+    )
 
 
 def _verify_successors(parent: TaskNode) -> List[TaskNode]:
@@ -612,6 +700,50 @@ def _verify_successors(parent: TaskNode) -> List[TaskNode]:
     if mode == SessionMode.GREENFIELD.value and outcome == "passed":
         return _runtime_verify_node(parent)
     return _verify_to_repair_or_terminal(parent)
+
+
+def _re_verify_node(parent: TaskNode, *, build_artifact_id: Optional[str],
+                    apply_artifact_id: Optional[str]) -> List[TaskNode]:
+    """Spawn the incremental RE_VERIFY gate for a scoped fix (design §C2).
+
+    Carries the origin ``reverify_report_id`` (the failing VERIFY_REPORT
+    whose recorded test file(s) get re-run) plus the artifact ids the
+    executor needs to resolve the venv python and stamp provenance. The
+    shared loop budget threads verbatim so a still-failing re-run keeps
+    the same attempt/flap accounting the full VERIFY path uses.
+    """
+    inputs = parent.inputs or {}
+    budget = LoopBudget.from_inputs(inputs)
+    return [TaskNode.new(
+        session_id=parent.session_id,
+        kind=TaskKind.RE_VERIFY,
+        name="Re-verify the scoped fix",
+        description=("Re-run pytest against only the test file(s) the origin "
+                     "VERIFY report recorded as failing, skipping the full "
+                     "bootstrap -> API-check -> smoke -> verify chain."),
+        parent_task_id=parent.task_id,
+        inputs={
+            "reverify_report_id": inputs.get("reverify_report_id"),
+            "reverify_origin_gate": inputs.get("reverify_origin_gate"),
+            "build_artifact_id": build_artifact_id,
+            "apply_artifact_id": apply_artifact_id,
+            "scaffold_artifact_id": inputs.get("scaffold_artifact_id"),
+            "plan_artifact_id": inputs.get("plan_artifact_id"),
+            "prior_goal": inputs.get("prior_goal"),
+            "mode": inputs.get("mode") or SessionMode.GREENFIELD.value,
+            **budget.repair_chain_inputs(),
+        },
+    )]
+
+
+def _re_verify_successors(parent: TaskNode) -> List[TaskNode]:
+    """Dispatch a finished RE_VERIFY exactly like VERIFY (design §C2).
+
+    RE_VERIFY emits a VERIFY_REPORT identical in shape, so the same
+    green -> RUNTIME_VERIFY / still-failing -> DIAGNOSE-or-REPAIR edges
+    apply unchanged.
+    """
+    return _verify_successors(parent)
 
 
 def _runtime_verify_node(parent: TaskNode) -> List[TaskNode]:
@@ -680,6 +812,15 @@ def _runtime_verify_to_repair_or_terminal(parent: TaskNode) -> List[TaskNode]:
         new_signature = f"runtime_failed|count={failed}"
     if budget.seen(new_signature):
         return []
+    spent = budget.spend_repair(new_signature)
+    # Reasoning-class boot failures route to DIAGNOSE (design §8.1); a
+    # mechanical token keeps the fast path straight to REPAIR.
+    classification = str(outputs.get("classification") or "").strip()
+    if classification in DIAGNOSE_CLASSIFICATIONS:
+        return [_diagnose_node(
+            parent, source_key="runtime_artifact_id",
+            source_id=parent.produced_artifact_id,
+            classification=classification, budget=spent, mode=mode)]
     return [TaskNode.new(
         session_id=parent.session_id,
         kind=TaskKind.REPAIR,
@@ -695,7 +836,7 @@ def _runtime_verify_to_repair_or_terminal(parent: TaskNode) -> List[TaskNode]:
             "scaffold_artifact_id": parent.inputs.get("scaffold_artifact_id"),
             "prior_goal": parent.inputs.get("prior_goal"),
             "mode": mode,
-            **budget.spend_repair(new_signature).repair_chain_inputs(),
+            **spent.repair_chain_inputs(),
         },
     )]
 
@@ -730,8 +871,14 @@ def _repair_to_apply_or_ask(parent: TaskNode) -> List[TaskNode]:
         inputs={
             "plan_artifact_id": parent.produced_artifact_id,
             "build_artifact_id": parent.inputs.get("build_artifact_id"),
+            "scaffold_artifact_id": parent.inputs.get("scaffold_artifact_id"),
             "prior_goal": parent.inputs.get("prior_goal"),
             "mode": parent.inputs.get("mode"),
+            # A DIAGNOSE-scoped patch threads its C2 re-verify markers on to
+            # APPLY so its successor (:func:`_apply_to_verify`) can splice
+            # RE_VERIFY; a mechanical repair leaves these unset (safe no-op).
+            "reverify_report_id": parent.inputs.get("reverify_report_id"),
+            "reverify_origin_gate": parent.inputs.get("reverify_origin_gate"),
             **budget.repair_chain_inputs(),
         },
     )]
@@ -922,6 +1069,109 @@ def _scaffold_to_apply(parent: TaskNode) -> List[TaskNode]:
     )]
 
 
+def _swarm_dev_inputs(parent: TaskNode, outputs: Dict[str, Any],
+                      file_index: int) -> Dict[str, Any]:
+    """Assemble the SWARM_DEVELOPER inputs for the ``file_index``-th file.
+
+    The plan reference, file count, goal, and project root are threaded
+    verbatim down the chain; ``failed_paths`` accumulates across turns so
+    the terminal edge can decide COMPLETED vs FAILED once every file has
+    been attempted.
+    """
+    return {
+        "work_plan_artifact_id": outputs.get("work_plan_artifact_id"),
+        "file_index": file_index,
+        "file_count": outputs.get("file_count"),
+        "failed_paths": outputs.get("failed_paths") or [],
+        "goal": outputs.get("goal") or parent.inputs.get("goal"),
+        "project_root": (outputs.get("project_root")
+                         or parent.inputs.get("project_root")),
+    }
+
+
+def _swarm_tech_lead_to_successors(parent: TaskNode) -> List[TaskNode]:
+    """Spawn the first Developer file-task, or finish (unbuildable plan)."""
+    outputs = parent.outputs or {}
+    if int(outputs.get("file_count") or 0) <= 0:
+        # No buildable plan -- no Developer chain; the terminal edge in
+        # ``on_task_completed`` ends the session FAILED.
+        return []
+    return [TaskNode.new(
+        session_id=parent.session_id,
+        kind=TaskKind.SWARM_DEVELOPER,
+        name="Generate file 1",
+        description="Generate the first planned file.",
+        parent_task_id=parent.task_id,
+        inputs=_swarm_dev_inputs(parent, outputs, 0),
+    )]
+
+
+def _swarm_verify_inputs(parent: TaskNode,
+                         outputs: Dict[str, Any]) -> Dict[str, Any]:
+    """Assemble the SWARM_VERIFY inputs from the last Developer's outputs."""
+    return {
+        "work_plan_artifact_id": outputs.get("work_plan_artifact_id"),
+        "failed_paths": outputs.get("failed_paths") or [],
+        "goal": outputs.get("goal"),
+        "project_root": outputs.get("project_root"),
+    }
+
+
+def _swarm_developer_to_successors(parent: TaskNode) -> List[TaskNode]:
+    """Spawn the next Developer file-task, or the tree-level VERIFY at the end."""
+    outputs = parent.outputs or {}
+    file_index = int(outputs.get("file_index") or 0)
+    file_count = int(outputs.get("file_count") or 0)
+    next_index = file_index + 1
+    if next_index >= file_count:
+        # Every file attempted -- hand off to the tree-level verification
+        # ladder, which owns the terminal edge in ``on_task_completed``.
+        return [TaskNode.new(
+            session_id=parent.session_id,
+            kind=TaskKind.SWARM_VERIFY,
+            name="Verify generated tree",
+            description="Structural + environment verification of the tree.",
+            parent_task_id=parent.task_id,
+            inputs=_swarm_verify_inputs(parent, outputs),
+        )]
+    return [TaskNode.new(
+        session_id=parent.session_id,
+        kind=TaskKind.SWARM_DEVELOPER,
+        name=f"Generate file {next_index + 1}",
+        description="Generate the next planned file.",
+        parent_task_id=parent.task_id,
+        inputs=_swarm_dev_inputs(parent, outputs, next_index),
+    )]
+
+
+def _swarm_verify_to_successors(parent: TaskNode) -> List[TaskNode]:
+    """SWARM_VERIFY is terminal -- it owns the session's final status."""
+    return []
+
+
+def _swarm_terminal_session_actions(
+        completed: TaskNode) -> List[RouterAction]:
+    """Set the swarm session's terminal status once the chain ends.
+
+    A Tech Lead that produced no buildable plan (no Developer successor) is a
+    definitive ``FAILED``. When the chain reaches VERIFY, its ``verify_ok``
+    (structurally clean, no unwritten files, tests not red) decides the
+    outcome. A Developer that ends the chain without a VERIFY successor (a
+    degenerate single-file plan edge) falls back to its ``failed_paths``.
+    Mirrors :func:`_verify_terminal_session_actions`.
+    """
+    outputs = completed.outputs or {}
+    if completed.kind is TaskKind.SWARM_TECH_LEAD:
+        green = False
+    elif completed.kind is TaskKind.SWARM_VERIFY:
+        green = bool(outputs.get("verify_ok"))
+    else:
+        green = not (outputs.get("failed_paths") or [])
+    status = SessionStatus.COMPLETED if green else SessionStatus.FAILED
+    return [UpdateSessionStatus(session_id=completed.session_id,
+                                status=status)]
+
+
 # Maps the parent's kind to a function that produces the successor
 # tasks. Greenfield kinds (CLARIFY_REQUIREMENTS, DECOMPOSE, SCAFFOLD,
 # BOOTSTRAP_ENV) chain to ASK_USER / APPLY / VERIFY respectively. A
@@ -942,8 +1192,12 @@ TASK_SUCCESSOR = {
     TaskKind.API_CHECK: _api_check_to_smoke_or_repair,
     TaskKind.SMOKE: _smoke_to_verify_or_repair,
     TaskKind.VERIFY: _verify_successors,
+    TaskKind.RE_VERIFY: _re_verify_successors,
     TaskKind.RUNTIME_VERIFY: _runtime_verify_to_repair_or_terminal,
     TaskKind.REPAIR: _repair_to_apply_or_ask,
+    TaskKind.SWARM_TECH_LEAD: _swarm_tech_lead_to_successors,
+    TaskKind.SWARM_DEVELOPER: _swarm_developer_to_successors,
+    TaskKind.SWARM_VERIFY: _swarm_verify_to_successors,
 }
 
 
@@ -965,6 +1219,10 @@ _COMPLETION_GUARDS: Tuple[Tuple[TaskKind, _CompletionGuard], ...] = (
     (TaskKind.REPAIR, _repair_regenerate_actions),
     (TaskKind.REPAIR,
      lambda completed, tasks: _repair_terminal_failure_actions(completed)),
+    # DIAGNOSE always dispatches (the escalate arm regenerates or fails
+    # terminally), so this guard never declines and no TASK_SUCCESSOR entry
+    # is needed -- the reasoning rung is never stranded.
+    (TaskKind.DIAGNOSE, _diagnose_dispatch_actions),
     (TaskKind.SCAFFOLD, _scaffold_failed_files_actions),
     (TaskKind.SCAFFOLD, _scaffold_payload_regenerate_actions),
     (TaskKind.SCAFFOLD, _scaffold_contract_regenerate_actions),
@@ -1035,7 +1293,7 @@ class Router:
             if override:
                 plan.actions.extend(override)
                 return plan
-        if completed.kind is TaskKind.VERIFY:
+        if completed.kind in (TaskKind.VERIFY, TaskKind.RE_VERIFY):
             plan.actions.extend(_verify_lesson_actions(completed, tasks))
         spawn = TASK_SUCCESSOR.get(completed.kind)
         if spawn is None:
@@ -1043,7 +1301,8 @@ class Router:
         children = spawn(completed)
         for child in children:
             plan.actions.append(CreateTask(child))
-        if completed.kind is TaskKind.VERIFY and not children:
+        if (completed.kind in (TaskKind.VERIFY, TaskKind.RE_VERIFY)
+                and not children):
             plan.actions.extend(
                 _verify_terminal_session_actions(completed))
         if completed.kind is TaskKind.RUNTIME_VERIFY and not children:
@@ -1053,6 +1312,12 @@ class Router:
                 and not children):
             plan.actions.extend(
                 _preverify_gate_terminal_actions(completed))
+        if (completed.kind in (TaskKind.SWARM_TECH_LEAD,
+                               TaskKind.SWARM_DEVELOPER,
+                               TaskKind.SWARM_VERIFY)
+                and not children):
+            plan.actions.extend(
+                _swarm_terminal_session_actions(completed))
         return plan
 
     @traced("router")
@@ -1097,11 +1362,19 @@ class Router:
         is already in a terminal status.
         """
         plan = RouterPlan()
-        if session.mode is not SessionMode.GREENFIELD:
-            return plan
         if session.status in (SessionStatus.COMPLETED,
                               SessionStatus.FAILED,
                               SessionStatus.ABANDONED):
+            return plan
+        # A swarm executor that crashed or errored has no automated recovery;
+        # end the session FAILED so it reaches a terminal status instead of
+        # hanging in ``active`` with a dead leaf (mirrors greenfield).
+        if session.mode is SessionMode.SWARM:
+            plan.actions.append(UpdateSessionStatus(
+                session_id=session.session_id,
+                status=SessionStatus.FAILED))
+            return plan
+        if session.mode is not SessionMode.GREENFIELD:
             return plan
         resume_actions = _scaffold_resume_actions(
             failed, tasks, resume_scaffold_artifact_id)
@@ -1186,9 +1459,23 @@ class Router:
 
 def _make_root(session: Session, message: str) -> TaskNode:
     """Pick the root task kind based on the session's mode."""
+    if session.mode is SessionMode.SWARM:
+        return _make_root_swarm_tech_lead(session, message)
     if session.mode is SessionMode.GREENFIELD:
         return _make_root_clarify(session, message)
     return _make_root_explore(session, message)
+
+
+def _make_root_swarm_tech_lead(session: Session, message: str) -> TaskNode:
+    return TaskNode.new(
+        session_id=session.session_id,
+        kind=TaskKind.SWARM_TECH_LEAD,
+        name="Tech Lead Planning",
+        description="Reason over the objective and delegate tasks.",
+        inputs={"goal": message,
+                "original_objective": session.original_objective,
+                "project_root": session.project_root},
+    )
 
 
 def _make_root_explore(session: Session, message: str) -> TaskNode:

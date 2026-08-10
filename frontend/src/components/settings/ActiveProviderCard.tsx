@@ -217,6 +217,28 @@ export function ActiveProviderCard({
           </Field>
         )}
       </div>
+
+      <div className="mt-4 pt-4 border-t border-muted">
+        <label className="flex items-start gap-3 cursor-pointer">
+          <input
+            type="checkbox"
+            checked={provider.multi_agent_debate ?? false}
+            onChange={(e) => setProvider({ multi_agent_debate: e.target.checked, use_profile: false })}
+            className="mt-1 rounded border-slate-600 bg-slate-900 text-emerald-500 focus:ring-emerald-500 focus:ring-offset-slate-950"
+          />
+          <div>
+            <span className="block text-sm font-medium text-slate-200">
+              Multi-Agent Debate (Tournament Mode)
+            </span>
+            <span className="block text-xs text-slate-400 mt-0.5">
+              Run complex reasoning tasks (like Tech Lead planning or Developer coding) 
+              with two parallel agents and a judge. Significantly improves quality at the 
+              cost of higher latency and token usage.
+            </span>
+          </div>
+        </label>
+      </div>
+
       <PingBanner result={pingResult} model={provider.model} />
     </Card>
   );

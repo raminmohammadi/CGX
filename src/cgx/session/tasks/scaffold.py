@@ -643,6 +643,22 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     # imports against package.json and splice the missing ones into
     # ``dependencies`` in place. Best-effort: any failure leaves the bundle
     # untouched.
+    # ... and, first, the placeholder guard: npm rejects an unsubstituted
+    # ``"{version}"`` range before resolving anything, so the manifest has
+    # to be installable before there is any point cross-checking what it
+    # declares.
+    js_specs_relaxed: List[str] = []
+    try:
+        js_specs_relaxed = _reconcile_js_dep_placeholders(
+            diffs=diffs, existing_with_content=existing_with_content)
+    except Exception:  # pragma: no cover - defensive: gate is best-effort
+        logger.exception(
+            "SCAFFOLD: JS version-placeholder reconciliation raised; "
+            "skipping")
+        js_specs_relaxed = []
+    if js_specs_relaxed:
+        _checkpoint_progress(deps, artifact)
+
     js_deps_added: List[str] = []
     try:
         js_deps_added = _reconcile_js_dependencies(
@@ -787,6 +803,7 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     artifact.content["skill_warnings"] = skill_warnings
     artifact.content["reconciled_count"] = reconciled_count
     artifact.content["js_deps_added"] = js_deps_added
+    artifact.content["js_specs_relaxed"] = js_specs_relaxed
     artifact.content["synthesized_modules"] = synthesized_modules
     artifact.content["smoke_test_synthesized"] = smoke_test_synthesized
     artifact.content["complete"] = True
@@ -805,6 +822,7 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             "skill_warnings_count": len(skill_warnings),
             "reconciled_count": reconciled_count,
             "js_deps_added": js_deps_added,
+            "js_specs_relaxed": js_specs_relaxed,
             "synthesized_modules": synthesized_modules,
             "smoke_test_synthesized": smoke_test_synthesized,
         },
@@ -2730,6 +2748,99 @@ def _js_import_coherence_failures(
     return failures
 
 
+# npm parses every dependency value as a version range and hard-fails the
+# whole install (``EINVALIDTAGNAME``) on one it cannot read, so a single
+# unsubstituted template placeholder leaves the tree with no node_modules
+# at all -- live: a generated package.json whose every entry was the
+# literal ``"{version}"``. Matched on the delimiter pair rather than a list
+# of known placeholder names so any spelling is caught, and repaired to the
+# same permissive ``"*"`` the missing-dep salvage uses (the lockfile pins
+# the concrete version at install time).
+_PLACEHOLDER_SPEC_RE = re.compile(r"^\s*[{<][^{}<>]*[}>]\s*$")
+_PLACEHOLDER_SPEC_FALLBACK = "*"
+_PKG_DEP_SECTIONS = ("dependencies", "devDependencies", "peerDependencies",
+                     "optionalDependencies")
+
+
+def _locate_package_json(
+        diffs: List[Dict[str, str]],
+        existing_with_content: List[Dict[str, str]],
+) -> Tuple[int, int, str]:
+    """Index of the ``package.json`` diff and its content entry, plus path.
+
+    Returns ``(-1, -1, "")`` when the bundle carries no manifest or the
+    diff has no matching ``existing_with_content`` entry, which is the
+    no-op signal for every manifest reconciler.
+    """
+    pkg_idx = -1
+    for i, d in enumerate(diffs):
+        if str(d.get("file") or "").strip().rsplit("/", 1)[-1] == "package.json":
+            pkg_idx = i
+            break
+    if pkg_idx < 0:
+        return -1, -1, ""
+    pkg_path = str(diffs[pkg_idx].get("file") or "").strip()
+    for i, e in enumerate(existing_with_content):
+        if str(e.get("path") or "").strip() == pkg_path:
+            return pkg_idx, i, pkg_path
+    return -1, -1, ""
+
+
+def _reconcile_js_dep_placeholders(
+        *,
+        diffs: List[Dict[str, str]],
+        existing_with_content: List[Dict[str, str]],
+) -> List[str]:
+    """Rewrite unsubstituted placeholder version specifiers to ``"*"``.
+
+    A manifest that declares ``"react": "{version}"`` is not installable:
+    npm rejects the range before resolving anything, so BOOTSTRAP_ENV
+    provisions nothing and every downstream JS failure is a symptom of a
+    defect no code repair can reach. Replaces each placeholder-shaped
+    specifier across all four dependency sections in place, using the
+    same new-file unified-diff helpers APPLY expects. No-ops (returns
+    ``[]``) when there is no manifest, it is unparseable, or every
+    specifier is real. Returns the rewritten package names.
+    """
+    from cgx.answer.engine import _content_to_new_file_patch
+
+    import json as _json
+    pkg_idx, ei, pkg_path = _locate_package_json(diffs, existing_with_content)
+    if pkg_idx < 0:
+        return []
+    before = str(existing_with_content[ei].get("content") or "")
+    try:
+        pkg = _json.loads(before)
+    except Exception:
+        return []
+    if not isinstance(pkg, dict):
+        return []
+
+    rewritten: List[str] = []
+    for key in _PKG_DEP_SECTIONS:
+        section = pkg.get(key)
+        if not isinstance(section, dict):
+            continue
+        for name, spec in list(section.items()):
+            if isinstance(spec, str) and _PLACEHOLDER_SPEC_RE.match(spec):
+                section[name] = _PLACEHOLDER_SPEC_FALLBACK
+                rewritten.append(str(name))
+    if not rewritten:
+        return []
+
+    repaired = _json.dumps(pkg, indent=2) + "\n"
+    diffs[pkg_idx] = {
+        "file": pkg_path,
+        "patch": _content_to_new_file_patch(pkg_path, repaired),
+    }
+    existing_with_content[ei] = {"path": pkg_path, "content": repaired}
+    logger.warning(
+        "SCAFFOLD: package.json left an unsubstituted version placeholder "
+        "on %s; relaxing to %r so npm install can resolve",
+        sorted(set(rewritten)), _PLACEHOLDER_SPEC_FALLBACK)
+    return rewritten
+
+
 def _reconcile_js_dependencies(
         *,
         diffs: List[Dict[str, str]],
@@ -2751,21 +2862,8 @@ def _reconcile_js_dependencies(
         _deterministic_package_json_repair,
     )
 
-    pkg_idx = -1
-    for i, d in enumerate(diffs):
-        if str(d.get("file") or "").strip().rsplit("/", 1)[-1] == "package.json":
-            pkg_idx = i
-            break
+    pkg_idx, ei, pkg_path = _locate_package_json(diffs, existing_with_content)
     if pkg_idx < 0:
-        return []
-    pkg_path = str(diffs[pkg_idx].get("file") or "").strip()
-
-    ei = -1
-    for i, e in enumerate(existing_with_content):
-        if str(e.get("path") or "").strip() == pkg_path:
-            ei = i
-            break
-    if ei < 0:
         return []
     before = str(existing_with_content[ei].get("content") or "")
 

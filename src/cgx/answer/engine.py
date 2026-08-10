@@ -1431,7 +1431,7 @@ def answer_with_llm(
         {"role": "user", "content": prep["context"]},
     ]
 
-    resp = provider.chat(messages, temperature=0.2)
+    resp = provider.chat(messages, temperature=0.2, force_json=True)
     content = (resp.get("content") or "").strip()
 
     parsed: Dict[str, Any] = _extract_json_object(content)
@@ -1444,7 +1444,7 @@ def answer_with_llm(
             messages.append({"role": "user", "content": "Reformat to strict JSON only. "
                                                        "Ensure non-empty 'answer_md' grounded in SOURCES with citations. "
                                                        "Keep the same content; do not add external knowledge."})
-            resp2 = provider.chat(messages, temperature=0)
+            resp2 = provider.chat(messages, temperature=0, force_json=True)
             parsed = _extract_json_object((resp2.get("content") or "")) or {"answer_md": (resp2.get("content") or content), "citations": []}
 
     ans = parsed.get("answer_md")
@@ -2471,7 +2471,8 @@ _MANIFEST_SYSTEM = (
     "- contracts (optional, but STRONGLY preferred for any multi-file or "
     "client/server project): declare the shared interfaces every file must "
     "agree on. MUST include a 'project_skeleton' string containing the folder structure and signatures of all files (classes, function names, type hints, docstrings) with 'pass' in the bodies.\n"
-    "- 3 to 15 files total. Prefer completeness over brevity.\n"
+    "- 3 to 15 files total, but any SCOPE CEILING in the request is a hard "
+    "cap -- never exceed it, and prefer the minimal viable stack.\n"
     "- Canonical top-level dirs: src/, backend/, tests/, public/, docs/.\n"
     "- A frontend manifest uses Vite and MUST list index.html at the project "
     "root (not public/index.html) alongside vite.config.js -- Vite resolves its "
@@ -2498,7 +2499,7 @@ def generate_project_skeleton(paths: List[str], provider: Any, goal: str) -> str
         {"role": "system", "content": system},
         {"role": "user", "content": user_msg},
     ]
-    resp = provider.chat(messages=messages, max_tokens=4000, temperature=0.0)
+    resp = provider.chat(messages=messages, max_tokens=4000, temperature=0.0, force_json=False)
     text = (resp or {}).get("content", "") if isinstance(resp, dict) else ""
     skeleton = _first_fenced_block_body(text) or text
     emit_trace("project_skeleton", skeleton=skeleton)
@@ -2512,6 +2513,7 @@ def plan_scaffold_manifest(
     goal: Optional[str] = None,
     skills: Optional[List[str]] = None,
     existing_files: Optional[List[str]] = None,
+    scope_constraint: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Return a file manifest for a new project -- paths and descriptions only, no content.
 
@@ -2548,6 +2550,9 @@ def plan_scaffold_manifest(
         parts.append(f"TASK DESCRIPTION:\n{idea_clean}")
     else:
         parts.append(f"PROJECT IDEA:\n{idea_clean}")
+    scope_clean = (scope_constraint or "").strip()
+    if scope_clean:
+        parts.append(scope_clean)
     if existing_files:
         listed = "\n".join(f"- {p}" for p in list(existing_files)[:60])
         parts.append("EXISTING FILES (already planned -- do NOT repeat):\n" + listed)
@@ -2626,6 +2631,8 @@ def plan_scaffold_manifest(
     # surrendering to the empty-layer placeholder.
     if not _layers_have_files(parsed) and goal_clean:
         retry_context = f"PROJECT IDEA:\n{idea_clean[:600]}"
+        if scope_clean:
+            retry_context += "\n\n" + scope_clean
         if existing_files:
             listed = "\n".join(f"- {p}" for p in list(existing_files)[:60])
             retry_context += "\n\nEXISTING FILES (already planned -- do NOT repeat):\n" + listed
@@ -2773,6 +2780,96 @@ def extract_endpoint_contracts(
     return normalized.get("endpoints") or []
 
 
+_MANIFEST_CRITIQUE_SYSTEM = (
+    "You are a scope reviewer for a proposed project file manifest. Given a "
+    "project goal, a minimal-viable-stack ceiling, and the list of planned "
+    "files, identify files that are SPECULATIVE -- not required to satisfy "
+    "the goal at the stated scope (e.g. a database layer, auth module, "
+    "migrations, a frontend, or E2E tests the goal never asked for).\n\n"
+    "Return strict JSON only:\n"
+    "{\n"
+    '  "remove": ["path/one.py", "path/two.py"]\n'
+    "}\n\n"
+    "Rules:\n"
+    "- Only list paths that appear verbatim in the provided manifest.\n"
+    "- NEVER remove the program's entry point, its core module, its unit "
+    "tests, or a file another kept file depends on.\n"
+    "- When in doubt, KEEP the file -- an empty \"remove\" list is the "
+    "correct answer for an already-minimal plan.\n"
+    "- No prose outside the JSON object.\n"
+)
+
+
+@traced("llm")
+def critique_scaffold_manifest(
+    goal: str,
+    layers: List[Dict[str, Any]],
+    provider: Any,
+    *,
+    scope_constraint: Optional[str] = None,
+) -> List[str]:
+    """Bounded LLM self-critique of a file manifest (P1.2): flag speculative files.
+
+    Runs one temperature-0 pass over the goal + scope ceiling + file list and
+    returns the manifest paths the model judged speculative (not traceable to
+    the goal). Deterministic-safe: a missing provider, a provider/parse error,
+    or an unparseable reply all degrade to ``[]`` so the caller keeps the full
+    manifest -- exactly today's behaviour. The caller owns the safety
+    guardrails (never drop an entry point / the last source file / a
+    ``depends_on`` target) before it actually removes anything.
+    """
+    if provider is None:
+        return []
+    listed: List[str] = []
+    manifest_paths: set = set()
+    for layer in (layers or []):
+        for f in (layer.get("files") or []):
+            if not isinstance(f, dict):
+                continue
+            path = str(f.get("path") or "").strip()
+            if not path:
+                continue
+            manifest_paths.add(path)
+            desc = str(f.get("description") or "").strip()
+            listed.append(f"- {path}: {desc}" if desc else f"- {path}")
+    if not listed:
+        return []
+    manifest_txt = "\n".join(listed[:60])
+    parts = [f"PROJECT GOAL:\n{(goal or '').strip()}"]
+    sc = (scope_constraint or "").strip()
+    if sc:
+        parts.append(sc)
+    parts.append(f"PROPOSED FILE MANIFEST:\n{manifest_txt}")
+    parts.append("List the speculative files to remove as strict JSON.")
+    user = "\n\n".join(parts)
+    try:
+        resp = provider.chat(
+            messages=[
+                {"role": "system", "content": _MANIFEST_CRITIQUE_SYSTEM},
+                {"role": "user", "content": user},
+            ],
+            temperature=0.0,
+            max_tokens=800,
+            force_json=True,
+        )
+        raw = (resp or {}).get("content", "") if isinstance(resp, dict) else ""
+    except Exception:  # pragma: no cover - defensive: critique is best-effort
+        logger.exception("critique_scaffold_manifest: provider call failed")
+        return []
+    parsed = _extract_json_object(raw) or {}
+    flagged = parsed.get("remove")
+    if not isinstance(flagged, list):
+        return []
+    out: List[str] = []
+    seen: set = set()
+    for p in flagged:
+        s = str(p or "").strip()
+        if s and s in manifest_paths and s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
+
+
 def _compact_json_fragment(value: Any, max_chars: int = 300) -> str:
     """Render a contract sub-value (schema fields, request body) compactly.
 
@@ -2793,6 +2890,104 @@ def _compact_json_fragment(value: Any, max_chars: int = 300) -> str:
     if len(s) > max_chars:
         s = s[: max_chars - 1] + "\u2026"
     return s
+
+
+def _format_function_contract(fn: Dict[str, Any]) -> str:
+    """Best signature string for a function contract entry.
+
+    Prefers an explicit ``signature``; otherwise synthesises one from
+    ``name`` + ``parameters`` (list of ``{name, type}``) + ``return_type`` so
+    a Tech Lead that emits structured fields (but no signature string) still
+    renders a real ``foo(a: int, b: int) -> int`` the model can implement.
+    Returns an empty string when nothing usable is present.
+    """
+    sig = str(fn.get("signature") or "").strip()
+    if sig:
+        return sig
+    name = str(fn.get("name") or "").strip()
+    if not name:
+        return ""
+    params = fn.get("parameters")
+    parts: List[str] = []
+    if isinstance(params, list):
+        for p in params:
+            if isinstance(p, dict):
+                pn = str(p.get("name") or "").strip()
+                pt = str(p.get("type") or "").strip()
+                if not pn:
+                    continue
+                # Never annotate the implicit receiver: a Tech Lead that
+                # declares ``self`` with the enclosing class type would render
+                # ``def __init__(self: Account, ...)``, whose annotation is
+                # evaluated at class-definition time -- before the name is
+                # bound -- and raises NameError at import. Emit the bare name.
+                if pn in ("self", "cls"):
+                    parts.append(pn)
+                else:
+                    parts.append(f"{pn}: {pt}" if pt else pn)
+            elif isinstance(p, str) and p.strip():
+                parts.append(p.strip())
+    ret = str(fn.get("return_type") or "").strip()
+    rendered = f"{name}({', '.join(parts)})"
+    if ret:
+        rendered += f" -> {ret}"
+    return rendered
+
+
+def _render_required_symbols_for_file(path: str, contracts: Any) -> str:
+    """Imperative directive naming the symbols THIS file must define.
+
+    The project-wide contract block declares shared interfaces but never says
+    which file owns which symbol, so a weak model given a terse per-file
+    purpose can drift into boilerplate (an empty settings class, an unrelated
+    import). This scopes the contract to ``path``: functions whose ``module``
+    is this file, dotted ``Class.method`` names grouped by their class, and
+    schemas bound to this module -- rendered as a hard "MUST define" list so
+    the model implements the plan instead of re-deriving it. Empty when the
+    contract binds nothing to this file.
+    """
+    if not isinstance(contracts, dict) or not path.endswith(".py"):
+        return ""
+    norm = path.replace("\\", "/")
+
+    def _bound_here(item: Dict[str, Any]) -> bool:
+        mod = str(item.get("module") or "").replace("\\", "/").strip()
+        return not mod or mod == norm
+
+    plain: List[str] = []
+    methods_by_class: Dict[str, List[str]] = {}
+    for fn in (contracts.get("functions") or []):
+        if not isinstance(fn, dict) or not _bound_here(fn):
+            continue
+        name = str(fn.get("name") or "").strip()
+        if not name:
+            continue
+        if "." in name:
+            owner, _, member = name.rpartition(".")
+            methods_by_class.setdefault(owner, []).append(member)
+        else:
+            plain.append(_format_function_contract(fn) or name)
+    classes: List[str] = []
+    for sc in (contracts.get("schemas") or []):
+        if not isinstance(sc, dict) or not _bound_here(sc):
+            continue
+        name = str(sc.get("name") or "").strip()
+        if name:
+            classes.append(name)
+
+    lines: List[str] = []
+    for cls in classes:
+        methods = methods_by_class.pop(cls, [])
+        suffix = (" with method(s) " + ", ".join(methods)) if methods else ""
+        lines.append(f"- class {cls}{suffix}")
+    for cls, methods in methods_by_class.items():
+        lines.append(f"- class {cls} with method(s) " + ", ".join(methods))
+    for sig in plain:
+        lines.append(f"- def {sig}")
+    if not lines:
+        return ""
+    return ("THIS FILE MUST DEFINE (implement fully -- no placeholders, no "
+            "unrelated boilerplate):\n" + "\n".join(lines))
 
 
 def _render_contracts_for_prompt(contracts: Any) -> str:
@@ -2867,11 +3062,15 @@ def _render_contracts_for_prompt(contracts: Any) -> str:
         for fn in functions:
             if not isinstance(fn, dict):
                 continue
-            sig = str(fn.get("signature") or fn.get("name") or "").strip()
+            sig = _format_function_contract(fn)
             if not sig:
                 continue
             module = str(fn.get("module") or "").strip()
-            lines.append(f"- {sig}" + (f" (in {module})" if module else ""))
+            desc = str(fn.get("description") or "").strip()
+            line = f"- {sig}" + (f" (in {module})" if module else "")
+            if desc:
+                line += f" -- {desc}"
+            lines.append(line)
         if lines:
             sections.append("Shared functions:\n" + "\n".join(lines))
 
@@ -3324,7 +3523,7 @@ _SINGLE_FILE_SYSTEM = (
     "- Use imports consistent with what already exists in the project.\n"
     "- ONLY import local modules/components if they are explicitly listed in the PROJECT MANIFEST. You are FORBIDDEN from importing ANY local file or component that is not in the PROJECT MANIFEST.\n"
     "- You MUST strictly adhere to the PROJECT CONTRACTS and Project Skeleton. ONLY use symbols, functions, classes, and variables that are explicitly defined there. Do NOT hallucinate undefined variables (e.g. app, API_BASE) if they are not exported by the skeleton.\n"
-    "- You MUST IMPLEMENT every symbol, function, and variable defined for this file in the Project Skeleton. If the skeleton says your file exports 'settings', you MUST define 'settings' in your file. Do NOT omit them!\n"
+    "- You MUST IMPLEMENT every symbol, function, class, and variable listed for this file in the REQUIRED SYMBOLS directive or Project Skeleton, with real working bodies. If a symbol is listed for this file, you MUST define it here; do NOT omit any. Do NOT add unrelated symbols, settings classes, or framework boilerplate the file's stated purpose did not ask for.\n"
     "- Assume the project root is the Python path. All imports must be absolute starting from the root directories: src., backend., or tests.. Never use 'import main', use 'from backend.main import router' (or whatever is explicitly in the skeleton).\n"
     "- Pay close attention to relative import paths (e.g., `./` vs `../`).\n"
     "- Do not repeat or regenerate any already-existing file.\n"
@@ -3335,7 +3534,6 @@ _SINGLE_FILE_SYSTEM = (
     "file, return {\"content\": \"\"} instead.\n"
     "- Satisfy the file's stated purpose exactly.\n"
     "Python import discipline (applies to every .py file in this project):\n"
-    "- We use Pydantic V2. `BaseSettings` MUST be imported from `pydantic_settings`, NOT `pydantic`.\n"
     "- src/ is a sys.path ROOT, NOT a package. There is no src/__init__.py.\n"
     "- Inside files under src/, import sibling modules by their flat name. "
     "RIGHT: `from chat_manager import ChatManager`. "
@@ -3348,23 +3546,20 @@ _SINGLE_FILE_SYSTEM = (
     "packages with their own __init__.py and are imported without the "
     "src. prefix: `from models.user import User`, never "
     "`from src.models.user import User`.\n"
-    "- Relative imports (`from .foo import bar`) are OK between modules in "
-    "the same subpackage, but NEVER use them inside a script that may be "
-    "launched directly (streamlit run, python src/app.py, etc.) -- those "
-    "scripts run as __main__ and have no parent package.\n"
+    "- DO NOT USE RELATIVE IMPORTS. NEVER use `from .foo import bar` or `from ..foo import bar`. "
+    "Relative imports cause `ImportError: attempted relative import with no known parent package` when the test suite runs. "
+    "You MUST use absolute imports for all local modules (e.g., `from routers import tasks` or `from models import Task`).\n"
     "Python web-framework test discipline (when the requested file is a "
     "pytest test under tests/ for a Flask / FastAPI / Starlette / Django app):\n"
     "- Exercise the application via the framework's in-process client "
     "(`app.test_client()` for Flask, `TestClient(app)` for FastAPI / "
     "Starlette, `Client()` for Django) -- never bind a real port or use "
     "`requests` / `httpx.Client(base_url='http://localhost:...')` in a test.\n"
-    "- For Flask specifically: obtain the client ONLY from the app object, "
-    "via `client = app.test_client()` (typically wrapped in a "
-    "`@pytest.fixture`). Do NOT import a test client class from werkzeug. "
-    "There is NO `werkzeug.test.TestClient` -- that symbol does not exist "
-    "and raises AttributeError. `TestClient(app)` is a FastAPI/Starlette "
-    "construct imported from `fastapi.testclient` / `starlette.testclient`, "
-    "NOT something you import for a Flask app.\n"
+    "- Obtain the client ONLY from the framework's own documented entry "
+    "point for the app under test (e.g. wrap `app.test_client()` in a "
+    "`@pytest.fixture`); never import a test-client symbol the framework "
+    "does not actually export, and never pair one framework's client with "
+    "another framework's app.\n"
     "- Import the application factory or app instance from the project's "
     "own source files (e.g. `from app import app` or `from main import "
     "create_app`); do not stub or reimplement the framework inline.\n"
@@ -3408,6 +3603,16 @@ _SINGLE_FILE_SYSTEM = (
     "usefixtures). Do NOT apply a custom @pytest.mark.* unless it is "
     "registered in pytest.ini/pyproject -- unregistered marks fail under "
     "strict-markers.\n"
+    "- Construct every input the test needs INSIDE the test: literals, small "
+    "in-test objects, or the `tmp_path` fixture for any files. NEVER read an "
+    "external data file, fixture file, or a path the project does not itself "
+    "create in the test -- it will not exist when the suite runs.\n"
+    "- Assert INVARIANTS and ROUND-TRIPS derivable from the code's documented "
+    "behaviour -- e.g. `decode(encode(x)) == x`, a length or ordering "
+    "property, idempotence, or a value you compute in-test from the same "
+    "inputs -- rather than a specific magic literal you cannot know the "
+    "function will return. Only assert an exact literal when the goal itself "
+    "fixes that value (a documented constant or a stated formula result).\n"
 )
 
 _SINGLE_FILE_FREEFORM_SYSTEM = (
@@ -3655,6 +3860,35 @@ def _looks_newline_collapsed(content: str) -> bool:
     return any(_line_joins_imports(ln) for ln in body.splitlines())
 
 
+_PYDANTIC_IMPORT_PIN = (
+    "Pydantic import discipline: this project uses Pydantic V2. `BaseSettings` "
+    "MUST be imported from `pydantic_settings`, NOT `pydantic`."
+)
+
+
+def _project_uses_pydantic(
+        goal: str, description: str,
+        existing_files_with_content: Optional[List[Dict[str, str]]],
+        skill_names: str) -> bool:
+    """Whether the pydantic/settings import pin is relevant to this project.
+
+    The pin (``BaseSettings`` comes from ``pydantic_settings``) is essential
+    for FastAPI/pydantic projects but actively harmful on a plain-Python task:
+    a weak model reads an unconditional rule and reaches for a
+    ``pydantic_settings.BaseSettings`` stub it was never asked for. Gate it on
+    a real signal -- the goal/description/skills naming pydantic or FastAPI, or
+    an already-generated file that actually imports pydantic.
+    """
+    needles = ("pydantic", "fastapi", "basesettings", "basemodel")
+    hay = " ".join(t for t in (goal, description, skill_names) if t).lower()
+    if any(n in hay for n in needles):
+        return True
+    for f in (existing_files_with_content or []):
+        if "pydantic" in str(f.get("content") or "").lower():
+            return True
+    return False
+
+
 @traced("llm")
 def generate_single_scaffold_file(
     path: str,
@@ -3793,7 +4027,15 @@ def generate_single_scaffold_file(
             "framework or language than the one declared for this project.\n\n"
         )
         system = _SINGLE_FILE_SYSTEM + header + skill_fragment
-    
+
+    # Append the pydantic import pin only when the project actually uses
+    # pydantic/FastAPI. Kept out of the base prompt because, unconditional, it
+    # seeds a `pydantic_settings.BaseSettings` boilerplate attractor that weak
+    # models over-apply to plain-Python files they were never asked to settle.
+    if _project_uses_pydantic(goal, description,
+                              existing_files_with_content, skill_names_str):
+        system = system + "\n\n" + _PYDANTIC_IMPORT_PIN
+
     emit_trace("scaffold_rules", rules=system)
 
     # Defense-in-depth: hard-pin framework conventions by file extension so
@@ -3834,6 +4076,9 @@ def generate_single_scaffold_file(
     parts.append(f"FILE TO GENERATE:\nPath: {path}\nPurpose: {description}")
     if layer:
         parts.append(f"Layer: {layer}")
+    required_block = _render_required_symbols_for_file(path, contracts)
+    if required_block:
+        parts.append(required_block)
     # Per-call prompt + response budget scaled to the active provider's
     # model context window. Local 8K models get tight caps; cloud
     # models with 200K+ windows get generous ones. See
@@ -4113,7 +4358,7 @@ def generate_single_scaffold_file(
                 if "".join(ec.split()) == norm_new:
                     syntax_ok = False
                     syntax_error = f"duplicate content of {ep}"
-                    content = ""
+                    content = retry or content
                     break
 
     # First-party symbol-consistency gate: a regenerated file (typically
@@ -4122,6 +4367,39 @@ def generate_single_scaffold_file(
     # `from auth import generate_jwt` when auth.py has no `generate_jwt`).
     # API_CHECK would flag it as a hallucinated attribute, but the
     # regenerate loop can't fix it without knowing what the module really
+    # Relative import gate: forbid relative imports. If the LLM generates a relative import, retry once.
+    if content and syntax_ok and ext == "py":
+        import ast as _ast
+        has_relative = False
+        try:
+            tree = _ast.parse(content)
+            for node in _ast.walk(tree):
+                if isinstance(node, _ast.ImportFrom) and getattr(node, "level", 0) > 0:
+                    has_relative = True
+                    break
+        except Exception:
+            pass
+            
+        if has_relative:
+            retry = _regenerate_scaffold_file(
+                provider, system, context, budget,
+                "CRITICAL ERROR: You used a relative import (from . or from ..). This is strictly forbidden. Rewrite the file using ONLY absolute imports (e.g. from models import Task)."
+            )
+            retry_ok = False
+            if retry:
+                try:
+                    tree2 = _ast.parse(retry)
+                    retry_ok = not any(isinstance(n, _ast.ImportFrom) and getattr(n, "level", 0) > 0 for n in _ast.walk(tree2))
+                except SyntaxError:
+                    pass
+            if retry_ok:
+                content = retry
+            else:
+                syntax_ok = False
+                syntax_error = "File rejected for containing forbidden relative imports."
+                content = retry or content
+
+    # Phantom-symbol gate: the baseline system prompt does not pass a flat
     # exports. Retry once with the real symbol inventory; otherwise fail
     # the file so APPLY drops it rather than persisting a broken import.
     if content and syntax_ok and ext == "py" and existing_files_with_content:
@@ -4150,7 +4428,7 @@ def generate_single_scaffold_file(
                     f"imports undefined first-party symbol(s) "
                     f"{first['missing']} from module '{first['module']}'. "
                     f"Available symbols in '{first['module']}' are: [{avail}]")
-                content = ""
+                content = retry or content
 
     # Undefined-name gate: a file can parse cleanly, import only modules
     # that really exist, and still die the instant anything touches it
@@ -4182,7 +4460,39 @@ def generate_single_scaffold_file(
                 syntax_error = (
                     f"uses undefined name(s) {unbound}: never imported, "
                     "assigned, or defined anywhere in this file. YOU MUST IMPORT IT AT THE TOP OF THE FILE. Regenerate the file with the missing imports added.")
-                content = ""
+                content = retry or content
+
+    # No-stub gate: a file can parse cleanly and import only names it defines
+    # yet still ship a required symbol whose body is a placeholder (`pass` /
+    # `...` / docstring-only / `raise NotImplementedError`). Such a stub clears
+    # every structural gate but fails the suite the instant a test calls it
+    # (the `encode()->pass` failure). When the WORK_PLAN contracts pin function
+    # symbols to this module, verify each has a real body and retry once with a
+    # hardened instruction naming the offenders before failing the file.
+    if content and syntax_ok and ext == "py" and contracts:
+        stubs = _contract_stub_symbols(content, path, contracts)
+        if stubs:
+            retry = _regenerate_scaffold_file(
+                provider, system, context, budget,
+                _stub_retry_instruction(stubs))
+            retry_ok = False
+            if retry:
+                import ast as _ast
+                try:
+                    _ast.parse(retry)
+                    retry_ok = not _contract_stub_symbols(
+                        retry, path, contracts)
+                except SyntaxError:
+                    retry_ok = False
+            if retry_ok:
+                content = retry
+            else:
+                syntax_ok = False
+                syntax_error = (
+                    "stub-only body for required contract symbol(s) "
+                    f"{stubs}: implement each with real logic (no pass / ... "
+                    "/ NotImplementedError)")
+                content = retry or content
 
     # Test-collectability gate: a pytest module that parses cleanly but
     # defines no module-top-level `def test_*` collects zero tests (pytest
@@ -4527,6 +4837,117 @@ def _has_collectable_pytest_test(content: str) -> bool:
                         and _is_test_name(item.name)):
                     return True
     return False
+
+
+def _body_is_stub(node: Any) -> bool:
+    """True when a def/method body is a placeholder, not an implementation.
+
+    A body counts as a stub when, after dropping a leading docstring, every
+    remaining statement is ``pass``, a bare ``...`` expression, or ``raise
+    NotImplementedError`` -- the shapes a weak model emits when it declares a
+    contract symbol but never fills it in. A docstring-only body is a stub too.
+    """
+    import ast as _ast
+    body = list(getattr(node, "body", []) or [])
+    if (body and isinstance(body[0], _ast.Expr)
+            and isinstance(body[0].value, _ast.Constant)
+            and isinstance(body[0].value.value, str)):
+        body = body[1:]
+    if not body:
+        return True
+    for stmt in body:
+        if isinstance(stmt, _ast.Pass):
+            continue
+        if (isinstance(stmt, _ast.Expr)
+                and isinstance(stmt.value, _ast.Constant)
+                and stmt.value.value is Ellipsis):
+            continue
+        if isinstance(stmt, _ast.Raise):
+            exc = stmt.exc
+            fname = None
+            if isinstance(exc, _ast.Name):
+                fname = exc.id
+            elif isinstance(exc, _ast.Call) and isinstance(exc.func, _ast.Name):
+                fname = exc.func.id
+            if fname == "NotImplementedError":
+                continue
+        return False
+    return True
+
+
+def _contract_stub_symbols(content: str, path: str,
+                           contracts: Optional[Dict[str, Any]]) -> List[str]:
+    """Contract functions/methods pinned to ``path`` whose body is a stub.
+
+    Parses ``content`` and, for each ``functions`` contract whose ``module``
+    is this path, resolves the matching def (a module-level ``name``, a dotted
+    ``Class.method``, or a bare method name defined on one of the module's
+    classes) and flags it when :func:`_body_is_stub` holds. Schemas are not
+    checked -- a dataclass legitimately carries no body. Returns the flagged
+    contract names so the caller can re-ask naming the offenders.
+    """
+    if not isinstance(contracts, dict) or not contracts:
+        return []
+    import ast as _ast
+    try:
+        tree = _ast.parse(content)
+    except SyntaxError:
+        return []
+    funcs: Dict[str, Any] = {}
+    classes: Dict[str, Any] = {}
+    for node in tree.body:
+        if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+            funcs[node.name] = node
+        elif isinstance(node, _ast.ClassDef):
+            classes[node.name] = node
+
+    def _method(cls: Any, name: str) -> Optional[Any]:
+        for sub in cls.body:
+            if (isinstance(sub, (_ast.FunctionDef, _ast.AsyncFunctionDef))
+                    and sub.name == name):
+                return sub
+        return None
+
+    norm = str(path or "").replace("\\", "/")
+    stubs: List[str] = []
+    for fn in (contracts.get("functions") or []):
+        if not isinstance(fn, dict):
+            continue
+        if str(fn.get("module") or "").replace("\\", "/") != norm:
+            continue
+        name = str(fn.get("name") or "").strip()
+        if not name:
+            continue
+        node = None
+        if "." in name:
+            owner, _, member = name.rpartition(".")
+            cls = classes.get(owner)
+            if cls is not None:
+                node = _method(cls, member)
+        else:
+            node = funcs.get(name)
+            if node is None:
+                for cls in classes.values():
+                    node = _method(cls, name)
+                    if node is not None:
+                        break
+        if node is not None and _body_is_stub(node):
+            stubs.append(name)
+    return stubs
+
+
+def _stub_retry_instruction(names: List[str]) -> str:
+    """A hardened re-ask naming the contract symbols left unimplemented."""
+    listed = ", ".join(names)
+    return (
+        "\n\nCRITICAL RETRY -- YOUR PREVIOUS ATTEMPT WAS REJECTED:\n"
+        f"These required functions/methods had a placeholder body: {listed}. "
+        "A placeholder is a body that is only `pass`, `...`, a docstring, or "
+        "`raise NotImplementedError`. They are binding contract symbols this "
+        "file MUST implement. Regenerate the COMPLETE file with a real, "
+        "working implementation for every one of them -- compute and return "
+        "the documented result. Do NOT emit stubs, TODOs, placeholders, or "
+        "`NotImplementedError`.")
 
 
 _TEST_RETRY_INSTR = (
@@ -5095,9 +5516,13 @@ _LOGIC_REPAIR_SYSTEM = (
     '{"files": [{"path": "<relative/path>", "content": "<complete new '
     'file>"}]}\n\n'
     "Rules:\n"
-    "- Prefer fixing the SOURCE code so the EXISTING tests pass. Only edit a "
-    "test file when the test itself is clearly wrong (asserts behaviour the "
-    "goal never asked for).\n"
+    "- Prefer fixing the SOURCE code so the EXISTING tests pass. BUT the test "
+    "is sometimes the broken artifact: when a test asserts a fabricated magic "
+    "literal the goal never specified (so no correct source could satisfy "
+    "it), or calls the source with arguments/attributes it does not accept, "
+    "rewrite THAT test instead -- assert an invariant or round-trip against "
+    "the real API rather than forcing the source to emit an impossible value. "
+    "Return the corrected test file's complete content.\n"
     "- Output the COMPLETE file content for every file you return -- no "
     "stubs, placeholders, ellipsis, or unified-diff markers.\n"
     "- Only return files that appear in the provided file list, and only "
@@ -5200,7 +5625,8 @@ def generate_repair_files(
         failure_text: str,
         files: List[Dict[str, str]],
         max_files: int = 8,
-        localized_files: Optional[List[str]] = None) -> Dict[str, str]:
+        localized_files: Optional[List[str]] = None,
+        temperature: float = 0.0) -> Dict[str, str]:
     """Propose corrected file contents for a logic/assertion failure.
 
     ``files`` is a list of ``{"path", "content"}`` for the on-disk
@@ -5282,7 +5708,7 @@ def generate_repair_files(
         try:
             raw = provider.chat(
                 messages=messages,
-                temperature=0.0,
+                temperature=temperature,
                 max_tokens=budget["output_tokens"],
                 force_json=True,
                 json_schema=REPAIR_FILES_SCHEMA,

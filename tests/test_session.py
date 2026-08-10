@@ -118,6 +118,23 @@ def test_dataclass_to_dict_uses_enum_string_values():
     assert d["stale"] is False
 
 
+def test_diagnose_model_kinds_present_and_round_trip():
+    # P2.1: the reasoning rung's typed additions exist with the exact
+    # string values the pure router / store serialization depend on.
+    assert TaskKind.DIAGNOSE.value == "diagnose"
+    assert ArtifactKind.DIAGNOSIS.value == "diagnosis"
+    assert FactKind.REPAIR_LEDGER.value == "repair_ledger"
+    assert TaskKind("diagnose") is TaskKind.DIAGNOSE
+    assert ArtifactKind("diagnosis") is ArtifactKind.DIAGNOSIS
+    assert FactKind("repair_ledger") is FactKind.REPAIR_LEDGER
+
+    ledger = Fact.new("ses_x", FactKind.REPAIR_LEDGER, {"attempts": []})
+    assert ledger.to_dict()["kind"] == "repair_ledger"
+    diag = Artifact.new("ses_x", "task_x", ArtifactKind.DIAGNOSIS,
+                        {"minimal_action": "escalate"})
+    assert diag.to_dict()["kind"] == "diagnosis"
+
+
 # --------------------- store round-trips ---------------------
 
 def test_save_and_get_session_round_trip(store: SessionStore):
@@ -1259,28 +1276,46 @@ def test_router_api_check_failed_spawns_repair():
         "prior_failure_signatures"]
 
 
-def test_router_api_check_failed_skips_repair_when_flapping():
-    """API_CHECK whose signature already appears in priors -> no spawn."""
+def test_router_api_check_repeated_signature_escalates_then_stops():
+    """A repeated signature buys one escalated round, then terminates.
+
+    Terminating on the first repeat gave the loop no way out of a
+    strategy that no-opped (install_deps for a hallucinated module, in
+    session ses_fa6f72a9d3da4217). The rung is passed to REPAIR as
+    ``repair_escalation`` so it abandons that strategy.
+    """
     from cgx.session.models import SessionMode
     session = Session.new("g", mode=SessionMode.GREENFIELD)
     sig = "api_check|werkzeug.urls.url_quote"
-    api = TaskNode.new(
-        session.session_id, TaskKind.API_CHECK, "api",
-        inputs={"build_artifact_id": "art_build",
-                "mode": SessionMode.GREENFIELD.value,
-                "repair_attempt": 1,
-                "prior_failure_signatures": [sig]})
-    api.produced_artifact_id = "art_api"
-    api.outputs = {"outcome": "failed", "failed_count": 1,
-                   "checked_count": 3, "failure_signature": sig}
-    api.status = TaskNodeStatus.DONE
+
+    def _completed(priors):
+        api = TaskNode.new(
+            session.session_id, TaskKind.API_CHECK, "api",
+            inputs={"build_artifact_id": "art_build",
+                    "mode": SessionMode.GREENFIELD.value,
+                    "repair_attempt": 1,
+                    "prior_failure_signatures": list(priors)})
+        api.produced_artifact_id = "art_api"
+        api.outputs = {"outcome": "failed", "failed_count": 1,
+                       "checked_count": 3, "failure_signature": sig}
+        api.status = TaskNodeStatus.DONE
+        return api
+
+    api = _completed([sig])
     plan = Router().on_task_completed(
         session=session, completed=api, tasks=[api])
     creates = [a for a in plan.actions if isinstance(a, CreateTask)]
-    assert creates == []
+    assert len(creates) == 1
+    assert creates[0].task.kind is TaskKind.REPAIR
+    assert creates[0].task.inputs["repair_escalation"] == 1
+
+    api2 = _completed([sig, sig])
+    plan2 = Router().on_task_completed(
+        session=session, completed=api2, tasks=[api2])
+    assert [a for a in plan2.actions if isinstance(a, CreateTask)] == []
     # C: a failed gate that declines to spawn REPAIR must resolve the
     # session terminally rather than leave the drain loop idle.
-    status = [a for a in plan.actions if isinstance(a, UpdateSessionStatus)]
+    status = [a for a in plan2.actions if isinstance(a, UpdateSessionStatus)]
     assert len(status) == 1
     assert status[0].status is SessionStatus.FAILED
 
@@ -3959,6 +3994,7 @@ def test_decompose_executor_happy_path_emits_work_plan(
     result = run_decompose(
         t, ExecutorDeps(provider=_StubProvider(""), store=store))
     assert result.failure is None
+    assert result.artifact is not None
     assert result.artifact.kind is ArtifactKind.WORK_PLAN
     layers = result.artifact.content["layers"]
     # _order_manifest_layers regroups files into strict pipeline buckets
@@ -4024,6 +4060,551 @@ def test_decompose_executor_defaults_contracts_to_empty(store, monkeypatch):
     assert result.failure is None
     assert result.artifact.content["contracts"] == {}
     assert result.outputs["contract_count"] == 0
+
+
+# ------------- P1.1: deterministic scope calibration -------------
+
+def test_estimate_scope_trivial_goal_is_tight_and_minimal():
+    """A bare 'calculator' names no heavy feature -> trivial, tight ceiling."""
+    from cgx.session.scope import estimate_scope
+    profile = estimate_scope("build a small calculator")
+    assert profile.complexity == "trivial"
+    assert profile.max_files == 5
+    assert profile.requested_features == ()
+    # The injected constraint fences off the exact over-scoping we saw.
+    assert "SCOPE CEILING" in profile.constraint
+    assert "at most 5 files" in profile.constraint
+    assert "a database, ORM, or migrations" in profile.constraint
+    assert "browser/E2E tests" in profile.constraint
+
+
+def test_estimate_scope_detects_requested_features_and_climbs():
+    """Explicitly-named capabilities raise the tier and are NOT fenced off."""
+    from cgx.session.scope import estimate_scope
+    profile = estimate_scope(
+        "a FastAPI service with a Postgres database, JWT auth and a React UI")
+    assert profile.complexity == "complex"
+    assert profile.max_files == 20
+    assert set(profile.requested_features) == {
+        "api_server", "database", "auth", "frontend"}
+    # Requested categories must not appear in the "do NOT introduce" line.
+    assert "a database, ORM, or migrations" not in profile.constraint
+    assert "authentication or user accounts" not in profile.constraint
+
+
+def test_clarify_records_project_complexity_on_requirements_sheet():
+    """CLARIFY stamps the goal-level complexity tier onto the sheet."""
+    from cgx.session.tasks.clarify_requirements import run_clarify_requirements
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    t = TaskNode.new(session.session_id, TaskKind.CLARIFY_REQUIREMENTS,
+                     "c", inputs={"goal": "build a small calculator"})
+    result = run_clarify_requirements(t, ExecutorDeps())
+    assert result.failure is None
+    assert result.artifact.content["project_complexity"] == "trivial"
+    assert result.artifact.content["scope"]["max_files"] == 5
+    assert result.outputs["project_complexity"] == "trivial"
+
+
+def test_decompose_threads_scope_constraint_into_planner(store, monkeypatch):
+    """DECOMPOSE passes the minimal-stack ceiling into the manifest planner
+    and records the complexity tier on the WORK_PLAN."""
+    from cgx.session.tasks.decompose import run_decompose
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    seen = {}
+
+    def fake_manifest(composed, provider, goal=None, skills=None,
+                      scope_constraint=None, **kwargs):
+        seen["scope_constraint"] = scope_constraint
+        return {"plan_md": "p", "layers": [{"name": "core", "files": [
+            {"path": "calculator.py", "description": "core"},
+            {"path": "tests/test_calculator.py", "description": "tests"}]}]}
+
+    monkeypatch.setattr("cgx.answer.engine.plan_scaffold_manifest",
+                        fake_manifest)
+    t = TaskNode.new(session.session_id, TaskKind.DECOMPOSE, "d",
+                     inputs={"prior_goal": "build a calculator", "answers": {}})
+    result = run_decompose(
+        t, ExecutorDeps(provider=_StubProvider(""), store=store))
+    assert result.failure is None
+    assert seen["scope_constraint"] and "SCOPE CEILING" in seen["scope_constraint"]
+    assert result.artifact.content["project_complexity"] == "trivial"
+    assert result.artifact.content["scope"]["max_files"] == 5
+    assert result.outputs["project_complexity"] == "trivial"
+    assert result.outputs["scope_max_files"] == 5
+
+
+def test_scope_estimate_traced_to_agent_log_when_enabled(tmp_path):
+    """With tracing toggled on, the scope estimate lands as a trace record."""
+    from cgx.session.tasks.clarify_requirements import run_clarify_requirements
+    from cgx.session import agent_log
+    from cgx import trace as trace_mod
+
+    agent_log.reset_for_tests()
+    trace_mod.reset_for_tests()
+    if trace_mod.is_trace_enabled():  # env-pinned: nothing to assert against
+        return
+    trace_mod.set_trace_enabled(True)
+    token = trace_mod.set_trace_context(
+        session_id="ses_scope", task_id="task_scope",
+        project_root=str(tmp_path))
+    try:
+        session = Session.new("g", mode=SessionMode.GREENFIELD)
+        t = TaskNode.new(session.session_id, TaskKind.CLARIFY_REQUIREMENTS,
+                         "c", inputs={"goal": "build a small calculator"})
+        run_clarify_requirements(t, ExecutorDeps())
+    finally:
+        trace_mod.reset_trace_context(token)
+        trace_mod.reset_for_tests()
+        agent_log.reset_for_tests()
+
+    records = _read_agent_log(tmp_path)
+    scope_events = [r for r in records if r.get("event") == "scope_estimate"]
+    assert scope_events, "scope_estimate should be traced when enabled"
+    assert scope_events[0]["stage"] == "clarify"
+    assert scope_events[0]["complexity"] == "trivial"
+
+
+# ------------- P1.2: bounded plan self-critique -------------
+
+def _bloated_manifest():
+    """A calculator manifest carrying a speculative DB + auth layer."""
+    return {"plan_md": "p", "layers": [{"name": "core", "files": [
+        {"path": "calculator.py", "description": "core arithmetic"},
+        {"path": "database.py", "description": "speculative persistence"},
+        {"path": "auth.py", "description": "speculative auth"},
+        {"path": "tests/test_calculator.py", "description": "unit tests",
+         "depends_on": ["calculator.py"]}]}]}
+
+
+def test_critique_scaffold_manifest_flags_only_manifest_paths():
+    """The engine helper returns flagged paths present in the manifest and
+    drops hallucinated ones; a missing provider is a no-op."""
+    import json as _json
+    from cgx.answer.engine import critique_scaffold_manifest
+    layers = _bloated_manifest()["layers"]
+    provider = _StubProvider(_json.dumps(
+        {"remove": ["database.py", "auth.py", "ghost.py"]}))
+    flagged = critique_scaffold_manifest(
+        "build a small calculator", layers, provider,
+        scope_constraint="SCOPE CEILING")
+    assert flagged == ["database.py", "auth.py"]
+    assert critique_scaffold_manifest("g", layers, None) == []
+
+
+def test_critique_scaffold_manifest_degrades_on_bad_reply():
+    """A non-JSON / error reply yields no removals (today's behaviour)."""
+    from cgx.answer.engine import critique_scaffold_manifest
+    layers = _bloated_manifest()["layers"]
+    assert critique_scaffold_manifest(
+        "g", layers, _StubProvider("not json at all")) == []
+
+    class _Boom:
+        def chat(self, **kw):
+            raise RuntimeError("model down")
+
+    assert critique_scaffold_manifest("g", layers, _Boom()) == []
+
+
+def test_decompose_applies_plan_critique_drops_speculative_files(
+        store, monkeypatch):
+    """DECOMPOSE folds the critique's safe removals out of the WORK_PLAN."""
+    from cgx.session.tasks.decompose import run_decompose
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    monkeypatch.setattr("cgx.answer.engine.plan_scaffold_manifest",
+                        lambda *a, **kw: _bloated_manifest())
+    monkeypatch.setattr("cgx.answer.engine.critique_scaffold_manifest",
+                        lambda *a, **kw: ["database.py", "auth.py"])
+    t = TaskNode.new(session.session_id, TaskKind.DECOMPOSE, "d",
+                     inputs={"prior_goal": "build a calculator", "answers": {}})
+    result = run_decompose(
+        t, ExecutorDeps(provider=_StubProvider(""), store=store))
+    assert result.failure is None
+    paths = {f["path"] for lay in result.artifact.content["layers"]
+             for f in lay["files"]}
+    assert "database.py" not in paths and "auth.py" not in paths
+    assert "calculator.py" in paths
+    assert "tests/test_calculator.py" in paths
+    assert result.outputs["critique_removed"] == 2
+
+
+def test_decompose_critique_guardrail_protects_depends_on_and_source(
+        store, monkeypatch):
+    """A critique that would drop the core module (a depends_on target and
+    the only source file) is refused wholesale."""
+    from cgx.session.tasks.decompose import run_decompose
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    monkeypatch.setattr("cgx.answer.engine.plan_scaffold_manifest",
+                        lambda *a, **kw: _bloated_manifest())
+    # The model over-reaches and flags the core module the tests depend on.
+    monkeypatch.setattr("cgx.answer.engine.critique_scaffold_manifest",
+                        lambda *a, **kw: ["calculator.py"])
+    t = TaskNode.new(session.session_id, TaskKind.DECOMPOSE, "d",
+                     inputs={"prior_goal": "build a calculator", "answers": {}})
+    result = run_decompose(
+        t, ExecutorDeps(provider=_StubProvider(""), store=store))
+    assert result.failure is None
+    paths = {f["path"] for lay in result.artifact.content["layers"]
+             for f in lay["files"]}
+    assert "calculator.py" in paths
+    assert result.outputs["critique_removed"] == 0
+
+
+def test_plan_critique_traced_to_agent_log_when_enabled(
+        store, monkeypatch, tmp_path):
+    """With tracing on, the critique outcome lands as a trace record."""
+    from cgx.session.tasks.decompose import run_decompose
+    from cgx.session import agent_log
+    from cgx import trace as trace_mod
+
+    agent_log.reset_for_tests()
+    trace_mod.reset_for_tests()
+    if trace_mod.is_trace_enabled():  # env-pinned: nothing to assert against
+        return
+    monkeypatch.setattr("cgx.answer.engine.plan_scaffold_manifest",
+                        lambda *a, **kw: _bloated_manifest())
+    monkeypatch.setattr("cgx.answer.engine.critique_scaffold_manifest",
+                        lambda *a, **kw: ["database.py"])
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    trace_mod.set_trace_enabled(True)
+    token = trace_mod.set_trace_context(
+        session_id=session.session_id, task_id="task_dec",
+        project_root=str(tmp_path))
+    try:
+        t = TaskNode.new(session.session_id, TaskKind.DECOMPOSE, "d",
+                         inputs={"prior_goal": "build a calculator",
+                                 "answers": {}})
+        run_decompose(t, ExecutorDeps(provider=_StubProvider(""), store=store))
+    finally:
+        trace_mod.reset_trace_context(token)
+        trace_mod.set_trace_enabled(False)
+
+    records = _read_agent_log(tmp_path)
+    events = [r for r in records if r.get("event") == "plan_critique"]
+    assert events, "plan_critique should be traced when enabled"
+    assert events[0]["stage"] == "decompose"
+    assert events[0]["removed"] == ["database.py"]
+    assert events[0]["removed_count"] == 1
+
+
+# ------------- P1.3: coherence surgery as a plan-quality signal -------------
+
+def _cyclic_py_manifest():
+    """Three independent 2-cycles: the gate breaks three back-edges, so the
+    surgery score clears COHERENCE_MUTATION_THRESHOLD. Pure Python (no
+    client/server seam) so the exhausted-budget path reaches WORK_PLAN."""
+    return {"plan_md": "p", "layers": [{"name": "core", "files": [
+        {"path": "a.py", "description": "a", "depends_on": ["b.py"]},
+        {"path": "b.py", "description": "b", "depends_on": ["a.py"]},
+        {"path": "c.py", "description": "c", "depends_on": ["d.py"]},
+        {"path": "d.py", "description": "d", "depends_on": ["c.py"]},
+        {"path": "e.py", "description": "e", "depends_on": ["f.py"]},
+        {"path": "f.py", "description": "f", "depends_on": ["e.py"]}]}]}
+
+
+def test_decompose_reasks_when_coherence_surgery_is_heavy(store, monkeypatch):
+    """A manifest the gate had to rewrite heavily is re-planned once rather
+    than scaffolded, using the existing DECOMPOSE_RETRY_BUDGET path."""
+    result = _run_decompose_with_manifest(
+        store, monkeypatch, _cyclic_py_manifest())
+    assert result.artifact is None
+    assert result.retryable is True
+    assert result.failure and "heavy structural repair" in result.failure
+    assert "dependency cycle" in result.failure
+
+
+def test_decompose_proceeds_after_reask_budget_exhausted(store, monkeypatch):
+    """On the retry (budget spent) the repaired manifest ships -- P1.3 is
+    never worse than today's in-place repair."""
+    from cgx.session.tasks.decompose import run_decompose
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    monkeypatch.setattr("cgx.answer.engine.plan_scaffold_manifest",
+                        lambda *a, **kw: _cyclic_py_manifest())
+    t = TaskNode.new(session.session_id, TaskKind.DECOMPOSE, "d",
+                     inputs={"prior_goal": "g", "answers": {},
+                             "decompose_retry": 1})
+    result = run_decompose(
+        t, ExecutorDeps(provider=_StubProvider(""), store=store))
+    assert result.failure is None
+    assert result.outputs["coherence_surgery"] >= 3
+
+
+def test_decompose_light_surgery_does_not_reask(store, monkeypatch):
+    """A single routine repair stays below the threshold and ships."""
+    result = _run_decompose_with_manifest(store, monkeypatch, {
+        "plan_md": "p", "layers": [{"name": "core", "files": [
+            {"path": "a.py", "description": "a", "depends_on": ["b.py"]},
+            {"path": "b.py", "description": "b", "depends_on": ["a.py"]},
+            {"path": "c.py", "description": "c"}]}]})
+    assert result.failure is None
+    assert result.outputs["coherence_surgery"] == 1
+
+
+def test_plan_coherence_traced_to_agent_log_when_enabled(
+        store, monkeypatch, tmp_path):
+    """With tracing on, the coherence surgery tally lands as a trace record."""
+    from cgx.session.tasks.decompose import run_decompose
+    from cgx.session import agent_log
+    from cgx import trace as trace_mod
+
+    agent_log.reset_for_tests()
+    trace_mod.reset_for_tests()
+    if trace_mod.is_trace_enabled():  # env-pinned: nothing to assert against
+        return
+    monkeypatch.setattr("cgx.answer.engine.plan_scaffold_manifest",
+                        lambda *a, **kw: _cyclic_py_manifest())
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    trace_mod.set_trace_enabled(True)
+    token = trace_mod.set_trace_context(
+        session_id=session.session_id, task_id="task_dec",
+        project_root=str(tmp_path))
+    try:
+        t = TaskNode.new(session.session_id, TaskKind.DECOMPOSE, "d",
+                         inputs={"prior_goal": "g", "answers": {}})
+        run_decompose(t, ExecutorDeps(provider=_StubProvider(""), store=store))
+    finally:
+        trace_mod.reset_trace_context(token)
+        trace_mod.set_trace_enabled(False)
+
+    records = _read_agent_log(tmp_path)
+    events = [r for r in records if r.get("event") == "plan_coherence"]
+    assert events, "plan_coherence should be traced when enabled"
+    assert events[0]["stage"] == "decompose"
+    assert events[0]["broken_cycles"] == 3
+    assert events[0]["surgery_score"] >= 3
+
+
+# ------------- P1.4: dependency/test de-scoping -------------
+
+def test_unrunnable_descope_needles_gated_on_request():
+    """Browser/E2E needles fire only when the goal did NOT request E2E."""
+    from cgx.session.scope import unrunnable_descope_needles
+    needles = unrunnable_descope_needles(())
+    assert "selenium" in needles and "e2e" in needles
+    # An explicit request suppresses the de-scope entirely.
+    assert unrunnable_descope_needles(("browser_e2e",)) == ()
+
+
+def test_remove_from_requirements_symmetric_and_idempotent(tmp_path):
+    """remove_from_requirements drops matched lines, keeps the rest, and is
+    a no-op on a second run (the symmetric counterpart to update)."""
+    from cgx.codegen.env_manager import remove_from_requirements
+    req = tmp_path / "requirements.txt"
+    req.write_text("flask==2.1\n# a comment\nselenium>=4.0\nrequests\n",
+                   encoding="utf-8")
+    removed = remove_from_requirements(str(tmp_path), ["Selenium"])
+    assert removed == ["selenium"]
+    text = req.read_text(encoding="utf-8")
+    assert "selenium" not in text.lower()
+    assert "flask==2.1" in text and "requests" in text
+    assert "# a comment" in text
+    # Already absent -> no-op (idempotent).
+    assert remove_from_requirements(str(tmp_path), ["selenium"]) == []
+
+
+def _e2e_manifest():
+    """A calculator manifest carrying an unrequested selenium E2E suite
+    alongside a real unit test, so the de-scope has a test to keep."""
+    return {"plan_md": "p", "layers": [{"name": "core", "files": [
+        {"path": "calculator.py", "description": "core arithmetic"},
+        {"path": "tests/test_calculator.py", "description": "unit tests",
+         "depends_on": ["calculator.py"]},
+        {"path": "tests/test_e2e.py",
+         "description": "selenium browser end-to-end flow",
+         "depends_on": ["calculator.py"]}]}]}
+
+
+def test_decompose_descopes_unrequested_e2e_files(store, monkeypatch):
+    """A goal that never asked for E2E has its selenium suite de-scoped
+    before scaffolding; the unit test and source survive."""
+    result = _run_decompose_with_manifest(store, monkeypatch, _e2e_manifest())
+    assert result.failure is None
+    paths = {f["path"] for lay in result.artifact.content["layers"]
+             for f in lay["files"]}
+    assert "tests/test_e2e.py" not in paths
+    assert "calculator.py" in paths
+    assert "tests/test_calculator.py" in paths
+    assert result.outputs["descoped_files"] == 1
+
+
+def test_decompose_keeps_explicitly_requested_e2e(store, monkeypatch):
+    """When the goal spells out Selenium E2E, the suite is kept (honoured)."""
+    from cgx.session.tasks.decompose import run_decompose
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    monkeypatch.setattr("cgx.answer.engine.plan_scaffold_manifest",
+                        lambda *a, **kw: _e2e_manifest())
+    t = TaskNode.new(session.session_id, TaskKind.DECOMPOSE, "d",
+                     inputs={"prior_goal":
+                             "a calculator with selenium e2e tests",
+                             "answers": {}})
+    result = run_decompose(
+        t, ExecutorDeps(provider=_StubProvider(""), store=store))
+    assert result.failure is None
+    paths = {f["path"] for lay in result.artifact.content["layers"]
+             for f in lay["files"]}
+    assert "tests/test_e2e.py" in paths
+    assert result.outputs["descoped_files"] == 0
+
+
+def test_decompose_warns_when_a_requested_feature_has_no_files(
+        store, monkeypatch, caplog):
+    """A goal asking for React whose plan is Python-only is reported.
+
+    The critique dropped package.json in ses_fa6f72a9d3da4217 and no JS
+    file survived, so the stated objective was unreachable from the plan
+    onwards with nothing said about it.
+    """
+    import logging
+    from cgx.session.tasks.decompose import run_decompose
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    monkeypatch.setattr(
+        "cgx.answer.engine.plan_scaffold_manifest",
+        lambda *a, **kw: {"plan_md": "p", "layers": [{"name": "api", "files": [
+            {"path": "app/main.py", "description": "FastAPI app"},
+            {"path": "tests/test_main.py", "description": "unit tests",
+             "depends_on": ["app/main.py"]}]}]})
+    t = TaskNode.new(
+        session.session_id, TaskKind.DECOMPOSE, "d",
+        inputs={"prior_goal":
+                "create a calculator app using fast-api and react frontend",
+                "answers": {}})
+    with caplog.at_level(logging.WARNING):
+        result = run_decompose(
+            t, ExecutorDeps(provider=_StubProvider(""), store=store))
+    assert result.failure is None
+    assert result.outputs["unmet_features"] == ["frontend"]
+    assert result.artifact.content["unmet_features"] == ["frontend"]
+    assert "frontend framework" in caplog.text
+    # Advisory only: the plan still ships.
+    assert result.artifact.content["layers"]
+
+
+def test_decompose_reports_no_gap_when_the_frontend_survives(
+        store, monkeypatch):
+    """A surviving JSX file counts as coverage -- no false positive."""
+    from cgx.session.tasks.decompose import run_decompose
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    monkeypatch.setattr(
+        "cgx.answer.engine.plan_scaffold_manifest",
+        lambda *a, **kw: {
+            "plan_md": "p",
+            "layers": [{"name": "app", "files": [
+                {"path": "app/main.py", "description": "FastAPI app"},
+                {"path": "web/src/App.jsx", "description": "calculator UI"}]}],
+            # The cross-seam gate is a separate concern; satisfy it so the
+            # coverage assertion is what this case exercises.
+            "contracts": {"endpoints": [
+                {"method": "POST", "path": "/calc",
+                 "request": {"expression": "str"},
+                 "response": {"result": "float"}}]}})
+    t = TaskNode.new(
+        session.session_id, TaskKind.DECOMPOSE, "d",
+        inputs={"prior_goal":
+                "create a calculator app using fast-api and react frontend",
+                "answers": {}})
+    result = run_decompose(
+        t, ExecutorDeps(provider=_StubProvider(""), store=store))
+    assert result.failure is None
+    assert result.outputs["unmet_features"] == []
+
+
+def test_plan_descope_traced_to_agent_log_when_enabled(
+        store, monkeypatch, tmp_path):
+    """With tracing on, the de-scope outcome lands as a trace record."""
+    from cgx.session.tasks.decompose import run_decompose
+    from cgx.session import agent_log
+    from cgx import trace as trace_mod
+
+    agent_log.reset_for_tests()
+    trace_mod.reset_for_tests()
+    if trace_mod.is_trace_enabled():  # env-pinned: nothing to assert against
+        return
+    monkeypatch.setattr("cgx.answer.engine.plan_scaffold_manifest",
+                        lambda *a, **kw: _e2e_manifest())
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    trace_mod.set_trace_enabled(True)
+    token = trace_mod.set_trace_context(
+        session_id=session.session_id, task_id="task_dec",
+        project_root=str(tmp_path))
+    try:
+        t = TaskNode.new(session.session_id, TaskKind.DECOMPOSE, "d",
+                         inputs={"prior_goal": "g", "answers": {}})
+        run_decompose(t, ExecutorDeps(provider=_StubProvider(""), store=store))
+    finally:
+        trace_mod.reset_trace_context(token)
+        trace_mod.set_trace_enabled(False)
+
+    records = _read_agent_log(tmp_path)
+    events = [r for r in records if r.get("event") == "plan_descope"]
+    assert events, "plan_descope should be traced when enabled"
+    assert events[0]["stage"] == "decompose"
+    assert events[0]["removed"] == ["tests/test_e2e.py"]
+    assert events[0]["removed_count"] == 1
+
+
+def test_bootstrap_descopes_dead_e2e_dependency(tmp_path):
+    """A declared selenium that no applied file imports is scrubbed from
+    requirements.txt; a package the code uses is left in place."""
+    from cgx.session.tasks.bootstrap_env import _descope_dead_e2e_requirements
+    (tmp_path / "requirements.txt").write_text(
+        "flask==2.1\nselenium>=4.0\n", encoding="utf-8")
+    (tmp_path / "app.py").write_text("import flask\n", encoding="utf-8")
+    removed = _descope_dead_e2e_requirements(tmp_path, ["app.py"])
+    assert removed == ["selenium"]
+    text = (tmp_path / "requirements.txt").read_text(encoding="utf-8")
+    assert "selenium" not in text.lower() and "flask" in text
+
+
+def test_bootstrap_keeps_imported_e2e_dependency(tmp_path):
+    """selenium stays when an applied file actually imports it."""
+    from cgx.session.tasks.bootstrap_env import _descope_dead_e2e_requirements
+    (tmp_path / "requirements.txt").write_text(
+        "selenium>=4.0\n", encoding="utf-8")
+    (tmp_path / "test_e2e.py").write_text(
+        "from selenium import webdriver\n", encoding="utf-8")
+    assert _descope_dead_e2e_requirements(tmp_path, ["test_e2e.py"]) == []
+    assert "selenium" in (tmp_path / "requirements.txt").read_text(
+        encoding="utf-8").lower()
+
+
+def test_dependency_descope_traced_to_agent_log_when_enabled(tmp_path):
+    """With tracing on, the dead-dependency scrub lands as a trace record."""
+    from cgx.session.tasks.bootstrap_env import _descope_dead_e2e_requirements
+    from cgx.session import agent_log
+    from cgx import trace as trace_mod
+
+    agent_log.reset_for_tests()
+    trace_mod.reset_for_tests()
+    if trace_mod.is_trace_enabled():  # env-pinned: nothing to assert against
+        return
+    (tmp_path / "requirements.txt").write_text(
+        "flask==2.1\nselenium>=4.0\n", encoding="utf-8")
+    (tmp_path / "app.py").write_text("import flask\n", encoding="utf-8")
+    trace_mod.set_trace_enabled(True)
+    token = trace_mod.set_trace_context(
+        session_id="s", task_id="task_boot", project_root=str(tmp_path))
+    try:
+        removed = _descope_dead_e2e_requirements(tmp_path, ["app.py"])
+    finally:
+        trace_mod.reset_trace_context(token)
+        trace_mod.set_trace_enabled(False)
+
+    assert removed == ["selenium"]
+    records = _read_agent_log(tmp_path)
+    events = [r for r in records if r.get("event") == "dependency_descope"]
+    assert events, "dependency_descope should be traced when enabled"
+    assert events[0]["stage"] == "bootstrap_env"
+    assert events[0]["removed"] == ["selenium"]
+    assert events[0]["removed_count"] == 1
 
 
 # ------------- P0a: mandatory cross-seam endpoint contracts -------------
@@ -4093,6 +4674,49 @@ def test_render_contracts_declares_success_status_and_message():
     no_status = _render_contracts_for_prompt({"endpoints": [{
         "method": "GET", "path": "/health", "status": True}]})
     assert "success_status" not in no_status
+
+
+def test_format_function_contract_prefers_and_synthesises_signature():
+    """A signature is used verbatim; else one is built from name/params/return."""
+    from cgx.answer.engine import _format_function_contract
+    assert _format_function_contract(
+        {"signature": "foo(a: int) -> int"}) == "foo(a: int) -> int"
+    synth = _format_function_contract({
+        "name": "total_area",
+        "parameters": [{"name": "circles", "type": "list"}],
+        "return_type": "float"})
+    assert synth == "total_area(circles: list) -> float"
+    # A bare string parameter and a missing type still render.
+    assert _format_function_contract({
+        "name": "g", "parameters": ["x"]}) == "g(x)"
+    # Nothing usable -> empty string.
+    assert _format_function_contract({}) == ""
+
+
+def test_render_required_symbols_scopes_contract_to_file():
+    """The per-file directive lists only symbols bound to that path."""
+    from cgx.answer.engine import _render_required_symbols_for_file
+    contracts = {
+        "functions": [
+            {"name": "total_area", "module": "src/geo.py",
+             "parameters": [{"name": "circles", "type": "list"}],
+             "return_type": "float"},
+            {"name": "Circle.area", "module": "src/geo.py",
+             "parameters": [], "return_type": "float"},
+            {"name": "other", "module": "src/elsewhere.py"},
+        ],
+        "schemas": [{"name": "Circle", "module": "src/geo.py",
+                     "fields": {"radius": "float"}}],
+    }
+    block = _render_required_symbols_for_file("src/geo.py", contracts)
+    assert "class Circle with method(s) area" in block
+    assert "def total_area(circles: list) -> float" in block
+    # A symbol bound to another module is not leaked into this file.
+    assert "other" not in block
+    # A file the contract binds nothing to gets no directive.
+    assert _render_required_symbols_for_file("src/empty.py", contracts) == ""
+    # Non-Python paths never receive the directive.
+    assert _render_required_symbols_for_file("README.md", contracts) == ""
 
 
 def _cross_seam_manifest():
@@ -4558,6 +5182,7 @@ def test_scaffold_executor_happy_path_accumulates_context(
     result = run_scaffold(
         t, ExecutorDeps(provider=_StubProvider(""), store=store))
     assert result.failure is None
+    assert result.artifact is not None
     assert result.artifact.kind is ArtifactKind.SCAFFOLD_PATCHES
     diffs = result.artifact.content["diffs"]
     assert [d["file"] for d in diffs] == ["app.py", "README.md"]
@@ -4868,6 +5493,53 @@ def test_reconcile_js_dependencies_noop_without_package_json():
                  "content": "import axios from 'axios';\n"}]
     assert _reconcile_js_dependencies(
         diffs=diffs, existing_with_content=existing) == []
+
+
+def test_reconcile_js_dep_placeholders_relaxes_unsubstituted_versions():
+    """``"{version}"`` in every section is rewritten to the ``*`` range.
+
+    npm parses each value as a range and aborts the whole install on the
+    first it cannot read, so one placeholder leaves the tree with no
+    node_modules at all (live: Calculator5).
+    """
+    import json
+    from cgx.answer.engine import _content_to_new_file_patch
+    from cgx.session.tasks.scaffold import (
+        _content_from_new_file_patch,
+        _reconcile_js_dep_placeholders,
+    )
+
+    pkg = json.dumps({
+        "dependencies": {"react": "{version}", "axios": "^1.7.2"},
+        "devDependencies": {"vite": "<version>"},
+    })
+    diffs = [{"file": "package.json",
+              "patch": _content_to_new_file_patch("package.json", pkg)}]
+    existing = [{"path": "package.json", "content": pkg}]
+    relaxed = _reconcile_js_dep_placeholders(
+        diffs=diffs, existing_with_content=existing)
+    assert sorted(relaxed) == ["react", "vite"]
+    rewritten = json.loads(_content_from_new_file_patch(diffs[0]["patch"]))
+    assert rewritten["dependencies"]["react"] == "*"
+    assert rewritten["devDependencies"]["vite"] == "*"
+    # A real specifier is left exactly as authored.
+    assert rewritten["dependencies"]["axios"] == "^1.7.2"
+    # The context copy is updated in place so later gates see the repair.
+    assert json.loads(existing[0]["content"])["dependencies"]["react"] == "*"
+
+
+def test_reconcile_js_dep_placeholders_noop_on_real_specifiers():
+    """A manifest with only resolvable ranges is left untouched."""
+    import json
+    from cgx.answer.engine import _content_to_new_file_patch
+    from cgx.session.tasks.scaffold import _reconcile_js_dep_placeholders
+    pkg = json.dumps({"dependencies": {"react": ">=18.0.0"}})
+    diffs = [{"file": "package.json",
+              "patch": _content_to_new_file_patch("package.json", pkg)}]
+    existing = [{"path": "package.json", "content": pkg}]
+    assert _reconcile_js_dep_placeholders(
+        diffs=diffs, existing_with_content=existing) == []
+    assert existing[0]["content"] == pkg
 
 
 def test_synthesize_missing_frontend_stylesheet_stub():
@@ -5948,6 +6620,7 @@ def test_bootstrap_env_skips_non_python_project(tmp_path, store):
     assert result.failure is None
     assert result.outputs["outcome"] == "skipped"
     assert result.outputs["project_type"] == "unknown"
+    assert result.artifact is not None
     assert result.artifact.kind is ArtifactKind.BUILD_REPORT
     assert result.artifact.content["venv_path"] is None
     assert result.artifact.content["resolved_packages"] == []
@@ -5962,6 +6635,61 @@ def test_bootstrap_env_python_takes_priority_over_package_json(tmp_path):
     assert _detect_project_type(tmp_path) == "node"
     (tmp_path / "requirements.txt").write_text("flask\n", encoding="utf-8")
     assert _detect_project_type(tmp_path) == "python"
+
+
+def test_bootstrap_env_python_sources_without_manifest_are_python(tmp_path):
+    """A .py source beside package.json still provisions a venv.
+
+    Live (Calculator5): the scaffold emitted a FastAPI backend and a
+    package.json but no requirements.txt, so the node-only path ran,
+    ``venv_path`` stayed None and VERIFY collected the generated tests
+    under the ambient interpreter instead of an isolated project venv.
+    """
+    from cgx.session.tasks.bootstrap_env import _detect_project_type
+    (tmp_path / "package.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "node_modules" / "pkg").mkdir(parents=True)
+    (tmp_path / "node_modules" / "pkg" / "setup.py").write_text(
+        "", encoding="utf-8")
+    assert _detect_project_type(tmp_path) == "node"
+    (tmp_path / "backend").mkdir()
+    (tmp_path / "backend" / "main.py").write_text(
+        "from fastapi import FastAPI\n", encoding="utf-8")
+    assert _detect_project_type(tmp_path) == "python"
+
+
+def test_provision_node_modules_failed_on_rejected_manifest(
+        tmp_path, monkeypatch):
+    """npm rejecting package.json -> ``failed`` (repairable), not ``skipped``.
+
+    Live (Calculator5): every version in the generated package.json was
+    the literal ``"{version}"`` and npm aborted with ``EINVALIDTAGNAME``.
+    Reporting that as ``skipped`` hid the only actionable error in the run.
+    """
+    from cgx.session.tasks import bootstrap_env as be
+    (tmp_path / "package.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(be.shutil, "which", lambda name: "/usr/bin/npm")
+    monkeypatch.setattr(
+        be, "_run_npm_install",
+        lambda root, timeout: (
+            1, 'npm error code EINVALIDTAGNAME\n'
+               'npm error Invalid tag name "{version}"'))
+    report = be._provision_node_modules(tmp_path, 60.0)
+    assert report["outcome"] == "failed"
+    assert report["error_code"] == "EINVALIDTAGNAME"
+
+
+def test_provision_node_modules_skipped_on_environmental_failure(
+        tmp_path, monkeypatch):
+    """An unreachable registry (no manifest code) stays non-fatal ``skipped``."""
+    from cgx.session.tasks import bootstrap_env as be
+    (tmp_path / "package.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(be.shutil, "which", lambda name: "/usr/bin/npm")
+    monkeypatch.setattr(
+        be, "_run_npm_install",
+        lambda root, timeout: (1, "npm error network ETIMEDOUT"))
+    report = be._provision_node_modules(tmp_path, 60.0)
+    assert report["outcome"] == "skipped"
+    assert report["error_code"] is None
 
 
 def test_pin_transitive_caps_werkzeug_for_flask_22(tmp_path):
@@ -6840,6 +7568,7 @@ def test_smoke_skipped_when_no_python_exe(tmp_path, store):
         t, ExecutorDeps(project_root=str(tmp_path), store=store))
     assert result.failure is None
     assert result.outputs["outcome"] == "skipped"
+    assert result.artifact is not None
     assert result.artifact.kind is ArtifactKind.SMOKE_REPORT
     assert result.artifact.content["modules"] == []
 
@@ -6966,6 +7695,63 @@ def test_smoke_node_build_failure_is_failed(tmp_path, store, monkeypatch):
     assert "npm run build" in result.outputs["failure_signature"]
 
 
+def _node_smoke_signature(store, tmp_path, monkeypatch, task,
+                          stderr: str) -> str:
+    """Run the SMOKE build-smoke against ``stderr`` and return its signature."""
+    from cgx.session.tasks import smoke as smoke_mod
+
+    class _P:
+        returncode = 1
+        stdout = ""
+
+    _P.stderr = stderr
+    monkeypatch.setattr(smoke_mod.shutil, "which", lambda name: "/usr/bin/npm")
+    monkeypatch.setattr(smoke_mod.subprocess, "run", lambda *a, **k: _P())
+    result = smoke_mod.run_smoke(
+        task, ExecutorDeps(project_root=str(tmp_path), store=store))
+    return result.outputs["failure_signature"]
+
+
+def test_smoke_build_signature_distinguishes_distinct_build_errors(
+        tmp_path, store, monkeypatch):
+    """Two different build errors must not collapse to one signature.
+
+    The label is identical for every frontend build failure, so keying the
+    signature on it alone made the router's flap guard kill a loop that was
+    progressing: ses_877e1b15a9b34994 fixed the unresolved entry module and
+    was terminated on the *next*, different error.
+    """
+    t = _node_smoke_task(store, tmp_path)
+    first = _node_smoke_signature(
+        store, tmp_path, monkeypatch, t,
+        "error during build:\n"
+        "[UNRESOLVED_ENTRY] Cannot resolve entry module index.html.\n")
+    second = _node_smoke_signature(
+        store, tmp_path, monkeypatch, t,
+        "error during build:\n"
+        "[plugin vite:build-html] /p/index.html\n"
+        "Error: Failed to resolve /src/main.jsx from /p/index.html\n")
+    assert first.startswith("smoke_import|npm run build --silent#")
+    assert first != second
+
+
+def test_smoke_build_signature_stable_across_timings_and_frames(
+        tmp_path, store, monkeypatch):
+    """The same build error hashes the same despite run-to-run noise."""
+    head = ("\u2717 Build failed in 46ms\nerror during build:\n"
+            "\x1b[31m[UNRESOLVED_ENTRY] \x1b[0mCannot resolve entry "
+            "module index.html.\n")
+    t = _node_smoke_task(store, tmp_path)
+    first = _node_smoke_signature(
+        store, tmp_path, monkeypatch, t,
+        head + "    at buildEnvironment (vite/dist/node/chunks/node.js:1:1)\n")
+    second = _node_smoke_signature(
+        store, tmp_path, monkeypatch, t,
+        head.replace("46ms", "1.2s")
+        + "    at Object.build (vite/dist/node/chunks/node.js:9:9)\n")
+    assert first == second
+
+
 def test_smoke_node_build_error_head_survives_truncation(
         tmp_path, store, monkeypatch):
     """Vite/rolldown print the cause at the HEAD then a long generic stack.
@@ -7032,6 +7818,66 @@ def test_smoke_node_skips_without_node_modules(tmp_path, store, monkeypatch):
     assert result.artifact.content["build_smoke"] is None
 
 
+def _node_build_report(store, session_id, *, node_outcome, log_tail=""):
+    """Persist a BUILD_REPORT carrying a node provisioning sub-report."""
+    art = Artifact.new(
+        session_id=session_id, produced_by_task_id="t_boot",
+        kind=ArtifactKind.BUILD_REPORT,
+        content={"project_type": "node",
+                 "node": {"outcome": node_outcome, "note": "n",
+                          "log_tail": log_tail, "error_code": None}})
+    store.save_artifact(art)
+    return art
+
+
+def test_smoke_reports_rejected_manifest_as_build_failure(
+        tmp_path, store, monkeypatch):
+    """A node bootstrap npm rejected surfaces as a real SMOKE failure.
+
+    BOOTSTRAP_ENV ran npm and npm refused the generated package.json
+    (``EINVALIDTAGNAME`` on an unsubstituted ``"{version}"``), so there is
+    no node_modules -- but the absence is the defect, not an offline box.
+    SMOKE must fail rather than skip so the loop can repair the manifest.
+    """
+    from cgx.session.tasks import smoke as smoke_mod
+    t = _node_smoke_task(store, tmp_path, node_modules=False)
+    build = _node_build_report(
+        store, t.session_id, node_outcome="failed",
+        log_tail="npm error code EINVALIDTAGNAME\n"
+                 'npm error Invalid tag name "{version}"')
+    t.inputs["build_artifact_id"] = build.artifact_id
+
+    def _no_run(*a, **k):
+        raise AssertionError("build-smoke must not spawn npm for this path")
+
+    monkeypatch.setattr(smoke_mod.shutil, "which", lambda name: "/usr/bin/npm")
+    monkeypatch.setattr(smoke_mod.subprocess, "run", _no_run)
+
+    result = smoke_mod.run_smoke(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    assert result.outputs["outcome"] == "failed"
+    bs = result.artifact.content["build_smoke"]
+    assert bs["ok"] is False
+    assert "EINVALIDTAGNAME" in bs["stderr_tail"]
+
+
+def test_smoke_still_skips_on_environmental_node_skip(
+        tmp_path, store, monkeypatch):
+    """An environmental ``skipped`` node bootstrap keeps SMOKE skipping."""
+    from cgx.session.tasks import smoke as smoke_mod
+    t = _node_smoke_task(store, tmp_path, node_modules=False)
+    build = _node_build_report(store, t.session_id, node_outcome="skipped")
+    t.inputs["build_artifact_id"] = build.artifact_id
+    monkeypatch.setattr(smoke_mod.shutil, "which", lambda name: "/usr/bin/npm")
+    monkeypatch.setattr(smoke_mod.subprocess, "run",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("must not run")))
+    result = smoke_mod.run_smoke(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    assert result.outputs["outcome"] == "skipped"
+    assert result.artifact.content["build_smoke"] is None
+
+
 def test_smoke_resolves_applied_files_from_apply_artifact(tmp_path, store):
     """When applied_files is not in inputs, fall back to the apply artifact."""
     from cgx.session.tasks.smoke import _resolve_applied_files
@@ -7073,6 +7919,7 @@ def test_api_check_skipped_when_no_python_exe(tmp_path, store):
         t, ExecutorDeps(project_root=str(tmp_path), store=store))
     assert result.failure is None
     assert result.outputs["outcome"] == "skipped"
+    assert result.artifact is not None
     assert result.artifact.kind is ArtifactKind.API_CHECK_REPORT
 
 
@@ -7552,6 +8399,47 @@ def test_repair_api_check_missing_dependency_installs(tmp_path, store):
     assert plan.content["missing_modules"] == ["flask", "flask_cors"]
     assert "flask" in plan.content["rationale"]
     assert plan.content["diffs"] == []
+
+
+def test_repair_api_check_escalated_missing_dependency_regenerates(
+        tmp_path, store):
+    """A second round on the same signature stops asking for the install.
+
+    ``app`` is not on PyPI, so install_deps was a no-op and the identical
+    signature came straight back. On the escalated rung REPAIR rewrites
+    the code that imports it instead.
+    """
+    from cgx.session.tasks.repair import run_repair
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    report = Artifact.new(
+        session_id=session.session_id, produced_by_task_id="t_api",
+        kind=ArtifactKind.API_CHECK_REPORT,
+        content={
+            "outcome": "failed",
+            "failed_references": [
+                {"module": "app", "name": "create_app",
+                 "error": "ModuleNotFoundError: No module named 'app'"},
+            ],
+            "missing_modules": ["app"],
+            "hallucinated_references": [],
+            "failure_signature": "api_check|app.create_app",
+        })
+    store.save_artifact(report)
+    t = TaskNode.new(
+        session.session_id, TaskKind.REPAIR, "repair",
+        inputs={"api_check_artifact_id": report.artifact_id,
+                "repair_attempt": 2,
+                "repair_escalation": 1,
+                "mode": SessionMode.GREENFIELD.value})
+    result = run_repair(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    assert result.failure is None
+    assert result.outputs["strategy"] == "regenerate"
+    assert result.outputs["classification"] == "api_check_failure"
+    rationale = result.artifact.content["rationale"]
+    assert "already attempted" in rationale
+    assert "app" in rationale
 
 
 def test_repair_api_check_dependency_conflict_resolves(tmp_path, store):
@@ -8152,6 +9040,538 @@ def test_traceback_source_files_empty_without_frames():
         {"stdout": "E   assert 1 == 3", "stderr": ""}) == ()
 
 
+# --------------------- FailureContext normalization (D1) -------------------
+
+def test_failure_context_verify_normalizes_and_reuses_signature():
+    """A VERIFY_REPORT folds into a FailureContext, reusing its cached
+    ``failure_signature`` and localizing the traceback files."""
+    from cgx.session.repair.context import FailureContext
+    content = {
+        "outcome": "assertions_failed",
+        "returncode": 1,
+        "stdout": (
+            "tests/test_util.py:5: in test_scale\n"
+            "    assert scale(2) == 4\n"
+            "src/util.py:3: in scale\n"
+            "    return x * 3\n"
+            "E   AssertionError: assert 6 == 4\n"
+        ),
+        "stderr": "",
+        "failure_signature": "cached-verify-sig",
+    }
+    fc = FailureContext.from_report(
+        "verify", content, goal="a calculator",
+        manifest_files=["src/util.py"], installed_packages=["pytest"])
+    assert fc.gate == "verify"
+    assert fc.classification == "assertion_drift"
+    # The precomputed signature is trusted, not recomputed.
+    assert fc.failure_signature == "cached-verify-sig"
+    assert "AssertionError" in fc.failure_text
+    assert fc.traceback_files == ("tests/test_util.py", "src/util.py")
+    assert fc.installed_packages == ("pytest",)
+    assert fc.manifest_files == ("src/util.py",)
+    assert fc.goal == "a calculator"
+
+
+def test_failure_context_computes_signature_when_absent():
+    """No cached signature -> FailureContext recomputes it via classify."""
+    from cgx.session.repair.classify import failure_signature
+    from cgx.session.repair.context import FailureContext
+    content = {"outcome": "assertions_failed", "returncode": 1,
+               "stdout": "E   AssertionError: 1 == 2"}
+    fc = FailureContext.from_report("verify", content)
+    assert fc.failure_signature == failure_signature(content)
+
+
+def test_failure_context_runtime_uses_runtime_text_and_frames():
+    """A RUNTIME_REPORT folds its failing probe stderr tails into one blob
+    and localizes the boot file from the captured traceback frame."""
+    from cgx.session.repair.classify import classify_runtime_report
+    from cgx.session.repair.context import FailureContext
+    content = {
+        "outcome": "failed",
+        "probes": [
+            {"file": "backend/app.py", "kind": "import_error", "ok": False,
+             "stderr_tail": (
+                 "Traceback (most recent call last):\n"
+                 '  File "backend/app.py", line 10, in <module>\n'
+                 "    db.init_app(app)\n"
+                 "NameError: name 'db' is not defined")},
+            {"file": "backend/ok.py", "kind": "import", "ok": True,
+             "stderr_tail": ""},
+        ],
+        "failed_entries": ["backend/app.py"],
+        "failure_signature": "runtime_boot|backend/app.py",
+    }
+    fc = FailureContext.from_report("runtime", content)
+    assert fc.gate == "runtime"
+    assert fc.classification == classify_runtime_report(content)
+    assert "NameError: name 'db' is not defined" in fc.failure_text
+    assert "backend/ok.py" not in fc.failure_text
+    assert fc.traceback_files == ("backend/app.py",)
+
+
+def test_failure_context_smoke_concatenates_failing_modules():
+    """SMOKE has no classifier: it maps to ``unknown`` and its blob is the
+    failing modules' stderr tails plus a failing build smoke."""
+    from cgx.session.repair.context import FailureContext
+    content = {
+        "outcome": "failed",
+        "modules": [
+            {"module": "werkzeug", "ok": False,
+             "stderr_tail": "ImportError: cannot import name 'url_quote'"},
+            {"module": "flask", "ok": True, "stderr_tail": ""},
+        ],
+        "build_smoke": {"label": "vite build", "ok": False,
+                        "stderr_tail": "[UNRESOLVED_ENTRY] index.html"},
+        "failure_signature": "smoke_import|werkzeug",
+    }
+    fc = FailureContext.from_report("smoke", content)
+    assert fc.gate == "smoke"
+    assert fc.classification == "unknown"
+    assert "url_quote" in fc.failure_text
+    assert "vite build" in fc.failure_text
+    assert "flask" not in fc.failure_text
+    assert fc.failure_signature == "smoke_import|werkzeug"
+
+
+def test_failure_context_api_check_renders_failed_references():
+    """API_CHECK folds its failed references into ``module.name: error`` lines
+    and appends any probe_error."""
+    from cgx.session.repair.context import FailureContext
+    content = {
+        "outcome": "failed",
+        "failed_references": [
+            {"module": "werkzeug.urls", "name": "url_quote",
+             "error": "ImportError: cannot import name 'url_quote'"},
+        ],
+        "probe_error": "probe crashed: exit 1",
+        "failure_signature": "api_check|werkzeug.urls.url_quote",
+    }
+    fc = FailureContext.from_report("api_check", content)
+    assert fc.gate == "api_check"
+    assert fc.classification == "unknown"
+    assert "werkzeug.urls.url_quote: ImportError" in fc.failure_text
+    assert "probe crashed: exit 1" in fc.failure_text
+
+
+def test_failure_context_explicit_classification_overrides_gate_default():
+    """A caller-supplied classification wins over the derived token."""
+    from cgx.session.repair.context import FailureContext
+    fc = FailureContext.from_report(
+        "smoke", {"outcome": "failed", "modules": []},
+        classification="smoke_import_failure")
+    assert fc.classification == "smoke_import_failure"
+
+
+def test_failure_context_truncates_failure_text():
+    """A pathological multi-thousand-line dump is bounded for small models."""
+    from cgx.session.repair.context import FAILURE_TEXT_LIMIT, FailureContext
+    huge = "E   AssertionError: boom\n" + ("x" * (FAILURE_TEXT_LIMIT * 2))
+    fc = FailureContext.from_report(
+        "verify", {"outcome": "assertions_failed", "stdout": huge})
+    assert len(fc.failure_text) == FAILURE_TEXT_LIMIT
+
+
+def test_failure_context_to_dict_is_json_friendly():
+    """``to_dict`` renders the tuple fields as lists for tracing/persistence."""
+    from cgx.session.repair.context import FailureContext
+    fc = FailureContext.from_report(
+        "verify", {"outcome": "assertions_failed", "stdout": "E   assert 0"},
+        manifest_files=["a.py"], installed_packages=["pytest"])
+    d = fc.to_dict()
+    assert isinstance(d["traceback_files"], list)
+    assert d["manifest_files"] == ["a.py"]
+    assert d["installed_packages"] == ["pytest"]
+    assert d["gate"] == "verify"
+
+
+# --------------------- RepairLedger working memory (P2.4) -------------------
+
+def test_repair_ledger_round_trips_content_and_normalizes_targets():
+    """``from_content``/``to_content`` survive a store round trip; targets
+    are de-duped and sorted so attempt identity is order-insensitive."""
+    from cgx.session.repair.ledger import RepairLedger
+    led = RepairLedger().append(
+        "regenerate_files", ["b.py", "a.py", "a.py"], "sig1",
+        rationale="try regen")
+    content = led.to_content()
+    assert content["attempts"][0]["targets"] == ["a.py", "b.py"]
+    assert content["attempts"][0]["outcome"] == "pending"
+    # Re-hydrating an equivalent (differently-ordered) targets list yields the
+    # same normalized attempt.
+    rebuilt = RepairLedger.from_content(
+        {"attempts": [{"action": "regenerate_files",
+                       "targets": ["b.py", "a.py"], "outcome": "pending",
+                       "signature": "sig1"}]})
+    assert rebuilt.attempts[0].targets == ("a.py", "b.py")
+
+
+def test_repair_ledger_finalize_pending_resolves_by_signature():
+    """The trailing pending attempt becomes ``still_failing`` when the live
+    signature is unchanged, ``changed`` when it moved."""
+    from cgx.session.repair.ledger import RepairLedger
+    led = RepairLedger().append("add_dependency", ["flask"], "sigA")
+    same = led.finalize_pending("sigA")
+    assert same.attempts[-1].outcome == "still_failing"
+    moved = led.finalize_pending("sigB")
+    assert moved.attempts[-1].outcome == "changed"
+    # A ledger with no pending tail is returned untouched.
+    assert same.finalize_pending("sigZ") is same
+
+
+def test_repair_ledger_has_attempted_only_blocks_dead_ends():
+    """Only an identical ``(action, targets)`` with a ``still_failing``
+    outcome blocks a re-proposal; pending / changed do not."""
+    from cgx.session.repair.ledger import RepairLedger
+    led = RepairLedger.from_content({"attempts": [
+        {"action": "add_dependency", "targets": ["flask"],
+         "outcome": "still_failing", "signature": "s"},
+        {"action": "patch_files", "targets": ["a.py"],
+         "outcome": "changed", "signature": "s"},
+        {"action": "regenerate_files", "targets": ["b.py"],
+         "outcome": "pending", "signature": "s"},
+    ]})
+    assert led.has_attempted("add_dependency", ["flask"]) is True
+    # order-insensitive + a non-dead-end outcome does not block
+    assert led.has_attempted("patch_files", ["a.py"]) is False
+    assert led.has_attempted("regenerate_files", ["b.py"]) is False
+    # a never-tried action is free
+    assert led.has_attempted("remove_dependency", ["flask"]) is False
+
+
+def test_loop_budget_threads_repair_ledger_fact_id():
+    """The ledger id rides ``repair_chain_inputs`` and re-hydrates; a chain
+    that never opened a ledger keeps the identical wire shape as before."""
+    from cgx.session.budget import LoopBudget
+    empty = LoopBudget.from_inputs({"repair_attempt": 1})
+    assert empty.repair_ledger_fact_id is None
+    assert "repair_ledger_fact_id" not in empty.repair_chain_inputs()
+    threaded = empty.with_repair_ledger("fact_123")
+    chain = threaded.repair_chain_inputs()
+    assert chain["repair_ledger_fact_id"] == "fact_123"
+    assert LoopBudget.from_inputs(chain).repair_ledger_fact_id == "fact_123"
+
+
+# --------------------- DIAGNOSE executor (P2.3) -------------------
+
+def _runtime_boot_report(session, produced_by, tail):
+    """A failing RUNTIME_REPORT whose probe carries a boot traceback."""
+    return Artifact.new(
+        session_id=session.session_id, produced_by_task_id=produced_by,
+        kind=ArtifactKind.RUNTIME_REPORT,
+        content={"outcome": "failed",
+                 "probes": [{"file": "app.py", "kind": "import",
+                             "ok": False, "stderr_tail": tail}]})
+
+
+def _smoke_fail_report(session, produced_by):
+    """A failing SMOKE_REPORT -- classifies to the reasoning token ``unknown``."""
+    return Artifact.new(
+        session_id=session.session_id, produced_by_task_id=produced_by,
+        kind=ArtifactKind.SMOKE_REPORT,
+        content={"outcome": "failed",
+                 "modules": [{"module": "app", "ok": False,
+                              "stderr_tail": "ImportError: no module flask"}]})
+
+
+def test_diagnose_deterministic_runtime_failure_targets_traceback_file(
+        store, tmp_path: Path):
+    """runtime_failure with a localized traceback -> model-free targeted regen."""
+    from cgx.session.tasks.diagnose import run_diagnose
+    (tmp_path / "app.py").write_text("import missing\n", encoding="utf-8")
+    session = Session.new("build a flask app", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    art = _runtime_boot_report(
+        session, "t_run",
+        'Traceback (most recent call last):\n'
+        '  File "app.py", line 1, in <module>\n'
+        "ModuleNotFoundError: No module named 'missing'\n")
+    store.save_artifact(art)
+    t = TaskNode.new(session.session_id, TaskKind.DIAGNOSE, "diagnose",
+                     inputs={"runtime_artifact_id": art.artifact_id})
+    result = run_diagnose(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    assert result.failure is None
+    assert result.artifact is not None
+    assert result.artifact.kind is ArtifactKind.DIAGNOSIS
+    assert result.outputs["minimal_action"] == "regenerate_files"
+    assert result.outputs["target_files"] == ["app.py"]
+    assert result.outputs["used_model"] is False
+    assert result.artifact.content["confidence"] == 0.8
+
+
+def test_diagnose_runtime_failure_without_disk_file_falls_back(
+        store, tmp_path: Path):
+    """A traceback file absent on disk is not deterministic -> ReAct/escalate."""
+    from cgx.session.tasks.diagnose import run_diagnose
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    art = _runtime_boot_report(
+        session, "t_run",
+        'File "ghost.py", line 1, in <module>\nRuntimeError: boom\n')
+    store.save_artifact(art)
+    t = TaskNode.new(session.session_id, TaskKind.DIAGNOSE, "diagnose",
+                     inputs={"runtime_artifact_id": art.artifact_id})
+    result = run_diagnose(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    # No provider + no on-disk target -> the additive escalate fallback.
+    assert result.outputs["minimal_action"] == "escalate"
+    assert result.outputs["used_model"] is False
+
+
+def test_diagnose_react_loop_emits_model_verdict(store, tmp_path: Path):
+    """An ambiguous SMOKE failure + a provider verdict -> that minimal_action."""
+    import json
+    from cgx.session.tasks.diagnose import run_diagnose
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    art = _smoke_fail_report(session, "t_smoke")
+    store.save_artifact(art)
+    provider = _StubProvider(json.dumps({
+        "minimal_action": "add_dependency", "root_cause": "flask not installed",
+        "add_dependencies": ["flask"], "rationale": "import fails",
+        "confidence": 0.9}))
+    t = TaskNode.new(session.session_id, TaskKind.DIAGNOSE, "diagnose",
+                     inputs={"smoke_artifact_id": art.artifact_id})
+    result = run_diagnose(t, ExecutorDeps(
+        project_root=str(tmp_path), store=store, provider=provider))
+    assert result.failure is None
+    assert result.outputs["minimal_action"] == "add_dependency"
+    assert result.outputs["used_model"] is True
+    assert result.artifact.content["add_dependencies"] == ["flask"]
+    assert result.artifact.content["confidence"] == 0.9
+
+
+def test_diagnose_react_runs_tool_then_verdict(store, tmp_path: Path):
+    """The loop may call a read-only tool, fold the observation, then decide."""
+    import json
+    from cgx.session.tasks.diagnose import run_diagnose
+
+    class _ScriptedProvider:
+        def __init__(self, replies):
+            self._replies = list(replies)
+            self.calls: list = []
+
+        def chat(self, **kwargs):
+            self.calls.append(kwargs)
+            return {"content": self._replies.pop(0)}
+
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    art = _smoke_fail_report(session, "t_smoke")
+    store.save_artifact(art)
+    provider = _ScriptedProvider([
+        json.dumps({"tool": "inspect_packages"}),
+        json.dumps({"minimal_action": "escalate", "root_cause": "unclear",
+                    "rationale": "not enough signal", "confidence": 0.1}),
+    ])
+    t = TaskNode.new(session.session_id, TaskKind.DIAGNOSE, "diagnose",
+                     inputs={"smoke_artifact_id": art.artifact_id})
+    result = run_diagnose(t, ExecutorDeps(
+        project_root=str(tmp_path), store=store, provider=provider))
+    assert result.failure is None
+    assert len(provider.calls) == 2
+    assert result.outputs["minimal_action"] == "escalate"
+    assert result.outputs["used_model"] is True
+
+
+def test_diagnose_no_provider_degrades_to_escalate(store, tmp_path: Path):
+    """An ambiguous failure with no provider hands off to the regenerate path."""
+    from cgx.session.tasks.diagnose import run_diagnose
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    art = _smoke_fail_report(session, "t_smoke")
+    store.save_artifact(art)
+    t = TaskNode.new(session.session_id, TaskKind.DIAGNOSE, "diagnose",
+                     inputs={"smoke_artifact_id": art.artifact_id})
+    result = run_diagnose(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    assert result.outputs["minimal_action"] == "escalate"
+    assert result.outputs["used_model"] is False
+    assert result.artifact.content["confidence"] == 0.0
+
+
+def test_diagnose_garbled_output_degrades_to_escalate(store, tmp_path: Path):
+    """A provider that returns non-JSON prose degrades cleanly to escalate."""
+    from cgx.session.tasks.diagnose import run_diagnose
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    art = _smoke_fail_report(session, "t_smoke")
+    store.save_artifact(art)
+    t = TaskNode.new(session.session_id, TaskKind.DIAGNOSE, "diagnose",
+                     inputs={"smoke_artifact_id": art.artifact_id})
+    result = run_diagnose(t, ExecutorDeps(
+        project_root=str(tmp_path), store=store,
+        provider=_StubProvider("no json here, just prose")))
+    assert result.outputs["minimal_action"] == "escalate"
+    assert result.outputs["used_model"] is True
+
+
+def test_diagnose_missing_source_report_fails(store, tmp_path: Path):
+    """No runtime/api/smoke/verify id in inputs -> a clear hard failure."""
+    from cgx.session.tasks.diagnose import run_diagnose
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    t = TaskNode.new(session.session_id, TaskKind.DIAGNOSE, "diagnose",
+                     inputs={})
+    result = run_diagnose(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    assert result.failure
+    assert "source report" in result.failure
+
+
+def test_diagnose_wrong_artifact_kind_fails(store, tmp_path: Path):
+    """A source id pointing at the wrong artifact kind -> a hard failure."""
+    from cgx.session.tasks.diagnose import run_diagnose
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    art = Artifact.new(
+        session_id=session.session_id, produced_by_task_id="t_x",
+        kind=ArtifactKind.WORK_PLAN, content={})
+    store.save_artifact(art)
+    t = TaskNode.new(session.session_id, TaskKind.DIAGNOSE, "diagnose",
+                     inputs={"runtime_artifact_id": art.artifact_id})
+    result = run_diagnose(
+        t, ExecutorDeps(project_root=str(tmp_path), store=store))
+    assert result.failure
+    assert "missing or wrong" in result.failure
+
+
+def test_diagnose_verdict_traced_to_agent_log_when_enabled(
+        store, tmp_path: Path):
+    """With tracing on, the verdict + tool step land as agent-log records."""
+    import json
+    from cgx.session.tasks.diagnose import run_diagnose
+    from cgx import trace as trace_mod
+
+    class _ToolThenVerdict:
+        def __init__(self):
+            self._replies = [
+                json.dumps({"tool": "inspect_packages"}),
+                json.dumps({"minimal_action": "escalate",
+                            "root_cause": "unclear", "confidence": 0.0}),
+            ]
+
+        def chat(self, **kwargs):
+            return {"content": self._replies.pop(0)}
+
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    art = _smoke_fail_report(session, "t_smoke")
+    store.save_artifact(art)
+    trace_mod.set_trace_enabled(True)
+    token = trace_mod.set_trace_context(
+        session_id=session.session_id, task_id="task_diag",
+        project_root=str(tmp_path))
+    try:
+        t = TaskNode.new(session.session_id, TaskKind.DIAGNOSE, "diagnose",
+                         inputs={"smoke_artifact_id": art.artifact_id})
+        run_diagnose(t, ExecutorDeps(
+            project_root=str(tmp_path), store=store,
+            provider=_ToolThenVerdict()))
+    finally:
+        trace_mod.reset_trace_context(token)
+        trace_mod.set_trace_enabled(False)
+
+    records = _read_agent_log(tmp_path)
+    verdicts = [r for r in records if r.get("event") == "diagnose_verdict"]
+    steps = [r for r in records if r.get("event") == "diagnose_step"]
+    assert verdicts, "diagnose_verdict should be traced when enabled"
+    assert verdicts[0]["minimal_action"] == "escalate"
+    assert verdicts[0]["used_model"] is True
+    assert steps and steps[0]["tool"] == "inspect_packages"
+
+
+# --------------------- DIAGNOSE repair ledger (P2.4) -------------------
+
+def test_diagnose_emits_repair_ledger_fact_recording_the_proposal(
+        store, tmp_path: Path):
+    """Every round appends its proposed action to a REPAIR_LEDGER fact and
+    threads that fact id forward via outputs."""
+    import json
+    from cgx.session.tasks.diagnose import run_diagnose
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    art = _smoke_fail_report(session, "t_smoke")
+    store.save_artifact(art)
+    provider = _StubProvider(json.dumps({
+        "minimal_action": "add_dependency", "root_cause": "flask missing",
+        "add_dependencies": ["flask"], "rationale": "import fails",
+        "confidence": 0.9}))
+    t = TaskNode.new(session.session_id, TaskKind.DIAGNOSE, "diagnose",
+                     inputs={"smoke_artifact_id": art.artifact_id})
+    result = run_diagnose(t, ExecutorDeps(
+        project_root=str(tmp_path), store=store, provider=provider))
+    ledgers = [f for f in result.facts if f.kind is FactKind.REPAIR_LEDGER]
+    assert len(ledgers) == 1
+    attempts = ledgers[0].content["attempts"]
+    assert len(attempts) == 1
+    assert attempts[0]["action"] == "add_dependency"
+    assert attempts[0]["targets"] == ["flask"]
+    assert attempts[0]["outcome"] == "pending"
+    assert result.outputs["repair_ledger_fact_id"] == ledgers[0].fact_id
+
+
+def test_diagnose_never_repeats_a_still_failing_action(store, tmp_path: Path):
+    """A prior attempt that left the failure standing is a proven dead end:
+    re-proposing it degrades to the additive escalate hand-off."""
+    import json
+    from cgx.session.tasks.diagnose import run_diagnose
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    art = _smoke_fail_report(session, "t_smoke")
+    store.save_artifact(art)
+    prior = Fact.new(session.session_id, FactKind.REPAIR_LEDGER, {"attempts": [
+        {"action": "add_dependency", "targets": ["flask"],
+         "outcome": "still_failing", "signature": "old"}]})
+    store.add_fact(prior)
+    provider = _StubProvider(json.dumps({
+        "minimal_action": "add_dependency", "add_dependencies": ["flask"],
+        "root_cause": "flask missing", "confidence": 0.9}))
+    t = TaskNode.new(session.session_id, TaskKind.DIAGNOSE, "diagnose",
+                     inputs={"smoke_artifact_id": art.artifact_id,
+                             "repair_ledger_fact_id": prior.fact_id})
+    result = run_diagnose(t, ExecutorDeps(
+        project_root=str(tmp_path), store=store, provider=provider))
+    assert result.outputs["minimal_action"] == "escalate"
+    # the prior ledger is superseded (stale) and a fresh one threaded forward
+    assert store.load_kb(session.session_id).facts[prior.fact_id].stale is True
+    assert result.outputs["repair_ledger_fact_id"] != prior.fact_id
+
+
+def test_diagnose_finalizes_prior_pending_attempt_across_rounds(
+        store, tmp_path: Path):
+    """Round 2 resolves round 1's pending proposal: an unchanged signature
+    marks it ``still_failing`` and supersedes the old ledger fact."""
+    import json
+    from cgx.session.tasks.diagnose import run_diagnose
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    art = _smoke_fail_report(session, "t_smoke")
+    store.save_artifact(art)
+    provider = _StubProvider(json.dumps({
+        "minimal_action": "add_dependency", "add_dependencies": ["flask"],
+        "root_cause": "flask missing", "confidence": 0.9}))
+    deps = ExecutorDeps(
+        project_root=str(tmp_path), store=store, provider=provider)
+    t1 = TaskNode.new(session.session_id, TaskKind.DIAGNOSE, "diagnose",
+                      inputs={"smoke_artifact_id": art.artifact_id})
+    r1 = run_diagnose(t1, deps)
+    for f in r1.facts:
+        store.add_fact(f)
+    ledger_id = r1.outputs["repair_ledger_fact_id"]
+    # Round 2 sees the same failure signature and the threaded ledger id.
+    t2 = TaskNode.new(session.session_id, TaskKind.DIAGNOSE, "diagnose",
+                      inputs={"smoke_artifact_id": art.artifact_id,
+                              "repair_ledger_fact_id": ledger_id})
+    r2 = run_diagnose(t2, deps)
+    new_ledger = [f for f in r2.facts if f.kind is FactKind.REPAIR_LEDGER][0]
+    outcomes = [a["outcome"] for a in new_ledger.content["attempts"]]
+    assert outcomes[0] == "still_failing"
+    assert store.load_kb(session.session_id).facts[ledger_id].stale is True
+
+
 def test_locate_unittest_pytest_mix_finds_offending_class(tmp_path: Path):
     from cgx.session.repair.locate import locate_unittest_pytest_mix
     rel = "tests/test_app.py"
@@ -8730,6 +10150,7 @@ def test_repair_executor_emits_smoke_repair_plan(store, tmp_path: Path):
     from cgx.session.tasks.base import _REGISTRY
     result = _REGISTRY[TaskKind.REPAIR](repair_task, deps)
     assert result.failure is None
+    assert result.artifact is not None
     assert result.artifact.kind is ArtifactKind.REPAIR_PLAN
     assert result.outputs["classification"] == "smoke_import_failure"
     assert result.outputs["can_apply"] is False
@@ -8740,7 +10161,11 @@ def test_repair_executor_emits_smoke_repair_plan(store, tmp_path: Path):
 
 def test_repair_executor_emits_regenerate_for_build_smoke_failure(
         store, tmp_path: Path):
-    """A JS build-smoke break -> strategy=regenerate with the build error."""
+    """A JS build-smoke break -> strategy=regenerate with targeted files.
+
+    If the error names a file (e.g. TS2345 in App.jsx), it should be extracted
+    and used for a targeted AST regeneration instead of escalating.
+    """
     from cgx.session.tasks import repair as _repair_module  # noqa: F401
     session = Session.new("g", mode=SessionMode.GREENFIELD)
     store.save_session(session)
@@ -8764,6 +10189,12 @@ def test_repair_executor_emits_regenerate_for_build_smoke_failure(
         inputs={"smoke_artifact_id": smoke_artifact.artifact_id,
                 "mode": SessionMode.GREENFIELD.value,
                 "repair_attempt": 1})
+
+    # Touch the file so the target file extractor confirms it exists
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    (src_dir / "App.jsx").touch()
+
     deps = ExecutorDeps(project_root=str(tmp_path), store=store)
     from cgx.session.tasks.base import _REGISTRY
     result = _REGISTRY[TaskKind.REPAIR](repair_task, deps)
@@ -8771,6 +10202,7 @@ def test_repair_executor_emits_regenerate_for_build_smoke_failure(
     assert result.outputs["strategy"] == "regenerate"
     constraints = result.outputs["extra_constraints"]
     assert constraints["kind"] == "invalid_build_smoke"
+    assert constraints["target_files"] == ["src/App.jsx"]
     assert "TS2345" in constraints["build_error"]
     assert "build" in result.artifact.content["rationale"].lower()
 
@@ -8816,6 +10248,50 @@ def test_repair_executor_names_unresolved_entry_module_as_missing_file(
     assert constraints["missing_files"][0]["description"]
 
 
+def test_repair_executor_routes_rejected_manifest_to_package_json(
+        store, tmp_path: Path):
+    """A build-smoke break npm caused targets package.json, not source.
+
+    The install never ran (npm rejected the manifest), so the bundler
+    heuristics -- which would guess an arbitrary source file or the whole
+    tree -- must not run; the regenerate has to fix package.json itself.
+    """
+    from cgx.session.tasks import repair as _repair_module  # noqa: F401
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    smoke_task = TaskNode.new(
+        session.session_id, TaskKind.SMOKE, "smoke", inputs={})
+    smoke_artifact = Artifact.new(
+        session_id=session.session_id,
+        produced_by_task_id=smoke_task.task_id,
+        kind=ArtifactKind.SMOKE_REPORT,
+        content={"outcome": "failed",
+                 "failed_modules": [],
+                 "failure_signature": "smoke_import|npm install",
+                 "modules": [],
+                 "build_smoke": {
+                     "label": "npm install",
+                     "ok": False,
+                     "stderr_tail": (
+                         "npm error code EINVALIDTAGNAME\n"
+                         'npm error Invalid tag name "{version}"')}})
+    store.save_task(smoke_task)
+    store.save_artifact(smoke_artifact)
+    repair_task = TaskNode.new(
+        session.session_id, TaskKind.REPAIR, "repair",
+        inputs={"smoke_artifact_id": smoke_artifact.artifact_id,
+                "mode": SessionMode.GREENFIELD.value,
+                "repair_attempt": 1})
+    deps = ExecutorDeps(project_root=str(tmp_path), store=store)
+    from cgx.session.tasks.base import _REGISTRY
+    result = _REGISTRY[TaskKind.REPAIR](repair_task, deps)
+    assert result.failure is None
+    assert result.outputs["strategy"] == "regenerate"
+    constraints = result.outputs["extra_constraints"]
+    assert constraints["target_files"] == ["package.json"]
+    assert "package.json" in result.artifact.content["rationale"]
+
+
 def test_unresolved_entry_paths_parses_rollup_and_vite_wordings():
     from cgx.session.repair.classify import unresolved_entry_paths
     assert unresolved_entry_paths(
@@ -8829,6 +10305,108 @@ def test_unresolved_entry_paths_parses_rollup_and_vite_wordings():
         "Cannot resolve entry module index.html\n"
         "Cannot resolve entry module index.html\n") == ("index.html",)
     assert unresolved_entry_paths("src/App.jsx: TS2345") == ()
+
+
+def test_unresolved_html_entry_specs_parses_vite_build_html_plugin():
+    from cgx.session.repair.classify import unresolved_html_entry_specs
+    assert unresolved_html_entry_specs(
+        "[plugin vite:build-html] /p/index.html\n"
+        "Error: Failed to resolve /src/main.jsx from /p/index.html\n") == (
+            "src/main.jsx",)
+    # Deduplicated, and the quoted relative-import shape stays out of it.
+    assert unresolved_html_entry_specs(
+        "Failed to resolve /src/main.jsx from /p/index.html\n"
+        "Failed to resolve /src/main.jsx from /p/index.html\n") == (
+            "src/main.jsx",)
+    assert unresolved_html_entry_specs(
+        'Could not resolve "./index.css" from "src/main.jsx"') == ()
+
+
+def test_repair_executor_names_absent_html_script_entry_as_missing_file(
+        store, tmp_path: Path):
+    """index.html pointing at an ungenerated script -> add it, don't re-author.
+
+    The document exists, so the resolution error is not a defect *in* it;
+    the script it names was never generated (live: ses_877e1b15a9b34994,
+    where the bare regenerate reproduced the miss and burned the budget).
+    """
+    from cgx.session.tasks import repair as _repair_module  # noqa: F401
+    (tmp_path / "index.html").write_text("<html></html>", encoding="utf-8")
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    smoke_task = TaskNode.new(
+        session.session_id, TaskKind.SMOKE, "smoke", inputs={})
+    smoke_artifact = Artifact.new(
+        session_id=session.session_id,
+        produced_by_task_id=smoke_task.task_id,
+        kind=ArtifactKind.SMOKE_REPORT,
+        content={"outcome": "failed",
+                 "failed_modules": [],
+                 "failure_signature": "smoke_import|npm run build --silent#ab",
+                 "modules": [],
+                 "build_smoke": {
+                     "label": "npm run build --silent",
+                     "ok": False,
+                     "stderr_tail": (
+                         "error during build:\n"
+                         f"[plugin vite:build-html] {tmp_path}/index.html\n"
+                         f"Error: Failed to resolve /src/main.jsx from "
+                         f"{tmp_path}/index.html\n")}})
+    store.save_task(smoke_task)
+    store.save_artifact(smoke_artifact)
+    repair_task = TaskNode.new(
+        session.session_id, TaskKind.REPAIR, "repair",
+        inputs={"smoke_artifact_id": smoke_artifact.artifact_id,
+                "mode": SessionMode.GREENFIELD.value,
+                "repair_attempt": 1})
+    deps = ExecutorDeps(project_root=str(tmp_path), store=store)
+    from cgx.session.tasks.base import _REGISTRY
+    result = _REGISTRY[TaskKind.REPAIR](repair_task, deps)
+    assert result.failure is None
+    assert result.outputs["strategy"] == "regenerate"
+    constraints = result.outputs["extra_constraints"]
+    assert constraints["kind"] == "missing_entry_module"
+    assert [f["path"] for f in constraints["missing_files"]] == [
+        "src/main.jsx"]
+
+
+def test_repair_executor_skips_html_entry_spec_that_exists_on_disk(
+        store, tmp_path: Path):
+    """A resolvable-on-disk spec is a resolution bug, not a missing file."""
+    from cgx.session.tasks import repair as _repair_module  # noqa: F401
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "main.jsx").write_text("export {}", encoding="utf-8")
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    smoke_task = TaskNode.new(
+        session.session_id, TaskKind.SMOKE, "smoke", inputs={})
+    smoke_artifact = Artifact.new(
+        session_id=session.session_id,
+        produced_by_task_id=smoke_task.task_id,
+        kind=ArtifactKind.SMOKE_REPORT,
+        content={"outcome": "failed",
+                 "failed_modules": [],
+                 "failure_signature": "smoke_import|npm run build --silent#cd",
+                 "modules": [],
+                 "build_smoke": {
+                     "label": "npm run build --silent",
+                     "ok": False,
+                     "stderr_tail": (
+                         "Error: Failed to resolve /src/main.jsx from "
+                         f"{tmp_path}/index.html\n")}})
+    store.save_task(smoke_task)
+    store.save_artifact(smoke_artifact)
+    repair_task = TaskNode.new(
+        session.session_id, TaskKind.REPAIR, "repair",
+        inputs={"smoke_artifact_id": smoke_artifact.artifact_id,
+                "mode": SessionMode.GREENFIELD.value,
+                "repair_attempt": 1})
+    deps = ExecutorDeps(project_root=str(tmp_path), store=store)
+    from cgx.session.tasks.base import _REGISTRY
+    result = _REGISTRY[TaskKind.REPAIR](repair_task, deps)
+    constraints = result.outputs["extra_constraints"]
+    assert constraints["kind"] != "missing_entry_module"
+    assert "missing_files" not in constraints
 
 
 def test_unresolved_import_sources_parses_rollup_resolution_error():
@@ -9393,6 +10971,95 @@ def test_repair_verify_missing_dependency_routes_to_install_deps(
     assert plan.content["missing_modules"] == ["httpx"]
     assert plan.content["diffs"] == []
     assert "httpx" in plan.content["rationale"]
+
+
+def _missing_dep_repair(store, tmp_path: Path, *, build_content=None):
+    """Drive REPAIR on a VERIFY missing-module error, optional BUILD_REPORT."""
+    from cgx.session.tasks import repair as _repair_module  # noqa: F401
+    from cgx.session.tasks.base import _REGISTRY
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    verify_task = TaskNode.new(
+        session.session_id, TaskKind.VERIFY, "verify",
+        inputs={"mode": SessionMode.GREENFIELD.value})
+    verify_artifact = Artifact.new(
+        session_id=session.session_id,
+        produced_by_task_id=verify_task.task_id,
+        kind=ArtifactKind.VERIFY_REPORT,
+        content={
+            "outcome": "collection_error",
+            "returncode": 2,
+            "stdout": (
+                "tests/test_api.py:3: in <module>\n"
+                "    import nosuchpkg\n"
+                "E   ModuleNotFoundError: No module named 'nosuchpkg'\n"),
+            "stderr": "",
+        })
+    verify_task.produced_artifact_id = verify_artifact.artifact_id
+    verify_task.status = TaskNodeStatus.DONE
+    store.save_task(verify_task)
+    store.save_artifact(verify_artifact)
+    inputs = {"verify_artifact_id": verify_artifact.artifact_id,
+              "mode": SessionMode.GREENFIELD.value,
+              "repair_attempt": 2}
+    if build_content is not None:
+        build = Artifact.new(
+            session_id=session.session_id,
+            produced_by_task_id=verify_task.task_id,
+            kind=ArtifactKind.BUILD_REPORT, content=build_content)
+        store.save_artifact(build)
+        inputs["build_artifact_id"] = build.artifact_id
+    repair_task = TaskNode.new(
+        session.session_id, TaskKind.REPAIR, "repair", inputs=inputs)
+    deps = ExecutorDeps(project_root=str(tmp_path), store=store)
+    return _REGISTRY[TaskKind.REPAIR](repair_task, deps)
+
+
+def test_repair_verify_missing_dependency_installs_without_pip_evidence(
+        store, tmp_path: Path):
+    """No BUILD_REPORT record of a failed install -> still install_deps.
+
+    A repeated failure signature is not evidence a package is invented:
+    the install may never have run (live Calculator5 -- BOOTSTRAP_ENV
+    resolved the tree as node, provisioned no venv, and silently skipped
+    it). Absent proof pip tried and failed, the loop keeps installing.
+    """
+    result = _missing_dep_repair(
+        store, tmp_path,
+        build_content={"failed_installs": [], "uninstallable": []})
+    assert result.failure is None
+    assert result.outputs["classification"] == "missing_dependency"
+    assert result.outputs["strategy"] == "install_deps"
+
+
+def test_repair_verify_pip_proven_unsatisfiable_regenerates(
+        store, tmp_path: Path):
+    """A BUILD_REPORT naming the failed install -> scoped regenerate.
+
+    pip ran and could not resolve the name, so no further install can
+    help and only a source change clears the import.
+    """
+    result = _missing_dep_repair(
+        store, tmp_path,
+        build_content={"failed_installs": ["nosuchpkg"],
+                       "uninstallable": []})
+    assert result.failure is None
+    assert result.outputs["classification"] == "uninstallable_dependency"
+    assert result.outputs["strategy"] == "regenerate"
+    assert result.outputs["missing_modules"] == ["nosuchpkg"]
+    assert "pip could not install" in result.artifact.content["rationale"]
+    assert (result.outputs["extra_constraints"]["target_files"]
+            == ["tests/test_api.py"])
+
+
+def test_repair_verify_pip_evidence_matches_normalized_name(
+        store, tmp_path: Path):
+    """``uninstallable`` entries match case-insensitively."""
+    result = _missing_dep_repair(
+        store, tmp_path,
+        build_content={"failed_installs": [], "uninstallable": ["NoSuchPkg"]})
+    assert result.outputs["classification"] == "uninstallable_dependency"
+    assert result.outputs["missing_modules"] == ["nosuchpkg"]
 
 
 def test_repair_verify_pip_installable_missing_module_installs(
@@ -10622,6 +12289,69 @@ def test_contract_check_function_falls_back_to_any_module():
     assert [w["name"] for w in warns] == ["compute"]
 
 
+def test_contract_check_resolves_dotted_class_method():
+    """A ``Class.method`` contract resolves against the class's methods.
+
+    The ses false-negative: the Tech Lead declared ``Circle.area`` (a method)
+    but the checker sought a module-level ``Circle.area`` symbol, never found
+    it, and flagged the tree even though the method exists and tests pass.
+    A dotted name must resolve against the generated class's method set.
+    """
+    from cgx.session.scaffold_validate import check_contract_compliance
+    contracts = {"functions": [{"name": "Circle.area", "module": "s/shapes.py"}]}
+    ok = {"s/shapes.py": (
+        "class Circle:\n"
+        "    def __init__(self, radius):\n        self.radius = radius\n\n"
+        "    def area(self):\n        return 3.14159 * self.radius ** 2\n")}
+    assert check_contract_compliance(ok, contracts) == []
+    # The class exists but the method does not -> one function warning that
+    # names the missing member on its owning class.
+    bad = {"s/shapes.py": "class Circle:\n    def perimeter(self):\n        return 0\n"}
+    warns = check_contract_compliance(bad, contracts)
+    assert [w["kind"] for w in warns] == ["function"]
+    assert warns[0]["name"] == "Circle.area"
+    assert "Circle" in warns[0]["reason"]
+
+
+def test_contract_check_dotted_unknown_owner_still_flagged():
+    """A dotted name whose owner class is absent still warns (missing class)."""
+    from cgx.session.scaffold_validate import check_contract_compliance
+    contracts = {"functions": [{"name": "Circle.area", "module": "s/shapes.py"}]}
+    contents = {"s/shapes.py": "def unrelated():\n    return 1\n"}
+    warns = check_contract_compliance(contents, contracts)
+    assert [w["kind"] for w in warns] == ["function"]
+    assert warns[0]["name"] == "Circle.area"
+
+
+def test_contract_check_resolves_bare_name_method():
+    """A bare-name contract resolves against a class method it names.
+
+    The Tech Lead routinely declares a method by its bare name (``__init__``,
+    ``deposit``) whose ``self`` receiver makes the class membership obvious,
+    with no ``Class.`` prefix. Such a name must resolve against the method the
+    module's classes define rather than being flagged as a missing module-level
+    function, both when the declared module matches and via the any-module
+    fallback.
+    """
+    from cgx.session.scaffold_validate import check_contract_compliance
+    contracts = {"functions": [
+        {"name": "deposit", "module": "src/account.py"},
+        {"name": "__init__", "module": "src/account.py"}]}
+    ok = {"src/account.py": (
+        "class Account:\n"
+        "    def __init__(self, balance=0):\n        self.balance = balance\n\n"
+        "    def deposit(self, amount):\n        self.balance += amount\n")}
+    assert check_contract_compliance(ok, contracts) == []
+    # The any-module fallback resolves the same bare name when the declared
+    # module was not generated but another module defines the method.
+    fallback = {"functions": [{"name": "deposit", "module": "src/missing.py"}]}
+    assert check_contract_compliance(ok, fallback) == []
+    # A bare name no class defines is still flagged.
+    bad = {"src/account.py": "class Account:\n    def close(self):\n        pass\n"}
+    warns = check_contract_compliance(bad, contracts)
+    assert sorted(w["name"] for w in warns) == ["__init__", "deposit"]
+
+
 def test_contract_check_abstains_without_python_and_on_empty():
     """No Python files -> symbol checks abstain; empty contracts -> []."""
     from cgx.session.scaffold_validate import check_contract_compliance
@@ -11119,7 +12849,7 @@ def test_tracing_provider_stamps_run_id_from_trace_context():
     tp.bind("sess-A", "task-X")
     token = set_trace_context(run_id="run_abc123")
     try:
-        tp.chat([{"role": "user", "content": "ping"}])
+        tp.chat([{"role": "user", "content": "ping"}], force_json=False)
     finally:
         reset_trace_context(token)
     fact = tp.drain()[0]
@@ -11142,7 +12872,7 @@ def test_tracing_provider_records_provider_usage_and_metrics():
     _metrics.reset_for_tests()
     tp = TracingProvider(_UsageProvider(model="gemini-2.5-flash"))
     tp.bind("s", "t")
-    tp.chat([{"role": "user", "content": "hi"}])
+    tp.chat([{"role": "user", "content": "hi"}], force_json=False)
     fact = tp.drain()[0]
     assert fact.content["provider"] == "gemini"
     assert fact.content["token_source"] == "provider"
@@ -11187,7 +12917,7 @@ def test_tracing_provider_records_chat_error():
     tp = TracingProvider(_Boom())
     tp.bind("s", "t")
     with pytest.raises(RuntimeError):
-        tp.chat([{"role": "user", "content": "x"}])
+        tp.chat([{"role": "user", "content": "x"}], force_json=False)
     facts = tp.drain()
     assert facts and facts[0].content["error"].startswith("RuntimeError")
 
@@ -11196,7 +12926,7 @@ def test_tracing_provider_unbound_calls_are_silent():
     """Calls made outside a bind/unbind window emit no facts."""
     from cgx.session.llm_trace import TracingProvider
     tp = TracingProvider(_StubChatProvider())
-    tp.chat([{"role": "user", "content": "x"}])
+    tp.chat([{"role": "user", "content": "x"}], force_json=False)
     assert tp.drain() == []
 
 
@@ -11218,7 +12948,7 @@ def test_runner_persists_llm_call_facts_via_tracing(tmp_path):
     @register_executor(TaskKind.EXPLORE)
     def _exec(t, deps):
         # Touch the provider so the tracer records a Fact.
-        deps.provider.chat([{"role": "user", "content": "probe"}])
+        deps.provider.chat([{"role": "user", "content": "probe"}], force_json=False)
         return ExecutorResult(outputs={})
 
     try:
@@ -11608,6 +13338,48 @@ def test_router_repair_regenerate_targets_build_smoke_importer():
     new_scaffold = creates[0].task
     assert new_scaffold.inputs["regenerate_files"] == ["src/main.jsx"]
     assert new_scaffold.inputs["prior_scaffold_artifact_id"] == "art_scaf"
+
+
+def test_router_repair_regenerate_reuses_diagnosed_target_files():
+    """C1: a diagnosed REPAIR that falls back to regenerate stays file-scoped.
+
+    A REPAIR reached from a DIAGNOSE ``patch_files`` verdict carries the
+    diagnosed implicated file(s) in its inputs. When the bounded patch is a
+    no-op and the executor emits ``strategy=regenerate`` *without* the
+    classifier naming ``target_files``, the router must reuse the diagnosed
+    ``target_files`` for a scoped regenerate instead of nuking the tree.
+    """
+    session, _scaffold, tasks, rep = _build_regenerate_chain()
+    rep.inputs = dict(rep.inputs)
+    rep.inputs["target_files"] = ["src/handlers.py"]
+    rep.outputs = dict(rep.outputs)
+    rep.outputs["classification"] = "assertion_drift"
+    rep.outputs["scaffold_artifact_id"] = "art_scaf"
+    # The classifier named no file this round (whole-tree today).
+    rep.outputs["extra_constraints"] = {"kind": "assertion_drift",
+                                        "rationale": "drift"}
+    plan = Router().on_task_completed(
+        session=session, completed=rep, tasks=tasks)
+    new_scaffold = [a.task for a in plan.actions
+                    if isinstance(a, CreateTask)][0]
+    assert new_scaffold.inputs["regenerate_files"] == ["src/handlers.py"]
+    assert new_scaffold.inputs["prior_scaffold_artifact_id"] == "art_scaf"
+
+
+def test_router_repair_regenerate_whole_tree_when_nothing_named():
+    """Whole-tree stays the fallback when neither classifier nor DIAGNOSE
+    named a file (no diagnosed inputs, no classifier target_files)."""
+    session, _scaffold, tasks, rep = _build_regenerate_chain()
+    rep.outputs = dict(rep.outputs)
+    rep.outputs["classification"] = "unknown"
+    rep.outputs["scaffold_artifact_id"] = "art_scaf"
+    rep.outputs["extra_constraints"] = {"kind": "unknown"}
+    plan = Router().on_task_completed(
+        session=session, completed=rep, tasks=tasks)
+    new_scaffold = [a.task for a in plan.actions
+                    if isinstance(a, CreateTask)][0]
+    assert not new_scaffold.inputs.get("regenerate_files")
+    assert not new_scaffold.inputs.get("prior_scaffold_artifact_id")
 
 
 def test_router_repair_regenerate_preserves_failure_signatures():
@@ -13547,6 +15319,12 @@ class _ScriptedLocalProvider:
                         if path.endswith(".py")
                         else f"placeholder for {path}\n")
             return {"content": _json.dumps({"content": body})}
+        # Bounded plan self-critique (DECOMPOSE, P1.2) -- a plain chat call
+        # asking for speculative files to drop. Return no removals so the
+        # scripted manifest ships intact (today's degrade-to-safe behaviour).
+        if "speculative files to remove" in user:
+            self.calls.append("critique")
+            return {"content": _json.dumps({"remove": []})}
         # Mandatory project-skeleton pass (DECOMPOSE) -- a plain chat call
         # carrying the manifest paths, no schema and no per-file marker.
         if "Manifest Paths:" in user:
@@ -13779,3 +15557,664 @@ def test_repair_retrieval_calls_query_when_index_present(tmp_path, monkeypatch):
     assert calls, "run_query_auto should have been called"
     # Only the existing first-party file survives resolution.
     assert out == ["calc.py"]
+
+
+# --------------------- DIAGNOSE router wiring (P2.5) ---------------------
+#
+# Two seams: (1) the gate -> DIAGNOSE edges -- a reasoning-class
+# ``classification`` on a failed VERIFY / RUNTIME_VERIFY routes to the
+# DIAGNOSE rung instead of a mechanical REPAIR; (2) the
+# ``_diagnose_dispatch_actions`` guard -- a completed DIAGNOSE verdict's
+# ``minimal_action`` maps to exactly one deterministic successor. The
+# router stays pure: it reads only ``classification`` / ``minimal_action``
+# and the dependency / target-file lists the executor already placed in
+# ``outputs``.
+
+
+def _diagnose_completed(*, minimal_action: str, extra_outputs: dict | None = None,
+                        repair_attempt: int = 1, prior_repair_regens: int = 0,
+                        with_scaffold: bool = True):
+    """Build a SCAFFOLD->APPLY->VERIFY->DIAGNOSE(DONE) chain.
+
+    Returns ``(session, diagnose, tasks)``. The DIAGNOSE node carries the
+    verdict ``minimal_action`` (+ any ``extra_outputs``) the dispatch guard
+    reads; the SCAFFOLD ancestor lets the regenerate / escalate arms splice
+    a scoped re-scaffold.
+    """
+    from cgx.session.models import SessionMode
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    tasks: list = []
+    parent_id = None
+    if with_scaffold:
+        scaffold = TaskNode.new(
+            session.session_id, TaskKind.SCAFFOLD, "scaffold",
+            inputs={"work_plan_artifact_id": "art_plan",
+                    "repair_regenerate_attempt": prior_repair_regens})
+        scaffold.status = TaskNodeStatus.DONE
+        apply_t = TaskNode.new(
+            session.session_id, TaskKind.APPLY, "apply",
+            parent_task_id=scaffold.task_id, inputs={})
+        apply_t.status = TaskNodeStatus.DONE
+        verify = TaskNode.new(
+            session.session_id, TaskKind.VERIFY, "verify",
+            parent_task_id=apply_t.task_id, inputs={})
+        verify.status = TaskNodeStatus.DONE
+        tasks += [scaffold, apply_t, verify]
+        parent_id = verify.task_id
+    diag = TaskNode.new(
+        session.session_id, TaskKind.DIAGNOSE, "diagnose",
+        parent_task_id=parent_id,
+        inputs={"verify_artifact_id": "art_verify",
+                "build_artifact_id": "art_build",
+                "apply_artifact_id": "art_applied",
+                "scaffold_artifact_id": "art_scaffold",
+                "plan_artifact_id": "art_plan",
+                "prior_goal": "g",
+                "mode": SessionMode.GREENFIELD.value,
+                "repair_attempt": repair_attempt})
+    outputs = {"minimal_action": minimal_action,
+               "verify_artifact_id": "art_verify",
+               "repair_attempt": repair_attempt}
+    outputs.update(extra_outputs or {})
+    diag.outputs = outputs
+    diag.status = TaskNodeStatus.DONE
+    tasks.append(diag)
+    return session, diag, tasks
+
+
+# (minimal_action, extra outputs, expected successor kind)
+_DIAGNOSE_DISPATCH_CASES = [
+    ("patch_files", {"target_files": ["src/x.py"]}, TaskKind.REPAIR),
+    ("add_dependency", {"add_dependencies": ["flask"]}, TaskKind.BOOTSTRAP_ENV),
+    ("remove_dependency", {"remove_dependencies": ["selenium"]},
+     TaskKind.BOOTSTRAP_ENV),
+    ("adjust_manifest", {"target_files": ["src/x.py"]}, TaskKind.SCAFFOLD),
+    ("regenerate_files", {"target_files": ["src/x.py"]}, TaskKind.SCAFFOLD),
+    ("escalate", {}, TaskKind.SCAFFOLD),
+]
+
+
+@pytest.mark.parametrize(
+    "action,extra,kind", _DIAGNOSE_DISPATCH_CASES,
+    ids=[c[0] for c in _DIAGNOSE_DISPATCH_CASES])
+def test_diagnose_dispatch_routes_each_minimal_action(action, extra, kind):
+    """Every minimal_action verdict maps to exactly one successor kind."""
+    session, diag, tasks = _diagnose_completed(
+        minimal_action=action, extra_outputs=extra)
+    plan = Router().on_task_completed(
+        session=session, completed=diag, tasks=tasks)
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    assert len(creates) == 1
+    assert creates[0].task.kind is kind
+
+
+def test_diagnose_patch_files_spawns_targeted_repair():
+    """patch_files -> REPAIR reusing the diagnosed source report + targets."""
+    session, diag, tasks = _diagnose_completed(
+        minimal_action="patch_files", repair_attempt=2,
+        extra_outputs={"target_files": ["src/handlers.py"],
+                       "repair_ledger_fact_id": "fact_led",
+                       "repair_attempt": 2})
+    plan = Router().on_task_completed(
+        session=session, completed=diag, tasks=tasks)
+    rep = [a.task for a in plan.actions if isinstance(a, CreateTask)][0]
+    assert rep.kind is TaskKind.REPAIR
+    assert rep.inputs["verify_artifact_id"] == "art_verify"
+    assert rep.inputs["target_files"] == ["src/handlers.py"]
+    # The gate-charged attempt + the ledger id ride the chain verbatim.
+    assert rep.inputs["repair_attempt"] == 2
+    assert rep.inputs["repair_ledger_fact_id"] == "fact_led"
+
+
+def test_diagnose_add_dependency_spawns_bootstrap_install():
+    """add_dependency -> BOOTSTRAP_ENV threading missing_modules to install."""
+    session, diag, tasks = _diagnose_completed(
+        minimal_action="add_dependency",
+        extra_outputs={"add_dependencies": ["flask", "flask_cors"],
+                       "repair_ledger_fact_id": "fact_led"})
+    plan = Router().on_task_completed(
+        session=session, completed=diag, tasks=tasks)
+    boot = [a.task for a in plan.actions if isinstance(a, CreateTask)][0]
+    assert boot.kind is TaskKind.BOOTSTRAP_ENV
+    assert boot.inputs["missing_modules"] == ["flask", "flask_cors"]
+    assert boot.inputs["repair_ledger_fact_id"] == "fact_led"
+
+
+def test_diagnose_remove_dependency_spawns_bootstrap_descope():
+    """remove_dependency -> BOOTSTRAP_ENV threading descope_packages (C3)."""
+    session, diag, tasks = _diagnose_completed(
+        minimal_action="remove_dependency",
+        extra_outputs={"remove_dependencies": ["selenium", "playwright"]})
+    plan = Router().on_task_completed(
+        session=session, completed=diag, tasks=tasks)
+    boot = [a.task for a in plan.actions if isinstance(a, CreateTask)][0]
+    assert boot.kind is TaskKind.BOOTSTRAP_ENV
+    assert boot.inputs["descope_packages"] == ["selenium", "playwright"]
+
+
+def test_diagnose_regenerate_files_scopes_scaffold_to_targets():
+    """regenerate_files -> a SCAFFOLD scoped to exactly the named files."""
+    session, diag, tasks = _diagnose_completed(
+        minimal_action="regenerate_files",
+        extra_outputs={"target_files": ["src/main.py"],
+                       "scaffold_artifact_id": "art_scaffold"})
+    plan = Router().on_task_completed(
+        session=session, completed=diag, tasks=tasks)
+    sc = [a.task for a in plan.actions if isinstance(a, CreateTask)][0]
+    assert sc.kind is TaskKind.SCAFFOLD
+    assert sc.inputs["regenerate_files"] == ["src/main.py"]
+    assert sc.inputs["prior_scaffold_artifact_id"] == "art_scaffold"
+
+
+def test_diagnose_escalate_regenerates_whole_tree():
+    """escalate -> today's whole-tree regenerate (no file scoping)."""
+    session, diag, tasks = _diagnose_completed(minimal_action="escalate")
+    plan = Router().on_task_completed(
+        session=session, completed=diag, tasks=tasks)
+    sc = [a.task for a in plan.actions if isinstance(a, CreateTask)][0]
+    assert sc.kind is TaskKind.SCAFFOLD
+    assert not sc.inputs.get("regenerate_files")
+
+
+def test_diagnose_patch_files_without_source_report_escalates():
+    """A malformed patch verdict (no source id) degrades to escalate."""
+    session, diag, tasks = _diagnose_completed(minimal_action="patch_files")
+    diag.outputs.pop("verify_artifact_id")
+    plan = Router().on_task_completed(
+        session=session, completed=diag, tasks=tasks)
+    sc = [a.task for a in plan.actions if isinstance(a, CreateTask)][0]
+    # No REPAIR -- the additive fallback re-scaffolds instead of stranding.
+    assert sc.kind is TaskKind.SCAFFOLD
+
+
+def test_diagnose_add_dependency_empty_list_escalates():
+    """add_dependency with no packages degrades to escalate, never stranded."""
+    session, diag, tasks = _diagnose_completed(
+        minimal_action="add_dependency", extra_outputs={"add_dependencies": []})
+    plan = Router().on_task_completed(
+        session=session, completed=diag, tasks=tasks)
+    sc = [a.task for a in plan.actions if isinstance(a, CreateTask)][0]
+    assert sc.kind is TaskKind.SCAFFOLD
+
+
+def test_diagnose_unknown_action_escalates():
+    """An unrecognized (or empty) verdict falls through to escalate."""
+    session, diag, tasks = _diagnose_completed(minimal_action="not_a_verdict")
+    plan = Router().on_task_completed(
+        session=session, completed=diag, tasks=tasks)
+    sc = [a.task for a in plan.actions if isinstance(a, CreateTask)][0]
+    assert sc.kind is TaskKind.SCAFFOLD
+
+
+def test_diagnose_escalate_without_scaffold_lineage_fails_session():
+    """escalate with no SCAFFOLD ancestor to regenerate fails terminally."""
+    session, diag, tasks = _diagnose_completed(
+        minimal_action="escalate", with_scaffold=False)
+    plan = Router().on_task_completed(
+        session=session, completed=diag, tasks=tasks)
+    assert [a for a in plan.actions if isinstance(a, CreateTask)] == []
+    status = [a for a in plan.actions if isinstance(a, UpdateSessionStatus)]
+    assert len(status) == 1
+    assert status[0].status is SessionStatus.FAILED
+
+
+# --------------------- gate -> DIAGNOSE routing ---------------------
+
+
+@pytest.mark.parametrize(
+    "classification",
+    ["assertion_drift", "collection_error", "unknown"])
+def test_router_verify_reasoning_class_routes_to_diagnose(classification):
+    """A reasoning-class VERIFY failure spawns DIAGNOSE, not a bare REPAIR."""
+    session = Session.new("g")
+    ver = _greenfield_failed_verify(signature="sig1", session=session)
+    ver.outputs["classification"] = classification
+    plan = Router().on_task_completed(
+        session=session, completed=ver, tasks=[ver])
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    assert len(creates) == 1
+    diag = creates[0].task
+    assert diag.kind is TaskKind.DIAGNOSE
+    assert diag.inputs["verify_artifact_id"] == "art_verify"
+    assert diag.inputs["classification"] == classification
+    # The gate charged the round on this edge exactly as REPAIR would.
+    assert diag.inputs["repair_attempt"] == 1
+    assert diag.parent_task_id == ver.task_id
+
+
+def test_router_verify_mechanical_class_stays_repair():
+    """A mechanical classification keeps the fast path straight to REPAIR."""
+    session = Session.new("g")
+    ver = _greenfield_failed_verify(signature="sig1", session=session)
+    ver.outputs["classification"] = "third_party_import_break"
+    plan = Router().on_task_completed(
+        session=session, completed=ver, tasks=[ver])
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    assert len(creates) == 1
+    assert creates[0].task.kind is TaskKind.REPAIR
+
+
+def test_router_runtime_verify_reasoning_class_routes_to_diagnose():
+    """A reasoning-class RUNTIME_VERIFY boot failure spawns DIAGNOSE."""
+    from cgx.session.models import SessionMode
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    rv = TaskNode.new(
+        session.session_id, TaskKind.RUNTIME_VERIFY, "runtime",
+        inputs={"mode": SessionMode.GREENFIELD.value})
+    rv.produced_artifact_id = "art_runtime"
+    rv.outputs = {"outcome": "failed",
+                  "failure_signature": "runtime_boot|app.py",
+                  "classification": "runtime_failure"}
+    rv.status = TaskNodeStatus.DONE
+    plan = Router().on_task_completed(
+        session=session, completed=rv, tasks=[rv])
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    assert len(creates) == 1
+    diag = creates[0].task
+    assert diag.kind is TaskKind.DIAGNOSE
+    assert diag.inputs["runtime_artifact_id"] == "art_runtime"
+    assert diag.inputs["classification"] == "runtime_failure"
+    assert diag.inputs["repair_attempt"] == 1
+
+
+# --------------------- P3.2: incremental RE_VERIFY (C2) ---------------------
+
+
+def test_re_verify_kind_registered_and_executor_wired():
+    """RE_VERIFY exists with the exact value and a discoverable executor."""
+    import cgx.session.tasks  # noqa: F401 (populates the executor registry)
+    from cgx.session.tasks.base import get_executor
+    assert TaskKind.RE_VERIFY.value == "re_verify"
+    assert TaskKind("re_verify") is TaskKind.RE_VERIFY
+    assert get_executor(TaskKind.RE_VERIFY) is not None
+
+
+def test_reverify_markers_only_for_verify_origin():
+    """Only a VERIFY-origin diagnosis yields C2 markers; others run full chain."""
+    from cgx.session.greenfield_edges import _reverify_markers
+    session = Session.new("g")
+    diag = TaskNode.new(session.session_id, TaskKind.DIAGNOSE, "d", inputs={})
+    diag.outputs = {"smoke_artifact_id": "art_smoke"}
+    assert _reverify_markers(diag) == {}
+    diag.outputs = {"verify_artifact_id": "art_verify"}
+    assert _reverify_markers(diag) == {
+        "reverify_origin_gate": "verify", "reverify_report_id": "art_verify"}
+
+
+def test_diagnose_patch_threads_reverify_markers_to_repair():
+    """A VERIFY-origin patch verdict rides the C2 markers on to REPAIR."""
+    session, diag, tasks = _diagnose_completed(
+        minimal_action="patch_files",
+        extra_outputs={"target_files": ["src/x.py"]})
+    plan = Router().on_task_completed(
+        session=session, completed=diag, tasks=tasks)
+    rep = [a.task for a in plan.actions if isinstance(a, CreateTask)][0]
+    assert rep.kind is TaskKind.REPAIR
+    assert rep.inputs["reverify_origin_gate"] == "verify"
+    assert rep.inputs["reverify_report_id"] == "art_verify"
+
+
+def test_diagnose_add_dependency_threads_reverify_markers_to_bootstrap():
+    """A VERIFY-origin add_dependency verdict rides the C2 markers on to boot."""
+    session, diag, tasks = _diagnose_completed(
+        minimal_action="add_dependency",
+        extra_outputs={"add_dependencies": ["flask"]})
+    plan = Router().on_task_completed(
+        session=session, completed=diag, tasks=tasks)
+    boot = [a.task for a in plan.actions if isinstance(a, CreateTask)][0]
+    assert boot.kind is TaskKind.BOOTSTRAP_ENV
+    assert boot.inputs["reverify_origin_gate"] == "verify"
+    assert boot.inputs["reverify_report_id"] == "art_verify"
+
+
+def test_repair_to_apply_threads_reverify_markers():
+    """A REPAIR carrying C2 markers threads them (and scaffold id) on to APPLY."""
+    session = Session.new("g")
+    rep = TaskNode.new(
+        session.session_id, TaskKind.REPAIR, "repair",
+        inputs={"mode": "greenfield", "build_artifact_id": "art_build",
+                "scaffold_artifact_id": "art_scaffold",
+                "reverify_origin_gate": "verify",
+                "reverify_report_id": "art_verify"})
+    rep.produced_artifact_id = "art_plan"
+    rep.outputs = {"can_apply": True, "failure_signature": "s",
+                   "repair_attempt": 1}
+    rep.status = TaskNodeStatus.DONE
+    plan = Router().on_task_completed(
+        session=session, completed=rep, tasks=[rep])
+    apply_t = [a.task for a in plan.actions if isinstance(a, CreateTask)][0]
+    assert apply_t.kind is TaskKind.APPLY
+    assert apply_t.inputs["reverify_origin_gate"] == "verify"
+    assert apply_t.inputs["reverify_report_id"] == "art_verify"
+    assert apply_t.inputs["scaffold_artifact_id"] == "art_scaffold"
+
+
+def test_apply_with_reverify_marker_spawns_re_verify():
+    """A DIAGNOSE-scoped patch's APPLY splices RE_VERIFY, not BOOTSTRAP/VERIFY."""
+    session = Session.new("g")
+    apply_t = TaskNode.new(
+        session.session_id, TaskKind.APPLY, "apply",
+        inputs={"mode": "greenfield", "build_artifact_id": "art_build",
+                "scaffold_artifact_id": "art_scaffold",
+                "reverify_origin_gate": "verify",
+                "reverify_report_id": "art_verify"})
+    apply_t.produced_artifact_id = "art_applied"
+    apply_t.status = TaskNodeStatus.DONE
+    plan = Router().on_task_completed(
+        session=session, completed=apply_t, tasks=[apply_t])
+    rv = [a.task for a in plan.actions if isinstance(a, CreateTask)][0]
+    assert rv.kind is TaskKind.RE_VERIFY
+    assert rv.inputs["reverify_report_id"] == "art_verify"
+    assert rv.inputs["build_artifact_id"] == "art_build"
+    assert rv.inputs["apply_artifact_id"] == "art_applied"
+
+
+def test_bootstrap_with_reverify_marker_spawns_re_verify():
+    """A DIAGNOSE dependency fix's BOOTSTRAP_ENV splices RE_VERIFY, not API_CHECK."""
+    session = Session.new("g")
+    boot = TaskNode.new(
+        session.session_id, TaskKind.BOOTSTRAP_ENV, "bootstrap",
+        inputs={"mode": "greenfield", "apply_artifact_id": "art_applied",
+                "scaffold_artifact_id": "art_scaffold",
+                "reverify_origin_gate": "verify",
+                "reverify_report_id": "art_verify"})
+    boot.produced_artifact_id = "art_build"
+    boot.status = TaskNodeStatus.DONE
+    plan = Router().on_task_completed(
+        session=session, completed=boot, tasks=[boot])
+    rv = [a.task for a in plan.actions if isinstance(a, CreateTask)][0]
+    assert rv.kind is TaskKind.RE_VERIFY
+    assert rv.inputs["build_artifact_id"] == "art_build"
+    assert rv.inputs["apply_artifact_id"] == "art_applied"
+    assert rv.inputs["reverify_report_id"] == "art_verify"
+
+
+def test_re_verify_pass_hands_off_like_verify():
+    """A green RE_VERIFY dispatches to RUNTIME_VERIFY exactly like VERIFY."""
+    from cgx.session.models import SessionMode
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    rv = TaskNode.new(
+        session.session_id, TaskKind.RE_VERIFY, "reverify",
+        inputs={"mode": SessionMode.GREENFIELD.value})
+    rv.produced_artifact_id = "art_reverify"
+    rv.outputs = {"outcome": "passed"}
+    rv.status = TaskNodeStatus.DONE
+    plan = Router().on_task_completed(
+        session=session, completed=rv, tasks=[rv])
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    assert len(creates) == 1
+    assert creates[0].task.kind is TaskKind.RUNTIME_VERIFY
+
+
+def test_re_verify_still_failing_reasoning_class_routes_to_diagnose():
+    """A still-failing reasoning-class RE_VERIFY routes back to DIAGNOSE."""
+    from cgx.session.models import SessionMode
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    rv = TaskNode.new(
+        session.session_id, TaskKind.RE_VERIFY, "reverify",
+        inputs={"mode": SessionMode.GREENFIELD.value})
+    rv.produced_artifact_id = "art_reverify"
+    rv.outputs = {"outcome": "assertions_failed",
+                  "failure_signature": "sig_new",
+                  "classification": "assertion_drift",
+                  "returncode": 1, "tests_selected_count": 3,
+                  "failing_count": 1}
+    rv.status = TaskNodeStatus.DONE
+    plan = Router().on_task_completed(
+        session=session, completed=rv, tasks=[rv])
+    creates = [a for a in plan.actions if isinstance(a, CreateTask)]
+    assert len(creates) == 1
+    diag = creates[0].task
+    assert diag.kind is TaskKind.DIAGNOSE
+    assert diag.inputs["verify_artifact_id"] == "art_reverify"
+
+
+def test_re_verify_failing_test_files_selects_only_failed():
+    """_failing_test_files narrows the selected set to the failing file(s)."""
+    from cgx.session.tasks.re_verify import _failing_test_files
+    content = {
+        "tests_selected": ["tests/test_a.py", "tests/test_b.py"],
+        "failures": [{"nodeid": "tests.test_b.TestX::test_it"}]}
+    assert _failing_test_files(content) == ["tests/test_b.py"]
+
+
+def test_re_verify_failing_test_files_falls_back_to_all_when_unresolved():
+    """No resolvable failure file -> re-run the full selected set, never zero."""
+    from cgx.session.tasks.re_verify import _failing_test_files
+    content = {"tests_selected": ["tests/test_a.py"], "failures": []}
+    assert _failing_test_files(content) == ["tests/test_a.py"]
+
+
+# ---------------------------------------------------------------------
+# Regression harness for session ``ses_fa6f72a9d3da4217`` (Calculator2).
+#
+# Each test encodes an input shape taken from that run's trace so the fix
+# is proven against the real failure rather than a reconstruction.
+# ---------------------------------------------------------------------
+
+class _RecordingProvider:
+    """Provider stub that records every prompt and replays canned text."""
+
+    def __init__(self, replies=None):
+        self.prompts: List[str] = []
+        self._replies = list(replies or [])
+
+    def chat(self, messages, force_json=False, **kwargs):
+        self.prompts.append(messages[-1]["content"])
+        return {"content": self._replies.pop(0) if self._replies
+                else "import os\n"}
+
+
+def test_ast_fallback_prompt_carries_the_project_goal(store):
+    """The AST fallback must never prompt with an empty project goal.
+
+    The router threads ``prior_goal``; the executor read ``composed_goal``,
+    so every fallback prompt had a blank goal and the model invented a
+    Flask app inside a FastAPI project.
+    """
+    from cgx.session.models import SessionMode
+    from cgx.session.tasks.ast_scaffold import run_ast_scaffold
+    session = Session.new("create a calculator app using fast-api and "
+                          "react frontend", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    work_plan = Artifact.new(
+        session_id=session.session_id, produced_by_task_id="t_plan",
+        kind=ArtifactKind.WORK_PLAN,
+        content={"contracts": {"project_skeleton":
+                               "# --- tests/test_core.py ---\n"
+                               "def test_compute():\n    ...\n"}})
+    store.save_artifact(work_plan)
+    provider = _RecordingProvider(
+        ["import pytest\n", "def test_compute():\n    assert True\n"])
+    task = TaskNode.new(
+        session.session_id, TaskKind.AST_REGENERATE, "regenerate",
+        inputs={"work_plan_artifact_id": work_plan.artifact_id,
+                "prior_goal": ("create a calculator app using fast-api "
+                               "and react frontend"),
+                "regenerate_attempt": 2,
+                "regenerate_files": ["tests/test_core.py"]})
+    run_ast_scaffold(task, ExecutorDeps(store=store, provider=provider))
+    assert provider.prompts, "the fallback issued no prompts"
+    for prompt in provider.prompts:
+        assert "create a calculator app using fast-api" in prompt, prompt
+    # The header prompt must carry the file's skeleton as context; it was
+    # hardcoded to "" while only the symbol prompt got the skeleton.
+    assert "def test_compute" in provider.prompts[0]
+
+
+def test_ast_fallback_rejects_empty_output(store):
+    """The fallback must gate its own output before APPLY writes it.
+
+    Prose replies leave the assembler with nothing to unparse, and the
+    1-byte file that came out still shipped as ``generated``.
+    """
+    from cgx.session.models import SessionMode
+    from cgx.session.tasks.ast_scaffold import run_ast_scaffold
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    work_plan = Artifact.new(
+        session_id=session.session_id, produced_by_task_id="t_plan",
+        kind=ArtifactKind.WORK_PLAN,
+        content={"contracts": {"project_skeleton":
+                               "# --- tests/test_core.py ---\n"}})
+    store.save_artifact(work_plan)
+    provider = _RecordingProvider(["Sure! Here is what I would write."] * 3)
+    task = TaskNode.new(
+        session.session_id, TaskKind.AST_REGENERATE, "regenerate",
+        inputs={"work_plan_artifact_id": work_plan.artifact_id,
+                "prior_goal": "g",
+                "regenerate_files": ["tests/test_core.py"]})
+    result = run_ast_scaffold(
+        task, ExecutorDeps(store=store, provider=provider))
+    content = result.artifact.content
+    assert content["generated"] == []
+    assert [f["file"] for f in content["failed"]] == ["tests/test_core.py"]
+
+
+def test_ast_fallback_rejects_undefined_first_party_import(store):
+    """A hallucinated first-party import must fail the file, not ship it.
+
+    The fallback runs only after SCAFFOLD's gates rejected a file twice,
+    yet it marked everything it assembled ``syntax_ok=True``. SCAFFOLD's
+    own cross-file import check now runs over the assembled tree.
+    """
+    from cgx.session.models import SessionMode
+    from cgx.session.tasks.ast_scaffold import run_ast_scaffold
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    work_plan = Artifact.new(
+        session_id=session.session_id, produced_by_task_id="t_plan",
+        kind=ArtifactKind.WORK_PLAN,
+        content={"contracts": {"project_skeleton":
+                               "# --- app/core.py ---\n"
+                               "def add(a, b):\n    ...\n"
+                               "# --- tests/test_core.py ---\n"
+                               "def test_add():\n    ...\n"}})
+    store.save_artifact(work_plan)
+    provider = _RecordingProvider([
+        "import math\n",
+        "def add(a, b):\n    return a + b\n",
+        "from app.core import subtract\n",
+        "def test_add():\n    assert True\n",
+    ])
+    task = TaskNode.new(
+        session.session_id, TaskKind.AST_REGENERATE, "regenerate",
+        inputs={"work_plan_artifact_id": work_plan.artifact_id,
+                "prior_goal": "g",
+                "regenerate_files": ["app/core.py", "tests/test_core.py"]})
+    result = run_ast_scaffold(
+        task, ExecutorDeps(store=store, provider=provider))
+    content = result.artifact.content
+    assert [g["file"] for g in content["generated"]] == ["app/core.py"]
+    assert [d["file"] for d in content["diffs"]] == ["app/core.py"]
+    failed = content["failed"]
+    assert [f["file"] for f in failed] == ["tests/test_core.py"]
+    assert "subtract" in failed[0]["error"]
+
+
+def test_ast_fallback_reprompts_once_on_prose(store):
+    """A reply that trails off into English is retried with the error.
+
+    Fence-stripping kept the prose, so the component was dropped and the
+    file collapsed to a byte. The second reply is now the one that ships.
+    """
+    from cgx.session.models import SessionMode
+    from cgx.session.tasks.ast_scaffold import run_ast_scaffold
+    session = Session.new("g", mode=SessionMode.GREENFIELD)
+    store.save_session(session)
+    work_plan = Artifact.new(
+        session_id=session.session_id, produced_by_task_id="t_plan",
+        kind=ArtifactKind.WORK_PLAN,
+        content={"contracts": {"project_skeleton":
+                               "# --- app/core.py ---\n"
+                               "def add(a, b):\n    ...\n"}})
+    store.save_artifact(work_plan)
+    provider = _RecordingProvider([
+        "```python\nimport math\n```\nHope that helps!",
+        "def add(a, b):\n    return a + b\n",
+    ])
+    task = TaskNode.new(
+        session.session_id, TaskKind.AST_REGENERATE, "regenerate",
+        inputs={"work_plan_artifact_id": work_plan.artifact_id,
+                "prior_goal": "g", "regenerate_files": ["app/core.py"]})
+    result = run_ast_scaffold(
+        task, ExecutorDeps(store=store, provider=provider))
+    content = result.artifact.content
+    # The fenced block is taken and the trailing prose discarded -- no
+    # retry needed, and the header survives into the assembled file.
+    assert content["failed"] == []
+    assert "import math" in content["generated"][0]["content"]
+
+
+def test_ast_fallback_gives_up_after_one_reprompt(store):
+    """Two unparseable replies for the same fragment yield a failed file."""
+    from cgx.session.tasks.ast_scaffold import _generate_code
+    provider = _RecordingProvider(
+        ["Sure! I would import math.", "Of course -- here it is."])
+    assert _generate_code("app/core.py", "header", provider, "p") == ""
+    assert len(provider.prompts) == 2
+    assert "not valid Python" in provider.prompts[1]
+
+
+def test_api_check_probe_resolves_lazy_submodules(tmp_path):
+    """``from jose import jwt`` works but ``hasattr(jose, 'jwt')`` is False.
+
+    The probe used ``hasattr`` alone, so any lazily-bound submodule was
+    reported as a hallucinated attribute. ``concurrent.futures`` is the
+    stdlib-only reproduction of the same shape.
+    """
+    import subprocess
+    import sys
+    from cgx.session.tasks.api_check import _probe_references
+    # The precondition holds in a *fresh* interpreter: this one may have
+    # imported concurrent.futures already, which binds the attribute.
+    pre = subprocess.run(
+        [sys.executable, "-I", "-c",
+         "import concurrent; print(hasattr(concurrent, 'futures'))"],
+        capture_output=True, text=True, timeout=30)
+    assert pre.stdout.strip() == "False", (
+        "precondition: concurrent.futures must be lazily bound")
+    rows, probe_error = _probe_references(
+        sys.executable,
+        [("concurrent", "futures"), ("json", "no_such_symbol")],
+        30.0, tmp_path)
+    assert probe_error is None
+    by_name = {(r["module"], r["name"]): r for r in rows}
+    assert by_name[("concurrent", "futures")]["ok"] is True
+    # A genuinely absent attribute must still fail, message intact.
+    absent = by_name[("json", "no_such_symbol")]
+    assert absent["ok"] is False
+    assert "AttributeError" in absent["error"]
+
+
+def test_bootstrap_unresolved_requested_roots_are_reported():
+    """A root ``install_deps`` asked for that is *still* unimportable.
+
+    This is the loop that killed the session: API_CHECK classified the
+    hallucinated ``app`` module as ``missing_dependency``, BOOTSTRAP_ENV
+    installed nothing, and the re-probe produced a byte-identical
+    signature. Roots that survive an install round unimportable are
+    recorded as ``uninstallable`` so API_CHECK calls them hallucinations.
+    """
+    import sys
+    from cgx.session.tasks.bootstrap_env import _unresolved_requested_roots
+    unresolved = _unresolved_requested_roots(
+        ["json", "cgx_definitely_not_a_real_module"], sys.executable)
+    assert unresolved == ["cgx_definitely_not_a_real_module"]
+
+
+def test_task_from_json_tolerates_an_unknown_kind():
+    """A legacy row must not 500 the snapshot endpoint forever.
+
+    One persisted task with ``kind='agentic_repair'`` -- a value dropped
+    from the enum -- made every GET on the session raise ValueError.
+    """
+    import json as _json
+    from cgx.session.store import _task_from_json
+    blob = _json.dumps({
+        "task_id": "task_legacy", "session_id": "ses_legacy",
+        "kind": "agentic_repair", "name": "legacy", "description": "",
+        "status": "done", "inputs": {}, "created_at": 1.0})
+    node = _task_from_json(blob)
+    assert node.task_id == "task_legacy"
+    assert node.kind is TaskKind.UNKNOWN

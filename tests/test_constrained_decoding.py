@@ -105,14 +105,14 @@ def test_ollama_sends_schema_format_and_falls_back(monkeypatch):
     ok = _Recorder([200], _OLLAMA_OK)
     monkeypatch.setattr(providers.requests, "post", ok)
     providers.OllamaProvider(model="llama3").chat(
-        [{"role": "user", "content": "hi"}], json_schema=MANIFEST_SCHEMA,
+        [{"role": "user", "content": "hi"}], force_json=True, json_schema=MANIFEST_SCHEMA,
     )
     assert ok.bodies[0]["format"] == MANIFEST_SCHEMA
 
     bad = _Recorder([400, 200], _OLLAMA_OK)
     monkeypatch.setattr(providers.requests, "post", bad)
     providers.OllamaProvider(model="llama3").chat(
-        [{"role": "user", "content": "hi"}], json_schema=MANIFEST_SCHEMA,
+        [{"role": "user", "content": "hi"}], force_json=True, json_schema=MANIFEST_SCHEMA,
     )
     assert len(bad.bodies) == 2
     assert bad.bodies[0]["format"] == MANIFEST_SCHEMA
@@ -155,7 +155,7 @@ def test_gemini_sends_response_schema_and_falls_back(monkeypatch):
     bad = _Recorder([400, 200], _GEMINI_OK)
     monkeypatch.setattr(providers.requests, "post", bad)
     providers.GeminiProvider(model="gemini-2.5-flash", api_key="x").chat(
-        [{"role": "user", "content": "hi"}], json_schema=CLARIFY_QUESTIONS_SCHEMA,
+        [{"role": "user", "content": "hi"}], force_json=True, json_schema=CLARIFY_QUESTIONS_SCHEMA,
     )
     assert len(bad.bodies) == 2
     assert "responseSchema" in bad.bodies[0]["generationConfig"]
@@ -171,7 +171,7 @@ def test_openai_compat_walks_response_format_ladder(monkeypatch):
     rec = _Recorder([400, 400, 200], _OAI_OK)
     monkeypatch.setattr(providers.requests, "post", rec)
     providers.OpenAICompatProvider(model="m", base_url="http://x").chat(
-        [{"role": "user", "content": "hi"}], json_schema=REPAIR_FILES_SCHEMA,
+        [{"role": "user", "content": "hi"}], force_json=True, json_schema=REPAIR_FILES_SCHEMA,
     )
     assert len(rec.bodies) == 3
     assert rec.bodies[0]["response_format"]["type"] == "json_schema"

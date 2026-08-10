@@ -396,6 +396,10 @@ def find_missing_python_packages(
     return missing
 
 
+def _has_uv() -> bool:
+    import shutil
+    return shutil.which("uv") is not None
+
 def install_packages(
     packages: List[str],
     python: Optional[str] = None,
@@ -404,27 +408,39 @@ def install_packages(
 
     ``python`` is the interpreter path (defaults to the running one).
     This is designed to install into the SANDBOX's Python environment.
+    Gracefully falls back to `uv pip` if standard pip fails or is unavailable.
     """
     if not packages:
         return {}
     py = python or sys.executable
     results: Dict[str, bool] = {}
+    has_uv = _has_uv()
+    
     for pkg in packages:
         logger.info("env_manager: installing missing package %r", pkg)
         try:
-            proc = subprocess.run(
-                [py, "-m", "pip", "install", "--quiet", "--no-input", pkg],
-                capture_output=True, text=True, timeout=120,
+            # Try pip first
+            cmd = [py, "-m", "pip", "install", "--quiet", "--no-input", pkg]
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            if proc.returncode == 0:
+                results[pkg] = True
+                continue
+                
+            # If pip failed (maybe missing), try uv if available
+            if has_uv:
+                cmd = ["uv", "pip", "install", "--python", py, "--quiet", pkg]
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+                if proc.returncode == 0:
+                    results[pkg] = True
+                    continue
+                    
+            logger.warning(
+                "env_manager: install %r failed (rc=%d): %s",
+                pkg, proc.returncode, proc.stderr[:200],
             )
-            ok = proc.returncode == 0
-            results[pkg] = ok
-            if not ok:
-                logger.warning(
-                    "env_manager: pip install %r failed (rc=%d): %s",
-                    pkg, proc.returncode, proc.stderr[:200],
-                )
+            results[pkg] = False
         except Exception as exc:
-            logger.warning("env_manager: pip install %r raised %s", pkg, exc)
+            logger.warning("env_manager: install %r raised %s", pkg, exc)
             results[pkg] = False
     return results
 
@@ -453,6 +469,46 @@ def update_requirements(project_root: str, new_packages: List[str]) -> None:
     )
     logger.info("env_manager: added %d package(s) to requirements.txt: %s",
                 len(to_add), to_add)
+
+
+def remove_from_requirements(project_root: str,
+                             packages: List[str]) -> List[str]:
+    """Drop ``packages`` from requirements.txt -- the symmetric counterpart
+    to :func:`update_requirements` (P1.4).
+
+    Removes only the lines whose distribution name matches one of
+    ``packages`` (normalised case-/dash-insensitively, mirroring
+    :func:`_read_requirements`); comments, ``-r``/``-c`` includes, blank
+    lines, and the version specifiers on kept lines are preserved verbatim.
+    Idempotent: a package already absent is a no-op, so repeated runs are
+    safe. Returns the distribution names actually removed.
+    """
+    if not packages:
+        return []
+    req_path = Path(project_root) / "requirements.txt"
+    if not req_path.exists():
+        return []
+    targets = {p.lower().replace("-", "_") for p in packages}
+    kept: List[str] = []
+    removed: List[str] = []
+    for line in req_path.read_text(encoding="utf-8").splitlines():
+        stripped = line.split("#")[0].strip()
+        if stripped and not stripped.startswith("-"):
+            name = re.split(r"[>=<!;\[]", stripped)[0].strip() \
+                .lower().replace("-", "_")
+            if name in targets:
+                removed.append(name)
+                continue
+        kept.append(line)
+    if not removed:
+        return []
+    text = "\n".join(kept)
+    if text and not text.endswith("\n"):
+        text += "\n"
+    req_path.write_text(text, encoding="utf-8")
+    logger.info("env_manager: removed %d package(s) from requirements.txt: %s",
+                len(removed), removed)
+    return removed
 
 
 # Marker recording that requirements.txt on disk is env-managed -- a
@@ -562,8 +618,13 @@ def _pip_freeze_versions(python: Optional[str] = None) -> Dict[str, str]:
             [py, "-m", "pip", "freeze"],
             capture_output=True, text=True, timeout=120,
         )
+        if proc.returncode != 0 and _has_uv():
+            proc = subprocess.run(
+                ["uv", "pip", "freeze", "--python", py],
+                capture_output=True, text=True, timeout=120,
+            )
     except Exception as exc:
-        logger.warning("env_manager: pip freeze raised %s", exc)
+        logger.warning("env_manager: freeze raised %s", exc)
         return out
     if proc.returncode != 0:
         return out
