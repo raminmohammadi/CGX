@@ -21,7 +21,9 @@
 **A local-first coding AI agent harness, codebase indexer, and search-and-response engine for self-testing code generation.**
 
 CGX is a highly modular orchestration layer that transforms LLMs from passive chat bots into autonomous developers. As a dedicated coding AI agent harness, it is fundamentally agentic: rather than relying on free-form loops, CGX drives deterministic, plan-driven agents—including a Swarm Agent architecture featuring a Tech Lead (planner), Developer (implementer), and Verifier (tester)—to execute complex engineering tasks.
+
 Beyond answering architectural questions, CGX generates entirely new code. It features robust code scaffolding with an AST-based symbol-level generation fallback, allowing it to dynamically parse expected project skeletons and generate functions and classes individually to bypass file-level syntax errors. To ground these agents with absolute precision, CGX indexes your repository and retrieves context via a hybrid search engine (semantic + lexical + graph).
+
 Model-agnostic by design, the harness ships with a React/Vite web UI served by a FastAPI backend, streaming execution progress and live agent telemetry over Server-Sent Events. Point the CGX agent at a repo and command it in plain English. Whether you're onboarding to an unfamiliar codebase, planning a refactor, or scaffolding a brand-new project from scratch, the search-and-response engine grounds every output in your actual source—with exact file and line citations. CGX ensures all data, embeddings, and executions remain strictly on your machine, unless you explicitly opt into a cloud provider.
 
 Point CGX at a repo and ask in plain English. Whether you're onboarding to
