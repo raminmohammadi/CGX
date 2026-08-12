@@ -24,13 +24,16 @@ CGX is a highly modular orchestration layer that transforms LLMs from passive ch
 
 Beyond answering architectural questions, CGX generates entirely new code. It features robust code scaffolding with an AST-based symbol-level generation fallback, allowing it to dynamically parse expected project skeletons and generate functions and classes individually to bypass file-level syntax errors. To ground these agents with absolute precision, CGX indexes your repository and retrieves context via a hybrid search engine (semantic + lexical + graph).
 
-Model-agnostic by design, the harness ships with a React/Vite web UI served by a FastAPI backend, streaming execution progress and live agent telemetry over Server-Sent Events. Point the CGX agent at a repo and command it in plain English. Whether you're onboarding to an unfamiliar codebase, planning a refactor, or scaffolding a brand-new project from scratch, the search-and-response engine grounds every output in your actual source—with exact file and line citations. CGX ensures all data, embeddings, and executions remain strictly on your machine, unless you explicitly opt into a cloud provider.
+Model-agnostic by design, the harness ships with a React/Vite web UI served by a FastAPI backend, streaming execution progress and live agent telemetry over Server-Sent Events. 
 
 Point CGX at a repo and ask in plain English. Whether you're onboarding to
 an unfamiliar codebase, planning a refactor, or scaffolding a brand-new
 project, CGX grounds every answer and every code change in your actual
 source -- with citations to the exact files and lines -- and keeps it all on
 your machine unless you explicitly opt into a cloud model.
+
+CGX ensures all data, embeddings, and executions remain strictly on your machine, unless you explicitly opt into a cloud provider.
+
 
 > **Who is this for?**
 > - **New to CGX?** Start with [Install](#install) and [Quick start](#quick-start),
