@@ -9,7 +9,7 @@ export default defineConfig({
   plugins: [react()],
   resolve: {
     alias: {
-      "@": path.resolve(__dirname, "src"),
+      "@": path.resolve(import.meta.dirname, "src"),
     },
   },
   server: {
@@ -25,7 +25,7 @@ export default defineConfig({
     },
   },
   build: {
-    outDir: path.resolve(__dirname, "../src/cgx/webui/static"),
+    outDir: path.resolve(import.meta.dirname, "../src/cgx/webui/static"),
     emptyOutDir: true,
     sourcemap: false,
     target: "es2020",
