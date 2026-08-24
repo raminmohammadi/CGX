@@ -44,12 +44,19 @@ export function embedPillState(hw: HardwareInfo | undefined): {
       title: `torch ${hw.torch_version || "?"}${buildTag} -- embeddings run on the GPU`,
     };
   }
+  if (hw.torch_mps_available) {
+    return {
+      tone: "neon",
+      label: "Embed: Apple Metal",
+      title: `torch ${hw.torch_version || "?"} (Metal MPS) -- embeddings run on Apple Silicon GPU`,
+    };
+  }
   return {
     tone: "slate",
     label: "Embed: CPU",
     title: hw.gpu_vram_gb
       ? "torch is CPU-only despite a GPU being present"
-      : "No NVIDIA GPU detected; embeddings run on CPU",
+      : "No GPU detected; embeddings run on CPU",
   };
 }
 

@@ -78,7 +78,18 @@ def probe_status(state: Any) -> str:
         hw = ollama_discovery.detect_hardware()
         ram = hw.get("ram_gb")
         vram = hw.get("gpu_vram_gb")
-        lines.append(f"Hardware : RAM {ram} GB / VRAM {vram} GB")
+        gpu_name = hw.get("gpu_name")
+        is_unified = hw.get("is_unified_memory")
+        if gpu_name and is_unified:
+            lines.append(f"Hardware : RAM {ram} GB / GPU: {gpu_name} ({vram} GB Unified)")
+        elif gpu_name:
+            lines.append(f"Hardware : RAM {ram} GB / GPU: {gpu_name} ({vram} GB VRAM)")
+        elif vram is not None:
+            lines.append(f"Hardware : RAM {ram} GB / VRAM {vram} GB")
+        elif ram is not None:
+            lines.append(f"Hardware : RAM {ram} GB (No GPU detected)")
+        else:
+            lines.append("Hardware : (probe unavailable)")
     except Exception:
         pass
     info = index_info(state.project_root)

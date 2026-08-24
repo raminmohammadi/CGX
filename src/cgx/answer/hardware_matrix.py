@@ -101,11 +101,16 @@ def _effective_budget_gb(hw: Dict[str, Any]) -> float:
     """Return a single GB number representing how much model we can afford.
 
     Mirrors :func:`cgx.answer.ollama_discovery.recommend_default_model`:
-    VRAM (when present) dominates because the model lives in GPU memory;
-    otherwise fall back to system RAM.
+    On unified memory systems (Apple Silicon), CPU and GPU share the full
+    RAM pool as VRAM. On discrete GPU systems, VRAM (when present) dominates
+    because the model lives in dedicated GPU memory; otherwise fall back
+    to system RAM.
     """
     ram = float(hw.get("ram_gb") or 0.0)
     vram = float(hw.get("gpu_vram_gb") or 0.0)
+    is_unified = bool(hw.get("is_unified_memory"))
+    if is_unified:
+        return max(ram, vram)
     if vram > 0:
         return max(ram, vram * 2.0)
     return ram
@@ -115,13 +120,14 @@ def _verdict(entry: Dict[str, Any], hw: Dict[str, Any]) -> Dict[str, str]:
     budget = _effective_budget_gb(hw)
     min_ram = float(entry["min_ram_gb"])
     vram = float(hw.get("gpu_vram_gb") or 0.0)
+    is_unified = bool(hw.get("is_unified_memory"))
     rec_vram = float(entry["recommended_vram_gb"])
     if budget == 0:
         return {"fit": "unknown", "reason": "hardware probe returned no values"}
     if budget < min_ram * 0.9:
         return {"fit": "won't fit",
                 "reason": f"need >={min_ram:g} GB, have {budget:.1f} GB"}
-    if vram and vram < rec_vram * 0.75:
+    if not is_unified and vram and vram < rec_vram * 0.75:
         return {"fit": "tight",
                 "reason": f">={rec_vram:g} GB VRAM recommended, GPU has {vram:.1f} GB"}
     if budget < min_ram * 1.2:

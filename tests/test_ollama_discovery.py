@@ -187,3 +187,109 @@ def test_health_check_rejects_bad_scheme_without_request(monkeypatch):
     monkeypatch.setattr(od.requests, "get", boom)
     out = od.health_check("gopher://localhost:11434")
     assert out["ok"] is False and "error" in out
+
+
+def test_detect_mac_gpu_apple_silicon(monkeypatch):
+    sample_system_profiler = """
+    Graphics/Displays:
+
+        Apple M3 Max:
+
+          Chipset Model: Apple M3 Max
+          Type: GPU
+          Bus: Built-In
+          Total Number of Cores: 30
+          Vendor: Apple (0x106b)
+          Metal Support: Metal 3
+    """
+    class _SubprocResult:
+        returncode = 0
+        stdout = sample_system_profiler
+
+    monkeypatch.setattr(od.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(od.platform, "machine", lambda: "arm64")
+    monkeypatch.setattr(od.subprocess, "run", lambda *a, **kw: _SubprocResult())
+
+    info = od._detect_mac_gpu(total_ram_gb=36.0)
+    assert info["gpu_type"] == "apple_silicon"
+    assert info["is_unified_memory"] is True
+    assert info["gpu_vram_gb"] == 36.0
+    assert "Apple M3 Max" in info["gpu_name"]
+    assert "30 cores" in info["gpu_name"]
+    assert "Metal 3" in info["gpu_name"]
+
+
+def test_detect_mac_gpu_discrete(monkeypatch):
+    sample_system_profiler = """
+    Graphics/Displays:
+
+        AMD Radeon Pro 5500M:
+
+          Chipset Model: AMD Radeon Pro 5500M
+          Type: GPU
+          Bus: PCIe
+          VRAM (Total): 8 GB
+          Vendor: AMD (0x1002)
+    """
+    class _SubprocResult:
+        returncode = 0
+        stdout = sample_system_profiler
+
+    monkeypatch.setattr(od.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(od.platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(od.subprocess, "run", lambda *a, **kw: _SubprocResult())
+
+    info = od._detect_mac_gpu(total_ram_gb=16.0)
+    assert info["gpu_type"] == "discrete"
+    assert info["is_unified_memory"] is False
+    assert info["gpu_vram_gb"] == 8.0
+    assert info["gpu_name"] == "AMD Radeon Pro 5500M"
+
+
+def test_detect_hardware_apple_silicon(monkeypatch):
+    monkeypatch.setattr(od, "_detect_total_ram_gb", lambda: 48.0)
+    monkeypatch.setattr(
+        od, "_detect_gpu_info",
+        lambda ram: {
+            "gpu_name": "Apple M5 Pro (20 cores, Metal 4)",
+            "gpu_type": "apple_silicon",
+            "gpu_vram_gb": 48.0,
+            "is_unified_memory": True,
+        }
+    )
+    monkeypatch.setattr(
+        od, "_detect_torch",
+        lambda: {
+            "installed": True,
+            "cuda_available": False,
+            "mps_available": True,
+            "torch_version": "2.5.1",
+            "cuda_build": None,
+            "error": None,
+        }
+    )
+    hw = od.detect_hardware()
+    assert hw["ram_gb"] == 48.0
+    assert hw["gpu_vram_gb"] == 48.0
+    assert hw["gpu_name"] == "Apple M5 Pro (20 cores, Metal 4)"
+    assert hw["is_unified_memory"] is True
+    assert hw["torch_mps_available"] is True
+    assert hw["torch_cuda_warning"] is None
+
+
+def test_recommend_default_model_unified_memory(monkeypatch):
+    monkeypatch.setattr(od, "list_installed_models", lambda *a, **kw: [])
+    monkeypatch.setattr(
+        od, "detect_hardware",
+        lambda: {"ram_gb": 32.0, "gpu_vram_gb": 32.0, "is_unified_memory": True}
+    )
+    pick = od.recommend_default_model()
+    # On 32 GB budget with no models installed, picks the most capable from ladder
+    assert pick == "qwen2.5:7b-instruct"
+
+    # When an installed model is present, prefers it
+    monkeypatch.setattr(
+        od, "list_installed_models",
+        lambda *a, **kw: [{"name": "llama3.1:8b-instruct"}]
+    )
+    assert od.recommend_default_model() == "llama3.1:8b-instruct"
