@@ -151,3 +151,30 @@ def test_make_fit_row_respects_explicit_requirements_and_flags():
         "model", "params_b", "min_ram_gb", "rec_vram_gb", "ctx_window",
         "family", "fit", "reason", "notes", "installed",
     }
+
+
+def test_compute_local_fit_apple_silicon_unified_memory():
+    # 48 GB Apple Silicon Mac: fits 14B and 31B models comfortably
+    rows = compute_local_fit({
+        "ram_gb": 48.0,
+        "gpu_vram_gb": 48.0,
+        "gpu_name": "Apple M5 Pro",
+        "gpu_type": "apple_silicon",
+        "is_unified_memory": True,
+    })
+    by_name = {r["model"]: r for r in rows}
+    assert by_name["qwen2.5-coder:14b-instruct"]["fit"] == "fits"
+    assert by_name["gemma4:31b"]["fit"] == "fits"
+    assert by_name["qwen2.5-coder:1.5b"]["fit"] == "fits"
+
+
+def test_compute_local_fit_apple_silicon_16gb():
+    # 16 GB Apple Silicon Mac: fits 7B, rejects/tight on 26B/31B
+    rows = compute_local_fit({
+        "ram_gb": 16.0,
+        "gpu_vram_gb": 16.0,
+        "is_unified_memory": True,
+    })
+    by_name = {r["model"]: r for r in rows}
+    assert by_name["qwen2.5-coder:7b-instruct"]["fit"] == "fits"
+    assert by_name["gemma4:31b"]["fit"] == "won't fit"

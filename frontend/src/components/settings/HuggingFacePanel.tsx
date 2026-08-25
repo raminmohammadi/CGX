@@ -252,7 +252,7 @@ function FitResult({ fit }: { fit: HfModelFit }) {
         <Spec
           label="Your budget"
           value={`${ram != null ? `${ram.toFixed(0)}G RAM` : "?"} / ${
-            vram != null ? `${vram.toFixed(0)}G VRAM` : "no GPU"
+            vram != null ? `${vram.toFixed(0)}G ${fit.hardware?.is_unified_memory ? "Unified" : "VRAM"}` : "no GPU"
           }`}
         />
       </div>

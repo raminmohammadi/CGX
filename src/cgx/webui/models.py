@@ -278,11 +278,13 @@ class SessionMessage(BaseModel):
 class HardwareInfo(BaseModel):
     ram_gb: Optional[float] = None
     gpu_vram_gb: Optional[float] = None
-    # Torch CUDA probe -- ``torch_installed`` is False on core-only installs;
-    # ``torch_cuda_warning`` is populated when nvidia-smi reports a GPU but
-    # ``torch.cuda.is_available()`` is False (usually a wheel/driver mismatch).
+    gpu_name: Optional[str] = None
+    gpu_type: Optional[str] = None
+    is_unified_memory: Optional[bool] = None
+    # Torch acceleration probe (CUDA & Apple Silicon Metal MPS)
     torch_installed: Optional[bool] = None
     torch_cuda_available: Optional[bool] = None
+    torch_mps_available: Optional[bool] = None
     torch_version: Optional[str] = None
     torch_cuda_build: Optional[str] = None
     torch_cuda_warning: Optional[str] = None

@@ -102,10 +102,13 @@ export type SessionMessage = {
 export type HardwareInfo = {
   ram_gb?: number | null;
   gpu_vram_gb?: number | null;
-  // Torch CUDA probe surfaced by the backend so the Header can render an
-  // Embed pill / warning. ``torch_installed`` is null on core-only installs.
+  gpu_name?: string | null;
+  gpu_type?: string | null;
+  is_unified_memory?: boolean | null;
+  // Torch acceleration probe (CUDA & Apple Silicon Metal MPS)
   torch_installed?: boolean | null;
   torch_cuda_available?: boolean | null;
+  torch_mps_available?: boolean | null;
   torch_version?: string | null;
   torch_cuda_build?: string | null;
   torch_cuda_warning?: string | null;

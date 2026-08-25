@@ -52,10 +52,12 @@ export default function OverviewPage() {
   const placement = activeRunning ? placementLabel(activeRunning) : null;
   const embedPill = embedPillState(status?.hardware);
 
-  const hardwareValue = status?.hardware?.ram_gb != null ? `${status.hardware.ram_gb.toFixed(1)} GB RAM` : "--";
-  const hardwareCaption =
-    status?.hardware?.gpu_vram_gb != null
-      ? `${status.hardware.gpu_vram_gb.toFixed(1)} GB VRAM detected`
+  const hw = status?.hardware;
+  const hardwareValue = hw?.ram_gb != null ? `${hw.ram_gb.toFixed(1)} GB RAM` : "--";
+  const hardwareCaption = hw?.gpu_name
+    ? `${hw.gpu_name}${hw.is_unified_memory ? ` · ${hw.gpu_vram_gb?.toFixed(1)} GB Unified` : hw.gpu_vram_gb != null ? ` · ${hw.gpu_vram_gb.toFixed(1)} GB VRAM` : ""}`
+    : hw?.gpu_vram_gb != null
+      ? `${hw.gpu_vram_gb.toFixed(1)} GB VRAM detected`
       : "No GPU detected";
 
   return (

@@ -92,8 +92,9 @@ export function HardwarePanel() {
       <div className="grid grid-cols-4 gap-3">
         <StatCard label="System RAM" value={ram != null ? `${ram.toFixed(1)} GB` : "--"} tone="neon" />
         <StatCard
-          label="GPU VRAM"
+          label={data?.hardware?.is_unified_memory ? "GPU Unified Memory" : "GPU VRAM"}
           value={vram != null ? `${vram.toFixed(1)} GB` : "--"}
+          caption={data?.hardware?.gpu_name || undefined}
           tone={vram != null ? "neon" : "slate"}
         />
         <StatCard label="Catalog rows" value={data ? `${data.rows.length}` : "--"} tone="slate" />
@@ -263,7 +264,7 @@ function FitResult({ fit }: { fit: HfModelFit }) {
         <Spec
           label="Your budget"
           value={`${ram != null ? `${ram.toFixed(0)}G RAM` : "?"} / ${
-            vram != null ? `${vram.toFixed(0)}G VRAM` : "no GPU"
+            vram != null ? `${vram.toFixed(0)}G ${fit.hardware?.is_unified_memory ? "Unified" : "VRAM"}` : "no GPU"
           }`}
         />
       </div>
