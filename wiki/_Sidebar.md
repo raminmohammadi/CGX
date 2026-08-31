@@ -16,6 +16,7 @@
 
 **Configure & extend**
 - [[Providers and Models]]
+  - [[MCP tool servers|Providers and Models#mcp-tool-servers]]
 - [[Skills Registry]]
 - [[Configuration and Tuning]]
 

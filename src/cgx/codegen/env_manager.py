@@ -154,18 +154,30 @@ def _extract_imports_python(source: str) -> Set[str]:
 
 
 def _extract_imports_js(source: str) -> Set[str]:
-    """Return npm package names from JS/TS import/require calls."""
+    """Return npm package names from JS/TS import/require statements.
+
+    Covers all common forms so dependency detection is complete:
+      * ``import 'pkg'`` / ``import(...)`` / ``require('pkg')``
+      * ``import X from 'pkg'`` / ``import {a} from 'pkg'`` / ``import * as X
+        from 'pkg'`` / ``export {a} from 'pkg'`` -- the ES-module ``from`` clause
+        the previous pattern missed (the bulk of real imports).
+    Relative specifiers (``./`` / ``../`` / absolute) are excluded by the
+    leading ``[^'"./]`` guard.
+    """
     roots: Set[str] = set()
-    for m in re.finditer(
-        r"""(?:import|require)\s*[\(]?\s*['"]([^'"./][^'"]*?)['"]""", source
-    ):
-        pkg = m.group(1)
-        if pkg.startswith("@"):
-            parts = pkg.split("/")
-            if len(parts) >= 2:
-                roots.add(f"{parts[0]}/{parts[1]}")
-        else:
-            roots.add(pkg.split("/")[0])
+    patterns = (
+        r"""(?:import|require)\s*[\(]?\s*['"]([^'"./][^'"]*?)['"]""",
+        r"""\bfrom\s+['"]([^'"./][^'"]*?)['"]""",
+    )
+    for pat in patterns:
+        for m in re.finditer(pat, source):
+            pkg = m.group(1)
+            if pkg.startswith("@"):
+                parts = pkg.split("/")
+                if len(parts) >= 2:
+                    roots.add(f"{parts[0]}/{parts[1]}")
+            else:
+                roots.add(pkg.split("/")[0])
     return roots
 
 

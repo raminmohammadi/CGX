@@ -224,9 +224,23 @@ def _cmd_agent(args: argparse.Namespace) -> None:
 
     state = _state_from_args(args)
     goal = " ".join(args.goal)
-    _run_cli_stream(lambda ce: ops.agent_events(
-        state, goal, index_dir=args.index_dir, records=args.records,
-        auto=True, mode=getattr(args, "mode", None), cancel_event=ce))
+
+    # Opt-in human-in-the-loop: --approve installs a gate that prompts at the
+    # terminal before any risky tool call (arbitrary code execution, file
+    # writes, external MCP calls). Off by default so unattended runs are
+    # unchanged.
+    if getattr(args, "approve", False):
+        from cgx.session.approval import (
+            ApprovalGate, set_default_gate, terminal_responder)
+        set_default_gate(ApprovalGate(responder=terminal_responder))
+    try:
+        _run_cli_stream(lambda ce: ops.agent_events(
+            state, goal, index_dir=args.index_dir, records=args.records,
+            auto=True, mode=getattr(args, "mode", None), cancel_event=ce))
+    finally:
+        if getattr(args, "approve", False):
+            from cgx.session.approval import set_default_gate
+            set_default_gate(None)
 
 
 def _cmd_status(args: argparse.Namespace) -> None:
@@ -347,6 +361,9 @@ def main(argv: list[str] | None = None) -> None:
     p_ag.add_argument("goal", nargs="+", help="The goal for the agent.")
     p_ag.add_argument("--target-dir", default=None,
                       help="Explicit target directory for swarm outputs (overrides project-root).")
+    p_ag.add_argument("--approve", action="store_true",
+                      help="Prompt for approval at the terminal before any "
+                           "risky tool call (code execution, file writes, MCP).")
     _add_provider_flags(p_ag)
     p_ag.set_defaults(func=_cmd_agent)
 

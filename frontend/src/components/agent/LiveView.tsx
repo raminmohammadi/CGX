@@ -372,9 +372,13 @@ function LiveProgress({ p, taskKind }: { p: TaskProgress; taskKind?: string }) {
   const failedCount = p.failed_count ?? 0;
   const isFailed = p.status === "failed";
   
+  // Task kinds arrive lowercase (e.g. "swarm_tech_lead"); compare
+  // case-insensitively so the banner reads "Planning"/"Verifying" during those
+  // phases instead of always "Generating".
+  const kind = (taskKind ?? "").toLowerCase();
   let prefix = "Generating";
-  if (taskKind === "SWARM_TECH_LEAD") prefix = "Planning";
-  if (taskKind === "SWARM_VERIFY") prefix = "Verifying";
+  if (kind === "swarm_tech_lead") prefix = "Planning";
+  if (kind === "swarm_verify") prefix = "Verifying";
   
   return (
     <div className={`mb-3 rounded-lg border p-3 ${isFailed

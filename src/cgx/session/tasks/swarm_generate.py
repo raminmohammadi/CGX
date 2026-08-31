@@ -18,63 +18,101 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from cgx.codegen.ast_gluer import ASTAssembler
 from cgx.session.import_audit import strip_unused_imports, unused_imports
 from cgx.session.tasks.swarm_ground import _safe_read, ground_dependencies
 
+# Caps on model-facing context. A tool response (``run_python_probe`` output, a
+# file skeleton) and an injected dependency body are both untrusted, unbounded
+# text; left uncapped they grow the prompt every turn until a weak local model
+# either declines or exceeds its window. These mirror the truncation the
+# DIAGNOSE loop already applies to observations.
+_TOOL_OUTPUT_LIMIT = 4000
+_DEP_CONTENT_LIMIT = 2000
+
+
+def _truncate(text: str, limit: int) -> str:
+    """Clip ``text`` to ``limit`` chars, marking the elision so it is visible."""
+    if text is None:
+        return ""
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n... [truncated {len(text) - limit} chars]"
+
+
+# Tools the Developer may call while generating a file: read-only introspection
+# so imports name symbols that actually exist, plus any configured MCP tools.
+# Dispatch and descriptions both come from the shared registry -- adding a tool
+# here (or an MCP server) needs no change to this loop.
+_DEV_BASE_TOOLS = ("run_python_probe", "file_skeleton", "list_symbols")
+_MAX_TOOL_ITERS = 5
+
+
+def _dev_tools() -> tuple:
+    """Developer tool set: introspection + MCP tools when servers exist."""
+    from cgx.session.tasks.swarm_tools import mcp_tools_if_configured
+    return _DEV_BASE_TOOLS + mcp_tools_if_configured()
+
+
 class ToolWrapper:
-    def __init__(self, p, root_dir):
+    """Provider shim that resolves ``<call_tool>`` requests via the registry.
+
+    Wraps a provider so the generation ladder can call it like any other, while
+    transparently running any tool the model requests (through the approval
+    gate, when one is supplied) and feeding the result back until the model
+    produces its final answer.
+    """
+
+    def __init__(self, p, root_dir, *, tools=None, deps=None,
+                 approval_gate=None):
         self.p = p
         self.root = root_dir
-        
+        self.tools = tuple(tools) if tools is not None else _dev_tools()
+        self.deps = deps
+        self.approval_gate = approval_gate
+
     def chat(self, messages, **kwargs):
-        import re, json
-        from cgx.session.tasks.swarm_tools import run_python_probe, query_codebase
-        from cgx.session.tasks.swarm_ground import file_skeleton, list_symbols
-        
+        from cgx.session.tasks.swarm_log import swarm_beat
+        from cgx.session.tasks.tool_registry import (
+            REGISTRY, ToolContext, parse_tool_calls)
+        # register_native_tools ran at import of swarm_tools; ensure it is
+        # imported so the registry is populated even if nothing else pulled it.
+        import cgx.session.tasks.swarm_tools  # noqa: F401
+
         if messages and messages[0].get("role") == "system":
-            if "run_python_probe" not in messages[0].get("content", ""):
+            if "<call_tool" not in messages[0].get("content", ""):
                 messages[0]["content"] += (
-                    "\n\nCRITICAL INSTRUCTION: BEFORE outputting your final code JSON, you MUST verify the "
-                    "API signatures, class names, and exports of ANY local file you plan to import from. "
-                    "You do this by calling tools. DO NOT GUESS OR HALLUCINATE imported names. "
-                    "Tools available: \n"
-                    "- run_python_probe(code: str) to run arbitrary python code.\n"
-                    "- file_skeleton(path: str) to view the exact classes/functions defined in a file.\n"
-                    "- list_symbols(path: str) to see symbols in a file.\n"
-                    "To call a tool, output EXACTLY: <call_tool name=\"tool_name\">{\"arg\": \"val\"}</call_tool>\n"
-                    "Wait for the tool response. Once you have verified the necessary imports, output your final JSON response."
+                    "\n\nCRITICAL INSTRUCTION: BEFORE outputting your final code JSON, "
+                    "you MUST verify the API signatures, class names, and exports of "
+                    "ANY local file you plan to import from, by calling tools. DO NOT "
+                    "GUESS OR HALLUCINATE imported names.\n"
+                    + REGISTRY.describe_for_prompt(self.tools)
                 )
-        
+
+        ctx = ToolContext(root=self.root, deps=self.deps,
+                          log_root=self.root,
+                          approval_gate=self.approval_gate)
         kwargs["force_json"] = False
-        for _ in range(5):
+        for _ in range(_MAX_TOOL_ITERS):
             res = self.p.chat(messages=messages, **kwargs)
             text = str(res.get("content", ""))
-            match = re.search(r'<call_tool name="(.*?)">(.*?)</call_tool>', text, re.DOTALL)
-            if match:
-                t_name, t_args_str = match.group(1), match.group(2)
-                messages.append({"role": "assistant", "content": text})
-                from cgx.session.tasks.swarm_log import swarm_beat
-                swarm_beat(self.root, "developer", "tool_call", tool=t_name, args=t_args_str)
-                try:
-                    args = json.loads(t_args_str)
-                    if t_name == "run_python_probe":
-                        out = run_python_probe(args.get("code", ""), self.root)
-                    elif t_name == "file_skeleton":
-                        out = file_skeleton(args.get("path", ""), self.root)
-                    elif t_name == "list_symbols":
-                        out = str(list_symbols(args.get("path", ""), self.root))
-                    else:
-                        out = f"Unknown tool: {t_name}"
-                except Exception as e:
-                    out = f"Tool error: {e}"
-                messages.append({"role": "user", "content": f"<tool_response>\n{out}\n</tool_response>"})
-            else:
+            calls = [c for c in parse_tool_calls(text) if c.name in self.tools]
+            if not calls:
                 return res
+            messages.append({"role": "assistant", "content": text})
+            for call in calls:  # honour every requested call, not just the first
+                swarm_beat(self.root, "developer", "tool_call",
+                           tool=call.name, args=call.raw_args)
+                out = _truncate(REGISTRY.dispatch(call, ctx),
+                                _TOOL_OUTPUT_LIMIT)
+                messages.append({
+                    "role": "user",
+                    "content": f"<tool_response name=\"{call.name}\">\n{out}\n"
+                               "</tool_response>"})
         return self.p.chat(messages=messages, **kwargs)
-        
+
     def chat_stream(self, *args, **kwargs):
         return self.p.chat_stream(*args, **kwargs)
 from cgx.session.tasks.swarm_log import swarm_beat
@@ -184,14 +222,69 @@ def _dep_context(depends_on: List[str], root: str) -> List[Dict[str, str]]:
     for dep in depends_on or []:
         src = _safe_read(dep, root)
         if src:
-            ctx.append({"path": dep, "content": src})
+            # Cap each dependency body: a widely-imported module would
+            # otherwise swamp the prompt (the very failure ``_DEP_LIMIT`` in
+            # swarm_ground warns about, in a path that previously ignored it).
+            ctx.append({"path": dep,
+                        "content": _truncate(src, _DEP_CONTENT_LIMIT)})
     return ctx
+
+
+def _gate_generated_content(path: str, content: str,
+                            contracts: Dict[str, Any],
+                            manifest_paths: Optional[List[str]],
+                            root: str) -> Optional[str]:
+    """Contract + import validation for one generated body; ``None`` if clean.
+
+    Unions the contract-compliance gate with (when a manifest is known) the
+    first-party import resolver and phantom third-party check, filters to this
+    file, and returns a single error string prefixed ``AST Import validation
+    failed`` (for a bad import) or ``Contract compliance failed`` (otherwise),
+    with a hint listing the real local files. Shared by both rungs of
+    :func:`_full_file_attempt` so the logic lives in one place.
+
+    These gates parse Python (``ast`` + dotted-import resolution), so they run
+    only for ``.py`` files. A non-Python file (``.jsx``/``.ts``/…) is validated
+    by its own syntax gate in the full-file rung and by the polyglot build/test
+    in SWARM_VERIFY, not here.
+    """
+    if not path.endswith(".py"):
+        return None
+    from cgx.session.scaffold_validate import check_contract_compliance
+    warnings = check_contract_compliance({path: content}, contracts)
+    if manifest_paths:
+        from cgx.session.import_audit import resolve_first_party_imports
+        from cgx.session.tasks.swarm_verify import _check_phantom_third_party_imports
+        allowed_3p = contracts.get("third_party_dependencies", [])
+        warnings.extend(
+            resolve_first_party_imports({path: content}, manifest_paths, root))
+        warnings.extend(
+            _check_phantom_third_party_imports([path], {path: content},
+                                               allowed_3p, root))
+    file_warnings = [w for w in warnings
+                     if w.get("file") == path or w.get("module") == path]
+    if not file_warnings:
+        return None
+    errs = "; ".join(w.get("reason", "unknown") for w in file_warnings)
+    is_import_err = bool(manifest_paths) and any(
+        w.get("kind") == "phantom_third_party"
+        or "resolves against neither" in w.get("reason", "")
+        for w in file_warnings)
+    if is_import_err:
+        available = ", ".join(manifest_paths or [])
+        errs += (f". IMPORTANT: You imported a non-existent local file! "
+                 f"Available local files in the project are: {available}. "
+                 "Use the correct dotted path (e.g. if the file is src/api.py, "
+                 "use 'from src.api import ...').")
+        return f"AST Import validation failed for {path}: {errs}"
+    return f"Contract compliance failed for {path}: {errs}"
 
 
 def _full_file_attempt(path: str, description: str, depends_on: List[str],
                        contracts: Dict[str, Any], goal: str, root: str,
                        provider: Any, layer: str,
-                       manifest_paths: Optional[List[str]]) -> Any:
+                       manifest_paths: Optional[List[str]],
+                       skills: Optional[List[str]] = None) -> Any:
     from cgx.answer.engine import generate_single_scaffold_file
 
     context = _dep_context(depends_on, root)
@@ -202,6 +295,7 @@ def _full_file_attempt(path: str, description: str, depends_on: List[str],
             layer=layer,
             existing_files_with_content=context,
             goal=goal,
+            skills=skills,
             depends_on=list(depends_on or []),
             contracts=contracts or {},
             manifest_paths=manifest_paths,
@@ -211,74 +305,23 @@ def _full_file_attempt(path: str, description: str, depends_on: List[str],
         
     content = str(result.get("content") or "")
     if content and bool(result.get("syntax_ok")):
-        # Pre-AST Validation: ensure contracts meant for this file are fulfilled
-        from cgx.session.scaffold_validate import check_contract_compliance
-        warnings = check_contract_compliance({path: content}, contracts)
-        
-        # New Feature: AST-based Import Path Validation
-        # Automatically verify if the local modules imported actually exist in the plan
-        if manifest_paths:
-            from cgx.session.import_audit import resolve_first_party_imports
-            from cgx.session.tasks.swarm_verify import _check_phantom_third_party_imports
-            import_warnings = resolve_first_party_imports({path: content}, manifest_paths, root)
-            allowed_3p = contracts.get("third_party_dependencies", [])
-            phantom_warnings = _check_phantom_third_party_imports([path], {path: content}, allowed_3p, root)
-            warnings.extend(import_warnings)
-            warnings.extend(phantom_warnings)
+        return content, _gate_generated_content(
+            path, content, contracts, manifest_paths, root)
 
-        # Filter warnings specifically related to this path
-        file_warnings = [w for w in warnings if w.get("file") == path or w.get("module") == path]
-        if file_warnings:
-            errs = "; ".join(w.get("reason", "unknown") for w in file_warnings)
-            
-            # Hint to the LLM what paths actually exist!
-            is_import_err = False
-            if manifest_paths and any(w.get("kind") == "phantom_third_party" or "resolves against neither" in w.get("reason", "") for w in file_warnings):
-                available = ", ".join(manifest_paths)
-                errs += f". IMPORTANT: You imported a non-existent local file! Available local files in the project are: {available}. Use the correct dotted path (e.g. if the file is src/api.py, use 'from src.api import ...')."
-                is_import_err = True
-                
-            if is_import_err:
-                return content, f"AST Import validation failed for {path}: {errs}"
-            return content, f"Contract compliance failed for {path}: {errs}"
-        return content, None
-        
     err = (str(result.get("syntax_error") or "").strip()
            or "full-file generation failed the syntax gate")
-           
+
     if "uses undefined name(s)" in err:
         repaired = _ast_import_injector(content, err, contracts or {})
         if repaired:
             import ast
             try:
                 ast.parse(repaired)
-                from cgx.session.scaffold_validate import check_contract_compliance
-                warnings = check_contract_compliance({path: repaired}, contracts)
-                
-                if manifest_paths:
-                    from cgx.session.import_audit import resolve_first_party_imports
-                    from cgx.session.tasks.swarm_verify import _check_phantom_third_party_imports
-                    import_warnings = resolve_first_party_imports({path: repaired}, manifest_paths, root)
-                    allowed_3p = contracts.get("third_party_dependencies", [])
-                    phantom_warnings = _check_phantom_third_party_imports([path], {path: repaired}, allowed_3p, root)
-                    warnings.extend(import_warnings)
-                    warnings.extend(phantom_warnings)
-                    
-                file_warnings = [w for w in warnings if w.get("file") == path or w.get("module") == path]
-                if file_warnings:
-                    errs = "; ".join(w.get("reason", "unknown") for w in file_warnings)
-                    is_import_err = False
-                    if manifest_paths and any(w.get("kind") == "phantom_third_party" or "resolves against neither" in w.get("reason", "") for w in file_warnings):
-                        available = ", ".join(manifest_paths)
-                        errs += f". IMPORTANT: You imported a non-existent local file! Available local files in the project are: {available}. Use the correct dotted path (e.g. if the file is src/api.py, use 'from src.api import ...')."
-                        is_import_err = True
-                    if is_import_err:
-                        return repaired, f"AST Import validation failed for {path}: {errs}"
-                    return repaired, f"Contract compliance failed for {path}: {errs}"
-                return repaired, None
+                return repaired, _gate_generated_content(
+                    path, repaired, contracts, manifest_paths, root)
             except SyntaxError:
                 pass
-                
+
     return content, err
 
 
@@ -309,21 +352,41 @@ def _renegotiate_contracts(
         return None
 
 
+# Map a file extension to a Markdown code-fence language hint, so semantic
+# repair prompts (and their fenced-block extraction) match the file's language
+# instead of always assuming Python.
+_FENCE_LANG = {
+    ".py": "python", ".js": "javascript", ".jsx": "jsx", ".mjs": "javascript",
+    ".cjs": "javascript", ".ts": "typescript", ".tsx": "tsx", ".vue": "vue",
+    ".go": "go", ".rs": "rust", ".java": "java",
+}
+
+
+def _fence_lang(path: str) -> str:
+    """Fence language for ``path`` (empty when unknown)."""
+    ext = "." + path.rsplit(".", 1)[-1].lower() if "." in path else ""
+    return _FENCE_LANG.get(ext, "")
+
+
 def _semantic_repair_fallback(
         path: str, content: str, err: str, goal: str, root: str, provider: Any
 ) -> Tuple[str, str]:
-    """Semantic repair agent: fix syntax errors without losing business logic."""
-    if not path.endswith(".py"):
-        return "", "Semantic repair only supports .py files"
-        
+    """Semantic repair agent: fix syntax errors without losing business logic.
+
+    Language-aware: the fence hint and extraction follow the file's extension,
+    so a broken ``.jsx``/``.ts`` file is repaired as JS/TS rather than being
+    refused (the previous ``.py``-only guard is gone).
+    """
+    lang = _fence_lang(path)
     prompt = (
         f"The following code for {path} failed the syntax gate with this error:\n"
         f"{err}\n\n"
-        f"Code:\n```python\n{content}\n```\n\n"
-        "Fix the error (e.g., add missing imports) WITHOUT removing any business logic or functions. "
-        "Output ONLY the fixed Python code inside a ```python``` block and nothing else."
+        f"Code:\n```{lang}\n{content}\n```\n\n"
+        "Fix the error (e.g., add missing imports) WITHOUT removing any business "
+        f"logic or functions. Output ONLY the fixed code inside a ```{lang} "
+        "block and nothing else."
     )
-    
+
     try:
         res = provider.chat(messages=[{"role": "user", "content": prompt}], force_json=False)
         text = str(res.get("content") or "")
@@ -336,14 +399,15 @@ def _semantic_repair_fallback(
                     text = parsed["code"]
             except Exception:
                 pass
-        
+
         import re
-        m = re.search(r"```python\s*(.*?)\s*```", text, re.DOTALL)
+        # Accept a fenced block in any language, not just ```python.
+        m = re.search(r"```[a-zA-Z0-9_+-]*\s*(.*?)\s*```", text, re.DOTALL)
         if m:
-            fixed = m.group(1)
-            return fixed, ""
+            return m.group(1), ""
         # if no markdown block, return raw text if it looks like code
-        if "def " in text or "import " in text:
+        if any(tok in text for tok in ("def ", "import ", "function ",
+                                       "const ", "class ", "export ")):
             return text.strip(), ""
         return "", "Semantic repair failed to produce valid code."
     except Exception as exc:
@@ -460,7 +524,8 @@ def generate_file(*, path: str, description: str, depends_on: List[str],
                   contracts: Dict[str, Any], goal: str, root: str,
                   provider: Any, layer: str = "",
                   manifest_paths: Optional[List[str]] = None,
-                  log_root: Optional[str] = None) -> GenerationOutcome:
+                  log_root: Optional[str] = None,
+                  skills: Optional[List[str]] = None) -> GenerationOutcome:
     """Run the full-file -> AST fallback ladder for a single file.
 
     A planned non-source deliverable (``requirements.txt``, ``conftest.py``,
@@ -483,7 +548,7 @@ def generate_file(*, path: str, description: str, depends_on: List[str],
     for attempt in range(2):
         content, err = _full_file_attempt(
             path, description, depends_on, contracts, goal, root, provider,
-            layer, manifest_paths)
+            layer, manifest_paths, skills)
         if err:
             last_broken_content = content or last_broken_content
             swarm_beat(log_root, "developer", "gate", file=path, ok=False,

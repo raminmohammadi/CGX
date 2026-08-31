@@ -78,6 +78,7 @@ Install any of these with `pip install -e ".[<extra>]"`:
 | `codegen`    | `unidiff` (stricter diff parsing)                      |
 | `keyring`    | OS keyring for API-key storage                         |
 | `parsers`    | `tree-sitter` grammars for JavaScript / TypeScript / TSX |
+| `mcp`        | Model Context Protocol SDK for external tool servers (see **[[Providers and Models]]**) |
 | `viz`        | `matplotlib` for graph visualisation                   |
 | `dev`        | `pytest`, `ruff`, `mypy`                               |
 

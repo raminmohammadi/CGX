@@ -1000,6 +1000,9 @@ same 404 on every mount.
 | Explore-mode executors            | `src/cgx/session/tasks/{explore,investigate,recommend,plan_change}.py` |
 | Greenfield executors              | `src/cgx/session/tasks/{clarify_requirements,decompose,scaffold,ast_scaffold,bootstrap_env,api_check,smoke,runtime_verify,repair}.py` |
 | Shared write executors            | `src/cgx/session/tasks/{apply,verify,ask}.py` |
+| Swarm tool registry / dispatch    | `src/cgx/session/tasks/tool_registry.py` |
+| MCP tool servers                  | `src/cgx/mcp/` (see `docs/mcp.md`) |
+| Human-in-the-loop approval gate   | `src/cgx/session/approval.py` (see below) |
 | Repair classify / locate / propose | `src/cgx/session/repair/{classify,locate,propose}.py` |
 | PyPI client + cache (Phases 3.2 / 4.1) | `src/cgx/session/repair/pypi_client.py` |
 | Scaffold-time pin validator (Phase 4.1) | `src/cgx/session/scaffold_validate.py` |
@@ -1010,6 +1013,35 @@ same 404 on every mount.
 | Wire models                       | `src/cgx/webui/models.py` :: `AgentSession*` |
 | UI                                | `frontend/src/pages/AgentPage.tsx` + `frontend/src/components/agent/` |
 | Integration tests                 | `tests/test_webui_agent_session.py`, `tests/test_session.py` |
+
+---
+
+### 1A.11 Human-in-the-loop approval (`src/cgx/session/approval.py`)
+
+The swarm's tools include arbitrary code execution (`run_python_probe`), file
+writes, and -- when MCP is configured -- calls that reach the outside world.
+The approval gate is an **opt-in** interception at registry dispatch: a risky
+tool must be approved by a human before it runs.
+
+- **Modes** (`CGX_APPROVAL_MODE`): `off` (never gate), `risky` (default -- gate
+  MEDIUM/HIGH-risk tools), `all` (gate every tool). Each `ToolSpec` carries a
+  `RiskLevel`.
+- **Fail-safe.** A request blocks until a decision arrives or the TTL elapses;
+  timeout means **reject**, never a silent run.
+- **Front-ends.** CLI: `cgx agent --approve` prompts `y/N` at the terminal.
+  Web: the **Approvals** page (`/approvals`) polls `GET /api/approvals/pending`
+  and resolves via `POST /api/approvals/resolve`; the Agent run view also
+  surfaces this session's pending requests inline while it runs. The web gate
+  is **opt-in** per the `CGX_WEB_APPROVAL` env var (off by default so unattended
+  web runs never block); it is installed and `register_gate`'d per session in
+  the drain, and reaches the executor thread because `asyncio.to_thread` copies
+  the context-local gate.
+- **Opt-in by default.** With no gate installed, dispatch runs tools exactly as
+  before -- nothing changes for unattended runs.
+
+The gate is resolved at dispatch via an explicit `ToolContext.approval_gate`,
+else the context-local gate (`use_gate`), else a process-global default (the
+CLI path). See `docs/mcp.md` for how MCP calls (HIGH risk) flow through it.
 
 ---
 

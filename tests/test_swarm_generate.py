@@ -60,13 +60,22 @@ def test_both_rungs_fail_reports_failed(monkeypatch):
     assert out.error
 
 
-def test_ast_fallback_refuses_non_python(monkeypatch):
+def test_non_python_file_gets_repair_path(monkeypatch):
+    # Polyglot swarm: a non-Python file is no longer refused -- semantic repair
+    # is language-aware and produces content (the old ".py only" guard is gone).
     _stub_full_file(monkeypatch, "", False)
     out = sg.generate_file(
         path="src/app.js", description="x", depends_on=[], contracts={},
         goal="demo", root=".", provider=StubProvider())
-    assert not out.ok
-    assert "only supports .py" in (out.error or "")
+    assert out.ok
+    assert out.method == "semantic-repair"
+
+
+def test_fence_lang_maps_extensions():
+    assert sg._fence_lang("a.py") == "python"
+    assert sg._fence_lang("src/App.jsx") == "jsx"
+    assert sg._fence_lang("x.ts") == "typescript"
+    assert sg._fence_lang("noext") == ""
 
 
 def test_dependency_context_reads_on_disk(tmp_path):

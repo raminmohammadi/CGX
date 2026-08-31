@@ -75,6 +75,35 @@ class ReactSkill(Skill):
             "- Don't introduce class components into a hooks-based codebase."
         )
 
+    def validate_plan(self, diffs: List[Dict[str, Any]],
+                      goal: str = "") -> Optional[SkillVerdict]:
+        """Veto a React plan missing the pieces a Vite build requires.
+
+        A React plan with source files but no ``index.html`` (Vite's build
+        entry) or no ``package.json`` cannot build -- the exact failure that
+        slipped through before. Returning a fatal verdict re-asks the planner
+        with this reason instead of generating an unbuildable tree.
+        """
+        paths = file_paths(diffs)
+        js = [p for p in paths
+              if p.lower().endswith((".jsx", ".tsx", ".js", ".ts"))]
+        if not js:
+            return None  # no React source planned; not this skill's concern
+        lower = [p.lower() for p in paths]
+        missing: List[str] = []
+        if not any(p.rsplit("/", 1)[-1] == "index.html" for p in lower):
+            missing.append("an index.html entry (Vite's build entry, beside "
+                           "the frontend src/)")
+        if not any(p.rsplit("/", 1)[-1] == "package.json" for p in lower):
+            missing.append("a package.json")
+        if missing:
+            return SkillVerdict(
+                passed=False, confidence=0.9,
+                rationale=("React skill: the plan has React source but is "
+                           "missing " + " and ".join(missing)
+                           + "; a Vite build needs them."))
+        return None
+
     def validate_scaffold(self, diffs: List[Dict[str, Any]],
                           goal: str = "") -> Optional[SkillVerdict]:
         paths = file_paths(diffs)

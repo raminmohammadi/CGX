@@ -49,6 +49,28 @@ def test_npm_runner_detects_package_json(tmp_path):
     assert PytestRunner().detect(str(tmp_path)) is False
 
 
+def test_npm_runner_detects_subdir_package_json(tmp_path):
+    # Monorepo: the JS component lives in frontend/, not at the root. The
+    # runner must still detect it so the frontend gets a build gate.
+    _write(tmp_path, "backend/app.py", "x = 1\n")
+    _write(tmp_path, "frontend/package.json",
+           '{"name": "ui", "scripts": {"build": "vite build"}}')
+    assert NpmRunner().detect(str(tmp_path)) is True
+
+
+def test_find_package_json_dirs_root_and_subdir(tmp_path):
+    from cgx.codegen.test_runners import _find_package_json_dirs
+    _write(tmp_path, "package.json", '{"name": "root"}')
+    _write(tmp_path, "frontend/package.json", '{"name": "ui"}')
+    _write(tmp_path, "node_modules/dep/package.json", '{"name": "dep"}')
+    dirs = {p.rsplit("/", 1)[-1] if "/" in p else "root"
+            for p in _find_package_json_dirs(str(tmp_path))}
+    # root + frontend found; vendored node_modules pruned.
+    assert "frontend" in dirs
+    assert not any("node_modules" in p
+                   for p in _find_package_json_dirs(str(tmp_path)))
+
+
 def test_detect_test_runners_polyglot(tmp_path):
     _write(tmp_path, "pyproject.toml", "[project]\nname='x'\n")
     _write(tmp_path, "package.json", '{"name": "x", "scripts": {"build": "tsc"}}')

@@ -27,6 +27,11 @@ const KIND_META: Record<TaskKind, { badge: string; label: string }> = {
   swarm_verify:          { badge: "bg-cyan-900/80 text-cyan-300",       label: "swarm verify" },
 };
 
+// Cap how deep the tree indents. Swarm developer tasks are siblings under the
+// Tech Lead, so real depth stays shallow; this only guards against a
+// pathological chain (the runaway-indentation bug fixed in the router).
+const MAX_INDENT_DEPTH = 6;
+
 function StatusIcon({ status }: { status: TaskNodeStatus }) {
   const base = "h-3.5 w-3.5 shrink-0";
   if (status === "done")        return <CircleCheck className={`${base} text-emerald-400`} />;
@@ -116,7 +121,10 @@ function TreeNode({
       <button
         type="button"
         onClick={() => onSelect(task.task_id)}
-        style={{ paddingLeft: 8 + depth * 14 }}
+        // Clamp indentation so a deep (or accidentally chained) task graph can
+        // never march off the right edge; beyond MAX_INDENT_DEPTH levels the
+        // padding stops growing.
+        style={{ paddingLeft: 8 + Math.min(depth, MAX_INDENT_DEPTH) * 14 }}
         className={cn(
           "w-full flex items-center gap-2 py-1.5 pr-2 rounded text-left transition-colors",
           "hover:bg-white/5",

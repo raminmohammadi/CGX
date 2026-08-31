@@ -68,6 +68,29 @@ class PingResponse(BaseModel):
     error: Optional[str] = None
 
 
+def _closest_installed(model: str, installed: set) -> Optional[str]:
+    """Best-guess installed Ollama tag for ``model``, for an error hint.
+
+    Handles the common "same model, different name/case" case (e.g. a manually
+    imported ``Qwen2.5-Coder-14B-Instruct-GGUF:latest`` vs a requested
+    ``qwen2.5-coder:14b-instruct``): a case-insensitive exact match wins, else a
+    tag whose alphanumeric-normalized name starts with the requested family
+    root. Returns ``None`` when nothing is plausibly the same model.
+    """
+    def norm(s: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", s.lower())
+
+    ml = model.lower()
+    for n in installed:
+        if n.lower() == ml:
+            return n
+    nbase = norm(model.split(":")[0])
+    if not nbase:
+        return None
+    cands = [n for n in installed if norm(n).startswith(nbase)]
+    return sorted(cands, key=len)[0] if cands else None
+
+
 @router.post("/provider/ping", response_model=PingResponse)
 def ping_provider(req: PingRequest) -> PingResponse:
     """Send a minimal request to the configured provider and report latency.
@@ -94,16 +117,27 @@ def ping_provider(req: PingRequest) -> PingResponse:
                 if isinstance(m, dict)
             }
             model = (req.model or "").strip()
+            # Ollama resolves a model by its *exact* tag at generation time, so
+            # the readiness check must be exact too. The previous same-family
+            # prefix fallback was both wrong ways: case-sensitive (a
+            # differently-cased install like ``Qwen2.5-Coder-...`` was reported
+            # missing) *and* over-lenient (``qwen2.5-coder:3b`` would satisfy a
+            # request for ``:14b``, then 404 at generation). Instead: require an
+            # exact match, and on a miss list what *is* installed -- suggesting
+            # the closest tag -- so a name/case mismatch is obvious here rather
+            # than surfacing as a confusing runtime 404.
             if model and installed_names and model not in installed_names:
-                # Check without the tag suffix too (e.g. "llama3.1:8b" vs "llama3.1:8b-instruct")
-                base_name = model.split(":")[0]
-                if not any(n.startswith(base_name) for n in installed_names):
-                    elapsed = (time.monotonic() - start) * 1000
-                    return PingResponse(
-                        ok=False,
-                        latency_ms=round(elapsed, 1),
-                        error=f"Model '{model}' is not installed. Use Pull to download it first.",
-                    )
+                elapsed = (time.monotonic() - start) * 1000
+                shown = ", ".join(sorted(installed_names)[:12]) or "(none)"
+                suggestion = _closest_installed(model, installed_names)
+                hint = (f" Did you mean '{suggestion}'?" if suggestion else "")
+                return PingResponse(
+                    ok=False,
+                    latency_ms=round(elapsed, 1),
+                    error=(f"Model '{model}' is not installed (Ollama matches "
+                           f"tags exactly).{hint} Installed: {shown}. Pull it, "
+                           "or set the profile to an installed tag."),
+                )
 
         elif req.kind == "gemini":
             import requests as _req

@@ -1118,11 +1118,22 @@ def _swarm_verify_inputs(parent: TaskNode,
 
 
 def _swarm_developer_to_successors(parent: TaskNode) -> List[TaskNode]:
-    """Spawn the next Developer file-task, or the tree-level VERIFY at the end."""
+    """Spawn the next Developer file-task, or the tree-level VERIFY at the end.
+
+    The Developer chain is a *sequence*, not a hierarchy: each file-task is
+    parented to the Tech Lead (``parent.parent_task_id``), not to the preceding
+    Developer, so the whole run renders as a flat ordered list under the plan.
+    Parenting each successor to its predecessor previously built an
+    ever-deepening linked list that the task tree indented one level per file,
+    marching off the right edge on any multi-file plan.
+    """
     outputs = parent.outputs or {}
     file_index = int(outputs.get("file_index") or 0)
     file_count = int(outputs.get("file_count") or 0)
     next_index = file_index + 1
+    # Siblings share the Tech Lead as their parent; fall back to the previous
+    # task only for a degenerate root-less chain.
+    sibling_parent = parent.parent_task_id or parent.task_id
     if next_index >= file_count:
         # Every file attempted -- hand off to the tree-level verification
         # ladder, which owns the terminal edge in ``on_task_completed``.
@@ -1131,7 +1142,7 @@ def _swarm_developer_to_successors(parent: TaskNode) -> List[TaskNode]:
             kind=TaskKind.SWARM_VERIFY,
             name="Verify generated tree",
             description="Structural + environment verification of the tree.",
-            parent_task_id=parent.task_id,
+            parent_task_id=sibling_parent,
             inputs=_swarm_verify_inputs(parent, outputs),
         )]
     return [TaskNode.new(
@@ -1139,7 +1150,7 @@ def _swarm_developer_to_successors(parent: TaskNode) -> List[TaskNode]:
         kind=TaskKind.SWARM_DEVELOPER,
         name=f"Generate file {next_index + 1}",
         description="Generate the next planned file.",
-        parent_task_id=parent.task_id,
+        parent_task_id=sibling_parent,
         inputs=_swarm_dev_inputs(parent, outputs, next_index),
     )]
 

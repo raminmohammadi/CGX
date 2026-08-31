@@ -23,7 +23,12 @@ from cgx.session.tasks.scaffold import _emit_scaffold_progress
 from cgx.session.tasks.swarm_generate import generate_file
 from cgx.session.tasks.swarm_log import swarm_beat
 from cgx.session.tasks.swarm_plan import plan_specs
-from cgx.session.tasks.swarm_tools import edit_file
+from cgx.session.tasks.swarm_tools import edit_file, judge_decision
+
+
+def _judge_decision(provider: Any, prompt: str) -> tuple:
+    """Thin alias so the debate path reads naturally; see ``judge_decision``."""
+    return judge_decision(provider, prompt)
 
 
 def _load_plan(deps: ExecutorDeps, artifact_id: str) -> Dict[str, Any]:
@@ -32,6 +37,51 @@ def _load_plan(deps: ExecutorDeps, artifact_id: str) -> Dict[str, Any]:
         return {}
     art = deps.store.get_artifact(artifact_id)
     return dict(art.content) if art and art.content else {}
+
+
+def _contract_item_key(item: Any) -> Any:
+    """Stable identity for a contract list entry (function/schema/endpoint)."""
+    if isinstance(item, dict):
+        if item.get("name"):
+            return ("name", item["name"])
+        if item.get("path"):
+            return ("path", item.get("path"), item.get("method"))
+    return ("raw", repr(item))
+
+
+def merge_contracts(old: Dict[str, Any],
+                    new: Dict[str, Any]) -> Dict[str, Any]:
+    """Merge renegotiated contracts into the plan's contracts as a *superset*.
+
+    A weak model asked to "output the complete updated contracts" routinely
+    returns only the entries for the file it just wrote, which -- if written
+    back verbatim -- silently drops the contracts for every file not yet
+    generated, so those files can no longer be contract-checked. This merges
+    instead: list sections (functions/schemas/endpoints) are unioned by symbol
+    identity with the new entry overriding a same-named old one, so a
+    renegotiated signature still takes effect but no previously-declared symbol
+    is ever lost. ``third_party_dependencies`` is set-unioned. Only when ``new``
+    is not a dict is the original returned unchanged.
+    """
+    if not isinstance(new, dict):
+        return dict(old or {})
+    merged: Dict[str, Any] = dict(old or {})
+    for key, new_val in new.items():
+        old_val = merged.get(key)
+        if isinstance(new_val, list) and isinstance(old_val, list):
+            if key == "third_party_dependencies":
+                merged[key] = sorted(
+                    {str(x) for x in old_val} | {str(x) for x in new_val})
+            else:
+                by_key: Dict[Any, Any] = {}
+                for item in old_val:
+                    by_key[_contract_item_key(item)] = item
+                for item in new_val:  # new overrides same-identity old
+                    by_key[_contract_item_key(item)] = item
+                merged[key] = list(by_key.values())
+        else:
+            merged[key] = new_val
+    return merged
 
 
 @register_executor(TaskKind.SWARM_DEVELOPER)
@@ -62,6 +112,10 @@ def swarm_developer(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     path = paths[file_index]
     spec = specs.get(path, {})
     contracts = content.get("contracts") or {}
+    # The stack the Tech Lead resolved: threaded into generation so the file is
+    # authored with the right framework conventions (React Vite layout, Flask
+    # routes, package.json shape, ...) instead of Python defaults.
+    skills = list(content.get("skills") or [])
 
     swarm_beat(project_root, "developer", "generate", file=path,
                index=file_index + 1, total=file_count)
@@ -78,13 +132,15 @@ def swarm_developer(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             path=path, description=str(spec.get("description") or ""),
             depends_on=list(spec.get("depends_on") or []), contracts=contracts,
             goal=goal, root=project_root, provider=deps.provider,
-            layer=path, manifest_paths=paths, log_root=project_root)
-        
+            layer=path, manifest_paths=paths, log_root=project_root,
+            skills=skills)
+
         outcome2 = generate_file(
             path=path, description=str(spec.get("description") or ""),
             depends_on=list(spec.get("depends_on") or []), contracts=contracts,
             goal=goal, root=project_root, provider=deps.provider,
-            layer=path, manifest_paths=paths, log_root=project_root)
+            layer=path, manifest_paths=paths, log_root=project_root,
+            skills=skills)
             
         if outcome1.ok and outcome2.ok:
             judge_prompt = (
@@ -94,15 +150,15 @@ def swarm_developer(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
                 f"CODE A:\n```python\n{outcome1.content}\n```\n\n"
                 f"CODE B:\n```python\n{outcome2.content}\n```\n\n"
                 "Evaluate both implementations based on correctness, simplicity, and adherence to the objective. "
-                "Output ONLY 'A' or 'B'."
+                "On the first line output ONLY the winner letter ('A' or 'B'). "
+                "On the next line give one sentence explaining why."
             )
-            try:
-                res = deps.provider.chat([{"role": "user", "content": judge_prompt}])
-                decision = str(res.get("content", "")).strip().upper()
-            except Exception:
-                decision = "A"
+            decision, reason = _judge_decision(deps.provider, judge_prompt)
             outcome = outcome1 if decision == "A" else outcome2
-            swarm_beat(project_root, "developer", "debate_decision", file=path, decision=decision)
+            # Record the rationale (not just the letter) so a debate run is
+            # auditable and its extra cost is justified in the trace.
+            swarm_beat(project_root, "developer", "debate_decision", file=path,
+                       decision=decision, reason=reason)
         else:
             outcome = outcome1 if outcome1.ok else outcome2
     else:
@@ -110,16 +166,24 @@ def swarm_developer(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             path=path, description=str(spec.get("description") or ""),
             depends_on=list(spec.get("depends_on") or []), contracts=contracts,
             goal=goal, root=project_root, provider=deps.provider,
-            layer=path, manifest_paths=paths, log_root=project_root)
+            layer=path, manifest_paths=paths, log_root=project_root,
+            skills=skills)
 
     if outcome.ok:
         if outcome.renegotiated_contracts and deps.store:
             art = deps.store.get_artifact(work_plan_id)
             if art and isinstance(art.content, dict):
-                art.content["contracts"] = outcome.renegotiated_contracts
+                # Merge (never replace): a partial renegotiated blob must not
+                # drop contracts for files not yet generated. See
+                # :func:`merge_contracts`.
+                merged = merge_contracts(art.content.get("contracts") or {},
+                                         outcome.renegotiated_contracts)
+                art.content["contracts"] = merged
                 deps.store.save_artifact(art)
-                # also update our local copy for the rest of this function if needed
-                contracts = outcome.renegotiated_contracts
+                swarm_beat(project_root, "developer", "contracts_merged",
+                           file=path)
+                # also update our local copy for the rest of this function
+                contracts = merged
         
         write_msg = edit_file(path, outcome.content, project_root)
         swarm_beat(project_root, "developer", "write", file=path,

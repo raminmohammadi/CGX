@@ -12,10 +12,27 @@ greenfield one without any bespoke log files.
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 from cgx.session.agent_log import log_event
 from cgx.trace import emit_trace
+
+# Cache one SessionStore per project root. ``swarm_beat`` fires on every step of
+# a run (plan, per-file generate/write, tool calls, verify rounds), and the
+# first cut opened a fresh SQLite connection on each beat -- a hot, chatty path.
+# The store is a thin, thread-safe handle over the project's ``.cgx`` DB, so a
+# process-lifetime cache keyed by root removes the per-beat open.
+_STORE_CACHE: Dict[str, Any] = {}
+
+
+def _get_store(project_root: str) -> Any:
+    """Return a cached SessionStore for ``project_root`` (opened on first use)."""
+    store = _STORE_CACHE.get(project_root)
+    if store is None:
+        from cgx.session.store import SessionStore
+        store = SessionStore(project_root)
+        _STORE_CACHE[project_root] = store
+    return store
 
 
 def swarm_beat(project_root: Optional[str], role: str, phase: str,
@@ -42,7 +59,6 @@ def swarm_beat(project_root: Optional[str], role: str, phase: str,
     try:
         if project_root:
             from cgx.trace import trace_context
-            from cgx.session.store import SessionStore
             from cgx.session.models import Fact, FactKind
             import time
             import uuid
@@ -50,7 +66,7 @@ def swarm_beat(project_root: Optional[str], role: str, phase: str,
             session_id = ctx.get("session_id")
             task_id = ctx.get("task_id")
             if session_id and task_id:
-                store = SessionStore(project_root)
+                store = _get_store(project_root)
                 fact = Fact(
                     fact_id="fact_" + uuid.uuid4().hex[:16],
                     session_id=session_id,

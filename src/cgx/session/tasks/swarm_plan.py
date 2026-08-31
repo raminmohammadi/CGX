@@ -39,6 +39,50 @@ _JSON_FENCE = re.compile(r"```(?:json)?\s*(\{.*\})\s*```", re.DOTALL)
 # File extensions the AST/verification ladder treats as runnable source.
 _SOURCE_EXT = (".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java")
 
+# Per-ecosystem source extensions, used to make scaffolding/manifest/rooting
+# rules language-aware instead of Python-only. A polyglot project (e.g. a
+# Python backend + a JS/TS frontend) needs each component's own manifest and
+# test convention, so these drive which scaffolding a plan must ship.
+_PY_EXT = (".py",)
+_JS_EXT = (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".vue")
+
+
+def _langs_present(plan: Dict[str, Any]) -> Dict[str, bool]:
+    """Which ecosystems the plan's non-test source files belong to."""
+    srcs = _source_paths(plan)
+    return {
+        "python": any(p.endswith(_PY_EXT) for p in srcs),
+        "node": any(p.endswith(_JS_EXT) for p in srcs),
+    }
+
+
+def _js_component_root(plan: Dict[str, Any]) -> Optional[str]:
+    """Directory that should hold the JS component's manifest/config.
+
+    A Vite build needs ``package.json``, ``index.html``, and the source in the
+    *same* component root; if they are split (manifest at repo root, app under
+    ``frontend/``) the build runs in the wrong directory and cannot resolve the
+    entry. Returns the component root ('' = repo root), or ``None`` when the
+    plan has no JS source. Prefers the directory of ``index.html`` (Vite's
+    entry lives at the root); otherwise the parent of the JS ``src/`` tree.
+    """
+    paths = [(f.get("path") or "").replace("\\", "/") for f in _flatten_files(plan)]
+    js = [p for p in paths if p.endswith(_JS_EXT)]
+    if not js:
+        return None
+    for p in paths:
+        if p.rsplit("/", 1)[-1] == "index.html":
+            return p.rsplit("/", 1)[0] if "/" in p else ""
+    # Fall back to the shallowest directory segment before a ``src/`` boundary
+    # (e.g. frontend/src/App.jsx -> frontend), else the common parent.
+    for p in js:
+        if "/src/" in p:
+            return p.split("/src/", 1)[0]
+        if p.startswith("src/"):
+            return ""
+    dirs = [p.rsplit("/", 1)[0] if "/" in p else "" for p in js]
+    return min(dirs, key=len) if dirs else ""
+
 
 def parse_plan_reply(reply: str) -> Optional[Dict[str, Any]]:
     """Extract a plan JSON object from an LLM reply (fenced or bare braces)."""
@@ -190,22 +234,65 @@ def _scaffolding_problems(plan: Dict[str, Any]) -> List[str]:
     files = _flatten_files(plan)
     paths = [(f.get("path") or "").replace("\\", "/") for f in files]
     bases = {p.rsplit("/", 1)[-1].lower() for p in paths}
+    langs = _langs_present(plan)
     problems: List[str] = []
     if "readme.md" not in bases:
         problems.append(
             "no README.md is planned; add a top-level README.md describing "
-            "the project, its install steps, and its usage")
-    if not ({"requirements.txt", "pyproject.toml"} & bases):
+            "the project, its components, install steps, and usage")
+    # Each ecosystem needs its own dependency manifest.
+    if langs["python"] and not ({"requirements.txt", "pyproject.toml"} & bases):
         problems.append(
-            "no dependency manifest is planned; add a top-level "
-            "requirements.txt (or pyproject.toml) listing the runtime and "
-            "test dependencies")
-    under_src = any(p.startswith("src/") for p in _source_paths(plan))
-    if under_src and "conftest.py" not in paths:
+            "no Python dependency manifest is planned; add a requirements.txt "
+            "(or pyproject.toml) for the Python component")
+    if langs["node"] and "package.json" not in bases:
         problems.append(
-            "a 'src/' layout needs a root conftest.py so pytest can import "
-            "the package; add a conftest.py at the project root")
+            "no Node dependency manifest is planned; add a package.json for "
+            "the JavaScript/TypeScript component (dependencies, devDependencies, "
+            "and scripts)")
+    # conftest.py only matters for a Python ``src/`` import layout.
+    py_src = [p for p in _source_paths(plan) if p.endswith(_PY_EXT)]
+    under_src = any(p.startswith("src/") for p in py_src)
+    if langs["python"] and under_src and "conftest.py" not in paths:
+        problems.append(
+            "a Python 'src/' layout needs a root conftest.py so pytest can "
+            "import the package; add a conftest.py at the project root")
     return problems
+
+
+# JS manifest/config files that must live in the component root next to the
+# entry (index.html) for the build/test toolchain to find them.
+_JS_MANIFESTS = ("package.json", "vite.config.js", "vite.config.ts",
+                 "tsconfig.json", "vitest.config.js", "vitest.config.ts")
+
+
+def _colocate_js_manifests(plan: Dict[str, Any]) -> Dict[str, Any]:
+    """Move any JS manifest/config to the JS component root (no-op if already).
+
+    A model sometimes strands ``package.json`` at the repo root while the React
+    app is under ``frontend/``; the Vite build then runs in the wrong directory
+    and fails to resolve the entry. This rewrites such a file's planned path to
+    ``<component_root>/<name>`` so the manifest, ``index.html``, and source
+    share one directory. Purely a path fix -- content is unchanged.
+    """
+    js_root = _js_component_root(plan)
+    if js_root is None:
+        return plan
+    prefix = (js_root + "/") if js_root else ""
+    changed = False
+    layers = []
+    for lay in plan.get("layers") or []:
+        files = []
+        for f in lay.get("files") or []:
+            p = (f.get("path") or "").replace("\\", "/")
+            base = p.rsplit("/", 1)[-1].lower()
+            cur_dir = p.rsplit("/", 1)[0] if "/" in p else ""
+            if base in _JS_MANIFESTS and cur_dir != js_root:
+                f = {**f, "path": prefix + base}
+                changed = True
+            files.append(f)
+        layers.append({**lay, "files": files})
+    return {**plan, "layers": layers} if changed else plan
 
 
 def ensure_scaffolding(plan: Dict[str, Any]) -> Dict[str, Any]:
@@ -222,33 +309,56 @@ def ensure_scaffolding(plan: Dict[str, Any]) -> Dict[str, Any]:
     ``requirements.txt`` depend on every planned ``.py`` file so they are
     generated last, after the sources they describe and scan exist on disk.
     """
+    # Co-locate the JS manifest/config with its component root *before*
+    # inspecting the plan, so a manifest the model stranded at the repo root
+    # (while the app lives under frontend/) is moved next to the entry -- a Vite
+    # build resolves index.html only when package.json sits in the same dir.
+    plan = _colocate_js_manifests(plan)
+
     files = _flatten_files(plan)
     raw_paths = [f.get("path") or "" for f in files]
     bases = {p.replace("\\", "/").rsplit("/", 1)[-1].lower()
              for p in raw_paths}
-    py_paths = [p for p in raw_paths if p.endswith(".py")]
-    under_src = any(p.startswith("src/") for p in _source_paths(plan))
+    langs = _langs_present(plan)
+    py_paths = [p for p in raw_paths if p.endswith(_PY_EXT)]
+    js_paths = [p for p in raw_paths if p.endswith(_JS_EXT)]
+    under_src = any(p.startswith("src/")
+                    for p in _source_paths(plan) if p.endswith(_PY_EXT))
+    js_root = _js_component_root(plan)
+    js_prefix = (js_root + "/") if js_root else ""
 
     injected: List[FileSpec] = []
-    if not ({"requirements.txt", "pyproject.toml"} & bases):
+    # Python ecosystem scaffolding.
+    if langs["python"] and not ({"requirements.txt", "pyproject.toml"} & bases):
         injected.append({
             "path": "requirements.txt",
-            "description": ("Runtime and test dependencies for the project, "
-                            "one pip requirement per line."),
+            "description": ("Runtime and test dependencies for the Python "
+                            "component, one pip requirement per line."),
             "depends_on": list(py_paths)})
-    if under_src and "conftest.py" not in raw_paths:
+    if langs["python"] and under_src and "conftest.py" not in raw_paths:
         injected.append({
             "path": "conftest.py",
             "description": ("Pytest bootstrap that puts the project root and "
                             "src/ on sys.path so tests import the package."),
             "depends_on": []})
+    # Node ecosystem scaffolding: a package.json is required to install/build a
+    # JS/TS component. Generated via the normal file rung (skills guide its
+    # dependencies + scripts), so it only needs to be declared here.
+    if langs["node"] and "package.json" not in bases:
+        injected.append({
+            "path": js_prefix + "package.json",
+            "description": ("Node manifest for the JavaScript/TypeScript "
+                            "component: dependencies, devDependencies, and "
+                            "scripts (dev/build/test) matching the chosen "
+                            "framework."),
+            "depends_on": list(js_paths)})
     if "readme.md" not in bases:
         injected.append({
             "path": "README.md",
-            "description": ("Top-level project README: summary, install steps "
-                            "(pip install -r requirements.txt), usage, and how "
-                            "to run the tests (pytest)."),
-            "depends_on": list(py_paths)})
+            "description": ("Top-level project README: summary, the project's "
+                            "components, per-component install and run steps, "
+                            "and how to run the tests."),
+            "depends_on": list(py_paths) + list(js_paths)})
 
     if injected:
         layers = list(plan.get("layers") or [])
@@ -346,11 +456,16 @@ def verify_plan(plan: Dict[str, Any]) -> List[str]:
     if _has_dependency_cycle(files):
         problems.append("the depends_on graph has a cycle")
     src = _source_paths(plan)
-    under_src = [p for p in src if p.startswith("src/")]
-    top_level = [p for p in src if "/" not in p]
+    # The 'src/ vs top-level' rooting rule is a Python-import concern, so apply
+    # it only to Python sources. A polyglot layout (e.g. backend/ + frontend/,
+    # or a JS ``src/`` beside a Python package) is legitimate and must not be
+    # flagged as inconsistent.
+    py_src = [p for p in src if p.endswith(_PY_EXT)]
+    under_src = [p for p in py_src if p.startswith("src/")]
+    top_level = [p for p in py_src if "/" not in p]
     if under_src and top_level:
         problems.append(
-            "inconsistent layout: modules are split between 'src/' "
+            "inconsistent Python layout: modules are split between 'src/' "
             f"({', '.join(under_src)}) and the top level "
             f"({', '.join(top_level)}); commit to one rooting so the "
             "Developer emits consistent imports")

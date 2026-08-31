@@ -52,8 +52,20 @@ _MAX_VERIFY_ROUNDS = 2
 # Failure-driven repair re-runs against the *current* red suite each round, so
 # a defect unmasked only after an earlier fix (a logic bug hidden behind an
 # import error that aborted collection) earns its own targeted repair rather
-# than being stranded by a single pass.
-_MAX_DYNAMIC_REPAIR_ROUNDS = 3
+# than being stranded by a single pass. Set to 5 (was 3): a weaker local model
+# often needs a couple more targeted passes -- with the temperature ramp -- to
+# converge on a genuine logic/validation bug before the stage goes terminal.
+_MAX_DYNAMIC_REPAIR_ROUNDS = 5
+
+
+def _repair_temperature(dyn_rounds: int) -> float:
+    """Temperature ramp for repair rounds: 0.2, +0.2/round, capped at 0.8.
+
+    A first repair is near-deterministic; if the same defect survives, later
+    rounds warm up to escape a repeated wrong fix. Shared by the AST logic-fix
+    and the failure-driven repair so the schedule stays in one place.
+    """
+    return min(0.2 + (dyn_rounds * 0.2), 0.8)
 
 
 def _load_plan(deps: ExecutorDeps, artifact_id: str) -> Dict[str, Any]:
@@ -176,39 +188,53 @@ def _check_phantom_third_party_imports(paths: List[str], contents: Dict[str, str
 
 def _structural_scan(
         paths: List[str], contents: Dict[str, str],
-        contracts: Dict[str, Any], root: str) -> Tuple[List[str], List[Dict[str, Any]],
-                                            List[Dict[str, Any]]]:
-    """Run the three structural checks; never raises (each gate is defensive).
+        contracts: Dict[str, Any], root: str) -> Tuple[
+            List[str], List[Dict[str, Any]], List[Dict[str, Any]],
+            List[Dict[str, Any]]]:
+    """Run the structural checks; never raises (each gate is defensive).
 
-    Import coherence is the union of two complementary gates: the symbol-level
-    ``cross_check_first_party_imports`` (a ``from X import name`` naming a
-    symbol no file defines) and the path-level ``resolve_first_party_imports``
-    (a first-party module that resolves against neither the project root nor
-    ``root/src`` -- the misrooting class the basename-blind check abstained on).
+    Returns ``(gaps, import_breaks, advisory, contract)``:
+
+    * ``import_breaks`` -- **hard** first-party coherence failures: a
+      ``from X import name`` naming a symbol no file defines
+      (``cross_check_first_party_imports``) or a first-party module that
+      resolves nowhere (``resolve_first_party_imports``). These are genuine
+      bugs a test run may not even reach, so they gate.
+    * ``advisory`` -- **soft** ``phantom_third_party`` warnings (an import not
+      listed in the plan's ``third_party_dependencies``). Since verify now
+      reconciles + installs every real import, a legitimate dependency the
+      model simply forgot to *declare* (e.g. ``uvicorn``) must not fail a build
+      whose tests actually pass; a genuinely hallucinated package fails the real
+      install/build instead. Reported, not gating.
+    * ``contract`` -- soft contract-compliance advisories (also non-gating).
     """
     gaps = _coverage_gaps(paths, contents)
     try:
         symbol_w = cross_check_first_party_imports(contents)
-    except Exception as e:
-        print(f"Exception in dynamic repair: {repr(e)}")  # pragma: no cover - the gate is best-effort
+    except Exception as e:  # pragma: no cover - the gate is best-effort
+        swarm_beat(root, "verify", "gate_error", gate="symbol_imports",
+                   error=repr(e))
         symbol_w = []
     try:
         resolve_w = resolve_first_party_imports(contents, paths)
-    except Exception as e:
-        print(f"Exception in dynamic repair: {repr(e)}")  # pragma: no cover - the gate is best-effort
+    except Exception as e:  # pragma: no cover - the gate is best-effort
+        swarm_beat(root, "verify", "gate_error", gate="resolve_imports",
+                   error=repr(e))
         resolve_w = []
     try:
         phantom_3p_w = _check_phantom_third_party_imports(paths, contents, contracts.get("third_party_dependencies") or [], root)
-    except Exception as e:
-        print(f"Exception in dynamic repair: {repr(e)}")
+    except Exception as e:  # pragma: no cover - the gate is best-effort
+        swarm_beat(root, "verify", "gate_error", gate="phantom_third_party",
+                   error=repr(e))
         phantom_3p_w = []
-    imports = _merge_import_warnings(symbol_w, resolve_w, phantom_3p_w)
+    import_breaks = _merge_import_warnings(symbol_w, resolve_w)
     try:
         contract = check_contract_compliance(contents, contracts)
-    except Exception as e:
-        print(f"Exception in dynamic repair: {repr(e)}")  # pragma: no cover - the gate is best-effort
+    except Exception as e:  # pragma: no cover - the gate is best-effort
+        swarm_beat(root, "verify", "gate_error", gate="contract_compliance",
+                   error=repr(e))
         contract = []
-    return gaps, imports, contract
+    return gaps, import_breaks, phantom_3p_w, contract
 
 
 def _regen_targets(gaps: List[str],
@@ -224,7 +250,8 @@ def _regen_targets(gaps: List[str],
 
 def _regenerate(targets: List[str], specs: Dict[str, Any],
                 contracts: Dict[str, Any], goal: str, root: str,
-                provider: Any, all_paths: List[str]) -> List[str]:
+                provider: Any, all_paths: List[str],
+                skills: Optional[List[str]] = None) -> List[str]:
     """Re-run the generation ladder on ``targets``; return the still-failing."""
     still_bad: List[str] = []
     for path in targets:
@@ -233,7 +260,7 @@ def _regenerate(targets: List[str], specs: Dict[str, Any],
             path=path, description=str(spec.get("description") or ""),
             depends_on=list(spec.get("depends_on") or []), contracts=contracts,
             goal=goal, root=root, provider=provider, layer=path,
-            manifest_paths=all_paths, log_root=root)
+            manifest_paths=all_paths, log_root=root, skills=skills)
         if outcome.ok:
             edit_file(path, outcome.content, root)
         else:
@@ -242,20 +269,34 @@ def _regenerate(targets: List[str], specs: Dict[str, Any],
 
 
 def _run_env_dryrun(paths: List[str], root: str) -> Dict[str, Any]:
-    """Install missing imports then run the project's tests (best-effort)."""
+    """Install deps then run the project's tests/build across all stacks.
+
+    Polyglot: Python imports are pip-installed here so pytest can import them,
+    and the shared :func:`run_project_tests` then detects and runs *every*
+    applicable stack (pytest + a ``package.json`` test/build for a JS/TS
+    component), merging them into one pass/fail signal -- so a React frontend
+    gets a real ``npm run build`` gate instead of being silently skipped. The
+    npm runner installs its own node_modules.
+    """
     py = [p for p in paths if p.endswith(".py")]
     py_abs = [os.path.join(root, p) for p in py]
     report: Dict[str, Any] = {"ran": False, "outcome": "skipped"}
+    # Proactively reconcile each component's manifest against its source imports
+    # *before* building/testing, so a directly-imported-but-undeclared package
+    # (Python or npm) never fails the run -- one mechanism for any package,
+    # rather than reacting to each missing-dependency error.
+    _reconcile_manifests(paths, root)
+    if py_abs:
+        try:
+            from cgx.codegen.env_manager import preflight_install
+            missing, results = preflight_install(py_abs, root)
+            report["missing_installed"] = missing
+            report["install_results"] = results
+        except Exception as exc:  # pragma: no cover - install is best-effort
+            report["install_error"] = f"{type(exc).__name__}: {exc}"
     try:
-        from cgx.codegen.env_manager import preflight_install
-        missing, results = preflight_install(py_abs, root)
-        report["missing_installed"] = missing
-        report["install_results"] = results
-    except Exception as exc:  # pragma: no cover - install is best-effort
-        report["install_error"] = f"{type(exc).__name__}: {exc}"
-    try:
-        from cgx.codegen.test_runner import run_tests_on_disk
-        outcome = run_tests_on_disk(root, py)
+        from cgx.codegen.test_runners import run_project_tests
+        outcome = run_project_tests(root, py or paths)
         report["ran"] = bool(outcome.ran)
         report["returncode"] = outcome.returncode
         report["skipped_reason"] = outcome.skipped_reason
@@ -276,32 +317,147 @@ _MODULE_ERR_RE = re.compile(
     r"(?:ModuleNotFoundError|ImportError):[^\n]*?['\"]([\w.]+)['\"]")
 
 
+# Source extensions the repairer can rewrite (Python + the JS/TS family). A
+# build/test failure in either ecosystem should offer the implicated source to
+# the repair model, not just ``.py`` -- otherwise a broken ``.jsx``/``.ts`` is
+# never handed to the repairer and a red frontend build can never self-heal.
+_REPAIRABLE_EXT = (".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".vue",
+                   ".json")
+
+
 def _repair_context_paths(localized: List[str], paths: List[str],
                           specs: Dict[str, Any]) -> List[str]:
-    """The focused ``.py`` set to offer the repairer, localized files first.
+    """The focused source set to offer the repairer, localized files first.
 
     A weak local model declines (returns ``{"files": []}``) when handed the
     whole planned tree as context -- the signal drowns in unrelated files, so a
-    one-line ``import`` fix in a single module is never made. When the
-    traceback localized one or more files, offer *only* those plus their direct
-    ``depends_on`` (the sibling API the failing frame calls), so the prompt is
-    small and centred on the defect. With no localization (a runtime failure
-    naming no file) fall back to every planned ``.py`` -- there is no better
-    hint and small trees still fit. Order is localized-first so
+    one-line fix in a single module is never made. When the failure localized
+    one or more files, offer *only* those plus their direct ``depends_on`` (the
+    sibling API the failing frame calls), so the prompt is small and centred on
+    the defect. With no localization fall back to every planned source file --
+    there is no better hint and small trees still fit. Language-aware: Python
+    *and* JS/TS sources are eligible, so a red ``npm run build`` can repair the
+    implicated frontend file. Order is localized-first so
     ``generate_repair_files``' own ``max_files`` cap never drops a target.
     """
-    py = [p for p in paths if p.endswith(".py")]
+    src = [p for p in paths if p.endswith(_REPAIRABLE_EXT)]
     if not localized:
-        return py
+        return src
     keep: List[str] = []
     for t in localized:
-        if t in py and t not in keep:
+        if t in src and t not in keep:
             keep.append(t)
         for dep in (specs.get(t, {}) or {}).get("depends_on") or []:
             dep = str(dep)
-            if dep in py and dep not in keep:
+            if dep in src and dep not in keep:
                 keep.append(dep)
-    return keep or py
+    return keep or src
+
+
+def _reconcile_manifests(paths: List[str], root: str) -> None:
+    """Make each component's manifest declare (and install) what its source
+    imports -- the systemic fix for 'code imports X but the manifest lacks X'.
+
+    Rather than react to each build/test error for a specific missing package,
+    this scans the generated source once, per ecosystem, and closes the
+    manifest gap generically for *any* package:
+
+    * **Python** -- every third-party import root (not stdlib, not first-party)
+      is mapped to its PyPI distribution, installed, and pinned to
+      ``requirements.txt``. FastAPI/Starlette additionally imply ``httpx`` (its
+      ``TestClient`` needs it but never imports it) -- a bounded, framework-level
+      known-dep, not a per-package rule.
+    * **Node** -- for each ``package.json`` component, every bare import in its
+      JS/TS source that isn't already a (dev)dependency is ``npm install``ed
+      (which also writes it to ``dependencies``).
+
+    Best-effort and idempotent: a package already declared/installed is skipped,
+    so this never loops. Never raises.
+    """
+    try:
+        _reconcile_python_requirements(paths, root)
+    except Exception:  # pragma: no cover - reconciliation is best-effort
+        pass
+    try:
+        _reconcile_node_dependencies(root)
+    except Exception:  # pragma: no cover
+        pass
+
+
+# FastAPI/Starlette TestClient needs httpx but the app never imports it, so an
+# import scan can't see it. This is the *only* implied-dependency mapping --
+# framework-level and bounded, deliberately not a growing per-package list.
+_PY_IMPLIED_DEPS = {"fastapi": ["httpx"], "starlette": ["httpx"]}
+
+
+def _reconcile_python_requirements(paths: List[str], root: str) -> None:
+    from cgx.codegen.env_manager import (
+        _STDLIB_TOP, _import_root_to_pypi, _is_local_package, _read_requirements,
+        install_packages, scan_imports, update_requirements)
+    py_abs = [os.path.join(root, p) for p in paths if p.endswith(".py")]
+    if not py_abs:
+        return
+    imports = scan_imports(py_abs)
+    if not imports:
+        return
+    have = _read_requirements(root)  # normalized existing requirement names
+    dists: set = set()
+    for imp in imports:
+        rootmod = imp.split(".")[0]
+        if not rootmod or rootmod.lower() in _STDLIB_TOP \
+                or _is_local_package(rootmod, root):
+            continue
+        for extra in _PY_IMPLIED_DEPS.get(rootmod.lower(), []):
+            dists.add(extra)
+        dists.add(_import_root_to_pypi(rootmod) or rootmod)
+    needed = sorted(d for d in dists
+                    if d.lower().replace("-", "_") not in have)
+    if not needed:
+        return
+    results = install_packages(needed)
+    installed = [d for d in needed if results.get(d)]
+    if installed:
+        update_requirements(root, installed)
+        swarm_beat(root, "verify", "deps_reconciled", ecosystem="python",
+                   packages=installed)
+
+
+def _reconcile_node_dependencies(root: str) -> None:
+    import json as _json
+    import shutil
+    import subprocess
+    if shutil.which("npm") is None:
+        return
+    from cgx.codegen.env_manager import scan_file_imports
+    from cgx.codegen.test_runners import _find_package_json_dirs
+    for d in _find_package_json_dirs(root):
+        pj = os.path.join(d, "package.json")
+        try:
+            data = _json.loads(open(pj, encoding="utf-8").read())
+        except Exception:
+            continue
+        have = {k.lower() for k in (data.get("dependencies") or {})}
+        have |= {k.lower() for k in (data.get("devDependencies") or {})}
+        # Scan the component's own JS/TS source for bare imports.
+        imports: set = set()
+        for dirpath, dirnames, filenames in os.walk(d):
+            dirnames[:] = [x for x in dirnames if x != "node_modules"]
+            for fn in filenames:
+                if fn.endswith((".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs")):
+                    imports |= scan_file_imports(os.path.join(dirpath, fn))
+        needed = sorted(p for p in imports if p.lower() not in have)
+        if not needed:
+            continue
+        try:
+            proc = subprocess.run(
+                ["npm", "install", "--no-audit", "--no-fund",
+                 "--legacy-peer-deps", *needed],
+                cwd=d, capture_output=True, text=True, timeout=180.0)
+        except Exception:  # pragma: no cover - install is best-effort
+            continue
+        if proc.returncode == 0:
+            swarm_beat(root, "verify", "deps_reconciled", ecosystem="node",
+                       dir=os.path.relpath(d, root), packages=needed)
 
 
 def _auto_fix_missing_imports(env: Dict[str, Any], root: str, provider: Any) -> bool:
@@ -328,9 +484,10 @@ def _auto_fix_missing_imports(env: Dict[str, Any], root: str, provider: Any) -> 
     try:
         reply = provider.chat([{"role": "user", "content": prompt}], force_json=False).get("content", "").strip()
     except Exception as e:
-        print(f"Exception in dynamic repair: {repr(e)}")
+        swarm_beat(root, "verify", "auto_fix_error", fix="missing_imports",
+                   error=repr(e))
         return False
-        
+
     reply = reply.replace("```python", "").replace("```", "").strip()
     if not (reply.startswith("import ") or reply.startswith("from ")):
         return False
@@ -414,13 +571,13 @@ def _auto_fix_function_logic(env: Dict[str, Any], root: str, provider: Any, dyn_
         f"Return ONLY the raw rewritten code inside a markdown block. Do not include JSON."
     )
     
-    # Dynamically scale temperature: starts at 0.2, increases by 0.2 each round up to 0.8
-    repair_temp = min(0.2 + (dyn_rounds * 0.2), 0.8)
-    
+    repair_temp = _repair_temperature(dyn_rounds)
+
     try:
         reply = provider.chat([{"role": "user", "content": prompt}], force_json=False, temperature=repair_temp).get("content", "").strip()
     except Exception as e:
-        print(f"Exception in dynamic repair: {repr(e)}")
+        swarm_beat(root, "verify", "auto_fix_error", fix="function_logic",
+                   error=repr(e))
         return False
         
     import re as re_mod
@@ -464,10 +621,7 @@ def _dynamic_repair(env: Dict[str, Any], localized: List[str],
     """
     from cgx.answer.engine import generate_repair_files
     from cgx.session.tasks.swarm_generate import ToolWrapper
-    
-    # Dynamically scale temperature based on the repair round
-    repair_temp = min(0.2 + (dyn_rounds * 0.2), 0.8)
-    
+
     failure_text = str(env.get("output") or "")
     if not failure_text:
         return []
@@ -481,8 +635,8 @@ def _dynamic_repair(env: Dict[str, Any], localized: List[str],
         repaired = generate_repair_files(
             wrapped_provider, goal=goal, failure_text=failure_text,
             files=files, localized_files=localized)
-    except Exception as e:
-        print(f"Exception in dynamic repair: {repr(e)}")  # pragma: no cover - repair is best-effort
+    except Exception as e:  # pragma: no cover - repair is best-effort
+        swarm_beat(root, "verify", "dynamic_repair_error", error=repr(e))
         return []
     written: List[str] = []
     for path, content in (repaired or {}).items():
@@ -544,6 +698,7 @@ def swarm_verify(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     paths: List[str] = list(plan.get("paths") or [])
     contracts = plan.get("contracts") or {}
     specs = plan_specs({"layers": plan.get("layers") or []})
+    skills = list(plan.get("skills") or [])  # stack for skill-guided regen
     goal = str(task.inputs.get("goal") or plan.get("goal") or "")
     project_root = (task.inputs.get("project_root")
                     or plan.get("project_root")
@@ -553,8 +708,8 @@ def swarm_verify(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     rounds = 0
     while True:
         contents = _collect_contents(paths, project_root)
-        gaps, import_w, contract_w = _structural_scan(paths, contents,
-                                                      contracts, project_root)
+        gaps, import_w, phantom_w, contract_w = _structural_scan(
+            paths, contents, contracts, project_root)
         targets = _regen_targets(gaps, import_w)
         if not targets or rounds >= _MAX_VERIFY_ROUNDS:
             break
@@ -562,17 +717,15 @@ def swarm_verify(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         swarm_beat(project_root, "verify", "regenerate", round=rounds,
                    targets=targets)
         _regenerate(targets, specs, contracts, goal, project_root,
-                    deps.provider, paths)
+                    deps.provider, paths, skills)
 
     env = _run_env_dryrun(paths, project_root)
-    structural_ok = not (gaps or import_w or contract_w)
-    # Contract warnings are *soft*: they are advisory (a declared interface a
-    # file does not obviously satisfy) and, unlike coverage gaps and import
-    # breaks, name no file the regeneration loop can act on. They must not gate
-    # the pytest-driven repair -- a red suite on a tree with only contract
-    # warnings still deserves failure-driven repair, so key that loop on the
-    # *hard* structural signals alone.
-    hard_structural_ok = not (gaps or import_w)
+    # Only *hard* signals gate the build: missing/unparseable files (gaps) and
+    # first-party import breaks. Phantom-third-party and contract warnings are
+    # advisory -- a build whose tests + real build actually pass must not be
+    # failed because the model under-declared a (working, installed) dependency
+    # like ``uvicorn``; a truly hallucinated package fails the real install.
+    structural_ok = not (gaps or import_w)
 
     # A structurally-clean tree whose suite is nonetheless red is exactly the
     # case the static gates cannot see: an import that resolves on paper but
@@ -602,26 +755,23 @@ def swarm_verify(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         # declines, so a missing-module case still gets its provider
         # regenerated even if the repair pass produced nothing.
         
-        # Try lightweight AST-based auto-fix for missing imports first!
-        auto_fixed = _auto_fix_missing_imports(env, project_root, deps.provider)
-        if auto_fixed:
+        # Lightweight AST-based auto-fix for missing imports first.
+        if _auto_fix_missing_imports(env, project_root, deps.provider):
             repaired = {"auto_fixed": True}
+        # Then AST-based function-logic repair.
+        elif _auto_fix_function_logic(env, project_root, deps.provider, dyn_rounds):
+            repaired = {"auto_fixed_logic": True}
+        # Finally, failure-driven repair fed the red suite's output.
         else:
-            # Next try AST-based function logic repair
-            auto_fixed_logic = _auto_fix_function_logic(env, project_root, deps.provider, dyn_rounds)
-            if auto_fixed_logic:
-                repaired = {"auto_fixed_logic": True}
-            else:
-                repaired = _dynamic_repair(env, dyn_targets, contents, goal,
-                                           project_root, deps.provider, paths, specs, dyn_rounds)
+            repaired = _dynamic_repair(env, dyn_targets, contents, goal,
+                                       project_root, deps.provider, paths, specs, dyn_rounds)
         if not repaired and dyn_targets:
             _regenerate(dyn_targets, specs, contracts, goal, project_root,
-                        deps.provider, paths)
+                        deps.provider, paths, skills)
         contents = _collect_contents(paths, project_root)
-        gaps, import_w, contract_w = _structural_scan(
+        gaps, import_w, phantom_w, contract_w = _structural_scan(
             paths, contents, contracts, project_root)
-        structural_ok = not (gaps or import_w or contract_w)
-        hard_structural_ok = not (gaps or import_w)
+        structural_ok = not (gaps or import_w)
         env = _run_env_dryrun(paths, project_root)
         # Stop early when a round cannot make progress: nothing to act on (no
         # repair and no regen target), or the failure is byte-for-byte
@@ -632,7 +782,14 @@ def swarm_verify(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             break
 
     tests_red = env.get("outcome") == "failed"
-    verify_ok = structural_ok and not failed_paths and not tests_red
+    # ``failed_paths`` recorded during the Developer chain is advisory only:
+    # Verify's regeneration loop may have successfully rebuilt a file that
+    # failed generation. Reconcile against the *final* structural scan -- a
+    # path is only still failed if it remains a coverage gap (missing from
+    # disk or unparseable). Threading the raw, never-cleared list into the
+    # verdict is what previously sank a fully-repaired tree.
+    still_failed = [p for p in failed_paths if p in gaps]
+    verify_ok = structural_ok and not still_failed and not tests_red
 
     content = {
         "work_plan_artifact_id": work_plan_id,
@@ -640,10 +797,11 @@ def swarm_verify(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         "paths": paths,
         "coverage_gaps": gaps,
         "import_warnings": import_w,
-        "contract_warnings": contract_w,
+        "phantom_third_party": phantom_w,   # advisory (non-gating)
+        "contract_warnings": contract_w,    # advisory (non-gating)
         "regen_rounds": rounds,
         "dynamic_regen_rounds": dyn_rounds,
-        "failed_paths": failed_paths,
+        "failed_paths": still_failed,
         "env": env,
         "structural_ok": structural_ok,
         "verify_ok": verify_ok,
@@ -659,5 +817,5 @@ def swarm_verify(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         outputs={"verify_ok": verify_ok,
                  "verify_report_artifact_id": artifact.artifact_id,
                  "coverage_gaps": gaps,
-                 "failed_paths": failed_paths,
+                 "failed_paths": still_failed,
                  "project_root": project_root})

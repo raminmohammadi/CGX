@@ -11,6 +11,8 @@ import {
   MessageSquareDot,
   Plus,
   Settings,
+  Server,
+  ShieldCheck,
   Trash2,
   Wand2,
   Gauge,
@@ -44,6 +46,13 @@ const navGroups: { eyebrow: string; tabs: NavTab[] }[] = [
   {
     eyebrow: "Retrieval",
     tabs: [{ to: "/index", label: "Incremental Index", icon: Database, pageKey: "index" }],
+  },
+  {
+    eyebrow: "Control",
+    tabs: [
+      { to: "/mcp", label: "MCP Servers", icon: Server, pageKey: null },
+      { to: "/approvals", label: "Approvals", icon: ShieldCheck, pageKey: null },
+    ],
   },
   {
     eyebrow: "Observability",

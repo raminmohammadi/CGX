@@ -543,8 +543,49 @@ export type HfHubModel = {
   quants: string[];
 };
 
+// --- MCP / Approvals ---
+
+export type McpServer = {
+  name: string;
+  transport: string;
+  url: string | null;
+  command: string | null;
+  enabled: boolean;
+};
+
+export type McpServersResponse = {
+  sdk_installed: boolean;
+  config_path: string;
+  servers: McpServer[];
+};
+
+export type ApprovalRisk = "low" | "medium" | "high";
+
+export type ApprovalRequest = {
+  request_id: string;
+  tool: string;
+  args: Record<string, unknown>;
+  risk: ApprovalRisk;
+  created_at: number;
+  session_id: string;
+};
+
 export const api = {
   status: () => jsonReq<StatusResponse>("/api/status"),
+  // --- MCP tool servers ---
+  mcpServers: () => jsonReq<McpServersResponse>("/api/mcp/servers"),
+  mcpToggle: (body: { name: string; enabled: boolean }) =>
+    jsonReq<{ ok: boolean; reason?: string }>("/api/mcp/toggle", "POST", body),
+  // --- Human-in-the-loop approvals ---
+  approvalsPending: () =>
+    jsonReq<{ pending: ApprovalRequest[] }>("/api/approvals/pending"),
+  approvalsResolve: (body: {
+    session_id: string;
+    request_id: string;
+    approved: boolean;
+    reason?: string;
+  }) => jsonReq<{ ok: boolean; reason?: string }>(
+    "/api/approvals/resolve", "POST", body),
   ollamaHealth: (base_url: string) =>
     jsonReq<{ ok: boolean; error?: string }>(
       `/api/health/ollama?base_url=${encodeURIComponent(base_url)}`,
