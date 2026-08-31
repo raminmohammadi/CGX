@@ -2,12 +2,13 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   api, ApiError,
   type AgentSessionState, type AgentSessionSummary, type TaskProgress,
-  type SessionModeValue,
+  type SessionModeValue, type ApprovalRequest,
 } from "../../lib/api";
 import { useWorkspace } from "../../store/workspace";
 import { useAgentSession } from "../../store/agentSession";
 import { SessionLauncher } from "./SessionLauncher";
 import { LiveView, PriorSessions, activeTask } from "./LiveView";
+import { PendingApprovals } from "../PendingApprovals";
 
 export interface AgentProfileLaunch {
   // Bumped on every "Launch" click so a re-launch of the same profile
@@ -42,7 +43,11 @@ export function RunTab({
   const [error, setError] = useState<string | null>(null);
   const [reply, setReply] = useState("");
   const [progress, setProgress] = useState<Record<string, TaskProgress>>({});
+  // Human-in-the-loop approvals raised by risky tool calls in this session.
+  const [approvals, setApprovals] = useState<ApprovalRequest[]>([]);
+  const [approvalBusy, setApprovalBusy] = useState<string | null>(null);
   const pollRef = useRef<number | null>(null);
+  const approvalTimer = useRef<number | null>(null);
   // True while the SSE stream is healthy; the poll below only fires as a
   // fallback when the stream is down so the two never double-fetch.
   const sseOkRef = useRef(false);
@@ -149,6 +154,51 @@ export function RunTab({
       if (pollRef.current) { window.clearInterval(pollRef.current); pollRef.current = null; }
     };
   }, [state, activeId, loadState]);
+
+  // Poll for pending approvals while this session has work in flight, so a
+  // risky tool call blocked on the gate surfaces an Approve/Deny prompt in the
+  // live view. Scoped to this session's id. Off entirely when nothing runs.
+  useEffect(() => {
+    const inFlight = !!state && state.tasks.some(
+      (t) => t.status === "in_progress" || t.status === "ready");
+    if (!activeId || !inFlight) {
+      if (approvalTimer.current) {
+        window.clearInterval(approvalTimer.current);
+        approvalTimer.current = null;
+      }
+      setApprovals([]);
+      return;
+    }
+    const poll = async () => {
+      try {
+        const res = await api.approvalsPending();
+        setApprovals(res.pending.filter((r) => r.session_id === activeId));
+      } catch { /* best-effort */ }
+    };
+    void poll();
+    approvalTimer.current = window.setInterval(() => void poll(), 2500);
+    return () => {
+      if (approvalTimer.current) {
+        window.clearInterval(approvalTimer.current);
+        approvalTimer.current = null;
+      }
+    };
+  }, [state, activeId]);
+
+  const resolveApproval = useCallback(
+    async (req: ApprovalRequest, approved: boolean) => {
+      setApprovalBusy(req.request_id);
+      try {
+        await api.approvalsResolve({
+          session_id: req.session_id,
+          request_id: req.request_id,
+          approved,
+        });
+        setApprovals((prev) =>
+          prev.filter((r) => r.request_id !== req.request_id));
+      } catch { /* the next poll will re-surface it */ }
+      finally { setApprovalBusy(null); }
+    }, []);
 
   const createSession = useCallback(async (opts: {
     objective: string; projectRoot: string;
@@ -278,23 +328,38 @@ export function RunTab({
   );
 
   return (
-    <LiveView
-      state={state} sessions={sessions} pending={pending} error={error}
-      progress={progress} running={running}
-      runModel={runModels[activeId] ?? null} selectedModel={provider.model}
-      reply={reply} setReply={setReply}
-      selectedTaskId={selectedTaskId} setSelectedTaskId={setSelectedTaskId}
-      onDecide={(payload) => {
-        const taskId = selectedTaskId
-          ?? activeTask(state)?.task_id ?? "";
-        if (taskId) return postDecision(taskId, payload);
-      }}
-      onSend={postMessage}
-      onCancel={cancelSession}
-      onSwitch={(sid) => { setActiveId(sid); setSelectedTaskId(null); }}
-      onNew={() => { setActiveId(null); setSelectedTaskId(null); setState(null); }}
-      onRefresh={() => loadState(activeId)}
-      onDelete={deleteSession}
-    />
+    <div className="relative flex flex-col h-full min-h-0">
+      {approvals.length > 0 && (
+        <div className="shrink-0 border-b border-amber-500/30 bg-amber-950/10 px-4 py-2">
+          <p className="text-[10px] uppercase tracking-wider text-amber-400 mb-1.5">
+            Approval required
+          </p>
+          <PendingApprovals
+            items={approvals} onResolve={resolveApproval}
+            busyId={approvalBusy} compact
+          />
+        </div>
+      )}
+      <div className="flex-1 min-h-0">
+        <LiveView
+          state={state} sessions={sessions} pending={pending} error={error}
+          progress={progress} running={running}
+          runModel={runModels[activeId] ?? null} selectedModel={provider.model}
+          reply={reply} setReply={setReply}
+          selectedTaskId={selectedTaskId} setSelectedTaskId={setSelectedTaskId}
+          onDecide={(payload) => {
+            const taskId = selectedTaskId
+              ?? activeTask(state)?.task_id ?? "";
+            if (taskId) return postDecision(taskId, payload);
+          }}
+          onSend={postMessage}
+          onCancel={cancelSession}
+          onSwitch={(sid) => { setActiveId(sid); setSelectedTaskId(null); }}
+          onNew={() => { setActiveId(null); setSelectedTaskId(null); setState(null); }}
+          onRefresh={() => loadState(activeId)}
+          onDelete={deleteSession}
+        />
+      </div>
+    </div>
   );
 }

@@ -506,18 +506,19 @@ def _diagnose_call(
 
 
 # --------------------- read-only tools ---------------------
+# DIAGNOSE keeps its JSON-per-turn protocol (a turn is either a tool call or the
+# final verdict, under ``force_json``), but tool *dispatch* now goes through the
+# shared ``ToolRegistry`` -- the same mechanism the swarm uses -- so there is no
+# longer a bespoke if/elif tool switch. The tools are read-only (LOW risk), so
+# the approval gate never intercepts them.
 
 def _run_tool(tool: str, parsed: Dict[str, Any], fc: FailureContext,
               root: Path) -> str:
-    if tool == "inspect_packages":
-        return "installed packages: " + (
-            ", ".join(fc.installed_packages) or "(none recorded)")
-    if tool == "read_file":
-        return _tool_read_file(str(parsed.get("path") or ""), root)
-    if tool == "grep_files":
-        return _tool_grep(str(parsed.get("pattern") or ""), root)
-    return (f"unknown tool {tool!r}; available: read_file, grep_files, "
-            "inspect_packages")
+    from cgx.session.tasks.tool_registry import ToolCall, ToolContext
+    ctx = ToolContext(root=str(root),
+                      extra={"installed_packages": list(fc.installed_packages)})
+    return _DIAGNOSE_TOOLS.dispatch(
+        ToolCall(name=tool, args=parsed, raw_args=""), ctx)
 
 
 def _tool_read_file(rel: str, root: Path) -> str:
@@ -556,6 +557,46 @@ def _tool_grep(pattern: str, root: Path) -> str:
                 if len(hits) >= _TOOL_GREP_MAX_HITS:
                     return "\n".join(hits)
     return "\n".join(hits) if hits else f"no matches for {pattern!r}"
+
+
+# --------------------- diagnose tool registry ---------------------
+# A dedicated registry (not the swarm's shared one): DIAGNOSE's tools are
+# read-only and project-scoped, and its wire protocol differs, but it reuses the
+# same ToolRegistry/ToolSpec/dispatch machinery so error handling and the "run a
+# named tool with args" contract are identical across the codebase.
+
+def _reg_read_file(args: "Dict[str, Any]", ctx: "Any") -> str:
+    return _tool_read_file(str(args.get("path") or ""), Path(ctx.root))
+
+
+def _reg_grep_files(args: "Dict[str, Any]", ctx: "Any") -> str:
+    return _tool_grep(str(args.get("pattern") or ""), Path(ctx.root))
+
+
+def _reg_inspect_packages(args: "Dict[str, Any]", ctx: "Any") -> str:
+    pkgs = ctx.extra.get("installed_packages") or []
+    return "installed packages: " + (", ".join(pkgs) or "(none recorded)")
+
+
+def _build_diagnose_registry():
+    from cgx.session.tasks.tool_registry import (
+        RiskLevel, ToolRegistry, ToolSpec)
+    reg = ToolRegistry()
+    reg.register(ToolSpec(name="read_file", risk=RiskLevel.LOW,
+                          arg_hint='{"path": "..."}',
+                          description="Read a project file (read-only).",
+                          handler=_reg_read_file))
+    reg.register(ToolSpec(name="grep_files", risk=RiskLevel.LOW,
+                          arg_hint='{"pattern": "..."}',
+                          description="Grep source files for a pattern.",
+                          handler=_reg_grep_files))
+    reg.register(ToolSpec(name="inspect_packages", risk=RiskLevel.LOW,
+                          description="List installed packages.",
+                          handler=_reg_inspect_packages))
+    return reg
+
+
+_DIAGNOSE_TOOLS = _build_diagnose_registry()
 
 
 def _iter_source_files(root: Path):

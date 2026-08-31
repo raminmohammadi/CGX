@@ -47,6 +47,9 @@ unset). The most useful:
 | `CGX_EMBED_DEVICE` | auto (CUDA > MPS > CPU) | Force `cpu`, `cuda`, or `mps`. |
 | `CGX_EMBED_BATCH` / `CGX_EMBED_MAXLEN` | `64` / `8192` | Embedding batch size / max tokens. |
 | `CGX_TELEMETRY` | `0` (off) | Set `1` to enable the anonymous startup ping. |
+| `CGX_APPROVAL_MODE` | `risky` | Human-in-the-loop gate for swarm tools: `off`, `risky` (gate MEDIUM/HIGH tools), or `all`. Only takes effect once a gate is installed (`cgx agent --approve` or the web approvals API). See **[[Privacy and Security]]**. |
+| `CGX_MCP_CONFIG` | `~/.cgx/mcp.json` | Path to the local MCP tool-server roster. |
+| `CGX_WEB_APPROVAL` | _(unset)_ | When set, the web session drive installs an approval gate so risky tool calls surface at `/approvals`. Off by default so web runs never block. Gated tools follow `CGX_APPROVAL_MODE`. |
 | `NO_COLOR` / `CGX_NO_COLOR` / `CGX_FORCE_COLOR` | — | Terminal colour control. |
 
 **FAISS knobs** (`CGX_FAISS_*`): `METRIC` (`cosine`), `INDEX`

@@ -96,7 +96,72 @@ def test_verify_plan_rejects_mixed_rooting():
         {"path": "src/a.py", "description": "a"},
         {"path": "b.py", "description": "b"}]}]})
     problems = verify_plan(plan)
-    assert any("inconsistent layout" in p for p in problems)
+    assert any("inconsistent Python layout" in p for p in problems)
+
+
+def _polyglot_plan():
+    # A Flask backend + a React/Vite frontend, each under its own directory.
+    return normalize_plan({"goal": "flask + react calculator", "layers": [
+        {"name": "backend", "files": [
+            {"path": "backend/app.py", "description": "flask app"},
+            {"path": "backend/routes.py", "description": "routes",
+             "depends_on": ["backend/app.py"]},
+        ]},
+        {"name": "frontend", "files": [
+            {"path": "frontend/src/main.jsx", "description": "mount"},
+            {"path": "frontend/src/App.jsx", "description": "root component",
+             "depends_on": ["frontend/src/main.jsx"]},
+        ]},
+    ]})
+
+
+def test_polyglot_layout_not_flagged_as_inconsistent():
+    # A JS 'src/' beside a Python 'backend/' must NOT trip the Python-only
+    # rooting rule (the bug that let the swarm ignore the frontend).
+    problems = verify_plan(_polyglot_plan())
+    assert not any("inconsistent" in p for p in problems)
+
+
+def test_scaffolding_problems_requires_both_manifests():
+    problems = verify_plan(_polyglot_plan())
+    assert any("Python dependency manifest" in p for p in problems)
+    assert any("package.json" in p for p in problems)
+
+
+def test_ensure_scaffolding_injects_node_and_python_manifests():
+    plan = ensure_scaffolding(_polyglot_plan())
+    paths = {f["path"] for lay in plan["layers"] for f in lay["files"]}
+    assert "requirements.txt" in paths                # python component
+    # package.json is co-located with the frontend component, not at repo root.
+    assert "frontend/package.json" in paths
+    assert "package.json" not in paths
+    assert "README.md" in paths
+    # No conftest.py: the Python code is under backend/, not a 'src/' layout.
+    assert "conftest.py" not in paths
+
+
+def test_colocate_relocates_root_package_json_to_frontend():
+    # The exact bug: model put package.json at the repo root while the React
+    # app is under frontend/. Co-location moves it beside the entry.
+    plan = normalize_plan({"goal": "x", "layers": [{"name": "l", "files": [
+        {"path": "package.json", "description": "manifest"},
+        {"path": "frontend/index.html", "description": "entry"},
+        {"path": "frontend/src/App.jsx", "description": "root"},
+    ]}]})
+    plan = ensure_scaffolding(plan)
+    paths = {f["path"] for lay in plan["layers"] for f in lay["files"]}
+    assert "frontend/package.json" in paths
+    assert "package.json" not in paths
+
+
+def test_ensure_scaffolding_skips_python_manifest_for_js_only():
+    js_only = normalize_plan({"goal": "react app", "layers": [{"name": "ui",
+        "files": [{"path": "src/main.jsx", "description": "mount"}]}]})
+    plan = ensure_scaffolding(js_only)
+    paths = {f["path"] for lay in plan["layers"] for f in lay["files"]}
+    assert "package.json" in paths
+    assert "requirements.txt" not in paths
+    assert "conftest.py" not in paths
 
 
 def test_verify_plan_rejects_unsafe_path():

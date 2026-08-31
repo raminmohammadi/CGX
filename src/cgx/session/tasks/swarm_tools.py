@@ -9,24 +9,6 @@ from cgx.session.tasks.base import ExecutorDeps
 
 logger = logging.getLogger(__name__)
 
-def bash_repl(command: str, cwd: str) -> str:
-    """Execute a bash command in the given directory and return stdout/stderr."""
-    try:
-        result = subprocess.run(
-            command,
-            shell=True,
-            cwd=cwd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            timeout=30  # Don't let it hang forever
-        )
-        return result.stdout or "Success (no output)"
-    except subprocess.TimeoutExpired:
-        return "Error: Command timed out after 30 seconds."
-    except Exception as e:
-        return f"Error executing command: {e}"
-
 def query_codebase(query: str, deps: ExecutorDeps) -> str:
     """Wrapper around run_query_auto to search the indexed codebase."""
     if not deps.index_dir or not deps.records_path:
@@ -67,26 +49,6 @@ def edit_file(path: str, content: str, cwd: str) -> str:
     except Exception as e:
         return f"Error writing file: {e}"
 
-def patch_file(path: str, find: str, replace: str, cwd: str) -> str:
-    """Replace a specific block of text in a file."""
-    full_path = os.path.join(cwd, path)
-    if not os.path.exists(full_path):
-        return f"Error: File {path} does not exist."
-    
-    try:
-        with open(full_path, "r", encoding="utf-8") as f:
-            content = f.read()
-        
-        if find not in content:
-            return f"Error: The 'find' text was not found in {path}. Ensure exact match."
-        
-        new_content = content.replace(find, replace, 1)
-        with open(full_path, "w", encoding="utf-8") as f:
-            f.write(new_content)
-        return f"Successfully patched {path}"
-    except Exception as e:
-        return f"Error patching file: {e}"
-
 def run_python_probe(code: str, cwd: str) -> str:
     """Run a Python snippet in a sandbox REPL to introspect libraries.
     
@@ -122,6 +84,30 @@ def run_python_probe(code: str, cwd: str) -> str:
         if os.path.exists(temp_path):
             os.remove(temp_path)
 
+def judge_decision(provider: Any, prompt: str) -> tuple:
+    """Ask a judge model for an A/B verdict plus a one-line rationale.
+
+    Used by debate mode in both the Tech Lead and Developer. The judge is
+    prompted to put the winner letter on the first line and the reason on the
+    next; this tolerantly extracts the first ``A``/``B`` seen (defaulting to
+    ``A``) and returns ``(letter, reason)`` so callers can record *why* a draft
+    won rather than discarding the reasoning. Never raises.
+    """
+    try:
+        res = provider.chat([{"role": "user", "content": prompt}])
+        text = str(res.get("content", "")).strip()
+    except Exception as e:
+        return "A", f"judge error: {e}"
+    letter = "A"
+    for ch in text:
+        if ch.upper() in ("A", "B"):
+            letter = ch.upper()
+            break
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    reason = lines[1] if len(lines) > 1 else (lines[0] if lines else "")
+    return letter, reason[:300]
+
+
 def search_web(query: str) -> str:
     """A simple web search tool for the Tech Lead to fetch API documentation snippets."""
     import urllib.request
@@ -141,3 +127,91 @@ def search_web(query: str) -> str:
         return '\\n\\n'.join(clean_snippets[:3]) if clean_snippets else "No relevant snippets found."
     except Exception as e:
         return f"Search failed: {e}"
+
+
+# --------------------- registry wiring ---------------------
+# Register the model-callable native tools so both swarm loops dispatch through
+# one table and their descriptions are auto-injected into the system prompt.
+# Handlers share the ``(args, ctx)`` shape; see :mod:`tool_registry`.
+from cgx.session.tasks.tool_registry import (  # noqa: E402
+    REGISTRY, RiskLevel, ToolContext, ToolSpec)
+
+
+def _h_run_python_probe(args: Dict[str, Any], ctx: ToolContext) -> str:
+    return run_python_probe(str(args.get("code", "")), ctx.root)
+
+
+def _h_file_skeleton(args: Dict[str, Any], ctx: ToolContext) -> str:
+    from cgx.session.tasks.swarm_ground import file_skeleton
+    return file_skeleton(str(args.get("path", "")), ctx.root)
+
+
+def _h_list_symbols(args: Dict[str, Any], ctx: ToolContext) -> str:
+    from cgx.session.tasks.swarm_ground import list_symbols
+    return str(list_symbols(str(args.get("path", "")), ctx.root))
+
+
+def _h_query_codebase(args: Dict[str, Any], ctx: ToolContext) -> str:
+    if ctx.deps is None:
+        return "Error: codebase index not available in this context."
+    return query_codebase(str(args.get("query", "")), ctx.deps)
+
+
+def _h_search_web(args: Dict[str, Any], ctx: ToolContext) -> str:
+    return search_web(str(args.get("query", "")))
+
+
+def register_native_tools() -> None:
+    """(Re)register the built-in swarm tools on the default registry."""
+    REGISTRY.register(ToolSpec(
+        name="run_python_probe", risk=RiskLevel.HIGH, arg_hint='{"code": "..."}',
+        description="Run a short Python snippet to introspect a library "
+                    "(dir(), help(), import checks). Executes code.",
+        handler=_h_run_python_probe))
+    REGISTRY.register(ToolSpec(
+        name="file_skeleton", risk=RiskLevel.LOW, arg_hint='{"path": "..."}',
+        description="Show the exact classes/functions a local file defines.",
+        handler=_h_file_skeleton))
+    REGISTRY.register(ToolSpec(
+        name="list_symbols", risk=RiskLevel.LOW, arg_hint='{"path": "..."}',
+        description="List the symbols defined in a local file.",
+        handler=_h_list_symbols))
+    REGISTRY.register(ToolSpec(
+        name="query_codebase", risk=RiskLevel.LOW, arg_hint='{"query": "..."}',
+        description="Semantic search over the indexed codebase for relevant "
+                    "files and snippets.",
+        handler=_h_query_codebase))
+    REGISTRY.register(ToolSpec(
+        name="search_web", risk=RiskLevel.MEDIUM, arg_hint='{"query": "..."}',
+        description="Search the web for API docs / library signatures.",
+        handler=_h_search_web))
+
+
+register_native_tools()
+
+# Register the MCP discovery/call tools too. They degrade gracefully when no
+# servers are configured or the optional SDK is absent, so registering them
+# unconditionally is safe; they are only *advertised* to a role when servers
+# exist (see ``mcp_tools_if_configured``).
+try:
+    from cgx.mcp.manager import register_mcp_tools
+    register_mcp_tools()
+except Exception:  # pragma: no cover - MCP package optional
+    logger.debug("MCP tools not registered", exc_info=True)
+
+
+def mcp_tools_if_configured() -> tuple:
+    """MCP tool names to advertise to the agent when servers are configured.
+
+    Keeping MCP off the advertised list until a server exists means the agent
+    only ever sees tools it can actually use, while a single ~/.cgx/mcp.json
+    edit makes them appear -- the agent then discovers and calls them via the
+    normal tool loop (requirements: MCP-aware + easy to extend).
+    """
+    try:
+        from cgx.mcp.config import enabled_servers
+        if enabled_servers():
+            return ("mcp_list_servers", "mcp_list_tools", "mcp_call")
+    except Exception:  # pragma: no cover
+        pass
+    return ()

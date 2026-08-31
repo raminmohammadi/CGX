@@ -2,6 +2,153 @@
 
 All notable changes are documented here. Versions follow semver-ish.
 
+## Unreleased -- Swarm self-healing (manifest reconciliation, honest gates)
+
+Follows the polyglot work below: the swarm now makes a generated project
+*actually installable/buildable* itself, and stops failing builds that pass —
+so the verdict reflects reality instead of model-authored metadata. All
+systemic (not per-package) fixes.
+
+* **Import-driven manifest reconciliation** (`swarm_verify.py`
+  `_reconcile_manifests`). Before building/testing, each component's manifest
+  is reconciled against what its source actually imports: Python third-party
+  imports are installed + pinned to `requirements.txt`; a component's bare
+  JS/TS imports are `npm install`ed into its `package.json`. One mechanism for
+  *any* package -- not a rule per package. FastAPI/Starlette additionally imply
+  `httpx` (its `TestClient` needs it but never imports it) via a single bounded
+  framework map (`_PY_IMPLIED_DEPS`).
+* **JS import extraction fixed** (`env_manager._extract_imports_js`). Now
+  recognizes the ES-module `import X from 'pkg'` / `export … from 'pkg'` forms
+  it previously missed (it only saw bare `import 'x'` / `require('x')`), so
+  dependency detection is complete.
+* **Manifest co-location** (`swarm_plan.py` `_colocate_js_manifests`). A JS
+  manifest/config the model stranded at the repo root while the app lives under
+  `frontend/` is moved to the component root beside its `index.html`, so the
+  Vite build resolves its entry. Scaffolding injects `package.json` at the
+  component root.
+* **Honest gates**: `phantom_third_party` and contract warnings are now
+  *advisory*, not gating -- a build whose tests and real build pass is no
+  longer failed because the model under-declared a working, installed
+  dependency (e.g. `uvicorn`). Only coverage gaps and first-party import breaks
+  gate; the real build/test is the authority. Reported under
+  `phantom_third_party` / `contract_warnings` in the verify report.
+* **npm robustness**: the runner discovers component subdir `package.json`
+  files (monorepo `frontend/`), and installs with `--legacy-peer-deps` so a
+  model's imperfect peer-version pin doesn't abort the whole install.
+* **Repair budget** raised (`_MAX_DYNAMIC_REPAIR_ROUNDS` 3 → 5) so a weaker
+  local model gets a couple more targeted, temperature-ramped passes to
+  converge on a genuine logic/validation bug before the stage goes terminal.
+
+## Unreleased -- Polyglot swarm (skill-aware, any-stack builds)
+
+The swarm build agent was effectively Python-only: the Tech Lead planner
+mandated `requirements.txt`/`conftest.py`/pytest and the verifier ran pytest
+alone, so a polyglot request ("Flask backend + React frontend") silently
+collapsed to a single Python package. The swarm now routes through CGX's
+existing polyglot infrastructure instead of a Python-only reimplementation.
+
+* **Skill-aware planning** (`swarm_tech_lead.py`, `swarm_plan.py`). The Tech
+  Lead resolves the active `skills` for the goal (`detect_skills`, or an
+  explicit session pin) and injects their `compose_plan_prompt` guidance, so a
+  "Flask + React" objective plans *both* components. Each active skill's
+  `validate_plan` gates the draft (a stack that omits its required files is
+  re-asked). The resolved stack is persisted on the WORK_PLAN.
+* **Per-component, language-aware scaffolding.** `ensure_scaffolding` /
+  `_scaffolding_problems` now require each ecosystem's own manifest --
+  `requirements.txt` (+ `conftest.py` for a Python `src/` layout) for Python,
+  `package.json` for a JS/TS component -- instead of forcing Python scaffolding
+  on every project. The `src/`-vs-top-level rooting rule applies to Python
+  sources only, so a `backend/` + `frontend/` layout is no longer flagged
+  "inconsistent."
+* **Skill-guided, language-aware generation** (`swarm_generate.py`,
+  `swarm_developer.py`). The resolved skills flow into
+  `generate_single_scaffold_file` (framework conventions + `package.json`
+  shape). Semantic repair is language-aware (fence + extraction by extension;
+  the old `.py`-only guard is gone), and the Python contract/import audit runs
+  only for `.py` files.
+* **Polyglot verification** (`swarm_verify.py`). `_run_env_dryrun` now calls the
+  shared `run_project_tests` / `detect_test_runners`, so a JS/TS component gets
+  a real `npm test`/`npm run build` gate (merged with pytest) instead of being
+  skipped; regeneration is skill-guided.
+* **Scope**: first-class Python + JS/TS/Node (Flask/FastAPI/Django +
+  React/Vue/Next/Express, CLIs, libraries). New stacks are added by shipping a
+  skill + a test runner -- not by editing the swarm. Multi-component isolation
+  with per-component roots/verdicts (a dedicated router fan-out) is a planned
+  follow-up.
+
+## Unreleased -- Tool registry, MCP, approval gate, swarm hardening
+
+A platform pass over the swarm: one tool system, external tools via MCP, an
+opt-in human-in-the-loop gate, and a batch of correctness/UX fixes.
+
+### Added
+
+* **Unified tool registry** (`session/tasks/tool_registry.py`). One
+  `ToolRegistry` of declarative `ToolSpec`s (name, description, handler,
+  `RiskLevel`, arg hint) replaces the three divergent hardcoded tool-dispatch
+  chains the swarm carried. `parse_tool_calls` now extracts *every*
+  `<call_tool name="...">{json}</call_tool>` block (was: only the first,
+  brittle on quote/whitespace variance), and `describe_for_prompt` auto-injects
+  each role's tool list into its system prompt so the agent always knows what
+  it can call. Native tools (`run_python_probe`, `file_skeleton`,
+  `list_symbols`, `query_codebase`, `search_web`) are registered here; the dead
+  `bash_repl`/`patch_file` tools and the unused `swarm_parse.py` module were
+  removed.
+* **MCP tool layer** (`cgx/mcp/`, optional extra `pip install cgx[mcp]`). The
+  swarm can use external Model Context Protocol tool servers via three
+  registry tools -- `mcp_list_servers` / `mcp_list_tools` / `mcp_call` (lazy
+  discovery so a large fleet never floods the prompt). Servers are a local JSON
+  roster at `~/.cgx/mcp.json` (override `CGX_MCP_CONFIG`); adding one is a
+  config edit, not code. stdio + http transports, per-server enable flag, and
+  bearer auth sourced from an env var (never stored in the file). Degrades
+  gracefully without the SDK. Web API: `GET /api/mcp/servers`,
+  `POST /api/mcp/toggle`. See `docs/mcp.md`.
+* **Human-in-the-loop approval gate** (`session/approval.py`). Opt-in;
+  intercepts risky tool calls (code execution, file writes, MCP effects) before
+  they run. `CGX_APPROVAL_MODE` = `off` | `risky` (default: gate MEDIUM/HIGH) |
+  `all`. Requests block until resolved or a TTL elapses (auto-**reject**,
+  fail-safe). CLI: `cgx agent --approve`. Web API: `GET /api/approvals/pending`,
+  `POST /api/approvals/resolve`. Off by default, so unattended runs are
+  unchanged.
+* **Web UI: MCP Servers + Approvals pages** (`frontend/src/pages/McpPage.tsx`,
+  `ApprovalsPage.tsx`, shared `components/PendingApprovals.tsx`). A "Control"
+  sidebar group manages the MCP roster (list/toggle, SDK + config status) and
+  lists pending approvals with Approve/Deny; the Agent run view surfaces its
+  own session's pending approvals inline while running. The web gate is opt-in
+  via `CGX_WEB_APPROVAL` and installed per session in the drain (propagated to
+  the executor thread via `asyncio.to_thread`'s context copy).
+* **`diagnose.py` unified onto the tool registry.** The DIAGNOSE ReAct loop's
+  read-only tools (`read_file`/`grep_files`/`inspect_packages`) now dispatch
+  through a dedicated `ToolRegistry` instead of a hand-written `if/elif`, so all
+  agent tool execution shares one mechanism. Its JSON-per-turn wire protocol is
+  unchanged.
+
+### Fixed
+
+* **False `FAILED` on a repaired tree** (`swarm_verify.py`). A file recorded in
+  `failed_paths` during the Developer chain but successfully regenerated by
+  Verify no longer sinks the session -- the verdict is reconciled against the
+  final on-disk structural scan.
+* **Mid-chain contract truncation** (`swarm_developer.py`). Renegotiated
+  contracts are now *merged* (superset) into the plan rather than replacing it,
+  so contracts for not-yet-generated files can never be dropped by a partial
+  renegotiation blob.
+* **Runaway task-tree indentation** (`router.py`, `TaskTree.tsx`). Swarm
+  Developer tasks are parented to the Tech Lead as siblings instead of a
+  deepening chain, so the task tree stays flat; a defensive indentation clamp
+  backstops any deep graph.
+* **Wrong live-phase label** (`LiveView.tsx`). The progress banner now reads
+  "Planning"/"Verifying" during those phases (kind comparison was
+  case-mismatched and always showed "Generating").
+* **Unbounded context growth** (`swarm_generate.py`). Tool-response output and
+  injected dependency bodies are truncated.
+* **Observability**: swarm `print()` debug statements replaced with structured
+  `swarm_beat` calls with accurate phase names; the beats feed is now
+  role/phase-labeled and summarized; Tech Lead tool-call beats are persisted
+  (were dropped); the per-beat `SessionStore` is cached instead of reopened.
+* Debate mode records the judge's rationale, not just the A/B letter; added a
+  missing `Tuple` import; extracted duplicated helpers.
+
 ## Unreleased -- Swarm mode redesign (plan-driven build engine)
 
 `SessionMode.SWARM` is rebuilt from a brittle free-form Tech Lead/Developer

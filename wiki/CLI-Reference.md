@@ -118,6 +118,12 @@ With no discoverable index the loop scaffolds a brand-new project into
 `<project_root>/.cgx/sessions.db` and can be resumed from the UI or
 dashboard.
 
+`--approve` installs an opt-in **human-in-the-loop gate**: before any risky
+tool call (code execution, file writes, MCP calls) the run prompts for `y/N` at
+the terminal and blocks until you answer. Off by default, so unattended runs are
+unchanged. The gated risk level is controlled by `CGX_APPROVAL_MODE` — see
+**[[Privacy and Security]]** and **[[Configuration and Tuning]]**.
+
 ## `cgx status`
 
 ```bash

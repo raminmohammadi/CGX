@@ -142,10 +142,28 @@ def test_collectible_test_helpers():
     assert not sv._has_collectible_test("")
 
 
-def test_unwritten_developer_file_fails_verify(tmp_path):
+def test_failed_path_reconciled_when_file_valid_on_disk(tmp_path):
+    # A path recorded in ``failed_paths`` during the Developer chain but which
+    # is present and parseable on disk (Verify may have regenerated it) must
+    # NOT sink the session: the verdict is reconciled against the final
+    # structural scan, not the never-cleared advisory list.
     (tmp_path / "app.py").write_text("x = 1\n", encoding="utf-8")
     res = _run(tmp_path, _plan(tmp_path, ["app.py"]), failed_paths=["app.py"])
+    assert res.outputs["verify_ok"] is True
+    assert res.outputs["failed_paths"] == []
+
+
+def test_genuinely_unwritten_failed_file_fails_verify(tmp_path, monkeypatch):
+    # The real failure case: a failed file is absent from disk, so it is a
+    # coverage gap; when regeneration cannot write it, verify stays red and the
+    # path remains in the reconciled failed set.
+    monkeypatch.setattr(
+        sv, "generate_file",
+        lambda **kw: type("O", (), {"ok": False, "content": ""})())
+    res = _run(tmp_path, _plan(tmp_path, ["app.py"]), failed_paths=["app.py"])
     assert res.outputs["verify_ok"] is False
+    assert "app.py" in res.outputs["coverage_gaps"]
+    assert "app.py" in res.outputs["failed_paths"]
 
 
 def test_no_provider_fails_fast(tmp_path):

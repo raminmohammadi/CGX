@@ -112,6 +112,36 @@ def test_react_validator_passes_when_jsx_present():
     assert skills.validate_scaffold(react, diffs) is None
 
 
+def test_react_validate_plan_vetoes_missing_index_html():
+    # The build failure that slipped through: React source but no index.html.
+    react = skills.skills_by_names(["react"])
+    diffs = [_diff("frontend/src/App.jsx"), _diff("frontend/package.json")]
+    v = skills.validate_plan(react, diffs)
+    assert v is not None and not v.passed
+    assert "index.html" in v.rationale
+
+
+def test_react_validate_plan_vetoes_missing_package_json():
+    react = skills.skills_by_names(["react"])
+    diffs = [_diff("frontend/src/App.jsx"), _diff("frontend/index.html")]
+    v = skills.validate_plan(react, diffs)
+    assert v is not None and "package.json" in v.rationale
+
+
+def test_react_validate_plan_passes_with_full_vite_entry():
+    react = skills.skills_by_names(["react"])
+    diffs = [_diff("frontend/src/main.jsx"), _diff("frontend/src/App.jsx"),
+             _diff("frontend/index.html"), _diff("frontend/package.json")]
+    assert skills.validate_plan(react, diffs) is None
+
+
+def test_react_validate_plan_ignores_pure_backend_plan():
+    # No React source planned -> the React skill has no opinion (base returns).
+    react = skills.skills_by_names(["react"])
+    diffs = [_diff("backend/app.py"), _diff("requirements.txt")]
+    assert skills.validate_plan(react, diffs) is None
+
+
 def test_fastapi_validator_requires_requirements_file():
     fa = skills.skills_by_names(["fastapi"])
     diffs = [_diff("backend/main.py",

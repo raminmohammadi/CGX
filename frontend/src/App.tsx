@@ -13,6 +13,8 @@ const OpsPage = lazy(() => import("./pages/OpsPage"));
 const ActivityPage = lazy(() => import("./pages/ActivityPage"));
 const AdminPage = lazy(() => import("./pages/AdminPage"));
 const SettingsPage = lazy(() => import("./pages/SettingsPage"));
+const McpPage = lazy(() => import("./pages/McpPage"));
+const ApprovalsPage = lazy(() => import("./pages/ApprovalsPage"));
 
 function RouteFallback() {
   return (
@@ -96,6 +98,22 @@ export default function App() {
           element={
             <Suspense fallback={<RouteFallback />}>
               <SettingsPage />
+            </Suspense>
+          }
+        />
+        <Route
+          path="/mcp"
+          element={
+            <Suspense fallback={<RouteFallback />}>
+              <McpPage />
+            </Suspense>
+          }
+        />
+        <Route
+          path="/approvals"
+          element={
+            <Suspense fallback={<RouteFallback />}>
+              <ApprovalsPage />
             </Suspense>
           }
         />

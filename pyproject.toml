@@ -44,11 +44,15 @@ ui = [
 codegen = ["unidiff>=0.7"]
 keyring = ["keyring>=24"]
 viz = ["matplotlib>=3.7"]
+# External tool servers via the Model Context Protocol. Without this extra the
+# swarm still runs; the MCP tools report that the SDK is not installed.
+mcp = ["mcp>=1.2"]
 # Multi-language ingestion (JavaScript / TypeScript / TSX, ...). Without this
 # extra CGX still indexes Python; other languages are simply skipped.
 parsers = [
   "tree-sitter>=0.21",
   "tree-sitter-language-pack>=0.2",
+  "mcp>=1.2",
 ]
 dev = [
   "pytest>=7.4",

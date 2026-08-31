@@ -113,6 +113,27 @@ Write a **skill** — a single self-contained folder under `skills/` (or a
 private `.py` under `~/.cgx/skills/`), with no agent-layer edits. See
 **[[Skills Registry]]**.
 
+### Do I need to declare a swarm build's dependencies myself?
+No. Before it builds or tests, the swarm **reconciles each component's
+manifest** against its actual source imports: a Python component's third-party
+imports are installed and pinned into `requirements.txt`, and a JS/TS
+component's bare imports are `npm install`ed into its `package.json` (installs
+use `--legacy-peer-deps` so an imperfect peer pin can't abort them). One
+general mechanism covers any package; FastAPI/Starlette also pull in `httpx`
+for its `TestClient`. A `package.json` left at the repo root while the app is
+under `frontend/` is moved next to `index.html` so the Vite build resolves it.
+See **[[Swarm Agent]]**.
+
+### My swarm build reported FAILED — did it silently ship broken code?
+No. A small local model can occasionally emit a logic bug the bounded repair
+loop (raised to **5 rounds**) can't fix. When that happens the session reports
+**FAILED honestly rather than passing a red suite** — so a FAILED verdict means
+the tests genuinely did not pass, not that CGX gave up quietly. Note that
+phantom third-party imports and contract mismatches are **advisory** now: since
+reconciliation installs every real import, the real build/test is the
+authority, and a truly hallucinated package fails the real install anyway. See
+**[[Swarm Agent]]**.
+
 ### How do I debug a session that fails in a weird place?
 Turn on **function-call tracing**: flip the toggle on the `/settings`
 page or export `CGX_TRACE=1` before `cgx serve`, then re-run the failing

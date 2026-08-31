@@ -111,34 +111,66 @@ function ArtifactsTab({
   );
 }
 
+// Per-swarm-phase accent so the beat feed reads as grouped phases (planning →
+// generating → verifying) rather than an undifferentiated "swarm_beat" pile.
+const SWARM_ROLE_ACCENT: Record<string, string> = {
+  tech_lead: "text-fuchsia-300",
+  developer: "text-emerald-300",
+  verify: "text-cyan-300",
+};
+
+// One-line summary of a swarm beat's payload, so each row says what happened
+// (file written, tool called, plan rejected) instead of just its kind.
+function summarizeBeat(c: Record<string, unknown>): string {
+  const phase = String(c.phase ?? "");
+  if (c.file) return `${phase}: ${String(c.file)}`;
+  if (c.tool) return `${phase}: ${String(c.tool)}`;
+  if (c.decision) return `${phase}: chose ${String(c.decision)}`;
+  if (typeof c.file_count === "number") return `${phase}: ${c.file_count} files`;
+  if (c.reason) return `${phase}: ${String(c.reason)}`;
+  if (c.ok !== undefined) return `${phase}: ${c.ok ? "ok" : "failed"}`;
+  return phase || "beat";
+}
+
 function FactsTab({ facts }: { facts: FactDTO[] }) {
   if (facts.length === 0) return <Empty>No facts surfaced yet.</Empty>;
   const sorted = [...facts].sort((a, b) => b.updated_at - a.updated_at);
   return (
     <ul className="space-y-1.5">
-      {sorted.map((f) => (
-        <li
-          key={f.fact_id}
-          className={cn(
-            "rounded border px-2 py-1.5",
-            f.stale
-              ? "border-amber-500/20 bg-amber-950/10"
-              : "border-white/5 bg-slate-950/60",
-          )}
-        >
-          <p className="text-[10px] font-mono text-slate-400 uppercase tracking-wider">
-            {f.kind}{f.stale && " · stale"}
-            {f.kind === "llm_call" && typeof f.content?.latency_ms === "number"
-              && ` · ${Math.round(f.content.latency_ms)}ms`}
-          </p>
-          <p className="text-[11px] text-slate-200 truncate">
-            {f.kind === "llm_call"
-              ? String(f.content?.model || "model?")
-              : String(f.content?.title || f.content?.path || f.content?.symbol
-                || f.content?.chunk_id || f.fact_id)}
-          </p>
-        </li>
-      ))}
+      {sorted.map((f) => {
+        const isBeat = f.kind === "swarm_beat";
+        const role = isBeat ? String(f.content?.role ?? "") : "";
+        const accent = SWARM_ROLE_ACCENT[role] ?? "text-slate-400";
+        return (
+          <li
+            key={f.fact_id}
+            className={cn(
+              "rounded border px-2 py-1.5",
+              f.stale
+                ? "border-amber-500/20 bg-amber-950/10"
+                : "border-white/5 bg-slate-950/60",
+            )}
+          >
+            <p className={cn(
+              "text-[10px] font-mono uppercase tracking-wider",
+              isBeat ? accent : "text-slate-400",
+            )}>
+              {isBeat ? `${role} · ${String(f.content?.phase ?? "")}` : f.kind}
+              {f.stale && " · stale"}
+              {f.kind === "llm_call" && typeof f.content?.latency_ms === "number"
+                && ` · ${Math.round(f.content.latency_ms)}ms`}
+            </p>
+            <p className="text-[11px] text-slate-200 truncate">
+              {isBeat
+                ? summarizeBeat(f.content ?? {})
+                : f.kind === "llm_call"
+                  ? String(f.content?.model || "model?")
+                  : String(f.content?.title || f.content?.path || f.content?.symbol
+                    || f.content?.chunk_id || f.fact_id)}
+            </p>
+          </li>
+        );
+      })}
     </ul>
   );
 }

@@ -166,8 +166,121 @@ recompute it per loop, since the Developer tasks only exist once the Tech
 Lead's `WORK_PLAN` lands.
 
 ## Wrapper-tolerant plan parsing
-**File:** `src/cgx/session/tasks/swarm_parse.py`
+**File:** `src/cgx/session/tasks/swarm_plan.py` (`parse_plan_reply`)
 
 Small local models routinely wrap JSON in prose or fenced code blocks. The
 parser tolerates those wrappers and extracts the plan object, feeding the
-typed `SwarmPlan` schema (`swarm_plan.py`) that the validation stages rely on.
+typed plan schema that the validation stages rely on.
+
+## Tool system -- one registry for all agents
+**File:** `src/cgx/session/tasks/tool_registry.py`
+
+The swarm previously carried three divergent tool-call designs (a hardcoded
+`if/elif` in `swarm_generate`, another in `swarm_tech_lead`, a JSON protocol in
+`diagnose`), plus a dead tolerant parser. Tools are now **declarative**: a
+`ToolSpec` bundles a tool's name, its LLM-facing description, a handler, an
+`arg_hint`, and a `RiskLevel`. One `ToolRegistry` owns them.
+
+- `parse_tool_calls(text)` extracts **every** `<call_tool name="...">{json}
+  </call_tool>` block in a reply (tolerant of quote style and whitespace) --
+  the old `re.search` matched only the first and broke on single quotes.
+- `REGISTRY.describe_for_prompt(names)` renders the tool list injected into a
+  role's system prompt, so the agent's advertised toolset never drifts from
+  what `dispatch` can actually run.
+- Native tools: `run_python_probe` (HIGH), `file_skeleton`, `list_symbols`,
+  `query_codebase` (LOW), `search_web` (MEDIUM). The Developer sees the
+  read-only introspection set; the Tech Lead sees `search_web`; both gain the
+  MCP tools when servers are configured.
+
+Adding a tool -- native or MCP -- is a single `register()` call; the generation
+loop is unchanged.
+
+## MCP tool servers
+**Files:** `src/cgx/mcp/` -- see [`mcp.md`](mcp.md).
+
+External tools over the Model Context Protocol, exposed to the swarm as three
+registry tools (`mcp_list_servers` / `mcp_list_tools` / `mcp_call`) with lazy
+discovery. Servers are a local `~/.cgx/mcp.json` roster; the tools are only
+advertised when at least one server is enabled.
+
+## Human-in-the-loop approval
+**File:** `src/cgx/session/approval.py` -- see [`Agent.md`](Agent.md).
+
+An opt-in gate intercepts risky tool calls (code execution, file writes, MCP
+effects) at registry dispatch. `CGX_APPROVAL_MODE` selects `off`/`risky`/`all`;
+a request blocks until resolved or auto-**rejected** after a TTL. Wired via the
+CLI (`cgx agent --approve`) or the web approvals API. Off by default.
+
+## Polyglot / any-stack builds
+
+The swarm was originally Python-only. It now plans, generates, and verifies
+multi-language, multi-component projects by routing through CGX's existing
+polyglot infrastructure rather than a Python-only reimplementation.
+
+- **Planning** (`swarm_tech_lead.py`): the Tech Lead resolves the goal's
+  `skills` (`detect_skills`, or an explicit session pin via `session_skills`)
+  and injects `compose_plan_prompt` guidance, so a polyglot objective plans
+  every component (a "Flask + React" app gets both the API and the UI). Each
+  active skill's `validate_plan` gates the draft; the resolved stack is stored
+  on the WORK_PLAN (`skills`) for the Developer and Verifier to reuse.
+- **Scaffolding** (`swarm_plan.py`): manifests are per ecosystem --
+  `requirements.txt` (+ `conftest.py` for a Python `src/` layout) for Python,
+  `package.json` for JS/TS -- and the `src/`-vs-top-level rooting check applies
+  to Python sources only, so `backend/` + `frontend/` layouts are valid.
+- **Generation** (`swarm_generate.py`): the resolved skills flow into
+  `generate_single_scaffold_file`; semantic repair is language-aware
+  (fence + extraction keyed on extension); the Python contract/import audit
+  runs only for `.py`.
+- **Verification** (`swarm_verify.py`): `_run_env_dryrun` calls the shared
+  `run_project_tests`/`detect_test_runners`, so a JS/TS component gets a real
+  `npm test`/`npm run build` gate merged with pytest.
+
+Scope: first-class Python + JS/TS/Node; new stacks are added by shipping a
+`skills/` entry plus a `test_runners.py` runner, not by changing the swarm.
+Per-component isolation (separate roots/verdicts via a router fan-out) is a
+planned extension; today a mixed-root single repo is verified as a whole.
+
+## Self-healing verification (make it real, judge honestly)
+
+The verifier's job is to make a generated project *actually* installable and
+buildable, then let the real build/test be the authority on correctness --
+rather than failing on model-authored metadata.
+
+- **Manifest reconciliation** (`swarm_verify._reconcile_manifests`, run before
+  the env dry-run): scans each component's source imports and closes the
+  manifest gap generically -- Python third-party imports are installed + pinned
+  to `requirements.txt`; a component's bare JS/TS imports are `npm install`ed.
+  This is one mechanism for *any* package, not a per-package rule. The only
+  hardcoded implied-dependency is the framework map `_PY_IMPLIED_DEPS`
+  (FastAPI/Starlette → `httpx`, needed by `TestClient` but never imported).
+- **Co-location** (`swarm_plan._colocate_js_manifests`): a JS manifest/config
+  is moved to the component root beside its `index.html` so the build resolves
+  its entry (a Vite build needs `package.json`, `index.html`, and source in one
+  directory).
+- **Hard vs advisory gates**: only coverage gaps and *first-party* import
+  breaks gate the build (`structural_ok`). `phantom_third_party` (an import not
+  in the plan's declared deps) and contract warnings are advisory -- since
+  reconciliation installs every real import, a truly hallucinated package fails
+  the real install, and a legitimate-but-under-declared one (e.g. `uvicorn`)
+  must not fail a build whose tests pass.
+- **Polyglot runner + robustness**: verification runs `run_project_tests`
+  (pytest + npm across component subdirs); npm installs with
+  `--legacy-peer-deps`. Failure-driven repair is bounded by
+  `_MAX_DYNAMIC_REPAIR_ROUNDS` with a temperature ramp.
+
+The residual limit is model quality: a small local model can still emit a logic
+bug the bounded repair loop doesn't fix, in which case the session honestly
+reports FAILED (it never falsely passes).
+
+## Correctness invariants (hardening)
+
+- **Failure reconciliation.** `SWARM_VERIFY` recomputes the failed set against
+  the *final* structural scan, so a file regenerated successfully during Verify
+  no longer forces `FAILED` just because it was listed in `failed_paths`.
+- **Contract merging.** A renegotiated contracts object is *merged* (superset)
+  into the plan, never wholesale-replaced, so a partial blob cannot drop
+  contracts for files not yet generated.
+- **Bounded context.** Tool-response output and injected dependency bodies are
+  truncated so the prompt cannot grow without limit across turns.
+- **Sibling task graph.** Developer tasks are parented to the Tech Lead, so the
+  task tree renders as a flat ordered list instead of an ever-deepening chain.

@@ -15,7 +15,7 @@ and the router drives the Developer over its ordered paths one file per turn.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from cgx.session.models import Artifact, ArtifactKind, TaskKind
 from cgx.session.tasks.base import (
@@ -66,80 +66,107 @@ _SYSTEM_PROMPT = (
     "}\n\n"
     "Rules: every file has a unique relative path; depends_on lists ONLY\n"
     "other planned paths; order files so dependencies come first; include at\n"
-    "least one runnable non-test source file. Commit to ONE layout -- put\n"
-    "every source module under 'src/' OR every module at the top level, never\n"
-    "a mix -- and give each test file a depends_on edge to the module it\n"
-    "exercises so imports stay consistent.\n"
-    "SCAFFOLDING IS MANDATORY: every plan MUST also include, as first-class\n"
-    "files with their own descriptions, a top-level 'README.md' (project\n"
-    "overview, install, and usage) and a top-level 'requirements.txt' (the\n"
-    "runtime and test dependencies, e.g. 'pytest'). When you use a 'src/'\n"
-    "layout, ALSO include a root 'conftest.py' so pytest can import the\n"
-    "package. These are real deliverables, not source code -- give them a\n"
-    "'description' but do NOT put them in 'contracts'.\n"
+    "least one runnable non-test source file; give each test file a depends_on\n"
+    "edge to the module it exercises. Use each file's REAL extension for its\n"
+    "language (.py, .jsx/.tsx, .go, ...); contract \"module\" values name the\n"
+    "exact planned path that defines the symbol.\n"
+    "MULTIPLE COMPONENTS: a project may span more than one component and\n"
+    "language -- e.g. a Python backend AND a JavaScript/React frontend. Plan\n"
+    "files for EVERY component the objective asks for; do not silently drop\n"
+    "one (a 'Flask + React' app needs both the Flask API and the React UI).\n"
+    "Give each component its own top-level directory (e.g. 'backend/' and\n"
+    "'frontend/') and keep each component's imports rooted consistently.\n"
+    "SCAFFOLDING IS MANDATORY, PER COMPONENT: every runnable component MUST\n"
+    "ship its dependency manifest and the project MUST ship a top-level\n"
+    "'README.md'. For a Python component include a 'requirements.txt' (and,\n"
+    "for a 'src/' layout, a root 'conftest.py'). For a JavaScript/TypeScript\n"
+    "component include a 'package.json' (dependencies, devDependencies, and\n"
+    "dev/build/test scripts). These are real deliverables with a\n"
+    "'description' but NOT part of 'contracts'.\n"
     "CONTRACTS ARE MANDATORY AND BINDING: every function, method, and class the\n"
     "objective requires MUST appear in contracts with a \"module\" naming the\n"
     "EXACT planned path that defines it. Name a method as \"ClassName.method\".\n"
     "Give each function real \"parameters\" and a \"return_type\". Do not invent\n"
     "symbols, files, or dependencies the objective did not ask for.\n"
-    "ENTRYPOINT IS MANDATORY: If the objective is an application or API (e.g. FastAPI), you MUST include a main entrypoint file (like 'src/main.py' or 'main.py') that initializes the application instance (e.g. 'app = FastAPI()'). Do NOT expect tests to run without a main application instance to import.\n"
-    "THIRD-PARTY LIBRARIES: If you use third-party libraries (e.g. FastAPI, Pydantic), you MUST "
-    "actively search the web to retrieve their latest API signatures and include them in the contracts.\n"
-    "You can use tools by outputting: <call_tool name=\"search_web\">{\"query\": \"...\"}</call_tool>.\n"
+    "ENTRYPOINT IS MANDATORY: each runnable component needs an entrypoint that\n"
+    "initializes it (e.g. a Python 'app = Flask(__name__)'/'FastAPI()' module,\n"
+    "or a JS 'src/main.jsx' that mounts the app). Do NOT expect tests to run\n"
+    "without an application instance to import.\n"
+    "THIRD-PARTY LIBRARIES: if you use third-party libraries, you MAY search\n"
+    "the web to retrieve their latest API signatures and include them in the\n"
+    "contracts. Use tools by outputting: "
+    "<call_tool name=\"search_web\">{\"query\": \"...\"}</call_tool>.\n"
     "If you call a tool, wait for the response before outputting the final JSON.\n"
+    "Follow any ACTIVE SKILL guidance below for the specific frameworks.\n"
     "Output ONLY the JSON when you are ready to finalize the plan."
 )
 
 
+# The Tech Lead may search the web (to fetch third-party API signatures) while
+# planning, plus any configured MCP tools; everything else is deterministic
+# plan validation.
+def _planner_tools() -> tuple:
+    from cgx.session.tasks.swarm_tools import mcp_tools_if_configured
+    return ("search_web",) + mcp_tools_if_configured()
+
+
 def _ask_for_plan(provider: Any, goal: str,
-                  correction: str) -> Dict[str, Any]:
-    """Prompt the model for a draft plan JSON (empty dict on failure), supporting tool calls."""
-    from cgx.session.tasks.swarm_tools import search_web
-    import re
-    import json
-    
+                  correction: str,
+                  project_root: Optional[str] = None,
+                  skill_prompt: str = "") -> Dict[str, Any]:
+    """Prompt the model for a draft plan JSON (empty dict on failure).
+
+    Tool calls (``search_web``) are resolved through the shared tool registry,
+    so the planner shares one dispatch path with the Developer instead of a
+    bespoke regex/if-chain. A non-tool reply is parsed as the plan JSON, with
+    one corrective re-ask on unparseable output.
+    """
+    from cgx.session.tasks.swarm_log import swarm_beat
+    from cgx.session.tasks.tool_registry import (
+        REGISTRY, ToolContext, parse_tool_calls)
+    import cgx.session.tasks.swarm_tools  # noqa: F401  (populate the registry)
+
     user = f"Objective:\n{goal}\n"
     if correction:
         user += f"\nYour previous plan was rejected: {correction}\nFix it."
+    system = _SYSTEM_PROMPT
+    if skill_prompt.strip():
+        # Framework-specific planning guidance (e.g. React's Vite layout,
+        # Flask's app/blueprint conventions) for the stacks detected in the
+        # goal -- this is what teaches the planner to include the frontend.
+        system += "\n\nACTIVE SKILLS (follow this guidance):\n" + skill_prompt
     messages = [
-        {"role": "system", "content": _SYSTEM_PROMPT},
+        {"role": "system", "content": system},
         {"role": "user", "content": user},
     ]
+    ctx = ToolContext(root=project_root or ".", log_root=project_root)
+    planner_tools = _planner_tools()
     for _ in range(5):
         try:
-            # We don't force_json=True here immediately because we allow tool tags.
-            # Some providers fail if force_json is True and it outputs a tool tag instead of JSON.
-            # Actually, we can use force_json=False.
+            # force_json=False so a tool tag isn't rejected by strict-JSON
+            # providers; the plan is parsed leniently from the final reply.
             res = provider.chat(messages=messages, force_json=False)
         except Exception:  # pragma: no cover
             return {}
-        
+
         text = str(res.get("content", ""))
-        tool_match = re.search(r'<call_tool name="(.*?)">(.*?)</call_tool>', text, re.DOTALL)
-        if tool_match:
-            tool_name = tool_match.group(1)
-            tool_args_str = tool_match.group(2)
+        calls = [c for c in parse_tool_calls(text) if c.name in planner_tools]
+        if calls:
             messages.append({"role": "assistant", "content": text})
-            from cgx.session.tasks.swarm_log import swarm_beat
-            swarm_beat(None, "tech_lead", "tool_call", tool=tool_name, args=tool_args_str)
-            if tool_name == "search_web":
-                try:
-                    args = json.loads(tool_args_str)
-                    tool_res = search_web(args.get("query", ""))
-                except Exception as e:
-                    tool_res = f"Tool error: {e}"
-            else:
-                tool_res = f"Unknown tool: {tool_name}"
-            messages.append({"role": "user", "content": f"<tool_response>{tool_res}</tool_response>"})
-        else:
-            parsed = parse_plan_reply(text)
-            if parsed:
-                with open("last_plan_parsed.json", "w") as f:
-                    import json as _json
-                    _json.dump(parsed, f, indent=2)
-                return parsed
-            messages.append({"role": "assistant", "content": text})
-            messages.append({"role": "user", "content": "<tool_response>Tool error: invalid JSON generated. Ensure your output is purely JSON without markdown formatting.</tool_response>"})
+            for call in calls:
+                swarm_beat(project_root, "tech_lead", "tool_call",
+                           tool=call.name, args=call.raw_args)
+                out = REGISTRY.dispatch(call, ctx)
+                messages.append({
+                    "role": "user",
+                    "content": f"<tool_response name=\"{call.name}\">{out}"
+                               "</tool_response>"})
+            continue
+        parsed = parse_plan_reply(text)
+        if parsed:
+            return parsed
+        messages.append({"role": "assistant", "content": text})
+        messages.append({"role": "user", "content": "<tool_response>Tool error: invalid JSON generated. Ensure your output is purely JSON without markdown formatting.</tool_response>"})
     return {}
 
 
@@ -186,18 +213,43 @@ def swarm_tech_lead(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         
     swarm_beat(project_root, "tech_lead", "plan", goal=goal[:200])
 
+    # Resolve the frameworks in play once: an explicit session pin (from an
+    # Agent Profile) wins, else auto-detect from the goal text. Their plan-time
+    # guidance is injected into the prompt and their validators gate the draft,
+    # so a polyglot objective (e.g. Flask + React) plans every component instead
+    # of collapsing to a single Python package.
+    from cgx.session.tasks.base import session_skills as _session_skills
+    from skills import (compose_plan_prompt, compose_scaffold_prompt,
+                        detect_skills, skill_names, skills_by_names,
+                        validate_plan)
+    pinned = _session_skills(task, deps)
+    active_skills = skills_by_names(pinned) if pinned else detect_skills(goal)
+    # The planner needs the framework's *structural* requirements (e.g. React's
+    # Vite layout mandates an index.html entry + main.jsx + package.json), which
+    # live in the scaffold fragment; the plan fragment adds modify-time rules.
+    # Composing both is what makes the plan include a buildable file set (the
+    # missing-index.html build failure came from planning with the terse plan
+    # fragment alone).
+    _struct = compose_scaffold_prompt(active_skills)
+    _rules = compose_plan_prompt(active_skills)
+    skill_prompt = "\n\n".join(p for p in (_struct, _rules) if p.strip())
+    active_skill_names = skill_names(active_skills)
+    if active_skill_names:
+        swarm_beat(project_root, "tech_lead", "skills",
+                   skills=active_skill_names)
+
     correction = ""
     plan: Dict[str, Any] = {}
     paths: List[str] = []
     problems: List[str] = []
-    
+
     is_debate = deps.extra.get("multi_agent_debate", False)
     
     for attempt in range(1, _MAX_PLAN_ATTEMPTS + 1):
         if is_debate:
             swarm_beat(project_root, "tech_lead", "debate_generation", attempt=attempt)
-            draft1 = _ask_for_plan(deps.provider, goal, correction)
-            draft2 = _ask_for_plan(deps.provider, goal, correction)
+            draft1 = _ask_for_plan(deps.provider, goal, correction, project_root, skill_prompt)
+            draft2 = _ask_for_plan(deps.provider, goal, correction, project_root, skill_prompt)
             
             # Judge decides
             judge_prompt = (
@@ -206,19 +258,17 @@ def swarm_tech_lead(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
                 f"PLAN A: {draft1}\n\n"
                 f"PLAN B: {draft2}\n\n"
                 "Evaluate both plans based on completeness, modularity, and adherence to the objective. "
-                "Output ONLY 'A' or 'B'."
+                "On the first line output ONLY the winner letter ('A' or 'B'). "
+                "On the next line give one sentence explaining why."
             )
-            try:
-                res = deps.provider.chat([{"role": "user", "content": judge_prompt}])
-                decision = str(res.get("content", "")).strip().upper()
-            except Exception:
-                decision = "A"
-            
+            from cgx.session.tasks.swarm_tools import judge_decision
+            decision, reason = judge_decision(deps.provider, judge_prompt)
             draft = draft1 if decision == "A" else draft2
-            swarm_beat(project_root, "tech_lead", "debate_decision", decision=decision)
+            swarm_beat(project_root, "tech_lead", "debate_decision",
+                       decision=decision, reason=reason)
         else:
-            draft = _ask_for_plan(deps.provider, goal, correction)
-            
+            draft = _ask_for_plan(deps.provider, goal, correction, project_root, skill_prompt)
+
         # Test coverage and scaffolding are injected deterministically rather
         # than re-asked: a pytest module is added for every uncovered source
         # module, and the README / dependency manifest / conftest the Developer
@@ -240,6 +290,17 @@ def swarm_tech_lead(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         # is re-asked with the exact problems before any Developer is spawned.
         problems = verify_plan(plan)
         if problems:
+            correction = "; ".join(problems)
+            swarm_beat(project_root, "tech_lead", "plan_rejected",
+                       attempt=attempt, problems=problems)
+            continue
+        # Framework-level validation: a skill can veto a plan that omits what
+        # the stack requires (e.g. the React skill flags a plan with no
+        # frontend files). A fatal verdict is fed back as a corrective re-ask.
+        verdict = validate_plan(active_skills, [{"path": p} for p in paths],
+                                goal)
+        if verdict is not None and not verdict.passed:
+            problems = [f"{verdict.skill or 'skill'}: {verdict.rationale}"]
             correction = "; ".join(problems)
             swarm_beat(project_root, "tech_lead", "plan_rejected",
                        attempt=attempt, problems=problems)
@@ -267,6 +328,10 @@ def swarm_tech_lead(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             "contracts": plan.get("contracts") or {},
             "paths": paths,
             "project_root": project_root,
+            # Persist the resolved stack so the Developer + Verifier reuse it
+            # (skill-guided generation, polyglot verification) without
+            # re-detecting per file.
+            "skills": active_skill_names,
         },
     )
     swarm_beat(project_root, "tech_lead", "report", ok=True,
@@ -277,4 +342,5 @@ def swarm_tech_lead(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
                  "swarm_paths": paths,
                  "file_count": len(paths),
                  "goal": goal,
-                 "project_root": project_root})
+                 "project_root": project_root,
+                 "skills": active_skill_names})

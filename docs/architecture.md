@@ -1467,6 +1467,34 @@ mount terminates after one round-trip.
 <details>
 <summary>
 
+## Swarm tool system, MCP, and approvals
+</summary>
+
+The swarm agents call tools through one **unified registry**
+(`cgx.session.tasks.tool_registry`): a `ToolRegistry` of declarative
+`ToolSpec`s (name, description, handler, `RiskLevel`, arg hint). This replaced
+three divergent hardcoded dispatch chains. `parse_tool_calls` extracts every
+`<call_tool name="...">{json}</call_tool>` block (tolerant of quoting), and
+`describe_for_prompt` auto-injects each role's tool list into its system prompt
+so the agent's advertised toolset always matches what can run. Native tools:
+`run_python_probe`, `file_skeleton`, `list_symbols`, `query_codebase`,
+`search_web`.
+
+**MCP** (`cgx.mcp`, optional `cgx[mcp]`): external Model Context Protocol tool
+servers, exposed as three lazy-discovery registry tools (`mcp_list_servers` /
+`mcp_list_tools` / `mcp_call`). Servers live in a local `~/.cgx/mcp.json`
+roster (stdio/http, per-server enable, env-sourced bearer auth), so adding a
+tool server is a config edit. See [`mcp.md`](mcp.md).
+
+**Human-in-the-loop approval** (`cgx.session.approval`): an opt-in gate at
+registry dispatch that requires human sign-off for risky tool calls
+(`CGX_APPROVAL_MODE` = `off`/`risky`/`all`; TTL auto-reject). Surfaced via
+`cgx agent --approve` and the `/api/approvals/*` endpoints. Off by default.
+
+</details>
+<details>
+<summary>
+
 ## Apply pipeline safeguards
 </summary>
 

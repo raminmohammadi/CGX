@@ -182,8 +182,46 @@ def _snapshot(runner: SessionRunner, session_id: str) -> AgentSessionState:
     )
 
 
+def _maybe_install_web_gate(session_id: str):
+    """Install + register an approval gate for a web session when opted in.
+
+    Opt-in via ``CGX_WEB_APPROVAL`` (default off), so ordinary web runs never
+    block waiting for an approval nobody is watching. When set, risky tool
+    calls (per ``CGX_APPROVAL_MODE``) surface at ``/api/approvals/pending`` and
+    are resolved from the UI. Returns the gate (registered) or ``None``.
+    """
+    import os
+    if not os.environ.get("CGX_WEB_APPROVAL"):
+        return None
+    from cgx.session.approval import (
+        ApprovalGate, mode_from_env, register_gate)
+    gate = ApprovalGate(mode=mode_from_env(), session_id=session_id)
+    register_gate(session_id, gate)
+    return gate
+
+
 async def _drain_ready(runner: SessionRunner, session_id: str,
                        deps: ExecutorDeps, *, max_steps: int = 64) -> None:
+    """Drive the drain, with an optional per-session approval gate installed.
+
+    The gate (when opted in) is set context-local here; ``asyncio.to_thread``
+    copies the context into the worker thread that runs each executor, so the
+    tool registry's dispatch finds it. Always unregistered/reset on exit.
+    """
+    from cgx.session.approval import reset_gate, set_gate, unregister_gate
+    gate = _maybe_install_web_gate(session_id)
+    token = set_gate(gate) if gate is not None else None
+    try:
+        await _drain_ready_impl(runner, session_id, deps, max_steps=max_steps)
+    finally:
+        if gate is not None:
+            unregister_gate(session_id)
+        if token is not None:
+            reset_gate(token)
+
+
+async def _drain_ready_impl(runner: SessionRunner, session_id: str,
+                            deps: ExecutorDeps, *, max_steps: int = 64) -> None:
     """Synchronously execute READY tasks until none remain or budget exhausts.
 
     The loop stops naturally when ``run_next`` returns ``None`` -- either

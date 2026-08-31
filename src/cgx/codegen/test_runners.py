@@ -125,6 +125,28 @@ def _load_package_json(project_root: str) -> Optional[Dict[str, Any]]:
     return data if isinstance(data, dict) else None
 
 
+def _find_package_json_dirs(project_root: str, max_depth: int = 4) -> List[str]:
+    """Directories containing a ``package.json`` (root and component subdirs).
+
+    A monorepo puts its JS/TS component in a subdir (``frontend/``), so a
+    root-only check misses it and the frontend never gets a build/test gate.
+    This walks the tree (pruning vendored/build dirs), bounded in depth, and
+    returns every directory that holds a ``package.json`` -- root first.
+    """
+    root = Path(project_root).resolve()
+    found: List[str] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in _JS_TEST_SKIP_DIRS]
+        depth = len(Path(dirpath).resolve().relative_to(root).parts)
+        if depth > max_depth:
+            dirnames[:] = []
+            continue
+        if "package.json" in filenames:
+            found.append(dirpath)
+    found.sort(key=len)  # root/shallowest first
+    return found
+
+
 def _npm_script_command(project_root: str) -> Optional[List[str]]:
     """Choose an npm invocation: prefer a real ``test`` script, else ``build``.
 
@@ -151,7 +173,60 @@ class NpmRunner(TestRunner):
     name = "npm"
 
     def detect(self, project_root: str) -> bool:
-        return (Path(project_root) / "package.json").is_file()
+        # Detect a package.json anywhere in the tree (root OR a component
+        # subdir like ``frontend/``), not just the root, so a monorepo's JS
+        # component is still gated.
+        return bool(_find_package_json_dirs(project_root))
+
+    def _run_in_dir(
+        self, pkg_dir: str, *, timeout_seconds: float, tests_present: bool,
+    ) -> TestRunOutcome:
+        """Install deps and run the test/build script in one package dir."""
+        cmd = _npm_script_command(pkg_dir)
+        if cmd is None:
+            return TestRunOutcome(
+                ran=False, skipped_reason="no npm test or build script",
+                tests_present=tests_present)
+        root = Path(pkg_dir).resolve()
+        if not (root / "node_modules").is_dir():
+            try:
+                # ``--legacy-peer-deps`` so a model's imperfect peer-version
+                # pin (e.g. vite ^4 with @vitejs/plugin-react ^2) doesn't abort
+                # the whole install with ERESOLVE and leave no node_modules --
+                # which then surfaces cryptically as "vite: command not found".
+                # This mirrors what a developer/CI does on real peer friction.
+                proc = subprocess.run(
+                    ["npm", "install", "--no-audit", "--no-fund",
+                     "--legacy-peer-deps"], cwd=root,
+                    capture_output=True, text=True,
+                    timeout=min(timeout_seconds, 180.0),
+                )
+                if proc.returncode != 0:
+                    logger.debug("npm install (%s) rc=%s: %s",
+                                 root.name, proc.returncode,
+                                 (proc.stderr or "")[:300])
+            except Exception as e:
+                logger.debug("npm install skipped: %s", e)
+        label = f"{root.name}: {' '.join(cmd)}"
+        ran_tests = cmd[:2] == ["npm", "test"]
+        try:
+            proc = subprocess.run(
+                cmd, cwd=root, capture_output=True, text=True,
+                timeout=timeout_seconds,
+            )
+        except subprocess.TimeoutExpired as e:
+            return TestRunOutcome(
+                ran=True, returncode=124, stdout=e.stdout or "",
+                stderr=(e.stderr or "") + "\n[timeout]", tests_selected=[label],
+                ran_tests=ran_tests, tests_present=tests_present)
+        except Exception as e:
+            return TestRunOutcome(
+                ran=False, skipped_reason=f"{type(e).__name__}: {e}",
+                tests_present=tests_present)
+        return TestRunOutcome(
+            ran=True, returncode=proc.returncode, stdout=proc.stdout,
+            stderr=proc.stderr, tests_selected=[label], ran_tests=ran_tests,
+            tests_present=tests_present)
 
     def run(
         self, project_root: str, changed_files: Sequence[str], *,
@@ -164,45 +239,24 @@ class NpmRunner(TestRunner):
         if shutil.which("npm") is None:
             return TestRunOutcome(
                 ran=False, skipped_reason="npm not installed", tests_present=tp)
-        cmd = _npm_script_command(project_root)
-        if cmd is None:
+        pkg_dirs = _find_package_json_dirs(project_root)
+        if not pkg_dirs:
             return TestRunOutcome(
-                ran=False, skipped_reason="no npm test or build script",
-                tests_present=tp)
-        root = Path(project_root).resolve()
-        # Best-effort dependency install so the smoke can run; bounded and
-        # non-fatal -- an offline box simply runs the script as-is.
-        if not (root / "node_modules").is_dir():
-            try:
-                subprocess.run(
-                    ["npm", "install", "--no-audit", "--no-fund"], cwd=root,
-                    capture_output=True, text=True,
-                    timeout=min(timeout_seconds, 180.0),
-                )
-            except Exception as e:
-                logger.debug("npm install skipped: %s", e)
-        label = " ".join(cmd)
-        # ``npm test`` runs a real suite; the ``npm run build`` fallback is a
-        # buildability smoke only, so a passing build is not a passing suite.
-        ran_tests = cmd[:2] == ["npm", "test"]
-        try:
-            proc = subprocess.run(
-                cmd, cwd=root, capture_output=True, text=True,
-                timeout=timeout_seconds,
-            )
-        except subprocess.TimeoutExpired as e:
-            return TestRunOutcome(
-                ran=True, returncode=124, stdout=e.stdout or "",
-                stderr=(e.stderr or "") + "\n[timeout]", tests_selected=[label],
-                ran_tests=ran_tests, tests_present=tp)
-        except Exception as e:
-            return TestRunOutcome(
-                ran=False, skipped_reason=f"{type(e).__name__}: {e}",
-                tests_present=tp)
-        return TestRunOutcome(
-            ran=True, returncode=proc.returncode, stdout=proc.stdout,
-            stderr=proc.stderr, tests_selected=[label], ran_tests=ran_tests,
-            tests_present=tp)
+                ran=False, skipped_reason="no package.json", tests_present=tp)
+        # Run every JS/TS component (root and/or subdirs) and merge worst-wins,
+        # so a monorepo frontend gets a real build/test gate.
+        outcomes = [
+            self._run_in_dir(d, timeout_seconds=timeout_seconds,
+                             tests_present=tp)
+            for d in pkg_dirs
+        ]
+        merged = _aggregate_outcomes([(f"npm:{Path(d).name}", o)
+                                      for d, o in zip(pkg_dirs, outcomes)])
+        # ``tests_present``/``ran_tests`` aren't set by the aggregator; carry
+        # them so P2's fail-closed-on-unrun-suite logic still sees them.
+        merged.tests_present = tp
+        merged.ran_tests = any(getattr(o, "ran_tests", False) for o in outcomes)
+        return merged
 
 
 # Registry of default runners, checked in order. Append new stacks here.

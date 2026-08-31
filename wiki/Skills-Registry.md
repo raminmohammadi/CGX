@@ -46,6 +46,11 @@ validators run.
   wrong-shaped output.
 - `cgx.session.tasks.plan_change` runs `validate_plan` and surfaces the
   verdict at the approval gate.
+- The **[[Swarm Agent]]**'s Tech Lead is skill-aware: it resolves the goal's
+  skills (auto-detected, or an explicit session / Agent-Profile pin) and
+  injects their guidance, so a *"Flask + React"* goal plans **both**
+  components. Each active skill's `validate_plan` can **veto** a plan that
+  omits its required files.
 
 Detection is scored: a skill's `detect(goal)` must meet
 `SKILL_DETECT_THRESHOLD` to activate. Verdicts marked

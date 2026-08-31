@@ -110,6 +110,44 @@ The agent only writes inside the **Project Root** you configure, and only
 
 ---
 
+## Human-in-the-loop approval for risky tools
+
+The swarm agent's tools include arbitrary code execution
+(`run_python_probe`), file writes, and — once MCP is configured — calls that
+reach the outside world. An **opt-in approval gate**
+(`cgx.session.approval`) can intercept these before they run.
+
+- **Off by default.** With no gate installed, tools dispatch exactly as before
+  — enabling the gate is the only behavior change.
+- **Mode is env-driven** via `CGX_APPROVAL_MODE`: `off`, `risky` (the default
+  when a gate is active — gates MEDIUM/HIGH tools), or `all` (gates every tool).
+- **Fail-safe.** A request **blocks** the worker until it is approved or denied;
+  if nobody answers within the TTL (default 1800 s) it **auto-rejects** — an
+  unanswered risky call is never silently run.
+- **Terminal**: `cgx agent --approve <goal>` prompts `y/N` before each risky
+  call. **Web/SSE**: a front-end reads `GET /api/approvals/pending` and resolves
+  with `POST /api/approvals/resolve`.
+
+See **[[Configuration and Tuning]]** for the env var and **[[CLI Reference]]**
+for the flag.
+
+## MCP tool servers (local config, env-held secrets)
+
+The optional **MCP (Model Context Protocol)** tool layer follows the same
+local-first, secrets-in-env posture as the rest of CGX:
+
+- The server roster is a **local JSON file** at `~/.cgx/mcp.json` (override with
+  `CGX_MCP_CONFIG`). Adding a tool server is a config edit, not a code change.
+- **Bearer tokens are never stored in the JSON.** A server entry names an env
+  var via `token_env`; the token is read from that variable at call time.
+- MCP calls (`mcp_call`) are HIGH risk, so they are gated by the approval gate
+  above when it is active. See **[[Providers and Models]]**.
+
+Configuring an MCP server can cause egress to whatever endpoint that server
+talks to — treat each server you add as a deliberate outbound path.
+
+---
+
 ## Tracing & redaction
 
 Function-call tracing (`CGX_TRACE=1` or the `/settings` toggle) writes

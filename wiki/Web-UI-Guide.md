@@ -60,6 +60,14 @@ Artifacts. Nothing reaches disk until you tick the approval checkpoint, and an
 its own sub-tabs for **Agent Profiles**, **Skills** and **New Skill**. Full
 walkthrough: **[[Session Based Agent]]**.
 
+**Swarm view fixes.** When a run is in `swarm` mode, the task tree now renders
+Developer tasks as **siblings under the Tech Lead** instead of a deepening
+parent chain that indented one level per file (with a defensive indentation
+clamp behind it). The live progress banner reads the correct phase —
+**Planning** / **Verifying** rather than always "Generating" — and the
+Facts/beats feed shows role- and phase-labeled swarm beats with concise
+summaries instead of an undifferentiated list. See **[[Swarm Agent]]**.
+
 ### Incremental Index (`/index`)
 Point at a project root or upload a `.zip`. Honours `.gitignore` and a 1 MB
 file-size cap; emits `indices/`, `records.jsonl`, `chunks.jsonl`, `graph.json`,
@@ -123,6 +131,22 @@ grid. The catalogue is pure-offline. Details in **[[Providers and Models]]**.
 - **Task registry.** Every operation is tracked in `~/.cgx/tasks.db`;
   cancel any running task with `DELETE /api/tasks/{id}` or the in-UI
   Cancel button.
+
+---
+
+## MCP servers & tool approvals
+
+A **Control** group in the sidebar adds two pages:
+
+- **MCP Servers** (`/mcp`) -- lists the tool servers configured in
+  `~/.cgx/mcp.json`, shows whether the optional SDK is installed and the config
+  path, and toggles a server on/off. Backed by `GET /api/mcp/servers` and
+  `POST /api/mcp/toggle`. See **[[Providers and Models]]**.
+- **Approvals** (`/approvals`) -- lists risky tool calls awaiting a human
+  decision (polled) with Approve/Deny. The Agent run view also surfaces its own
+  session's pending approvals inline while it runs. Backed by
+  `GET /api/approvals/pending` and `POST /api/approvals/resolve`; enable the web
+  gate with `CGX_WEB_APPROVAL`. See **[[Privacy and Security]]**.
 
 ---
 

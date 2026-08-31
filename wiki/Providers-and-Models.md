@@ -299,6 +299,43 @@ and documented in
 
 ---
 
+## MCP tool servers
+
+Beyond the LLM provider, the **swarm agent** can call external tools through the
+**Model Context Protocol (MCP)** — an optional layer installed with
+`pip install cgx[mcp]` (see **[[Installation]]**).
+
+The server roster is a **local JSON config** at `~/.cgx/mcp.json` (override the
+path with `CGX_MCP_CONFIG`). Adding a tool server is a config edit — no code
+change. Both `stdio` and `http` transports are supported, each server has an
+`enabled` flag, and bearer auth is expressed as an env-var name via `token_env`
+so the **token is never stored in the JSON**:
+
+```json
+{
+  "servers": [
+    {"name": "fetch", "transport": "stdio",
+     "command": "uvx", "args": ["mcp-server-fetch"], "enabled": true},
+    {"name": "docs", "transport": "http",
+     "url": "http://localhost:3000/mcp", "enabled": true,
+     "auth": {"type": "bearer", "token_env": "DOCS_TOKEN"}}
+  ]
+}
+```
+
+The swarm gets three registry tools — `mcp_list_servers`, `mcp_list_tools`, and
+`mcp_call` (HIGH risk, so gated by the approval gate when active). Discovery is
+**lazy** so many servers don't flood the prompt, and MCP tools are only
+advertised to the agent when at least one server is configured.
+
+It **degrades gracefully**: without the `mcp` SDK installed, discovery from the
+config still works and the call tools return an "install `cgx[mcp]`" message
+rather than failing. Over the web API, `GET /api/mcp/servers` lists the servers
+with an `sdk_installed` flag and `POST /api/mcp/toggle` enables/disables one.
+See **[[Swarm Agent]]** and **[[Privacy and Security]]**.
+
+---
+
 ## See also
 
 - **[[Ops and Observability]]** — the observability hub and its Metrics tab.
