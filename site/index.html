@@ -4,10 +4,10 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="theme-color" content="#030712" />
-    <title>CGX -- Code Graph eXecution | Local-first codebase RAG &amp; self-testing codegen</title>
+    <title>CGX -- Code Graph eXecution | Local-first coding agent harness</title>
     <meta
       name="description"
-      content="CGX indexes your repository, retrieves grounded context with a hybrid semantic + lexical + graph engine, and drives a session-shaped agent that writes self-tested code. Local-first: indexing, embeddings, retrieval and sessions never leave your machine."
+      content="CGX is a local-first coding agent harness: a modular orchestration layer that turns an interchangeable local or remote LLM into an autonomous developer, driving deterministic, plan-driven agents that write self-tested code grounded in your indexed repository. Nothing leaves your machine unless you say so."
     />
     <link rel="canonical" href="https://raminmohammadi.github.io/CGX/" />
     <link rel="icon" type="image/svg+xml" href="assets/favicon.svg" />
@@ -16,7 +16,7 @@
     <meta property="og:title" content="CGX -- Code Graph eXecution" />
     <meta
       property="og:description"
-      content="Local-first codebase RAG and self-testing code generation. Hybrid retrieval, a session-shaped agent that pauses for your approval, and nothing leaves your machine."
+      content="A local-first coding agent harness. A modular orchestration layer that drives deterministic, plan-driven agents to write self-tested code, grounded in your indexed repo — and nothing leaves your machine unless you say so."
     />
     <meta property="og:image" content="assets/logo.png" />
     <meta name="twitter:card" content="summary_large_image" />
@@ -90,16 +90,17 @@
       <section class="hero" id="top">
         <div class="shell hero-grid">
           <div>
-            <p class="eyebrow">Local-first codebase intelligence</p>
+            <p class="eyebrow">Local-first coding agent harness</p>
             <h1>
-              Your repository is the context.<br />
-              The model is <em>interchangeable</em>.
+              Turn an interchangeable model<br />
+              into an <em>autonomous developer</em>.
             </h1>
             <p>
-              CGX parses your code into a graph, retrieves grounded context with a hybrid
-              semantic&nbsp;+&nbsp;lexical&nbsp;+&nbsp;graph engine, and asks a local or remote LLM to
-              answer questions or produce <strong>self-tested</strong> change plans. Indexing,
-              embeddings, retrieval, sessions, and telemetry never leave the machine.
+              CGX is a modular orchestration layer that transforms an LLM — local or remote — from a
+              passive chatbot into a coding agent. Rather than a free-form loop, it drives
+              <strong>deterministic, plan-driven agents</strong> that index your repository, retrieve
+              grounded context, and write <strong>self-tested</strong> code. The model is interchangeable;
+              indexing, embeddings, retrieval, sessions, and telemetry never leave the machine.
             </p>
 
             <div class="hero-actions">
@@ -377,14 +378,15 @@ flowchart TD
       <section id="agent">
         <div class="shell">
           <div class="section-head">
-            <p class="eyebrow">The session-shaped agent</p>
-            <h2>A state machine you can pause, resume, and undo.</h2>
+            <p class="eyebrow">The agent harness</p>
+            <h2>Not a chat loop — a harness that drives the model.</h2>
             <p class="lede">
-              Every interaction belongs to a <strong>Session</strong> that survives process restarts in
-              <code class="inline">&lt;project&gt;/.cgx/sessions.db</code>. A deterministic
-              pure-Python router owns every transition — no LLM decides control flow — and the loop
-              progresses exactly one task per call, stopping at each
-              <code class="inline">ASK_USER</code> checkpoint for a typed decision.
+              This is the heart of CGX: the orchestration layer that turns an interchangeable model into
+              a coding agent. Instead of letting an LLM improvise in a free-form loop, the harness runs a
+              <strong>deterministic, plan-driven</strong> chain — a pure-Python router owns every
+              transition, the loop advances one typed task at a time, and the model is called only to do
+              the focused work inside a step. Everything is grounded, checkpointed, approvable, and
+              reversible.
             </p>
           </div>
 
@@ -463,77 +465,38 @@ flowchart TD
 
           <div class="grid grid-3" style="margin-top: 1.25rem">
             <article class="card reveal">
-              <h3>Verification that tells the truth</h3>
+              <h3>Deterministic control, focused calls</h3>
               <p>
-                <code class="inline">BOOTSTRAP_ENV</code> provisions a <code class="inline">.venv</code>
-                for Python and the JS toolchain for a <code class="inline">package.json</code> — a
-                polyglot repo is verified in one pass — so "Flask wasn't installed" reads as a
-                collection error rather than masquerading as a test failure.
+                A pure-Python router — never the LLM — decides what happens next, walking an explicit
+                task chain and pausing at every branch for a typed <strong>Decision</strong>. The model
+                is invoked only for the bounded work inside a step, so control flow is reproducible and
+                nothing improvises its way onto disk.
               </p>
             </article>
             <article class="card reveal">
-              <h3>Repair that stops instead of flapping</h3>
+              <h3>Self-testing, then self-repairing</h3>
               <p>
-                Deterministic, LLM-free classifiers handle the mechanical breaks first; only genuine
-                logic failures fall back to a bounded LLM repair over at most five files. The loop runs
-                while the failing-test count strictly drops, under a hard ceiling, gated by a
-                failure-signature hash.
+                Before you ever see a change, diffs are parsed, syntax-checked and run against impacted
+                tests in a sandbox — with the environment bootstrapped first, so a missing package reads
+                as a collection error, not a fake test failure. Failures feed a bounded, progress-aware
+                repair loop that stops instead of flapping.
               </p>
             </article>
             <article class="card reveal">
-              <h3>Budgets as a safety valve</h3>
+              <h3>Persistent, reversible, one loop everywhere</h3>
               <p>
-                A typed <code class="inline">LoopBudget</code> bounds each retry chain and a
-                session-level budget backstops the whole run: an interactive session pauses on an
-                <code class="inline">ASK_USER</code> when it is spent, a headless one ends terminally.
+                Sessions survive restarts in <code class="inline">.cgx/sessions.db</code> and resume
+                identically from the web UI, the terminal dashboard, or <code class="inline">cgx
+                agent</code>. Every overwrite is mirrored under <code class="inline">.cgx-backups/</code>
+                and a whole run undoes with one rollback call; typed budgets backstop a runaway loop.
               </p>
             </article>
           </div>
 
-          <figure class="reveal" style="margin-top: 2.5rem; text-align: center;">
-            <div class="mermaid">
-flowchart TD
-    subgraph Surfaces
-        UI[AgentPage.tsx<br/>POST /api/agent-session<br/>EventSource /events]
-        Web[cgx.webui.routes.agent_session<br/>REST + SSE]
-        CLI[cgx.cli terminal<br/>TUI dashboard]
-    end
-
-    subgraph Core[Session Loop Core]
-        Runner[SessionRunner<br/>_pick_ready → _execute → _apply_plan]
-        Execs[Executors cgx.session.tasks.*<br/>explore, clarify, scaffold, apply...]
-        Router[Router cgx.session.router<br/>TASK_SUCCESSOR edges]
-    end
-
-    subgraph Data[Persistence & Events]
-        Store[SessionStore<br/>SQLite .cgx/sessions.db]
-        Events[Event Bus<br/>SSE, TUI stream, agent.log]
-    end
-
-    Providers[cgx.answer.providers<br/>Ollama, OpenAI, Gemini]
-
-    UI --> Web
-    CLI --> Runner
-    Web --> Runner
-
-    Runner --> Execs
-    Execs --> Router
-    Execs --> Providers
-
-    Router --> Store
-    Store --> Events
-    Events -.-> UI
-
-    style Surfaces fill:#0f172a,stroke:#38bdf8,color:#fff
-    style Core fill:#0f172a,stroke:#a78bfa,color:#fff
-    style Data fill:#0f172a,stroke:#94a3b8,color:#fff
-    style Providers fill:#0b1220,stroke:#f59e0b,color:#fff
-            </div>
-            <figcaption>
-              One loop, three surfaces — the web UI, the terminal dashboard, and
-              <code class="inline">cgx agent</code> all drive the same runner over the same store.
-            </figcaption>
-          </figure>
+          <p class="lede" style="margin-top: 2rem; text-align: center;">
+            And when you want it to just build the whole thing, the same harness drives a plan-driven
+            multi-role <a href="#swarm"><strong>Swarm</strong></a>. →
+          </p>
         </div>
       </section>
 
@@ -1002,7 +965,7 @@ flowchart TB
         Repo[📁 Your repository<br/>read-only ingest]
         Indexer[⚙️ Indexer<br/>chunks, graph, embeddings]
         Artifacts[💾 On-disk artefacts<br/>indices/, records.jsonl]
-        Agent[🤖 Agent loop<br/>session-shaped]
+        Agent[🤖 Agent harness<br/>plan-driven]
         State[💬 Sessions & Cache<br/>.cgx/sessions.db]
         Creds[🔑 Credentials<br/>OS keyring]
 
@@ -1106,8 +1069,8 @@ flowchart TB
               <span>CGX<small>Code Graph eXecution</small></span>
             </a>
             <p style="color: var(--fg-muted); font-size: 0.8125rem; max-width: 34ch; margin: 1rem 0 0">
-              Local-first codebase RAG and self-testing code generation. Your code, your embeddings,
-              your sessions, your model.
+              A local-first coding agent harness for self-tested code generation. Your code, your
+              embeddings, your sessions, your model.
             </p>
           </div>
 
