@@ -27,8 +27,8 @@ OpenAI-compatible endpoint and either rely on the local embedder later or
 supply your own embeddings via a BYO embedder callable.
 
 ```bash
-git clone <your fork>
-cd cgx
+git clone https://github.com/raminmohammadi/CGX.git
+cd CGX
 python -m venv .venv
 
 # Linux / macOS
@@ -79,7 +79,7 @@ Install any of these with `pip install -e ".[<extra>]"`:
 | `keyring`    | OS keyring for API-key storage                         |
 | `parsers`    | `tree-sitter` grammars for JavaScript / TypeScript / TSX |
 | `mcp`        | Model Context Protocol SDK for external tool servers (see **[[Providers and Models]]**) |
-| `viz`        | `matplotlib` for graph visualisation                   |
+| `viz`        | `matplotlib` (regenerate the docs book diagrams)       |
 | `dev`        | `pytest`, `ruff`, `mypy`                               |
 
 Without the `parsers` extra CGX still indexes Python; other languages are
