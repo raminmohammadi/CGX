@@ -3,7 +3,7 @@
 The **Ops & Observability** hub (sidebar → **Observability → Ops &
 Observability**, route `/ops`) is one screen over the entire production
 MLOps layer. It surfaces every subsystem documented in
-[`docs/mlops.md`](https://github.com/raminmohammadi/Averix/blob/main/docs/mlops.md) —
+[`docs/mlops.md`](https://github.com/raminmohammadi/CGX/blob/main/docs/mlops.md) —
 metrics, activity, alerts, cost, feedback, governance, health and traces —
 as ten tabs of cards, charts and controls.
 
@@ -419,7 +419,7 @@ flowchart LR
 ## Subsystem legend
 
 The eyebrow letters on the cards map to the subsystems in
-[`docs/mlops.md`](https://github.com/raminmohammadi/Averix/blob/main/docs/mlops.md):
+[`docs/mlops.md`](https://github.com/raminmohammadi/CGX/blob/main/docs/mlops.md):
 
 | Letter | Subsystem | Module / store | Appears on |
 |--------|-----------|----------------|------------|
@@ -447,5 +447,5 @@ The eyebrow letters on the cards map to the subsystems in
   `CGX_RETENTION_DAYS` and tracing environment variables.
 - **[[Privacy and Security]]** — redaction, the trace-delete threat model,
   and what stays local.
-- [`docs/mlops.md`](https://github.com/raminmohammadi/Averix/blob/main/docs/mlops.md)
+- [`docs/mlops.md`](https://github.com/raminmohammadi/CGX/blob/main/docs/mlops.md)
   — the exhaustive operator reference (endpoints, env vars, store layout).

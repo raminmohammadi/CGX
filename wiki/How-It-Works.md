@@ -4,7 +4,7 @@ CGX is a one-way pipeline — **parse → graph → embed → retrieve → answe
 codegen** — with the **[[Session Based Agent]]** orchestrating that
 pipeline one typed task at a time. This page is the conceptual tour; the
 contributor-facing deep dive is **[[Architecture]]** and
-[`docs/architecture.md`](https://github.com/raminmohammadi/Averix/blob/main/docs/architecture.md).
+[`docs/architecture.md`](https://github.com/raminmohammadi/CGX/blob/main/docs/architecture.md).
 
 ```mermaid
 flowchart LR
@@ -107,7 +107,7 @@ Per-tier budgets scale by the provider's advertised context window
 (bands at 16K / 64K / 200K). This is automatic; if a query triggers no
 graph expansion, the prompt falls back to the legacy single-tier list and
 behaves identically. Full treatment:
-[`docs/architecture.md` § Tiered SLM context](https://github.com/raminmohammadi/Averix/blob/main/docs/architecture.md#tiered-slm-context-code-map).
+[`docs/architecture.md` § Tiered SLM context](https://github.com/raminmohammadi/CGX/blob/main/docs/architecture.md#tiered-slm-context-code-map).
 
 ---
 
@@ -124,6 +124,6 @@ retrieval, codegen, and provider stacks described here.
 ## See also
 
 - **[[Architecture]]** — module map and data-flow reference.
-- [`docs/flowcharts.md`](https://github.com/raminmohammadi/Averix/blob/main/docs/flowcharts.md) — user / developer /
+- [`docs/flowcharts.md`](https://github.com/raminmohammadi/CGX/blob/main/docs/flowcharts.md) — user / developer /
   company diagrams.
 - **[[Configuration and Tuning]]** — the knobs behind each stage.

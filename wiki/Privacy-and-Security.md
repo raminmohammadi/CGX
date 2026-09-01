@@ -60,7 +60,7 @@ The entire payload is:
 No prompts, code, file paths, model names, or PII — ever. The install id
 lives at `~/.cgx/install_id`; delete it to rotate. The POST runs in a
 daemon thread with a 2 s timeout and swallows every exception. Review
-[`src/cgx/telemetry.py`](https://github.com/raminmohammadi/Averix/blob/main/src/cgx/telemetry.py) before opting in.
+[`src/cgx/telemetry.py`](https://github.com/raminmohammadi/CGX/blob/main/src/cgx/telemetry.py) before opting in.
 
 ---
 
@@ -173,4 +173,4 @@ other file on the machine.
 - **[[Providers and Models]]** — provider selection and credential flow.
 - **[[Web UI Guide]]** — binding and remote-access notes.
 - **[[Session Based Agent]]** — approval checkpoints and rollback.
-- [`docs/architecture.md` § Telemetry / Privacy](https://github.com/raminmohammadi/Averix/blob/main/docs/architecture.md).
+- [`docs/architecture.md` § Telemetry / Privacy](https://github.com/raminmohammadi/CGX/blob/main/docs/architecture.md).

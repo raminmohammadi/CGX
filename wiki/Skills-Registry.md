@@ -14,7 +14,7 @@ Each skill answers three questions for its technology:
 3. **Did the produced output actually use me correctly?** —
    `validate_scaffold(diffs, goal)` / `validate_plan(diffs, goal)`
 
-The contract lives in [`skills/base.py`](https://github.com/raminmohammadi/Averix/blob/main/skills/base.py).
+The contract lives in [`skills/base.py`](https://github.com/raminmohammadi/CGX/blob/main/skills/base.py).
 
 ---
 
@@ -65,7 +65,7 @@ the scaffold; only non-warning failures do.
   `skills/__init__.py`. Contribute these upstream.
 - **Private / local-only** — drop a single `Skill` subclass in a `.py`
   file under `~/.cgx/skills/`. It is discovered at runtime by
-  [`skills/loader.py`](https://github.com/raminmohammadi/Averix/blob/main/skills/loader.py) and participates in detection,
+  [`skills/loader.py`](https://github.com/raminmohammadi/CGX/blob/main/skills/loader.py) and participates in detection,
   prompt composition, and validation exactly like a built-in — no repo
   edits required.
 
@@ -117,7 +117,7 @@ class SvelteSkill(Skill):
 
 ### 2. Register it (built-in only)
 
-Import the class at the top of [`skills/__init__.py`](https://github.com/raminmohammadi/Averix/blob/main/skills/__init__.py)
+Import the class at the top of [`skills/__init__.py`](https://github.com/raminmohammadi/CGX/blob/main/skills/__init__.py)
 and append an instance to `SKILLS`. Registry order only affects
 diagnostic logging.
 
@@ -153,4 +153,4 @@ pytest tests/test_skills_<name>.py -q
 
 - **[[Contributing]]** — the full PR checklist.
 - **[[Session Based Agent]]** — where scaffold validation runs.
-- [`CONTRIBUTING.md`](https://github.com/raminmohammadi/Averix/blob/main/CONTRIBUTING.md#adding-a-new-skill).
+- [`CONTRIBUTING.md`](https://github.com/raminmohammadi/CGX/blob/main/CONTRIBUTING.md#adding-a-new-skill).

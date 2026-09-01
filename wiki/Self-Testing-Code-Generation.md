@@ -108,4 +108,4 @@ Or tick **Validate diffs** + **Run impacted tests** in the Plan tab.
 
 - **[[Session Based Agent]]** — where codegen runs inside a task DAG.
 - **[[Skills Registry]]** — structural validators that gate scaffolds.
-- [`docs/architecture.md` § Self-test loop](https://github.com/raminmohammadi/Averix/blob/main/docs/architecture.md#self-test-loop).
+- [`docs/architecture.md` § Self-test loop](https://github.com/raminmohammadi/CGX/blob/main/docs/architecture.md#self-test-loop).

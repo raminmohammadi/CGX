@@ -61,7 +61,7 @@ unset). The most useful:
 `BUILD_GRAPH` (1).
 
 These map to the dataclasses in
-[`src/cgx/config.py`](https://github.com/raminmohammadi/Averix/blob/main/src/cgx/config.py) and can also be set via
+[`src/cgx/config.py`](https://github.com/raminmohammadi/CGX/blob/main/src/cgx/config.py) and can also be set via
 `.from_overrides(...)`.
 
 ---
@@ -81,7 +81,7 @@ The production layer (**[[MLOps and Production]]**) is env-driven too:
 | `CGX_EVAL_CANDIDATES_PATH` | Override the feedback flywheel's eval-candidate JSONL path. |
 
 The full reference and endpoints are in
-[`docs/mlops.md`](https://github.com/raminmohammadi/Averix/blob/main/docs/mlops.md).
+[`docs/mlops.md`](https://github.com/raminmohammadi/CGX/blob/main/docs/mlops.md).
 
 ---
 
@@ -145,4 +145,4 @@ regenerate budgets (`REPAIR_BUDGET=4`, `REGENERATE_BUDGET=3`, …) in
 - **[[How It Works]]** — what each stage does.
 - **[[Providers and Models]]** — provider-side configuration.
 - **[[MLOps and Production]]** — the production observability/governance layer.
-- [`docs/usage.md`](https://github.com/raminmohammadi/Averix/blob/main/docs/usage.md#5-tune-retrieval-optional).
+- [`docs/usage.md`](https://github.com/raminmohammadi/CGX/blob/main/docs/usage.md#5-tune-retrieval-optional).

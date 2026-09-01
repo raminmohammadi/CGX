@@ -1,12 +1,16 @@
 # CGX Wiki — Code Graph eXecution
 
-**Local-first codebase RAG and self-testing code-generation platform.**
+**A local-first coding AI agent harness, codebase indexer, and
+search-and-response engine for self-testing code generation.**
 
-CGX indexes a repository, retrieves grounded context through a hybrid
-engine (semantic + lexical + graph), and asks a local or remote LLM to
-answer questions or produce **self-tested** code-change plans. It is
-model-agnostic and ships with a React/Vite web UI served by a FastAPI
-backend that streams progress over Server-Sent Events.
+CGX is a modular orchestration layer that turns an LLM — local or remote —
+into an autonomous developer. It indexes a repository, retrieves grounded
+context through a hybrid engine (semantic + lexical + graph), and drives
+**deterministic, plan-driven agents** (a session-based agent and a
+multi-role **Swarm** of Tech Lead / Developer / Verifier) to answer
+questions and produce **self-tested** code. It is model-agnostic and ships
+with a React/Vite web UI served by a FastAPI backend that streams execution
+progress and live agent telemetry over Server-Sent Events.
 
 Point CGX at a repo and ask in plain English. Whether you are onboarding
 to an unfamiliar codebase, planning a refactor, or scaffolding a
@@ -29,6 +33,7 @@ Pick the path that matches what you need right now.
 | Learn the web UI tab-by-tab                   | **[[Web UI Guide]]** |
 | Script CGX from the terminal                  | **[[CLI Reference]]** |
 | Drive the multi-step agent                    | **[[Session Based Agent]]** |
+| Run the plan-driven multi-role build engine   | **[[Swarm Agent]]** |
 | Generate and auto-validate code changes       | **[[Self Testing Code Generation]]** |
 | Teach CGX a new framework                     | **[[Skills Registry]]** |
 | Choose a provider / model for my hardware     | **[[Providers and Models]]** |
@@ -69,6 +74,12 @@ Pick the path that matches what you need right now.
   step at a time, pausing at every branch so **you approve each decision**.
   It explores an existing codebase or scaffolds a new project from a
   plain-language idea.
+- **Swarm agent.** A deterministic, plan-driven build engine that replaces
+  free-form loops with three router-driven roles — a **Tech Lead** (planner),
+  a **Developer** (one file per turn), and a **Verifier** (polyglot
+  build/test) — each stage propose-then-validate, with bounded auto-repair
+  (AST import injection, contract renegotiation, semantic repair with a
+  dynamic temperature ramp).
 - **Self-testing code generation.** Diffs are parsed, syntax-checked, and
   optionally run against impacted tests in a sandbox before you ever see
   them.
@@ -76,7 +87,7 @@ Pick the path that matches what you need right now.
   folder and bundles detection, prompt guidance, and a structural
   validator. Adding a framework is a single-folder change.
 
-See the full list in the project [README](https://github.com/raminmohammadi/Averix/blob/main/README.md#highlights).
+See the full list in the project [README](https://github.com/raminmohammadi/CGX/blob/main/README.md#highlights).
 
 ---
 
@@ -111,14 +122,14 @@ The **[[How It Works]]** page walks this pipeline end to end, and
 The wiki is the curated, navigable entry point. The in-repo `docs/` set
 holds the authoritative deep dives that individual wiki pages link into:
 
-- [`docs/architecture.md`](https://github.com/raminmohammadi/Averix/blob/main/docs/architecture.md) — full architecture reference
-- [`docs/mlops.md`](https://github.com/raminmohammadi/Averix/blob/main/docs/mlops.md) — production MLOps operator guide
-- [`docs/usage.md`](https://github.com/raminmohammadi/Averix/blob/main/docs/usage.md) — exhaustive usage guide
-- [`docs/Agent.md`](https://github.com/raminmohammadi/Averix/blob/main/docs/Agent.md) — session-agent internals
-- [`docs/flowcharts.md`](https://github.com/raminmohammadi/Averix/blob/main/docs/flowcharts.md) — audience-specific diagrams
-- [`docs/hardware_matrix.md`](https://github.com/raminmohammadi/Averix/blob/main/docs/hardware_matrix.md) — model fit matrix
+- [`docs/architecture.md`](https://github.com/raminmohammadi/CGX/blob/main/docs/architecture.md) — full architecture reference
+- [`docs/mlops.md`](https://github.com/raminmohammadi/CGX/blob/main/docs/mlops.md) — production MLOps operator guide
+- [`docs/usage.md`](https://github.com/raminmohammadi/CGX/blob/main/docs/usage.md) — exhaustive usage guide
+- [`docs/Agent.md`](https://github.com/raminmohammadi/CGX/blob/main/docs/Agent.md) — session-agent internals
+- [`docs/flowcharts.md`](https://github.com/raminmohammadi/CGX/blob/main/docs/flowcharts.md) — audience-specific diagrams
+- [`docs/hardware_matrix.md`](https://github.com/raminmohammadi/CGX/blob/main/docs/hardware_matrix.md) — model fit matrix
 
-> **A note on naming.** This wiki uses **CGX**, matching `README.md`,
-> `pyproject.toml`, the `docs/` set, and the `cgx` import package. If the
-> project is rebranding (the `averix` build metadata suggests it may be),
-> the pages can be updated in one pass.
+> **A note on naming.** The project is **CGX** (**Code Graph eXecution**)
+> throughout — matching `README.md`, `pyproject.toml` (`name = "cgx"`), the
+> `docs/` set, the `cgx` / `cgx-ui` commands, and the repository at
+> [github.com/raminmohammadi/CGX](https://github.com/raminmohammadi/CGX).
