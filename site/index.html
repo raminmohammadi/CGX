@@ -9,7 +9,7 @@
       name="description"
       content="CGX indexes your repository, retrieves grounded context with a hybrid semantic + lexical + graph engine, and drives a session-shaped agent that writes self-tested code. Local-first: indexing, embeddings, retrieval and sessions never leave your machine."
     />
-    <link rel="canonical" href="https://raminmohammadi.github.io/Averix/" />
+    <link rel="canonical" href="https://raminmohammadi.github.io/CGX/" />
     <link rel="icon" type="image/svg+xml" href="assets/favicon.svg" />
 
     <meta property="og:type" content="website" />
@@ -39,7 +39,9 @@
       <a href="#how" data-label="How it works"><span class="rail-dot"></span></a>
       <a href="#retrieval" data-label="Retrieval"><span class="rail-dot"></span></a>
       <a href="#agent" data-label="Agent"><span class="rail-dot"></span></a>
+      <a href="#swarm" data-label="Swarm"><span class="rail-dot"></span></a>
       <a href="#surfaces" data-label="Surfaces"><span class="rail-dot"></span></a>
+      <a href="#ops" data-label="Ops"><span class="rail-dot"></span></a>
       <a href="#install" data-label="Install"><span class="rail-dot"></span></a>
       <a href="#trust" data-label="Trust"><span class="rail-dot"></span></a>
       <a href="#docs" data-label="Docs"><span class="rail-dot"></span></a>
@@ -64,13 +66,15 @@
           <a href="#how">How it works</a>
           <a href="#retrieval">Retrieval</a>
           <a href="#agent">Agent</a>
+          <a href="#swarm">Swarm</a>
           <a href="#surfaces">Surfaces</a>
+          <a href="#ops">Ops</a>
           <a href="#trust">Trust</a>
           <a href="#docs">Docs</a>
         </nav>
         <a
           class="btn btn-ghost btn-sm"
-          href="https://github.com/raminmohammadi/Averix"
+          href="https://github.com/raminmohammadi/CGX"
           rel="noopener"
         >
           <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true">
@@ -533,6 +537,129 @@ flowchart TD
         </div>
       </section>
 
+      <!-- =========================================================== swarm -->
+      <section id="swarm">
+        <div class="shell">
+          <div class="section-head">
+            <p class="eyebrow">The Swarm</p>
+            <h2>When you want it to just build the thing.</h2>
+            <p class="lede">
+              Swarm is a deterministic, <strong>plan-driven</strong> build engine — a session mode
+              (<code class="inline">cgx agent --mode swarm</code>) that replaces the free-form loop with
+              three router-driven roles. Every stage is <strong>propose-then-validate</strong>: the
+              model proposes, deterministic invariants enforce. It is polyglot — Python and JS/TS are
+              first-class, and a new stack is a skill plus a test runner, not a change to the swarm.
+            </p>
+          </div>
+
+          <div class="grid grid-3">
+            <article class="card reveal">
+              <span class="pill pill-neon">Role 1</span>
+              <h3>Tech Lead — plans, never codes</h3>
+              <p>
+                Resolves the goal's active skills, drafts a JSON <code class="inline">WORK_PLAN</code>
+                (files, <code class="inline">depends_on</code> edges, per-file contracts), then
+                normalises, topologically orders, and gates it on buildability — with a bounded
+                corrective re-ask. Per-ecosystem scaffolding (a
+                <code class="inline">requirements.txt</code> or <code class="inline">package.json</code>,
+                a README, a test per module) is injected deterministically.
+              </p>
+            </article>
+            <article class="card reveal">
+              <span class="pill">Role 2</span>
+              <h3>Developer — one file per turn</h3>
+              <p>
+                Implements exactly one planned file at a time, in dependency order, grounded on the
+                <em>real on-disk</em> content of its dependencies. A generation ladder falls back to a
+                deterministic AST assembler, and two hard gates — a <strong>phantom-import</strong> gate
+                and a <strong>no-stub</strong> gate — reject an unused import or a
+                <code class="inline">pass</code>-bodied contract function before it can break the suite.
+              </p>
+            </article>
+            <article class="card reveal">
+              <span class="pill">Role 3</span>
+              <h3>Verifier — the real build is the authority</h3>
+              <p>
+                Reconciles each component's manifest against its actual imports, runs static structural
+                checks, then a <strong>polyglot</strong> dry-run: <code class="inline">pytest</code> for
+                a Python component, <code class="inline">npm test</code> /
+                <code class="inline">npm run build</code> for JS/TS. A red suite on a clean tree drives
+                failure-driven repair rather than a false pass.
+              </p>
+            </article>
+          </div>
+
+          <div class="chain reveal" aria-label="Swarm role chain" style="margin-top: 1.5rem">
+            <span>SWARM_TECH_LEAD</span><i>→</i>
+            <span>SWARM_DEVELOPER</span><i>⟲ per file</i>
+            <span class="write">SWARM_VERIFY</span><i>⟲</i>
+            <span class="write">REPAIR</span>
+          </div>
+
+          <div class="grid grid-3" style="margin-top: 1.25rem">
+            <article class="card reveal">
+              <h3>Bounded auto-repair</h3>
+              <p>
+                Mechanical breaks are fixed without the LLM: an <strong>AST import injector</strong>
+                prepends missing imports resolved from plan contracts, and
+                <strong>contract renegotiation</strong> merges an amended signature into the plan
+                instead of failing the build.
+              </p>
+            </article>
+            <article class="card reveal">
+              <h3>Repair that ramps, then stops</h3>
+              <p>
+                When a structurally-clean tree still fails, an <strong>AST function-logic repair</strong>
+                rewrites the enclosing function and the loop scales temperature
+                <code class="inline">0.2 → 0.8</code> across up to five bounded rounds to break
+                repetitive output — never a silent green on a red suite.
+              </p>
+            </article>
+            <article class="card reveal">
+              <h3>Live Swarm Operations feed</h3>
+              <p>
+                The Agent page renders a <strong>Swarm Operations</strong> timeline of
+                <code class="inline">swarm_beat</code> telemetry — role, phase, target file, tool calls
+                and pass/fail — streamed over SSE, with Developer tasks nested under the Tech Lead in the
+                task tree.
+              </p>
+            </article>
+          </div>
+
+          <figure class="reveal" style="margin-top: 2.5rem; text-align: center;">
+            <div class="mermaid">
+flowchart LR
+    Goal[Objective<br/>cgx agent --mode swarm] --> TL
+
+    subgraph Swarm[Router-driven roles]
+        direction TB
+        TL[Tech Lead<br/>SWARM_TECH_LEAD<br/>plan + contracts + toposort]
+        DEV[Developer<br/>SWARM_DEVELOPER<br/>one file / turn, grounded]
+        VER[Verifier<br/>SWARM_VERIFY<br/>polyglot build + test]
+    end
+
+    TL -->|WORK_PLAN| DEV
+    DEV -->|next file| DEV
+    DEV --> VER
+    VER -->|red suite| REP[REPAIR<br/>AST inject · logic fix<br/>temp 0.2 → 0.8, bounded]
+    REP --> VER
+    VER -->|green| Done[Runnable project<br/>or honest FAILED]
+
+    style Swarm fill:#0f172a,stroke:#a78bfa,color:#fff
+    style TL fill:#0b1220,stroke:#38bdf8,color:#fff
+    style DEV fill:#0b1220,stroke:#34d399,color:#fff
+    style VER fill:#0b1220,stroke:#fbbf24,color:#fff
+    style REP fill:#0b1220,stroke:#fb7185,color:#fff
+    style Done fill:#0b1220,stroke:#34d399,color:#fff
+            </div>
+            <figcaption>
+              The swarm loop — plan once, generate file by file, verify the real build, repair a red
+              suite under a hard ceiling. Deterministic invariants gate every stage.
+            </figcaption>
+          </figure>
+        </div>
+      </section>
+
       <!-- ======================================================== surfaces -->
       <section id="surfaces">
         <div class="shell">
@@ -569,7 +696,8 @@ flowchart TD
                 <li><strong>Index</strong> — point at a root or upload a zip; cancel mid-run.</li>
                 <li><strong>Ask</strong> — streaming thought-process panel, then the grounded answer.</li>
                 <li><strong>Plan</strong> — validate diffs and run impacted tests before you read them.</li>
-                <li><strong>Agent</strong> — the task DAG with status icons, facts, artifacts, and Undo.</li>
+                <li><strong>Agent</strong> — the task DAG with status icons, facts, artifacts, and Undo; explore, greenfield, or <strong>swarm</strong> mode with a live Swarm Operations feed.</li>
+                <li><strong>Ops</strong> — ten-tab MLOps hub: metrics, activity, monitoring, cost, feedback, governance, health, and a Trace explorer.</li>
                 <li><strong>Hardware</strong> — fit verdicts per model; fully offline.</li>
               </ul>
             </div>
@@ -624,6 +752,86 @@ ans = <span class="f">answer_with_llm</span>(
         </div>
       </section>
 
+      <!-- ============================================================= ops -->
+      <section id="ops">
+        <div class="shell">
+          <div class="section-head">
+            <p class="eyebrow">Ops &amp; observability</p>
+            <h2>A production MLOps layer, local-first and zero-config.</h2>
+            <p class="lede">
+              The <code class="inline">/ops</code> hub is a single console with <strong>ten tabs</strong>
+              of live signal. Every store is SQLite (WAL, <code class="inline">$CGX_CONFIG_DIR</code>-aware),
+              metrics are collected in-process, and every recorder is best-effort — an observability
+              failure can never break a request.
+            </p>
+          </div>
+
+          <div class="chain reveal" aria-label="Ops hub tabs" style="margin-bottom: 1.75rem">
+            <span>Overview</span>
+            <span>Pipelines</span>
+            <span>Activity</span>
+            <span>Monitoring</span>
+            <span>Cost &amp; Quota</span>
+            <span>Feedback</span>
+            <span>Metrics</span>
+            <span>Governance</span>
+            <span>Health</span>
+            <span class="write">Trace</span>
+          </div>
+
+          <div class="grid grid-3">
+            <article class="card reveal">
+              <h3>Metrics &amp; tracing</h3>
+              <p>
+                In-process Prometheus series at <code class="inline">GET /api/metrics</code> (RED-style
+                LLM latency / cost / tokens) plus a curated <code class="inline">@traced</code>
+                function-call tracer (<code class="inline">CGX_TRACE</code>) that logs every LLM call's
+                full <em>redacted</em> prompt + response — browsable in the Trace tab.
+              </p>
+            </article>
+            <article class="card reveal">
+              <h3>AIOps monitoring</h3>
+              <p>
+                Groundedness, retrieval-drift, cost-anomaly and repair-health checks persist
+                <code class="inline">Alert</code> records (<code class="inline">CGX_MON_*</code>),
+                surfaced at <code class="inline">GET /api/monitor/alerts</code> and the Monitoring tab.
+              </p>
+            </article>
+            <article class="card reveal">
+              <h3>Cost &amp; quota</h3>
+              <p>
+                Truthful token/cost accounting (<code class="inline">CGX_MODEL_PRICING</code>) plus
+                per-owner day budgets with soft-warn / hard-stop
+                (<code class="inline">CGX_BUDGET_*</code>).
+              </p>
+            </article>
+            <article class="card reveal">
+              <h3>Feedback flywheel</h3>
+              <p>
+                Thumbs up/down + comments that export down-votes into eval candidates and unify with
+                cross-session lessons, closing the loop back into the offline eval harness.
+              </p>
+            </article>
+            <article class="card reveal">
+              <h3>Data governance</h3>
+              <p>
+                Configurable retention/TTL, right-to-erasure, and a PII scan/scrub pass beyond
+                credential redaction — <code class="inline">/api/govdata/*</code>, driven from the
+                Governance tab.
+              </p>
+            </article>
+            <article class="card reveal">
+              <h3>Reliability &amp; deploy</h3>
+              <p>
+                <code class="inline">/healthz</code> (liveness) and <code class="inline">/readyz</code>
+                (readiness) probes with Prometheus SLO rules, and a container / Compose (CGX + Prometheus
+                + Grafana) / Helm path under <code class="inline">deploy/</code>.
+              </p>
+            </article>
+          </div>
+        </div>
+      </section>
+
       <!-- ========================================================= install -->
       <section id="install">
         <div class="shell">
@@ -651,8 +859,8 @@ ans = <span class="f">answer_with_llm</span>(
                   copy
                 </button>
               </div>
-              <pre><code><span class="p">$</span> git clone https://github.com/raminmohammadi/Averix
-<span class="p">$</span> cd Averix
+              <pre><code><span class="p">$</span> git clone https://github.com/raminmohammadi/CGX
+<span class="p">$</span> cd CGX
 <span class="p">$</span> python -m venv .venv
 <span class="p">$</span> source .venv/bin/activate   <span class="c"># Windows: .venv\Scripts\Activate.ps1</span>
 <span class="p">$</span> pip install -r requirements.txt
@@ -695,9 +903,33 @@ ans = <span class="f">answer_with_llm</span>(
                 <tr><td>parsers</td><td>tree-sitter grammars for JavaScript / TypeScript / TSX ingestion</td></tr>
                 <tr><td>codegen</td><td><code class="inline">unidiff</code> for stricter diff parsing</td></tr>
                 <tr><td>keyring</td><td>OS keyring for API-key storage</td></tr>
+                <tr><td>mcp</td><td>Model Context Protocol SDK — external tool servers for the swarm</td></tr>
+                <tr><td>viz</td><td><code class="inline">matplotlib</code> — regenerate the book diagrams</td></tr>
                 <tr><td>dev</td><td><code class="inline">pytest</code>, <code class="inline">ruff</code>, <code class="inline">mypy</code></td></tr>
               </tbody>
             </table>
+          </div>
+
+          <div class="grid grid-2" style="margin-top: 1.75rem">
+            <article class="card reveal">
+              <h3>No model yet? Browse and pull one.</h3>
+              <p>
+                Settings → <strong>Browse Hugging Face</strong> lists GGUF repos from the Hub, sizes each
+                against your hardware with <strong>Check fit</strong>, and <strong>Pull</strong>s it
+                straight into your local Ollama daemon — then <strong>re-aliases</strong> the download to
+                a clean local name (<code class="inline">ornith-1.0-9b-gguf</code>) instead of the full
+                <code class="inline">hf.co/&lt;repo&gt;</code> address.
+              </p>
+            </article>
+            <article class="card reveal">
+              <h3>A hardware-aware picker for 21 models.</h3>
+              <p>
+                Settings → <strong>Hardware</strong> detects your RAM / VRAM — including Apple Silicon
+                <strong>unified memory</strong> and Metal (MPS) — and annotates a curated catalogue of 21
+                local models with ✅ / ⚠️ / ❌ fit verdicts, merging in what you've already pulled. It is
+                pure-offline: annotating fires no network call.
+              </p>
+            </article>
           </div>
         </div>
       </section>
@@ -813,22 +1045,22 @@ flowchart TB
           </div>
 
           <div class="grid grid-4">
-            <a class="card reveal" href="https://github.com/raminmohammadi/Averix/blob/main/docs/book.md">
+            <a class="card reveal" href="https://github.com/raminmohammadi/CGX/blob/main/docs/book.md">
               <span class="pill pill-neon">Narrative</span>
               <h3>The CGX Book</h3>
               <p>Follows one request end-to-end, from an unindexed tree to a tested patch on disk — and explains why each layer exists.</p>
             </a>
-            <a class="card reveal" href="https://github.com/raminmohammadi/Averix/blob/main/docs/architecture.md">
+            <a class="card reveal" href="https://github.com/raminmohammadi/CGX/blob/main/docs/architecture.md">
               <span class="pill">Reference</span>
               <h3>Architecture</h3>
               <p>Organised by module: every layer under <code class="inline">cgx.*</code>, the data flow, and the seams meant to be replaced.</p>
             </a>
-            <a class="card reveal" href="https://github.com/raminmohammadi/Averix/blob/main/docs/usage.md">
+            <a class="card reveal" href="https://github.com/raminmohammadi/CGX/blob/main/docs/usage.md">
               <span class="pill">How-to</span>
               <h3>Usage</h3>
               <p>Organised by task: pick a provider, index, ask, plan, tune retrieval, run the agent, add a skill.</p>
             </a>
-            <a class="card reveal" href="https://github.com/raminmohammadi/Averix/blob/main/docs/flowcharts.md">
+            <a class="card reveal" href="https://github.com/raminmohammadi/CGX/blob/main/docs/flowcharts.md">
               <span class="pill">Diagrams</span>
               <h3>Flowcharts</h3>
               <p>The same system drawn for users, developers, and companies — plus every checkpoint of both loop modes.</p>
@@ -882,20 +1114,20 @@ flowchart TB
           <div>
             <h5>Project</h5>
             <ul>
-              <li><a href="https://github.com/raminmohammadi/Averix">Repository</a></li>
-              <li><a href="https://github.com/raminmohammadi/Averix/releases">Releases</a></li>
-              <li><a href="https://github.com/raminmohammadi/Averix/blob/main/CHANGELOG.md">Changelog</a></li>
-              <li><a href="https://github.com/raminmohammadi/Averix/blob/main/CONTRIBUTING.md">Contributing</a></li>
+              <li><a href="https://github.com/raminmohammadi/CGX">Repository</a></li>
+              <li><a href="https://github.com/raminmohammadi/CGX/releases">Releases</a></li>
+              <li><a href="https://github.com/raminmohammadi/CGX/blob/main/CHANGELOG.md">Changelog</a></li>
+              <li><a href="https://github.com/raminmohammadi/CGX/blob/main/CONTRIBUTING.md">Contributing</a></li>
             </ul>
           </div>
 
           <div>
             <h5>Docs</h5>
             <ul>
-              <li><a href="https://github.com/raminmohammadi/Averix/blob/main/docs/book.md">The CGX Book</a></li>
-              <li><a href="https://github.com/raminmohammadi/Averix/blob/main/docs/architecture.md">Architecture</a></li>
-              <li><a href="https://github.com/raminmohammadi/Averix/blob/main/docs/usage.md">Usage</a></li>
-              <li><a href="https://github.com/raminmohammadi/Averix/blob/main/docs/Agent.md">Agent reference</a></li>
+              <li><a href="https://github.com/raminmohammadi/CGX/blob/main/docs/book.md">The CGX Book</a></li>
+              <li><a href="https://github.com/raminmohammadi/CGX/blob/main/docs/architecture.md">Architecture</a></li>
+              <li><a href="https://github.com/raminmohammadi/CGX/blob/main/docs/usage.md">Usage</a></li>
+              <li><a href="https://github.com/raminmohammadi/CGX/blob/main/docs/Agent.md">Agent reference</a></li>
             </ul>
           </div>
 
@@ -904,8 +1136,8 @@ flowchart TB
             <ul>
               <li><a href="#surfaces">Web UI</a></li>
               <li><a href="#surfaces">CLI &amp; dashboard</a></li>
-              <li><a href="https://github.com/raminmohammadi/Averix/blob/main/extension/README.md">VS Code extension</a></li>
-              <li><a href="https://github.com/raminmohammadi/Averix/blob/main/docs/hardware_matrix.md">Hardware matrix</a></li>
+              <li><a href="https://github.com/raminmohammadi/CGX/blob/main/extension/README.md">VS Code extension</a></li>
+              <li><a href="https://github.com/raminmohammadi/CGX/blob/main/docs/hardware_matrix.md">Hardware matrix</a></li>
             </ul>
           </div>
         </div>

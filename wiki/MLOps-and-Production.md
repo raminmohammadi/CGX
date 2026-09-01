@@ -12,9 +12,9 @@ This page is the subsystem-level reference. For a field guide to the **`/ops`
 web hub** — every tab, stat card, donut, gauge, bar list and button, and the
 subsystem each maps to — see **[[Ops and Observability]]**. The exhaustive
 operator guide (endpoints, env vars, store layout) is
-[`docs/mlops.md`](https://github.com/raminmohammadi/Averix/blob/main/docs/mlops.md);
+[`docs/mlops.md`](https://github.com/raminmohammadi/CGX/blob/main/docs/mlops.md);
 deployment specifics live in
-[`deploy/README.md`](https://github.com/raminmohammadi/Averix/blob/main/deploy/README.md).
+[`deploy/README.md`](https://github.com/raminmohammadi/CGX/blob/main/deploy/README.md).
 
 ---
 
@@ -130,7 +130,7 @@ observation stores. Tuning details are on **[[Configuration and Tuning]]**.
 `cgx.health` backs Kubernetes-style probes: `GET /healthz` (liveness, touches
 nothing external) and `GET /readyz` (readiness — config dir writable, SQLite
 usable; provider/index are reported but do not gate). The
-[`deploy/`](https://github.com/raminmohammadi/Averix/blob/main/deploy/README.md)
+[`deploy/`](https://github.com/raminmohammadi/CGX/blob/main/deploy/README.md)
 tree packages CGX as a multi-stage Docker image, a Compose stack (CGX +
 Prometheus + Grafana with provisioned SLO rules and a starter dashboard), and a
 Helm chart with the probes, a PVC for the config volume, and an optional
@@ -146,8 +146,8 @@ Helm chart with the probes, a PVC for the config volume, and an optional
 ## See also
 
 - **[[Ops and Observability]]** — the `/ops` hub, tab by tab.
-- [`docs/mlops.md`](https://github.com/raminmohammadi/Averix/blob/main/docs/mlops.md) — the full operator reference.
-- [`deploy/README.md`](https://github.com/raminmohammadi/Averix/blob/main/deploy/README.md) — build / run / scale.
+- [`docs/mlops.md`](https://github.com/raminmohammadi/CGX/blob/main/docs/mlops.md) — the full operator reference.
+- [`deploy/README.md`](https://github.com/raminmohammadi/CGX/blob/main/deploy/README.md) — build / run / scale.
 - **[[Configuration and Tuning]]** — the MLOps environment variables.
 - **[[Privacy and Security]]** — redaction, secrets, and egress boundaries.
 - **[[Architecture]]** — where these modules sit in the codebase.

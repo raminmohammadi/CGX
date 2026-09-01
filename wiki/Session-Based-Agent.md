@@ -8,7 +8,7 @@ typed task at a time, pausing at every branch so **you approve each
 decision** — nothing reaches disk until you say so.
 
 This page is the practical guide. The full internals live in
-[`docs/Agent.md`](https://github.com/raminmohammadi/Averix/blob/main/docs/Agent.md) and **[[Architecture]]**.
+[`docs/Agent.md`](https://github.com/raminmohammadi/CGX/blob/main/docs/Agent.md) and **[[Architecture]]**.
 
 ---
 
@@ -238,6 +238,6 @@ task = runner.run_next(session_id=session.session_id, deps=deps)
   and `SCAFFOLD` rely on.
 - **[[Skills Registry]]** — how greenfield scaffolding becomes
   technology-aware.
-- [`docs/Agent.md`](https://github.com/raminmohammadi/Averix/blob/main/docs/Agent.md) — the exhaustive internals.
-- [`docs/flowcharts.md`](https://github.com/raminmohammadi/Averix/blob/main/docs/flowcharts.md#session-shaped-write-loop-agent)
+- [`docs/Agent.md`](https://github.com/raminmohammadi/CGX/blob/main/docs/Agent.md) — the exhaustive internals.
+- [`docs/flowcharts.md`](https://github.com/raminmohammadi/CGX/blob/main/docs/flowcharts.md#session-shaped-write-loop-agent)
   — the write-loop diagrams.

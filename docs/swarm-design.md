@@ -1,7 +1,7 @@
 # Swarm Agent Design
 
 This document details the architecture and flow of `SessionMode.SWARM` in
-the `Averix` (`cgx`) framework. Swarm is a **plan-driven, one-file-at-a-time**
+the CGX (`cgx`) framework. Swarm is a **plan-driven, one-file-at-a-time**
 build engine: rather than a free-form agent loop, a Tech Lead authors a
 validated plan, a Developer implements exactly one planned file per turn in
 dependency order, and a Verifier gates the whole tree. Every stage follows a

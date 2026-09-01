@@ -165,7 +165,7 @@ cgx_index/
 # Rope project settings
 .ropeproject
 
-# mkdocs documentation (Averix landing page uses /site, so we unignore it)
+# mkdocs documentation (the CGX landing page uses /site, so we unignore it)
 !/site/
 
 # mypy

@@ -333,9 +333,73 @@ def fig_ch7():
     save(fig, "chapter_7.png")
 
 
+def fig_swarm():
+    """swarm.png -- the plan-driven swarm loop (agent --mode swarm)."""
+    fig, ax = _fig()
+    title(ax, "The swarm",
+          "plan-driven roles: Tech Lead plans, Developer writes one file, Verifier proves the build")
+    box(ax, 20, 62, 28, 16, "Objective",
+        ["--mode swarm"], accent=EMERALD, ts=12)
+    box(ax, 60, 62, 32, 20, "Tech Lead",
+        ["skill-aware plan", "contracts + toposort"], accent=SKY, ts=12, ss=9.5)
+    box(ax, 104, 62, 32, 20, "Developer",
+        ["one file / turn", "grounded on deps"], accent=EMERALD, ts=12, ss=9.5)
+    box(ax, 140, 62, 26, 20, "Verifier",
+        ["polyglot", "build + test"], accent=AMBER, ts=12, ss=9.5)
+    box(ax, 140, 30, 26, 18, "Repair",
+        ["AST inject / logic", "temp 0.2 -> 0.8"], accent=ROSE, ts=12, ss=9.5)
+    box(ax, 92, 30, 34, 18, "Result",
+        ["runnable project", "or honest FAILED"], accent=EMERALD, ts=12, ss=9.5)
+    arrow(ax, (34, 62), (44, 62))
+    arrow(ax, (76, 62), (88, 62), color=SKY)
+    # developer self-loop (next file)
+    arrow(ax, (104, 72), (104, 78), color=EMERALD, rad=0)
+    ax.annotate("", xy=(96, 72), xytext=(96, 78),
+                arrowprops=dict(arrowstyle="-", color=EMERALD, lw=2))
+    ax.text(100, 81, "next file", color=MUTED, fontsize=8.5, ha="center")
+    arrow(ax, (120, 62), (127, 62), color=EMERALD)
+    arrow(ax, (140, 52), (140, 39), color=AMBER)          # verify -> repair
+    arrow(ax, (146, 39), (146, 52), color=ROSE, rad=-0.4)  # repair -> verify (loop)
+    ax.text(157, 46, "red\nsuite", color=MUTED, fontsize=8.2, ha="center", va="center")
+    arrow(ax, (134, 53), (112, 36), color=EMERALD, rad=0.15)  # verify green -> result
+    ax.text(126, 50, "green", color=MUTED, fontsize=8.5, ha="center")
+    save(fig, "swarm.png")
+
+
+def fig_ops():
+    """ops.png -- the Ops & Observability hub."""
+    fig, ax = _fig()
+    title(ax, "Ops & observability",
+          "one /ops hub, ten tabs, best-effort recorders over local SQLite")
+    box(ax, 20, 48, 26, 20, "LLM run",
+        ["ask / plan", "agent / swarm"], accent=VIOLET, ts=12, ss=9.5)
+    rec = [
+        (60, 74, "Metrics", "/api/metrics"),
+        (60, 58, "Trace", "@traced (redacted)"),
+        (60, 42, "Activity", "per-run grounding"),
+        (60, 26, "Monitoring", "AIOps alerts"),
+        (96, 74, "Cost & quota", "budgets, pricing"),
+        (96, 58, "Feedback", "flywheel -> evals"),
+        (96, 42, "Governance", "PII / retention"),
+        (96, 26, "Health", "/healthz /readyz"),
+    ]
+    for cx, cy, t, s in rec:
+        box(ax, cx, cy, 30, 12, t, [s], accent=SKY, ts=10.5, ss=8.6)
+        arrow(ax, (33, 48), (cx - 15, cy),
+              color=SLATE, rad=0.0 if cy == 48 else (0.08 if cy > 48 else -0.08))
+    box(ax, 138, 50, 28, 44, "Ops hub  /ops",
+        ["Overview  Pipelines", "Activity  Monitoring",
+         "Cost  Feedback", "Metrics  Governance", "Health  Trace"],
+        accent=AMBER, ts=12, ss=9)
+    for _, cy, _, _ in rec:
+        arrow(ax, (111, cy), (124, 50), color=AMBER,
+              rad=0.0 if cy == 50 else (0.06 if cy > 50 else -0.06))
+    save(fig, "ops.png")
+
+
 def build_all():
     for fn in (fig_hero, fig_ch1, fig_ch2, fig_ch3, fig_ch4, fig_ch5,
-               fig_ch6, fig_ch7):
+               fig_ch6, fig_ch7, fig_swarm, fig_ops):
         fn()
 
 

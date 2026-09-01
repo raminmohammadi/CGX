@@ -52,7 +52,7 @@ pages is non-destructive. See **[[Self Testing Code Generation]]**.
 
 ### Agent Loop (`/agent`)
 The **session-based** agentic surface. Start a session with an objective, pick
-a **mode** (auto / explore / greenfield), and watch the agent walk the chain,
+a **mode** (auto / explore / greenfield / swarm), and watch the agent walk the chain,
 pausing at every branch for a typed decision. The task tree shows the full DAG
 with status icons; a side panel surfaces the Knowledge Base (facts) and
 Artifacts. Nothing reaches disk until you tick the approval checkpoint, and an
@@ -167,7 +167,7 @@ Commands contributed: **CGX: Open UI**, **CGX: Reload UI**. The server
 URL is read from the `cgx.ui.url` setting (default
 `http://localhost:8765`); the extension does not spawn the server, so
 start it with `cgx-ui` first. See
-[`extension/README.md`](https://github.com/raminmohammadi/Averix/blob/main/extension/README.md).
+[`extension/README.md`](https://github.com/raminmohammadi/CGX/blob/main/extension/README.md).
 
 ---
 

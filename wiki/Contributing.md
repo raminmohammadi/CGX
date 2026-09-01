@@ -2,7 +2,7 @@
 
 Thanks for wanting to improve CGX. This page is the practical
 contributor guide; the canonical source is
-[`CONTRIBUTING.md`](https://github.com/raminmohammadi/Averix/blob/main/CONTRIBUTING.md) in the repo root.
+[`CONTRIBUTING.md`](https://github.com/raminmohammadi/CGX/blob/main/CONTRIBUTING.md) in the repo root.
 
 ---
 
@@ -92,10 +92,10 @@ change touches that path:
   error message.
 - Scrub Gemini-style `?key=...` URLs before propagating exceptions — see
   `GeminiProvider._scrub_secret` in
-  [`src/cgx/answer/providers.py`](https://github.com/raminmohammadi/Averix/blob/main/src/cgx/answer/providers.py).
+  [`src/cgx/answer/providers.py`](https://github.com/raminmohammadi/CGX/blob/main/src/cgx/answer/providers.py).
 - Use `os.open(..., 0o600)` (not `write_text` + `chmod`) when creating
   any file that may hold secret material — see `_write_json` in
-  [`src/cgx/answer/profiles.py`](https://github.com/raminmohammadi/Averix/blob/main/src/cgx/answer/profiles.py).
+  [`src/cgx/answer/profiles.py`](https://github.com/raminmohammadi/CGX/blob/main/src/cgx/answer/profiles.py).
 
 Report security issues privately via the repository's **"Report a
 vulnerability"** workflow rather than a public issue. More detail:
@@ -114,4 +114,4 @@ By contributing, you agree that your contribution is released under the
 
 - **[[Skills Registry]]** — the primary contribution surface.
 - **[[Architecture]]** — where each subsystem lives.
-- [`CONTRIBUTING.md`](https://github.com/raminmohammadi/Averix/blob/main/CONTRIBUTING.md) — the canonical guide.
+- [`CONTRIBUTING.md`](https://github.com/raminmohammadi/CGX/blob/main/CONTRIBUTING.md) — the canonical guide.

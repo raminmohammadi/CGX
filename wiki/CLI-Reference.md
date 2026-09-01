@@ -156,4 +156,4 @@ works cleanly over SSH. **Ctrl-C** cancels the running task; `/quit` or
 Ctrl-D leaves.
 
 Full reference:
-[`docs/usage.md`](https://github.com/raminmohammadi/Averix/blob/main/docs/usage.md#the-cli-non-interactive-subcommands).
+[`docs/usage.md`](https://github.com/raminmohammadi/CGX/blob/main/docs/usage.md#the-cli-non-interactive-subcommands).

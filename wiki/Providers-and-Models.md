@@ -293,9 +293,9 @@ The final card is an editorial comparison — a grid of decision dimensions
 use, setup effort, operational risk). Each tile states the **Local** and
 **Cloud** position and a **winner** badge (emerald `local`, purple `cloud`, or
 `tie`). It is pure guidance — no live numbers. The same data is exported to
-[`docs/hardware_matrix.json`](https://github.com/raminmohammadi/Averix/blob/main/docs/hardware_matrix.json)
+[`docs/hardware_matrix.json`](https://github.com/raminmohammadi/CGX/blob/main/docs/hardware_matrix.json)
 and documented in
-[`docs/hardware_matrix.md`](https://github.com/raminmohammadi/Averix/blob/main/docs/hardware_matrix.md).
+[`docs/hardware_matrix.md`](https://github.com/raminmohammadi/CGX/blob/main/docs/hardware_matrix.md).
 
 ---
 

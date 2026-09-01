@@ -3,8 +3,8 @@
 This page is the contributor's map of the codebase: the top-level
 packages under `src/cgx/`, how they compose end-to-end, and where to look
 when you want to change something. For the exhaustive internals see
-[`docs/architecture.md`](https://github.com/raminmohammadi/Averix/blob/main/docs/architecture.md) and
-[`docs/Agent.md`](https://github.com/raminmohammadi/Averix/blob/main/docs/Agent.md).
+[`docs/architecture.md`](https://github.com/raminmohammadi/CGX/blob/main/docs/architecture.md) and
+[`docs/Agent.md`](https://github.com/raminmohammadi/CGX/blob/main/docs/Agent.md).
 
 ---
 
@@ -138,4 +138,4 @@ These hold across the codebase; respect them when contributing:
 - **[[Session Based Agent]]** — the orchestrator internals.
 - **[[MLOps and Production]]** — the observability/governance/deploy layer.
 - **[[Contributing]]** — dev setup, tests, and the PR checklist.
-- [`docs/architecture.md`](https://github.com/raminmohammadi/Averix/blob/main/docs/architecture.md) — the full reference.
+- [`docs/architecture.md`](https://github.com/raminmohammadi/CGX/blob/main/docs/architecture.md) — the full reference.

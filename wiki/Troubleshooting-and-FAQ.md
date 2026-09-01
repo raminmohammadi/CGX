@@ -177,4 +177,4 @@ See **[[Configuration and Tuning]]**.
 - **[[Installation]]** · **[[Quick Start]]** — get up and running.
 - **[[Configuration and Tuning]]** — the full list of knobs.
 - **[[Privacy and Security]]** — data-flow and safety details.
-- [`docs/usage.md`](https://github.com/raminmohammadi/Averix/blob/main/docs/usage.md) — the exhaustive usage reference.
+- [`docs/usage.md`](https://github.com/raminmohammadi/CGX/blob/main/docs/usage.md) — the exhaustive usage reference.

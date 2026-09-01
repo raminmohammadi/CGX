@@ -29,8 +29,8 @@ end-to-end, read in order; each chapter assumes the one before it.
 | 4 | [**Assembling the prompt**](#chapter-4----assembling-the-prompt) | The tiered Code Map: full-body primaries, one-line neighbours, budgeted to the window. |
 | 5 | [**Talking to the model**](#chapter-5----talking-to-the-model) | One chat() interface fronting Ollama, OpenAI-compatible, and Gemini. |
 | 6 | [**Writing to disk**](#chapter-6----writing-to-disk) | Parse, apply in memory, syntax-check, sandbox-test -- then write with backups. |
-| 7 | [**The agent**](#chapter-7----the-agent) | A checkpointed task DAG in SQLite that explores or scaffolds, one step at a time. |
-| 8 | [**The front door**](#chapter-8----the-front-door) | The FastAPI + React surface: SSE streaming and tab-switch replay. |
+| 7 | [**The agent**](#chapter-7----the-agent) | A checkpointed task DAG in SQLite that explores, scaffolds, or swarm-builds, one step at a time. |
+| 8 | [**The front door**](#chapter-8----the-front-door) | The FastAPI + React surface: SSE streaming, tab-switch replay, and the ten-tab Ops hub. |
 | 9 | [**Choosing a model**](#chapter-9----choosing-a-model) | An offline catalogue that matches runnable models to your hardware. |
 | 10 | [**The trust model**](#chapter-10----the-trust-model) | Where does my code go? Nowhere, unless you ask it to. |
 | 11 | [**Reading the source**](#chapter-11----reading-the-source) | A guided reading order through the modules, in the sequence this book introduces them. |
@@ -405,7 +405,7 @@ calls `run_pytest_paths` against every discovered test file.
 <summary>
 
 ## Chapter 7 -- The agent
-<br><sub><i>A checkpointed task DAG in SQLite that explores or scaffolds, one step at a time.</i></sub>
+<br><sub><i>A checkpointed task DAG in SQLite that explores, scaffolds, or swarm-builds, one step at a time.</i></sub>
 </summary>
 
 `cgx.session` ties the disk-writing pieces of Chapter 6 to the
@@ -484,13 +484,55 @@ UIs share -- a message becomes a follow-up objective or answers an
 open `ASK_USER`, and a decision resolves a checkpoint so the loop
 can continue.
 
+### Swarm mode -- plan, build, verify
+
+Alongside `explore` and `greenfield`, a session can run in a third
+mode: `swarm` (`SessionMode.SWARM`, selected with `cgx agent --mode
+swarm` or the launcher). Swarm reuses the same store, runner, and
+router, but seeds a different root and a different set of executors --
+three router-driven roles, each stage *propose-then-validate*.
+
+![The swarm loop: a Tech Lead plans, a Developer writes one file per turn, and a Verifier proves the real build, with bounded auto-repair on a red suite](images/swarm.png)
+
+The **Tech Lead** (`SWARM_TECH_LEAD`, in
+`cgx.session.tasks.swarm_tech_lead`) resolves the goal's active
+skills, drafts a JSON `WORK_PLAN` -- files, `depends_on` edges, and
+per-file contracts -- then normalises it, topologically orders the
+files, and gates on buildability with a bounded corrective re-ask.
+Per-ecosystem scaffolding (a `requirements.txt` or `package.json`, a
+`README.md`, a test per untested module) is injected deterministically
+so a weak model can never forget the boilerplate that makes a project
+runnable. The **Developer** (`SWARM_DEVELOPER`) implements exactly one
+planned file per turn, in dependency order, grounded on the real
+on-disk content of its dependencies; a generation ladder falls back
+to a deterministic AST assembler, and two hard gates -- a
+phantom-import gate and a no-stub gate -- reject an unused import or a
+`pass`-bodied contract function before it can break the suite.
+Mechanical breaks are repaired without the model: an AST import
+injector (`_ast_import_injector`) prepends imports resolved from the
+plan contracts, and contract renegotiation merges an amended signature
+into the plan rather than failing the build.
+
+The **Verifier** (`SWARM_VERIFY`) reconciles each component's manifest
+against its actual imports, runs static structural checks, then a
+polyglot dry-run -- `pytest` for a Python component, `npm test` /
+`npm run build` for JS/TS. When a structurally-clean tree still fails,
+an AST function-logic repair (`_auto_fix_function_logic`) rewrites the
+enclosing function, and the loop scales temperature `0.2 → 0.8`
+(`_repair_temperature`) across up to five bounded rounds to break
+repetitive output. If the bounded repair cannot turn the suite green,
+the session reports **FAILED** -- it never falsely passes a red suite.
+The whole run streams `swarm_beat` telemetry that the Agent page
+renders as a live *Swarm Operations* feed. Full reference:
+[`docs/swarm-design.md`](swarm-design.md).
+
 </details>
 
 <details>
 <summary>
 
 ## Chapter 8 -- The front door
-<br><sub><i>The FastAPI + React surface: SSE streaming and tab-switch replay.</i></sub>
+<br><sub><i>The FastAPI + React surface: SSE streaming, tab-switch replay, and the ten-tab Ops hub.</i></sub>
 </summary>
 
 The web UI is a FastAPI app composed in `cgx.webui.server.create_app`
@@ -549,6 +591,30 @@ The Ask tab's sidebar reads and writes through the public API
 (`create_session`, `append_message`, `list_sessions`,
 `delete_session`); nothing else in CGX talks directly to those
 files.
+
+### The Ops hub -- observability without a stack
+
+The same FastAPI app mounts a family of observability routers --
+`metrics`, `monitor`, `activity`, `feedback`, `usage`, `govdata`,
+`admin`, and `health` -- and the React SPA folds them into one
+console at `/ops`, a **ten-tab** hub: Overview, Pipelines, Activity,
+Monitoring, Cost & Quota, Feedback, Metrics, Governance, Health, and
+Trace.
+
+![The Ops hub: an LLM run feeds best-effort recorders -- metrics, trace, activity, monitoring, cost, feedback, governance, health -- that the ten-tab /ops console reads back](images/ops.png)
+
+Everything is local-first and best-effort, so an observability failure
+can never break a request. In-process Prometheus series are served at
+`GET /api/metrics`; a curated `@traced` tracer (enabled with
+`CGX_TRACE`) logs every LLM call's full *redacted* prompt and response
+for the Trace tab (read via `/api/admin/logs`). AIOps checks persist
+`Alert` records surfaced at `GET /api/monitor/alerts`; a feedback
+flywheel exports down-votes into eval candidates; per-owner budgets
+enforce soft-warn / hard-stop cost limits; and a data-governance pass
+(`/api/govdata/*`) adds retention/TTL, right-to-erasure, and a PII
+scan/scrub beyond credential redaction. Liveness and readiness probes
+answer at `/healthz` and `/readyz` (mounted at the root, not under
+`/api`). The full operator guide is [`docs/mlops.md`](mlops.md).
 
 </details>
 
