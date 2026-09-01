@@ -170,8 +170,8 @@ Use this if you'll point CGX at an Ollama server or an OpenAI-compatible
 endpoint and supply your own embeddings via a BYO embedder callable.
 
 ```bash
-git clone <your fork>
-cd cgx
+git clone https://github.com/raminmohammadi/CGX.git
+cd CGX
 python -m venv .venv
 
 # Linux / macOS
@@ -211,6 +211,9 @@ Optional extras:
 | `faiss`      | `faiss-cpu` (large speedup over numpy fallback)   |
 | `codegen`    | `unidiff` (stricter diff parsing)                 |
 | `keyring`    | OS keyring for API-key storage                    |
+| `parsers`    | tree-sitter grammars for JS / TS / TSX ingestion  |
+| `mcp`        | Model Context Protocol SDK (external tool servers)|
+| `viz`        | `matplotlib` (regenerate the docs book diagrams)  |
 | `dev`        | `pytest`, `ruff`, `mypy`                          |
 
 Pull a small local model (recommended default):
