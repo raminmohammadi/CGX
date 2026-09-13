@@ -146,3 +146,17 @@ def test_failed_swarm_task_fails_session():
     plan = Router().on_task_failed(
         session=session, failed=failed, tasks=[failed])
     assert _statuses(plan) == [SessionStatus.FAILED]
+
+
+def test_completed_verify_partial_build_attaches_summary_error():
+    from cgx.session.actions import UpdateTaskStatus
+    session = _session()
+    completed = _verify({
+        "verify_ok": False,
+        "summary": "partial build: built 14/15 files; tests failed: test_total_area",
+    })
+    plan = Router().on_task_completed(
+        session=session, completed=completed, tasks=[completed])
+    errs = [a for a in plan.actions if isinstance(a, UpdateTaskStatus)]
+    assert len(errs) == 1 and "partial build" in errs[0].error
+    assert SessionStatus.FAILED in _statuses(plan)

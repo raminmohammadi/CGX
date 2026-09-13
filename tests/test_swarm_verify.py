@@ -415,3 +415,21 @@ def test_assertion_repair_targets_finds_test_file(tmp_path):
     env = {"output": _PYTEST_ASSERT_OUTPUT}
     targets = sv._assertion_repair_targets(env, paths, str(tmp_path))
     assert targets == ["tests/test_models.py"]
+
+
+# --------------------- C5: partial-success summary ---------------------
+
+def test_verify_summary_partial_build_lists_failing_tests():
+    env = {"outcome": "failed",
+           "output": "___ test_total_area ___\nE   assert 43.98 == 14.13\n"}
+    s = sv._verify_summary(["a.py", "b.py", "c.py"], ["a.py", "b.py"],
+                           ["c.py"], ["c.py"], env, False)
+    assert s.startswith("partial build")
+    assert "2/3" in s
+    assert "test_total_area" in s
+
+
+def test_verify_summary_green_reports_passed():
+    env = {"outcome": "passed", "output": ""}
+    s = sv._verify_summary(["a.py"], ["a.py"], [], [], env, True)
+    assert s.startswith("verified") and "tests passed" in s

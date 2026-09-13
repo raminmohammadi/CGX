@@ -865,6 +865,7 @@ def swarm_verify(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             break
 
     tests_red = env.get("outcome") == "failed"
+    built = [p for p in paths if p not in gaps]
     # ``failed_paths`` recorded during the Developer chain is advisory only:
     # Verify's regeneration loop may have successfully rebuilt a file that
     # failed generation. Reconcile against the *final* structural scan -- a
@@ -873,6 +874,12 @@ def swarm_verify(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     # verdict is what previously sank a fully-repaired tree.
     still_failed = [p for p in failed_paths if p in gaps]
     verify_ok = structural_ok and not still_failed and not tests_red
+
+    # A human-readable one-liner so a not-green run explains itself concretely
+    # ("built 14/15 files; tests failed: test_total_area") instead of the UI /
+    # CLI showing a bare "session failed". Surfaced on the terminal task by the
+    # router (see _swarm_terminal_session_actions) and shown in the dashboard.
+    summary = _verify_summary(paths, built, gaps, still_failed, env, verify_ok)
 
     content = {
         "work_plan_artifact_id": work_plan_id,
@@ -888,6 +895,7 @@ def swarm_verify(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         "env": env,
         "structural_ok": structural_ok,
         "verify_ok": verify_ok,
+        "summary": summary,
     }
     artifact = Artifact.new(
         session_id=task.session_id, produced_by_task_id=task.task_id,
@@ -901,4 +909,35 @@ def swarm_verify(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
                  "verify_report_artifact_id": artifact.artifact_id,
                  "coverage_gaps": gaps,
                  "failed_paths": still_failed,
+                 "summary": summary,
                  "project_root": project_root})
+
+
+def _verify_summary(paths: List[str], built: List[str], gaps: List[str],
+                    still_failed: List[str], env: Dict[str, Any],
+                    verify_ok: bool) -> str:
+    """A concise, human-readable outcome line for a swarm run.
+
+    Distinguishes a green build from a *partial* one (most files built, one
+    gate red) so a not-green terminal reports what actually happened and what to
+    look at next, instead of an opaque "session failed".
+    """
+    n = len(paths)
+    parts = [f"built {len(built)}/{n} files"]
+    if gaps:
+        parts.append(f"{len(gaps)} missing/unparseable")
+    outcome = str(env.get("outcome") or "skipped")
+    if outcome == "passed":
+        parts.append("tests passed")
+    elif outcome == "failed":
+        failing = sorted(_failing_test_names(str(env.get("output") or "")))
+        if failing:
+            shown = ", ".join(failing[:5])
+            more = f" (+{len(failing) - 5} more)" if len(failing) > 5 else ""
+            parts.append(f"tests failed: {shown}{more}")
+        else:
+            parts.append("tests/build failed")
+    else:
+        parts.append("tests not run")
+    head = "verified" if verify_ok else "partial build"
+    return f"{head}: " + "; ".join(parts)

@@ -1179,8 +1179,25 @@ def _swarm_terminal_session_actions(
     else:
         green = not (outputs.get("failed_paths") or [])
     status = SessionStatus.COMPLETED if green else SessionStatus.FAILED
-    return [UpdateSessionStatus(session_id=completed.session_id,
-                                status=status)]
+    actions: List[RouterAction] = []
+    # On a not-green terminal, stamp the terminal task with the run's concrete
+    # summary ("partial build: built 14/15 files; tests failed: test_total_area")
+    # so the CLI epilogue and the live dashboard show what actually happened and
+    # what to fix, instead of a bare "session failed". The task stays DONE (it
+    # ran fine; its *report* is what failed) -- mirrors the greenfield
+    # pre-verify gate terminal.
+    if not green:
+        reason = (str(outputs.get("summary") or "").strip()
+                  or str(outputs.get("reason") or "").strip())
+        if not reason and completed.kind is TaskKind.SWARM_TECH_LEAD:
+            reason = "Tech Lead could not produce a buildable plan"
+        if reason:
+            actions.append(UpdateTaskStatus(
+                task_id=completed.task_id, status=completed.status,
+                error=reason))
+    actions.append(UpdateSessionStatus(session_id=completed.session_id,
+                                       status=status))
+    return actions
 
 
 # Maps the parent's kind to a function that produces the successor
