@@ -121,6 +121,45 @@ def _project_is_empty(project_root: Optional[str], *,
     return count < threshold
 
 
+# Imperative verbs that mark an objective as "build/change this", so it is a
+# task even if phrased with a leading question word ("how about you build...").
+_BUILD_VERBS = frozenset({
+    "build", "create", "add", "implement", "generate", "make", "scaffold",
+    "write", "develop", "refactor", "fix", "setup", "bootstrap", "port",
+    "migrate", "convert", "wire", "rewrite", "extend", "delete", "remove",
+    "update", "rename",
+})
+
+# Sentence starts that mark an objective as a read-only question ("explain how
+# X works") rather than a build request.
+_QUESTION_STARTS = (
+    "how ", "how's", "what ", "what's", "why ", "where ", "where's", "when ",
+    "which ", "who ", "does ", "do ", "is ", "are ", "can ", "could ",
+    "should ", "would ", "explain", "describe", "summarize", "summarise",
+    "tell me", "list ", "show me", "walk me", "where is", "what is",
+)
+
+
+def is_question(objective: Optional[str]) -> bool:
+    """True when ``objective`` reads as a read-only question, not a build task.
+
+    Deterministic (no LLM): a leading imperative build verb ("build ...",
+    "add ...") is always a task; otherwise a trailing ``?`` or a question-word
+    opener marks it as something to *answer*. Lets the single Swarm mode route
+    "how does auth work?" to read-only investigation while "add rate limiting"
+    still builds.
+    """
+    t = (objective or "").strip().lower()
+    if not t:
+        return False
+    first = t.split(None, 1)[0].rstrip(":,")
+    if first in _BUILD_VERBS:
+        return False
+    if t.endswith("?"):
+        return True
+    return t.startswith(_QUESTION_STARTS)
+
+
 def detect_mode(*, project_root: Optional[str] = None,
                 index_dir: Optional[str] = None,
                 records_path: Optional[str] = None) -> SessionMode:

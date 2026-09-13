@@ -160,3 +160,33 @@ def test_completed_verify_partial_build_attaches_summary_error():
     errs = [a for a in plan.actions if isinstance(a, UpdateTaskStatus)]
     assert len(errs) == 1 and "partial build" in errs[0].error
     assert SessionStatus.FAILED in _statuses(plan)
+
+
+# --------------------- C2: question vs build intent routing ---------------------
+
+def test_is_question_classifier():
+    from cgx.session.mode import is_question
+    assert is_question("how does the auth flow work?")
+    assert is_question("Explain the retrieval pipeline")
+    assert is_question("what is the entrypoint")
+    assert not is_question("build a flask api")
+    assert not is_question("add rate limiting to the webhook")
+    assert not is_question("")
+    # a build verb wins even with a trailing question mark
+    assert not is_question("build a chatbot?")
+
+
+def test_swarm_question_routes_to_explore_root():
+    from cgx.session.models import TaskKind
+    plan = Router().on_user_message(
+        session=_session(), message="how does the login work?", tasks=[])
+    created = _created(plan)
+    assert len(created) == 1 and created[0].kind is TaskKind.EXPLORE
+
+
+def test_swarm_build_routes_to_tech_lead_root():
+    from cgx.session.models import TaskKind
+    plan = Router().on_user_message(
+        session=_session(), message="build a REST API for todos", tasks=[])
+    created = _created(plan)
+    assert len(created) == 1 and created[0].kind is TaskKind.SWARM_TECH_LEAD

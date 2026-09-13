@@ -1486,8 +1486,18 @@ class Router:
 
 
 def _make_root(session: Session, message: str) -> TaskNode:
-    """Pick the root task kind based on the session's mode."""
+    """Pick the root task kind based on the session's mode.
+
+    In the unified SWARM mode a *question* objective ("how does auth work?")
+    routes to read-only investigation (the EXPLORE root) instead of the
+    from-scratch build pipeline, so the single mode answers as well as builds;
+    anything task-shaped ("add rate limiting") still builds. Investigation
+    needs an index and fails cleanly when none exists.
+    """
     if session.mode is SessionMode.SWARM:
+        from cgx.session.mode import is_question
+        if is_question(message):
+            return _make_root_explore(session, message)
         return _make_root_swarm_tech_lead(session, message)
     if session.mode is SessionMode.GREENFIELD:
         return _make_root_clarify(session, message)
