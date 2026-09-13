@@ -121,7 +121,7 @@ _SYSTEM_PROMPT = (
 # plan validation.
 def _planner_tools() -> tuple:
     from cgx.session.tasks.swarm_tools import mcp_tools_if_configured
-    return ("search_web",) + mcp_tools_if_configured()
+    return ("search_web", "fetch_url") + mcp_tools_if_configured()
 
 
 def _ask_for_plan(provider: Any, goal: str,

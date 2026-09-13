@@ -43,13 +43,14 @@ def _truncate(text: str, limit: int) -> str:
 
 
 # Tools the Developer may call while generating a file: read-only introspection
-# so imports name symbols that actually exist, plus web search so it can look up
-# a real third-party/SDK API (e.g. the Gemini client) and implement the actual
-# integration instead of shipping an echo/placeholder stub for a feature it
-# doesn't know. Dispatch and descriptions come from the shared registry --
-# adding a tool here (or an MCP server) needs no change to this loop.
+# so imports name symbols that actually exist, plus web search + page fetch so
+# it can look up a real third-party/SDK API (e.g. the Gemini client) from its
+# docs and implement the actual integration instead of shipping an echo/
+# placeholder stub for a feature it doesn't know. Dispatch and descriptions come
+# from the shared registry -- adding a tool here (or an MCP server) needs no
+# change to this loop.
 _DEV_BASE_TOOLS = ("run_python_probe", "file_skeleton", "list_symbols",
-                   "search_web")
+                   "search_web", "fetch_url")
 _MAX_TOOL_ITERS = 5
 
 
@@ -103,6 +104,12 @@ class ToolWrapper:
                     "you MUST verify the API signatures, class names, and exports of "
                     "ANY local file you plan to import from, by calling tools. DO NOT "
                     "GUESS OR HALLUCINATE imported names.\n"
+                    "If this file must integrate a THIRD-PARTY API or SDK you are not "
+                    "certain of (e.g. an LLM/cloud client), use search_web to find its "
+                    "official docs and fetch_url to READ them, then implement the REAL "
+                    "call. NEVER ship a placeholder, echo, or 'this is a response' stub "
+                    "for a feature the objective requires -- research it and implement "
+                    "it for real.\n"
                     + REGISTRY.describe_for_prompt(self.tools)
                 )
 

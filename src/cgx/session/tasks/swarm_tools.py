@@ -131,25 +131,179 @@ def judge_decision(provider: Any, prompt: str) -> tuple:
     return letter, reason[:300]
 
 
-def search_web(query: str) -> str:
-    """A simple web search tool for the Tech Lead to fetch API documentation snippets."""
-    import urllib.request
+_UA = "Mozilla/5.0 (compatible; CGX/1.0; +https://github.com/raminmohammadi/CGX)"
+
+
+def _ddg_real_url(href: str) -> str:
+    """Decode a DuckDuckGo redirect (``/l/?uddg=<enc>``) to the real target URL."""
     import urllib.parse
+    href = (href or "").strip()
+    if "uddg=" in href:
+        try:
+            qs = urllib.parse.urlparse(href).query
+            uddg = urllib.parse.parse_qs(qs).get("uddg", [])
+            if uddg:
+                return urllib.parse.unquote(uddg[0])
+        except Exception:
+            pass
+    if href.startswith("//"):
+        return "https:" + href
+    return href
+
+
+def search_web(query: str) -> str:
+    """Web search that returns each result's TITLE, real URL, and snippet.
+
+    Returning the URLs (not just snippets) is what makes ``search_web`` +
+    ``fetch_url`` a usable chain: the model searches, picks the best doc URL,
+    then fetches the full page to implement against the real API. Best-effort
+    scrape of DuckDuckGo's HTML endpoint; degrades to a clear message.
+    """
     import re
-    
-    url = 'https://html.duckduckgo.com/html/?q=' + urllib.parse.quote(query)
-    req = urllib.request.Request(
-        url, 
-        headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-    )
+    import urllib.parse
+    import urllib.request
+
+    url = "https://html.duckduckgo.com/html/?q=" + urllib.parse.quote(query)
+    req = urllib.request.Request(url, headers={"User-Agent": _UA})
     try:
-        response = urllib.request.urlopen(req, timeout=10)
-        html = response.read().decode('utf-8')
-        snippets = re.findall(r'<a class=\"result__snippet[^>]*>(.*?)</a>', html, re.IGNORECASE | re.DOTALL)
-        clean_snippets = [re.sub(r'<[^>]+>', '', s).strip() for s in snippets]
-        return '\\n\\n'.join(clean_snippets[:3]) if clean_snippets else "No relevant snippets found."
+        with urllib.request.urlopen(req, timeout=12) as response:
+            html = response.read(200_000).decode("utf-8", errors="replace")
     except Exception as e:
-        return f"Search failed: {e}"
+        return f"Search failed: {type(e).__name__}: {e}"
+
+    def _strip(s: str) -> str:
+        return re.sub(r"<[^>]+>", "", s or "").strip()
+
+    links = re.findall(
+        r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
+        html, re.IGNORECASE | re.DOTALL)
+    snippets = re.findall(
+        r'class="result__snippet[^>]*>(.*?)</a>',
+        html, re.IGNORECASE | re.DOTALL)
+    if not links:
+        return "No results found."
+    out = []
+    for i, (href, title) in enumerate(links[:5]):
+        snip = _strip(snippets[i]) if i < len(snippets) else ""
+        out.append(f"{i + 1}. {_strip(title)}\n   URL: {_ddg_real_url(href)}"
+                   + (f"\n   {snip}" if snip else ""))
+    return "\n\n".join(out)
+
+
+def _host_is_blocked(host: str) -> bool:
+    """True for loopback/private/link-local/reserved hosts (basic SSRF guard).
+
+    A model-chosen URL must not be able to poke internal services. Literal
+    private IPs are rejected outright; hostnames are resolved and every
+    resolved address is checked. Unresolvable hosts are left to ``urlopen`` to
+    fail naturally (we don't want DNS failures to look like a policy block).
+    """
+    import ipaddress
+    import socket
+    h = (host or "").strip().lower()
+    if not h or h == "localhost" or h.endswith(".local") or h.endswith(".internal"):
+        return True
+    addrs: list = []
+    try:
+        addrs = [info[4][0] for info in socket.getaddrinfo(h, None)]
+    except Exception:
+        return False
+    for ip in addrs:
+        try:
+            a = ipaddress.ip_address(ip)
+        except ValueError:
+            continue
+        if (a.is_private or a.is_loopback or a.is_link_local
+                or a.is_reserved or a.is_multicast or a.is_unspecified):
+            return True
+    return False
+
+
+def _html_to_text(s: str) -> str:
+    """Reduce an HTML page to readable text (drop script/style/tags, unescape)."""
+    import html as _html
+    import re
+    s = re.sub(r"(?is)<(script|style|noscript|template)[^>]*>.*?</\1>", " ", s)
+    s = re.sub(r"(?is)<!--.*?-->", " ", s)
+    s = re.sub(r"(?s)<[^>]+>", " ", s)
+    s = _html.unescape(s)
+    s = re.sub(r"[ \t\f\v]+", " ", s)
+    s = re.sub(r"\n\s*\n\s*\n+", "\n\n", s)
+    return s.strip()
+
+
+class _SafeRedirectHandler:
+    """Redirect handler that refuses a redirect to a private/loopback host.
+
+    ``fetch_url`` validates the initial host, but urllib follows 3xx redirects
+    automatically -- so without this a public URL could 302 to an internal
+    target (e.g. cloud metadata at 169.254.169.254). Every hop's host is
+    re-checked before it is followed.
+    """
+
+    def __new__(cls):
+        import urllib.request
+
+        class _Impl(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                import urllib.error
+                import urllib.parse
+                host = urllib.parse.urlparse(newurl).hostname or ""
+                if _host_is_blocked(host):
+                    raise urllib.error.HTTPError(
+                        newurl, code, "blocked redirect to private/loopback host",
+                        headers, fp)
+                return super().redirect_request(
+                    req, fp, code, msg, headers, newurl)
+
+        return _Impl()
+
+
+def _safe_opener():
+    """A urllib opener that blocks redirect-based SSRF (see _SafeRedirectHandler)."""
+    import urllib.request
+    return urllib.request.build_opener(_SafeRedirectHandler())
+
+
+def fetch_url(url: str, max_bytes: int = 40_000, timeout: float = 12.0) -> str:
+    """Fetch an http(s) URL and return its readable text (HTML reduced to text).
+
+    Lets the agent READ real API/SDK documentation (found via ``search_web``)
+    and implement the actual interface instead of guessing or shipping a stub.
+    Safety: only http/https; loopback/private/link-local hosts are refused on
+    the initial request AND on every redirect hop (no SSRF into internal
+    services); the response is size-capped. Never raises -- returns an error
+    string the model can react to.
+    """
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    u = (url or "").strip()
+    parsed = urllib.parse.urlparse(u)
+    if parsed.scheme not in ("http", "https"):
+        return (f"Error: only http/https URLs may be fetched (got "
+                f"{parsed.scheme or 'no'} scheme).")
+    if _host_is_blocked(parsed.hostname or ""):
+        return (f"Error: refusing to fetch a private/loopback host "
+                f"({parsed.hostname!r}).")
+    req = urllib.request.Request(u, headers={"User-Agent": _UA})
+    try:
+        with _safe_opener().open(req, timeout=timeout) as resp:
+            ctype = (resp.headers.get("Content-Type") or "").lower()
+            raw = resp.read(max_bytes + 1)
+    except urllib.error.HTTPError as e:
+        return f"Error: HTTP {e.code} fetching {u}"
+    except Exception as e:
+        return f"Error fetching {u}: {type(e).__name__}: {e}"
+    truncated = len(raw) > max_bytes
+    text = raw[:max_bytes].decode("utf-8", errors="replace")
+    if "html" in ctype or (not ctype and "<html" in text.lower()[:2000]):
+        text = _html_to_text(text)
+    text = text.strip()
+    if truncated:
+        text += "\n... [truncated]"
+    return text or "(empty response)"
 
 
 # --------------------- registry wiring ---------------------
@@ -184,6 +338,10 @@ def _h_search_web(args: Dict[str, Any], ctx: ToolContext) -> str:
     return search_web(str(args.get("query", "")))
 
 
+def _h_fetch_url(args: Dict[str, Any], ctx: ToolContext) -> str:
+    return fetch_url(str(args.get("url", "")))
+
+
 def register_native_tools() -> None:
     """(Re)register the built-in swarm tools on the default registry."""
     REGISTRY.register(ToolSpec(
@@ -206,8 +364,16 @@ def register_native_tools() -> None:
         handler=_h_query_codebase))
     REGISTRY.register(ToolSpec(
         name="search_web", risk=RiskLevel.MEDIUM, arg_hint='{"query": "..."}',
-        description="Search the web for API docs / library signatures.",
+        description="Search the web; returns each result's title, URL, and "
+                    "snippet. Use it to find the docs URL for a library/SDK, "
+                    "then read it with fetch_url.",
         handler=_h_search_web))
+    REGISTRY.register(ToolSpec(
+        name="fetch_url", risk=RiskLevel.MEDIUM, arg_hint='{"url": "https://..."}',
+        description="Fetch an http(s) page and return its readable text. Use it "
+                    "to READ real API/SDK documentation and implement the actual "
+                    "interface instead of guessing or writing a placeholder.",
+        handler=_h_fetch_url))
 
 
 register_native_tools()

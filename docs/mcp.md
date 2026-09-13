@@ -65,6 +65,42 @@ Fields:
 | `enabled`   | Set `false` to keep a server configured but hidden from the agent. |
 | `auth`      | Optional. `{"type": "bearer", "token_env": "ENV_NAME"}` reads the token from an environment variable -- **secrets are never stored in the JSON**. |
 
+## Built-in web tools vs. an MCP fetch server
+
+The swarm's **Tech Lead and Developer** always have two built-in web tools, so
+they can implement a real third-party API instead of guessing or shipping a
+stub:
+
+- `search_web {"query": "..."}` -- returns each result's title, **URL**, and
+  snippet (best-effort DuckDuckGo scrape).
+- `fetch_url {"url": "https://..."}` -- fetches an http(s) page and returns its
+  readable text (HTML reduced to text; loopback/private hosts refused; size
+  capped). This is how the Developer **reads the actual docs** for, say, the
+  Gemini or Stripe SDK and writes the real call.
+
+These are dependency-free and always on, but best-effort (a scrape can miss and
+`fetch_url` returns raw page text). For **more reliable retrieval**, enable an
+MCP fetch/docs server -- e.g. the reference `mcp-server-fetch`, which returns
+clean, readable Markdown for a URL:
+
+```json
+{
+  "servers": [
+    {"name": "fetch", "transport": "stdio",
+     "command": "uvx", "args": ["mcp-server-fetch"], "enabled": true}
+  ]
+}
+```
+
+With it enabled, the agent additionally sees the `mcp_*` tools and can pull
+higher-fidelity documentation. A dedicated docs server (e.g. an HTTP MCP that
+indexes a library's reference) is the most robust option for a fleet that
+integrates many SDKs.
+
+> Note: reliable docs retrieval removes the *"the model didn't know the API"*
+> excuse for a stub, but turning docs into correct, version-matched code still
+> depends on the model's strength -- see [Agent.md](Agent.md).
+
 ## How the agent uses them
 
 The swarm sees three tools once at least one server is enabled:
