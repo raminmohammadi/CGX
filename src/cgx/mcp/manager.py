@@ -97,9 +97,17 @@ def call_tool(args: Dict[str, Any], _ctx: Any) -> str:
         return _SDK_HINT
     try:
         import asyncio
-        return asyncio.run(_call_tool_async(server, tool, arguments))
+        result = asyncio.run(_call_tool_async(server, tool, arguments))
     except Exception as exc:  # pragma: no cover - depends on live server
         return f"MCP call failed: {type(exc).__name__}: {exc}"
+    # An MCP tool result (e.g. a fetched web page) is untrusted third-party
+    # content -- screen it through the shared prompt-injection guardrail before
+    # it enters the model's context, exactly as the built-in fetch/search do.
+    try:
+        from cgx.guardrails.injection import screen_untrusted
+        return screen_untrusted(result, origin=f"MCP {name}/{tool}")
+    except Exception:  # pragma: no cover - guardrail is best-effort
+        return result
 
 
 # --------------------- async SDK bridge ---------------------

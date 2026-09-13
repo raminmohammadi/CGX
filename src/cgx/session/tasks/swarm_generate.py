@@ -43,33 +43,35 @@ def _truncate(text: str, limit: int) -> str:
 
 
 # Tools the Developer may call while generating a file: read-only introspection
-# so imports name symbols that actually exist, plus web search + page fetch so
-# it can look up a real third-party/SDK API (e.g. the Gemini client) from its
-# docs and implement the actual integration instead of shipping an echo/
-# placeholder stub for a feature it doesn't know. Dispatch and descriptions come
-# from the shared registry -- adding a tool here (or an MCP server) needs no
-# change to this loop.
+# so imports name symbols that actually exist, plus web search so it can find a
+# real third-party/SDK API's docs and implement the actual integration instead
+# of shipping an echo/placeholder stub. Page FETCHING is served by an MCP fetch
+# server when one is configured (preferred), else the built-in ``fetch_url``
+# fallback (see _dev_tools). Dispatch/descriptions come from the shared registry.
 _DEV_BASE_TOOLS = ("run_python_probe", "file_skeleton", "list_symbols",
-                   "search_web", "fetch_url")
+                   "search_web")
 _MAX_TOOL_ITERS = 5
 
 
 def _dev_tools(deps: Any = None) -> tuple:
-    """Developer tool set: introspection + MCP tools when servers exist.
+    """Developer tool set: introspection + web + MCP tools when servers exist.
 
-    ``query_codebase`` (semantic retrieval over the indexed repo) is advertised
-    ONLY when ``deps`` actually carries an index -- so a Developer editing an
-    existing repo can discover a symbol the plan forgot to list in
-    ``depends_on`` instead of hallucinating it, while a fresh greenfield build
-    (no index) never sees a tool that would just return "not available" and
-    tempt a weak model into a wasted call.
+    * ``query_codebase`` (semantic retrieval) is advertised ONLY when ``deps``
+      carries an index, so a fresh greenfield build never sees a no-op tool.
+    * Page fetching prefers MCP: when an MCP server is configured the built-in
+      ``fetch_url`` is dropped (the model fetches via ``mcp_call``); with no MCP
+      server it is advertised as the fallback. Either way ``search_web`` stays
+      for URL discovery, and both fetch paths are guardrail-screened.
     """
     from cgx.session.tasks.swarm_tools import mcp_tools_if_configured
+    mcp = mcp_tools_if_configured()
     tools = _DEV_BASE_TOOLS
+    if not mcp:
+        tools = tools + ("fetch_url",)
     if deps is not None and getattr(deps, "index_dir", None) \
             and getattr(deps, "records_path", None):
         tools = tools + ("query_codebase",)
-    return tools + mcp_tools_if_configured()
+    return tools + mcp
 
 
 class ToolWrapper:

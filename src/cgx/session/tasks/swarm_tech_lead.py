@@ -120,8 +120,12 @@ _SYSTEM_PROMPT = (
 # planning, plus any configured MCP tools; everything else is deterministic
 # plan validation.
 def _planner_tools() -> tuple:
+    # Page fetching prefers MCP: when a server is configured the built-in
+    # fetch_url is dropped (fetch via mcp_call); otherwise it is the fallback.
     from cgx.session.tasks.swarm_tools import mcp_tools_if_configured
-    return ("search_web", "fetch_url") + mcp_tools_if_configured()
+    mcp = mcp_tools_if_configured()
+    base = ("search_web",) if mcp else ("search_web", "fetch_url")
+    return base + mcp
 
 
 def _ask_for_plan(provider: Any, goal: str,
