@@ -346,3 +346,26 @@ def test_dev_tools_include_search_web():
     """The Developer can look up a real API (to implement it, not stub it)."""
     from cgx.session.tasks.swarm_generate import _dev_tools
     assert "search_web" in _dev_tools(None)
+
+
+def test_render_structure_is_accurate_tree():
+    from cgx.session.tasks.swarm_generate import _render_structure
+    s = _render_structure(["backend/app.py", "backend/routes.py",
+                           "frontend/src/App.jsx", "README.md"])
+    assert "## Project structure" in s
+    assert "backend/" in s and "app.py" in s
+    assert "frontend/" in s and "src/" in s and "App.jsx" in s
+
+
+def test_readme_keeps_prose_and_appends_real_structure():
+    import cgx.session.tasks.swarm_generate as sg
+
+    class _P:
+        def chat(self, *a, **k):
+            return {"content": "# My App\n\nA thing that does things.\n"}
+
+    out = sg._readme_content("readme", "build my app", _P(),
+                             ["backend/app.py", "frontend/src/App.jsx"])
+    assert "# My App" in out                 # model prose kept
+    assert "## Project structure" in out     # accurate structure appended
+    assert "app.py" in out and "App.jsx" in out

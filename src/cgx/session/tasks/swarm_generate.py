@@ -476,14 +476,45 @@ def _requirements_content(manifest_paths: Optional[List[str]],
     return "\n".join(sorted(dists)) + "\n"
 
 
+def _render_structure(manifest_paths: Optional[List[str]]) -> str:
+    """A deterministic, ACCURATE 'Project structure' tree from the real files.
+
+    The README's file listing must reflect the actual codebase, not the model's
+    guess -- so we own it: build an indented directory tree from the planned/
+    generated paths and render it in a fenced block. Empty when nothing planned.
+    """
+    paths = sorted({str(p).replace("\\", "/") for p in (manifest_paths or []) if p})
+    if not paths:
+        return ""
+    tree: Dict[str, Any] = {}
+    for p in paths:
+        node = tree
+        for part in p.split("/"):
+            node = node.setdefault(part, {})
+    lines = ["## Project structure", "", "```"]
+
+    def _walk(node: Dict[str, Any], prefix: str = "") -> None:
+        for name in sorted(node):
+            children = node[name]
+            lines.append(f"{prefix}{name}{'/' if children else ''}")
+            if children:
+                _walk(children, prefix + "  ")
+
+    _walk(tree)
+    lines.append("```")
+    return "\n".join(lines) + "\n"
+
+
 def _fallback_readme(goal: str, manifest_paths: Optional[List[str]]) -> str:
-    """A minimal but valid README when the free-form model path is unusable."""
+    """A minimal but valid README when the free-form model path is unusable.
+
+    The accurate structure section is appended by :func:`_readme_content`, so
+    this body carries only the prose + generic run/test commands.
+    """
     title = (goal or "Project").strip().splitlines()[0][:80] or "Project"
-    files = "\n".join(f"- `{p}`" for p in (manifest_paths or []))
     return (f"# {title}\n\n{goal}\n\n"
             "## Install\n\n```\npip install -r requirements.txt\n```\n\n"
-            "## Testing\n\n```\npytest\n```\n"
-            + (f"\n## Files\n\n{files}\n" if files else ""))
+            "## Testing\n\n```\npytest\n```\n")
 
 
 def _readme_content(description: str, goal: str, provider: Any,
@@ -495,20 +526,29 @@ def _readme_content(description: str, goal: str, provider: Any,
     :func:`_fallback_readme` so a README always ships.
     """
     listing = "\n".join(f"- {p}" for p in (manifest_paths or []))
-    system = ("You write a concise, accurate README.md for a Python project. "
-              "Output ONLY Markdown -- no surrounding code fence. Include a "
-              "title, a one-paragraph description, an Install section using "
-              "'pip install -r requirements.txt', and a Testing section using "
-              "'pytest'.")
+    system = ("You write a concise, accurate README.md for a software project "
+              "(it may span multiple components/languages, e.g. a Python backend "
+              "and a JS/React frontend). Output ONLY Markdown -- no surrounding "
+              "code fence. Include a title, a one-paragraph description of what "
+              "the app actually does, a Setup/Run section with the real commands "
+              "to install dependencies and start each component, and a Testing "
+              "section. Do NOT invent a file listing or a 'Project structure' "
+              "section -- an accurate one is appended automatically.")
     user = (f"Project goal:\n{goal}\n\nThis file's purpose:\n{description}\n\n"
-            f"Planned files:\n{listing}\n")
+            f"Files in the project (context only; do not paste verbatim):\n{listing}\n")
     try:
         res = provider.chat(messages=[{"role": "system", "content": system},
                                         {"role": "user", "content": user}], force_json=False)
         content = str((res or {}).get("content") or "").strip()
     except Exception:  # pragma: no cover - defensive: provider crash
         content = ""
-    return content + "\n" if content else _fallback_readme(goal, manifest_paths)
+    body = (content + "\n") if content else _fallback_readme(goal, manifest_paths)
+    # Own the facts: append the real, deterministic structure regardless of what
+    # the model wrote, so the README always reflects the actual codebase.
+    structure = _render_structure(manifest_paths)
+    if structure:
+        body = body.rstrip() + "\n\n" + structure
+    return body
 
 
 def _generate_non_source(path: str, description: str, goal: str, root: str,
