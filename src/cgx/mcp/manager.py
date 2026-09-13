@@ -74,6 +74,13 @@ def list_tools(args: Dict[str, Any], _ctx: Any) -> str:
         result = asyncio.run(_list_tools_async(server))
     except Exception as exc:  # pragma: no cover - depends on live server
         return f"Failed to list tools for {name}: {type(exc).__name__}: {exc}"
+    # Tool descriptions are server-controlled text that lands in the model's
+    # context -- an injection vector too. Screen them like any untrusted blob.
+    try:
+        from cgx.guardrails.injection import screen_untrusted
+        result = screen_untrusted(result, origin=f"MCP {name} tool list")
+    except Exception:  # pragma: no cover - guardrail is best-effort
+        pass
     _TOOLS_CACHE[name] = (result, time.time())
     return result
 
