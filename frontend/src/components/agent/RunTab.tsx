@@ -6,6 +6,7 @@ import {
 } from "../../lib/api";
 import { useWorkspace } from "../../store/workspace";
 import { useAgentSession } from "../../store/agentSession";
+import { applySessionEvent } from "../../store/agentEvents";
 import { SessionLauncher } from "./SessionLauncher";
 import { LiveView, PriorSessions, activeTask } from "./LiveView";
 import { PendingApprovals } from "../PendingApprovals";
@@ -89,21 +90,26 @@ export function RunTab({
     else setState(null);
   }, [activeId, loadState]);
 
-  // Live updates over SSE: the backend drains the pipeline in the
-  // background and streams events here. State-changing events trigger a
-  // (debounced) authoritative refetch; ``task.output_partial`` carries
-  // transient per-file scaffold progress that never lands in a snapshot.
+  // Live updates over SSE: the backend drains the pipeline in the background
+  // and streams events here. Each frame carries the full changed entity, so we
+  // apply it in place (``applySessionEvent``) and the affected node animates
+  // its own transition -- no more throwing the payload away and refetching the
+  // whole snapshot on every beat (which made the view "reload" and re-stack).
+  // A long-debounced full refetch still runs as a reconciliation fallback in
+  // case the bounded SSE queue ever drops a frame under a burst.
+  // ``task.output_partial`` carries transient per-file progress that is never
+  // persisted, so it stays in its own ``progress`` map.
   useEffect(() => {
     if (!activeId) return;
     setProgress({});
     sseOkRef.current = false;
     const es = new EventSource(api.agentSessionEventsUrl(activeId));
-    const scheduleRefetch = () => {
-      if (refetchTimer.current) return;
+    const scheduleReconcile = () => {
+      if (refetchTimer.current) window.clearTimeout(refetchTimer.current);
       refetchTimer.current = window.setTimeout(() => {
         refetchTimer.current = null;
         loadState(activeId);
-      }, 250);
+      }, 1500);
     };
     es.addEventListener("snapshot", (e: MessageEvent) => {
       sseOkRef.current = true;
@@ -119,12 +125,16 @@ export function RunTab({
       } catch { /* ignore */ }
     });
     [
-      "session.updated", "task.created", "task.status_changed",
-      "task.completed", "task.failed", "decision.recorded",
-      "fact.added", "fact.stale", "artifact.created",
-    ].forEach((name) => es.addEventListener(name, () => {
+      "session.created", "session.updated", "task.created",
+      "task.status_changed", "task.completed", "task.failed",
+      "decision.recorded", "fact.added", "fact.stale", "artifact.created",
+    ].forEach((name) => es.addEventListener(name, (e: MessageEvent) => {
       sseOkRef.current = true;
-      scheduleRefetch();
+      try {
+        const ev = JSON.parse(e.data);
+        setState((prev) => (prev ? applySessionEvent(prev, name, ev?.payload) : prev));
+      } catch { /* ignore */ }
+      scheduleReconcile();
     }));
     es.onerror = () => { sseOkRef.current = false; };
     return () => {

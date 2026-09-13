@@ -8,6 +8,7 @@ import type {
 } from "../../lib/api";
 import { TaskTree } from "./TaskTree";
 import { ActiveTaskPanel } from "./ActiveTask";
+import { SessionDashboard } from "./SessionDashboard";
 import { SidePanel } from "./SidePanel";
 import { ResizeHandle } from "./ResizeHandle";
 import { CollapsedRail } from "../CollapsedRail";
@@ -129,6 +130,9 @@ export function LiveView({
             </div>
           )}
         </header>
+        <ErrorBoundary label="session-dashboard">
+          <SessionDashboard state={state} />
+        </ErrorBoundary>
         <div className="flex-1 flex overflow-hidden min-h-0">
           <div
             style={{ width: taskTreeWidth }}
