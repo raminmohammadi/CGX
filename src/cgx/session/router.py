@@ -1089,6 +1089,64 @@ def _swarm_dev_inputs(parent: TaskNode, outputs: Dict[str, Any],
     }
 
 
+def _swarm_tech_lead_node(session_id: str, *, goal: str, project_root: Any,
+                          require_plan_approval: bool,
+                          parent_task_id: str = None,
+                          description: str = "Reason over the objective and delegate tasks.",
+                          decision_id: str = None) -> TaskNode:
+    """A SWARM_TECH_LEAD task seeded with an explicit goal/root/approval mode.
+
+    Used by the assess + relocate edges to (re)root the build at a chosen
+    project_root while preserving the session's plan-approval setting.
+    """
+    inputs: Dict[str, Any] = {
+        "goal": goal,
+        "project_root": project_root,
+        "require_plan_approval": bool(require_plan_approval),
+    }
+    if decision_id:
+        inputs["decision_id"] = decision_id
+    return TaskNode.new(
+        session_id=session_id, kind=TaskKind.SWARM_TECH_LEAD,
+        name="Tech Lead Planning", description=description,
+        parent_task_id=parent_task_id, inputs=inputs)
+
+
+def _swarm_assess_to_successors(parent: TaskNode) -> List[TaskNode]:
+    """Route a finished SWARM_ASSESS: proceed to plan, or ask where to build.
+
+    A ``relevant`` verdict spawns the Tech Lead against the existing repo (the
+    Developer then modifies it, with C3's per-file backups). A ``not relevant``
+    verdict raises ASK_USER(RELOCATE) so the user picks a fresh folder rather
+    than scaffolding an unrelated project over real code.
+    """
+    outputs = parent.outputs or {}
+    goal = str(outputs.get("goal") or parent.inputs.get("goal") or "")
+    project_root = (outputs.get("project_root")
+                    or parent.inputs.get("project_root"))
+    rpa = bool(outputs.get("require_plan_approval")
+               or parent.inputs.get("require_plan_approval"))
+    if bool(outputs.get("relevant", True)):
+        return [_swarm_tech_lead_node(
+            parent.session_id, goal=goal, project_root=project_root,
+            require_plan_approval=rpa, parent_task_id=parent.task_id,
+            description="Plan changes against the existing repo.")]
+    return [TaskNode.new(
+        session_id=parent.session_id, kind=TaskKind.ASK_USER,
+        name="Choose where to build",
+        description=("The existing folder doesn't match your objective. Enter a "
+                     "new folder to build in, or confirm to build here."),
+        parent_task_id=parent.task_id,
+        inputs={
+            "expected_kind": DecisionKind.RELOCATE.value,
+            "goal": goal,
+            "current_project_root": project_root,
+            "reason": outputs.get("reason"),
+            "require_plan_approval": rpa,
+        },
+    )]
+
+
 def _swarm_tech_lead_to_successors(parent: TaskNode) -> List[TaskNode]:
     """Spawn the first Developer file-task, gate on approval, or finish.
 
@@ -1248,6 +1306,7 @@ TASK_SUCCESSOR = {
     TaskKind.RE_VERIFY: _re_verify_successors,
     TaskKind.RUNTIME_VERIFY: _runtime_verify_to_repair_or_terminal,
     TaskKind.REPAIR: _repair_to_apply_or_ask,
+    TaskKind.SWARM_ASSESS: _swarm_assess_to_successors,
     TaskKind.SWARM_TECH_LEAD: _swarm_tech_lead_to_successors,
     TaskKind.SWARM_DEVELOPER: _swarm_developer_to_successors,
     TaskKind.SWARM_VERIFY: _swarm_verify_to_successors,
@@ -1520,13 +1579,32 @@ def _make_root(session: Session, message: str) -> TaskNode:
     needs an index and fails cleanly when none exists.
     """
     if session.mode is SessionMode.SWARM:
-        from cgx.session.mode import is_question
+        from cgx.session.mode import _project_is_empty, is_question
         if is_question(message):
             return _make_root_explore(session, message)
+        # Existing (non-empty) repo: assess relevance before building so we
+        # never scaffold an unrelated project on top of real code -- the
+        # assessor either proceeds (relevant -> modify) or asks the user for a
+        # fresh folder. An empty target goes straight to the build.
+        if session.project_root and not _project_is_empty(session.project_root):
+            return _make_root_swarm_assess(session, message)
         return _make_root_swarm_tech_lead(session, message)
     if session.mode is SessionMode.GREENFIELD:
         return _make_root_clarify(session, message)
     return _make_root_explore(session, message)
+
+
+def _make_root_swarm_assess(session: Session, message: str) -> TaskNode:
+    return TaskNode.new(
+        session_id=session.session_id,
+        kind=TaskKind.SWARM_ASSESS,
+        name="Assess existing repo",
+        description="Judge whether the existing repo fits the objective.",
+        inputs={"goal": message,
+                "original_objective": session.original_objective,
+                "project_root": session.project_root,
+                "require_plan_approval": bool(session.require_plan_approval)},
+    )
 
 
 def _make_root_swarm_tech_lead(session: Session, message: str) -> TaskNode:
@@ -1631,7 +1709,30 @@ def _decision_successor(ask: TaskNode,
         return _from_clarify_answers(ask, decision)
     if decision.kind is DecisionKind.APPROVE_PLAN:
         return _from_approve_plan(ask, decision)
+    if decision.kind is DecisionKind.RELOCATE:
+        return _from_relocate(ask, decision)
     return None
+
+
+def _from_relocate(ask: TaskNode, decision: Decision) -> Optional[TaskNode]:
+    """Re-root the swarm build after the user chose where to build.
+
+    ``chosen.path`` (a new folder) wins; otherwise the build proceeds in the
+    original folder (the user confirmed "build here anyway"). Either way a fresh
+    SWARM_TECH_LEAD is spawned at the chosen root, preserving the session's
+    plan-approval mode.
+    """
+    chosen = decision.chosen or {}
+    new_root = str(chosen.get("path") or "").strip()
+    root = new_root or ask.inputs.get("current_project_root")
+    return _swarm_tech_lead_node(
+        ask.session_id,
+        goal=str(ask.inputs.get("goal") or ""),
+        project_root=root,
+        require_plan_approval=bool(ask.inputs.get("require_plan_approval")),
+        parent_task_id=ask.task_id,
+        description="Plan the build at the chosen folder.",
+        decision_id=decision.decision_id)
 
 
 def _from_choose_recommendation(ask: TaskNode,

@@ -243,3 +243,88 @@ def test_decline_plan_swarm_spawns_no_successor():
                        kind=DecisionKind.APPROVE_PLAN, question="approve?",
                        chosen={"approved": False})
     assert _from_approve_plan(ask, dec) is None
+
+
+# --------------------- existing-repo relevance routing (Phase C) ---------------------
+
+def _assess(outputs, inputs=None):
+    t = TaskNode.new(session_id="s", kind=TaskKind.SWARM_ASSESS, name="assess",
+                     inputs=inputs or {"goal": "g", "project_root": "/p"})
+    t.outputs = outputs
+    return t
+
+
+def test_assess_relevant_spawns_tech_lead():
+    from cgx.session.router import _swarm_assess_to_successors
+    kids = _swarm_assess_to_successors(
+        _assess({"relevant": True, "goal": "g", "project_root": "/p"}))
+    assert len(kids) == 1 and kids[0].kind is TaskKind.SWARM_TECH_LEAD
+    assert kids[0].inputs["project_root"] == "/p"
+
+
+def test_assess_irrelevant_asks_relocate():
+    from cgx.session.models import DecisionKind
+    from cgx.session.router import _swarm_assess_to_successors
+    kids = _swarm_assess_to_successors(
+        _assess({"relevant": False, "reason": "unrelated", "goal": "g",
+                 "project_root": "/p"}))
+    assert len(kids) == 1 and kids[0].kind is TaskKind.ASK_USER
+    assert kids[0].inputs["expected_kind"] == DecisionKind.RELOCATE.value
+    assert kids[0].inputs["current_project_root"] == "/p"
+
+
+def test_relocate_new_path_reroots_tech_lead():
+    from cgx.session.models import Decision, DecisionKind
+    from cgx.session.router import _from_relocate
+    ask = TaskNode.new(session_id="s", kind=TaskKind.ASK_USER, name="reloc",
+                       inputs={"expected_kind": DecisionKind.RELOCATE.value,
+                               "goal": "g", "current_project_root": "/old"})
+    dec = Decision.new(session_id="s", resolved_task_id=ask.task_id,
+                       kind=DecisionKind.RELOCATE, question="?",
+                       chosen={"path": "/new"})
+    succ = _from_relocate(ask, dec)
+    assert succ.kind is TaskKind.SWARM_TECH_LEAD
+    assert succ.inputs["project_root"] == "/new"
+
+
+def test_relocate_proceed_here_uses_current_root():
+    from cgx.session.models import Decision, DecisionKind
+    from cgx.session.router import _from_relocate
+    ask = TaskNode.new(session_id="s", kind=TaskKind.ASK_USER, name="reloc",
+                       inputs={"expected_kind": DecisionKind.RELOCATE.value,
+                               "goal": "g", "current_project_root": "/old"})
+    dec = Decision.new(session_id="s", resolved_task_id=ask.task_id,
+                       kind=DecisionKind.RELOCATE, question="?",
+                       chosen={"proceed_here": True})
+    assert _from_relocate(ask, dec).inputs["project_root"] == "/old"
+
+
+def test_make_root_swarm_existing_repo_assesses(tmp_path):
+    (tmp_path / "main.py").write_text("print(1)\n")
+    session = Session.new("add a feature", mode=SessionMode.SWARM,
+                          project_root=str(tmp_path))
+    plan = Router().on_user_message(
+        session=session, message="add a feature", tasks=[])
+    created = _created(plan)
+    assert len(created) == 1 and created[0].kind is TaskKind.SWARM_ASSESS
+
+
+def test_make_root_swarm_empty_repo_builds_directly(tmp_path):
+    session = Session.new("build an app", mode=SessionMode.SWARM,
+                          project_root=str(tmp_path))  # empty dir
+    plan = Router().on_user_message(
+        session=session, message="build an app", tasks=[])
+    created = _created(plan)
+    assert len(created) == 1 and created[0].kind is TaskKind.SWARM_TECH_LEAD
+
+
+def test_snapshot_repo_lists_source_and_skips_ignored(tmp_path):
+    from cgx.session.tasks.swarm_assess import snapshot_repo
+    (tmp_path / "a.py").write_text("x")
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "cfg").write_text("x")
+    (tmp_path / "node_modules").mkdir()
+    (tmp_path / "node_modules" / "b.js").write_text("x")
+    files = snapshot_repo(str(tmp_path))
+    assert "a.py" in files
+    assert not any("node_modules" in f or ".git" in f for f in files)

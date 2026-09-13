@@ -207,6 +207,7 @@ export type TaskKind =
   | "bootstrap_env"
   | "repair"
   | "summarize"
+  | "swarm_assess"
   | "swarm_tech_lead"
   | "swarm_developer"
   | "swarm_verify";
@@ -245,7 +246,8 @@ export type DecisionKind =
   | "approve"
   | "freeform"
   | "clarify_answers"
-  | "approve_plan";
+  | "approve_plan"
+  | "relocate";
 
 export type SessionStatusValue =
   | "active" | "paused" | "completed" | "abandoned";

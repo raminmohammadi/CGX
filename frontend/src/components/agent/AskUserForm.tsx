@@ -33,6 +33,9 @@ export function AskUserForm({
   if (expectedKind === "approve_plan") {
     return <ApprovePlanForm linked={linked} onDecide={onDecide} pending={pending} />;
   }
+  if (expectedKind === "relocate") {
+    return <RelocateForm task={task} onDecide={onDecide} pending={pending} />;
+  }
   return <FreeformForm onDecide={onDecide} pending={pending} />;
 }
 
@@ -281,7 +284,53 @@ function ApprovePlanForm({
           type="button" disabled={pending}
           onClick={() => onDecide({ chosen: { approved: true } })}
           className="av-btn-primary"
-        ><Check className="h-3 w-3" /> Approve &amp; Scaffold</button>
+        ><Check className="h-3 w-3" /> Approve &amp; Build</button>
+      </div>
+    </div>
+  );
+}
+
+function RelocateForm({
+  task, onDecide, pending,
+}: { task: TaskNodeDTO; onDecide: (p: DecidePayload) => any; pending: boolean }) {
+  const [path, setPath] = useState("");
+  const reason = String(task.inputs?.reason || "");
+  const current = String(task.inputs?.current_project_root || "");
+  return (
+    <div className="rounded-lg border border-amber-500/30 bg-amber-950/10 p-4 space-y-3">
+      <p className="text-[10px] uppercase tracking-wider font-mono text-amber-300">
+        This folder doesn't match your objective
+      </p>
+      {reason && <p className="text-[12px] text-slate-300">{reason}</p>}
+      {current && (
+        <p className="text-[11px] font-mono text-slate-500 break-all">
+          current: {current}
+        </p>
+      )}
+      <div className="space-y-1.5">
+        <label className="block text-[11px] text-slate-300">
+          Build in a new folder (absolute path):
+        </label>
+        <TextArea
+          rows={1}
+          value={path}
+          onChange={(e) => setPath(e.target.value)}
+          placeholder="/path/to/new/project"
+          disabled={pending}
+        />
+      </div>
+      <div className="flex items-center gap-2 justify-end pt-1">
+        <button
+          type="button" disabled={pending}
+          onClick={() => onDecide({ chosen: { proceed_here: true } })}
+          className="inline-flex items-center gap-1.5 rounded-md border border-white/10 bg-white/5 px-3 py-1.5 text-[11px] font-mono text-slate-200 hover:bg-white/10 disabled:opacity-40"
+        >Build here anyway</button>
+        <button
+          type="button"
+          disabled={pending || !path.trim()}
+          onClick={() => onDecide({ chosen: { path: path.trim() } })}
+          className="av-btn-primary"
+        ><Send className="h-3 w-3" /> Build in new folder</button>
       </div>
     </div>
   );

@@ -116,6 +116,7 @@ class TaskKind(str, enum.Enum):
     # build). The router never spawns it and no executor is registered;
     # it exists so one legacy row cannot make a whole session unreadable.
     UNKNOWN = "unknown"
+    SWARM_ASSESS = "swarm_assess"
     SWARM_TECH_LEAD = "swarm_tech_lead"
     SWARM_DEVELOPER = "swarm_developer"
     SWARM_VERIFY = "swarm_verify"
@@ -165,6 +166,9 @@ class DecisionKind(str, enum.Enum):
     FREEFORM = "freeform"
     CLARIFY_ANSWERS = "clarify_answers"
     APPROVE_PLAN = "approve_plan"
+    # Swarm pointed at an existing repo judged unrelated to the objective: the
+    # user picks a fresh folder to build in, or confirms building in place.
+    RELOCATE = "relocate"
 
 
 # --------------------- core dataclasses ---------------------
