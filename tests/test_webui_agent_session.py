@@ -1201,3 +1201,16 @@ def test_resolve_runner_for_rebuilds_a_stale_runner(tmp_path: Path) -> None:
 
     assert resolved is not first
     assert Path(resolved.store.path).exists()
+
+
+def test_list_sessions_nonexistent_root_is_not_created(tmp_path):
+    """Regression: listing sessions for a project_root that doesn't exist must
+    NOT materialize <root>/.cgx (a stale persisted projectRoot was recreating a
+    deleted folder like an empty Calculator/ on every sidebar load)."""
+    import asyncio
+    import os as _os
+    from cgx.webui.routes.agent_session import list_agent_sessions
+    ghost = str(tmp_path / "ghost_project")
+    result = asyncio.run(list_agent_sessions(project_root=ghost))
+    assert result == []
+    assert not _os.path.exists(ghost)

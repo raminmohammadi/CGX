@@ -481,6 +481,15 @@ def _resolve_mode(req: AgentSessionCreateRequest) -> SessionMode:
 async def list_agent_sessions(
         project_root: Optional[str] = Query(default=None)) -> List[Dict[str, Any]]:
     normalized_project_root = _normalize_project_root(project_root)
+    # A project_root that doesn't exist on disk has no sessions -- and merely
+    # opening a runner for it would create ``<root>/.cgx`` via the store's
+    # mkdir, resurrecting a folder the user deleted. (A stale ``projectRoot``
+    # persisted in the browser was recreating e.g. an empty ``Calculator/``
+    # every time the sidebar listed sessions on load.) Read-only paths must not
+    # materialize a workspace; return empty instead.
+    if (normalized_project_root is not None
+            and not os.path.isdir(normalized_project_root)):
+        return []
     runner = _get_runner(normalized_project_root)
     return [s.to_dict() for s in
             runner.store.list_sessions(project_root=normalized_project_root)]
@@ -491,6 +500,11 @@ async def get_session(sid: str,
                       project_root: Optional[str] = Query(default=None)
                       ) -> AgentSessionState:
     normalized_project_root = _normalize_project_root(project_root)
+    # Don't materialize <root>/.cgx for a non-existent project root on a
+    # read-only fetch (see list_agent_sessions); the session cannot be there.
+    if (normalized_project_root is not None
+            and not os.path.isdir(normalized_project_root)):
+        raise HTTPException(status_code=404, detail=f"session {sid!r} not found")
     runner = _resolve_runner_for(sid) if normalized_project_root is None \
         else _get_runner(normalized_project_root)
     return _snapshot(runner, sid)

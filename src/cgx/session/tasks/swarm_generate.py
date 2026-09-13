@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from cgx.codegen.ast_gluer import ASTAssembler
-from cgx.session.import_audit import strip_unused_imports, unused_imports
+from cgx.session.import_audit import strip_unused_imports
 from cgx.session.tasks.swarm_ground import _safe_read, ground_dependencies
 
 # Caps on model-facing context. A tool response (``run_python_probe`` output, a
@@ -266,21 +266,24 @@ def _gate_generated_content(path: str, content: str,
     warnings = check_contract_compliance({path: content}, contracts)
     if manifest_paths:
         from cgx.session.import_audit import resolve_first_party_imports
-        from cgx.session.tasks.swarm_verify import _check_phantom_third_party_imports
-        allowed_3p = contracts.get("third_party_dependencies", [])
         warnings.extend(
             resolve_first_party_imports({path: content}, manifest_paths, root))
-        warnings.extend(
-            _check_phantom_third_party_imports([path], {path: content},
-                                               allowed_3p, root))
+        # NOTE: an undeclared *third-party* import (one not in the plan's
+        # third_party_dependencies) is deliberately NOT gated here. It is almost
+        # always the Developer making a legitimate framework choice the planner
+        # under-declared (e.g. importing `flask`), and verify's dependency
+        # reconcile installs + pins it. Gating on it drove a
+        # generate -> reject -> (syntax) semantic-repair thrash that could not
+        # fix a *policy* rejection and shipped the file with the import anyway.
+        # Only first-party resolution breaks (a local symbol that does not
+        # exist) and contract compliance gate here.
     file_warnings = [w for w in warnings
                      if w.get("file") == path or w.get("module") == path]
     if not file_warnings:
         return None
     errs = "; ".join(w.get("reason", "unknown") for w in file_warnings)
     is_import_err = bool(manifest_paths) and any(
-        w.get("kind") == "phantom_third_party"
-        or "resolves against neither" in w.get("reason", "")
+        "resolves against neither" in w.get("reason", "")
         for w in file_warnings)
     if is_import_err:
         available = ", ".join(manifest_paths or [])
@@ -586,14 +589,11 @@ def generate_file(*, path: str, description: str, depends_on: List[str],
                        method="full-file", error=err)
             content = ""
             continue
-        phantom = unused_imports(content, path=path)
-        if phantom and attempt == 0:
-            last_broken_content = content
-            swarm_beat(log_root, "developer", "gate", file=path, ok=False,
-                       method="full-file",
-                       error=f"phantom imports: {', '.join(phantom)}")
-            content = ""
-            continue
+        # An UNUSED import (e.g. a test file that imports ``pytest`` but only
+        # uses bare ``assert``) is not a defect: ``_sanitize_phantoms`` below
+        # strips genuinely-unused imports from the accepted body. Rejecting the
+        # whole file and regenerating on that basis was pure churn (it forced a
+        # wasted round on nearly every test file), so accept and sanitize.
         break
     if content:
         content = _sanitize_phantoms(content, path, log_root)

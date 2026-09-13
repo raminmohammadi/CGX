@@ -112,22 +112,23 @@ def test_phantom_import_is_stripped_before_return(monkeypatch):
     assert "import os" not in out.content and "x = 1" in out.content
 
 
-def test_phantom_import_triggers_reask(monkeypatch):
+def test_unused_import_is_stripped_not_reasked(monkeypatch):
+    # An unused import is no longer a gate failure that forces a wasted re-ask
+    # (that churned nearly every test file over its `import pytest`); the
+    # accepted body is sanitized instead.
     calls = {"n": 0}
 
     def fake(path, description, provider, **kw):
         calls["n"] += 1
-        # First body has a phantom import (gate failure -> re-ask); the second
-        # is clean and short-circuits.
-        content = "import os\nx = 1\n" if calls["n"] == 1 else "y = 2\n"
-        return {"file": path, "content": content, "syntax_ok": True,
+        return {"file": path, "content": "import os\nx = 1\n", "syntax_ok": True,
                 "syntax_error": ""}
     monkeypatch.setattr(engine, "generate_single_scaffold_file", fake)
     out = sg.generate_file(
         path="src/app.py", description="x", depends_on=[], contracts={},
         goal="demo", root=".", provider=StubProvider())
-    assert out.ok and calls["n"] == 2
-    assert out.content == "y = 2\n"
+    assert out.ok and calls["n"] == 1          # accepted first try, no re-ask
+    assert "import os" not in out.content       # unused import stripped
+    assert "x = 1" in out.content
 
 
 def test_requirements_generated_from_real_imports(tmp_path):
@@ -288,3 +289,54 @@ def test_generate_file_modify_existing_grounds_on_current(tmp_path, monkeypatch)
     assert out.ok
     assert "ALREADY EXISTS" in captured["description"]
     assert "def keep()" in captured["description"]
+
+
+# ---------- gate no longer thrashes on framework/unused imports (PIP fixes) ----------
+
+def test_gate_allows_undeclared_third_party_import(tmp_path):
+    """An undeclared but real third-party import (e.g. flask) is advisory, not a
+    gate failure -- verify's dependency reconcile installs/pins it."""
+    from cgx.session.tasks.swarm_generate import _gate_generated_content
+    content = "import flask\napp = flask.Flask(__name__)\n"
+    err = _gate_generated_content(
+        "backend/app.py", content, contracts={"third_party_dependencies": []},
+        manifest_paths=["backend/app.py"], root=str(tmp_path))
+    assert err is None
+
+
+def test_gate_still_flags_missing_first_party_symbol(tmp_path):
+    """A first-party import of a symbol no planned file defines still gates."""
+    from cgx.session.tasks.swarm_generate import _gate_generated_content
+    # `backend.ghost` is not a planned path and not on disk -> a first-party
+    # import that resolves against neither still gates (a genuine bug).
+    content = "from backend.ghost import Thing\n"
+    err = _gate_generated_content(
+        "backend/app.py", content, contracts={},
+        manifest_paths=["backend/app.py"], root=str(tmp_path))
+    assert err is not None
+
+
+def test_generate_file_accepts_unused_pytest_import(tmp_path, monkeypatch):
+    """A test file importing pytest but not referencing it is accepted (the
+    sanitizer strips the unused import) rather than rejected + regenerated."""
+    import cgx.answer.engine as engine
+    import cgx.session.tasks.swarm_generate as sg
+    calls = {"n": 0}
+
+    def fake_gen(path, description, provider, **kw):
+        calls["n"] += 1
+        return {"content": "import pytest\n\ndef test_ok():\n    assert True\n",
+                "syntax_ok": True}
+
+    monkeypatch.setattr(engine, "generate_single_scaffold_file", fake_gen)
+
+    class _P:
+        def chat(self, *a, **k):
+            return {"content": "", "syntax_ok": True}
+
+    out = sg.generate_file(path="tests/test_ok.py", description="a test",
+                           depends_on=[], contracts={}, goal="g",
+                           root=str(tmp_path), provider=_P())
+    assert out.ok and out.method == "full-file"
+    assert calls["n"] == 1          # accepted on the first attempt, no regen churn
+    assert "import pytest" not in out.content  # unused import stripped

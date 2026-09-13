@@ -240,3 +240,31 @@ def test_run_project_tests_aggregates_worst_case_returncode(tmp_path):
     assert outcome.returncode == 1
     assert outcome.tests_selected == ["a", "b"]
     assert "== npm ==" in outcome.stderr
+
+
+def test_run_pytest_paths_pins_rootdir_and_uses_relative_targets(tmp_path, monkeypatch):
+    """Regression: pytest is invoked with --rootdir pinned to the project and
+    test targets relative to it, so rootdir inference can't drift to a parent
+    dir (which produced 'no tests ran / no match in [<parent>]')."""
+    import cgx.codegen.test_runner as tr
+    (tmp_path / "tests").mkdir()
+    tf = tmp_path / "tests" / "test_x.py"
+    tf.write_text("def test_x():\n    assert True\n")
+    captured = {}
+
+    class _Proc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(cmd, **kw):
+        captured["cmd"] = cmd
+        captured["cwd"] = kw.get("cwd")
+        return _Proc()
+
+    monkeypatch.setattr(tr.subprocess, "run", fake_run)
+    tr.run_pytest_paths(str(tmp_path), [str(tf)], python_exe="python3")
+    cmd = captured["cmd"]
+    assert any(str(a).startswith("--rootdir=") for a in cmd)
+    assert "tests/test_x.py" in cmd  # relative target, not the absolute path
+    assert str(tf) not in cmd
