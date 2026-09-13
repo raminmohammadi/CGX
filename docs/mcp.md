@@ -95,10 +95,18 @@ stub:
   - `CGX_FETCH_ALLOWLIST="docs.mycorp.com,internal-wiki.example"` -- add domains.
   - `CGX_FETCH_ALLOW_ANY=1` -- permit any public host (still SSRF-blocked).
 
-> Fetched page text is treated as **reference data, not instructions.** Keeping
-> the agent on reputable docs domains is also the main mitigation against a
-> page trying to inject instructions or bad code -- widen the allowlist only to
-> sources you trust.
+- **Prompt-injection screening:** every fetched page (and every search result
+  blob) is run through CGX's shared injection heuristics
+  (`cgx.guardrails.injection`). A **critical** hit (secret-exfiltration
+  phrasing) → the content is **withheld** and an error returned; a lesser hit
+  (override/role-reassignment/delimiter/…) → the content is returned but
+  **prefixed with a loud banner** so the model treats it strictly as reference
+  data and ignores any embedded instructions.
+
+> Fetched page text is treated as **reference data, not instructions.** The
+> allowlist keeps the agent on reputable domains and the injection screen
+> defangs a page that tries to hijack it -- widen the allowlist only to sources
+> you trust.
 
 These are dependency-free and always on, but best-effort (a scrape can miss and
 `fetch_url` returns raw page text). For **more reliable retrieval**, enable an
