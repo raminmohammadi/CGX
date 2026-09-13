@@ -340,3 +340,9 @@ def test_generate_file_accepts_unused_pytest_import(tmp_path, monkeypatch):
     assert out.ok and out.method == "full-file"
     assert calls["n"] == 1          # accepted on the first attempt, no regen churn
     assert "import pytest" not in out.content  # unused import stripped
+
+
+def test_dev_tools_include_search_web():
+    """The Developer can look up a real API (to implement it, not stub it)."""
+    from cgx.session.tasks.swarm_generate import _dev_tools
+    assert "search_web" in _dev_tools(None)

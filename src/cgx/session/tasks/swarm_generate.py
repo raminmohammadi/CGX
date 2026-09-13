@@ -43,10 +43,13 @@ def _truncate(text: str, limit: int) -> str:
 
 
 # Tools the Developer may call while generating a file: read-only introspection
-# so imports name symbols that actually exist, plus any configured MCP tools.
-# Dispatch and descriptions both come from the shared registry -- adding a tool
-# here (or an MCP server) needs no change to this loop.
-_DEV_BASE_TOOLS = ("run_python_probe", "file_skeleton", "list_symbols")
+# so imports name symbols that actually exist, plus web search so it can look up
+# a real third-party/SDK API (e.g. the Gemini client) and implement the actual
+# integration instead of shipping an echo/placeholder stub for a feature it
+# doesn't know. Dispatch and descriptions come from the shared registry --
+# adding a tool here (or an MCP server) needs no change to this loop.
+_DEV_BASE_TOOLS = ("run_python_probe", "file_skeleton", "list_symbols",
+                   "search_web")
 _MAX_TOOL_ITERS = 5
 
 

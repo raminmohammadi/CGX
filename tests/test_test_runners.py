@@ -268,3 +268,45 @@ def test_run_pytest_paths_pins_rootdir_and_uses_relative_targets(tmp_path, monke
     assert any(str(a).startswith("--rootdir=") for a in cmd)
     assert "tests/test_x.py" in cmd  # relative target, not the absolute path
     assert str(tf) not in cmd
+
+
+def test_is_toolchain_missing_classifies_vite_not_found():
+    from cgx.codegen.test_runners import _is_toolchain_missing
+    assert _is_toolchain_missing("sh: vite: command not found")
+    assert _is_toolchain_missing("npm ERR! ENOENT")
+    assert not _is_toolchain_missing("SyntaxError: Unexpected token in App.jsx")
+
+
+def test_npm_install_failure_is_skipped_not_failed(tmp_path, monkeypatch):
+    import cgx.codegen.test_runners as tr
+    (tmp_path / "package.json").write_text('{"scripts":{"build":"vite build"}}')
+
+    class _Proc:
+        returncode = 1
+        stdout = ""
+        stderr = "npm ERR! network request failed"
+
+    monkeypatch.setattr(tr.subprocess, "run", lambda cmd, **kw: _Proc())
+    monkeypatch.setattr(tr.shutil, "which", lambda x: "/usr/bin/npm")
+    out = tr.NpmRunner()._run_in_dir(str(tmp_path), timeout_seconds=30,
+                                     tests_present=False)
+    assert out.ran is False
+    assert "toolchain" in (out.skipped_reason or "").lower()
+
+
+def test_npm_build_tool_not_found_is_skipped(tmp_path, monkeypatch):
+    import cgx.codegen.test_runners as tr
+    (tmp_path / "package.json").write_text('{"scripts":{"build":"vite build"}}')
+    (tmp_path / "node_modules").mkdir()  # present -> install is skipped
+
+    class _Proc:
+        returncode = 1
+        stdout = ""
+        stderr = "sh: vite: command not found"
+
+    monkeypatch.setattr(tr.subprocess, "run", lambda cmd, **kw: _Proc())
+    monkeypatch.setattr(tr.shutil, "which", lambda x: "/usr/bin/npm")
+    out = tr.NpmRunner()._run_in_dir(str(tmp_path), timeout_seconds=30,
+                                     tests_present=False)
+    assert out.ran is False
+    assert "not found" in (out.skipped_reason or "").lower()

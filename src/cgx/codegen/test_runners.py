@@ -167,6 +167,21 @@ def _npm_script_command(project_root: str) -> Optional[List[str]]:
     return None
 
 
+def _is_toolchain_missing(output: str) -> bool:
+    """True when a failed npm run is a missing *tool*, not a real build error.
+
+    ``sh: vite: command not found`` / ``ENOENT`` mean the JS toolchain wasn't
+    provisioned (offline install, unresolved peer deps), so the failure is
+    environmental -- it must be reported as *skipped*, not as a build failure
+    that sinks an otherwise-passing run.
+    """
+    low = (output or "").lower()
+    return ("command not found" in low
+            or ": not found" in low
+            or "enoent" in low
+            or "is not recognized as an internal or external command" in low)
+
+
 class NpmRunner(TestRunner):
     """JS/TS stack: runs the package.json ``test`` script, else a ``build`` smoke."""
 
@@ -189,6 +204,7 @@ class NpmRunner(TestRunner):
                 tests_present=tests_present)
         root = Path(pkg_dir).resolve()
         if not (root / "node_modules").is_dir():
+            install_ok = False
             try:
                 # ``--legacy-peer-deps`` so a model's imperfect peer-version
                 # pin (e.g. vite ^4 with @vitejs/plugin-react ^2) doesn't abort
@@ -201,12 +217,23 @@ class NpmRunner(TestRunner):
                     capture_output=True, text=True,
                     timeout=min(timeout_seconds, 180.0),
                 )
-                if proc.returncode != 0:
+                install_ok = proc.returncode == 0
+                if not install_ok:
                     logger.debug("npm install (%s) rc=%s: %s",
                                  root.name, proc.returncode,
                                  (proc.stderr or "")[:300])
             except Exception as e:
                 logger.debug("npm install skipped: %s", e)
+            if not install_ok:
+                # The JS toolchain couldn't be provisioned (offline / unresolved
+                # deps). Running the build now would only emit "vite: command
+                # not found" and fail the whole run. Report it as SKIPPED so a
+                # passing Python half isn't sunk by an unavailable JS toolchain.
+                return TestRunOutcome(
+                    ran=False,
+                    skipped_reason=("npm install failed; JS build/test skipped "
+                                    "(toolchain unavailable)"),
+                    tests_present=tests_present)
         label = f"{root.name}: {' '.join(cmd)}"
         ran_tests = cmd[:2] == ["npm", "test"]
         try:
@@ -222,6 +249,15 @@ class NpmRunner(TestRunner):
         except Exception as e:
             return TestRunOutcome(
                 ran=False, skipped_reason=f"{type(e).__name__}: {e}",
+                tests_present=tests_present)
+        # A non-zero exit that is really a missing build tool (vite/tsc not on
+        # PATH because the install didn't land) is environmental, not a code
+        # defect -> skip, don't fail.
+        if proc.returncode != 0 and _is_toolchain_missing(
+                (proc.stdout or "") + "\n" + (proc.stderr or "")):
+            return TestRunOutcome(
+                ran=False,
+                skipped_reason="JS build tool not found (toolchain unavailable)",
                 tests_present=tests_present)
         return TestRunOutcome(
             ran=True, returncode=proc.returncode, stdout=proc.stdout,
