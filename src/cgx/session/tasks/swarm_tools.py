@@ -2,7 +2,7 @@ import subprocess
 import os
 import json
 import logging
-from typing import Dict, Any
+from typing import Any, Dict, Optional
 
 from cgx.pipeline.auto import run_query_auto
 from cgx.session.tasks.base import ExecutorDeps
@@ -219,6 +219,69 @@ def _host_is_blocked(host: str) -> bool:
     return False
 
 
+# Trusted hosts fetch_url may read from BY DEFAULT: official language/package
+# docs, package registries, code hosts, and the major cloud/LLM provider docs --
+# i.e. where real API documentation lives. A model-chosen URL that isn't a
+# suffix of one of these is refused, so the agent can't be steered into reading
+# an arbitrary/malicious site (prompt-injection / bad-code surface). This is
+# additive to the SSRF block (which is always enforced and cannot be disabled).
+# ``example.com``/``example.org`` are IANA doc-reserved and safe to allow.
+_DEFAULT_FETCH_ALLOWLIST = frozenset({
+    "example.com", "example.org",
+    # language / package docs + registries
+    "python.org", "readthedocs.io", "readthedocs.org", "pypi.org",
+    "npmjs.com", "nodejs.org", "developer.mozilla.org", "pkg.go.dev",
+    "go.dev", "docs.rs", "crates.io", "rubygems.org", "packagist.org",
+    # code hosts / Q&A
+    "github.com", "githubusercontent.com", "gitlab.com", "stackoverflow.com",
+    "stackexchange.com",
+    # major provider / cloud / framework docs
+    "ai.google.dev", "developers.google.com", "cloud.google.com",
+    "platform.openai.com", "docs.anthropic.com", "learn.microsoft.com",
+    "docs.aws.amazon.com", "developer.apple.com", "huggingface.co",
+    "palletsprojects.com", "fastapi.tiangolo.com", "djangoproject.com",
+    "react.dev", "vuejs.org", "angular.io", "vitejs.dev", "expressjs.com",
+    "tailwindcss.com", "stripe.com", "twilio.com",
+})
+
+
+def _fetch_allowlist() -> frozenset:
+    """Default allowlist plus any domains from ``CGX_FETCH_ALLOWLIST`` (CSV)."""
+    extra = os.environ.get("CGX_FETCH_ALLOWLIST", "")
+    if not extra.strip():
+        return _DEFAULT_FETCH_ALLOWLIST
+    return _DEFAULT_FETCH_ALLOWLIST | {
+        d.strip().lower().lstrip(".") for d in extra.split(",") if d.strip()}
+
+
+def _host_allowed(host: str) -> bool:
+    """True if ``host`` matches (is a subdomain of) an allowlisted domain.
+
+    Bypassed entirely when ``CGX_FETCH_ALLOW_ANY`` is set truthy -- for a user
+    who wants the agent to read any public host (still SSRF-blocked).
+    """
+    if os.environ.get("CGX_FETCH_ALLOW_ANY", "").strip().lower() in (
+            "1", "true", "yes", "on"):
+        return True
+    h = (host or "").strip().lower().rstrip(".")
+    return any(h == d or h.endswith("." + d) for d in _fetch_allowlist())
+
+
+def _fetch_refusal(host: str) -> Optional[str]:
+    """Reason to refuse fetching ``host`` (SSRF or not-allowlisted), else None.
+
+    SSRF (private/loopback) is a hard block; the allowlist is the "don't read
+    the wrong external place" control and is user-extensible.
+    """
+    if _host_is_blocked(host):
+        return f"private/loopback host ({host})"
+    if not _host_allowed(host):
+        return (f"host {host!r} is not in the fetch allowlist -- add it via the "
+                "CGX_FETCH_ALLOWLIST env var (comma-separated domains) or set "
+                "CGX_FETCH_ALLOW_ANY=1 to permit any public host")
+    return None
+
+
 def _html_to_text(s: str) -> str:
     """Reduce an HTML page to readable text (drop script/style/tags, unescape)."""
     import html as _html
@@ -249,10 +312,10 @@ class _SafeRedirectHandler:
                 import urllib.error
                 import urllib.parse
                 host = urllib.parse.urlparse(newurl).hostname or ""
-                if _host_is_blocked(host):
+                refusal = _fetch_refusal(host)
+                if refusal:
                     raise urllib.error.HTTPError(
-                        newurl, code, "blocked redirect to private/loopback host",
-                        headers, fp)
+                        newurl, code, f"blocked redirect: {refusal}", headers, fp)
                 return super().redirect_request(
                     req, fp, code, msg, headers, newurl)
 
@@ -284,9 +347,9 @@ def fetch_url(url: str, max_bytes: int = 40_000, timeout: float = 12.0) -> str:
     if parsed.scheme not in ("http", "https"):
         return (f"Error: only http/https URLs may be fetched (got "
                 f"{parsed.scheme or 'no'} scheme).")
-    if _host_is_blocked(parsed.hostname or ""):
-        return (f"Error: refusing to fetch a private/loopback host "
-                f"({parsed.hostname!r}).")
+    refusal = _fetch_refusal(parsed.hostname or "")
+    if refusal:
+        return f"Error: {refusal}."
     req = urllib.request.Request(u, headers={"User-Agent": _UA})
     try:
         with _safe_opener().open(req, timeout=timeout) as resp:
@@ -370,9 +433,10 @@ def register_native_tools() -> None:
         handler=_h_search_web))
     REGISTRY.register(ToolSpec(
         name="fetch_url", risk=RiskLevel.MEDIUM, arg_hint='{"url": "https://..."}',
-        description="Fetch an http(s) page and return its readable text. Use it "
-                    "to READ real API/SDK documentation and implement the actual "
-                    "interface instead of guessing or writing a placeholder.",
+        description="Fetch an http(s) page (restricted to trusted documentation "
+                    "/ package / code-host domains) and return its readable "
+                    "text. Use it to READ real API/SDK docs and implement the "
+                    "actual interface instead of guessing or writing a stub.",
         handler=_h_fetch_url))
 
 

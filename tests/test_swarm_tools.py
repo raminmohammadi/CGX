@@ -115,3 +115,37 @@ def test_fetch_url_registered_and_advertised():
     assert "fetch_url" in REGISTRY.names()
     assert "fetch_url" in _dev_tools(None) and "search_web" in _dev_tools(None)
     assert "fetch_url" in _planner_tools()
+
+
+# ---------------------- fetch_url domain allowlist ----------------------
+
+def test_host_allowed_matches_domain_and_subdomains():
+    assert st._host_allowed("ai.google.dev")
+    assert st._host_allowed("flask.palletsprojects.com")   # subdomain match
+    assert st._host_allowed("pypi.org")
+    assert not st._host_allowed("totally-random-host.test")
+
+
+def test_fetch_url_refuses_non_allowlisted_host():
+    out = st.fetch_url("https://totally-random-host.test/docs")
+    assert "not in the fetch allowlist" in out
+
+
+def test_fetch_url_allowlist_extended_by_env(monkeypatch):
+    monkeypatch.setenv("CGX_FETCH_ALLOWLIST", "mycorp-docs.test")
+    _patch_opener(monkeypatch, _Resp(b"<p>internal docs</p>"))
+    out = st.fetch_url("https://mycorp-docs.test/api")
+    assert "internal docs" in out
+
+
+def test_fetch_url_allow_any_env_bypasses_allowlist(monkeypatch):
+    monkeypatch.setenv("CGX_FETCH_ALLOW_ANY", "1")
+    _patch_opener(monkeypatch, _Resp(b"<p>anywhere</p>"))
+    out = st.fetch_url("https://some-random-host.test/x")
+    assert "anywhere" in out
+
+
+def test_fetch_url_allow_any_still_blocks_ssrf(monkeypatch):
+    monkeypatch.setenv("CGX_FETCH_ALLOW_ANY", "1")
+    # SSRF block is not overridable by the allow-any escape hatch.
+    assert "private/loopback" in st.fetch_url("http://169.254.169.254/latest/meta-data/")
