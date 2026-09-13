@@ -307,3 +307,46 @@ def test_ensure_test_coverage_disambiguates_basename_collision():
     paths = [f["path"] for f in iter_plan_files(ensure_test_coverage(plan))]
     injected = [p for p in paths if p.startswith("tests/")]
     assert len(injected) == 2 and len(set(injected)) == 2
+
+
+# --------------------- anti-contamination guard (Phase C) ---------------------
+
+from cgx.session.tasks.swarm_tech_lead import _example_contamination_problems
+
+
+def test_contamination_guard_flags_toy_symbols_for_unrelated_goal():
+    """A chatbot plan that copied the Circle/total_area example is rejected."""
+    plan = {
+        "layers": [{"name": "models", "files": [
+            {"path": "backend/models.py", "description": "Circle geometry"}]}],
+        "contracts": {"functions": [
+            {"name": "total_area", "module": "backend/models.py"}],
+            "schemas": [{"name": "Circle", "module": "backend/models.py"}]},
+    }
+    problems = _example_contamination_problems(plan, "build a Gemini chatbot")
+    assert problems and "circle" in problems[0].lower()
+
+
+def test_contamination_guard_allows_genuine_geometry_goal():
+    """The same symbols are fine when the objective is actually geometry."""
+    plan = {
+        "layers": [{"name": "models", "files": [
+            {"path": "src/shapes.py", "description": "Circle area helpers"}]}],
+        "contracts": {"functions": [
+            {"name": "total_area", "module": "src/shapes.py"}]},
+    }
+    problems = _example_contamination_problems(
+        plan, "compute the total area of a list of circles by radius")
+    assert problems == []
+
+
+def test_contamination_guard_passes_clean_ondomain_plan():
+    """An on-domain chatbot plan raises no contamination problem."""
+    plan = {
+        "layers": [{"name": "api", "files": [
+            {"path": "backend/api.py", "description": "chat endpoint"}]}],
+        "contracts": {"functions": [
+            {"name": "chat", "module": "backend/api.py"}],
+            "schemas": [{"name": "Message", "module": "backend/api.py"}]},
+    }
+    assert _example_contamination_problems(plan, "build a Gemini chatbot") == []

@@ -58,9 +58,9 @@ export function SessionLauncher({
           disabled={pending}
         />
       </Field>
-      <Field label="Mode" hint="Auto picks greenfield for empty / unindexed projects; explore otherwise.">
+      <Field label="Mode" hint="Auto runs the Swarm builder for a new/empty project and explore for an existing indexed repo.">
         <div className="flex gap-1.5">
-          {(["auto", "explore", "greenfield", "swarm"] as const).map((m) => (
+          {(["auto", "swarm", "explore"] as const).map((m) => (
             <button
               key={m} type="button" disabled={pending}
               onClick={() => setMode(m)}

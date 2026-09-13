@@ -3573,18 +3573,22 @@ from cgx.session.models import SessionMode  # noqa: E402
 
 # --------------------- mode detection ---------------------
 
-def test_detect_mode_empty_project_root_is_greenfield(tmp_path: Path):
+def test_detect_mode_empty_project_root_is_swarm(tmp_path: Path):
+    """Phase C: an empty project defaults to the Swarm builder (was greenfield)."""
     from cgx.session.mode import detect_mode
-    assert detect_mode(project_root=str(tmp_path)) is SessionMode.GREENFIELD
+    assert detect_mode(project_root=str(tmp_path)) is SessionMode.SWARM
 
 
-def test_detect_mode_missing_project_root_is_greenfield():
+def test_detect_mode_missing_project_root_is_swarm():
+    """Phase C: a missing project root (nothing to overwrite) defaults to Swarm."""
     from cgx.session.mode import detect_mode
-    assert detect_mode(project_root=None) is SessionMode.GREENFIELD
+    assert detect_mode(project_root=None) is SessionMode.SWARM
 
 
 def test_detect_mode_no_index_is_greenfield(tmp_path: Path):
-    """A populated project with no FAISS meta still falls to greenfield."""
+    """A *populated* project with no FAISS meta still falls to greenfield --
+    Swarm's surgical edit path for existing trees lands later (C3), so an
+    existing tree is not routed to a from-scratch builder yet."""
     from cgx.session.mode import detect_mode
     (tmp_path / "main.py").write_text("print('hi')\n")
     assert detect_mode(project_root=str(tmp_path)) is SessionMode.GREENFIELD

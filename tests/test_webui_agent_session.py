@@ -592,14 +592,31 @@ def _install_greenfield_stubs() -> None:
                      "outcome": "skipped"}, artifact=art)
 
 
-def test_create_greenfield_session_auto_detects_empty_root(
+def test_create_empty_root_auto_detects_swarm(
         client: _HandlerClient, tmp_path: Path) -> None:
-    """Empty project_root + no index -> mode resolves to greenfield."""
+    """Phase C: an empty project_root + no index auto-resolves to Swarm.
+
+    Created without running the initial task so no provider/executor is needed
+    -- we only assert the mode auto-detection contract flipped from greenfield
+    to swarm.
+    """
+    state = client.create(
+        objective="build a flask api that saves JSON to disk",
+        project_root=str(tmp_path / "fresh"),
+        mode=None,  # opt out of the default explore override -> auto-detect
+        run_initial_task=False)
+    assert client.last_status == 200
+    assert state["session"]["mode"] == "swarm"
+
+
+def test_create_greenfield_session_explicit_mode(
+        client: _HandlerClient, tmp_path: Path) -> None:
+    """Greenfield is now explicit-only; its clarify pipeline still runs."""
     _install_greenfield_stubs()
     state = client.create(
         objective="build a flask api that saves JSON to disk",
         project_root=str(tmp_path / "fresh"),
-        mode=None,  # opt out of the default explore override
+        mode="greenfield",
         run_initial_task=True)
     assert client.last_status == 200
     assert state["session"]["mode"] == "greenfield"

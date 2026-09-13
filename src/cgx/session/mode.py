@@ -129,17 +129,21 @@ def detect_mode(*, project_root: Optional[str] = None,
     Rules (first match wins):
 
     1. ``project_root`` is missing or empty (no non-ignored entries)
-       -> ``GREENFIELD``.
+       -> ``SWARM`` (build a new project from the objective).
     2. No usable FAISS index visible at ``index_dir`` /
        ``records_path`` -> ``GREENFIELD``.
     3. Otherwise -> ``EXPLORE``.
 
-    The greenfield path neither requires nor builds an index; it walks
-    the working tree and generates files directly via the scaffold
-    engine.
+    Phase C soft-hide: an empty ``project_root`` (nothing to overwrite) now
+    defaults to the Swarm builder rather than the older GREENFIELD scaffold
+    pipeline -- the Swarm is being unified into the single end-to-end build
+    mode. A *non-empty but unindexed* project still routes to GREENFIELD for
+    now: neither pipeline should overwrite an existing tree, and Swarm's
+    surgical edit path lands in a later step (C3). GREENFIELD/EXPLORE remain
+    fully reachable when a mode is passed explicitly.
     """
     if _project_is_empty(project_root):
-        return SessionMode.GREENFIELD
+        return SessionMode.SWARM
     if not _has_usable_index(index_dir, records_path, project_root):
         return SessionMode.GREENFIELD
     return SessionMode.EXPLORE

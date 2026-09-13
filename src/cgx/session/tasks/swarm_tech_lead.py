@@ -32,36 +32,44 @@ _MAX_PLAN_ATTEMPTS = 3
 _SYSTEM_PROMPT = (
     "You are the Tech Lead in a two-agent swarm. You do NOT write code.\n"
     "You author a build PLAN as a single JSON object and nothing else.\n\n"
-    "Schema:\n"
+    "CRITICAL -- READ THIS FIRST: The schema below is a FORMAT EXAMPLE ONLY.\n"
+    "Every name in it is a <placeholder>. NEVER copy a placeholder, and NEVER\n"
+    "emit unrelated toy domains (no Circle/area/total_area, no foo/bar, no\n"
+    "Widget). Derive EVERY file path, class, function, endpoint, and dependency\n"
+    "strictly from the USER'S OBJECTIVE. If the objective is a chatbot, plan\n"
+    "chatbot files (message/conversation models, the chat endpoint, the client);\n"
+    "if it is a calculator, plan calculator files. The plan must be about the\n"
+    "objective and nothing else.\n\n"
+    "Schema (angle-bracket names are PLACEHOLDERS -- replace all of them):\n"
     "{\n"
     '  "goal": "one sentence restating the objective",\n'
     '  "layers": [\n'
     '    {"name": "models|core|api|tests|...",\n'
     '     "files": [\n'
-    '       {"path": "src/foo.py",\n'
+    '       {"path": "src/<module_a>.py",\n'
     '        "description": "what this file must contain",\n'
-    '        "depends_on": ["src/bar.py"]}\n'
+    '        "depends_on": ["src/<module_b>.py"]}\n'
     "     ]}\n"
     "  ],\n"
     '  "contracts": {\n'
     '    "endpoints": [\n'
-    '      {"path": "/ping", "method": "GET",\n'
-    '       "description": "Returns pong"}\n'
+    '      {"path": "/<route>", "method": "GET|POST|...",\n'
+    '       "description": "<what this endpoint does>"}\n'
     '    ],\n'
     '    "functions": [\n'
-    '      {"name": "total_area", "module": "src/foo.py",\n'
-    '       "parameters": [{"name": "circles", "type": "list"}],\n'
-    '       "return_type": "float",\n'
-    '       "description": "sum of each circle area"},\n'
-    '      {"name": "Circle.area", "module": "src/foo.py",\n'
-    '       "parameters": [], "return_type": "float",\n'
-    '       "description": "area of this circle"}\n'
+    '      {"name": "<function_name>", "module": "src/<module_a>.py",\n'
+    '       "parameters": [{"name": "<param>", "type": "<type>"}],\n'
+    '       "return_type": "<type>",\n'
+    '       "description": "<what it does>"},\n'
+    '      {"name": "<ClassName>.<method>", "module": "src/<module_a>.py",\n'
+    '       "parameters": [], "return_type": "<type>",\n'
+    '       "description": "<what it does>"}\n'
     "    ],\n"
     '    "schemas": [\n'
-    '      {"name": "Circle", "module": "src/foo.py",\n'
-    '       "fields": {"radius": "float"}}\n'
+    '      {"name": "<ClassName>", "module": "src/<module_a>.py",\n'
+    '       "fields": {"<field>": "<type>"}}\n'
     "    ],\n"
-    '    "third_party_dependencies": ["fastapi", "pydantic", "pytest"]\n'
+    '    "third_party_dependencies": ["<library>", "..."]\n'
     "  }\n"
     "}\n\n"
     "Rules: every file has a unique relative path; depends_on lists ONLY\n"
@@ -168,6 +176,50 @@ def _ask_for_plan(provider: Any, goal: str,
         messages.append({"role": "assistant", "content": text})
         messages.append({"role": "user", "content": "<tool_response>Tool error: invalid JSON generated. Ensure your output is purely JSON without markdown formatting.</tool_response>"})
     return {}
+
+
+# Toy-domain tokens that only ever appear in a prompt's few-shot example. A
+# weak local planner sometimes regurgitates the example instead of planning for
+# the objective (session ses_33663d10cf524ca7 planned a Circle/total_area
+# geometry module for a *chatbot* app, which then failed verification). This is
+# a deterministic backstop to the prompt's "placeholders only" instruction: if
+# a plan emits one of these and the objective has nothing to do with that
+# domain, the plan was copied, not authored -- reject it for one corrective
+# re-ask. Guarded by a keyword allowlist so a genuine geometry objective passes.
+_EXAMPLE_CONTAMINATION = {
+    "circle": ("circle", "area", "radius", "geometry", "shape", "circumference"),
+    "total_area": ("area", "geometry", "shape"),
+    "widget": ("widget",),
+}
+
+
+def _example_contamination_problems(plan: Dict[str, Any], goal: str) -> List[str]:
+    """Flag a plan that copied the prompt's illustrative toy symbols.
+
+    Returns a single corrective problem string (or empty) naming the offending
+    tokens so the model re-plans against the real objective instead of the
+    few-shot example.
+    """
+    g = (goal or "").lower()
+    names: List[str] = []
+    for layer in plan.get("layers", []) or []:
+        for f in layer.get("files", []) or []:
+            names.append(str(f.get("path") or "").lower())
+            names.append(str(f.get("description") or "").lower())
+    contracts = plan.get("contracts") or {}
+    for section in ("functions", "schemas", "endpoints"):
+        for item in contracts.get(section, []) or []:
+            if isinstance(item, dict):
+                names.append(str(item.get("name") or "").lower())
+    hay = " \n ".join(names)
+    hits = sorted(
+        tok for tok, allow in _EXAMPLE_CONTAMINATION.items()
+        if tok in hay and not any(w in g for w in allow))
+    if not hits:
+        return []
+    return [("the plan uses the illustrative example symbol(s) "
+             f"{hits} which are unrelated to the objective; re-plan every "
+             "file, symbol, and dependency from the OBJECTIVE only")]
 
 
 def _auto_repair_plan_dependencies(plan: Dict[str, Any]) -> Dict[str, Any]:
@@ -289,6 +341,15 @@ def swarm_tech_lead(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         # (unsafe paths, mixed rooting, a dependency cycle, an orphan test)
         # is re-asked with the exact problems before any Developer is spawned.
         problems = verify_plan(plan)
+        if problems:
+            correction = "; ".join(problems)
+            swarm_beat(project_root, "tech_lead", "plan_rejected",
+                       attempt=attempt, problems=problems)
+            continue
+        # Anti-contamination: a plan that regurgitated the prompt's toy example
+        # (Circle/total_area/…) for an unrelated objective is re-asked before any
+        # Developer is spawned, so the whole build can't drift off-domain.
+        problems = _example_contamination_problems(plan, goal)
         if problems:
             correction = "; ".join(problems)
             swarm_beat(project_root, "tech_lead", "plan_rejected",
