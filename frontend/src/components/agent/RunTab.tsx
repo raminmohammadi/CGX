@@ -214,6 +214,7 @@ export function RunTab({
     objective: string; projectRoot: string;
     mode: SessionModeValue | null;
     skills?: string[];
+    requirePlanApproval?: boolean;
   }) => {
     setPending(true); setError(null);
     try {
@@ -226,6 +227,7 @@ export function RunTab({
         index, provider,
         run_initial_task: true,
         skills: opts.skills && opts.skills.length > 0 ? opts.skills : undefined,
+        require_plan_approval: opts.requirePlanApproval ?? false,
       });
       setState(next);
       setRunModel(next.session.session_id, provider.model);

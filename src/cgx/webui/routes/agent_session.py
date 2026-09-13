@@ -441,6 +441,7 @@ async def create_session(req: AgentSessionCreateRequest) -> AgentSessionState:
     session = await asyncio.to_thread(
         runner.start_session, objective=req.objective,
         project_root=project_root, title=req.title, mode=mode,
+        require_plan_approval=bool(req.require_plan_approval),
         skills=req.skills or None)
     with _RUNNERS_LOCK:
         _SESSION_TO_RUNNER[session.session_id] = runner

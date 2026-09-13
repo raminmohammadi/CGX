@@ -190,3 +190,56 @@ def test_swarm_build_routes_to_tech_lead_root():
         session=_session(), message="build a REST API for todos", tasks=[])
     created = _created(plan)
     assert len(created) == 1 and created[0].kind is TaskKind.SWARM_TECH_LEAD
+
+
+# --------------------- plan-approval gate (Phase C) ---------------------
+
+def test_tech_lead_gates_on_plan_approval_when_required():
+    from cgx.session.models import DecisionKind
+    parent = _tech_lead({"work_plan_artifact_id": "art_1", "file_count": 2,
+                         "swarm_paths": ["a.py", "b.py"], "goal": "g",
+                         "project_root": "/p"})
+    parent.inputs["require_plan_approval"] = True
+    kids = _swarm_tech_lead_to_successors(parent)
+    assert len(kids) == 1
+    ask = kids[0]
+    assert ask.kind is TaskKind.ASK_USER
+    assert ask.inputs["expected_kind"] == DecisionKind.APPROVE_PLAN.value
+    seed = ask.inputs.get("swarm_dev_seed")
+    assert isinstance(seed, dict) and seed["file_index"] == 0
+
+
+def test_tech_lead_no_gate_when_not_required():
+    parent = _tech_lead({"work_plan_artifact_id": "art_1", "file_count": 2,
+                         "swarm_paths": ["a.py", "b.py"], "goal": "g",
+                         "project_root": "/p"})  # require_plan_approval absent
+    kids = _swarm_tech_lead_to_successors(parent)
+    assert kids and kids[0].kind is TaskKind.SWARM_DEVELOPER
+
+
+def test_approve_plan_swarm_seed_spawns_first_developer():
+    from cgx.session.models import Decision, DecisionKind
+    from cgx.session.router import _from_approve_plan
+    seed = {"work_plan_artifact_id": "art_1", "file_index": 0, "file_count": 2,
+            "failed_paths": [], "goal": "g", "project_root": "/p"}
+    ask = TaskNode.new(session_id="s", kind=TaskKind.ASK_USER, name="approve",
+                       inputs={"expected_kind": DecisionKind.APPROVE_PLAN.value,
+                               "swarm_dev_seed": seed})
+    dec = Decision.new(session_id="s", resolved_task_id=ask.task_id,
+                       kind=DecisionKind.APPROVE_PLAN, question="approve?",
+                       chosen={"approved": True})
+    succ = _from_approve_plan(ask, dec)
+    assert succ is not None and succ.kind is TaskKind.SWARM_DEVELOPER
+    assert succ.inputs["file_index"] == 0
+
+
+def test_decline_plan_swarm_spawns_no_successor():
+    from cgx.session.models import Decision, DecisionKind
+    from cgx.session.router import _from_approve_plan
+    ask = TaskNode.new(session_id="s", kind=TaskKind.ASK_USER, name="approve",
+                       inputs={"expected_kind": DecisionKind.APPROVE_PLAN.value,
+                               "swarm_dev_seed": {"file_index": 0}})
+    dec = Decision.new(session_id="s", resolved_task_id=ask.task_id,
+                       kind=DecisionKind.APPROVE_PLAN, question="approve?",
+                       chosen={"approved": False})
+    assert _from_approve_plan(ask, dec) is None

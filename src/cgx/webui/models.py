@@ -196,6 +196,9 @@ class AgentSessionCreateRequest(BaseModel):
     # Explicit skill names to use instead of auto-detecting from the
     # objective text. Empty (the default) preserves today's behavior.
     skills: List[str] = Field(default_factory=list)
+    # Swarm human-in-the-loop: gate the Tech Lead's plan on a user APPROVE_PLAN
+    # decision before any file is generated. Ignored by explore/greenfield.
+    require_plan_approval: bool = False
 
 
 class AgentSessionMessageRequest(BaseModel):

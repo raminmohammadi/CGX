@@ -1090,12 +1090,37 @@ def _swarm_dev_inputs(parent: TaskNode, outputs: Dict[str, Any],
 
 
 def _swarm_tech_lead_to_successors(parent: TaskNode) -> List[TaskNode]:
-    """Spawn the first Developer file-task, or finish (unbuildable plan)."""
+    """Spawn the first Developer file-task, gate on approval, or finish.
+
+    With ``require_plan_approval`` set, the validated plan is surfaced for an
+    explicit user APPROVE_PLAN decision before any file is generated -- the
+    cheap human checkpoint that catches a drifted/off-objective plan before the
+    whole build runs. On approval the successor is the first Developer (see
+    :func:`_from_approve_plan`); a decline halts the loop.
+    """
     outputs = parent.outputs or {}
     if int(outputs.get("file_count") or 0) <= 0:
         # No buildable plan -- no Developer chain; the terminal edge in
         # ``on_task_completed`` ends the session FAILED.
         return []
+    if bool(parent.inputs.get("require_plan_approval")):
+        return [TaskNode.new(
+            session_id=parent.session_id,
+            kind=TaskKind.ASK_USER,
+            name="Approve build plan",
+            description=("Review the Tech Lead's file plan and approve to start "
+                         "building, or decline to stop."),
+            parent_task_id=parent.task_id,
+            inputs={
+                "expected_kind": DecisionKind.APPROVE_PLAN.value,
+                "work_plan_artifact_id": outputs.get("work_plan_artifact_id"),
+                "file_count": outputs.get("file_count"),
+                # Seed for the first Developer, replayed verbatim on approval so
+                # the swarm APPROVE_PLAN path is self-contained (distinct from
+                # the greenfield APPROVE_PLAN -> SCAFFOLD edge).
+                "swarm_dev_seed": _swarm_dev_inputs(parent, outputs, 0),
+            },
+        )]
     return [TaskNode.new(
         session_id=parent.session_id,
         kind=TaskKind.SWARM_DEVELOPER,
@@ -1512,7 +1537,10 @@ def _make_root_swarm_tech_lead(session: Session, message: str) -> TaskNode:
         description="Reason over the objective and delegate tasks.",
         inputs={"goal": message,
                 "original_objective": session.original_objective,
-                "project_root": session.project_root},
+                "project_root": session.project_root,
+                # Threaded to the tech-lead successor so a plan can be gated on
+                # user approval before any file is generated.
+                "require_plan_approval": bool(session.require_plan_approval)},
     )
 
 
@@ -1729,6 +1757,21 @@ def _from_approve_plan(ask: TaskNode,
     """
     if not bool(decision.chosen.get("approved")):
         return None
+    # Swarm APPROVE_PLAN: the ask carries a self-contained first-Developer seed,
+    # so approval starts the incremental build chain (vs the greenfield edge
+    # below, which spawns SCAFFOLD from the work plan).
+    seed = ask.inputs.get("swarm_dev_seed")
+    if isinstance(seed, dict) and seed:
+        inputs = dict(seed)
+        inputs["decision_id"] = decision.decision_id
+        return TaskNode.new(
+            session_id=ask.session_id,
+            kind=TaskKind.SWARM_DEVELOPER,
+            name="Generate file 1",
+            description="Generate the first planned file.",
+            parent_task_id=ask.task_id,
+            inputs=inputs,
+        )
     work_plan_artifact_id = str(
         ask.inputs.get("work_plan_artifact_id") or "").strip()
     if not work_plan_artifact_id:

@@ -21,6 +21,7 @@ export function SessionLauncher({
     objective: string; projectRoot: string;
     mode: SessionModeValue | null;
     skills: string[];
+    requirePlanApproval: boolean;
   }) => Promise<void> | void;
   pending: boolean;
   error: string | null;
@@ -29,6 +30,10 @@ export function SessionLauncher({
   const [projectRoot, setProjectRoot] = useState(defaultProjectRoot);
   const [mode, setMode] = useState<ModeChoice>("auto");
   const [skills, setSkills] = useState<string[]>([]);
+  // Default ON: a plan-approval checkpoint catches a drifted plan before the
+  // whole build runs -- the right default for local models. Uncheck for a
+  // fully autonomous run.
+  const [requirePlanApproval, setRequirePlanApproval] = useState(true);
   const canSubmit = objective.trim().length > 0 && !pending;
   return (
     <div className="max-w-2xl mx-auto w-full mt-8 px-6 space-y-5">
@@ -77,6 +82,21 @@ export function SessionLauncher({
       <Field label="Skills" hint="Optional; leave empty to auto-detect from the objective.">
         <SkillPicker selected={skills} onChange={setSkills} />
       </Field>
+      <label className="flex items-start gap-2.5 cursor-pointer">
+        <input
+          type="checkbox"
+          checked={requirePlanApproval}
+          onChange={(e) => setRequirePlanApproval(e.target.checked)}
+          disabled={pending}
+          className="mt-0.5 rounded border-slate-600 bg-slate-900 text-emerald-500 focus:ring-emerald-500 focus:ring-offset-slate-950"
+        />
+        <span>
+          <span className="block text-[12px] text-slate-200">Approve plan before building (swarm)</span>
+          <span className="block text-[11px] text-slate-500">
+            Review the file plan and approve before any code is generated. Recommended for local models; uncheck to run fully autonomously.
+          </span>
+        </span>
+      </label>
       {error && (
         <p className="text-[12px] font-mono text-red-300 bg-red-950/30 border border-red-500/20 rounded px-3 py-2">
           {error}
@@ -91,6 +111,7 @@ export function SessionLauncher({
             projectRoot: projectRoot.trim(),
             mode: mode === "auto" ? null : mode,
             skills,
+            requirePlanApproval,
           })}
           className="av-btn-primary"
         >

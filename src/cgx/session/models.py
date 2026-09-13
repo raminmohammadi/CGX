@@ -365,6 +365,13 @@ class Session:
     max_task_runs: Optional[int] = None
     max_wall_seconds: Optional[float] = None
     headless: bool = False
+    # Human-in-the-loop control for the SWARM build pipeline: when True the
+    # Tech Lead's plan is gated on an explicit user APPROVE_PLAN decision before
+    # any file is generated (recommended for weak local models -- it catches a
+    # drifted/off-objective plan before the whole build runs). When False the
+    # swarm runs fully autonomously. Ignored by explore/greenfield, which have
+    # their own approval semantics.
+    require_plan_approval: bool = False
     # Live counters the runner maintains as it dispatches work tasks
     # (everything except the ASK_USER pause primitive).
     task_runs: int = 0
@@ -382,6 +389,7 @@ class Session:
             max_task_runs: Optional[int] = None,
             max_wall_seconds: Optional[float] = None,
             headless: bool = False,
+            require_plan_approval: bool = False,
             skills: Optional[List[str]] = None) -> "Session":
         t = (title or original_objective).strip()
         if len(t) > 80:
@@ -395,6 +403,7 @@ class Session:
             max_task_runs=max_task_runs,
             max_wall_seconds=max_wall_seconds,
             headless=headless,
+            require_plan_approval=require_plan_approval,
             skills=list(skills or []),
         )
 

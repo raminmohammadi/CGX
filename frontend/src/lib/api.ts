@@ -734,6 +734,7 @@ export const api = {
     provider: ProviderConfig;
     run_initial_task?: boolean;
     skills?: string[];
+    require_plan_approval?: boolean;
   }) => jsonReq<AgentSessionState>("/api/agent-session", "POST", body),
   agentSessionList: (projectRoot?: string | null) => {
     const q = projectRoot

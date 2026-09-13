@@ -109,6 +109,7 @@ class SessionRunner:
                       max_task_runs: Optional[int] = None,
                       max_wall_seconds: Optional[float] = None,
                       headless: bool = False,
+                      require_plan_approval: bool = False,
                       skills: Optional[List[str]] = None) -> Session:
         """Create a session + its root task and persist both.
 
@@ -138,7 +139,9 @@ class SessionRunner:
                               project_root=project_root, title=title,
                               mode=mode, max_task_runs=max_task_runs,
                               max_wall_seconds=max_wall_seconds,
-                              headless=headless, skills=skills)
+                              headless=headless,
+                              require_plan_approval=require_plan_approval,
+                              skills=skills)
         self._store.save_session(session)
         # Trace the seed-router call inside the session's context so the
         # on_user_message records land in the project agent.log.

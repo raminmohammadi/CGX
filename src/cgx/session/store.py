@@ -463,6 +463,7 @@ def _session_from_json(blob: str) -> Session:
         max_wall_seconds=(float(d["max_wall_seconds"])
                           if d.get("max_wall_seconds") is not None else None),
         headless=bool(d.get("headless", False)),
+        require_plan_approval=bool(d.get("require_plan_approval", False)),
         task_runs=int(d.get("task_runs") or 0),
         first_task_started_at=(float(d["first_task_started_at"])
                                if d.get("first_task_started_at") is not None
