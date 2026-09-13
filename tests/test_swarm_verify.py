@@ -372,3 +372,46 @@ def test_repair_context_falls_back_to_all_py_without_localization():
     paths = ["a.py", "b.py", "README.md", "requirements.txt"]
     ctx = sv._repair_context_paths([], paths, {})
     assert ctx == ["a.py", "b.py"]
+
+
+# --------------- assertion-failure localization (Phase C4) ---------------
+
+_PYTEST_ASSERT_OUTPUT = """== pytest ==
+.F                                                                       [100%]
+=================================== FAILURES ===================================
+_______________________________ test_total_area ________________________________
+    def test_total_area():
+        circles = [Circle(1.0), Circle(2.0), Circle(3.0)]
+>       assert total_area(circles) == pytest.approx(14.137166941154067)
+E       assert 43.982297150257104 == 14.137166941154067 +- 1.4e-05
+=========================== short test summary info ============================
+FAILED tests/test_models.py::test_total_area
+"""
+
+
+def test_failing_test_names_from_banner_and_summary():
+    names = sv._failing_test_names(_PYTEST_ASSERT_OUTPUT)
+    assert "test_total_area" in names
+
+
+def test_is_assertion_failure_true_for_assert_diff():
+    assert sv._is_assertion_failure(_PYTEST_ASSERT_OUTPUT) is True
+
+
+def test_is_assertion_failure_false_for_import_error():
+    out = "E   ModuleNotFoundError: No module named 'fastapi'"
+    assert sv._is_assertion_failure(out) is False
+
+
+def test_assertion_repair_targets_finds_test_file(tmp_path):
+    # A planned test file that defines the failing test is localized so its
+    # depends_on impl gets pulled into repair context (test<->impl reconcile).
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_models.py").write_text(
+        "def test_total_area():\n    assert True\n")
+    (tmp_path / "tests" / "test_other.py").write_text(
+        "def test_unrelated():\n    assert True\n")
+    paths = ["tests/test_models.py", "tests/test_other.py", "backend/models.py"]
+    env = {"output": _PYTEST_ASSERT_OUTPUT}
+    targets = sv._assertion_repair_targets(env, paths, str(tmp_path))
+    assert targets == ["tests/test_models.py"]

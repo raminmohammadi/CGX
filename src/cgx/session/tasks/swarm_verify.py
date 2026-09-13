@@ -316,6 +316,75 @@ def _run_env_dryrun(paths: List[str], root: str) -> Dict[str, Any]:
 _MODULE_ERR_RE = re.compile(
     r"(?:ModuleNotFoundError|ImportError):[^\n]*?['\"]([\w.]+)['\"]")
 
+# pytest prints one ``____ test_name ____`` banner per failing test in the
+# FAILURES section, and ``FAILED path::[Class::]test_name`` in the short
+# summary. Keying on the test NAME (always present) rather than a ``file:line:
+# Error`` line (absent for a plain ``assert`` diff) is what makes assertion
+# failures localizable -- the gap that let a wrong ``test_total_area`` survive
+# two repair rounds in session ses_33663d10cf524ca7.
+_FAIL_BANNER_RE = re.compile(r"^_{3,}\s+([\w.]+)\s+_{3,}\s*$", re.M)
+_FAIL_SUMMARY_RE = re.compile(r"^FAILED\s+\S+?::(?:\w+::)?(\w+)", re.M)
+
+
+def _failing_test_names(output: str) -> set:
+    """Names of failing pytest tests, from the FAILURES banners + summary."""
+    names: set = set()
+    for m in _FAIL_BANNER_RE.finditer(output or ""):
+        names.add(m.group(1).split(".")[-1])  # Class.method -> method
+    for m in _FAIL_SUMMARY_RE.finditer(output or ""):
+        names.add(m.group(1))
+    return names
+
+
+def _assertion_repair_targets(env: Dict[str, Any], paths: List[str],
+                              root: str) -> List[str]:
+    """Planned test files that own a failing test -- the assertion-failure
+    localizer the ``ModuleNotFoundError`` regex can't provide.
+
+    Returns just the failing *test* files; :func:`_repair_context_paths` then
+    pulls in each test's ``depends_on`` implementation module, so the repairer
+    sees BOTH sides of a test<->impl disagreement and can fix whichever is
+    wrong (e.g. a test asserting 14.137 against an impl that correctly yields
+    43.98).
+    """
+    names = _failing_test_names(str(env.get("output") or ""))
+    if not names:
+        return []
+    targets: List[str] = []
+    for p in paths:
+        if not _is_pytest_test_path(p):
+            continue
+        src = _safe_read(p, root)
+        if not src:
+            continue
+        if any(re.search(rf"def\s+{re.escape(n)}\s*\(", src) for n in names):
+            targets.append(p)
+    return targets
+
+
+def _is_assertion_failure(output: str) -> bool:
+    """True when the red suite is an assertion/logic failure (not an import).
+
+    Import failures have their own module-name localizer + auto-fix; an
+    ``assert``-style failure needs the test<->impl reconciliation path instead.
+    """
+    text = output or ""
+    if _MODULE_ERR_RE.search(text):
+        return False
+    return bool(re.search(r"^E\s+assert\b", text, re.M)
+                or "AssertionError" in text)
+
+
+_RECONCILE_HINT = (
+    "A test ASSERTION failed: the test and its implementation disagree. "
+    "Decide which is correct FOR THE OBJECTIVE and fix only the wrong file: "
+    "if the test's expected value is wrong (e.g. bad arithmetic), fix the "
+    "TEST; if the implementation is wrong, fix the IMPLEMENTATION. Never "
+    "weaken a correct test just to make it pass, and never break a correct "
+    "implementation to match a wrong test.\n\n"
+    "----- failing suite output -----\n"
+)
+
 
 # Source extensions the repairer can rewrite (Python + the JS/TS family). A
 # build/test failure in either ecosystem should offer the implicated source to
@@ -604,7 +673,8 @@ def _auto_fix_function_logic(env: Dict[str, Any], root: str, provider: Any, dyn_
 def _dynamic_repair(env: Dict[str, Any], localized: List[str],
                     contents: Dict[str, str], goal: str, root: str,
                     provider: Any, paths: List[str],
-                    specs: Dict[str, Any], dyn_rounds: int = 0) -> List[str]:
+                    specs: Dict[str, Any], dyn_rounds: int = 0,
+                    hint: str = "") -> List[str]:
     """Failure-driven repair of a red-but-structurally-clean tree.
 
     Blind regeneration re-asks with the same description and contracts, so a
@@ -625,6 +695,11 @@ def _dynamic_repair(env: Dict[str, Any], localized: List[str],
     failure_text = str(env.get("output") or "")
     if not failure_text:
         return []
+    # A reconciliation hint (assertion failures) reframes the task as "fix the
+    # wrong side" and widens the focus to the full test+impl context so the
+    # repairer may edit either file, not just the localized one.
+    if hint:
+        failure_text = hint + failure_text
     context_paths = _repair_context_paths(localized, paths, specs)
     files = [{"path": p, "content": contents[p]}
              for p in context_paths if p in contents]
@@ -634,7 +709,7 @@ def _dynamic_repair(env: Dict[str, Any], localized: List[str],
         wrapped_provider = ToolWrapper(provider, root)
         repaired = generate_repair_files(
             wrapped_provider, goal=goal, failure_text=failure_text,
-            files=files, localized_files=localized)
+            files=files, localized_files=(context_paths if hint else localized))
     except Exception as e:  # pragma: no cover - repair is best-effort
         swarm_beat(root, "verify", "dynamic_repair_error", error=repr(e))
         return []
@@ -746,22 +821,30 @@ def swarm_verify(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         # TypeError) name no such file but are still fair game -- the import
         # targets, when present, merely seed the localization hint.
         prev_output = str(env.get("output") or "")
+        is_assert = _is_assertion_failure(prev_output)
         dyn_targets = _dynamic_regen_targets(env, paths)
+        # An assertion failure carries no ModuleNotFoundError to localize, so
+        # fall back to the failing test files (their depends_on impl is pulled
+        # in by _repair_context_paths) -- both sides of the disagreement.
+        if not dyn_targets and is_assert:
+            dyn_targets = _assertion_repair_targets(env, paths, project_root)
         dyn_rounds += 1
         swarm_beat(project_root, "verify", "dynamic_regenerate",
-                   round=dyn_rounds, targets=dyn_targets)
-        # Prefer failure-driven repair (fed the red suite's output); fall back
-        # to blind regeneration of the import targets only when the repairer
-        # declines, so a missing-module case still gets its provider
-        # regenerated even if the repair pass produced nothing.
-        
-        # Lightweight AST-based auto-fix for missing imports first.
-        if _auto_fix_missing_imports(env, project_root, deps.provider):
+                   round=dyn_rounds, targets=dyn_targets,
+                   mode="reconcile" if is_assert else "repair")
+        # An assertion failure means a test<->impl disagreement: go straight to
+        # full-file reconciliation repair (the single-function AST fix cannot
+        # edit a *test* file's wrong expected value, and the import auto-fix
+        # doesn't apply). Otherwise keep the import/logic auto-fix ladder, then
+        # failure-driven repair fed the red suite's output.
+        if is_assert:
+            repaired = _dynamic_repair(env, dyn_targets, contents, goal,
+                                       project_root, deps.provider, paths,
+                                       specs, dyn_rounds, hint=_RECONCILE_HINT)
+        elif _auto_fix_missing_imports(env, project_root, deps.provider):
             repaired = {"auto_fixed": True}
-        # Then AST-based function-logic repair.
         elif _auto_fix_function_logic(env, project_root, deps.provider, dyn_rounds):
             repaired = {"auto_fixed_logic": True}
-        # Finally, failure-driven repair fed the red suite's output.
         else:
             repaired = _dynamic_repair(env, dyn_targets, contents, goal,
                                        project_root, deps.provider, paths, specs, dyn_rounds)
