@@ -133,14 +133,14 @@ def swarm_developer(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             depends_on=list(spec.get("depends_on") or []), contracts=contracts,
             goal=goal, root=project_root, provider=deps.provider,
             layer=path, manifest_paths=paths, log_root=project_root,
-            skills=skills)
+            skills=skills, deps=deps, modify_existing=True)
 
         outcome2 = generate_file(
             path=path, description=str(spec.get("description") or ""),
             depends_on=list(spec.get("depends_on") or []), contracts=contracts,
             goal=goal, root=project_root, provider=deps.provider,
             layer=path, manifest_paths=paths, log_root=project_root,
-            skills=skills)
+            skills=skills, deps=deps, modify_existing=True)
             
         if outcome1.ok and outcome2.ok:
             judge_prompt = (
@@ -167,7 +167,7 @@ def swarm_developer(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             depends_on=list(spec.get("depends_on") or []), contracts=contracts,
             goal=goal, root=project_root, provider=deps.provider,
             layer=path, manifest_paths=paths, log_root=project_root,
-            skills=skills)
+            skills=skills, deps=deps, modify_existing=True)
 
     if outcome.ok:
         if outcome.renegotiated_contracts and deps.store:

@@ -38,11 +38,34 @@ def query_codebase(query: str, deps: ExecutorDeps) -> str:
         logger.exception("query_codebase failed")
         return f"Error querying codebase: {e}"
 
+def _backup_existing(full_path: str, cwd: str, rel_path: str) -> None:
+    """Mirror an existing file under ``.cgx-backups/swarm/`` before overwriting.
+
+    The Swarm Developer/Verifier write whole files; when a planned path collides
+    with a real file in an existing repo, this preserves the original so an
+    overwrite is never unrecoverable (mirrors the ``.cgx-backups`` convention the
+    diff-apply path uses). The first backup for a path wins -- repeated writes in
+    one run don't clobber the pristine original. Best-effort; never raises.
+    """
+    try:
+        if not os.path.isfile(full_path):
+            return  # brand-new file: nothing to preserve
+        import shutil
+        backup_path = os.path.join(cwd, ".cgx-backups", "swarm", rel_path)
+        if os.path.exists(backup_path):
+            return  # keep the earliest (pristine) copy
+        os.makedirs(os.path.dirname(backup_path), exist_ok=True)
+        shutil.copy2(full_path, backup_path)
+    except Exception:  # pragma: no cover - backup is best-effort
+        pass
+
+
 def edit_file(path: str, content: str, cwd: str) -> str:
-    """Write or overwrite a file with content."""
+    """Write or overwrite a file with content (backing up an existing original)."""
     full_path = os.path.join(cwd, path)
     os.makedirs(os.path.dirname(full_path), exist_ok=True)
     try:
+        _backup_existing(full_path, cwd, path)
         with open(full_path, "w", encoding="utf-8") as f:
             f.write(content)
         return f"Successfully wrote to {path}"

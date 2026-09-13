@@ -50,10 +50,22 @@ _DEV_BASE_TOOLS = ("run_python_probe", "file_skeleton", "list_symbols")
 _MAX_TOOL_ITERS = 5
 
 
-def _dev_tools() -> tuple:
-    """Developer tool set: introspection + MCP tools when servers exist."""
+def _dev_tools(deps: Any = None) -> tuple:
+    """Developer tool set: introspection + MCP tools when servers exist.
+
+    ``query_codebase`` (semantic retrieval over the indexed repo) is advertised
+    ONLY when ``deps`` actually carries an index -- so a Developer editing an
+    existing repo can discover a symbol the plan forgot to list in
+    ``depends_on`` instead of hallucinating it, while a fresh greenfield build
+    (no index) never sees a tool that would just return "not available" and
+    tempt a weak model into a wasted call.
+    """
     from cgx.session.tasks.swarm_tools import mcp_tools_if_configured
-    return _DEV_BASE_TOOLS + mcp_tools_if_configured()
+    tools = _DEV_BASE_TOOLS
+    if deps is not None and getattr(deps, "index_dir", None) \
+            and getattr(deps, "records_path", None):
+        tools = tools + ("query_codebase",)
+    return tools + mcp_tools_if_configured()
 
 
 class ToolWrapper:
@@ -284,12 +296,14 @@ def _full_file_attempt(path: str, description: str, depends_on: List[str],
                        contracts: Dict[str, Any], goal: str, root: str,
                        provider: Any, layer: str,
                        manifest_paths: Optional[List[str]],
-                       skills: Optional[List[str]] = None) -> Any:
+                       skills: Optional[List[str]] = None,
+                       deps: Any = None) -> Any:
     from cgx.answer.engine import generate_single_scaffold_file
 
     context = _dep_context(depends_on, root)
     try:
-        wrapped = ToolWrapper(provider, root)
+        # Advertise query_codebase only when deps carries an index (see _dev_tools).
+        wrapped = ToolWrapper(provider, root, tools=_dev_tools(deps), deps=deps)
         result = generate_single_scaffold_file(
             path, description, wrapped,
             layer=layer,
@@ -525,7 +539,9 @@ def generate_file(*, path: str, description: str, depends_on: List[str],
                   provider: Any, layer: str = "",
                   manifest_paths: Optional[List[str]] = None,
                   log_root: Optional[str] = None,
-                  skills: Optional[List[str]] = None) -> GenerationOutcome:
+                  skills: Optional[List[str]] = None,
+                  deps: Any = None,
+                  modify_existing: bool = False) -> GenerationOutcome:
     """Run the full-file -> AST fallback ladder for a single file.
 
     A planned non-source deliverable (``requirements.txt``, ``conftest.py``,
@@ -543,12 +559,27 @@ def generate_file(*, path: str, description: str, depends_on: List[str],
         return _generate_non_source(path, description, goal, root, provider,
                                     manifest_paths, log_root)
     depends_on = list(depends_on or [])
+    # Existing-repo safety: when the target file already exists (the Swarm is
+    # editing a real tree, not scaffolding an empty one), ground generation on
+    # its current body and ask for a *modification* that preserves unrelated
+    # code, instead of a blind from-scratch overwrite that would delete it.
+    if modify_existing:
+        existing = _safe_read(path, root)
+        if existing and existing.strip():
+            description = (
+                description
+                + "\n\nIMPORTANT: this file ALREADY EXISTS. MODIFY it to satisfy "
+                "the requirements while PRESERVING all unrelated existing code, "
+                "imports, and public symbols. Do not delete working code. "
+                "Current content:\n" + _truncate(existing, _DEP_CONTENT_LIMIT))
+            swarm_beat(log_root, "developer", "modify_existing", file=path,
+                       bytes=len(existing))
     content = err = ""
     last_broken_content = ""
     for attempt in range(2):
         content, err = _full_file_attempt(
             path, description, depends_on, contracts, goal, root, provider,
-            layer, manifest_paths, skills)
+            layer, manifest_paths, skills, deps)
         if err:
             last_broken_content = content or last_broken_content
             swarm_beat(log_root, "developer", "gate", file=path, ok=False,

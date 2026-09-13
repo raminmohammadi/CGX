@@ -234,3 +234,57 @@ def test_body_is_stub_true_and_false():
     assert engine._body_is_stub(stub)
     assert engine._body_is_stub(docstring_only)
     assert not engine._body_is_stub(real)
+
+
+# --------------------- C3: existing-repo safety + grounding ---------------------
+
+def test_edit_file_backs_up_existing_and_keeps_pristine(tmp_path):
+    from cgx.session.tasks.swarm_tools import edit_file
+    (tmp_path / "a.py").write_text("original\n")
+    edit_file("a.py", "new1\n", str(tmp_path))
+    bak = tmp_path / ".cgx-backups" / "swarm" / "a.py"
+    assert bak.read_text() == "original\n"
+    assert (tmp_path / "a.py").read_text() == "new1\n"
+    edit_file("a.py", "new2\n", str(tmp_path))  # second write keeps 1st backup
+    assert bak.read_text() == "original\n"
+
+
+def test_edit_file_no_backup_for_new_file(tmp_path):
+    from cgx.session.tasks.swarm_tools import edit_file
+    edit_file("b.py", "hi\n", str(tmp_path))
+    assert not (tmp_path / ".cgx-backups").exists()
+
+
+def test_dev_tools_query_codebase_index_awareness():
+    from cgx.session.tasks.swarm_generate import _dev_tools
+    assert "query_codebase" not in _dev_tools(None)
+
+    class _DepsIdx:
+        index_dir = "/tmp/x"
+        records_path = "/tmp/y"
+    assert "query_codebase" in _dev_tools(_DepsIdx())
+
+
+def test_generate_file_modify_existing_grounds_on_current(tmp_path, monkeypatch):
+    import cgx.answer.engine as engine
+    import cgx.session.tasks.swarm_generate as sg
+    (tmp_path / "svc.py").write_text("def keep():\n    return 1\n")
+    captured = {}
+
+    def fake_gen(path, description, provider, **kw):
+        captured["description"] = description
+        return {"content": "def keep():\n    return 1\n", "syntax_ok": True}
+
+    monkeypatch.setattr(engine, "generate_single_scaffold_file", fake_gen)
+
+    class _P:
+        def chat(self, *a, **k):
+            return {"content": "", "syntax_ok": True}
+
+    out = sg.generate_file(path="svc.py", description="add feature X",
+                           depends_on=[], contracts={}, goal="g",
+                           root=str(tmp_path), provider=_P(),
+                           modify_existing=True)
+    assert out.ok
+    assert "ALREADY EXISTS" in captured["description"]
+    assert "def keep()" in captured["description"]
