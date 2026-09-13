@@ -1181,9 +1181,9 @@ def _swarm_terminal_session_actions(
     status = SessionStatus.COMPLETED if green else SessionStatus.FAILED
     actions: List[RouterAction] = []
     # On a not-green terminal, stamp the terminal task with the run's concrete
-    # summary ("partial build: built 14/15 files; tests failed: test_total_area")
-    # so the CLI epilogue and the live dashboard show what actually happened and
-    # what to fix, instead of a bare "session failed". The task stays DONE (it
+    # summary ("partial build: built N/M files; tests failed: <names>") so the
+    # CLI epilogue and the live dashboard show what actually happened and what
+    # to fix, instead of a bare "session failed". The task stays DONE (it
     # ran fine; its *report* is what failed) -- mirrors the greenfield
     # pre-verify gate terminal.
     if not green:

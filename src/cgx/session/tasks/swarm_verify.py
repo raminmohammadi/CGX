@@ -320,8 +320,8 @@ _MODULE_ERR_RE = re.compile(
 # FAILURES section, and ``FAILED path::[Class::]test_name`` in the short
 # summary. Keying on the test NAME (always present) rather than a ``file:line:
 # Error`` line (absent for a plain ``assert`` diff) is what makes assertion
-# failures localizable -- the gap that let a wrong ``test_total_area`` survive
-# two repair rounds in session ses_33663d10cf524ca7.
+# failures localizable -- otherwise a wrong assertion survives every repair
+# round because the loop never identifies which test file to reconcile.
 _FAIL_BANNER_RE = re.compile(r"^_{3,}\s+([\w.]+)\s+_{3,}\s*$", re.M)
 _FAIL_SUMMARY_RE = re.compile(r"^FAILED\s+\S+?::(?:\w+::)?(\w+)", re.M)
 
@@ -876,9 +876,9 @@ def swarm_verify(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     verify_ok = structural_ok and not still_failed and not tests_red
 
     # A human-readable one-liner so a not-green run explains itself concretely
-    # ("built 14/15 files; tests failed: test_total_area") instead of the UI /
-    # CLI showing a bare "session failed". Surfaced on the terminal task by the
-    # router (see _swarm_terminal_session_actions) and shown in the dashboard.
+    # ("built N/M files; tests failed: <names>") instead of the UI / CLI showing
+    # a bare "session failed". Surfaced on the terminal task by the router
+    # (see _swarm_terminal_session_actions) and shown in the dashboard.
     summary = _verify_summary(paths, built, gaps, still_failed, env, verify_ok)
 
     content = {

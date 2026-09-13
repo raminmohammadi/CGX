@@ -15,6 +15,7 @@ and the router drives the Developer over its ordered paths one file per turn.
 
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, List, Optional
 
 from cgx.session.models import Artifact, ArtifactKind, TaskKind
@@ -33,13 +34,10 @@ _SYSTEM_PROMPT = (
     "You are the Tech Lead in a two-agent swarm. You do NOT write code.\n"
     "You author a build PLAN as a single JSON object and nothing else.\n\n"
     "CRITICAL -- READ THIS FIRST: The schema below is a FORMAT EXAMPLE ONLY.\n"
-    "Every name in it is a <placeholder>. NEVER copy a placeholder, and NEVER\n"
-    "emit unrelated toy domains (no Circle/area/total_area, no foo/bar, no\n"
-    "Widget). Derive EVERY file path, class, function, endpoint, and dependency\n"
-    "strictly from the USER'S OBJECTIVE. If the objective is a chatbot, plan\n"
-    "chatbot files (message/conversation models, the chat endpoint, the client);\n"
-    "if it is a calculator, plan calculator files. The plan must be about the\n"
-    "objective and nothing else.\n\n"
+    "Every name in it is a <placeholder>. Do NOT copy any name from the schema;\n"
+    "derive EVERY file path, class, function, endpoint, and dependency STRICTLY\n"
+    "from the USER'S OBJECTIVE. The plan must implement the objective and nothing\n"
+    "else -- if a name is not something the objective calls for, do not invent it.\n\n"
     "Schema (angle-bracket names are PLACEHOLDERS -- replace all of them):\n"
     "{\n"
     '  "goal": "one sentence restating the objective",\n'
@@ -178,45 +176,46 @@ def _ask_for_plan(provider: Any, goal: str,
     return {}
 
 
-# Toy-domain tokens that only ever appear in a prompt's few-shot example. A
-# weak local planner sometimes regurgitates the example instead of planning for
-# the objective (session ses_33663d10cf524ca7 planned a Circle/total_area
-# geometry module for a *chatbot* app, which then failed verification). This is
-# a deterministic backstop to the prompt's "placeholders only" instruction: if
-# a plan emits one of these and the objective has nothing to do with that
-# domain, the plan was copied, not authored -- reject it for one corrective
-# re-ask. Guarded by a keyword allowlist so a genuine geometry objective passes.
-_EXAMPLE_CONTAMINATION = {
-    "circle": ("circle", "area", "radius", "geometry", "shape", "circumference"),
-    "total_area": ("area", "geometry", "shape"),
-    "widget": ("widget",),
-}
+# A weak planner sometimes regurgitates the prompt's schema template instead of
+# authoring names from the objective. Because the schema now uses only
+# ``<angle_bracket>`` placeholders, that failure mode is detectable *generically*
+# -- no per-domain token list: if a real file path or symbol still carries a
+# ``<placeholder>`` token, the model copied the template rather than planning, so
+# the plan is re-asked once. This is fully domain-agnostic (nothing about any
+# particular example is encoded); semantic "does the plan match the objective?"
+# drift is caught by the optional plan-approval gate, not by a keyword list.
+_PLACEHOLDER_RE = re.compile(r"<[a-z_][\w./-]*>", re.IGNORECASE)
 
 
-def _example_contamination_problems(plan: Dict[str, Any], goal: str) -> List[str]:
-    """Flag a plan that copied the prompt's illustrative toy symbols.
+def _template_copy_problems(plan: Dict[str, Any]) -> List[str]:
+    """Flag a plan that left the schema's ``<placeholder>`` names in real slots.
 
-    Returns a single corrective problem string (or empty) naming the offending
-    tokens so the model re-plans against the real objective instead of the
-    few-shot example.
+    Scans identifier slots only (file paths, contract symbol names, module
+    refs, endpoint paths) -- never free-form descriptions, which may legitimately
+    mention ``<Foo>`` in prose. Returns one corrective problem string listing a
+    sample of the offending tokens, or ``[]`` when the plan is clean.
     """
-    g = (goal or "").lower()
-    names: List[str] = []
+    offenders: set = set()
     for layer in plan.get("layers", []) or []:
         for f in layer.get("files", []) or []:
-            names.append(str(f.get("path") or "").lower())
-            names.append(str(f.get("description") or "").lower())
+            p = str(f.get("path") or "")
+            if _PLACEHOLDER_RE.search(p):
+                offenders.add(p)
     contracts = plan.get("contracts") or {}
     for section in ("functions", "schemas", "endpoints"):
         for item in contracts.get(section, []) or []:
-            if isinstance(item, dict):
-                names.append(str(item.get("name") or "").lower())
-    hay = " \n ".join(names)
-    hits = sorted(
-        tok for tok, allow in _EXAMPLE_CONTAMINATION.items()
-        if tok in hay and not any(w in g for w in allow))
-    if not hits:
+            if not isinstance(item, dict):
+                continue
+            for key in ("name", "module", "path"):
+                v = str(item.get(key) or "")
+                if _PLACEHOLDER_RE.search(v):
+                    offenders.add(v)
+    if not offenders:
         return []
+    sample = sorted(offenders)[:5]
+    return [("the plan still contains schema PLACEHOLDER names "
+             f"{sample}; replace every file path and symbol with real names "
+             "derived from the OBJECTIVE")]
     return [("the plan uses the illustrative example symbol(s) "
              f"{hits} which are unrelated to the objective; re-plan every "
              "file, symbol, and dependency from the OBJECTIVE only")]
@@ -346,10 +345,10 @@ def swarm_tech_lead(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             swarm_beat(project_root, "tech_lead", "plan_rejected",
                        attempt=attempt, problems=problems)
             continue
-        # Anti-contamination: a plan that regurgitated the prompt's toy example
-        # (Circle/total_area/…) for an unrelated objective is re-asked before any
-        # Developer is spawned, so the whole build can't drift off-domain.
-        problems = _example_contamination_problems(plan, goal)
+        # Anti-template-copy: a plan that left the schema's <placeholder> names
+        # in real file/symbol slots is re-asked before any Developer is spawned
+        # (domain-agnostic; no per-example tokens).
+        problems = _template_copy_problems(plan)
         if problems:
             correction = "; ".join(problems)
             swarm_beat(project_root, "tech_lead", "plan_rejected",

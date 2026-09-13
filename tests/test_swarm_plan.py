@@ -309,44 +309,43 @@ def test_ensure_test_coverage_disambiguates_basename_collision():
     assert len(injected) == 2 and len(set(injected)) == 2
 
 
-# --------------------- anti-contamination guard (Phase C) ---------------------
+# ---------------- template-copy guard (Phase C, domain-agnostic) ----------------
 
-from cgx.session.tasks.swarm_tech_lead import _example_contamination_problems
+from cgx.session.tasks.swarm_tech_lead import _template_copy_problems
 
 
-def test_contamination_guard_flags_toy_symbols_for_unrelated_goal():
-    """A chatbot plan that copied the Circle/total_area example is rejected."""
+def test_template_copy_guard_flags_placeholder_paths_and_symbols():
+    """A plan that left the schema's <placeholder> names in real slots is rejected."""
     plan = {
-        "layers": [{"name": "models", "files": [
-            {"path": "backend/models.py", "description": "Circle geometry"}]}],
-        "contracts": {"functions": [
-            {"name": "total_area", "module": "backend/models.py"}],
-            "schemas": [{"name": "Circle", "module": "backend/models.py"}]},
+        "layers": [{"name": "core", "files": [
+            {"path": "src/<module_a>.py", "description": "the main module"}]}],
+        "contracts": {
+            "functions": [{"name": "<function_name>", "module": "src/<module_a>.py"}],
+            "schemas": [{"name": "<ClassName>", "module": "src/<module_a>.py"}],
+            "endpoints": [{"path": "/<route>", "method": "GET"}],
+        },
     }
-    problems = _example_contamination_problems(plan, "build a Gemini chatbot")
-    assert problems and "circle" in problems[0].lower()
+    problems = _template_copy_problems(plan)
+    assert problems and "placeholder" in problems[0].lower()
 
 
-def test_contamination_guard_allows_genuine_geometry_goal():
-    """The same symbols are fine when the objective is actually geometry."""
+def test_template_copy_guard_ignores_placeholders_in_prose_descriptions():
+    """A <placeholder> in a free-form description is not an identifier -> allowed."""
     plan = {
-        "layers": [{"name": "models", "files": [
-            {"path": "src/shapes.py", "description": "Circle area helpers"}]}],
-        "contracts": {"functions": [
-            {"name": "total_area", "module": "src/shapes.py"}]},
+        "layers": [{"name": "api", "files": [
+            {"path": "backend/api.py",
+             "description": "returns a <Response>-like object"}]}],
+        "contracts": {"functions": [{"name": "chat", "module": "backend/api.py"}]},
     }
-    problems = _example_contamination_problems(
-        plan, "compute the total area of a list of circles by radius")
-    assert problems == []
+    assert _template_copy_problems(plan) == []
 
 
-def test_contamination_guard_passes_clean_ondomain_plan():
-    """An on-domain chatbot plan raises no contamination problem."""
+def test_template_copy_guard_passes_a_real_plan_any_domain():
+    """A plan with real names (any domain) raises no problem."""
     plan = {
         "layers": [{"name": "api", "files": [
             {"path": "backend/api.py", "description": "chat endpoint"}]}],
-        "contracts": {"functions": [
-            {"name": "chat", "module": "backend/api.py"}],
-            "schemas": [{"name": "Message", "module": "backend/api.py"}]},
+        "contracts": {"functions": [{"name": "chat", "module": "backend/api.py"}],
+                      "schemas": [{"name": "Message", "module": "backend/api.py"}]},
     }
-    assert _example_contamination_problems(plan, "build a Gemini chatbot") == []
+    assert _template_copy_problems(plan) == []
