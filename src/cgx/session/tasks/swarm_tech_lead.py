@@ -52,6 +52,8 @@ _SYSTEM_PROMPT = (
     '  "contracts": {\n'
     '    "endpoints": [\n'
     '      {"path": "/<route>", "method": "GET|POST|...",\n'
+    '       "request": {"<field>": "<type>"},\n'
+    '       "response": {"<field>": "<type>"},\n'
     '       "description": "<what this endpoint does>"}\n'
     '    ],\n'
     '    "functions": [\n'
@@ -94,6 +96,12 @@ _SYSTEM_PROMPT = (
     "EXACT planned path that defines it. Name a method as \"ClassName.method\".\n"
     "Give each function real \"parameters\" and a \"return_type\". Do not invent\n"
     "symbols, files, or dependencies the objective did not ask for.\n"
+    "ENDPOINTS ARE A BINDING WIRE CONTRACT: for every HTTP endpoint the app\n"
+    "needs, declare its \"request\" and \"response\" JSON keys. The backend route\n"
+    "that implements it AND every frontend client that calls it MUST use these\n"
+    "EXACT keys (same names, same casing) and the exact path/method -- a\n"
+    "frontend sending {\"message\": ...} to a backend expecting {\"user_message\":\n"
+    "...} is a bug. Do not invent alternate key names on either side.\n"
     "ENTRYPOINT IS MANDATORY: each runnable component needs an entrypoint that\n"
     "initializes it (e.g. a Python 'app = Flask(__name__)'/'FastAPI()' module,\n"
     "or a JS 'src/main.jsx' that mounts the app). Do NOT expect tests to run\n"

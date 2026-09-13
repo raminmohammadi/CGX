@@ -349,3 +349,26 @@ def test_template_copy_guard_passes_a_real_plan_any_domain():
                       "schemas": [{"name": "Message", "module": "backend/api.py"}]},
     }
     assert _template_copy_problems(plan) == []
+
+
+def test_endpoint_wire_contract_survives_normalize_and_renders():
+    """Endpoint request/response keys survive plan normalization and render into
+    the per-file prompt, so the backend route and the frontend client bind to
+    the SAME wire keys (the {message} vs {user_message} mismatch fix)."""
+    from cgx.session.tasks.swarm_plan import normalize_plan
+    from cgx.answer.engine import _render_contracts_for_prompt
+    plan = {
+        "goal": "chatbot",
+        "layers": [{"name": "api", "files": [
+            {"path": "backend/app.py", "description": "api"}]}],
+        "contracts": {"endpoints": [
+            {"path": "/chat", "method": "POST",
+             "request": {"message": "str"}, "response": {"reply": "str"},
+             "description": "chat"}]},
+    }
+    norm = normalize_plan(plan)
+    eps = (norm.get("contracts") or {}).get("endpoints") or []
+    assert eps and eps[0].get("request") == {"message": "str"}
+    assert eps[0].get("response") == {"reply": "str"}
+    rendered = _render_contracts_for_prompt(norm.get("contracts") or {})
+    assert "/chat" in rendered and "message" in rendered and "reply" in rendered
