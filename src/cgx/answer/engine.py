@@ -3903,6 +3903,7 @@ def generate_single_scaffold_file(
     depends_on: Optional[List[str]] = None,
     contracts: Optional[Dict[str, Any]] = None,
     manifest_paths: Optional[List[str]] = None,
+    import_hint: str = "",
 ) -> Dict[str, Any]:
     """Generate the content of a single file in a new-project scaffold.
 
@@ -4079,6 +4080,12 @@ def generate_single_scaffold_file(
     required_block = _render_required_symbols_for_file(path, contracts)
     if required_block:
         parts.append(required_block)
+    # Deterministic, verified import lines for this file's dependencies (see
+    # swarm_skeleton.render_import_hints) -- collapses the dotted-path / symbol
+    # -name guesswork a weak model gets wrong. Advisory; unused lines are
+    # stripped downstream.
+    if import_hint:
+        parts.append(import_hint)
     # Per-call prompt + response budget scaled to the active provider's
     # model context window. Local 8K models get tight caps; cloud
     # models with 200K+ windows get generous ones. See

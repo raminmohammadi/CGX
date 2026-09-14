@@ -316,6 +316,14 @@ def _full_file_attempt(path: str, description: str, depends_on: List[str],
     from cgx.answer.engine import generate_single_scaffold_file
 
     context = _dep_context(depends_on, root)
+    # Deterministic, verified import lines for this file's Python dependencies,
+    # so a weak model copies a correct `from <module> import <symbol>` instead
+    # of guessing the dotted path or a non-existent symbol name. Derived from
+    # the FULL on-disk dep source (not the truncated context) so the public
+    # surface is complete; advisory only (unused lines are stripped later).
+    from cgx.session.tasks.swarm_skeleton import render_import_hints
+    dep_sources = {d: (_safe_read(d, root) or "") for d in (depends_on or [])}
+    import_hint = render_import_hints(path, dep_sources)
     try:
         # Advertise query_codebase only when deps carries an index (see _dev_tools).
         wrapped = ToolWrapper(provider, root, tools=_dev_tools(deps), deps=deps)
@@ -328,6 +336,7 @@ def _full_file_attempt(path: str, description: str, depends_on: List[str],
             depends_on=list(depends_on or []),
             contracts=contracts or {},
             manifest_paths=manifest_paths,
+            import_hint=import_hint,
         )
     except Exception as exc:  # pragma: no cover
         return "", f"{type(exc).__name__}: {exc}"
