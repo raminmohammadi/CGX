@@ -221,13 +221,25 @@ def _structural_scan(
         swarm_beat(root, "verify", "gate_error", gate="resolve_imports",
                    error=repr(e))
         resolve_w = []
+    # Cross-file module resolution for the JS/TS family (and any future
+    # ecosystem with a spec row): a *relative* import that resolves to no
+    # generated file is an integration break Python's resolver above cannot see
+    # for non-Python source. ``cross_ref`` abstains on Python (handled above) and
+    # on assets/aliases, so this only adds high-precision, un-gameable signals.
+    try:
+        from cgx.session.cross_ref import unresolved_references
+        crossref_w = unresolved_references(contents, paths, root)
+    except Exception as e:  # pragma: no cover - the gate is best-effort
+        swarm_beat(root, "verify", "gate_error", gate="cross_ref",
+                   error=repr(e))
+        crossref_w = []
     try:
         phantom_3p_w = _check_phantom_third_party_imports(paths, contents, contracts.get("third_party_dependencies") or [], root)
     except Exception as e:  # pragma: no cover - the gate is best-effort
         swarm_beat(root, "verify", "gate_error", gate="phantom_third_party",
                    error=repr(e))
         phantom_3p_w = []
-    import_breaks = _merge_import_warnings(symbol_w, resolve_w)
+    import_breaks = _merge_import_warnings(symbol_w, resolve_w, crossref_w)
     try:
         contract = check_contract_compliance(contents, contracts)
     except Exception as e:  # pragma: no cover - the gate is best-effort

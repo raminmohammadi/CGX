@@ -100,6 +100,25 @@ def test_phantom_third_party_is_advisory_not_gating(tmp_path):
     assert import_breaks == []   # not a hard, gating signal
 
 
+def test_crossref_flags_missing_js_sibling_import(tmp_path):
+    # A JS file importing a sibling that was never generated is a gating
+    # import break -- the non-Python equivalent of the first-party resolver.
+    contents = {"src/App.jsx": "import { sendMessage } from './api';\n"}
+    gaps, import_breaks, phantom, contract = sv._structural_scan(
+        ["src/App.jsx"], contents, {}, str(tmp_path))
+    assert any(w.get("module") == "./api"
+               and w.get("kind") == "unresolved_module"
+               for w in import_breaks)
+
+
+def test_crossref_clean_when_js_sibling_present(tmp_path):
+    contents = {"src/App.jsx": "import { sendMessage } from './api';\n",
+                "src/api.js": "export function sendMessage(){}\n"}
+    gaps, import_breaks, phantom, contract = sv._structural_scan(
+        ["src/App.jsx", "src/api.js"], contents, {}, str(tmp_path))
+    assert import_breaks == []
+
+
 def test_repair_context_includes_js_files():
     # Fix B: a red JS build must offer the implicated frontend file to the
     # repairer -- the context is no longer .py-only.
