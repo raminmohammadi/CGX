@@ -3093,6 +3093,42 @@ def _render_contracts_for_prompt(contracts: Any) -> str:
     if isinstance(skeleton, str) and skeleton.strip():
         sections.append("Project Skeleton:\n" + skeleton.strip())
 
+    # External-dependency grounding fetched from the real package registry.
+    # Provenance-scoped labels: introspected (``verified``) metadata is an
+    # authority to implement against; registry text is an UNVERIFIED excerpt --
+    # it narrows the model to the real package/names but exact signatures must
+    # still be confirmed with tools. Never presented as "do not stub" over what
+    # may be truncated prose.
+    ext_ref = contracts.get("external_api_reference")
+    if isinstance(ext_ref, dict) and ext_ref:
+        verified_lines: List[str] = []
+        unverified_lines: List[str] = []
+        for name, ref in ext_ref.items():
+            if not isinstance(ref, dict):
+                continue
+            eco = str(ref.get("ecosystem") or "").strip()
+            summary = str(ref.get("summary") or "").strip()
+            detail = str(ref.get("detail") or "").strip()
+            head = f"- {name}" + (f" ({eco})" if eco else "")
+            if summary:
+                head += f": {summary}"
+            body = ("\n" + _compact_json_fragment(detail, max_chars=1200)
+                    ) if detail else ""
+            (verified_lines if ref.get("verified")
+             else unverified_lines).append(head + body)
+        if verified_lines:
+            sections.append(
+                "EXTERNAL DEPENDENCY REFERENCE (verified real API -- implement "
+                "against THIS, do not guess or stub):\n"
+                + "\n".join(verified_lines))
+        if unverified_lines:
+            sections.append(
+                "EXTERNAL DEPENDENCY REFERENCE (real package metadata fetched "
+                "for you -- UNVERIFIED excerpt: use it to implement against the "
+                "REAL package and names, but confirm exact signatures with "
+                "tools; do NOT invent an API that contradicts this):\n"
+                + "\n".join(unverified_lines))
+
     if not sections:
         return ""
     return ("PROJECT CONTRACTS (shared interfaces every file MUST honour "

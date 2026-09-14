@@ -30,7 +30,8 @@ DEFAULT_FETCH_ALLOWLIST = frozenset({
     "example.com", "example.org",
     # language / package docs + registries
     "python.org", "readthedocs.io", "readthedocs.org", "pypi.org",
-    "npmjs.com", "nodejs.org", "developer.mozilla.org", "pkg.go.dev",
+    "npmjs.com", "npmjs.org", "nodejs.org", "developer.mozilla.org",
+    "pkg.go.dev",
     "go.dev", "docs.rs", "crates.io", "rubygems.org", "packagist.org",
     # code hosts / Q&A
     "github.com", "githubusercontent.com", "gitlab.com", "stackoverflow.com",

@@ -390,6 +390,24 @@ def swarm_tech_lead(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             outputs={"file_count": 0, "reason": correction
                      or "Tech Lead could not produce a buildable plan."})
 
+    # Ground every DECLARED third-party dependency against its real package
+    # registry (PyPI / npm) so the Developer implements against real metadata
+    # instead of a remembered/hallucinated API. Best-effort: offline or a
+    # private registry yields nothing and we proceed (never block the plan).
+    contracts_out = dict(plan.get("contracts") or {})
+    try:
+        from cgx.session.tasks.swarm_apiground import ground_external_dependencies
+        grounded = ground_external_dependencies(contracts_out, paths)
+        if grounded:
+            contracts_out["external_api_reference"] = grounded
+            swarm_beat(project_root, "tech_lead", "api_grounded",
+                       packages=sorted(grounded.keys()))
+        else:
+            swarm_beat(project_root, "tech_lead", "api_grounding_unavailable")
+    except Exception as e:  # pragma: no cover - grounding is best-effort
+        swarm_beat(project_root, "tech_lead", "api_grounding_error",
+                   error=repr(e))
+
     artifact = Artifact.new(
         session_id=task.session_id,
         produced_by_task_id=task.task_id,
@@ -397,7 +415,7 @@ def swarm_tech_lead(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         content={
             "goal": goal,
             "layers": plan["layers"],
-            "contracts": plan.get("contracts") or {},
+            "contracts": contracts_out,
             "paths": paths,
             "project_root": project_root,
             # Persist the resolved stack so the Developer + Verifier reuse it
