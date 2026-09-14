@@ -310,3 +310,50 @@ def test_npm_build_tool_not_found_is_skipped(tmp_path, monkeypatch):
                                      tests_present=False)
     assert out.ran is False
     assert "not found" in (out.skipped_reason or "").lower()
+
+
+def test_is_npm_auth_error_detects_registry_auth_failures():
+    from cgx.codegen.test_runners import _is_npm_auth_error
+    assert _is_npm_auth_error("npm error code E401\nUnable to authenticate")
+    assert _is_npm_auth_error("401 Unauthorized")
+    assert not _is_npm_auth_error("npm ERR! ETARGET No matching version found")
+
+
+def test_npm_install_retries_public_registry_on_auth_error(tmp_path, monkeypatch):
+    import cgx.codegen.test_runners as tr
+    calls = []
+
+    class _P:
+        def __init__(self, rc, out=""):
+            self.returncode = rc
+            self.stdout = out
+            self.stderr = out
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        if "--registry" in cmd:            # retry against the public registry
+            return _P(0)
+        return _P(1, "npm error code E401 Unable to authenticate")  # private fail
+
+    monkeypatch.setattr(tr.subprocess, "run", fake_run)
+    ok, _out = tr._npm_install(tmp_path, timeout=30)
+    assert ok is True
+    assert any("--registry" in c and tr._PUBLIC_NPM_REGISTRY in c for c in calls)
+
+
+def test_npm_install_no_public_retry_on_non_auth_error(tmp_path, monkeypatch):
+    import cgx.codegen.test_runners as tr
+    calls = []
+
+    class _P:
+        returncode = 1
+        stdout = ""
+        stderr = "npm ERR! ETARGET No matching version"
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        return _P()
+
+    monkeypatch.setattr(tr.subprocess, "run", fake_run)
+    ok, _out = tr._npm_install(tmp_path, timeout=30)
+    assert ok is False and len(calls) == 1   # no retry for a non-auth failure

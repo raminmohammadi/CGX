@@ -167,6 +167,52 @@ def _npm_script_command(project_root: str) -> Optional[List[str]]:
     return None
 
 
+_PUBLIC_NPM_REGISTRY = "https://registry.npmjs.org/"
+
+
+def _is_npm_auth_error(output: str) -> bool:
+    """True when an npm failure is a registry AUTH problem, not a code/dep issue.
+
+    A user's global ``~/.npmrc`` often points npm at a private corporate
+    registry (e.g. AWS CodeArtifact) whose token has expired -> every install
+    gets ``E401``. A scaffolded frontend only needs *public* packages, so that
+    stale corporate token must not break its build.
+    """
+    low = (output or "").lower()
+    return ("e401" in low or "unable to authenticate" in low
+            or "unauthorized" in low or "log in again" in low
+            or "authentication token" in low)
+
+
+def _npm_install(root: "Path", timeout: float) -> "tuple[bool, str]":
+    """``npm install`` with a public-registry retry on an auth failure.
+
+    Returns ``(ok, output)``. On an ``E401``/auth error against the configured
+    (often private/expired) registry, retries once against the public npm
+    registry so a scaffolded, public-package build still provisions.
+    """
+    base = ["npm", "install", "--no-audit", "--no-fund", "--legacy-peer-deps"]
+    try:
+        proc = subprocess.run(base, cwd=root, capture_output=True, text=True,
+                              timeout=timeout)
+    except Exception as e:  # pragma: no cover - subprocess/env failure
+        return False, f"{type(e).__name__}: {e}"
+    if proc.returncode == 0:
+        return True, ""
+    out = (proc.stdout or "") + "\n" + (proc.stderr or "")
+    if _is_npm_auth_error(out):
+        try:
+            retry = subprocess.run(
+                base + ["--registry", _PUBLIC_NPM_REGISTRY], cwd=root,
+                capture_output=True, text=True, timeout=timeout)
+        except Exception as e:  # pragma: no cover
+            return False, f"{type(e).__name__}: {e}"
+        if retry.returncode == 0:
+            return True, ""
+        out = (retry.stdout or "") + "\n" + (retry.stderr or "")
+    return False, out
+
+
 def _is_toolchain_missing(output: str) -> bool:
     """True when a failed npm run is a missing *tool*, not a real build error.
 
@@ -204,27 +250,15 @@ class NpmRunner(TestRunner):
                 tests_present=tests_present)
         root = Path(pkg_dir).resolve()
         if not (root / "node_modules").is_dir():
-            install_ok = False
-            try:
-                # ``--legacy-peer-deps`` so a model's imperfect peer-version
-                # pin (e.g. vite ^4 with @vitejs/plugin-react ^2) doesn't abort
-                # the whole install with ERESOLVE and leave no node_modules --
-                # which then surfaces cryptically as "vite: command not found".
-                # This mirrors what a developer/CI does on real peer friction.
-                proc = subprocess.run(
-                    ["npm", "install", "--no-audit", "--no-fund",
-                     "--legacy-peer-deps"], cwd=root,
-                    capture_output=True, text=True,
-                    timeout=min(timeout_seconds, 180.0),
-                )
-                install_ok = proc.returncode == 0
-                if not install_ok:
-                    logger.debug("npm install (%s) rc=%s: %s",
-                                 root.name, proc.returncode,
-                                 (proc.stderr or "")[:300])
-            except Exception as e:
-                logger.debug("npm install skipped: %s", e)
+            # ``--legacy-peer-deps`` so a model's imperfect peer-version pin
+            # doesn't abort with ERESOLVE; a registry AUTH failure (e.g. an
+            # expired private CodeArtifact token in ~/.npmrc) retries against
+            # the public registry so a public-package build still provisions.
+            install_ok, install_out = _npm_install(
+                root, timeout=min(timeout_seconds, 180.0))
             if not install_ok:
+                logger.debug("npm install (%s) failed: %s",
+                             root.name, (install_out or "")[:300])
                 # The JS toolchain couldn't be provisioned (offline / unresolved
                 # deps). Running the build now would only emit "vite: command
                 # not found" and fail the whole run. Report it as SKIPPED so a
