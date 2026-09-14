@@ -35,11 +35,11 @@ import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
+from cgx.session import repair_engine
 from cgx.session.import_audit import resolve_first_party_imports
 from cgx.session.models import Artifact, ArtifactKind, TaskKind
 from cgx.session.scaffold_validate import (
-    _module_name_for_path, check_contract_compliance,
-    cross_check_first_party_imports)
+    check_contract_compliance, cross_check_first_party_imports)
 from cgx.session.tasks.base import (
     ExecutorDeps, ExecutorResult, TaskNode, register_executor)
 from cgx.session.tasks.swarm_generate import generate_file
@@ -325,15 +325,10 @@ def _run_env_dryrun(paths: List[str], root: str) -> Dict[str, Any]:
     return report
 
 
-_MODULE_ERR_RE = re.compile(
-    r"(?:ModuleNotFoundError|ImportError):[^\n]*?['\"]([\w.]+)['\"]")
-
 # pytest prints one ``____ test_name ____`` banner per failing test in the
 # FAILURES section, and ``FAILED path::[Class::]test_name`` in the short
-# summary. Keying on the test NAME (always present) rather than a ``file:line:
-# Error`` line (absent for a plain ``assert`` diff) is what makes assertion
-# failures localizable -- otherwise a wrong assertion survives every repair
-# round because the loop never identifies which test file to reconcile.
+# summary. These names drive two consumers: the human-readable summary
+# ("tests failed: <names>") and the failing-test-file localizer below.
 _FAIL_BANNER_RE = re.compile(r"^_{3,}\s+([\w.]+)\s+_{3,}\s*$", re.M)
 _FAIL_SUMMARY_RE = re.compile(r"^FAILED\s+\S+?::(?:\w+::)?(\w+)", re.M)
 
@@ -348,18 +343,17 @@ def _failing_test_names(output: str) -> set:
     return names
 
 
-def _assertion_repair_targets(env: Dict[str, Any], paths: List[str],
-                              root: str) -> List[str]:
-    """Planned test files that own a failing test -- the assertion-failure
-    localizer the ``ModuleNotFoundError`` regex can't provide.
+def _failing_test_files(output: str, paths: List[str], root: str) -> List[str]:
+    """Planned pytest files that define a failing test named in ``output``.
 
-    Returns just the failing *test* files; :func:`_repair_context_paths` then
-    pulls in each test's ``depends_on`` implementation module, so the repairer
-    sees BOTH sides of a test<->impl disagreement and can fix whichever is
-    wrong (e.g. a test asserting 14.137 against an impl that correctly yields
-    43.98).
+    A red suite whose diagnostic prints no source PATH (a plain ``assert`` diff
+    names only the test) is still localizable by its failing test NAME:
+    :func:`repair_engine.neighbor_context` then pulls in each test's
+    ``depends_on`` impl, so the repairer sees BOTH sides of a test<->impl
+    disagreement. pytest-shaped; a runner that prints no such names simply
+    contributes nothing here (the general path-appearance localizer still runs).
     """
-    names = _failing_test_names(str(env.get("output") or ""))
+    names = _failing_test_names(output or "")
     if not names:
         return []
     targets: List[str] = []
@@ -374,28 +368,23 @@ def _assertion_repair_targets(env: Dict[str, Any], paths: List[str],
     return targets
 
 
-def _is_assertion_failure(output: str) -> bool:
-    """True when the red suite is an assertion/logic failure (not an import).
+def _localize_failure(output: str, paths: List[str], root: str) -> List[str]:
+    """Planned files a red build implicates, from three general signals.
 
-    Import failures have their own module-name localizer + auto-fix; an
-    ``assert``-style failure needs the test<->impl reconciliation path instead.
+    De-duplicated (order preserved): files named verbatim in the diagnostic
+    (:func:`repair_engine.localize_paths`, boundary-guarded so ``a.py`` never
+    matches inside ``data.py``); the planned module a ``ModuleNotFoundError``
+    points at (:func:`repair_engine.python_module_targets`); and any planned
+    pytest file that defines a failing test (:func:`_failing_test_files`).
     """
-    text = output or ""
-    if _MODULE_ERR_RE.search(text):
-        return False
-    return bool(re.search(r"^E\s+assert\b", text, re.M)
-                or "AssertionError" in text)
-
-
-_RECONCILE_HINT = (
-    "A test ASSERTION failed: the test and its implementation disagree. "
-    "Decide which is correct FOR THE OBJECTIVE and fix only the wrong file: "
-    "if the test's expected value is wrong (e.g. bad arithmetic), fix the "
-    "TEST; if the implementation is wrong, fix the IMPLEMENTATION. Never "
-    "weaken a correct test just to make it pass, and never break a correct "
-    "implementation to match a wrong test.\n\n"
-    "----- failing suite output -----\n"
-)
+    seen: List[str] = []
+    for group in (repair_engine.localize_paths(output, paths),
+                  repair_engine.python_module_targets(output, paths),
+                  _failing_test_files(output, paths, root)):
+        for p in group:
+            if p not in seen:
+                seen.append(p)
+    return seen
 
 
 # Source extensions the repairer can rewrite (Python + the JS/TS family). A
@@ -410,29 +399,18 @@ def _repair_context_paths(localized: List[str], paths: List[str],
                           specs: Dict[str, Any]) -> List[str]:
     """The focused source set to offer the repairer, localized files first.
 
-    A weak local model declines (returns ``{"files": []}``) when handed the
-    whole planned tree as context -- the signal drowns in unrelated files, so a
-    one-line fix in a single module is never made. When the failure localized
-    one or more files, offer *only* those plus their direct ``depends_on`` (the
-    sibling API the failing frame calls), so the prompt is small and centred on
-    the defect. With no localization fall back to every planned source file --
-    there is no better hint and small trees still fit. Language-aware: Python
-    *and* JS/TS sources are eligible, so a red ``npm run build`` can repair the
-    implicated frontend file. Order is localized-first so
-    ``generate_repair_files``' own ``max_files`` cap never drops a target.
+    Delegates to :func:`repair_engine.neighbor_context`: the localized files,
+    their direct ``depends_on``, and their reverse dependencies, filtered to
+    repairable source extensions (Python *and* the JS/TS family, so a red
+    ``npm run build`` can repair the implicated frontend file). A weak local
+    model declines when handed the whole tree, so this small, defect-centred
+    context is what turns "detected the failure" into "produced working code";
+    with no localization it falls back to every source file. Order is
+    localized-first so ``generate_repair_files``' ``max_files`` cap never drops
+    a target.
     """
-    src = [p for p in paths if p.endswith(_REPAIRABLE_EXT)]
-    if not localized:
-        return src
-    keep: List[str] = []
-    for t in localized:
-        if t in src and t not in keep:
-            keep.append(t)
-        for dep in (specs.get(t, {}) or {}).get("depends_on") or []:
-            dep = str(dep)
-            if dep in src and dep not in keep:
-                keep.append(dep)
-    return keep or src
+    return repair_engine.neighbor_context(localized, paths, specs,
+                                          _REPAIRABLE_EXT)
 
 
 def _reconcile_manifests(paths: List[str], root: str) -> None:
@@ -541,152 +519,10 @@ def _reconcile_node_dependencies(root: str) -> None:
                        dir=os.path.relpath(d, root), packages=needed)
 
 
-def _auto_fix_missing_imports(env: Dict[str, Any], root: str, provider: Any) -> bool:
-    """Parse output for NameError and safely inject missing imports using AST."""
-    output = str(env.get("output") or "")
-    match = re.search(r"NameError: name '(\w+)' is not defined", output)
-    if not match:
-        return False
-    
-    missing_name = match.group(1)
-    file_match = re.search(r"^([^:\n]+):[0-9]+: NameError", output, re.MULTILINE)
-    if not file_match:
-        return False
-    
-    failed_file = file_match.group(1).strip()
-    if not failed_file.endswith(".py"):
-        return False
-        
-    prompt = (f"The name '{missing_name}' is undefined in a Python project. "
-              f"What is the standard import statement for this? "
-              f"Reply with ONLY the single import line, e.g. 'from fastapi import {missing_name}'. "
-              "Do not use markdown fences.")
-    
-    try:
-        reply = provider.chat([{"role": "user", "content": prompt}], force_json=False).get("content", "").strip()
-    except Exception as e:
-        swarm_beat(root, "verify", "auto_fix_error", fix="missing_imports",
-                   error=repr(e))
-        return False
-
-    reply = reply.replace("```python", "").replace("```", "").strip()
-    if not (reply.startswith("import ") or reply.startswith("from ")):
-        return False
-        
-    path = os.path.join(root, failed_file)
-    if not os.path.exists(path):
-        return False
-        
-    with open(path, "r", encoding="utf-8") as f:
-        content = f.read()
-        
-    if reply in content:
-        return False
-        
-    new_content = reply + "\n" + content
-    from cgx.session.tasks.swarm_tools import edit_file
-    edit_file(failed_file, new_content, root)
-    return True
-
-
-def _auto_fix_function_logic(env: Dict[str, Any], root: str, provider: Any, dyn_rounds: int = 0) -> bool:
-    """Parse output for logic errors, extract the broken function via AST, and ask LLM to rewrite it."""
-    import ast
-    output = str(env.get("output") or "")
-    
-    matches = list(re.finditer(r"^([^:\n]+):([0-9]+): ([a-zA-Z0-9_]+Error)", output, re.MULTILINE))
-    if not matches:
-        return False
-        
-    last_match = matches[-1]
-    failed_file = last_match.group(1).strip()
-    line_number = int(last_match.group(2).strip())
-    error_type = last_match.group(3).strip()
-    
-    if not failed_file.endswith(".py"):
-        return False
-        
-    error_msg_match = re.search(r"E\s+(.*?\n)\n" + re.escape(last_match.group(0)), output)
-    if not error_msg_match:
-        error_msg_match = re.search(r"E\s+(.*?)\n", output[output.rfind('E '):])
-        
-    error_message = error_msg_match.group(1).strip() if error_msg_match else error_type
-    
-    path = os.path.join(root, failed_file)
-    if not os.path.exists(path):
-        return False
-        
-    with open(path, "r", encoding="utf-8") as f:
-        source_code = f.read()
-        
-    try:
-        tree = ast.parse(source_code)
-    except SyntaxError:
-        return False
-        
-    target_node = None
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            if hasattr(node, "lineno") and hasattr(node, "end_lineno"):
-                if node.lineno <= line_number <= node.end_lineno:
-                    # In python 3.8+, decorators are included in lineno, but let's be safe
-                    target_node = node
-                    break
-                    
-    if not target_node:
-        return False
-        
-    lines = source_code.split("\n")
-    start_idx = target_node.lineno - 1
-    if hasattr(target_node, "decorator_list") and target_node.decorator_list:
-        start_idx = min(start_idx, target_node.decorator_list[0].lineno - 1)
-        
-    end_idx = target_node.end_lineno
-    old_function_code = "\n".join(lines[start_idx:end_idx])
-    
-    prompt = (
-        f"The following Python code failed with this error:\n"
-        f"ERROR: {error_message}\n\n"
-        f"CODE:\n```python\n{old_function_code}\n```\n\n"
-        f"Rewrite this specific code block to fix the logic error. "
-        f"Return ONLY the raw rewritten code inside a markdown block. Do not include JSON."
-    )
-    
-    repair_temp = _repair_temperature(dyn_rounds)
-
-    try:
-        reply = provider.chat([{"role": "user", "content": prompt}], force_json=False, temperature=repair_temp).get("content", "").strip()
-    except Exception as e:
-        swarm_beat(root, "verify", "auto_fix_error", fix="function_logic",
-                   error=repr(e))
-        return False
-        
-    import re as re_mod
-    code_match = re_mod.search(r"```python\s*(.*?)\s*```", reply, re_mod.DOTALL)
-    if code_match:
-        new_function_code = code_match.group(1).strip()
-    else:
-        new_function_code = reply.replace("```python", "").replace("```", "").strip()
-        
-    if not new_function_code:
-        return False
-        
-    # verify it parses as valid python
-    try:
-        ast.parse(new_function_code)
-    except SyntaxError:
-        return False
-        
-    new_content = "\n".join(lines[:start_idx]) + "\n" + new_function_code + "\n" + "\n".join(lines[end_idx:])
-    
-    from cgx.session.tasks.swarm_tools import edit_file
-    edit_file(failed_file, new_content, root)
-    return True
 def _dynamic_repair(env: Dict[str, Any], localized: List[str],
                     contents: Dict[str, str], goal: str, root: str,
                     provider: Any, paths: List[str],
-                    specs: Dict[str, Any], dyn_rounds: int = 0,
-                    hint: str = "") -> List[str]:
+                    specs: Dict[str, Any], dyn_rounds: int = 0) -> List[str]:
     """Failure-driven repair of a red-but-structurally-clean tree.
 
     Blind regeneration re-asks with the same description and contracts, so a
@@ -695,11 +531,15 @@ def _dynamic_repair(env: Dict[str, Any], localized: List[str],
     the implicated file bodies into :func:`generate_repair_files`, which
     diagnoses the concrete failure and returns corrected content -- the step
     that turns "detected the failure" into "produced working code". The context
-    is focused via :func:`_repair_context_paths` (the localized files plus
-    their dependencies, not the whole tree) so a weak model does not decline on
-    an over-large prompt; ``localized`` is flagged so it starts at the failing
-    frames. Only files the repairer actually rewrote (and that pass its own
-    source validation) are written back. Returns the paths it changed.
+    is focused via :func:`_repair_context_paths` (the localized files plus their
+    dependencies and reverse dependencies, not the whole tree) so a weak model
+    does not decline on an over-large prompt yet still sees BOTH sides of a
+    test<->impl disagreement; ``localized`` is flagged so it starts at the
+    failing frames. The "fix the wrong side, never weaken a correct test"
+    guardrail lives in :data:`~cgx.answer.engine._LOGIC_REPAIR_SYSTEM`, so a
+    single repair path serves every red signal (import, assertion, or build).
+    Only files the repairer actually rewrote (and that pass its own source
+    validation) are written back. Returns the paths it changed.
     """
     from cgx.answer.engine import generate_repair_files
     from cgx.session.tasks.swarm_generate import ToolWrapper
@@ -707,11 +547,6 @@ def _dynamic_repair(env: Dict[str, Any], localized: List[str],
     failure_text = str(env.get("output") or "")
     if not failure_text:
         return []
-    # A reconciliation hint (assertion failures) reframes the task as "fix the
-    # wrong side" and widens the focus to the full test+impl context so the
-    # repairer may edit either file, not just the localized one.
-    if hint:
-        failure_text = hint + failure_text
     context_paths = _repair_context_paths(localized, paths, specs)
     files = [{"path": p, "content": contents[p]}
              for p in context_paths if p in contents]
@@ -721,7 +556,7 @@ def _dynamic_repair(env: Dict[str, Any], localized: List[str],
         wrapped_provider = ToolWrapper(provider, root)
         repaired = generate_repair_files(
             wrapped_provider, goal=goal, failure_text=failure_text,
-            files=files, localized_files=(context_paths if hint else localized))
+            files=files, localized_files=localized)
     except Exception as e:  # pragma: no cover - repair is best-effort
         swarm_beat(root, "verify", "dynamic_repair_error", error=repr(e))
         return []
@@ -730,46 +565,6 @@ def _dynamic_repair(env: Dict[str, Any], localized: List[str],
         edit_file(path, content, root)
         written.append(path)
     return written
-
-
-def _dynamic_regen_targets(env: Dict[str, Any], paths: List[str]) -> List[str]:
-    """Planned source files implicated by a red suite's import failures.
-
-    Two complementary signals, both bounded to *planned* paths so a stray
-    traceback frame in a dependency can never widen the blast radius:
-
-    * any planned path named verbatim in the pytest output (the importing
-      frame pytest prints for a collection error), and
-    * any planned module whose dotted name (or ``src``-stripped variant)
-      matches a ``ModuleNotFoundError`` / ``ImportError`` target -- the file
-      that was expected to *provide* the missing module.
-    """
-    text = str(env.get("output") or "")
-    if not text:
-        return []
-    targets: List[str] = []
-    for p in paths:
-        rel_p = p
-        if "/src/" in p:
-            rel_p = "src/" + p.split("/src/", 1)[-1]
-        elif "/tests/" in p:
-            rel_p = "tests/" + p.split("/tests/", 1)[-1]
-        
-        if (p and p in text) or (rel_p and rel_p in text):
-            if p not in targets:
-                targets.append(p)
-    wanted = set(_MODULE_ERR_RE.findall(text))
-    if wanted:
-        for p in paths:
-            mod = _module_name_for_path(p)
-            if not mod:
-                continue
-            variants = {mod}
-            if mod.startswith("src."):
-                variants.add(mod[len("src."):])
-            if (variants & wanted) and p not in targets:
-                targets.append(p)
-    return targets
 
 
 @register_executor(TaskKind.SWARM_VERIFY)
@@ -828,38 +623,23 @@ def swarm_verify(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         # exactly the defect the static gates cannot see, and a bug exposed
         # only once an earlier import error is cleared (collection aborts at the
         # first broken module, masking the rest) must get its own targeted pass.
-        # Import-style failures localize to the file expected to provide the
-        # missing module; other red suites (a wrong assertion, a runtime
-        # TypeError) name no such file but are still fair game -- the import
-        # targets, when present, merely seed the localization hint.
+        # ``_localize_failure`` is toolchain-agnostic (planned paths named in the
+        # diagnostic + a missing-module resolver + failing-test files), so a red
+        # pytest, tsc, vite, or cargo build all localize the same way.
         prev_output = str(env.get("output") or "")
-        is_assert = _is_assertion_failure(prev_output)
-        dyn_targets = _dynamic_regen_targets(env, paths)
-        # An assertion failure carries no ModuleNotFoundError to localize, so
-        # fall back to the failing test files (their depends_on impl is pulled
-        # in by _repair_context_paths) -- both sides of the disagreement.
-        if not dyn_targets and is_assert:
-            dyn_targets = _assertion_repair_targets(env, paths, project_root)
+        dyn_targets = _localize_failure(prev_output, paths, project_root)
         dyn_rounds += 1
         swarm_beat(project_root, "verify", "dynamic_regenerate",
-                   round=dyn_rounds, targets=dyn_targets,
-                   mode="reconcile" if is_assert else "repair")
-        # An assertion failure means a test<->impl disagreement: go straight to
-        # full-file reconciliation repair (the single-function AST fix cannot
-        # edit a *test* file's wrong expected value, and the import auto-fix
-        # doesn't apply). Otherwise keep the import/logic auto-fix ladder, then
-        # failure-driven repair fed the red suite's output.
-        if is_assert:
-            repaired = _dynamic_repair(env, dyn_targets, contents, goal,
-                                       project_root, deps.provider, paths,
-                                       specs, dyn_rounds, hint=_RECONCILE_HINT)
-        elif _auto_fix_missing_imports(env, project_root, deps.provider):
-            repaired = {"auto_fixed": True}
-        elif _auto_fix_function_logic(env, project_root, deps.provider, dyn_rounds):
-            repaired = {"auto_fixed_logic": True}
-        else:
-            repaired = _dynamic_repair(env, dyn_targets, contents, goal,
-                                       project_root, deps.provider, paths, specs, dyn_rounds)
+                   round=dyn_rounds, targets=dyn_targets)
+        # One failure-driven repair path for every red signal: thread the
+        # runner output + the focused file bodies (both sides of a test<->impl
+        # disagreement) into generate_repair_files, whose prompt carries the
+        # "fix the wrong side, never weaken a correct test" guardrail. Only if
+        # the repairer declines AND we localized a file do we fall back to a
+        # blind regenerate of that file.
+        repaired = _dynamic_repair(env, dyn_targets, contents, goal,
+                                   project_root, deps.provider, paths,
+                                   specs, dyn_rounds)
         if not repaired and dyn_targets:
             _regenerate(dyn_targets, specs, contracts, goal, project_root,
                         deps.provider, paths, skills)

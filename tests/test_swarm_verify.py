@@ -394,16 +394,7 @@ def test_failing_test_names_from_banner_and_summary():
     assert "test_total_area" in names
 
 
-def test_is_assertion_failure_true_for_assert_diff():
-    assert sv._is_assertion_failure(_PYTEST_ASSERT_OUTPUT) is True
-
-
-def test_is_assertion_failure_false_for_import_error():
-    out = "E   ModuleNotFoundError: No module named 'fastapi'"
-    assert sv._is_assertion_failure(out) is False
-
-
-def test_assertion_repair_targets_finds_test_file(tmp_path):
+def test_failing_test_files_localizes_by_test_name(tmp_path):
     # A planned test file that defines the failing test is localized so its
     # depends_on impl gets pulled into repair context (test<->impl reconcile).
     (tmp_path / "tests").mkdir()
@@ -412,9 +403,17 @@ def test_assertion_repair_targets_finds_test_file(tmp_path):
     (tmp_path / "tests" / "test_other.py").write_text(
         "def test_unrelated():\n    assert True\n")
     paths = ["tests/test_models.py", "tests/test_other.py", "backend/models.py"]
-    env = {"output": _PYTEST_ASSERT_OUTPUT}
-    targets = sv._assertion_repair_targets(env, paths, str(tmp_path))
+    targets = sv._failing_test_files(_PYTEST_ASSERT_OUTPUT, paths, str(tmp_path))
     assert targets == ["tests/test_models.py"]
+
+
+def test_localize_failure_composes_all_signals(tmp_path):
+    # A ModuleNotFoundError localizes to the planned file meant to provide the
+    # module, without matching a lookalike path (data.py must not match a.py).
+    out = "ModuleNotFoundError: No module named 'store'\napp.py:1: in <module>"
+    paths = ["store.py", "app.py", "data.py"]
+    got = sv._localize_failure(out, paths, str(tmp_path))
+    assert "store.py" in got and "app.py" in got and "data.py" not in got
 
 
 # --------------------- C5: partial-success summary ---------------------
