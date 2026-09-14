@@ -2,7 +2,7 @@ import subprocess
 import os
 import json
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 from cgx.pipeline.auto import run_query_auto
 from cgx.session.tasks.base import ExecutorDeps
@@ -190,96 +190,14 @@ def search_web(query: str) -> str:
     return _screen_untrusted("\n\n".join(out), "web search results")
 
 
-def _host_is_blocked(host: str) -> bool:
-    """True for loopback/private/link-local/reserved hosts (basic SSRF guard).
-
-    A model-chosen URL must not be able to poke internal services. Literal
-    private IPs are rejected outright; hostnames are resolved and every
-    resolved address is checked. Unresolvable hosts are left to ``urlopen`` to
-    fail naturally (we don't want DNS failures to look like a policy block).
-    """
-    import ipaddress
-    import socket
-    h = (host or "").strip().lower()
-    if not h or h == "localhost" or h.endswith(".local") or h.endswith(".internal"):
-        return True
-    addrs: list = []
-    try:
-        addrs = [info[4][0] for info in socket.getaddrinfo(h, None)]
-    except Exception:
-        return False
-    for ip in addrs:
-        try:
-            a = ipaddress.ip_address(ip)
-        except ValueError:
-            continue
-        if (a.is_private or a.is_loopback or a.is_link_local
-                or a.is_reserved or a.is_multicast or a.is_unspecified):
-            return True
-    return False
-
-
-# Trusted hosts fetch_url may read from BY DEFAULT: official language/package
-# docs, package registries, code hosts, and the major cloud/LLM provider docs --
-# i.e. where real API documentation lives. A model-chosen URL that isn't a
-# suffix of one of these is refused, so the agent can't be steered into reading
-# an arbitrary/malicious site (prompt-injection / bad-code surface). This is
-# additive to the SSRF block (which is always enforced and cannot be disabled).
-# ``example.com``/``example.org`` are IANA doc-reserved and safe to allow.
-_DEFAULT_FETCH_ALLOWLIST = frozenset({
-    "example.com", "example.org",
-    # language / package docs + registries
-    "python.org", "readthedocs.io", "readthedocs.org", "pypi.org",
-    "npmjs.com", "nodejs.org", "developer.mozilla.org", "pkg.go.dev",
-    "go.dev", "docs.rs", "crates.io", "rubygems.org", "packagist.org",
-    # code hosts / Q&A
-    "github.com", "githubusercontent.com", "gitlab.com", "stackoverflow.com",
-    "stackexchange.com",
-    # major provider / cloud / framework docs
-    "ai.google.dev", "developers.google.com", "cloud.google.com",
-    "platform.openai.com", "docs.anthropic.com", "learn.microsoft.com",
-    "docs.aws.amazon.com", "developer.apple.com", "huggingface.co",
-    "palletsprojects.com", "fastapi.tiangolo.com", "djangoproject.com",
-    "react.dev", "vuejs.org", "angular.io", "vitejs.dev", "expressjs.com",
-    "tailwindcss.com", "stripe.com", "twilio.com",
-})
-
-
-def _fetch_allowlist() -> frozenset:
-    """Default allowlist plus any domains from ``CGX_FETCH_ALLOWLIST`` (CSV)."""
-    extra = os.environ.get("CGX_FETCH_ALLOWLIST", "")
-    if not extra.strip():
-        return _DEFAULT_FETCH_ALLOWLIST
-    return _DEFAULT_FETCH_ALLOWLIST | {
-        d.strip().lower().lstrip(".") for d in extra.split(",") if d.strip()}
-
-
-def _host_allowed(host: str) -> bool:
-    """True if ``host`` matches (is a subdomain of) an allowlisted domain.
-
-    Bypassed entirely when ``CGX_FETCH_ALLOW_ANY`` is set truthy -- for a user
-    who wants the agent to read any public host (still SSRF-blocked).
-    """
-    if os.environ.get("CGX_FETCH_ALLOW_ANY", "").strip().lower() in (
-            "1", "true", "yes", "on"):
-        return True
-    h = (host or "").strip().lower().rstrip(".")
-    return any(h == d or h.endswith("." + d) for d in _fetch_allowlist())
-
-
-def _fetch_refusal(host: str) -> Optional[str]:
-    """Reason to refuse fetching ``host`` (SSRF or not-allowlisted), else None.
-
-    SSRF (private/loopback) is a hard block; the allowlist is the "don't read
-    the wrong external place" control and is user-extensible.
-    """
-    if _host_is_blocked(host):
-        return f"private/loopback host ({host})"
-    if not _host_allowed(host):
-        return (f"host {host!r} is not in the fetch allowlist -- add it via the "
-                "CGX_FETCH_ALLOWLIST env var (comma-separated domains) or set "
-                "CGX_FETCH_ALLOW_ANY=1 to permit any public host")
-    return None
+# Network egress policy (SSRF block + domain allowlist) lives in the shared
+# guardrail so BOTH the built-in fetch tools and the MCP path enforce one rule.
+# Aliased to the local underscore names the fetch/redirect code already uses.
+from cgx.guardrails.net import (  # noqa: E402
+    host_allowed as _host_allowed,
+    host_is_blocked as _host_is_blocked,
+    host_refusal as _fetch_refusal,
+)
 
 
 def _html_to_text(s: str) -> str:

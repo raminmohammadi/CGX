@@ -102,6 +102,20 @@ def call_tool(args: Dict[str, Any], _ctx: Any) -> str:
         return "mcp_call requires a 'tool' name."
     if not _have_sdk():
         return _SDK_HINT
+    # Egress policy: an MCP tool that fetches a URL (e.g. mcp-server-fetch) must
+    # obey the same SSRF block + domain allowlist as the built-in fetch_url, so
+    # switching to MCP doesn't lose the "don't reach internal / arbitrary hosts"
+    # guarantee. Screen every URL-valued argument before dispatching.
+    try:
+        from cgx.guardrails.net import find_urls, url_refusal
+        for u in find_urls(arguments):
+            refusal = url_refusal(u)
+            if refusal:
+                return (f"[BLOCKED] MCP {name}/{tool} refused: {refusal}. "
+                        "Adjust the URL, or set CGX_FETCH_ALLOWLIST / "
+                        "CGX_FETCH_ALLOW_ANY to permit it.")
+    except Exception:  # pragma: no cover - guardrail is best-effort
+        pass
     try:
         import asyncio
         result = asyncio.run(_call_tool_async(server, tool, arguments))
