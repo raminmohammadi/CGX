@@ -432,3 +432,39 @@ def test_verify_summary_green_reports_passed():
     env = {"outcome": "passed", "output": ""}
     s = sv._verify_summary(["a.py"], ["a.py"], [], [], env, True)
     assert s.startswith("verified") and "tests passed" in s
+
+
+# --------------------- behavioural acceptance gate ---------------------
+
+def test_acceptance_failure_gates_verify(tmp_path, monkeypatch):
+    from cgx.session.tasks.acceptance import AcceptanceResult
+    (tmp_path / "app.py").write_text("x = 1\n", encoding="utf-8")
+    monkeypatch.setattr(sv, "_run_acceptance", lambda contracts, root:
+                        AcceptanceResult(outcome="failed",
+                                         reason="1/1 declared routes errored",
+                                         failures=["GET / -> HTTP 500"]))
+    monkeypatch.setattr(sv, "_dynamic_repair", lambda *a, **k: [])
+    res = _run(tmp_path, _plan(tmp_path, ["app.py"]))
+    assert res.outputs["verify_ok"] is False
+    assert res.artifact.content["acceptance"]["outcome"] == "failed"
+    assert "acceptance failed" in res.outputs["summary"]
+
+
+def test_acceptance_pass_keeps_verify_green(tmp_path, monkeypatch):
+    from cgx.session.tasks.acceptance import AcceptanceResult
+    (tmp_path / "app.py").write_text("x = 1\n", encoding="utf-8")
+    monkeypatch.setattr(sv, "_run_acceptance", lambda contracts, root:
+                        AcceptanceResult(outcome="passed",
+                                         reason="1 routes responded",
+                                         checks_run=1))
+    res = _run(tmp_path, _plan(tmp_path, ["app.py"]))
+    assert res.outputs["verify_ok"] is True
+    assert res.artifact.content["acceptance"]["outcome"] == "passed"
+
+
+def test_acceptance_skip_is_advisory(tmp_path):
+    # No run command declared -> acceptance SKIPS and must not block a green tree.
+    (tmp_path / "app.py").write_text("x = 1\n", encoding="utf-8")
+    res = _run(tmp_path, _plan(tmp_path, ["app.py"]))
+    assert res.outputs["verify_ok"] is True
+    assert res.artifact.content["acceptance"]["outcome"] == "skipped"

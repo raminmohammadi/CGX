@@ -665,13 +665,40 @@ def swarm_verify(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     # disk or unparseable). Threading the raw, never-cleared list into the
     # verdict is what previously sank a fully-repaired tree.
     still_failed = [p for p in failed_paths if p in gaps]
-    verify_ok = structural_ok and not still_failed and not tests_red
+    structurally_green = structural_ok and not still_failed and not tests_red
+
+    # Independent, objective-grounded behavioural acceptance: only when the tree
+    # is otherwise green (no point booting a broken tree) AND the plan declared
+    # a run command. Its checks come from the declared endpoints, not the model
+    # -- so a stub cannot also weaken them. A genuine route error gates and earns
+    # ONE impl-only repair; every environmental case (no command, no bind,
+    # toolchain missing) is an advisory SKIP that never blocks.
+    accept = _run_acceptance(contracts, project_root) if structurally_green \
+        else None
+    if accept is not None and accept.outcome == "failed":
+        impl_paths = [p for p in paths if not _is_pytest_test_path(p)]
+        failure_text = (
+            "ACCEPTANCE FAILURE: the running application errored on declared "
+            "routes (this is a real behavioural defect a unit test missed):\n"
+            + "\n".join(accept.failures)
+            + "\n\nFix the IMPLEMENTATION so these routes respond without a "
+            "server error. Do NOT edit tests.")
+        contents = _collect_contents(paths, project_root)
+        swarm_beat(project_root, "verify", "acceptance_repair",
+                   failures=accept.failures)
+        _dynamic_repair({"output": failure_text}, [], contents, goal,
+                        project_root, deps.provider, impl_paths, specs)
+        accept = _run_acceptance(contracts, project_root)
+    acceptance_ok = accept.ok if accept is not None else True
+
+    verify_ok = structurally_green and acceptance_ok
 
     # A human-readable one-liner so a not-green run explains itself concretely
     # ("built N/M files; tests failed: <names>") instead of the UI / CLI showing
     # a bare "session failed". Surfaced on the terminal task by the router
     # (see _swarm_terminal_session_actions) and shown in the dashboard.
-    summary = _verify_summary(paths, built, gaps, still_failed, env, verify_ok)
+    summary = _verify_summary(paths, built, gaps, still_failed, env, verify_ok,
+                              accept)
 
     content = {
         "work_plan_artifact_id": work_plan_id,
@@ -686,6 +713,9 @@ def swarm_verify(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         "failed_paths": still_failed,
         "env": env,
         "structural_ok": structural_ok,
+        "acceptance": ({"outcome": accept.outcome, "reason": accept.reason,
+                        "failures": accept.failures}
+                       if accept is not None else None),
         "verify_ok": verify_ok,
         "summary": summary,
     }
@@ -705,9 +735,30 @@ def swarm_verify(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
                  "project_root": project_root})
 
 
+def _run_acceptance(contracts: Dict[str, Any], root: str):
+    """Behavioural acceptance against a plan-declared server; never raises.
+
+    Advisory-degrading: returns a SKIPPED result (which does not block) unless a
+    declared route genuinely errors. Kept in the executor (not the pure module)
+    so it can resolve the project interpreter and emit a telemetry beat.
+    """
+    try:
+        from pathlib import Path
+        from cgx.codegen.test_runner import _project_python_exe
+        from cgx.session.tasks.acceptance import run_acceptance
+        result = run_acceptance(contracts, root,
+                                python_exe=_project_python_exe(Path(root)))
+        swarm_beat(root, "verify", "acceptance", outcome=result.outcome,
+                   reason=result.reason, checks=result.checks_run)
+        return result
+    except Exception as e:  # pragma: no cover - acceptance is best-effort
+        swarm_beat(root, "verify", "acceptance_error", error=repr(e))
+        return None
+
+
 def _verify_summary(paths: List[str], built: List[str], gaps: List[str],
                     still_failed: List[str], env: Dict[str, Any],
-                    verify_ok: bool) -> str:
+                    verify_ok: bool, accept: Any = None) -> str:
     """A concise, human-readable outcome line for a swarm run.
 
     Distinguishes a green build from a *partial* one (most files built, one
@@ -731,5 +782,12 @@ def _verify_summary(paths: List[str], built: List[str], gaps: List[str],
             parts.append("tests/build failed")
     else:
         parts.append("tests not run")
+    # Only surface acceptance when it actually ran a verdict (passed/failed);
+    # an advisory skip stays quiet so it never implies a behavioural guarantee
+    # that was not checked.
+    if accept is not None and getattr(accept, "outcome", "skipped") == "failed":
+        parts.append(f"acceptance failed: {accept.reason}")
+    elif accept is not None and getattr(accept, "outcome", "") == "passed":
+        parts.append("acceptance passed")
     head = "verified" if verify_ok else "partial build"
     return f"{head}: " + "; ".join(parts)
