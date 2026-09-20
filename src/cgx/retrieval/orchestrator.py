@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import concurrent.futures
 import threading
 
 """
@@ -635,7 +634,13 @@ class HybridRetriever:
         lists_for_rrf: List[List[Dict[str, Any]]] = []
         provenance: Dict[str, Dict[str, Any]] = {}
 
-        # --- semantic per view (intent + impl) -- run both views in parallel ---
+        # --- semantic per view (intent + impl) -- searched SERIALLY ---
+        # Both views embed the SAME query with the (torch) embedder; running
+        # them in parallel threads means two concurrent torch forward passes on
+        # one model instance, which is not thread-safe and -- alongside faiss --
+        # segfaults the interpreter on multi-core machines (the query path of
+        # `cgx query`/`cgx ask`/the UI). The two searches are tiny; serial costs
+        # nothing measurable and is crash-free everywhere.
         available_views = [(v, k) for v, k in (("intent", cfg.k_intent), ("impl", cfg.k_impl))
                            if v in self.tv.available_views()]
 
@@ -643,8 +648,7 @@ class HybridRetriever:
             view, k = view_k
             return view, self.tv.search_view(view, query, embedder=embedder, top_k=k)
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as _ex:
-            view_results = list(_ex.map(_search_view, available_views))
+        view_results = [_search_view(vk) for vk in available_views]
 
         for view, hits in view_results:
             lists_for_rrf.append([{"chunk_id": h["chunk_id"], "rank": h["rank"]} for h in hits])
