@@ -86,12 +86,38 @@ def run_gate(evals_dir: str) -> Tuple[Dict[str, Any], bool]:
     report["failures"] += _check_thresholds(
         "recovery", rc["aggregate"], thresholds.get("recovery", {}),
     )
+    # --- Lexical retrieval (always runs; NO torch/faiss needed) ------------
+    # Isolates the BM25/lexical arm against content queries whose signal lives
+    # in docstrings/comments/bodies rather than symbol names. The fused eval
+    # below uses a bag-of-words embedder that masks lexical-coverage gaps, so
+    # this is the honest measure of "does the lexical index cover content".
+    lex_golden_path = os.path.join(evals_dir, "retrieval_lexical_golden.jsonl")
+    lex_repo = os.path.join(evals_dir, "retrieval_repo")
+    if os.path.exists(lex_golden_path) and os.path.isdir(lex_repo):
+        lx_golden = _load_jsonl(lex_golden_path)
+        records = _retrieval.build_sample_records(lex_repo)
+        lx = _retrieval.evaluate_retrieval_lexical(lx_golden, records)
+        report["sections"]["retrieval_lexical"] = lx
+        report["failures"] += _check_thresholds(
+            "retrieval_lexical", lx["aggregate"],
+            thresholds.get("retrieval_lexical", {}),
+        )
+    else:
+        report["sections"]["retrieval_lexical"] = {"skipped": "no lexical golden set"}
+
     if _faiss_available():
         rt_golden = _load_jsonl(os.path.join(evals_dir, "retrieval_golden.jsonl"))
-        embedder = _retrieval.DeterministicEmbedder(dim=32)
+        # Prefer the real embedding model when its deps are installed so the
+        # fused eval measures true semantic quality; fall back to the
+        # deterministic bag-of-words embedder (torch-free) otherwise. The
+        # deterministic embedder is a WEAK proxy (perfect bag-of-words over the
+        # full chunk text), so it validates fusion/ranking wiring but not
+        # semantic recall -- hence the lexical gate above and the real path here.
+        embedder, embedder_kind = _resolve_eval_embedder()
         with tempfile.TemporaryDirectory(prefix="cgx-eval-") as tmp:
             artifacts = _retrieval.build_sample_index(sample_repo, tmp, embedder)
             rt = _retrieval.evaluate_retrieval(rt_golden, artifacts, embedder)
+        rt["embedder_kind"] = embedder_kind
         report["sections"]["retrieval"] = rt
         report["failures"] += _check_thresholds(
             "retrieval", rt["aggregate"], thresholds.get("retrieval", {}),
@@ -101,3 +127,30 @@ def run_gate(evals_dir: str) -> Tuple[Dict[str, Any], bool]:
         logger.warning("eval.harness: faiss absent -- retrieval gate skipped")
 
     return report, not report["failures"]
+
+
+def _resolve_eval_embedder() -> Tuple[Any, str]:
+    """Return ``(embedder, kind)`` -- the real ST model when available, else the
+    deterministic bag-of-words fallback. ``kind`` is recorded in the report so a
+    reader can tell which fidelity the fused numbers reflect."""
+    import importlib.util
+    if importlib.util.find_spec("sentence_transformers") is not None:
+        try:
+            from sentence_transformers import SentenceTransformer
+
+            class _STEmbedder:
+                model_name = "jinaai/jina-embeddings-v2-base-code"
+
+                def __init__(self) -> None:
+                    self._m = SentenceTransformer(
+                        self.model_name, trust_remote_code=True,
+                    )
+
+                def encode(self, texts):  # type: ignore[no-untyped-def]
+                    return self._m.encode(list(texts), normalize_embeddings=False)
+
+            return _STEmbedder(), "sentence-transformers/jina-v2-code"
+        except Exception as e:  # pragma: no cover - env dependent
+            logger.warning("eval.harness: real embedder unavailable (%s); "
+                           "using deterministic fallback", e)
+    return _retrieval.DeterministicEmbedder(dim=32), "deterministic-bow"

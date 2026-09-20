@@ -4,6 +4,10 @@
     "mrr": 0.4,
     "ndcg@5": 0.4
   },
+  "retrieval_lexical": {
+    "recall@5": 0.15,
+    "mrr": 0.15
+  },
   "codegen": {
     "expectation_match_rate": 1.0,
     "parse_rate": 0.6

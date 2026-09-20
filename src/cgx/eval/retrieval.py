@@ -85,6 +85,69 @@ def build_sample_index(sample_repo: str, out_dir: str, embedder: Any) -> Dict[st
     return res["out"]
 
 
+def build_sample_records(sample_repo: str) -> List[Dict[str, Any]]:
+    """Parse ``sample_repo`` into index records WITHOUT embeddings or faiss.
+
+    This is the torch-free / faiss-free path the lexical eval uses: it exercises
+    the exact record-builder (``make_index_records``) and lexical-helper tokens
+    that the BM25 arm indexes at query time, so a change to what the lexical
+    index covers is measured directly -- no embedding model required. Runs in
+    the "core" CI matrix that has neither torch nor faiss.
+    """
+    from cgx.parser.parse_codebase import parse_codebase
+    from cgx.graph.build_graph import build_knowledge_graph
+    from cgx.embeddings.records import make_index_records
+
+    res = parse_codebase(sample_repo)
+    if isinstance(res, tuple):
+        chunks, calls = res[0], (res[1] if len(res) > 1 else None)
+    else:
+        chunks, calls = res, None
+    G = build_knowledge_graph(chunks, calls or [])
+    return make_index_records(chunks, G)
+
+
+def evaluate_retrieval_lexical(
+    golden: Sequence[Dict[str, Any]],
+    records: List[Dict[str, Any]],
+    *,
+    top_k: int = 10,
+    k_values: Sequence[int] = (1, 5, 10),
+) -> Dict[str, Any]:
+    """Score the BM25/lexical arm IN ISOLATION against a content-query golden set.
+
+    The fused retrieval eval (:func:`evaluate_retrieval`) uses a bag-of-words
+    embedder whose semantic arm already matches any query word appearing
+    anywhere in the chunk text, which *masks* gaps in lexical field coverage.
+    This harness bypasses the embedder entirely and queries only
+    :class:`cgx.retrieval.lexical.LexicalIndex`, so a query whose signal lives
+    in a docstring / comment / body (not the symbol name) exposes exactly what
+    the lexical index does and does not cover. Embedder-independent by design.
+    """
+    from cgx.retrieval.lexical import LexicalIndex
+
+    idx = LexicalIndex.from_records(records)
+    per_query: List[Dict[str, Any]] = []
+    for item in golden:
+        q = str(item.get("query", ""))
+        relevant = list(item.get("relevant", []))
+        hits = idx.search(q, top_k=top_k)
+        hit_ids = [h.get("chunk_id") for h in hits]
+        scores = evaluate_query(hit_ids, relevant, k_values)
+        per_query.append({"query": q, "scores": scores, "hits": hit_ids[:5]})
+        logger.info("eval.retrieval.lexical: query=%r scores=%s", q, scores)
+
+    keys = per_query[0]["scores"].keys() if per_query else []
+    aggregate = {
+        key: M.mean([row["scores"][key] for row in per_query]) for key in keys
+    }
+    return {
+        "n_queries": len(per_query),
+        "per_query": per_query,
+        "aggregate": aggregate,
+    }
+
+
 def evaluate_retrieval(
     golden: Sequence[Dict[str, Any]],
     artifacts: Dict[str, str],

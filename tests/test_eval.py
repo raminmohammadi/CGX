@@ -189,6 +189,33 @@ def test_run_gate_passes_on_repo_golden():
     assert rc_agg["action_match_rate"] == 1.0
     assert rc_agg["never_worse_rate"] == 1.0
     assert rc_agg["determinism_ok"] == 1.0
+    # Lexical retrieval gate runs unconditionally (no torch/faiss needed).
+    assert "retrieval_lexical" in report["sections"]
+    assert "aggregate" in report["sections"]["retrieval_lexical"]
+
+
+def test_lexical_eval_isolates_the_bm25_arm():
+    """The lexical eval must run WITHOUT torch/faiss and score content queries.
+
+    It exercises the exact record-builder + LexicalIndex the query path uses, so
+    a change to lexical field coverage is measured directly. The identifier-
+    overlap control query is retrievable regardless of the fix, which makes it a
+    stable anchor; the content queries are what the Phase-1 BM25 fix must lift.
+    """
+    golden = [
+        {"query": "issue a refund against a paid invoice",
+         "relevant": ["routes.py::function::refund_invoice"]},
+        {"query": "exponential backoff on HTTP 429 rate limiting",
+         "relevant": ["client.py::function::fetch"]},
+    ]
+    records = RT.build_sample_records(str(Path(EVALS_DIR) / "retrieval_repo"))
+    assert records, "fixture repo produced no records"
+    out = RT.evaluate_retrieval_lexical(golden, records, top_k=10)
+    assert out["n_queries"] == 2
+    # Control query (identifier overlap) is always found.
+    ctrl = out["per_query"][0]["scores"]
+    assert ctrl["recall@5"] == pytest.approx(1.0)
+    assert ctrl["mrr"] > 0.0
 
 
 def test_retrieval_end_to_end_over_sample_repo(tmp_path):

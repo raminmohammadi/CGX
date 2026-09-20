@@ -1,0 +1,6 @@
+{"query": "exponential backoff on HTTP 429 rate limiting", "relevant": ["client.py::function::fetch"], "note": "signal only in body comments, not in name/docstring"}
+{"query": "reverse a charge and credit the payment method", "relevant": ["billing.md::doc::refunds"], "note": "doc body prose, not the heading word"}
+{"query": "upsert a row into the accounts table", "relevant": ["UserRepository.save"], "note": "signal in docstring + inline comment, generic method name"}
+{"query": "lowercase the keys and strip whitespace from a payload", "relevant": ["client.py::function::normalize"], "note": "signal in docstring + comment + body"}
+{"query": "suspend a delinquent account after failed payment retries", "relevant": ["billing.md::doc::dunning"], "note": "doc body prose, heading word absent from query"}
+{"query": "issue a refund against a paid invoice", "relevant": ["routes.py::function::refund_invoice"], "note": "control: identifier overlap, should pass even before the fix"}
