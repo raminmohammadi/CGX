@@ -190,6 +190,21 @@ def _extract_symbol_tokens(q: str) -> List[str]:
     return expanded
 
 
+def _extract_quoted_symbols(q: str) -> List[str]:
+    """Identifier tokens the user EXPLICITLY delimited with quotes/backticks.
+
+    These are strong, intended references ("where is `build_two_view_indices`
+    used?") and get the dominant symbol boost. Bare identifier-like words
+    scraped from ordinary prose (via :func:`_extract_symbol_tokens`) only get a
+    gentle nudge, so a question like "how do we process a payment" no longer
+    lets a function literally named ``process`` leapfrog the semantically
+    correct answer."""
+    q = q or ""
+    quoted = re.findall(r"[`\"]([A-Za-z_][A-Za-z0-9_]*)[`\"]", q)
+    expanded = expand_with_subwords(quoted, min_len=_MIN_SYMBOL_LEN)
+    return sorted({t for t in expanded if t not in SYMBOL_STOPWORDS})
+
+
 def _cid_segments(cid: str) -> List[str]:
     """Return the '::'-separated segments of a chunk id, lowercased."""
     return [seg.lower() for seg in str(cid).split("::") if seg]
@@ -214,25 +229,36 @@ class HybridConfig:
     agg_decay: float = 0.75
     agg_max_per_group: int = 6
 
-    # Rerank knobs (post-RRF). The defaults preserve historical behavior.
-    # Symbol-match boost applied to chunks whose name/id matches a quoted or
-    # identifier-like token from the query. RRF scores at k=60 sit around
-    # 0.01–0.05 per signal, so 0.5 deliberately dominates when the user
-    # explicitly names a symbol.
-    symbol_boost: float = 0.5
-    # Graph-proximity bonus added to chunks reachable from top seeds. The
-    # actual per-chunk increment is ``graph_bonus / (depth + 1)`` so closer
-    # neighbors get more credit. Set to 0.0 to disable.
-    graph_bonus: float = 0.2
+    # Rerank knobs (post-RRF). Boosts are expressed as MULTIPLES of the top RRF
+    # score (``rrf_scale``), not absolute constants, so they stay commensurate
+    # with the fused distribution regardless of ``rrf_k``. Previously these were
+    # absolute (symbol +0.5, graph 0.2) while RRF scores sit around 0.01-0.05,
+    # so a single boost was 2-30x a fused score and OVERRODE the ranking instead
+    # of nudging it.
+    #
+    # ``symbol_boost`` applies to BARE identifier-like tokens scraped from prose
+    # (a gentle nudge). ``symbol_boost_quoted`` applies to tokens the user
+    # explicitly quoted/backticked (an intended reference -> dominant).
+    symbol_boost: float = 0.5          # x rrf_scale, bare NL tokens (nudge)
+    symbol_boost_quoted: float = 4.0   # x rrf_scale, quoted symbols (dominate)
+    # Graph-proximity bonus for chunks reachable from top seeds; per-chunk
+    # increment is ``graph_bonus * rrf_scale / (depth + 1)`` so closer neighbors
+    # get more credit and the bonus never dwarfs the semantic/lexical signal.
+    # Set to 0.0 to disable.
+    graph_bonus: float = 0.5           # x rrf_scale
 
-    # Optional cross-encoder reranker over the top-N fused chunks. Disabled
-    # by default to keep the no-torch path clean. When enabled, the rest of
-    # the fused ordering is preserved as a tiebreaker for chunks below
-    # ``reranker_top_n``.
+    # Optional cross-encoder reranker over the top-N fused chunks. Opt-in
+    # (threaded per profile: cloud kinds default on, local/custom off -- see
+    # cgx.answer.profiles.default_reranker_for_kind) to keep the no-torch path
+    # clean and avoid its per-query latency by default. ``reranker_weight`` is a
+    # convex blend with the (normalised) RRF score -- previously 1.0, which
+    # entirely DISCARDED the fused/symbol/graph ordering (a cross-encoder miss
+    # then had no fused signal to fall back on); 0.7 lets the cross-encoder lead
+    # while the fused order still breaks ties and cushions bad CE scores.
     enable_reranker: bool = False
     reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
     reranker_top_n: int = 30
-    reranker_weight: float = 1.0
+    reranker_weight: float = 0.7
 
 
 # ---------------------------
@@ -750,6 +776,12 @@ class HybridRetriever:
 
         logger.debug("fused %s", fused)
 
+        # Scale for the graph/symbol boosts below: the top fused score. Boosts
+        # are expressed as multiples of this so they stay commensurate with the
+        # RRF distribution (which depends on rrf_k and the number of signals)
+        # instead of being absolute constants that dwarf it.
+        rrf_scale = fused[0][1] if fused else 0.0
+
         # --- graph expansion (required shape; no-op if G is None) ---
         """
         Expand the top fused chunks into their neighbors on the knowledge graph.
@@ -797,18 +829,19 @@ class HybridRetriever:
             if cid not in self._rec_by_id and cid not in in_fused:
                 continue
             provenance.setdefault(cid, {}).update({"graph_depth": depth})
-        if cfg.graph_bonus > 0.0 and graph_depths:
+        if cfg.graph_bonus > 0.0 and graph_depths and rrf_scale > 0.0:
+            graph_unit = cfg.graph_bonus * rrf_scale
             bumped: List[Tuple[str, float]] = []
             for c, sc in fused:
                 d = graph_depths.get(c)
-                bumped.append((c, sc + cfg.graph_bonus / (d + 1)) if d is not None else (c, sc))
+                bumped.append((c, sc + graph_unit / (d + 1)) if d is not None else (c, sc))
             fused = bumped
             for cid, depth in graph_depths.items():
                 if cid in in_fused:
                     continue
                 if cid not in self._rec_by_id:
                     continue
-                fused.append((cid, cfg.graph_bonus / (depth + 1)))
+                fused.append((cid, graph_unit / (depth + 1)))
 
         logger.debug("fused after graph %s", fused)
 
@@ -842,8 +875,11 @@ class HybridRetriever:
           since the user explicitly mentioned it.
         """
         sym_tokens = _extract_symbol_tokens(query)
-        if sym_tokens and cfg.symbol_boost > 0.0:
+        quoted_set = set(_extract_quoted_symbols(query))
+        if sym_tokens and rrf_scale > 0.0 and (cfg.symbol_boost > 0.0 or cfg.symbol_boost_quoted > 0.0):
             tok_set = set(sym_tokens)
+            bare_unit = cfg.symbol_boost * rrf_scale
+            quoted_unit = cfg.symbol_boost_quoted * rrf_scale
             boosted: Dict[str, float] = {}
             for cid, _ in list(fused):
                 rec = self._rec_by_id.get(cid) or {}
@@ -852,9 +888,15 @@ class HybridRetriever:
                 # Require exact match against the record name OR a full '::'
                 # segment of the chunk id, never a bare substring (avoids
                 # short tokens like 'add' matching 'add_calls_edges' etc.).
-                if (nm and nm in tok_set) or (segs & tok_set):
-                    provenance.setdefault(cid, {})["symbol_match"] = True
-                    boosted[cid] = cfg.symbol_boost
+                if not ((nm and nm in tok_set) or (segs & tok_set)):
+                    continue
+                # A match on an EXPLICITLY quoted/backticked symbol dominates
+                # (the user named it); a match on a bare prose token only nudges.
+                is_quoted = (nm and nm in quoted_set) or bool(segs & quoted_set)
+                prov = provenance.setdefault(cid, {})
+                prov["symbol_match"] = True  # bool kept for back-compat consumers
+                prov["symbol_match_kind"] = "quoted" if is_quoted else "bare"
+                boosted[cid] = quoted_unit if is_quoted else bare_unit
             if boosted:
                 fused = [(c, sc + boosted.get(c, 0.0)) for c, sc in fused]
 
@@ -965,7 +1007,12 @@ class HybridRetriever:
                 items = sorted(items, key=lambda kv: (-kv[1], kv[0]))
                 best = items[0][1]
                 extra = sum((decay ** (i - 1)) * sc for i, (_, sc) in enumerate(items[1:max_per_group], start=1))
-                total = best + alpha * extra
+                # Cap the corroboration bonus at ``best`` so a container's rank
+                # stays anchored to its single most-relevant chunk. Without the
+                # cap the bonus is an unbounded (decayed) SUM over members, so a
+                # large file full of mediocre chunks outranks the file holding
+                # the one truly-relevant chunk -- purely on member count.
+                total = best + alpha * min(extra, best)
                 out.append((gid, float(total), items[:max_per_group]))
             out.sort(key=lambda kv: (-kv[1], kv[0]))
             return out
