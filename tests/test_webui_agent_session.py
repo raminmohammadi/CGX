@@ -1214,3 +1214,43 @@ def test_list_sessions_nonexistent_root_is_not_created(tmp_path):
     result = asyncio.run(list_agent_sessions(project_root=ghost))
     assert result == []
     assert not _os.path.exists(ghost)
+
+
+# --------------- project-root validation on create (clean 400) ---------------
+
+def test_create_rejects_project_root_with_missing_parent(tmp_path):
+    """A mistyped root whose parent chain does not exist must be a clean 400,
+    NOT a 500 from mkdir walking up into a protected dir like /Users -- and it
+    must not create any directory."""
+    import os as _os
+    from cgx.webui.routes.agent_session import _validate_project_root_writable
+    bad = str(tmp_path / "no_such_parent" / "proj")
+    with pytest.raises(HTTPException) as ei:
+        _validate_project_root_writable(bad)
+    assert ei.value.status_code == 400
+    assert "parent" in str(ei.value.detail).lower()
+    assert not _os.path.exists(bad)
+    assert not _os.path.exists(str(tmp_path / "no_such_parent"))
+
+
+def test_create_allows_new_leaf_under_existing_parent(tmp_path):
+    # A not-yet-created project folder whose parent exists is fine: the
+    # greenfield/swarm build creates the leaf. Validation must not reject it.
+    from cgx.webui.routes.agent_session import _validate_project_root_writable
+    _validate_project_root_writable(str(tmp_path / "new_proj"))  # no raise
+
+
+def test_validate_project_root_existing_dir_and_none_ok(tmp_path):
+    from cgx.webui.routes.agent_session import _validate_project_root_writable
+    _validate_project_root_writable(str(tmp_path))  # existing dir: no raise
+    _validate_project_root_writable(None)           # default store: no raise
+
+
+def test_create_rejects_project_root_that_is_a_file(tmp_path):
+    from cgx.webui.routes.agent_session import _validate_project_root_writable
+    f = tmp_path / "a_file"
+    f.write_text("x", encoding="utf-8")
+    with pytest.raises(HTTPException) as ei:
+        _validate_project_root_writable(str(f))
+    assert ei.value.status_code == 400
+    assert "not a directory" in str(ei.value.detail).lower()

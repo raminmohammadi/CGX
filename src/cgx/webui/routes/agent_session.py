@@ -433,9 +433,45 @@ def _normalize_project_root(project_root: Optional[str]) -> Optional[str]:
 
 # --------------------- routes ---------------------
 
+def _validate_project_root_writable(project_root: Optional[str]) -> None:
+    """Reject an unusable project root with a clean 400 (not an opaque 500).
+
+    Opening a session creates a ``.cgx`` dir under the project root. When the
+    root's parent chain does not exist -- almost always a mistyped path (a wrong
+    user name, a folder that was never created) -- a blind
+    ``mkdir(parents=True)`` walks up and tries to create directories in
+    protected locations (e.g. ``/Users``), which escapes as a 500
+    ``PermissionError``. Accept an existing directory, or a not-yet-created leaf
+    whose parent IS an existing writable directory (greenfield/swarm creates the
+    leaf); otherwise fail fast with an actionable message so the user fixes the
+    path instead of the harness silently trying to create system folders.
+    """
+    if project_root is None:
+        return
+    if os.path.isdir(project_root):
+        return
+    if os.path.exists(project_root):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Project root is not a directory: {project_root}")
+    parent = os.path.dirname(os.path.normpath(project_root)) or os.sep
+    if not os.path.isdir(parent):
+        raise HTTPException(
+            status_code=400,
+            detail=(f"Project root {project_root!r} does not exist and its "
+                    f"parent directory {parent!r} is missing. Check the path "
+                    "(a typo in the folder or user name?)."))
+    if not os.access(parent, os.W_OK):
+        raise HTTPException(
+            status_code=400,
+            detail=(f"Cannot create the project folder under {parent!r}: "
+                    "permission denied."))
+
+
 @router.post("", response_model=AgentSessionState)
 async def create_session(req: AgentSessionCreateRequest) -> AgentSessionState:
     project_root = _normalize_project_root(req.project_root)
+    _validate_project_root_writable(project_root)
     runner = _get_runner(project_root)
     mode = _resolve_mode(req)
     session = await asyncio.to_thread(
