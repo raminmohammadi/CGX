@@ -30,6 +30,11 @@ function currentUrl(): string {
 
 function openOrFocus(context: vscode.ExtensionContext): void {
   if (currentPanel) {
+    // Reload the framed UI, don't just reveal it: the served bundle may have
+    // changed (a rebuild) or the server may have restarted since the panel was
+    // opened, and the webview never refreshes on its own -- retainContextWhenHidden
+    // keeps the old document alive. Re-rendering re-fetches a fresh page.
+    currentPanel.webview.html = renderHtml(currentUrl());
     currentPanel.reveal(vscode.ViewColumn.Active);
     return;
   }
@@ -54,9 +59,13 @@ function openOrFocus(context: vscode.ExtensionContext): void {
 
 function renderHtml(url: string): string {
   // The CGX UI is served as a full HTML document, so we frame it as
-  // an iframe filling the panel. We escape the URL so a malicious
-  // setting value can't break out of the attribute.
-  const safe = url.replace(/"/g, "&quot;");
+  // an iframe filling the panel. A cache-busting query param forces the
+  // iframe to load a fresh document on every render (open / refresh), so a
+  // rebuilt bundle or a restarted server is never masked by a retained
+  // webview. We escape the URL so a malicious setting value can't break out
+  // of the attribute.
+  const busted = url + (url.includes("?") ? "&" : "?") + "_cgx=" + Date.now();
+  const safe = busted.replace(/"/g, "&quot;");
   return `<!doctype html>
 <html>
   <head>
