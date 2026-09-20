@@ -1994,3 +1994,37 @@ def test_cap_forced_symbol_hits_keeps_all_when_unambiguous():
     hits, ambiguous = _cap_forced_symbol_hits(raw)
     assert ambiguous is False
     assert len(hits) == 3
+
+
+def test_citation_resolution_tolerates_shortened_ids():
+    from cgx.answer.engine import (
+        _resolve_citation, _sanitize_inline_citations, _sanitize_citations,
+    )
+    allowed = ["/home/u/repo/pkg/foo.py::function::bar",
+               "/home/u/repo/pkg/baz.py::class::Widget"]
+    # Exact, repo-relative (dropped abs prefix), and bare kind::symbol tail all map
+    # back to the canonical id; unknown -> None.
+    assert _resolve_citation(allowed[0], allowed) == allowed[0]
+    assert _resolve_citation("pkg/foo.py::function::bar", allowed) == allowed[0]
+    assert _resolve_citation("function::bar", allowed) == allowed[0]
+    assert _resolve_citation("nope::qux", allowed) is None
+    # Inline: shortened citations are canonicalized, fabricated ones stripped.
+    out = _sanitize_inline_citations(
+        "See [[pkg/foo.py::function::bar]], [[fabricated::thing]], [[class::Widget]].",
+        allowed,
+    )
+    assert "[[/home/u/repo/pkg/foo.py::function::bar]]" in out
+    assert "fabricated" not in out
+    assert "[[/home/u/repo/pkg/baz.py::class::Widget]]" in out
+    # Structured citations are canonicalized too.
+    assert _sanitize_citations([{"chunk_id": "function::bar"}, {"chunk_id": "x"}],
+                               allowed) == [{"chunk_id": allowed[0]}]
+
+
+def test_citation_resolution_drops_ambiguous_tail():
+    from cgx.answer.engine import _resolve_citation
+    # Same symbol name in two files -> ambiguous tail -> not resolved (no guess).
+    allowed = ["a/x.py::method::A.save", "b/y.py::method::B.save"]
+    assert _resolve_citation("save", allowed) is None
+    # But a fuller path-suffix disambiguates.
+    assert _resolve_citation("x.py::method::A.save", allowed) == allowed[0]

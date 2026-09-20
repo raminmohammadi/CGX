@@ -545,16 +545,51 @@ def _hits_from_records(indices: Dict[str, Any], records_path: Optional[str], sym
 # Matches ``[[chunk_id]]`` citation tokens in Markdown text
 _INLINE_CITATION_RE = re.compile(r"\[\[([^\[\]]+)\]\]")
 
+
+def _citation_tail(cid: str) -> str:
+    """Last two ``::`` segments of a chunk id (``kind::symbol``), lowercased."""
+    parts = str(cid).split("::")
+    return "::".join(parts[-2:]).lower() if len(parts) >= 2 else str(cid).lower()
+
+
+def _resolve_citation(cited: str, allowed_ids: Sequence[str]) -> Optional[str]:
+    """Map a model-emitted citation to a canonical allowed chunk_id.
+
+    SOURCES show the full ABSOLUTE chunk_id (``/home/u/repo/foo.py::function::bar``)
+    and the prompt asks the model to reproduce it verbatim. Small models routinely
+    emit only the repo-relative id (``foo.py::function::bar``) or the ``::symbol``
+    tail, so a verbatim-only check silently drops correct citations and the answer
+    reads as ungrounded. Match exactly, else by a UNIQUE path-suffix, else by a
+    UNIQUE ``kind::symbol`` tail; ambiguous or unknown -> None. Returns the
+    canonical id so callers can re-render it consistently.
+    """
+    cited = (cited or "").strip()
+    if not cited:
+        return None
+    allowed = list(allowed_ids)
+    if cited in set(allowed):
+        return cited
+    suffix = {a for a in allowed if a.endswith("/" + cited) or a.endswith("::" + cited) or a.endswith(cited)}
+    if len(suffix) == 1:
+        return next(iter(suffix))
+    ct = _citation_tail(cited)
+    tail = {a for a in allowed if _citation_tail(a) == ct}
+    if len(tail) == 1:
+        return next(iter(tail))
+    return None
+
+
 def _sanitize_inline_citations(answer_md: str, allowed_ids: Sequence[str]) -> str:
-    """Strip or clean inline [[chunk_id]] tokens that are not present in allowed_ids."""
+    """Strip unknown inline [[chunk_id]] tokens; canonicalize resolvable ones.
+
+    A resolvable-but-shortened citation (dropped abs-path prefix / bare tail) is
+    rewritten to its canonical allowed id rather than dropped, so grounding
+    survives small-model id mangling."""
     if not answer_md or not isinstance(answer_md, str):
         return str(answer_md or "")
-    allowed_set = set(allowed_ids)
-    def _replace_cite(m: re.Match) -> str:
-        cid = m.group(1).strip()
-        if cid in allowed_set:
-            return m.group(0)
-        return ""
+    def _replace_cite(m: "re.Match") -> str:
+        canonical = _resolve_citation(m.group(1), allowed_ids)
+        return f"[[{canonical}]]" if canonical else ""
     cleaned = _INLINE_CITATION_RE.sub(_replace_cite, answer_md)
     cleaned = re.sub(r' +\.', '.', cleaned)
     cleaned = re.sub(r' +,', ',', cleaned)
@@ -565,10 +600,10 @@ def _sanitize_citations(citations, allowed_ids):
     if not isinstance(citations, (list, tuple)):
         return out
     for c in citations:
-        if isinstance(c, dict) and "chunk_id" in c and c["chunk_id"] in allowed_ids:
-            out.append({"chunk_id": c["chunk_id"]})
-        elif isinstance(c, str) and c in allowed_ids:
-            out.append({"chunk_id": c})
+        raw = c.get("chunk_id") if isinstance(c, dict) else (c if isinstance(c, str) else None)
+        canonical = _resolve_citation(raw, allowed_ids) if raw is not None else None
+        if canonical:
+            out.append({"chunk_id": canonical})
     seen = set(); dedup = []
     for c in out:
         if c["chunk_id"] not in seen:
@@ -1636,6 +1671,10 @@ def answer_with_llm_stream(
     allowed_ids = [s["chunk_id"] for s in sources]
     raw_cites = [{"chunk_id": m.group(1)} for m in _INLINE_CITATION_RE.finditer(answer_md)]
     citations = _sanitize_citations(raw_cites, allowed_ids)
+    # Strip fabricated inline [[id]] markers and canonicalize resolvable ones so
+    # the streamed answer can't render a citation to a chunk that was never in
+    # SOURCES (the blocking path already does this).
+    answer_md = _sanitize_inline_citations(answer_md, allowed_ids)
 
     answer_md = _shorten_chunk_refs(answer_md, root)
 
