@@ -256,3 +256,39 @@ def test_prompt_strategy_hardens_weak_models_and_frees_strong_ones():
     assert large["tier"] == "xlarge"
     assert large["reinforce_json"] is False
     assert large["plan_max_tokens"] == 2_000
+
+
+# ---------------------------------------------------------------------------
+# effective_context_window: budget must match the real (Ollama) KV cache
+# ---------------------------------------------------------------------------
+class _OllamaProv:
+    """Stand-in exposing the resolved num_ctx like OllamaProvider does."""
+    def __init__(self, model: str, num_ctx=None):
+        self.model = model
+        self.extra_options = {"num_ctx": num_ctx} if num_ctx else {}
+
+
+def test_effective_window_respects_ollama_num_ctx_cap():
+    from cgx.answer.model_caps import effective_context_window
+    # 128K-window model, but Ollama KV cache capped at 8192 -> effective 8192.
+    p = _OllamaProv("llama-3.1", num_ctx=8192)
+    assert get_model_context_window("llama-3.1") == 128_000
+    assert effective_context_window(p) == 8_192
+    # Tier + context-map budget follow the EFFECTIVE window, so SOURCES can't be
+    # sized past the KV cache and silently truncated by the server.
+    assert get_capability_tier(p) == "small"
+    assert get_context_map_budget(p)["total_chars"] == 6_000
+
+
+def test_effective_window_grows_with_user_num_ctx_override():
+    from cgx.answer.model_caps import effective_context_window
+    p = _OllamaProv("llama-3.1", num_ctx=32_768)
+    assert effective_context_window(p) == 32_768
+    assert get_capability_tier(p) == "medium"
+
+
+def test_effective_window_falls_back_to_registry_without_num_ctx():
+    from cgx.answer.model_caps import effective_context_window
+    # No num_ctx (e.g. cloud provider) -> full registry window / tier.
+    assert effective_context_window(_Prov("gemini-2.5-flash")) == 1_000_000
+    assert effective_context_window(_OllamaProv("llama-3.1")) == 128_000
