@@ -22,6 +22,7 @@ Supported modes
 - "callers_list"    : List all functions/classes that call a target symbol.
 - "callees_list"    : List all functions/classes that a target symbol calls.
 - "enumerate"       : Count/list API endpoints or routes deterministically.
+- "debug"           : Diagnose an error/exception/failure and propose a fix.
 """
 
 import re
@@ -38,7 +39,31 @@ Intent = Literal[
     "callers_list",
     "callees_list",
     "enumerate",
+    "debug",
 ]
+
+# Unambiguous malfunction phrases -> a debugging question regardless of symbols.
+_DEBUG_STRONG = (
+    "traceback", "stack trace", "stacktrace", "not working", "doesn't work",
+    "does not work", "isn't working", "is not working", "keeps failing",
+    "getting an error", "got an error", "throwing an error", "throws an error",
+    "raises an error", "raising an error", "debug this", "how do i fix",
+    "how to fix", "why is this failing", "what's wrong with", "whats wrong with",
+)
+# Error/failure word + a diagnostic verb -> debugging (e.g. "why does the
+# indexer fail", "fix the crash in parse"). Kept separate so a conceptual
+# "how does error handling work" (error word, no diagnostic verb) is NOT caught.
+_DEBUG_ERR_RE = re.compile(
+    # ``\w*error`` / ``\w*exception`` catch CamelCase exception names lowercased
+    # by the caller (KeyError -> keyerror, ValueError -> valueerror) as well as
+    # the bare words; ``raise`` variants signal a thrown exception.
+    r"\b(?:\w*error|\w*exception|traceback|crash(?:es|ing)?|"
+    r"fail(?:s|ed|ing)?|broken|regression|raise[sd]?|raising)\b"
+)
+_DEBUG_DIAG_RE = re.compile(
+    r"\b(why|fix|fixed|fixing|cause[ds]?|causing|diagnose|debug(?:ging)?|"
+    r"wrong|break(?:s|ing)?)\b"
+)
 
 _IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _QUOTED_IDENT_RE = re.compile(r"[`\"]([A-Za-z_][A-Za-z0-9_]*)[`\"]")
@@ -127,6 +152,16 @@ def detect_intent(question: str) -> Intent:
         return "callers_list"
     if has_sym and any(k in ql for k in ["functions called by", "callees of", "calls to ", "what does this function call", "what functions does"]):
         return "callees_list"
+
+    # Debugging: an error/failure to diagnose + fix. Placed before symbol_* /
+    # qa so "why is parse_codebase raising a KeyError" routes to a root-cause
+    # answer instead of a Purpose/Signature write-up (symbol_explain) triggered
+    # by the exception token. Guarded so conceptual questions that merely
+    # mention "error" (e.g. "how does error handling work") are not caught.
+    if any(k in ql for k in _DEBUG_STRONG) or (
+        _DEBUG_ERR_RE.search(ql) and _DEBUG_DIAG_RE.search(ql)
+    ):
+        return "debug"
 
     # Symbol location (explicit "where" phrasing)
     if any(k in ql for k in ["where is", "location of", "which file contains", "which file has", "find the file", "in which file"]):

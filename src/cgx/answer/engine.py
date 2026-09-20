@@ -632,6 +632,18 @@ SYSTEM_PROMPTS: Dict[str, str] = {
         "from SOURCES. Return JSON keys: answer_md, citations, "
         "suggested_changes, confidence. No prose outside JSON. "
     ) + ALLOWED_CITATION_NOTE,
+    "debug": (
+        "You are a senior engineer debugging a reported failure. Use ONLY the "
+        "SOURCES to reason about the actual code on the failure path. Structure "
+        "answer_md as: Likely root cause (the specific line/branch in SOURCES "
+        "that produces the error, with a [[chunk_id]] citation), Why it happens "
+        "(the conditions/inputs that trigger it), Fix (a concrete, minimal code "
+        "change grounded in SOURCES), How to verify (a check or test). If the "
+        "SOURCES do not contain the failing code, say exactly what to retrieve "
+        "next (a file/symbol/traceback frame) rather than guessing. Cite every "
+        "claim with [[chunk_id]]. Return JSON keys: answer_md, citations, "
+        "suggested_changes, confidence. No prose outside JSON. "
+    ) + ALLOWED_CITATION_NOTE,
 }
 
 
@@ -709,6 +721,14 @@ SYSTEM_PROMPTS_STREAM: Dict[str, str] = {
         "would touch; (3) one follow-up question asking which direction to pursue or "
         "what constraint matters most. Do NOT propose code edits and do NOT invent "
         "components absent from SOURCES. Do NOT wrap in JSON."
+    ),
+    "debug": (
+        "You are a senior engineer debugging a reported failure. Use ONLY the SOURCES "
+        "to reason about the actual code on the failure path. Reply in plain Markdown: "
+        "Likely root cause (the specific line/branch in SOURCES, cited [[chunk_id]]), "
+        "Why it happens, Fix (a concrete minimal change grounded in SOURCES), and How "
+        "to verify. If the failing code is not in SOURCES, say exactly what to retrieve "
+        "next instead of guessing. Cite every claim with [[chunk_id]]. Do NOT wrap in JSON."
     ),
 }
 
