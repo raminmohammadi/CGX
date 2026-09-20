@@ -23,6 +23,17 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import os
 import json
+import threading
+
+# Serializes the retrieval critical section (query embedding + faiss search +
+# graph/insertion work) PROCESS-WIDE. torch and faiss-cpu in one process are not
+# safe to drive from multiple threads at once: concurrent torch forward passes
+# on the shared model and concurrent OpenMP pools abort/segfault the interpreter
+# (reproduced on macOS; possible on Linux). The web UI serves sync request
+# handlers from uvicorn's threadpool, so two simultaneous asks would otherwise
+# embed + search in parallel and crash. The lock is uncontended (near-free) for
+# a single local user; concurrent requests queue instead of crashing.
+_RETRIEVAL_LOCK = threading.Lock()
 
 from cgx.parser.parse_codebase import parse_codebase
 from cgx.graph.build_graph import build_knowledge_graph
@@ -495,20 +506,23 @@ def run_query_auto(
     # on every call (build is O(N) over all records).
     lex_idx = get_cached_lexical_index(records_path, records) if records else None
 
-    # Hybrid retrieval (semantic+lexical+graph → RRF)
-    retrieval_out = hybrid_retrieve_two_view(
-        query,
-        indices=indices,
-        records=records,
-        embedder=embedder,
-        chunks=chunks,
-        G=G,
-        top_k_per_view=top_k_per_view,
-        neighbor_depth=neighbor_depth,
-        use_lexical=True,  # forced on
-        lexical_index=lex_idx,
-        enable_reranker=enable_reranker,
-    )
+    # Hybrid retrieval (semantic+lexical+graph → RRF). Serialized process-wide
+    # (see _RETRIEVAL_LOCK) so concurrent callers -- notably the web UI's sync
+    # request threadpool -- never drive torch + faiss from parallel threads.
+    with _RETRIEVAL_LOCK:
+        retrieval_out = hybrid_retrieve_two_view(
+            query,
+            indices=indices,
+            records=records,
+            embedder=embedder,
+            chunks=chunks,
+            G=G,
+            top_k_per_view=top_k_per_view,
+            neighbor_depth=neighbor_depth,
+            use_lexical=True,  # forced on
+            lexical_index=lex_idx,
+            enable_reranker=enable_reranker,
+        )
 
     hits = retrieval_out.get("hits", [])
     if scope in {"src", "tests"}:
@@ -522,9 +536,11 @@ def run_query_auto(
     # we compute it and let the UI/agent decide how to present it.
     impact = analyze_change_impact(query, hits, records, G)
 
-    # Optional: insertion anchors (non-critical)
+    # Optional: insertion anchors (non-critical). Also embeds, so it shares the
+    # retrieval lock -- concurrent callers must not run torch + faiss in parallel.
     try:
-        anchors = suggest_insertion_points(query, hits, records, G=G, embedder=embedder)
+        with _RETRIEVAL_LOCK:
+            anchors = suggest_insertion_points(query, hits, records, G=G, embedder=embedder)
     except Exception as e:
         logger.warning("suggest_insertion_points failed: %s", e)
         anchors = []
