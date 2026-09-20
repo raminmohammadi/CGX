@@ -2043,3 +2043,28 @@ def test_window_text_centers_on_densest_region_not_first_mention():
     assert "exponential_backoff(retry)" in out
     assert "for attempt in range(retries)" in out
     assert "note: retry helper" not in out
+
+
+def test_overview_loads_repo_map_render(tmp_path):
+    """Overview grounding pulls the persisted whole-repo map that sits beside
+    the index dir; absent map -> empty string (no crash)."""
+    from cgx.answer.repo_map import build_repo_map, save_repo_map
+    from cgx.answer.engine import _load_repo_map_render
+    records = [
+        {"id": "/r/pkg/a.py::file", "type": "file", "name": "a.py",
+         "file": "/r/pkg/a.py", "module_path": "pkg.a",
+         "doc_first_sentence": "Alpha module.", "metrics": {"n_loc": 10}},
+        {"id": "/r/pkg/a.py::function::run", "type": "function", "name": "run",
+         "file": "/r/pkg/a.py", "signature": "(x)", "doc_first_sentence": "Run it.",
+         "start_line": 3, "end_line": 5},
+    ]
+    rm = build_repo_map(records)
+    idx = tmp_path / "idx"
+    idx.mkdir()
+    save_repo_map(str(tmp_path / "repo_map.json"), rm)
+    out = _load_repo_map_render(str(idx))
+    assert "Repo map:" in out and "def run(x)" in out
+    # No map beside a different dir -> empty, no error.
+    empty_idx = tmp_path / "other" / "idx"
+    empty_idx.mkdir(parents=True)
+    assert _load_repo_map_render(str(empty_idx)) == ""

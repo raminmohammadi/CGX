@@ -93,6 +93,22 @@ def _chunk_map(indices: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
                 cmap[str(cid)] = r
     return cmap
 
+def _load_repo_map_render(index_dir: str, *, max_chars: int = 4000) -> str:
+    """Render the persisted whole-repo map (built at index time) for overview
+    grounding; empty string when it is absent or unreadable. The map lives beside
+    the index dir (``<index_dir>/../repo_map.json``), mirroring graph.json."""
+    try:
+        from cgx.answer.repo_map import load_repo_map, render_repo_map
+        p = Path(index_dir).parent / "repo_map.json"
+        if not p.exists():
+            return ""
+        rm = load_repo_map(str(p))
+        return render_repo_map(rm, max_chars=max_chars) if rm else ""
+    except Exception as e:  # pragma: no cover - defensive
+        logger.debug("repo map render failed: %s", e)
+        return ""
+
+
 def _read_readme(project_root: Optional[str]) -> Optional[str]:
     if not project_root:
         return None
@@ -673,11 +689,14 @@ SYSTEM_PROMPTS: Dict[str, str] = {
         "No prose outside JSON. "
     ) + ALLOWED_CITATION_NOTE,
     "overview": (
-        "You are a senior codebase assistant. Use ONLY the SOURCES (and the "
-        "optional README lead) to produce a concise repo overview: Purpose, "
-        "Major components, How they fit together, Entry points. Cite each "
-        "claim with [[chunk_id]]. Return JSON keys: answer_md, citations, "
-        "suggested_changes, confidence. No prose outside JSON. "
+        "You are a senior codebase assistant. Use ONLY the REPO MAP (the "
+        "whole-repo package/file/symbol tree), the SOURCES, and the optional "
+        "README lead to produce a concise repo overview: Purpose, Major "
+        "components, How they fit together, Entry points. Prefer the REPO MAP "
+        "for breadth (what exists and how it is organised) and SOURCES for "
+        "specific claims. Cite specific claims with [[chunk_id]]. Return JSON "
+        "keys: answer_md, citations, suggested_changes, confidence. No prose "
+        "outside JSON. "
     ) + ALLOWED_CITATION_NOTE,
     "qa": (
         "You are a senior codebase assistant answering a specific question. "
@@ -771,10 +790,11 @@ SYSTEM_PROMPTS_STREAM: Dict[str, str] = {
         "justification and a [[chunk_id]] citation each."
     ),
     "overview": (
-        "You are a senior codebase assistant. Use ONLY the SOURCES (and the optional README "
-        "lead) to produce a concise repo overview in plain Markdown: Purpose, Major "
-        "components, How they fit together, Entry points. Cite each claim with [[chunk_id]]. "
-        "Do NOT wrap in JSON."
+        "You are a senior codebase assistant. Use ONLY the REPO MAP (whole-repo "
+        "package/file/symbol tree), the SOURCES, and the optional README lead to produce a "
+        "concise repo overview in plain Markdown: Purpose, Major components, How they fit "
+        "together, Entry points. Prefer the REPO MAP for breadth and SOURCES for specific "
+        "claims. Cite specific claims with [[chunk_id]]. Do NOT wrap in JSON."
     ),
     "qa": (
         "You are a senior codebase assistant answering a specific question. Use ONLY the "
@@ -1097,6 +1117,14 @@ def _prepare_answer_request(
     if readme and mode not in {"symbol_explain"}:
         lead_lines = [ln for ln in readme.splitlines() if ln.strip()][:12]
         context += "README (lead):\n" + "\n".join(lead_lines) + "\n\n"
+    # Overview questions ("what does this repo do") are a whole-repo aggregate
+    # that ~20 retrieved chunks answer unreliably. Ground them in the
+    # purpose-built hierarchical repo map (packages -> files -> symbols, built
+    # deterministically at index time) when it is available.
+    if mode == "overview":
+        repo_map_text = _load_repo_map_render(index_dir)
+        if repo_map_text:
+            context += "REPO MAP (whole-repo structure):\n" + repo_map_text + "\n\n"
     if target:
         context += f"TARGET_SYMBOL: {target}\n\n"
     context += "SOURCES:\n" + "\n".join(_fmt_source(s) for s in sources)
