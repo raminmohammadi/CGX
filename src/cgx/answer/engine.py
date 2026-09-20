@@ -42,6 +42,12 @@ _SYMBOL_TARGETED_MODES = frozenset({
     "callers_list", "callees_list",
 })
 
+# Cap on distinct chunks force-added purely because their name/id matches the
+# target symbol. Beyond this the name is treated as ambiguous (many homonyms):
+# the forced set is capped and query-based retrieval is run to disambiguate,
+# instead of flooding SOURCES with every same-named chunk in the repo.
+_MAX_FORCED_SYMBOL_CHUNKS = 10
+
 
 def _symbol_covers_target(symbol: str, chunk_id: str, target: str) -> bool:
     """Return True when a SOURCE row's symbol/chunk_id covers ``target``.
@@ -483,6 +489,30 @@ def _find_symbol_rows(indices: Dict[str, Any], symbol: str) -> List[Tuple[str, D
             seen.add(cid); dedup.append((cid, r, view))
     return dedup
 
+def _cap_forced_symbol_hits(
+    raw_forced: List[Dict[str, Any]], cap: int = _MAX_FORCED_SYMBOL_CHUNKS,
+) -> Tuple[List[Dict[str, Any]], bool]:
+    """Dedup forced symbol hits by chunk_id and cap the distinct count.
+
+    Returns ``(hits, ambiguous)``. ``ambiguous`` is True when the symbol matched
+    more than ``cap`` distinct chunks (a common name with many homonyms): the
+    caller then also runs query-based retrieval so the question disambiguates,
+    instead of flooding SOURCES with every same-named chunk. Order (and thus
+    the kept subset when capping) is first-seen -- name/id matches before the
+    record-name matches, mirroring the caller's append order.
+    """
+    distinct: List[str] = []
+    seen: set[str] = set()
+    for h in raw_forced:
+        c = str(h.get("chunk_id"))
+        if c and c not in seen:
+            seen.add(c)
+            distinct.append(c)
+    ambiguous = len(distinct) > cap
+    keep = set(distinct[:cap]) if ambiguous else seen
+    return [h for h in raw_forced if str(h.get("chunk_id")) in keep], ambiguous
+
+
 def _hits_from_records(indices: Dict[str, Any], records_path: Optional[str], symbol: Optional[str]) -> List[Dict[str, Any]]:
     if not records_path or not symbol:
         return []
@@ -908,20 +938,27 @@ def _prepare_answer_request(
             }
 
     # --- Build/augment hits ---
+    # Symbol force-add pulls every chunk whose name/id matches ``target``. A
+    # common name (save/run/handle) matches dozens of unrelated homonyms across
+    # the repo; forcing them ALL into SOURCES crowds out the query-relevant one
+    # and, because retrieval was skipped whenever any symbol matched, left the
+    # model with no query signal to pick the right one. Cap the forced set, and
+    # when the symbol is ambiguous also run retrieval so the QUESTION
+    # disambiguates among the homonyms.
     forced_hits: List[Dict[str, Any]] = []
+    symbol_ambiguous = False
     if target:
+        raw_forced: List[Dict[str, Any]] = []
         for cid, _row, view in _find_symbol_rows(indices, target):
-            forced_hits.append({"chunk_id": cid, "score": 2.0, "view": view})
-        rec_hits = _hits_from_records(indices, records_path, target)
-        seen = {str(h["chunk_id"]) for h in forced_hits}
-        for h in rec_hits:
-            if str(h["chunk_id"]) not in seen:
-                forced_hits.append(h); seen.add(str(h["chunk_id"]))
+            raw_forced.append({"chunk_id": cid, "score": 2.0, "view": view})
+        for h in _hits_from_records(indices, records_path, target):
+            raw_forced.append(h)
+        forced_hits, symbol_ambiguous = _cap_forced_symbol_hits(raw_forced)
 
     base_hits: List[Dict[str, Any]] = []
     if hits:
         base_hits = hits
-    elif not forced_hits:
+    elif not forced_hits or symbol_ambiguous:
         # No caller-supplied hits and no symbol match. Run real hybrid
         # retrieval (semantic + lexical + graph) so SOURCES reflect the
         # question. The previous fallback grabbed the first ``top_k`` rows

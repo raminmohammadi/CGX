@@ -1969,3 +1969,28 @@ def test_answer_with_llm_accepts_markdown_prose_and_extracts_inline_citations(tm
 
 
 
+
+
+def test_cap_forced_symbol_hits_caps_ambiguous_names():
+    from cgx.answer.engine import _cap_forced_symbol_hits, _MAX_FORCED_SYMBOL_CHUNKS
+    # 20 distinct same-named homonyms, each with an intent + impl row.
+    raw = []
+    for i in range(20):
+        cid = f"pkg/m{i}.py::method::C{i}.save"
+        raw.append({"chunk_id": cid, "score": 2.0, "view": "intent"})
+        raw.append({"chunk_id": cid, "score": 2.0, "view": "impl"})
+    hits, ambiguous = _cap_forced_symbol_hits(raw)
+    assert ambiguous is True
+    distinct = {h["chunk_id"] for h in hits}
+    assert len(distinct) == _MAX_FORCED_SYMBOL_CHUNKS  # capped, not flooded
+    # Both views of a kept chunk are preserved (dedup is by chunk_id, not row).
+    assert len(hits) == 2 * _MAX_FORCED_SYMBOL_CHUNKS
+
+
+def test_cap_forced_symbol_hits_keeps_all_when_unambiguous():
+    from cgx.answer.engine import _cap_forced_symbol_hits
+    raw = [{"chunk_id": f"pkg/a.py::function::f{i}", "score": 2.0, "view": "intent"}
+           for i in range(3)]
+    hits, ambiguous = _cap_forced_symbol_hits(raw)
+    assert ambiguous is False
+    assert len(hits) == 3
