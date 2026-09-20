@@ -181,11 +181,16 @@ def _row_lines(row: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
 
 
 def _window_text(text: str, focus_terms: List[str], max_chars: int, *, context_lines: int = 8) -> str:
-    """Return a focused window of ``text`` centered on the first line matching
-    any term in ``focus_terms``.
+    """Return a focused window of ``text`` centered on the DENSEST region of
+    ``focus_terms`` matches.
 
-    When no term matches, falls back to ``_trim(text, max_chars)``. This
-    typically reduces SOURCES size 5–10× while preserving the relevant region.
+    Centering on the *first* match (the old behavior) can drop the region that
+    actually answers the query: e.g. a chunk that mentions a term once in an
+    early import/comment but implements the relevant logic further down. Each
+    line is scored by how many DISTINCT focus terms it contains (over a small
+    neighbourhood), and the window centres on the best-scoring line. Falls back
+    to ``_trim`` when nothing matches. Reduces SOURCES size 5-10x while keeping
+    the most relevant span.
     """
     if not text or not focus_terms:
         return _trim(text, max_chars)
@@ -193,14 +198,20 @@ def _window_text(text: str, focus_terms: List[str], max_chars: int, *, context_l
     if not lines:
         return _trim(text, max_chars)
     lc_terms = [t for t in (s.lower() for s in focus_terms) if t]
-    hit_idx: Optional[int] = None
-    for i, ln in enumerate(lines):
-        low = ln.lower()
-        if any(t in low for t in lc_terms):
-            hit_idx = i
-            break
-    if hit_idx is None:
+    # Per-line distinct-term count.
+    per_line = [sum(1 for t in lc_terms if t in ln.lower()) for ln in lines]
+    if not any(per_line):
         return _trim(text, max_chars)
+    # Score each line by the distinct-term hits within +/- context_lines, so the
+    # window lands where matches cluster rather than on the first lone mention.
+    half = max(1, context_lines)
+    best_idx, best_score = 0, -1
+    for i in range(len(lines)):
+        lo, hi = max(0, i - half), min(len(lines), i + half + 1)
+        score = sum(per_line[lo:hi])
+        if score > best_score:
+            best_score, best_idx = score, i
+    hit_idx = best_idx
     start = max(0, hit_idx - context_lines)
     end = min(len(lines), hit_idx + context_lines + 1)
     window = "\n".join(lines[start:end])

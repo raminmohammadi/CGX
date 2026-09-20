@@ -2028,3 +2028,18 @@ def test_citation_resolution_drops_ambiguous_tail():
     assert _resolve_citation("save", allowed) is None
     # But a fuller path-suffix disambiguates.
     assert _resolve_citation("x.py::method::A.save", allowed) == allowed[0]
+
+
+def test_window_text_centers_on_densest_region_not_first_mention():
+    from cgx.answer.engine import _window_text
+    lines = ["# note: retry helper below"] + [f"pad line number {i}" for i in range(2, 20)] + \
+            ["    for attempt in range(retries):",
+             "        do_retry_now()",
+             "        exponential_backoff(retry)"] + \
+            [f"tail line number {i}" for i in range(23, 40)]
+    text = "\n".join(lines)
+    out = _window_text(text, ["retry", "backoff", "retries"], max_chars=200, context_lines=3)
+    # Lands on the cluster of matches, not the single early comment mention.
+    assert "exponential_backoff(retry)" in out
+    assert "for attempt in range(retries)" in out
+    assert "note: retry helper" not in out
