@@ -137,13 +137,22 @@ def detect_intent(question: str) -> Intent:
     # api/endpoint/route keyword so ordinary questions ("how does the API
     # work?") are not hijacked into the enumeration path. Placed high so a
     # phrasing like "list all endpoints" wins before broader branches.
+    # Two tiers to avoid hijacking conceptual API questions:
+    #  (1) STRONG count/list cues are enumerative on their own -> pair with any
+    #      api/endpoint/route keyword.
+    #  (2) WEAK cues (which/what-are/all-the) also read as enumeration in casual
+    #      phrasing ("which endpoints exist?"), but only when the ENUMERATED NOUN
+    #      is endpoint/route -- NOT bare "api", so "which API framework/pattern
+    #      should I use" stays a conceptual question, not a route count.
+    _strong = any(k in ql for k in [
+        "how many", "number of", "count of", "count the",
+        "list all", "list the", "list every", "list of", "enumerate",
+        "show me all", "show all",
+    ])
+    _weak = any(k in ql for k in ["what are the", "which ", "all the", "how much"])
     if (
-        any(k in ql for k in [
-            "how many", "how much", "number of", "count of", "count the",
-            "list all", "list the", "list every", "list of", "enumerate",
-            "what are the", "which ", "all the", "show me all", "show all",
-        ])
-        and re.search(r"\b(api|apis|endpoint|endpoints|route|routes)\b", ql)
+        (_strong and re.search(r"\b(api|apis|endpoint|endpoints|route|routes)\b", ql))
+        or (_weak and re.search(r"\b(endpoint|endpoints|route|routes)\b", ql))
     ):
         return "enumerate"
 

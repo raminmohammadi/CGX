@@ -248,3 +248,16 @@ def test_debug_intent_does_not_hijack_conceptual_questions():
     assert detect_intent("add error handling to the loader") != "debug"
     # "why does X <do-something>" with no failure signal stays conceptual.
     assert detect_intent("why does the tokenizer split camelCase") != "debug"
+
+
+def test_enumerate_does_not_hijack_conceptual_api_questions():
+    # Weak cues (which / what are the / all the) only enumerate when the noun is
+    # endpoint/route -- not bare "api" -- so conceptual API questions are spared.
+    assert detect_intent("which API framework should I use") != "enumerate"
+    assert detect_intent("what are the main API abstractions") != "enumerate"
+    assert detect_intent("all the api design patterns in use") != "enumerate"
+    assert detect_intent("how does the api work") != "enumerate"
+    # But genuine endpoint/route enumeration still routes correctly.
+    assert detect_intent("which endpoints exist?") == "enumerate"
+    assert detect_intent("what are the routes") == "enumerate"
+    assert detect_intent("how many endpoints are there") == "enumerate"
