@@ -16,6 +16,15 @@ from __future__ import annotations
 import os as _os
 import sys as _sys
 
+# faiss-cpu and torch each vendor their own OpenMP runtime; on macOS importing
+# both into one process (the local-embedding index path: torch encoder +
+# faiss.IndexFlat) trips "OMP: Error #15 ... libomp already initialized" and the
+# interpreter aborts. Opt into the standard single-runtime workaround here --
+# the earliest import point, before either library loads -- so local jina
+# embeddings + faiss actually run instead of crashing. ``setdefault`` respects
+# an explicit user override. Harmless when torch/faiss aren't installed.
+_os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
 # ``cgx`` resolves to ``<repo_root>/src/cgx``. Two parents up is the repo
 # root, where ``skills/`` lives in the editable layout. Only prepend it
 # when the directory contains the package -- installations that bundle

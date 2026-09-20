@@ -130,27 +130,35 @@ def run_gate(evals_dir: str) -> Tuple[Dict[str, Any], bool]:
 
 
 def _resolve_eval_embedder() -> Tuple[Any, str]:
-    """Return ``(embedder, kind)`` -- the real ST model when available, else the
-    deterministic bag-of-words fallback. ``kind`` is recorded in the report so a
-    reader can tell which fidelity the fused numbers reflect."""
-    import importlib.util
-    if importlib.util.find_spec("sentence_transformers") is not None:
-        try:
-            from sentence_transformers import SentenceTransformer
+    """Return ``(embedder, kind)`` for the fused retrieval eval.
 
-            class _STEmbedder:
-                model_name = "jinaai/jina-embeddings-v2-base-code"
+    Deterministic (bag-of-words, torch-free) BY DEFAULT so ``run_gate`` stays
+    fast, reproducible, and CI-safe -- and, critically, never loads a torch
+    model into the same process as faiss, which on some setups (notably macOS,
+    where faiss-cpu and torch ship incompatible OpenMP runtimes) segfaults the
+    interpreter. Set ``CGX_EVAL_REAL_EMBEDDER=1`` to opt into a real
+    sentence-transformers measurement (true semantic recall) where the deps and
+    environment support it.
+    """
+    if os.environ.get("CGX_EVAL_REAL_EMBEDDER"):
+        import importlib.util
+        if importlib.util.find_spec("sentence_transformers") is not None:
+            try:
+                from sentence_transformers import SentenceTransformer
 
-                def __init__(self) -> None:
-                    self._m = SentenceTransformer(
-                        self.model_name, trust_remote_code=True,
-                    )
+                class _STEmbedder:
+                    model_name = "jinaai/jina-embeddings-v2-base-code"
 
-                def encode(self, texts):  # type: ignore[no-untyped-def]
-                    return self._m.encode(list(texts), normalize_embeddings=False)
+                    def __init__(self) -> None:
+                        self._m = SentenceTransformer(
+                            self.model_name, trust_remote_code=True,
+                        )
 
-            return _STEmbedder(), "sentence-transformers/jina-v2-code"
-        except Exception as e:  # pragma: no cover - env dependent
-            logger.warning("eval.harness: real embedder unavailable (%s); "
-                           "using deterministic fallback", e)
+                    def encode(self, texts):  # type: ignore[no-untyped-def]
+                        return self._m.encode(list(texts), normalize_embeddings=False)
+
+                return _STEmbedder(), "sentence-transformers/jina-v2-code"
+            except Exception as e:  # pragma: no cover - env dependent
+                logger.warning("eval.harness: real embedder unavailable (%s); "
+                               "using deterministic fallback", e)
     return _retrieval.DeterministicEmbedder(dim=32), "deterministic-bow"

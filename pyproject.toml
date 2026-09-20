@@ -30,8 +30,13 @@ dependencies = [
 
 [project.optional-dependencies]
 embeddings = [
-  "sentence-transformers>=2.7",
-  "transformers>=4.40,<6",
+  # Pins capped to keep the default local embedder loadable: transformers 5.x
+  # removed transformers.pytorch_utils.find_pruneable_heads_and_indices, which
+  # jinaai/jina-embeddings-v2-base-code's trust_remote_code modeling imports, and
+  # sentence-transformers 6.x hard-requires transformers>=5. So both are held on
+  # the last jina-compatible line (transformers 4.57.x / sentence-transformers 5.7.x).
+  "sentence-transformers>=2.7,<6",
+  "transformers>=4.40,<5",
   "torch>=2.13.0",
 ]
 faiss = ["faiss-cpu>=1.7"]
@@ -62,8 +67,13 @@ dev = [
   "types-requests",
 ]
 all = [
-  "sentence-transformers>=2.7",
-  "transformers>=4.40,<6",
+  # Pins capped to keep the default local embedder loadable: transformers 5.x
+  # removed transformers.pytorch_utils.find_pruneable_heads_and_indices, which
+  # jinaai/jina-embeddings-v2-base-code's trust_remote_code modeling imports, and
+  # sentence-transformers 6.x hard-requires transformers>=5. So both are held on
+  # the last jina-compatible line (transformers 4.57.x / sentence-transformers 5.7.x).
+  "sentence-transformers>=2.7,<6",
+  "transformers>=4.40,<5",
   "torch>=2.13.0",
   "faiss-cpu>=1.7",
   "fastapi>=0.115",
