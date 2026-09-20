@@ -626,19 +626,33 @@ def _parse_python_module(
             - Initializes per-function metadata in `func_meta`.
             - Visits body recursively and finalizes metrics.
             """
-            effective_is_method = is_method or (self.current_class_name is not None)
-            qual = (
-                f"{self.current_class_name}.{node.name}"
-                if effective_is_method and self.current_class_name
-                else node.name
+            # A function is a METHOD only when it is defined DIRECTLY in a class
+            # body -- i.e. inside a class AND not nested within another function.
+            # Previously ``current_class_name is not None`` alone marked it a
+            # method, so a helper nested inside a method (e.g. ``_key`` inside
+            # ``Widget.save``) became ``file::method::Widget._key`` and COLLIDED
+            # with an identically-named helper in a sibling method -- the second
+            # was silently dropped by make_index_records' id dedup, and both were
+            # mislabeled as class methods (corrupting class membership + graph).
+            in_function = self.current_func_id is not None
+            effective_is_method = (
+                (is_method or (self.current_class_name is not None)) and not in_function
             )
             if effective_is_method:
+                qual = (
+                    f"{self.current_class_name}.{node.name}"
+                    if self.current_class_name else node.name
+                )
                 func_id = f"{self.filename}::method::{qual}"
-            elif self._func_name_stack:
-                # Nested function inside another function: qualify with the
-                # enclosing function path so identically-named helpers in
-                # different test functions get distinct chunk IDs.
-                func_id = f"{self.filename}::function::{'.'.join(self._func_name_stack)}.{node.name}"
+            elif in_function:
+                # Nested function (inside a method OR another function). Derive
+                # the id from the enclosing function's id -- already unique --
+                # so identically-named helpers in different scopes never collide
+                # and stay in the ``::function::`` namespace (not mislabeled as
+                # methods). ``file::method::Widget.save`` -> local ``Widget.save``
+                # -> ``file::function::Widget.save.<name>``.
+                parent_local = self.current_func_id.split("::", 2)[-1]
+                func_id = f"{self.filename}::function::{parent_local}.{node.name}"
             else:
                 func_id = f"{self.filename}::function::{node.name}"
 
