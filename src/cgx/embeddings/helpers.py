@@ -292,9 +292,68 @@ def _neighbors_summary(G, node_id: str, max_n: int = 64) -> List[Tuple[str, str]
     return sorted({(et, nid) for et, nid in pairs})[:max_n]
 
 
+# Cap the number of content tokens indexed per chunk so a single pathological
+# multi-thousand-line file cannot dominate the BM25 postings. Function/method
+# chunks are far below this; only very large classes/files approach it.
+_MAX_CONTENT_TOKENS = 4000
+
+
+def _file_stem(path: str) -> str:
+    """Basename without directory or extension: ``a/b/client.py`` -> ``client``.
+
+    Used instead of the full path so filename queries still work without
+    polluting every posting with directory/machine-path tokens (which share a
+    huge common prefix and add near-zero-IDF noise to every chunk's vector and
+    posting list)."""
+    base = (path or "").replace("\\", "/").rsplit("/", 1)[-1]
+    return base.rsplit(".", 1)[0] if "." in base else base
+
+
+def _doc_parsed_text(meta: Dict[str, Any]) -> str:
+    """Flatten the structured docstring (summary/description/params/returns/raises)
+    into searchable text. Belt-and-suspenders for chunk types (e.g. file stubs)
+    whose ``code`` segment omits the real body/docstring."""
+    dp = meta.get("doc_parsed")
+    if not isinstance(dp, dict):
+        return ""
+    parts: List[str] = []
+    for key in ("summary", "description", "returns"):
+        v = dp.get(key)
+        if isinstance(v, str) and v:
+            parts.append(v)
+    for key in ("params", "raises"):
+        seq = dp.get(key)
+        if isinstance(seq, list):
+            for it in seq:
+                if isinstance(it, dict):
+                    for kk in ("name", "type", "description", "desc"):
+                        vv = it.get(kk)
+                        if isinstance(vv, str) and vv:
+                            parts.append(vv)
+                elif isinstance(it, str):
+                    parts.append(it)
+    return " ".join(parts)
+
+
 def _lexical_helpers(chunk: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Build lexical helper fields (lowercased and n-grams) for a chunk.
+    Build lexical helper fields (lowercased identity fields + BM25 posting tokens).
+
+    ``ngrams_1`` is the frequency-preserving unigram stream the BM25 index scores
+    over. Historically it covered ONLY identifiers (name/id/file/class/signature),
+    so the lexical arm was blind to every docstring, comment, and code body -- a
+    query phrased in behaviour/domain terms rather than the exact symbol name hit
+    nothing. It now also tokenizes the chunk's source segment (``code`` -- which
+    already includes the docstring, inline comments, and body) plus the flattened
+    structured docstring, so content queries retrieve. For ``doc`` chunks ``code``
+    is the section prose, so documentation bodies become searchable too.
+
+    Tokens are NOT deduplicated into a set anymore: repeats are what give BM25 a
+    real term-frequency signal (previously every term collapsed to tf=1). The
+    absolute path is dropped from the posting stream (only the file *stem* is
+    kept) to avoid polluting every posting with shared directory/machine tokens.
+    Bigrams stay scoped to the short high-value identity+summary fields so phrase
+    matches keep precision without exploding the index over full bodies.
 
     Args:
         chunk (Dict[str, Any]): Code chunk dictionary.
@@ -308,10 +367,30 @@ def _lexical_helpers(chunk: Dict[str, Any]) -> Dict[str, Any]:
     meta = chunk.get("meta") or {}
     cls = _lc(meta.get("class_name"))
     sig = _lc(meta.get("signature"))
+    code = chunk.get("code") or ""
+    docstring = meta.get("docstring") or ""
+    stem = _file_stem(chunk.get("file") or "")
 
-    toks = _split_tokens(" ".join([t for t in [name, cid, file, cls, sig] if t]))
-    unigrams = sorted(set(toks))
-    bigrams = sorted(set(_ngrams(toks, 2)))
+    # Identity tokens: symbol name, class, signature, file stem. High-precision;
+    # these also seed the bigram phrase index.
+    identity_text = " ".join([t for t in [name, cls, sig, stem] if t])
+    identity_toks = _split_tokens(identity_text)
+
+    # Content tokens: source segment (docstring + comments + body) and the
+    # flattened structured docstring. Capped to bound index size.
+    content_text = " ".join([t for t in [docstring, _doc_parsed_text(meta), code] if t])
+    content_toks = _split_tokens(content_text)[:_MAX_CONTENT_TOKENS]
+
+    # Frequency-preserving unigram stream (identity first so exact-name repeats
+    # keep their weight), then content. No set() dedup -> real BM25 tf.
+    unigrams = identity_toks + content_toks
+
+    # Bigrams over the short, high-signal fields only (name/class/signature +
+    # docstring summary) -- phrase precision without full-body explosion.
+    from cgx.embeddings.views import _doc_first_sentence as _dfs  # local: avoid import cycle
+    summary = _dfs(meta) if isinstance(meta, dict) else ""
+    bigram_src = _split_tokens(" ".join([t for t in [name, cls, sig, summary] if t]))
+    bigrams = sorted(set(_ngrams(bigram_src, 2)))
 
     return {
         "name_lc": name,

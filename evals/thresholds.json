@@ -5,8 +5,8 @@
     "ndcg@5": 0.4
   },
   "retrieval_lexical": {
-    "recall@5": 0.15,
-    "mrr": 0.15
+    "recall@5": 0.9,
+    "mrr": 0.7
   },
   "codegen": {
     "expectation_match_rate": 1.0,
