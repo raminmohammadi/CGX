@@ -270,3 +270,33 @@ def test_nested_helpers_in_methods_do_not_collide(tmp_path):
     # Records dedup by id -- previously one _key was dropped here.
     recs = make_index_records(chunks, G=None)
     assert sum(1 for r in recs if r.get("name") == "_key") == 2
+
+
+def test_module_level_wiring_is_captured_and_searchable():
+    """Top-level wiring (blueprint registration, __main__ guard) must land in the
+    file chunk's searchable text AND be recorded as module-scope call relations
+    attributed to the file node -- previously both were dropped."""
+    src = textwrap.dedent(
+        '''
+        """App entrypoint."""
+        from flask import Flask
+
+        def create_app():
+            return Flask(__name__)
+
+        app = create_app()
+        app.register_blueprint(billing_bp)
+
+        if __name__ == "__main__":
+            app.run(port=8080)
+        '''
+    )
+    chunks, calls = _parse_python_module("app.py", src, ".")
+    fchunk = next(c for c in chunks if c["type"] == "file")
+    # (b) module wiring is in the searchable file stub, docstring not duplicated.
+    assert "app.register_blueprint(billing_bp)" in fchunk["code"]
+    assert '__main__' in fchunk["code"]
+    assert fchunk["code"].count('"""App entrypoint."""') == 1
+    # (a) module-level calls recorded with the file as caller.
+    mod_callees = {c["callee_name"] for c in calls if c["caller_id"] == fchunk["id"]}
+    assert {"register_blueprint", "run", "create_app"} <= mod_callees

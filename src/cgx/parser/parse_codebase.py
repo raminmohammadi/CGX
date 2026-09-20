@@ -300,7 +300,7 @@ def _parse_docstring(docstring: Optional[str]) -> Optional[Dict[str, Any]]:
 def _collect_top_level_members(tree: ast.AST, source: str) -> Dict[str, List[Dict[str, Any]]]:
     """Collect deterministic summaries of top-level members of a file."""
     out: Dict[str, List[Dict[str, Any]]] = {
-        "functions": [], "classes": [], "imports": [], "globals": []
+        "functions": [], "classes": [], "imports": [], "globals": [], "statements": []
     }
     try:
         for n in getattr(tree, "body", []):
@@ -332,6 +332,21 @@ def _collect_top_level_members(tree: ast.AST, source: str) -> Dict[str, List[Dic
                     "value": _value_preview(n.value),
                     "annotation": _unparse(n.annotation),
                 })
+            elif (
+                (isinstance(n, ast.Expr) and isinstance(n.value, ast.Call))
+                or isinstance(n, (ast.If, ast.With, ast.AsyncWith,
+                                  ast.For, ast.AsyncFor, ast.While, ast.Try))
+            ):
+                # Top-level EXECUTABLE statements -- app wiring, blueprint/route
+                # registration, ``if __name__ == '__main__'`` guards, config
+                # setup. Previously dropped from the file stub, so "how is the
+                # app wired / where are routes registered" had no text to match.
+                # Only call-expressions are taken among bare Expr statements, so
+                # the module docstring / bare string literals are not duplicated.
+                # Captured as bounded source so the file chunk is searchable.
+                src = _get_source(source, n)
+                if src and len(out["statements"]) < 25:
+                    out["statements"].append(src.strip()[:400])
     except Exception:
         pass
     return out
@@ -357,6 +372,11 @@ def _build_file_code_stub(module_doc: Optional[str], members: Dict[str, List[Dic
     for c in members.get("classes", []):
         sig = c["signature"]  # already 'class Name(Base, ...)'
         parts.append(f"{sig}: ...")
+
+    # Top-level executable statements (module wiring) -- kept verbatim (bounded)
+    # so the file chunk is searchable by what the module actually does at import.
+    for stmt in members.get("statements", []):
+        parts.append(stmt)
 
     return "\n".join(parts)
 
@@ -1008,20 +1028,20 @@ def _parse_python_module(
             - Adds call relation entry to global `call_relations`.
             - Updates function metadata (`calls_detailed`, metrics).
             """
-            if self.current_func_id and self.current_func_id in self.func_meta:
-                callee_full = _dotted_attr(node.func) or None
-                if isinstance(node.func, ast.Name):
-                    callee_name = node.func.id
-                elif isinstance(node.func, ast.Attribute):
-                    callee_name = node.func.attr
-                elif callee_full:
-                    callee_name = callee_full.split(".")[-1]
-                else:
-                    callee_name = None
+            callee_full = _dotted_attr(node.func) or None
+            if isinstance(node.func, ast.Name):
+                callee_name = node.func.id
+            elif isinstance(node.func, ast.Attribute):
+                callee_name = node.func.attr
+            elif callee_full:
+                callee_name = callee_full.split(".")[-1]
+            else:
+                callee_name = None
 
+            in_func = bool(self.current_func_id and self.current_func_id in self.func_meta)
+            if in_func:
                 has_starargs = any(isinstance(a, ast.Starred) for a in node.args)
                 has_kwargs = any(kw.arg is None for kw in node.keywords)
-
                 self.func_meta[self.current_func_id]["calls_detailed"].append(
                     {
                         "callee_fullname": callee_full,
@@ -1034,15 +1054,20 @@ def _parse_python_module(
                     }
                 )
 
-                if callee_name:
-                    call_relations.append(
-                        {
-                            "caller_id": self.current_func_id,
-                            "callee_name": callee_name,
-                            "callee_fullname": callee_full,
-                            "lineno": getattr(node, "lineno", None),
-                        }
-                    )
+            if callee_name:
+                # Attribute the call to the enclosing function, or -- for a call
+                # at module (or class-body) scope -- to the FILE node, so
+                # top-level wiring (app.register_blueprint(bp), a __main__ guard's
+                # app.run(), config setup) enters the call graph instead of being
+                # dropped. self.filename is the file chunk id, already emitted.
+                call_relations.append(
+                    {
+                        "caller_id": self.current_func_id if in_func else self.filename,
+                        "callee_name": callee_name,
+                        "callee_fullname": callee_full,
+                        "lineno": getattr(node, "lineno", None),
+                    }
+                )
             self.generic_visit(node)
 
     # ---------- parse + emit file chunk + run visitor ----------
