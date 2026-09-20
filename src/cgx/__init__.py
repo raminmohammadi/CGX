@@ -16,14 +16,25 @@ from __future__ import annotations
 import os as _os
 import sys as _sys
 
-# faiss-cpu and torch each vendor their own OpenMP runtime; on macOS importing
-# both into one process (the local-embedding index path: torch encoder +
-# faiss.IndexFlat) trips "OMP: Error #15 ... libomp already initialized" and the
-# interpreter aborts. Opt into the standard single-runtime workaround here --
-# the earliest import point, before either library loads -- so local jina
-# embeddings + faiss actually run instead of crashing. ``setdefault`` respects
-# an explicit user override. Harmless when torch/faiss aren't installed.
+# faiss-cpu and torch each vendor their own OpenMP runtime. Loading both into
+# one process -- exactly the local-embedding index AND query paths (torch
+# encoder + faiss.IndexFlat) -- is unstable on multi-core machines: it either
+# aborts with "OMP: Error #15 ... libomp already initialized" or, once torch's
+# multi-thread OpenMP pool contends with faiss's, SEGFAULTS the interpreter
+# (reproduced on macOS; possible on Linux depending on the wheels). Two guards,
+# set here at the earliest import point -- BEFORE torch/faiss/numpy load, which
+# is the only point early enough for torch to size its thread pool from the env
+# and for a BYO embedder (which never calls our build path) to be covered:
+#   * KMP_DUPLICATE_LIB_OK=TRUE  -> tolerate the duplicate runtime (no abort).
+#   * OMP_NUM_THREADS=1          -> bound the shared OpenMP pool so torch's
+#     threads can't collide with faiss's (empirically the actual segfault fix;
+#     capping faiss alone does not help, capping torch does). GPU/MPS matmuls
+#     use CUDA/Metal, not OpenMP, so GPU embedding speed is unaffected; the cost
+#     is single-threaded CPU embedding, which the incremental cache amortizes.
+# Both use setdefault so an explicit user value wins -- a user on ABI-matched
+# faiss/torch builds can export OMP_NUM_THREADS=<n> to restore CPU parallelism.
 _os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+_os.environ.setdefault("OMP_NUM_THREADS", "1")
 
 # ``cgx`` resolves to ``<repo_root>/src/cgx``. Two parents up is the repo
 # root, where ``skills/`` lives in the editable layout. Only prepend it

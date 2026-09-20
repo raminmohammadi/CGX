@@ -18,7 +18,6 @@ Adds graph + chunks persistence and loading so hybrid retrieval can
 actually use lexical and graph expansion at query time.
 """
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
@@ -293,26 +292,28 @@ def run_index_auto(
             "rows": rows, "ids": _to_faiss_ids(rows),
         }, stats
 
-    # Run both views concurrently (embedding is the bottleneck; FAISS build is CPU-bound).
-    # ThreadPoolExecutor is appropriate here: torch releases the GIL during GPU ops, and
-    # FAISS C++ calls also release the GIL, so true parallelism occurs for both.
-    logger.info("Building embeddings + FAISS for %d views in parallel", len(per_view))
-    with ThreadPoolExecutor(max_workers=len(per_view)) as pool:
-        futures = {pool.submit(_build_view, vn, rows): vn for vn, rows in per_view.items()}
-        for fut in as_completed(futures):
-            view_name = futures[fut]
-            try:
-                vn, view_dict, vstats = fut.result()
-                indices["views"][vn] = view_dict
-                if vstats:
-                    cache_stats_per_view[vn] = vstats
-            except IndexBuildCancelled:
-                # Cancellation is expected control flow, not a build failure:
-                # propagate quietly so the caller can stop without a scary trace.
-                raise
-            except Exception as e:
-                logger.error("View %s failed: %s", view_name, e, exc_info=True)
-                raise
+    # Build the views SERIALLY. Embedding two views concurrently in a
+    # ThreadPoolExecutor oversubscribes threads -- a torch encoder already
+    # parallelizes each pass internally across cores (intra-op threads) -- for
+    # negligible wall-clock gain, and running two torch inference passes in
+    # parallel threads alongside faiss segfaults on setups where torch and
+    # faiss-cpu bring conflicting OpenMP/BLAS runtimes (reproducible on macOS,
+    # possible on Linux too depending on the wheels). Serial is safe on every
+    # platform; the per-view embedding cache already makes re-indexing fast.
+    logger.info("Building embeddings + FAISS for %d views (serial)", len(per_view))
+    for view_name, rows in per_view.items():
+        try:
+            vn, view_dict, vstats = _build_view(view_name, rows)
+            indices["views"][vn] = view_dict
+            if vstats:
+                cache_stats_per_view[vn] = vstats
+        except IndexBuildCancelled:
+            # Cancellation is expected control flow, not a build failure:
+            # propagate quietly so the caller can stop without a scary trace.
+            raise
+        except Exception as e:
+            logger.error("View %s failed: %s", view_name, e, exc_info=True)
+            raise
 
     # A Ctrl-C between the last view finishing and the writes below must still
     # abort before any index file is persisted, so a cancelled build never
