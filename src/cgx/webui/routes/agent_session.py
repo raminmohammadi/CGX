@@ -485,23 +485,33 @@ def _validate_project_root_writable(project_root: Optional[str]) -> None:
     whose parent IS an existing writable directory (greenfield/swarm creates the
     leaf); otherwise fail fast with an actionable message so the user fixes the
     path instead of the harness silently trying to create system folders.
+
+    Security note (the ``codeql[py/path-injection]`` dismissals below): pointing
+    the agent at an arbitrary LOCAL directory is a documented, intentional
+    feature (see :func:`_normalize_project_root`). The server binds to loopback
+    with no auth by DEFAULT, so a caller able to reach this endpoint is already a
+    local user with direct filesystem access -- a user-chosen ``project_root``
+    grants no privilege they lack. Deployments exposed beyond loopback confine
+    roots to a trusted tree via ``CGX_PROJECT_ROOT_BASE``
+    (:func:`_enforce_project_root_base`). These read-only existence/permission
+    probes are therefore not an exploitable path sink under CGX's threat model.
     """
     if project_root is None:
         return
-    if os.path.isdir(project_root):
+    if os.path.isdir(project_root):  # codeql[py/path-injection]
         return
-    if os.path.exists(project_root):
+    if os.path.exists(project_root):  # codeql[py/path-injection]
         raise HTTPException(
             status_code=400,
             detail=f"Project root is not a directory: {project_root}")
-    parent = str(Path(project_root).parent)
-    if not os.path.isdir(parent):
+    parent = str(Path(project_root).parent)  # codeql[py/path-injection]
+    if not os.path.isdir(parent):  # codeql[py/path-injection]
         raise HTTPException(
             status_code=400,
             detail=(f"Project root {project_root!r} does not exist and its "
                     f"parent directory {parent!r} is missing. Check the path "
                     "(a typo in the folder or user name?)."))
-    if not os.access(parent, os.W_OK):
+    if not os.access(parent, os.W_OK):  # codeql[py/path-injection]
         raise HTTPException(
             status_code=400,
             detail=(f"Cannot create the project folder under {parent!r}: "
@@ -566,7 +576,9 @@ async def list_agent_sessions(
     # every time the sidebar listed sessions on load.) Read-only paths must not
     # materialize a workspace; return empty instead.
     if (normalized_project_root is not None
-            and not os.path.isdir(normalized_project_root)):
+            # user-chosen local project_root, loopback+no-auth default -> not an
+            # exploitable path sink (see _validate_project_root_writable).
+            and not os.path.isdir(normalized_project_root)):  # codeql[py/path-injection]
         return []
     runner = _get_runner(normalized_project_root)
     return [s.to_dict() for s in
@@ -581,7 +593,9 @@ async def get_session(sid: str,
     # Don't materialize <root>/.cgx for a non-existent project root on a
     # read-only fetch (see list_agent_sessions); the session cannot be there.
     if (normalized_project_root is not None
-            and not os.path.isdir(normalized_project_root)):
+            # user-chosen local project_root, loopback+no-auth default -> not an
+            # exploitable path sink (see _validate_project_root_writable).
+            and not os.path.isdir(normalized_project_root)):  # codeql[py/path-injection]
         raise HTTPException(status_code=404, detail=f"session {sid!r} not found")
     runner = _resolve_runner_for(sid) if normalized_project_root is None \
         else _get_runner(normalized_project_root)
