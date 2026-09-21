@@ -440,21 +440,23 @@ def _normalize_project_root(project_root: Optional[str]) -> Optional[str]:
 # --------------------- routes ---------------------
 
 def _enforce_project_root_base(project_root: Optional[str]) -> None:
-    """Constrain project roots to a configured safe base directory.
+    """Constrain project roots to a configured safe base directory -- OPT-IN.
 
-    ``project_root`` is user-controlled input and must not be allowed to point
-    at arbitrary filesystem locations. ``CGX_PROJECT_ROOT_BASE`` therefore
-    defines the allowed root tree and is required whenever ``project_root`` is
-    supplied.
+    ``project_root`` is user-controlled input. When ``CGX_PROJECT_ROOT_BASE`` is
+    set, the resolved root MUST live inside that base tree; a value outside it is
+    rejected with a 400. This is the hardening to enable when the server is
+    exposed beyond loopback (see the README's binding/auth notes).
+
+    When the base is NOT configured the check is a no-op: CGX is local-first and
+    single-user by default, and "point the agent at any local project" is the
+    documented behaviour. Deny-by-default here would break that UX and force an
+    env var on every local user, so enforcement is opt-in via the env var.
     """
     if project_root is None:
         return
     configured_base = os.getenv("CGX_PROJECT_ROOT_BASE")
     if not configured_base:
-        raise HTTPException(
-            status_code=400,
-            detail=("Project root override is disabled until "
-                    "CGX_PROJECT_ROOT_BASE is configured."))
+        return  # opt-in: no base configured -> no restriction (local-first default)
     base_root = os.path.abspath(os.path.expanduser(configured_base))
     candidate = os.path.abspath(os.path.expanduser(project_root))
     try:
@@ -555,8 +557,8 @@ def _resolve_mode(req: AgentSessionCreateRequest) -> SessionMode:
 @router.get("", response_model=List[Dict[str, Any]])
 async def list_agent_sessions(
         project_root: Optional[str] = Query(default=None)) -> List[Dict[str, Any]]:
+    normalized_project_root = _normalize_project_root(project_root)
     _enforce_project_root_base(normalized_project_root)
-    normalized_project_root = _validate_project_root_for_read(project_root)
     # A project_root that doesn't exist on disk has no sessions -- and merely
     # opening a runner for it would create ``<root>/.cgx`` via the store's
     # mkdir, resurrecting a folder the user deleted. (A stale ``projectRoot``
