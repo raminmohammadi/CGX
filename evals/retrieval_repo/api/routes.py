@@ -1,6 +1,6 @@
 """HTTP API surface for the billing service."""
 
-from flask import Blueprint, Flask
+from flask import Blueprint, Flask, escape
 
 bp = Blueprint("billing", __name__)
 
@@ -14,7 +14,7 @@ def list_invoices():
 @bp.route("/invoices/<invoice_id>/refund", methods=["POST"])
 def refund_invoice(invoice_id):
     """Issue a refund against a previously paid invoice."""
-    return {"refunded": invoice_id}
+    return {"refunded": escape(invoice_id)}
 
 
 def create_app():
