@@ -434,17 +434,19 @@ def _normalize_project_root(project_root: Optional[str]) -> Optional[str]:
     normalized = os.path.abspath(os.path.expanduser(candidate))
     if not os.path.isabs(normalized):
         raise HTTPException(status_code=400, detail="Project root must resolve to an absolute path.")
-    return normalized
+    """Constrain project roots to a configured safe base directory.
 
-
-def _validate_project_root_for_read(project_root: Optional[str]) -> Optional[str]:
-    """Validate caller-provided project root before read-only fs checks."""
+    ``project_root`` is user-controlled input and must be bounded to a trusted
+    base before any filesystem path checks/operations.
     normalized = _normalize_project_root(project_root)
     if normalized is None:
         return None
     if not normalized.strip():
         raise HTTPException(status_code=400, detail="project_root cannot be empty")
-    if "\x00" in normalized:
+        raise HTTPException(
+            status_code=400,
+            detail=("Server is not configured to accept user-supplied project "
+                    "roots (missing CGX_PROJECT_ROOT_BASE)."))
         raise HTTPException(status_code=400, detail="project_root contains NUL byte")
     if not os.path.isabs(normalized):
         raise HTTPException(status_code=400, detail="project_root must be absolute")
