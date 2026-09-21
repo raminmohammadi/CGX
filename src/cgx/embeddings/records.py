@@ -80,7 +80,14 @@ logger = get_logger(__name__)
 #     ``chunk.meta['route']`` when a FastAPI/Flask-style route decorator is
 #     present, else ``None``. Enables deterministic endpoint enumeration
 #     ("how many API endpoints…"). v4 indices lack ``route``; rebuild to gain it.
-SCHEMA_VERSION = 5
+# v6: Content-bearing lexical index. ``lexical_helpers.ngrams_1`` now tokenizes
+#     the chunk's source segment (docstring + inline comments + body) and the
+#     flattened structured docstring -- not just identifiers -- and preserves
+#     term frequency (no set() dedup) so BM25 has a real tf signal. The absolute
+#     path is dropped from the posting stream (only the file stem is kept) to
+#     stop shared directory/machine tokens polluting every posting. v5 indices
+#     match only on symbol names and MUST be rebuilt to retrieve on content.
+SCHEMA_VERSION = 6
 
 
 # ---------------------------

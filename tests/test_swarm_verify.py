@@ -372,3 +372,99 @@ def test_repair_context_falls_back_to_all_py_without_localization():
     paths = ["a.py", "b.py", "README.md", "requirements.txt"]
     ctx = sv._repair_context_paths([], paths, {})
     assert ctx == ["a.py", "b.py"]
+
+
+# --------------- assertion-failure localization (Phase C4) ---------------
+
+_PYTEST_ASSERT_OUTPUT = """== pytest ==
+.F                                                                       [100%]
+=================================== FAILURES ===================================
+_______________________________ test_total_area ________________________________
+    def test_total_area():
+        circles = [Circle(1.0), Circle(2.0), Circle(3.0)]
+>       assert total_area(circles) == pytest.approx(14.137166941154067)
+E       assert 43.982297150257104 == 14.137166941154067 +- 1.4e-05
+=========================== short test summary info ============================
+FAILED tests/test_models.py::test_total_area
+"""
+
+
+def test_failing_test_names_from_banner_and_summary():
+    names = sv._failing_test_names(_PYTEST_ASSERT_OUTPUT)
+    assert "test_total_area" in names
+
+
+def test_failing_test_files_localizes_by_test_name(tmp_path):
+    # A planned test file that defines the failing test is localized so its
+    # depends_on impl gets pulled into repair context (test<->impl reconcile).
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_models.py").write_text(
+        "def test_total_area():\n    assert True\n")
+    (tmp_path / "tests" / "test_other.py").write_text(
+        "def test_unrelated():\n    assert True\n")
+    paths = ["tests/test_models.py", "tests/test_other.py", "backend/models.py"]
+    targets = sv._failing_test_files(_PYTEST_ASSERT_OUTPUT, paths, str(tmp_path))
+    assert targets == ["tests/test_models.py"]
+
+
+def test_localize_failure_composes_all_signals(tmp_path):
+    # A ModuleNotFoundError localizes to the planned file meant to provide the
+    # module, without matching a lookalike path (data.py must not match a.py).
+    out = "ModuleNotFoundError: No module named 'store'\napp.py:1: in <module>"
+    paths = ["store.py", "app.py", "data.py"]
+    got = sv._localize_failure(out, paths, str(tmp_path))
+    assert "store.py" in got and "app.py" in got and "data.py" not in got
+
+
+# --------------------- C5: partial-success summary ---------------------
+
+def test_verify_summary_partial_build_lists_failing_tests():
+    env = {"outcome": "failed",
+           "output": "___ test_total_area ___\nE   assert 43.98 == 14.13\n"}
+    s = sv._verify_summary(["a.py", "b.py", "c.py"], ["a.py", "b.py"],
+                           ["c.py"], ["c.py"], env, False)
+    assert s.startswith("partial build")
+    assert "2/3" in s
+    assert "test_total_area" in s
+
+
+def test_verify_summary_green_reports_passed():
+    env = {"outcome": "passed", "output": ""}
+    s = sv._verify_summary(["a.py"], ["a.py"], [], [], env, True)
+    assert s.startswith("verified") and "tests passed" in s
+
+
+# --------------------- behavioural acceptance gate ---------------------
+
+def test_acceptance_failure_gates_verify(tmp_path, monkeypatch):
+    from cgx.session.tasks.acceptance import AcceptanceResult
+    (tmp_path / "app.py").write_text("x = 1\n", encoding="utf-8")
+    monkeypatch.setattr(sv, "_run_acceptance", lambda contracts, root:
+                        AcceptanceResult(outcome="failed",
+                                         reason="1/1 declared routes errored",
+                                         failures=["GET / -> HTTP 500"]))
+    monkeypatch.setattr(sv, "_dynamic_repair", lambda *a, **k: [])
+    res = _run(tmp_path, _plan(tmp_path, ["app.py"]))
+    assert res.outputs["verify_ok"] is False
+    assert res.artifact.content["acceptance"]["outcome"] == "failed"
+    assert "acceptance failed" in res.outputs["summary"]
+
+
+def test_acceptance_pass_keeps_verify_green(tmp_path, monkeypatch):
+    from cgx.session.tasks.acceptance import AcceptanceResult
+    (tmp_path / "app.py").write_text("x = 1\n", encoding="utf-8")
+    monkeypatch.setattr(sv, "_run_acceptance", lambda contracts, root:
+                        AcceptanceResult(outcome="passed",
+                                         reason="1 routes responded",
+                                         checks_run=1))
+    res = _run(tmp_path, _plan(tmp_path, ["app.py"]))
+    assert res.outputs["verify_ok"] is True
+    assert res.artifact.content["acceptance"]["outcome"] == "passed"
+
+
+def test_acceptance_skip_is_advisory(tmp_path):
+    # No run command declared -> acceptance SKIPS and must not block a green tree.
+    (tmp_path / "app.py").write_text("x = 1\n", encoding="utf-8")
+    res = _run(tmp_path, _plan(tmp_path, ["app.py"]))
+    assert res.outputs["verify_ok"] is True
+    assert res.artifact.content["acceptance"]["outcome"] == "skipped"

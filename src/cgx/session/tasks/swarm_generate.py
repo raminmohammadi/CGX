@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from cgx.codegen.ast_gluer import ASTAssembler
-from cgx.session.import_audit import strip_unused_imports, unused_imports
+from cgx.session.import_audit import strip_unused_imports
 from cgx.session.tasks.swarm_ground import _safe_read, ground_dependencies
 
 # Caps on model-facing context. A tool response (``run_python_probe`` output, a
@@ -43,17 +43,35 @@ def _truncate(text: str, limit: int) -> str:
 
 
 # Tools the Developer may call while generating a file: read-only introspection
-# so imports name symbols that actually exist, plus any configured MCP tools.
-# Dispatch and descriptions both come from the shared registry -- adding a tool
-# here (or an MCP server) needs no change to this loop.
-_DEV_BASE_TOOLS = ("run_python_probe", "file_skeleton", "list_symbols")
+# so imports name symbols that actually exist, plus web search so it can find a
+# real third-party/SDK API's docs and implement the actual integration instead
+# of shipping an echo/placeholder stub. Page FETCHING is served by an MCP fetch
+# server when one is configured (preferred), else the built-in ``fetch_url``
+# fallback (see _dev_tools). Dispatch/descriptions come from the shared registry.
+_DEV_BASE_TOOLS = ("run_python_probe", "file_skeleton", "list_symbols",
+                   "search_web")
 _MAX_TOOL_ITERS = 5
 
 
-def _dev_tools() -> tuple:
-    """Developer tool set: introspection + MCP tools when servers exist."""
+def _dev_tools(deps: Any = None) -> tuple:
+    """Developer tool set: introspection + web + MCP tools when servers exist.
+
+    * ``query_codebase`` (semantic retrieval) is advertised ONLY when ``deps``
+      carries an index, so a fresh greenfield build never sees a no-op tool.
+    * Page fetching prefers MCP: when an MCP server is configured the built-in
+      ``fetch_url`` is dropped (the model fetches via ``mcp_call``); with no MCP
+      server it is advertised as the fallback. Either way ``search_web`` stays
+      for URL discovery, and both fetch paths are guardrail-screened.
+    """
     from cgx.session.tasks.swarm_tools import mcp_tools_if_configured
-    return _DEV_BASE_TOOLS + mcp_tools_if_configured()
+    mcp = mcp_tools_if_configured()
+    tools = _DEV_BASE_TOOLS
+    if not mcp:
+        tools = tools + ("fetch_url",)
+    if deps is not None and getattr(deps, "index_dir", None) \
+            and getattr(deps, "records_path", None):
+        tools = tools + ("query_codebase",)
+    return tools + mcp
 
 
 class ToolWrapper:
@@ -88,6 +106,12 @@ class ToolWrapper:
                     "you MUST verify the API signatures, class names, and exports of "
                     "ANY local file you plan to import from, by calling tools. DO NOT "
                     "GUESS OR HALLUCINATE imported names.\n"
+                    "If this file must integrate a THIRD-PARTY API or SDK you are not "
+                    "certain of (e.g. an LLM/cloud client), use search_web to find its "
+                    "official docs and fetch_url to READ them, then implement the REAL "
+                    "call. NEVER ship a placeholder, echo, or 'this is a response' stub "
+                    "for a feature the objective requires -- research it and implement "
+                    "it for real.\n"
                     + REGISTRY.describe_for_prompt(self.tools)
                 )
 
@@ -254,21 +278,24 @@ def _gate_generated_content(path: str, content: str,
     warnings = check_contract_compliance({path: content}, contracts)
     if manifest_paths:
         from cgx.session.import_audit import resolve_first_party_imports
-        from cgx.session.tasks.swarm_verify import _check_phantom_third_party_imports
-        allowed_3p = contracts.get("third_party_dependencies", [])
         warnings.extend(
             resolve_first_party_imports({path: content}, manifest_paths, root))
-        warnings.extend(
-            _check_phantom_third_party_imports([path], {path: content},
-                                               allowed_3p, root))
+        # NOTE: an undeclared *third-party* import (one not in the plan's
+        # third_party_dependencies) is deliberately NOT gated here. It is almost
+        # always the Developer making a legitimate framework choice the planner
+        # under-declared (e.g. importing `flask`), and verify's dependency
+        # reconcile installs + pins it. Gating on it drove a
+        # generate -> reject -> (syntax) semantic-repair thrash that could not
+        # fix a *policy* rejection and shipped the file with the import anyway.
+        # Only first-party resolution breaks (a local symbol that does not
+        # exist) and contract compliance gate here.
     file_warnings = [w for w in warnings
                      if w.get("file") == path or w.get("module") == path]
     if not file_warnings:
         return None
     errs = "; ".join(w.get("reason", "unknown") for w in file_warnings)
     is_import_err = bool(manifest_paths) and any(
-        w.get("kind") == "phantom_third_party"
-        or "resolves against neither" in w.get("reason", "")
+        "resolves against neither" in w.get("reason", "")
         for w in file_warnings)
     if is_import_err:
         available = ", ".join(manifest_paths or [])
@@ -284,12 +311,22 @@ def _full_file_attempt(path: str, description: str, depends_on: List[str],
                        contracts: Dict[str, Any], goal: str, root: str,
                        provider: Any, layer: str,
                        manifest_paths: Optional[List[str]],
-                       skills: Optional[List[str]] = None) -> Any:
+                       skills: Optional[List[str]] = None,
+                       deps: Any = None) -> Any:
     from cgx.answer.engine import generate_single_scaffold_file
 
     context = _dep_context(depends_on, root)
+    # Deterministic, verified import lines for this file's Python dependencies,
+    # so a weak model copies a correct `from <module> import <symbol>` instead
+    # of guessing the dotted path or a non-existent symbol name. Derived from
+    # the FULL on-disk dep source (not the truncated context) so the public
+    # surface is complete; advisory only (unused lines are stripped later).
+    from cgx.session.tasks.swarm_skeleton import render_import_hints
+    dep_sources = {d: (_safe_read(d, root) or "") for d in (depends_on or [])}
+    import_hint = render_import_hints(path, dep_sources)
     try:
-        wrapped = ToolWrapper(provider, root)
+        # Advertise query_codebase only when deps carries an index (see _dev_tools).
+        wrapped = ToolWrapper(provider, root, tools=_dev_tools(deps), deps=deps)
         result = generate_single_scaffold_file(
             path, description, wrapped,
             layer=layer,
@@ -299,6 +336,7 @@ def _full_file_attempt(path: str, description: str, depends_on: List[str],
             depends_on=list(depends_on or []),
             contracts=contracts or {},
             manifest_paths=manifest_paths,
+            import_hint=import_hint,
         )
     except Exception as exc:  # pragma: no cover
         return "", f"{type(exc).__name__}: {exc}"
@@ -456,14 +494,45 @@ def _requirements_content(manifest_paths: Optional[List[str]],
     return "\n".join(sorted(dists)) + "\n"
 
 
+def _render_structure(manifest_paths: Optional[List[str]]) -> str:
+    """A deterministic, ACCURATE 'Project structure' tree from the real files.
+
+    The README's file listing must reflect the actual codebase, not the model's
+    guess -- so we own it: build an indented directory tree from the planned/
+    generated paths and render it in a fenced block. Empty when nothing planned.
+    """
+    paths = sorted({str(p).replace("\\", "/") for p in (manifest_paths or []) if p})
+    if not paths:
+        return ""
+    tree: Dict[str, Any] = {}
+    for p in paths:
+        node = tree
+        for part in p.split("/"):
+            node = node.setdefault(part, {})
+    lines = ["## Project structure", "", "```"]
+
+    def _walk(node: Dict[str, Any], prefix: str = "") -> None:
+        for name in sorted(node):
+            children = node[name]
+            lines.append(f"{prefix}{name}{'/' if children else ''}")
+            if children:
+                _walk(children, prefix + "  ")
+
+    _walk(tree)
+    lines.append("```")
+    return "\n".join(lines) + "\n"
+
+
 def _fallback_readme(goal: str, manifest_paths: Optional[List[str]]) -> str:
-    """A minimal but valid README when the free-form model path is unusable."""
+    """A minimal but valid README when the free-form model path is unusable.
+
+    The accurate structure section is appended by :func:`_readme_content`, so
+    this body carries only the prose + generic run/test commands.
+    """
     title = (goal or "Project").strip().splitlines()[0][:80] or "Project"
-    files = "\n".join(f"- `{p}`" for p in (manifest_paths or []))
     return (f"# {title}\n\n{goal}\n\n"
             "## Install\n\n```\npip install -r requirements.txt\n```\n\n"
-            "## Testing\n\n```\npytest\n```\n"
-            + (f"\n## Files\n\n{files}\n" if files else ""))
+            "## Testing\n\n```\npytest\n```\n")
 
 
 def _readme_content(description: str, goal: str, provider: Any,
@@ -475,20 +544,29 @@ def _readme_content(description: str, goal: str, provider: Any,
     :func:`_fallback_readme` so a README always ships.
     """
     listing = "\n".join(f"- {p}" for p in (manifest_paths or []))
-    system = ("You write a concise, accurate README.md for a Python project. "
-              "Output ONLY Markdown -- no surrounding code fence. Include a "
-              "title, a one-paragraph description, an Install section using "
-              "'pip install -r requirements.txt', and a Testing section using "
-              "'pytest'.")
+    system = ("You write a concise, accurate README.md for a software project "
+              "(it may span multiple components/languages, e.g. a Python backend "
+              "and a JS/React frontend). Output ONLY Markdown -- no surrounding "
+              "code fence. Include a title, a one-paragraph description of what "
+              "the app actually does, a Setup/Run section with the real commands "
+              "to install dependencies and start each component, and a Testing "
+              "section. Do NOT invent a file listing or a 'Project structure' "
+              "section -- an accurate one is appended automatically.")
     user = (f"Project goal:\n{goal}\n\nThis file's purpose:\n{description}\n\n"
-            f"Planned files:\n{listing}\n")
+            f"Files in the project (context only; do not paste verbatim):\n{listing}\n")
     try:
         res = provider.chat(messages=[{"role": "system", "content": system},
                                         {"role": "user", "content": user}], force_json=False)
         content = str((res or {}).get("content") or "").strip()
     except Exception:  # pragma: no cover - defensive: provider crash
         content = ""
-    return content + "\n" if content else _fallback_readme(goal, manifest_paths)
+    body = (content + "\n") if content else _fallback_readme(goal, manifest_paths)
+    # Own the facts: append the real, deterministic structure regardless of what
+    # the model wrote, so the README always reflects the actual codebase.
+    structure = _render_structure(manifest_paths)
+    if structure:
+        body = body.rstrip() + "\n\n" + structure
+    return body
 
 
 def _generate_non_source(path: str, description: str, goal: str, root: str,
@@ -525,7 +603,9 @@ def generate_file(*, path: str, description: str, depends_on: List[str],
                   provider: Any, layer: str = "",
                   manifest_paths: Optional[List[str]] = None,
                   log_root: Optional[str] = None,
-                  skills: Optional[List[str]] = None) -> GenerationOutcome:
+                  skills: Optional[List[str]] = None,
+                  deps: Any = None,
+                  modify_existing: bool = False) -> GenerationOutcome:
     """Run the full-file -> AST fallback ladder for a single file.
 
     A planned non-source deliverable (``requirements.txt``, ``conftest.py``,
@@ -543,26 +623,38 @@ def generate_file(*, path: str, description: str, depends_on: List[str],
         return _generate_non_source(path, description, goal, root, provider,
                                     manifest_paths, log_root)
     depends_on = list(depends_on or [])
+    # Existing-repo safety: when the target file already exists (the Swarm is
+    # editing a real tree, not scaffolding an empty one), ground generation on
+    # its current body and ask for a *modification* that preserves unrelated
+    # code, instead of a blind from-scratch overwrite that would delete it.
+    if modify_existing:
+        existing = _safe_read(path, root)
+        if existing and existing.strip():
+            description = (
+                description
+                + "\n\nIMPORTANT: this file ALREADY EXISTS. MODIFY it to satisfy "
+                "the requirements while PRESERVING all unrelated existing code, "
+                "imports, and public symbols. Do not delete working code. "
+                "Current content:\n" + _truncate(existing, _DEP_CONTENT_LIMIT))
+            swarm_beat(log_root, "developer", "modify_existing", file=path,
+                       bytes=len(existing))
     content = err = ""
     last_broken_content = ""
     for attempt in range(2):
         content, err = _full_file_attempt(
             path, description, depends_on, contracts, goal, root, provider,
-            layer, manifest_paths, skills)
+            layer, manifest_paths, skills, deps)
         if err:
             last_broken_content = content or last_broken_content
             swarm_beat(log_root, "developer", "gate", file=path, ok=False,
                        method="full-file", error=err)
             content = ""
             continue
-        phantom = unused_imports(content, path=path)
-        if phantom and attempt == 0:
-            last_broken_content = content
-            swarm_beat(log_root, "developer", "gate", file=path, ok=False,
-                       method="full-file",
-                       error=f"phantom imports: {', '.join(phantom)}")
-            content = ""
-            continue
+        # An UNUSED import (e.g. a test file that imports ``pytest`` but only
+        # uses bare ``assert``) is not a defect: ``_sanitize_phantoms`` below
+        # strips genuinely-unused imports from the accepted body. Rejecting the
+        # whole file and regenerating on that basis was pure churn (it forced a
+        # wasted round on nearly every test file), so accept and sanitize.
         break
     if content:
         content = _sanitize_phantoms(content, path, log_root)

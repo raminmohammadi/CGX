@@ -116,6 +116,7 @@ class TaskKind(str, enum.Enum):
     # build). The router never spawns it and no executor is registered;
     # it exists so one legacy row cannot make a whole session unreadable.
     UNKNOWN = "unknown"
+    SWARM_ASSESS = "swarm_assess"
     SWARM_TECH_LEAD = "swarm_tech_lead"
     SWARM_DEVELOPER = "swarm_developer"
     SWARM_VERIFY = "swarm_verify"
@@ -165,6 +166,9 @@ class DecisionKind(str, enum.Enum):
     FREEFORM = "freeform"
     CLARIFY_ANSWERS = "clarify_answers"
     APPROVE_PLAN = "approve_plan"
+    # Swarm pointed at an existing repo judged unrelated to the objective: the
+    # user picks a fresh folder to build in, or confirms building in place.
+    RELOCATE = "relocate"
 
 
 # --------------------- core dataclasses ---------------------
@@ -365,6 +369,13 @@ class Session:
     max_task_runs: Optional[int] = None
     max_wall_seconds: Optional[float] = None
     headless: bool = False
+    # Human-in-the-loop control for the SWARM build pipeline: when True the
+    # Tech Lead's plan is gated on an explicit user APPROVE_PLAN decision before
+    # any file is generated (recommended for weak local models -- it catches a
+    # drifted/off-objective plan before the whole build runs). When False the
+    # swarm runs fully autonomously. Ignored by explore/greenfield, which have
+    # their own approval semantics.
+    require_plan_approval: bool = False
     # Live counters the runner maintains as it dispatches work tasks
     # (everything except the ASK_USER pause primitive).
     task_runs: int = 0
@@ -382,6 +393,7 @@ class Session:
             max_task_runs: Optional[int] = None,
             max_wall_seconds: Optional[float] = None,
             headless: bool = False,
+            require_plan_approval: bool = False,
             skills: Optional[List[str]] = None) -> "Session":
         t = (title or original_objective).strip()
         if len(t) > 80:
@@ -395,6 +407,7 @@ class Session:
             max_task_runs=max_task_runs,
             max_wall_seconds=max_wall_seconds,
             headless=headless,
+            require_plan_approval=require_plan_approval,
             skills=list(skills or []),
         )
 

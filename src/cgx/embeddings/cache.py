@@ -43,9 +43,11 @@ def hash_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
 
 
-def _meta_dict(*, model_name: str, dim: int, normalize: bool) -> Dict[str, Any]:
+def _meta_dict(*, model_name: str, dim: int, normalize: bool,
+               max_length: int = 0) -> Dict[str, Any]:
     return {"version": _CACHE_VERSION, "model_name": str(model_name),
-            "dim": int(dim), "normalize": bool(normalize)}
+            "dim": int(dim), "normalize": bool(normalize),
+            "max_length": int(max_length or 0)}
 
 
 def load_cache(path: str, *, expected_meta: Dict[str, Any]) -> Dict[str, np.ndarray]:
@@ -73,10 +75,18 @@ def load_cache(path: str, *, expected_meta: Dict[str, Any]) -> Dict[str, np.ndar
                 cached_version = 0
             if cached_version != _CACHE_VERSION:
                 return {}
-            for k in ("model_name", "dim", "normalize"):
+            for k in ("model_name", "dim", "normalize", "max_length"):
                 # ``dim == 0`` in the expected meta acts as a wildcard so
                 # callers can probe without yet knowing the model dim.
                 if k == "dim" and int(expected_meta.get(k) or 0) == 0:
+                    continue
+                # ``max_length == 0`` is a wildcard too: a cache written before
+                # the field existed (or by a caller that doesn't set it) is not
+                # rejected on that basis alone. When the caller DOES pass a
+                # concrete truncation length, a mismatch invalidates the cache
+                # so a 256->8192 change re-embeds instead of serving clipped
+                # vectors under an unchanged text hash.
+                if k == "max_length" and int(expected_meta.get(k) or 0) == 0:
                     continue
                 if str(meta.get(k)) != str(expected_meta.get(k)):
                     return {}
@@ -90,7 +100,8 @@ def load_cache(path: str, *, expected_meta: Dict[str, Any]) -> Dict[str, np.ndar
 
 
 def save_cache(path: str, store: Dict[str, np.ndarray], *,
-               model_name: str, dim: int, normalize: bool) -> None:
+               model_name: str, dim: int, normalize: bool,
+               max_length: int = 0) -> None:
     """Persist ``store`` to ``path`` atomically."""
     if not store:
         return
@@ -98,7 +109,8 @@ def save_cache(path: str, store: Dict[str, np.ndarray], *,
     p.parent.mkdir(parents=True, exist_ok=True)
     keys = list(store.keys())
     values = np.stack([np.asarray(store[k], dtype=np.float32) for k in keys], axis=0)
-    meta = _meta_dict(model_name=model_name, dim=dim, normalize=normalize)
+    meta = _meta_dict(model_name=model_name, dim=dim, normalize=normalize,
+                      max_length=max_length)
     # ``np.savez`` appends ``.npz`` when the path lacks that suffix, so we
     # name the temp file with a ``.npz`` extension already (just disambiguated)
     # to ensure the post-write rename targets a real file.
@@ -121,6 +133,7 @@ def embed_with_cache(
     cache_path: str,
     model_name: str,
     normalize: bool,
+    max_length: int = 0,
 ) -> Tuple[np.ndarray, Dict[str, int]]:
     """Return embeddings for ``texts``, consulting + updating the cache.
 
@@ -151,7 +164,7 @@ def embed_with_cache(
     # Load the cache. ``dim=0`` is treated as a wildcard by ``load_cache``
     # so we don't need to know the model dim ahead of time.
     cache = load_cache(cache_path, expected_meta=_meta_dict(
-        model_name=model_name, dim=0, normalize=normalize))
+        model_name=model_name, dim=0, normalize=normalize, max_length=max_length))
 
     missing_idx: List[int] = [i for i, k in enumerate(keys) if k not in cache]
     if missing_idx:
@@ -171,5 +184,6 @@ def embed_with_cache(
         return np.zeros((0, 0), dtype=np.float32), {"hits": 0, "misses": 0, "dim": 0}
 
     embs = np.stack([cache[k] for k in keys], axis=0) if n else np.zeros((0, dim), dtype=np.float32)
-    save_cache(cache_path, cache, model_name=model_name, dim=dim, normalize=normalize)
+    save_cache(cache_path, cache, model_name=model_name, dim=dim,
+               normalize=normalize, max_length=max_length)
     return embs, {"hits": n - len(missing_idx), "misses": len(missing_idx), "dim": dim}

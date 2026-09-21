@@ -592,14 +592,31 @@ def _install_greenfield_stubs() -> None:
                      "outcome": "skipped"}, artifact=art)
 
 
-def test_create_greenfield_session_auto_detects_empty_root(
+def test_create_empty_root_auto_detects_swarm(
         client: _HandlerClient, tmp_path: Path) -> None:
-    """Empty project_root + no index -> mode resolves to greenfield."""
+    """Phase C: an empty project_root + no index auto-resolves to Swarm.
+
+    Created without running the initial task so no provider/executor is needed
+    -- we only assert the mode auto-detection contract flipped from greenfield
+    to swarm.
+    """
+    state = client.create(
+        objective="build a flask api that saves JSON to disk",
+        project_root=str(tmp_path / "fresh"),
+        mode=None,  # opt out of the default explore override -> auto-detect
+        run_initial_task=False)
+    assert client.last_status == 200
+    assert state["session"]["mode"] == "swarm"
+
+
+def test_create_greenfield_session_explicit_mode(
+        client: _HandlerClient, tmp_path: Path) -> None:
+    """Greenfield is now explicit-only; its clarify pipeline still runs."""
     _install_greenfield_stubs()
     state = client.create(
         objective="build a flask api that saves JSON to disk",
         project_root=str(tmp_path / "fresh"),
-        mode=None,  # opt out of the default explore override
+        mode="greenfield",
         run_initial_task=True)
     assert client.last_status == 200
     assert state["session"]["mode"] == "greenfield"
@@ -1184,3 +1201,56 @@ def test_resolve_runner_for_rebuilds_a_stale_runner(tmp_path: Path) -> None:
 
     assert resolved is not first
     assert Path(resolved.store.path).exists()
+
+
+def test_list_sessions_nonexistent_root_is_not_created(tmp_path):
+    """Regression: listing sessions for a project_root that doesn't exist must
+    NOT materialize <root>/.cgx (a stale persisted projectRoot was recreating a
+    deleted folder like an empty Calculator/ on every sidebar load)."""
+    import asyncio
+    import os as _os
+    from cgx.webui.routes.agent_session import list_agent_sessions
+    ghost = str(tmp_path / "ghost_project")
+    result = asyncio.run(list_agent_sessions(project_root=ghost))
+    assert result == []
+    assert not _os.path.exists(ghost)
+
+
+# --------------- project-root validation on create (clean 400) ---------------
+
+def test_create_rejects_project_root_with_missing_parent(tmp_path):
+    """A mistyped root whose parent chain does not exist must be a clean 400,
+    NOT a 500 from mkdir walking up into a protected dir like /Users -- and it
+    must not create any directory."""
+    import os as _os
+    from cgx.webui.routes.agent_session import _validate_project_root_writable
+    bad = str(tmp_path / "no_such_parent" / "proj")
+    with pytest.raises(HTTPException) as ei:
+        _validate_project_root_writable(bad)
+    assert ei.value.status_code == 400
+    assert "parent" in str(ei.value.detail).lower()
+    assert not _os.path.exists(bad)
+    assert not _os.path.exists(str(tmp_path / "no_such_parent"))
+
+
+def test_create_allows_new_leaf_under_existing_parent(tmp_path):
+    # A not-yet-created project folder whose parent exists is fine: the
+    # greenfield/swarm build creates the leaf. Validation must not reject it.
+    from cgx.webui.routes.agent_session import _validate_project_root_writable
+    _validate_project_root_writable(str(tmp_path / "new_proj"))  # no raise
+
+
+def test_validate_project_root_existing_dir_and_none_ok(tmp_path):
+    from cgx.webui.routes.agent_session import _validate_project_root_writable
+    _validate_project_root_writable(str(tmp_path))  # existing dir: no raise
+    _validate_project_root_writable(None)           # default store: no raise
+
+
+def test_create_rejects_project_root_that_is_a_file(tmp_path):
+    from cgx.webui.routes.agent_session import _validate_project_root_writable
+    f = tmp_path / "a_file"
+    f.write_text("x", encoding="utf-8")
+    with pytest.raises(HTTPException) as ei:
+        _validate_project_root_writable(str(f))
+    assert ei.value.status_code == 400
+    assert "not a directory" in str(ei.value.detail).lower()

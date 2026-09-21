@@ -236,3 +236,67 @@ def test_source_kind_provenance_on_records(tmp_path):
     assert "a.py" in by_kind.get("code", set())
     # Every record has an explicit provenance (no None leaking through).
     assert all(r.get("source_kind") in ("code", "doc") for r in recs)
+
+
+def test_nested_helpers_in_methods_do_not_collide(tmp_path):
+    """Identically-named helpers nested inside different methods must each get a
+    distinct chunk id in the ``::function::`` namespace -- not collide on
+    ``::method::Class.helper`` (which silently dropped one and mislabeled both
+    as class methods)."""
+    src = textwrap.dedent(
+        '''
+        class Service:
+            def alpha(self):
+                def _key(x):
+                    return x + 1
+                return _key(1)
+
+            def beta(self):
+                def _key(y):
+                    return y * 2
+                return _key(2)
+        '''
+    )
+    chunks, _calls = _parse_python_module("svc.py", src, ".")
+    keys = [c for c in chunks if c.get("name") == "_key"]
+    assert len(keys) == 2, "both nested helpers must survive as distinct chunks"
+    ids = {c["id"] for c in keys}
+    assert len(ids) == 2, f"nested helper ids collided: {ids}"
+    # Neither nested helper is mislabeled as a method, and neither carries a
+    # class_name (they are local functions, not members of Service).
+    for c in keys:
+        assert "::method::" not in c["id"]
+        assert (c.get("meta") or {}).get("class_name") is None
+    # Records dedup by id -- previously one _key was dropped here.
+    recs = make_index_records(chunks, G=None)
+    assert sum(1 for r in recs if r.get("name") == "_key") == 2
+
+
+def test_module_level_wiring_is_captured_and_searchable():
+    """Top-level wiring (blueprint registration, __main__ guard) must land in the
+    file chunk's searchable text AND be recorded as module-scope call relations
+    attributed to the file node -- previously both were dropped."""
+    src = textwrap.dedent(
+        '''
+        """App entrypoint."""
+        from flask import Flask
+
+        def create_app():
+            return Flask(__name__)
+
+        app = create_app()
+        app.register_blueprint(billing_bp)
+
+        if __name__ == "__main__":
+            app.run(port=8080)
+        '''
+    )
+    chunks, calls = _parse_python_module("app.py", src, ".")
+    fchunk = next(c for c in chunks if c["type"] == "file")
+    # (b) module wiring is in the searchable file stub, docstring not duplicated.
+    assert "app.register_blueprint(billing_bp)" in fchunk["code"]
+    assert '__main__' in fchunk["code"]
+    assert fchunk["code"].count('"""App entrypoint."""') == 1
+    # (a) module-level calls recorded with the file as caller.
+    mod_callees = {c["callee_name"] for c in calls if c["caller_id"] == fchunk["id"]}
+    assert {"register_blueprint", "run", "create_app"} <= mod_callees

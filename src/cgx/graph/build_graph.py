@@ -329,6 +329,7 @@ def init_indices():
         "funcs_by_name": {},                # name -> [ids]
         "funcs_by_file_and_name": {},       # (file, name) -> [ids]
         "methods_by_class_and_name": {},    # (file, class, method) -> id
+        "module_to_file": {},               # dotted module_path -> file (for import resolution)
     }
 
 
@@ -412,12 +413,17 @@ def add_code_nodes(G, chunks, indices):
 
         # ---- NEW: enrich 'file' nodes with docstring/module_path/members/metrics
         if kind == "file":
+            mp = ch.get("module_path")
             node_attrs.update({
-                "module_path": ch.get("module_path"),
+                "module_path": mp,
                 "docstring": meta.get("docstring"),
                 "members": meta.get("members"),
                 "metrics": meta.get("metrics"),
             })
+            # Map dotted module_path -> file so an `import` can be resolved to
+            # the project file it names (and thence to a specific symbol).
+            if isinstance(mp, str) and mp:
+                indices["module_to_file"][mp] = cfile
 
         if kind == "class":
             node_attrs.update({
@@ -573,36 +579,84 @@ def resolve_callee_candidates(rel: dict, indices: dict, G: nx.DiGraph):
     caller_k = node_kind(caller)
     caller_cls = meta_of(caller).get("class_name") if caller_k == "method" else None
 
-    # Case 1: self.method / super().method → same-class method resolve
-    if caller_cls and callee_full:
-        if callee_full.startswith("self.") or callee_full.startswith("super()."):
+    def _module_node(mod: str) -> str:
+        node = f"module::{mod}"
+        if node not in G:
+            G.add_node(node, type="module", name=mod)
+        return node
+
+    def _unresolved_node() -> str:
+        node = f"unresolved::{callee_name}"
+        if node not in G:
+            G.add_node(node, type="unresolved", name=callee_name)
+        return node
+
+    def _project_symbol(module_full: str) -> list:
+        """A project file whose dotted module_path == ``module_full`` (or whose
+        path basename matches its tail), holding a function/method ``callee_name``."""
+        f = indices["module_to_file"].get(module_full)
+        if not f:
+            # tolerate submodule tails: 'pkg.sub.mod' -> try 'mod'/'sub.mod'
+            tail = module_full.rsplit(".", 1)[-1]
+            for mp, mf in indices["module_to_file"].items():
+                if mp == tail or mp.endswith("." + tail):
+                    f = mf
+                    break
+        if f:
+            hits = indices["funcs_by_file_and_name"].get((f, callee_name))
+            if hits:
+                return list(hits)
+        return []
+
+    # The receiver is everything before the final ``.name`` in the written call
+    # expression (``obj`` in ``obj.save``, ``np`` in ``np.array``). ``None`` for
+    # a bare call ``foo()``. Import aliases are keyed on the receiver's head.
+    receiver = None
+    if callee_full and "." in callee_full:
+        receiver = callee_full.rsplit(".", 1)[0]
+    alias_map = {a: full for (a, full) in normalize_imports_used(meta_of(caller)) if a}
+
+    # Case 1: self.method / super().method -> same-class method resolve.
+    # A self/super receiver we cannot resolve stays unresolved rather than
+    # mis-binding to a same-named global (dropping the receiver was the bug).
+    if callee_full and (callee_full.startswith("self.") or callee_full.startswith("super().")):
+        if caller_cls:
             m = indices["methods_by_class_and_name"].get((caller_file, caller_cls, callee_name))
             if m:
                 return [m], attrs
+        return [_unresolved_node()], attrs
 
-    # Case 2: same-file functions/methods
-    cands = list(indices["funcs_by_file_and_name"].get((caller_file, callee_name), []))
-    if cands:
-        return cands, attrs
+    # Case 2: import-alias resolution (receiver- or bare-name-keyed).
+    #   `np.array()` with `import numpy as np`   -> module::numpy (not phantom np)
+    #   `bar()`      with `from foo import bar`   -> foo.py::function::bar or module::foo
+    recv_head = receiver.split(".", 1)[0] if receiver else None
+    if recv_head and recv_head in alias_map:
+        full_mod = alias_map[recv_head]
+        proj = _project_symbol(full_mod)
+        return (proj, attrs) if proj else ([_module_node(full_mod)], attrs)
+    if receiver is None and callee_name in alias_map:
+        full = alias_map[callee_name]                    # e.g. "foo.bar" or "foo"
+        mod = full.rsplit(".", 1)[0] if "." in full else full
+        proj = _project_symbol(mod) or _project_symbol(full)
+        return (proj, attrs) if proj else ([_module_node(mod)], attrs)
 
-    # Case 3: global functions/methods
-    cands = list(indices["funcs_by_name"].get(callee_name, []))
-    if cands:
-        return cands, attrs
+    # Case 3: BARE calls only -> same-file, then unique global by name. Qualified
+    # calls never reach here: dropping their receiver to match a bare global is
+    # exactly what wired `obj.save()` to every `save` in the repo.
+    if receiver is None:
+        cands = list(indices["funcs_by_file_and_name"].get((caller_file, callee_name), []))
+        if cands:
+            return cands, attrs
+        cands = list(indices["funcs_by_name"].get(callee_name, []))
+        if cands:
+            return cands, attrs
 
-    # Case 4: dotted fullname -> module::<prefix>
+    # Case 4: qualified fullname -> module::<prefix> (dotted receiver path).
     if callee_full and "." in callee_full:
-        mod_hint = callee_full.rsplit(".", 1)[0]
-        mod_node = f"module::{mod_hint}"
-        if mod_node not in G:
-            G.add_node(mod_node, type="module", name=mod_hint)
-        return [mod_node], attrs
+        return [_module_node(callee_full.rsplit(".", 1)[0])], attrs
 
     # Case 5: unresolved
-    unresolved = f"unresolved::{callee_name}"
-    if unresolved not in G:
-        G.add_node(unresolved, type="unresolved", name=callee_name)
-    return [unresolved], attrs
+    return [_unresolved_node()], attrs
 
 
 def add_calls_edges(G, calls, indices):

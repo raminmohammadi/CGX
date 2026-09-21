@@ -95,3 +95,36 @@ export function showPullButton(
 ): boolean {
   return kind === "ollama" && !!model && reachable && !installed.includes(model) && !pulling;
 }
+
+// Case-insensitive "is this model already pulled?" check. Ollama tags are
+// matched exactly at generation time, but the installed list may differ only
+// in case (a re-aliased ``hf.co`` pull lands lowercased), so compare loosely
+// here to avoid showing "not installed" for a tag that is in fact present.
+export function modelInstalled(installed: string[], model: string): boolean {
+  if (!model) return false;
+  const needle = model.toLowerCase();
+  return installed.some((m) => m.toLowerCase() === needle);
+}
+
+// Map a model name to the correct ``ollama pull`` target plus the local tag it
+// will resolve to. A plain Ollama tag (``qwen2.5-coder:3b``) pulls as-is. A
+// Hugging Face repo id (``owner/Repo`` or ``hf.co/owner/repo``) must be pulled
+// via the ``hf.co/<repo>`` form and lands under a lowercased local alias, which
+// the caller should adopt as the active model so later exact-match pings pass.
+export function ollamaPullPlan(model: string): { target: string; localName?: string } {
+  const m = (model || "").trim();
+  if (!m) return { target: m };
+  if (m.startsWith("hf.co/")) {
+    const repo = m.slice("hf.co/".length).split(":")[0];
+    const leaf = repo.split("/").pop() || repo;
+    return { target: m, localName: leaf.toLowerCase() };
+  }
+  // ``owner/repo`` Hugging Face id — has a slash but no scheme; route via hf.co.
+  if (m.includes("/")) {
+    const leaf = m.split("/").pop() || m;
+    return { target: `hf.co/${m}`, localName: leaf.toLowerCase() };
+  }
+  // A bare tag or a slash-less GGUF display name: pull as-is. If it isn't a
+  // real registry tag Ollama will report it; nothing we can rewrite safely.
+  return { target: m };
+}

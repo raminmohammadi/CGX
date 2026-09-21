@@ -33,6 +33,12 @@
 #
 # CPU-only (any platform, no GPU): the default `pip install torch` is fine.
 
-sentence-transformers>=2.7
-transformers>=4.40,<6
+# Version caps keep the default local embedder loadable. transformers 5.x
+# removed transformers.pytorch_utils.find_pruneable_heads_and_indices, which the
+# jina-embeddings-v2-base-code trust_remote_code modeling imports; and
+# sentence-transformers 6.x hard-requires transformers>=5. Holding both on the
+# last jina-compatible line (transformers 4.57.x / sentence-transformers 5.7.x)
+# avoids an ImportError at model load on a fresh install.
+sentence-transformers>=2.7,<6
+transformers>=4.40,<5
 torch>=2.13.0

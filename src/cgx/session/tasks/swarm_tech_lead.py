@@ -15,6 +15,7 @@ and the router drives the Developer over its ordered paths one file per turn.
 
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, List, Optional
 
 from cgx.session.models import Artifact, ArtifactKind, TaskKind
@@ -32,36 +33,43 @@ _MAX_PLAN_ATTEMPTS = 3
 _SYSTEM_PROMPT = (
     "You are the Tech Lead in a two-agent swarm. You do NOT write code.\n"
     "You author a build PLAN as a single JSON object and nothing else.\n\n"
-    "Schema:\n"
+    "CRITICAL -- READ THIS FIRST: The schema below is a FORMAT EXAMPLE ONLY.\n"
+    "Every name in it is a <placeholder>. Do NOT copy any name from the schema;\n"
+    "derive EVERY file path, class, function, endpoint, and dependency STRICTLY\n"
+    "from the USER'S OBJECTIVE. The plan must implement the objective and nothing\n"
+    "else -- if a name is not something the objective calls for, do not invent it.\n\n"
+    "Schema (angle-bracket names are PLACEHOLDERS -- replace all of them):\n"
     "{\n"
     '  "goal": "one sentence restating the objective",\n'
     '  "layers": [\n'
     '    {"name": "models|core|api|tests|...",\n'
     '     "files": [\n'
-    '       {"path": "src/foo.py",\n'
+    '       {"path": "src/<module_a>.py",\n'
     '        "description": "what this file must contain",\n'
-    '        "depends_on": ["src/bar.py"]}\n'
+    '        "depends_on": ["src/<module_b>.py"]}\n'
     "     ]}\n"
     "  ],\n"
     '  "contracts": {\n'
     '    "endpoints": [\n'
-    '      {"path": "/ping", "method": "GET",\n'
-    '       "description": "Returns pong"}\n'
+    '      {"path": "/<route>", "method": "GET|POST|...",\n'
+    '       "request": {"<field>": "<type>"},\n'
+    '       "response": {"<field>": "<type>"},\n'
+    '       "description": "<what this endpoint does>"}\n'
     '    ],\n'
     '    "functions": [\n'
-    '      {"name": "total_area", "module": "src/foo.py",\n'
-    '       "parameters": [{"name": "circles", "type": "list"}],\n'
-    '       "return_type": "float",\n'
-    '       "description": "sum of each circle area"},\n'
-    '      {"name": "Circle.area", "module": "src/foo.py",\n'
-    '       "parameters": [], "return_type": "float",\n'
-    '       "description": "area of this circle"}\n'
+    '      {"name": "<function_name>", "module": "src/<module_a>.py",\n'
+    '       "parameters": [{"name": "<param>", "type": "<type>"}],\n'
+    '       "return_type": "<type>",\n'
+    '       "description": "<what it does>"},\n'
+    '      {"name": "<ClassName>.<method>", "module": "src/<module_a>.py",\n'
+    '       "parameters": [], "return_type": "<type>",\n'
+    '       "description": "<what it does>"}\n'
     "    ],\n"
     '    "schemas": [\n'
-    '      {"name": "Circle", "module": "src/foo.py",\n'
-    '       "fields": {"radius": "float"}}\n'
+    '      {"name": "<ClassName>", "module": "src/<module_a>.py",\n'
+    '       "fields": {"<field>": "<type>"}}\n'
     "    ],\n"
-    '    "third_party_dependencies": ["fastapi", "pydantic", "pytest"]\n'
+    '    "third_party_dependencies": ["<library>", "..."]\n'
     "  }\n"
     "}\n\n"
     "Rules: every file has a unique relative path; depends_on lists ONLY\n"
@@ -88,6 +96,12 @@ _SYSTEM_PROMPT = (
     "EXACT planned path that defines it. Name a method as \"ClassName.method\".\n"
     "Give each function real \"parameters\" and a \"return_type\". Do not invent\n"
     "symbols, files, or dependencies the objective did not ask for.\n"
+    "ENDPOINTS ARE A BINDING WIRE CONTRACT: for every HTTP endpoint the app\n"
+    "needs, declare its \"request\" and \"response\" JSON keys. The backend route\n"
+    "that implements it AND every frontend client that calls it MUST use these\n"
+    "EXACT keys (same names, same casing) and the exact path/method -- a\n"
+    "frontend sending {\"message\": ...} to a backend expecting {\"user_message\":\n"
+    "...} is a bug. Do not invent alternate key names on either side.\n"
     "ENTRYPOINT IS MANDATORY: each runnable component needs an entrypoint that\n"
     "initializes it (e.g. a Python 'app = Flask(__name__)'/'FastAPI()' module,\n"
     "or a JS 'src/main.jsx' that mounts the app). Do NOT expect tests to run\n"
@@ -106,8 +120,12 @@ _SYSTEM_PROMPT = (
 # planning, plus any configured MCP tools; everything else is deterministic
 # plan validation.
 def _planner_tools() -> tuple:
+    # Page fetching prefers MCP: when a server is configured the built-in
+    # fetch_url is dropped (fetch via mcp_call); otherwise it is the fallback.
     from cgx.session.tasks.swarm_tools import mcp_tools_if_configured
-    return ("search_web",) + mcp_tools_if_configured()
+    mcp = mcp_tools_if_configured()
+    base = ("search_web",) if mcp else ("search_web", "fetch_url")
+    return base + mcp
 
 
 def _ask_for_plan(provider: Any, goal: str,
@@ -168,6 +186,51 @@ def _ask_for_plan(provider: Any, goal: str,
         messages.append({"role": "assistant", "content": text})
         messages.append({"role": "user", "content": "<tool_response>Tool error: invalid JSON generated. Ensure your output is purely JSON without markdown formatting.</tool_response>"})
     return {}
+
+
+# A weak planner sometimes regurgitates the prompt's schema template instead of
+# authoring names from the objective. Because the schema now uses only
+# ``<angle_bracket>`` placeholders, that failure mode is detectable *generically*
+# -- no per-domain token list: if a real file path or symbol still carries a
+# ``<placeholder>`` token, the model copied the template rather than planning, so
+# the plan is re-asked once. This is fully domain-agnostic (nothing about any
+# particular example is encoded); semantic "does the plan match the objective?"
+# drift is caught by the optional plan-approval gate, not by a keyword list.
+_PLACEHOLDER_RE = re.compile(r"<[a-z_][\w./-]*>", re.IGNORECASE)
+
+
+def _template_copy_problems(plan: Dict[str, Any]) -> List[str]:
+    """Flag a plan that left the schema's ``<placeholder>`` names in real slots.
+
+    Scans identifier slots only (file paths, contract symbol names, module
+    refs, endpoint paths) -- never free-form descriptions, which may legitimately
+    mention ``<Foo>`` in prose. Returns one corrective problem string listing a
+    sample of the offending tokens, or ``[]`` when the plan is clean.
+    """
+    offenders: set = set()
+    for layer in plan.get("layers", []) or []:
+        for f in layer.get("files", []) or []:
+            p = str(f.get("path") or "")
+            if _PLACEHOLDER_RE.search(p):
+                offenders.add(p)
+    contracts = plan.get("contracts") or {}
+    for section in ("functions", "schemas", "endpoints"):
+        for item in contracts.get(section, []) or []:
+            if not isinstance(item, dict):
+                continue
+            for key in ("name", "module", "path"):
+                v = str(item.get(key) or "")
+                if _PLACEHOLDER_RE.search(v):
+                    offenders.add(v)
+    if not offenders:
+        return []
+    sample = sorted(offenders)[:5]
+    return [("the plan still contains schema PLACEHOLDER names "
+             f"{sample}; replace every file path and symbol with real names "
+             "derived from the OBJECTIVE")]
+    return [("the plan uses the illustrative example symbol(s) "
+             f"{hits} which are unrelated to the objective; re-plan every "
+             "file, symbol, and dependency from the OBJECTIVE only")]
 
 
 def _auto_repair_plan_dependencies(plan: Dict[str, Any]) -> Dict[str, Any]:
@@ -294,6 +357,15 @@ def swarm_tech_lead(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             swarm_beat(project_root, "tech_lead", "plan_rejected",
                        attempt=attempt, problems=problems)
             continue
+        # Anti-template-copy: a plan that left the schema's <placeholder> names
+        # in real file/symbol slots is re-asked before any Developer is spawned
+        # (domain-agnostic; no per-example tokens).
+        problems = _template_copy_problems(plan)
+        if problems:
+            correction = "; ".join(problems)
+            swarm_beat(project_root, "tech_lead", "plan_rejected",
+                       attempt=attempt, problems=problems)
+            continue
         # Framework-level validation: a skill can veto a plan that omits what
         # the stack requires (e.g. the React skill flags a plan with no
         # frontend files). A fatal verdict is fed back as a corrective re-ask.
@@ -318,6 +390,24 @@ def swarm_tech_lead(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             outputs={"file_count": 0, "reason": correction
                      or "Tech Lead could not produce a buildable plan."})
 
+    # Ground every DECLARED third-party dependency against its real package
+    # registry (PyPI / npm) so the Developer implements against real metadata
+    # instead of a remembered/hallucinated API. Best-effort: offline or a
+    # private registry yields nothing and we proceed (never block the plan).
+    contracts_out = dict(plan.get("contracts") or {})
+    try:
+        from cgx.session.tasks.swarm_apiground import ground_external_dependencies
+        grounded = ground_external_dependencies(contracts_out, paths)
+        if grounded:
+            contracts_out["external_api_reference"] = grounded
+            swarm_beat(project_root, "tech_lead", "api_grounded",
+                       packages=sorted(grounded.keys()))
+        else:
+            swarm_beat(project_root, "tech_lead", "api_grounding_unavailable")
+    except Exception as e:  # pragma: no cover - grounding is best-effort
+        swarm_beat(project_root, "tech_lead", "api_grounding_error",
+                   error=repr(e))
+
     artifact = Artifact.new(
         session_id=task.session_id,
         produced_by_task_id=task.task_id,
@@ -325,7 +415,7 @@ def swarm_tech_lead(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         content={
             "goal": goal,
             "layers": plan["layers"],
-            "contracts": plan.get("contracts") or {},
+            "contracts": contracts_out,
             "paths": paths,
             "project_root": project_root,
             # Persist the resolved stack so the Developer + Verifier reuse it

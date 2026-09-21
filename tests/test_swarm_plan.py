@@ -307,3 +307,68 @@ def test_ensure_test_coverage_disambiguates_basename_collision():
     paths = [f["path"] for f in iter_plan_files(ensure_test_coverage(plan))]
     injected = [p for p in paths if p.startswith("tests/")]
     assert len(injected) == 2 and len(set(injected)) == 2
+
+
+# ---------------- template-copy guard (Phase C, domain-agnostic) ----------------
+
+from cgx.session.tasks.swarm_tech_lead import _template_copy_problems
+
+
+def test_template_copy_guard_flags_placeholder_paths_and_symbols():
+    """A plan that left the schema's <placeholder> names in real slots is rejected."""
+    plan = {
+        "layers": [{"name": "core", "files": [
+            {"path": "src/<module_a>.py", "description": "the main module"}]}],
+        "contracts": {
+            "functions": [{"name": "<function_name>", "module": "src/<module_a>.py"}],
+            "schemas": [{"name": "<ClassName>", "module": "src/<module_a>.py"}],
+            "endpoints": [{"path": "/<route>", "method": "GET"}],
+        },
+    }
+    problems = _template_copy_problems(plan)
+    assert problems and "placeholder" in problems[0].lower()
+
+
+def test_template_copy_guard_ignores_placeholders_in_prose_descriptions():
+    """A <placeholder> in a free-form description is not an identifier -> allowed."""
+    plan = {
+        "layers": [{"name": "api", "files": [
+            {"path": "backend/api.py",
+             "description": "returns a <Response>-like object"}]}],
+        "contracts": {"functions": [{"name": "chat", "module": "backend/api.py"}]},
+    }
+    assert _template_copy_problems(plan) == []
+
+
+def test_template_copy_guard_passes_a_real_plan_any_domain():
+    """A plan with real names (any domain) raises no problem."""
+    plan = {
+        "layers": [{"name": "api", "files": [
+            {"path": "backend/api.py", "description": "chat endpoint"}]}],
+        "contracts": {"functions": [{"name": "chat", "module": "backend/api.py"}],
+                      "schemas": [{"name": "Message", "module": "backend/api.py"}]},
+    }
+    assert _template_copy_problems(plan) == []
+
+
+def test_endpoint_wire_contract_survives_normalize_and_renders():
+    """Endpoint request/response keys survive plan normalization and render into
+    the per-file prompt, so the backend route and the frontend client bind to
+    the SAME wire keys (the {message} vs {user_message} mismatch fix)."""
+    from cgx.session.tasks.swarm_plan import normalize_plan
+    from cgx.answer.engine import _render_contracts_for_prompt
+    plan = {
+        "goal": "chatbot",
+        "layers": [{"name": "api", "files": [
+            {"path": "backend/app.py", "description": "api"}]}],
+        "contracts": {"endpoints": [
+            {"path": "/chat", "method": "POST",
+             "request": {"message": "str"}, "response": {"reply": "str"},
+             "description": "chat"}]},
+    }
+    norm = normalize_plan(plan)
+    eps = (norm.get("contracts") or {}).get("endpoints") or []
+    assert eps and eps[0].get("request") == {"message": "str"}
+    assert eps[0].get("response") == {"reply": "str"}
+    rendered = _render_contracts_for_prompt(norm.get("contracts") or {})
+    assert "/chat" in rendered and "message" in rendered and "reply" in rendered

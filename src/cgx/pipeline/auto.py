@@ -18,12 +18,22 @@ Adds graph + chunks persistence and loading so hybrid retrieval can
 actually use lexical and graph expansion at query time.
 """
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import os
 import json
+import threading
+
+# Serializes the retrieval critical section (query embedding + faiss search +
+# graph/insertion work) PROCESS-WIDE. torch and faiss-cpu in one process are not
+# safe to drive from multiple threads at once: concurrent torch forward passes
+# on the shared model and concurrent OpenMP pools abort/segfault the interpreter
+# (reproduced on macOS; possible on Linux). The web UI serves sync request
+# handlers from uvicorn's threadpool, so two simultaneous asks would otherwise
+# embed + search in parallel and crash. The lock is uncontended (near-free) for
+# a single local user; concurrent requests queue instead of crashing.
+_RETRIEVAL_LOCK = threading.Lock()
 
 from cgx.parser.parse_codebase import parse_codebase
 from cgx.graph.build_graph import build_knowledge_graph
@@ -178,6 +188,28 @@ def run_index_auto(
     cache_stats_per_view: Dict[str, Dict[str, int]] = {}
     normalize = (metric in {"cosine", "ip"})
 
+    # Truncation length for the embedder. Historically hard-coded to 256, which
+    # silently clipped the tail of every function/class longer than ~256 tokens
+    # before it was ever embedded -- even though the model (jina v2 code)
+    # supports 8192 and EmbeddingConfig.max_length already defaults to it. Honour
+    # the configured value so long bodies embed in full; the cache key now
+    # includes it (see embed_with_cache) so a change re-embeds instead of
+    # serving clipped vectors.
+    try:
+        from cgx.config import EmbeddingConfig
+        embed_max_length = int(EmbeddingConfig().max_length)
+    except Exception:
+        embed_max_length = 8192
+
+    # Cache identity must reflect the ACTUAL embedder, not the declared
+    # model_name string: a BYO encoder (tests, custom models) reusing the
+    # default model_name would poison the cache with vectors from a different
+    # model. Derive a stable identity from the embedder when one is supplied.
+    if embedder is not None and hasattr(embedder, "encode"):
+        cache_model_id = getattr(embedder, "model_name", None) or f"byo:{type(embedder).__name__}"
+    else:
+        cache_model_id = model_name
+
     def _make_progress_cb(view_name: str):
         """A throttled (done, total) callback that logs embedding progress.
 
@@ -229,13 +261,14 @@ def run_index_auto(
                         normalize=normalize,
                         batch_size=batch_size,
                         field_strategy="auto",
-                        max_length=256,
+                        max_length=embed_max_length,
                         progress_cb=progress_cb,
                     )
 
                 embs, stats = embed_with_cache(
                     texts, encode_fn=_encode, cache_path=cache_path,
-                    model_name=model_name, normalize=normalize,
+                    model_name=cache_model_id, normalize=normalize,
+                    max_length=embed_max_length,
                 )
                 logger.info("Embedding cache view=%s hits=%d misses=%d",
                             view_name, stats["hits"], stats["misses"])
@@ -247,7 +280,7 @@ def run_index_auto(
                     embs = build_embeddings(
                         rows, model_name=model_name, backend="auto",
                         normalize=normalize, batch_size=batch_size,
-                        field_strategy="auto", max_length=256,
+                        field_strategy="auto", max_length=embed_max_length,
                         progress_cb=_make_progress_cb(view_name),
                     )
             logger.info("Embedding done for view=%s shape=%s", view_name, np.asarray(embs).shape)
@@ -270,26 +303,28 @@ def run_index_auto(
             "rows": rows, "ids": _to_faiss_ids(rows),
         }, stats
 
-    # Run both views concurrently (embedding is the bottleneck; FAISS build is CPU-bound).
-    # ThreadPoolExecutor is appropriate here: torch releases the GIL during GPU ops, and
-    # FAISS C++ calls also release the GIL, so true parallelism occurs for both.
-    logger.info("Building embeddings + FAISS for %d views in parallel", len(per_view))
-    with ThreadPoolExecutor(max_workers=len(per_view)) as pool:
-        futures = {pool.submit(_build_view, vn, rows): vn for vn, rows in per_view.items()}
-        for fut in as_completed(futures):
-            view_name = futures[fut]
-            try:
-                vn, view_dict, vstats = fut.result()
-                indices["views"][vn] = view_dict
-                if vstats:
-                    cache_stats_per_view[vn] = vstats
-            except IndexBuildCancelled:
-                # Cancellation is expected control flow, not a build failure:
-                # propagate quietly so the caller can stop without a scary trace.
-                raise
-            except Exception as e:
-                logger.error("View %s failed: %s", view_name, e, exc_info=True)
-                raise
+    # Build the views SERIALLY. Embedding two views concurrently in a
+    # ThreadPoolExecutor oversubscribes threads -- a torch encoder already
+    # parallelizes each pass internally across cores (intra-op threads) -- for
+    # negligible wall-clock gain, and running two torch inference passes in
+    # parallel threads alongside faiss segfaults on setups where torch and
+    # faiss-cpu bring conflicting OpenMP/BLAS runtimes (reproducible on macOS,
+    # possible on Linux too depending on the wheels). Serial is safe on every
+    # platform; the per-view embedding cache already makes re-indexing fast.
+    logger.info("Building embeddings + FAISS for %d views (serial)", len(per_view))
+    for view_name, rows in per_view.items():
+        try:
+            vn, view_dict, vstats = _build_view(view_name, rows)
+            indices["views"][vn] = view_dict
+            if vstats:
+                cache_stats_per_view[vn] = vstats
+        except IndexBuildCancelled:
+            # Cancellation is expected control flow, not a build failure:
+            # propagate quietly so the caller can stop without a scary trace.
+            raise
+        except Exception as e:
+            logger.error("View %s failed: %s", view_name, e, exc_info=True)
+            raise
 
     # A Ctrl-C between the last view finishing and the writes below must still
     # abort before any index file is persisted, so a cancelled build never
@@ -409,10 +444,19 @@ def run_query_auto(
 
     class BuildEmbedder:
         """Wrapper so build_embeddings can be used consistently at query time."""
-        def __init__(self, model_name: str, batch_size: int = 64, normalize: bool = True, max_length: int = 256):
+        def __init__(self, model_name: str, batch_size: int = 64, normalize: bool = True, max_length: Optional[int] = None):
             self.model_name = model_name
             self.batch_size = batch_size
             self.normalize = normalize
+            if max_length is None:
+                # Match the index-time truncation length (configurable) so a long
+                # query -- e.g. a pasted code snippet -- is not clipped to 256
+                # tokens while the documents it must match were embedded in full.
+                try:
+                    from cgx.config import EmbeddingConfig
+                    max_length = int(EmbeddingConfig().max_length)
+                except Exception:
+                    max_length = 8192
             self.max_length = max_length
         def encode(self, texts: List[str]) -> np.ndarray:
             rows = [{"text": t} for t in texts]
@@ -462,20 +506,23 @@ def run_query_auto(
     # on every call (build is O(N) over all records).
     lex_idx = get_cached_lexical_index(records_path, records) if records else None
 
-    # Hybrid retrieval (semantic+lexical+graph → RRF)
-    retrieval_out = hybrid_retrieve_two_view(
-        query,
-        indices=indices,
-        records=records,
-        embedder=embedder,
-        chunks=chunks,
-        G=G,
-        top_k_per_view=top_k_per_view,
-        neighbor_depth=neighbor_depth,
-        use_lexical=True,  # forced on
-        lexical_index=lex_idx,
-        enable_reranker=enable_reranker,
-    )
+    # Hybrid retrieval (semantic+lexical+graph → RRF). Serialized process-wide
+    # (see _RETRIEVAL_LOCK) so concurrent callers -- notably the web UI's sync
+    # request threadpool -- never drive torch + faiss from parallel threads.
+    with _RETRIEVAL_LOCK:
+        retrieval_out = hybrid_retrieve_two_view(
+            query,
+            indices=indices,
+            records=records,
+            embedder=embedder,
+            chunks=chunks,
+            G=G,
+            top_k_per_view=top_k_per_view,
+            neighbor_depth=neighbor_depth,
+            use_lexical=True,  # forced on
+            lexical_index=lex_idx,
+            enable_reranker=enable_reranker,
+        )
 
     hits = retrieval_out.get("hits", [])
     if scope in {"src", "tests"}:
@@ -489,9 +536,11 @@ def run_query_auto(
     # we compute it and let the UI/agent decide how to present it.
     impact = analyze_change_impact(query, hits, records, G)
 
-    # Optional: insertion anchors (non-critical)
+    # Optional: insertion anchors (non-critical). Also embeds, so it shares the
+    # retrieval lock -- concurrent callers must not run torch + faiss in parallel.
     try:
-        anchors = suggest_insertion_points(query, hits, records, G=G, embedder=embedder)
+        with _RETRIEVAL_LOCK:
+            anchors = suggest_insertion_points(query, hits, records, G=G, embedder=embedder)
     except Exception as e:
         logger.warning("suggest_insertion_points failed: %s", e)
         anchors = []

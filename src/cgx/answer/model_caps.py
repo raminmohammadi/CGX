@@ -206,19 +206,38 @@ _TIER_LADDER = (
 _TOP_TIER: CapabilityTier = "xlarge"
 
 
+def effective_context_window(provider_or_model: Any) -> int:
+    """Context window (tokens) that will ACTUALLY be usable at inference time.
+
+    For cloud providers and raw model ids this is the model's registry window.
+    For Ollama the KV cache is bounded by the resolved ``num_ctx`` (which the
+    web layer caps at ~8K unless the user overrides it): a model with a 128K
+    registry window but ``num_ctx=8192`` can only see 8192 tokens, and anything
+    the prompt-budgets size beyond that is SILENTLY TRUNCATED by the server --
+    dropping the tail (often the SOURCES the answer must cite). Reading the
+    provider's resolved ``num_ctx`` keeps every budget derived from the tier
+    consistent with the real window instead of the theoretical one.
+    """
+    if isinstance(provider_or_model, str):
+        return get_model_context_window(provider_or_model)
+    window = get_model_context_window(provider_model_name(provider_or_model))
+    opts = getattr(provider_or_model, "extra_options", None)
+    if isinstance(opts, dict):
+        nc = opts.get("num_ctx")
+        if isinstance(nc, (int, float)) and nc > 0:
+            return min(int(window), int(nc))
+    return window
+
+
 def get_capability_tier(provider_or_model: Any) -> CapabilityTier:
     """Classify a provider (or raw model-id string) into a capability tier.
 
-    The tier is derived only from the context window via
-    :func:`get_model_context_window`, so adding a model to the registry
-    is enough to tier it -- no per-model branching anywhere else.
+    The tier is derived from the EFFECTIVE context window (see
+    :func:`effective_context_window`), so a local model whose KV cache is capped
+    below its registry window is tiered -- and budgeted -- to what actually
+    fits, not to a theoretical window the server will truncate past.
     """
-    model = (
-        provider_or_model
-        if isinstance(provider_or_model, str)
-        else provider_model_name(provider_or_model)
-    )
-    ctx = get_model_context_window(model)
+    ctx = effective_context_window(provider_or_model)
     for bound, tier in _TIER_LADDER:
         if ctx < bound:
             return tier

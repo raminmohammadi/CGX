@@ -122,7 +122,7 @@ def patched_retriever(monkeypatch):
 
 
 @pytest.mark.parametrize("enable,expected", [
-    (None, False),    # default: off
+    (None, False),    # default: off (opt-in; threaded per profile kind)
     (False, False),
     (True, True),
 ])

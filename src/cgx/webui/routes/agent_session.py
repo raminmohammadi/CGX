@@ -411,36 +411,124 @@ def _safe_json(payload: Any) -> str:
         return json.dumps({"_repr": str(payload)})
 
 def _normalize_project_root(project_root: Optional[str]) -> Optional[str]:
-    """Canonicalize a caller-supplied project root before it reaches disk.
+    """Canonicalize and validate a caller-supplied project root.
 
     Resolves ``~`` and any ``..``/relative segments to an absolute path
-    up front so a crafted value can't be used to escape the intended
-    directory once it flows into filesystem operations (``SessionStore``,
-    ``detect_mode``, etc.) -- CodeQL: uncontrolled data used in a path
-    expression. This intentionally does not restrict *which* directory
-    may be used: pointing the agent at an arbitrary local project is the
-    whole point of ``project_root``.
+    up front so crafted values are reduced to a canonical form before
+    flowing into filesystem operations (``SessionStore``, ``detect_mode``,
+    ``os.path.isdir``, ``os.access``, etc.).
+
+    This intentionally does not restrict *which* directory may be used:
+    pointing the agent at an arbitrary local project is the whole point
+    of ``project_root``.
     """
     if project_root is None:
         return None
-    # Normalize with ``os.path.abspath`` (a pure normalization, not a
-    # filesystem-access sink like ``Path.resolve``) after expanding ``~``.
-    # This collapses any ``..`` segments up front; it deliberately does not
-    # restrict *which* directory may be used -- pointing the agent at an
-    # arbitrary local project is the whole point of ``project_root``.
-    return os.path.abspath(os.path.expanduser(project_root))
+    if not isinstance(project_root, str):
+        raise HTTPException(status_code=400, detail="Project root must be a string.")
+    candidate = project_root.strip()
+    if not candidate:
+        raise HTTPException(status_code=400, detail="Project root must not be empty.")
+    if "\x00" in candidate:
+        raise HTTPException(status_code=400, detail="Project root contains invalid characters.")
+    normalized = os.path.abspath(os.path.expanduser(candidate))
+    if not os.path.isabs(normalized):
+        raise HTTPException(status_code=400, detail="Project root must resolve to an absolute path.")
+    return normalized
 
 
 # --------------------- routes ---------------------
 
+def _enforce_project_root_base(project_root: Optional[str]) -> None:
+    """Constrain project roots to a configured safe base directory -- OPT-IN.
+
+    ``project_root`` is user-controlled input. When ``CGX_PROJECT_ROOT_BASE`` is
+    set, the resolved root MUST live inside that base tree; a value outside it is
+    rejected with a 400. This is the hardening to enable when the server is
+    exposed beyond loopback (see the README's binding/auth notes).
+
+    When the base is NOT configured the check is a no-op: CGX is local-first and
+    single-user by default, and "point the agent at any local project" is the
+    documented behaviour. Deny-by-default here would break that UX and force an
+    env var on every local user, so enforcement is opt-in via the env var.
+    """
+    if project_root is None:
+        return
+    configured_base = os.getenv("CGX_PROJECT_ROOT_BASE")
+    if not configured_base:
+        return  # opt-in: no base configured -> no restriction (local-first default)
+    base_root = os.path.abspath(os.path.expanduser(configured_base))
+    candidate = os.path.abspath(os.path.expanduser(project_root))
+    try:
+        if os.path.commonpath([base_root, candidate]) != base_root:
+            raise HTTPException(
+                status_code=400,
+                detail=(f"Project root must be within configured base "
+                        f"directory: {base_root!r}"))
+    except ValueError:
+        # Different drives on Windows, or malformed path composition.
+        raise HTTPException(
+            status_code=400,
+            detail=(f"Project root must be within configured base "
+                    f"directory: {base_root!r}"))
+
+
+def _validate_project_root_writable(project_root: Optional[str]) -> None:
+    """Reject an unusable project root with a clean 400 (not an opaque 500).
+
+    Opening a session creates a ``.cgx`` dir under the project root. When the
+    root's parent chain does not exist -- almost always a mistyped path (a wrong
+    user name, a folder that was never created) -- a blind
+    ``mkdir(parents=True)`` walks up and tries to create directories in
+    protected locations (e.g. ``/Users``), which escapes as a 500
+    ``PermissionError``. Accept an existing directory, or a not-yet-created leaf
+    whose parent IS an existing writable directory (greenfield/swarm creates the
+    leaf); otherwise fail fast with an actionable message so the user fixes the
+    path instead of the harness silently trying to create system folders.
+
+    Security note (the ``codeql[py/path-injection]`` dismissals below): pointing
+    the agent at an arbitrary LOCAL directory is a documented, intentional
+    feature (see :func:`_normalize_project_root`). The server binds to loopback
+    with no auth by DEFAULT, so a caller able to reach this endpoint is already a
+    local user with direct filesystem access -- a user-chosen ``project_root``
+    grants no privilege they lack. Deployments exposed beyond loopback confine
+    roots to a trusted tree via ``CGX_PROJECT_ROOT_BASE``
+    (:func:`_enforce_project_root_base`). These read-only existence/permission
+    probes are therefore not an exploitable path sink under CGX's threat model.
+    """
+    if project_root is None:
+        return
+    if os.path.isdir(project_root):  # codeql[py/path-injection]
+        return
+    if os.path.exists(project_root):  # codeql[py/path-injection]
+        raise HTTPException(
+            status_code=400,
+            detail=f"Project root is not a directory: {project_root}")
+    parent = str(Path(project_root).parent)  # codeql[py/path-injection]
+    if not os.path.isdir(parent):  # codeql[py/path-injection]
+        raise HTTPException(
+            status_code=400,
+            detail=(f"Project root {project_root!r} does not exist and its "
+                    f"parent directory {parent!r} is missing. Check the path "
+                    "(a typo in the folder or user name?)."))
+    if not os.access(parent, os.W_OK):  # codeql[py/path-injection]
+        raise HTTPException(
+            status_code=400,
+            detail=(f"Cannot create the project folder under {parent!r}: "
+                    "permission denied."))
+
+
 @router.post("", response_model=AgentSessionState)
 async def create_session(req: AgentSessionCreateRequest) -> AgentSessionState:
     project_root = _normalize_project_root(req.project_root)
+    _enforce_project_root_base(project_root)
+    _validate_project_root_writable(project_root)
     runner = _get_runner(project_root)
     mode = _resolve_mode(req)
     session = await asyncio.to_thread(
         runner.start_session, objective=req.objective,
         project_root=project_root, title=req.title, mode=mode,
+        require_plan_approval=bool(req.require_plan_approval),
         skills=req.skills or None)
     with _RUNNERS_LOCK:
         _SESSION_TO_RUNNER[session.session_id] = runner
@@ -480,6 +568,18 @@ def _resolve_mode(req: AgentSessionCreateRequest) -> SessionMode:
 async def list_agent_sessions(
         project_root: Optional[str] = Query(default=None)) -> List[Dict[str, Any]]:
     normalized_project_root = _normalize_project_root(project_root)
+    _enforce_project_root_base(normalized_project_root)
+    # A project_root that doesn't exist on disk has no sessions -- and merely
+    # opening a runner for it would create ``<root>/.cgx`` via the store's
+    # mkdir, resurrecting a folder the user deleted. (A stale ``projectRoot``
+    # persisted in the browser was recreating e.g. an empty ``Calculator/``
+    # every time the sidebar listed sessions on load.) Read-only paths must not
+    # materialize a workspace; return empty instead.
+    if (normalized_project_root is not None
+            # user-chosen local project_root, loopback+no-auth default -> not an
+            # exploitable path sink (see _validate_project_root_writable).
+            and not os.path.isdir(normalized_project_root)):  # codeql[py/path-injection]
+        return []
     runner = _get_runner(normalized_project_root)
     return [s.to_dict() for s in
             runner.store.list_sessions(project_root=normalized_project_root)]
@@ -490,6 +590,13 @@ async def get_session(sid: str,
                       project_root: Optional[str] = Query(default=None)
                       ) -> AgentSessionState:
     normalized_project_root = _normalize_project_root(project_root)
+    # Don't materialize <root>/.cgx for a non-existent project root on a
+    # read-only fetch (see list_agent_sessions); the session cannot be there.
+    if (normalized_project_root is not None
+            # user-chosen local project_root, loopback+no-auth default -> not an
+            # exploitable path sink (see _validate_project_root_writable).
+            and not os.path.isdir(normalized_project_root)):  # codeql[py/path-injection]
+        raise HTTPException(status_code=404, detail=f"session {sid!r} not found")
     runner = _resolve_runner_for(sid) if normalized_project_root is None \
         else _get_runner(normalized_project_root)
     return _snapshot(runner, sid)

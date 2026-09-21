@@ -74,6 +74,13 @@ def list_tools(args: Dict[str, Any], _ctx: Any) -> str:
         result = asyncio.run(_list_tools_async(server))
     except Exception as exc:  # pragma: no cover - depends on live server
         return f"Failed to list tools for {name}: {type(exc).__name__}: {exc}"
+    # Tool descriptions are server-controlled text that lands in the model's
+    # context -- an injection vector too. Screen them like any untrusted blob.
+    try:
+        from cgx.guardrails.injection import screen_untrusted
+        result = screen_untrusted(result, origin=f"MCP {name} tool list")
+    except Exception:  # pragma: no cover - guardrail is best-effort
+        pass
     _TOOLS_CACHE[name] = (result, time.time())
     return result
 
@@ -95,11 +102,33 @@ def call_tool(args: Dict[str, Any], _ctx: Any) -> str:
         return "mcp_call requires a 'tool' name."
     if not _have_sdk():
         return _SDK_HINT
+    # Egress policy: an MCP tool that fetches a URL (e.g. mcp-server-fetch) must
+    # obey the same SSRF block + domain allowlist as the built-in fetch_url, so
+    # switching to MCP doesn't lose the "don't reach internal / arbitrary hosts"
+    # guarantee. Screen every URL-valued argument before dispatching.
+    try:
+        from cgx.guardrails.net import find_urls, url_refusal
+        for u in find_urls(arguments):
+            refusal = url_refusal(u)
+            if refusal:
+                return (f"[BLOCKED] MCP {name}/{tool} refused: {refusal}. "
+                        "Adjust the URL, or set CGX_FETCH_ALLOWLIST / "
+                        "CGX_FETCH_ALLOW_ANY to permit it.")
+    except Exception:  # pragma: no cover - guardrail is best-effort
+        pass
     try:
         import asyncio
-        return asyncio.run(_call_tool_async(server, tool, arguments))
+        result = asyncio.run(_call_tool_async(server, tool, arguments))
     except Exception as exc:  # pragma: no cover - depends on live server
         return f"MCP call failed: {type(exc).__name__}: {exc}"
+    # An MCP tool result (e.g. a fetched web page) is untrusted third-party
+    # content -- screen it through the shared prompt-injection guardrail before
+    # it enters the model's context, exactly as the built-in fetch/search do.
+    try:
+        from cgx.guardrails.injection import screen_untrusted
+        return screen_untrusted(result, origin=f"MCP {name}/{tool}")
+    except Exception:  # pragma: no cover - guardrail is best-effort
+        return result
 
 
 # --------------------- async SDK bridge ---------------------

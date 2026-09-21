@@ -4,6 +4,7 @@ import Header from "./Header";
 import Sidebar from "./Sidebar";
 import ConnectionBanner from "../components/ConnectionBanner";
 import { startConnectionPoller } from "../store/connection";
+import { bootstrapProvider } from "../store/workspace";
 import { useTrace } from "../store/trace";
 
 export default function AppShell() {
@@ -13,6 +14,11 @@ export default function AppShell() {
   // the server-side state (incl. CGX_TRACE env pinning) on first paint.
   useEffect(() => {
     void useTrace.getState().refresh();
+  }, []);
+  // On first run, adopt a saved profile as the active provider so the app
+  // doesn't open pointed at a placeholder model the user never installed.
+  useEffect(() => {
+    void bootstrapProvider();
   }, []);
 
   return (

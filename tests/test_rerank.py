@@ -120,6 +120,90 @@ def test_symbol_boost_respects_config():
     assert out["hits"][0]["provenance"].get("symbol_match") is True
 
 
+FOO = "pkg/a.py::function::foo"
+BAR = "pkg/b.py::function::bar"
+
+
+def _score_of(out, cid):
+    for h in out["hits"]:
+        if h["chunk_id"] == cid:
+            return h["score"]
+    raise AssertionError(f"{cid} not in hits")
+
+
+def _foo_bar_retriever():
+    """Retriever isolating the semantic + symbol-boost interaction: no chunks
+    (so the regex fallback is off) and no lexical helpers on the records (so
+    BM25 is empty). Only the intent/impl semantic ranks and the symbol boost
+    decide the order -- exactly what the calibration governs."""
+    records = _records(FOO, BAR)
+    # bar tops both views; foo appears only at intent rank 2 (a weak semantic hit).
+    hits = {
+        "intent": [{"chunk_id": BAR, "rank": 1, "score": 0.9},
+                   {"chunk_id": FOO, "rank": 2, "score": 0.3}],
+        "impl":   [{"chunk_id": BAR, "rank": 1, "score": 0.9}],
+    }
+    return HybridRetriever(
+        tv_index=_FakeView(hits), records=records,
+        lexical_index=None, chunks=[], G=None,
+    )
+
+
+def test_bare_symbol_boost_does_not_dominate_by_orders_of_magnitude():
+    """A bare symbol match adds ~one signal's worth (proportional to rrf_scale),
+    not the old absolute +0.5 that was ~15x the top RRF score. ``bar`` is the
+    strong hit (top of both views) and never matches the query token, so its
+    score equals rrf_scale; ``foo`` matches the bare token ``foo`` from a lone
+    weak semantic rank. Under the old absolute boost foo (~0.52) buried bar
+    (~0.033); under the proportional boost bar stays on top."""
+    r = _foo_bar_retriever()
+    cfg = HybridConfig(k_intent=5, k_impl=5, k_lex=5, top_k_chunks=10,
+                       graph_bonus=0.0, enable_reranker=False)
+    out = r.search("the foo thing", embedder=None, cfg=cfg)
+    foo_score, bar_score = _score_of(out, FOO), _score_of(out, BAR)
+    assert out["hits"][0]["chunk_id"] == BAR  # strong hit stays on top
+    # Proportional: a bare match is bounded near the fused scale, not 15x it.
+    assert foo_score < 2.0 * bar_score
+    prov = {h["chunk_id"]: h["provenance"] for h in out["hits"]}
+    assert prov[FOO].get("symbol_match_kind") == "bare"
+
+
+def test_quoted_symbol_boost_strictly_exceeds_bare():
+    """Quoting a symbol (an explicit, intended reference) yields a strictly
+    stronger boost than the same token appearing bare in prose."""
+    cfg = HybridConfig(k_intent=5, k_impl=5, k_lex=5, top_k_chunks=10,
+                       graph_bonus=0.0, enable_reranker=False)
+    bare = _foo_bar_retriever().search("the foo thing", embedder=None, cfg=cfg)
+    quoted = _foo_bar_retriever().search("the `foo` thing", embedder=None, cfg=cfg)
+    # Only the boost magnitude differs between the two runs; quoted > bare.
+    assert _score_of(quoted, FOO) > _score_of(bare, FOO)
+    qprov = {h["chunk_id"]: h["provenance"] for h in quoted["hits"]}
+    assert qprov[FOO].get("symbol_match_kind") == "quoted"
+    # Explicitly named, foo now leads.
+    assert quoted["hits"][0]["chunk_id"] == FOO
+
+
+def test_file_aggregation_favors_single_best_chunk_over_member_count():
+    """A file with ONE excellent chunk must outrank a file with many mediocre
+    chunks. The corroboration bonus is capped at the group's best score, so
+    ranking is anchored to relevance, not member count (the old unbounded
+    decayed SUM let the crowded file win)."""
+    a1 = "pkg/a.py::function::a1"
+    bs = [f"pkg/b.py::function::b{i}" for i in range(1, 6)]
+    records = _records(a1, *bs)
+    # a1 tops both views (strong). b1..b5 are a crowd of weak intent hits.
+    intent = [{"chunk_id": a1, "rank": 1, "score": 0.9}]
+    intent += [{"chunk_id": b, "rank": i + 2, "score": 0.3} for i, b in enumerate(bs)]
+    hits = {"intent": intent, "impl": [{"chunk_id": a1, "rank": 1, "score": 0.9}]}
+    r = HybridRetriever(tv_index=_FakeView(hits), records=records,
+                        lexical_index=None, chunks=[], G=None)
+    cfg = HybridConfig(k_intent=10, k_impl=10, k_lex=10, top_k_chunks=20,
+                       graph_bonus=0.0, enable_reranker=False)
+    out = r.search("generic query terms", embedder=None, cfg=cfg)
+    assert out["top_files"], "expected file aggregation"
+    assert out["top_files"][0]["file"] == "pkg/a.py"
+
+
 def test_reranker_hook_runs_and_records_provenance(monkeypatch):
     records = _records("pkg/a.py::function::alpha", "pkg/b.py::function::beta")
     hits = {

@@ -42,6 +42,12 @@ _SYMBOL_TARGETED_MODES = frozenset({
     "callers_list", "callees_list",
 })
 
+# Cap on distinct chunks force-added purely because their name/id matches the
+# target symbol. Beyond this the name is treated as ambiguous (many homonyms):
+# the forced set is capped and query-based retrieval is run to disambiguate,
+# instead of flooding SOURCES with every same-named chunk in the repo.
+_MAX_FORCED_SYMBOL_CHUNKS = 10
+
 
 def _symbol_covers_target(symbol: str, chunk_id: str, target: str) -> bool:
     """Return True when a SOURCE row's symbol/chunk_id covers ``target``.
@@ -86,6 +92,22 @@ def _chunk_map(indices: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
             if cid:
                 cmap[str(cid)] = r
     return cmap
+
+def _load_repo_map_render(index_dir: str, *, max_chars: int = 4000) -> str:
+    """Render the persisted whole-repo map (built at index time) for overview
+    grounding; empty string when it is absent or unreadable. The map lives beside
+    the index dir (``<index_dir>/../repo_map.json``), mirroring graph.json."""
+    try:
+        from cgx.answer.repo_map import load_repo_map, render_repo_map
+        p = Path(index_dir).parent / "repo_map.json"
+        if not p.exists():
+            return ""
+        rm = load_repo_map(str(p))
+        return render_repo_map(rm, max_chars=max_chars) if rm else ""
+    except Exception as e:  # pragma: no cover - defensive
+        logger.debug("repo map render failed: %s", e)
+        return ""
+
 
 def _read_readme(project_root: Optional[str]) -> Optional[str]:
     if not project_root:
@@ -175,11 +197,16 @@ def _row_lines(row: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
 
 
 def _window_text(text: str, focus_terms: List[str], max_chars: int, *, context_lines: int = 8) -> str:
-    """Return a focused window of ``text`` centered on the first line matching
-    any term in ``focus_terms``.
+    """Return a focused window of ``text`` centered on the DENSEST region of
+    ``focus_terms`` matches.
 
-    When no term matches, falls back to ``_trim(text, max_chars)``. This
-    typically reduces SOURCES size 5–10× while preserving the relevant region.
+    Centering on the *first* match (the old behavior) can drop the region that
+    actually answers the query: e.g. a chunk that mentions a term once in an
+    early import/comment but implements the relevant logic further down. Each
+    line is scored by how many DISTINCT focus terms it contains (over a small
+    neighbourhood), and the window centres on the best-scoring line. Falls back
+    to ``_trim`` when nothing matches. Reduces SOURCES size 5-10x while keeping
+    the most relevant span.
     """
     if not text or not focus_terms:
         return _trim(text, max_chars)
@@ -187,14 +214,20 @@ def _window_text(text: str, focus_terms: List[str], max_chars: int, *, context_l
     if not lines:
         return _trim(text, max_chars)
     lc_terms = [t for t in (s.lower() for s in focus_terms) if t]
-    hit_idx: Optional[int] = None
-    for i, ln in enumerate(lines):
-        low = ln.lower()
-        if any(t in low for t in lc_terms):
-            hit_idx = i
-            break
-    if hit_idx is None:
+    # Per-line distinct-term count.
+    per_line = [sum(1 for t in lc_terms if t in ln.lower()) for ln in lines]
+    if not any(per_line):
         return _trim(text, max_chars)
+    # Score each line by the distinct-term hits within +/- context_lines, so the
+    # window lands where matches cluster rather than on the first lone mention.
+    half = max(1, context_lines)
+    best_idx, best_score = 0, -1
+    for i in range(len(lines)):
+        lo, hi = max(0, i - half), min(len(lines), i + half + 1)
+        score = sum(per_line[lo:hi])
+        if score > best_score:
+            best_score, best_idx = score, i
+    hit_idx = best_idx
     start = max(0, hit_idx - context_lines)
     end = min(len(lines), hit_idx + context_lines + 1)
     window = "\n".join(lines[start:end])
@@ -483,6 +516,30 @@ def _find_symbol_rows(indices: Dict[str, Any], symbol: str) -> List[Tuple[str, D
             seen.add(cid); dedup.append((cid, r, view))
     return dedup
 
+def _cap_forced_symbol_hits(
+    raw_forced: List[Dict[str, Any]], cap: int = _MAX_FORCED_SYMBOL_CHUNKS,
+) -> Tuple[List[Dict[str, Any]], bool]:
+    """Dedup forced symbol hits by chunk_id and cap the distinct count.
+
+    Returns ``(hits, ambiguous)``. ``ambiguous`` is True when the symbol matched
+    more than ``cap`` distinct chunks (a common name with many homonyms): the
+    caller then also runs query-based retrieval so the question disambiguates,
+    instead of flooding SOURCES with every same-named chunk. Order (and thus
+    the kept subset when capping) is first-seen -- name/id matches before the
+    record-name matches, mirroring the caller's append order.
+    """
+    distinct: List[str] = []
+    seen: set[str] = set()
+    for h in raw_forced:
+        c = str(h.get("chunk_id"))
+        if c and c not in seen:
+            seen.add(c)
+            distinct.append(c)
+    ambiguous = len(distinct) > cap
+    keep = set(distinct[:cap]) if ambiguous else seen
+    return [h for h in raw_forced if str(h.get("chunk_id")) in keep], ambiguous
+
+
 def _hits_from_records(indices: Dict[str, Any], records_path: Optional[str], symbol: Optional[str]) -> List[Dict[str, Any]]:
     if not records_path or not symbol:
         return []
@@ -515,16 +572,51 @@ def _hits_from_records(indices: Dict[str, Any], records_path: Optional[str], sym
 # Matches ``[[chunk_id]]`` citation tokens in Markdown text
 _INLINE_CITATION_RE = re.compile(r"\[\[([^\[\]]+)\]\]")
 
+
+def _citation_tail(cid: str) -> str:
+    """Last two ``::`` segments of a chunk id (``kind::symbol``), lowercased."""
+    parts = str(cid).split("::")
+    return "::".join(parts[-2:]).lower() if len(parts) >= 2 else str(cid).lower()
+
+
+def _resolve_citation(cited: str, allowed_ids: Sequence[str]) -> Optional[str]:
+    """Map a model-emitted citation to a canonical allowed chunk_id.
+
+    SOURCES show the full ABSOLUTE chunk_id (``/home/u/repo/foo.py::function::bar``)
+    and the prompt asks the model to reproduce it verbatim. Small models routinely
+    emit only the repo-relative id (``foo.py::function::bar``) or the ``::symbol``
+    tail, so a verbatim-only check silently drops correct citations and the answer
+    reads as ungrounded. Match exactly, else by a UNIQUE path-suffix, else by a
+    UNIQUE ``kind::symbol`` tail; ambiguous or unknown -> None. Returns the
+    canonical id so callers can re-render it consistently.
+    """
+    cited = (cited or "").strip()
+    if not cited:
+        return None
+    allowed = list(allowed_ids)
+    if cited in set(allowed):
+        return cited
+    suffix = {a for a in allowed if a.endswith("/" + cited) or a.endswith("::" + cited) or a.endswith(cited)}
+    if len(suffix) == 1:
+        return next(iter(suffix))
+    ct = _citation_tail(cited)
+    tail = {a for a in allowed if _citation_tail(a) == ct}
+    if len(tail) == 1:
+        return next(iter(tail))
+    return None
+
+
 def _sanitize_inline_citations(answer_md: str, allowed_ids: Sequence[str]) -> str:
-    """Strip or clean inline [[chunk_id]] tokens that are not present in allowed_ids."""
+    """Strip unknown inline [[chunk_id]] tokens; canonicalize resolvable ones.
+
+    A resolvable-but-shortened citation (dropped abs-path prefix / bare tail) is
+    rewritten to its canonical allowed id rather than dropped, so grounding
+    survives small-model id mangling."""
     if not answer_md or not isinstance(answer_md, str):
         return str(answer_md or "")
-    allowed_set = set(allowed_ids)
-    def _replace_cite(m: re.Match) -> str:
-        cid = m.group(1).strip()
-        if cid in allowed_set:
-            return m.group(0)
-        return ""
+    def _replace_cite(m: "re.Match") -> str:
+        canonical = _resolve_citation(m.group(1), allowed_ids)
+        return f"[[{canonical}]]" if canonical else ""
     cleaned = _INLINE_CITATION_RE.sub(_replace_cite, answer_md)
     cleaned = re.sub(r' +\.', '.', cleaned)
     cleaned = re.sub(r' +,', ',', cleaned)
@@ -535,10 +627,10 @@ def _sanitize_citations(citations, allowed_ids):
     if not isinstance(citations, (list, tuple)):
         return out
     for c in citations:
-        if isinstance(c, dict) and "chunk_id" in c and c["chunk_id"] in allowed_ids:
-            out.append({"chunk_id": c["chunk_id"]})
-        elif isinstance(c, str) and c in allowed_ids:
-            out.append({"chunk_id": c})
+        raw = c.get("chunk_id") if isinstance(c, dict) else (c if isinstance(c, str) else None)
+        canonical = _resolve_citation(raw, allowed_ids) if raw is not None else None
+        if canonical:
+            out.append({"chunk_id": canonical})
     seen = set(); dedup = []
     for c in out:
         if c["chunk_id"] not in seen:
@@ -597,11 +689,14 @@ SYSTEM_PROMPTS: Dict[str, str] = {
         "No prose outside JSON. "
     ) + ALLOWED_CITATION_NOTE,
     "overview": (
-        "You are a senior codebase assistant. Use ONLY the SOURCES (and the "
-        "optional README lead) to produce a concise repo overview: Purpose, "
-        "Major components, How they fit together, Entry points. Cite each "
-        "claim with [[chunk_id]]. Return JSON keys: answer_md, citations, "
-        "suggested_changes, confidence. No prose outside JSON. "
+        "You are a senior codebase assistant. Use ONLY the REPO MAP (the "
+        "whole-repo package/file/symbol tree), the SOURCES, and the optional "
+        "README lead to produce a concise repo overview: Purpose, Major "
+        "components, How they fit together, Entry points. Prefer the REPO MAP "
+        "for breadth (what exists and how it is organised) and SOURCES for "
+        "specific claims. Cite specific claims with [[chunk_id]]. Return JSON "
+        "keys: answer_md, citations, suggested_changes, confidence. No prose "
+        "outside JSON. "
     ) + ALLOWED_CITATION_NOTE,
     "qa": (
         "You are a senior codebase assistant answering a specific question. "
@@ -630,6 +725,18 @@ SYSTEM_PROMPTS: Dict[str, str] = {
         "constraint matters most (accuracy/latency/code-size/etc.). "
         "Do NOT propose code edits and do NOT invent components absent "
         "from SOURCES. Return JSON keys: answer_md, citations, "
+        "suggested_changes, confidence. No prose outside JSON. "
+    ) + ALLOWED_CITATION_NOTE,
+    "debug": (
+        "You are a senior engineer debugging a reported failure. Use ONLY the "
+        "SOURCES to reason about the actual code on the failure path. Structure "
+        "answer_md as: Likely root cause (the specific line/branch in SOURCES "
+        "that produces the error, with a [[chunk_id]] citation), Why it happens "
+        "(the conditions/inputs that trigger it), Fix (a concrete, minimal code "
+        "change grounded in SOURCES), How to verify (a check or test). If the "
+        "SOURCES do not contain the failing code, say exactly what to retrieve "
+        "next (a file/symbol/traceback frame) rather than guessing. Cite every "
+        "claim with [[chunk_id]]. Return JSON keys: answer_md, citations, "
         "suggested_changes, confidence. No prose outside JSON. "
     ) + ALLOWED_CITATION_NOTE,
 }
@@ -683,10 +790,11 @@ SYSTEM_PROMPTS_STREAM: Dict[str, str] = {
         "justification and a [[chunk_id]] citation each."
     ),
     "overview": (
-        "You are a senior codebase assistant. Use ONLY the SOURCES (and the optional README "
-        "lead) to produce a concise repo overview in plain Markdown: Purpose, Major "
-        "components, How they fit together, Entry points. Cite each claim with [[chunk_id]]. "
-        "Do NOT wrap in JSON."
+        "You are a senior codebase assistant. Use ONLY the REPO MAP (whole-repo "
+        "package/file/symbol tree), the SOURCES, and the optional README lead to produce a "
+        "concise repo overview in plain Markdown: Purpose, Major components, How they fit "
+        "together, Entry points. Prefer the REPO MAP for breadth and SOURCES for specific "
+        "claims. Cite specific claims with [[chunk_id]]. Do NOT wrap in JSON."
     ),
     "qa": (
         "You are a senior codebase assistant answering a specific question. Use ONLY the "
@@ -709,6 +817,14 @@ SYSTEM_PROMPTS_STREAM: Dict[str, str] = {
         "would touch; (3) one follow-up question asking which direction to pursue or "
         "what constraint matters most. Do NOT propose code edits and do NOT invent "
         "components absent from SOURCES. Do NOT wrap in JSON."
+    ),
+    "debug": (
+        "You are a senior engineer debugging a reported failure. Use ONLY the SOURCES "
+        "to reason about the actual code on the failure path. Reply in plain Markdown: "
+        "Likely root cause (the specific line/branch in SOURCES, cited [[chunk_id]]), "
+        "Why it happens, Fix (a concrete minimal change grounded in SOURCES), and How "
+        "to verify. If the failing code is not in SOURCES, say exactly what to retrieve "
+        "next instead of guessing. Cite every claim with [[chunk_id]]. Do NOT wrap in JSON."
     ),
 }
 
@@ -888,20 +1004,27 @@ def _prepare_answer_request(
             }
 
     # --- Build/augment hits ---
+    # Symbol force-add pulls every chunk whose name/id matches ``target``. A
+    # common name (save/run/handle) matches dozens of unrelated homonyms across
+    # the repo; forcing them ALL into SOURCES crowds out the query-relevant one
+    # and, because retrieval was skipped whenever any symbol matched, left the
+    # model with no query signal to pick the right one. Cap the forced set, and
+    # when the symbol is ambiguous also run retrieval so the QUESTION
+    # disambiguates among the homonyms.
     forced_hits: List[Dict[str, Any]] = []
+    symbol_ambiguous = False
     if target:
+        raw_forced: List[Dict[str, Any]] = []
         for cid, _row, view in _find_symbol_rows(indices, target):
-            forced_hits.append({"chunk_id": cid, "score": 2.0, "view": view})
-        rec_hits = _hits_from_records(indices, records_path, target)
-        seen = {str(h["chunk_id"]) for h in forced_hits}
-        for h in rec_hits:
-            if str(h["chunk_id"]) not in seen:
-                forced_hits.append(h); seen.add(str(h["chunk_id"]))
+            raw_forced.append({"chunk_id": cid, "score": 2.0, "view": view})
+        for h in _hits_from_records(indices, records_path, target):
+            raw_forced.append(h)
+        forced_hits, symbol_ambiguous = _cap_forced_symbol_hits(raw_forced)
 
     base_hits: List[Dict[str, Any]] = []
     if hits:
         base_hits = hits
-    elif not forced_hits:
+    elif not forced_hits or symbol_ambiguous:
         # No caller-supplied hits and no symbol match. Run real hybrid
         # retrieval (semantic + lexical + graph) so SOURCES reflect the
         # question. The previous fallback grabbed the first ``top_k`` rows
@@ -994,6 +1117,14 @@ def _prepare_answer_request(
     if readme and mode not in {"symbol_explain"}:
         lead_lines = [ln for ln in readme.splitlines() if ln.strip()][:12]
         context += "README (lead):\n" + "\n".join(lead_lines) + "\n\n"
+    # Overview questions ("what does this repo do") are a whole-repo aggregate
+    # that ~20 retrieved chunks answer unreliably. Ground them in the
+    # purpose-built hierarchical repo map (packages -> files -> symbols, built
+    # deterministically at index time) when it is available.
+    if mode == "overview":
+        repo_map_text = _load_repo_map_render(index_dir)
+        if repo_map_text:
+            context += "REPO MAP (whole-repo structure):\n" + repo_map_text + "\n\n"
     if target:
         context += f"TARGET_SYMBOL: {target}\n\n"
     context += "SOURCES:\n" + "\n".join(_fmt_source(s) for s in sources)
@@ -1579,6 +1710,10 @@ def answer_with_llm_stream(
     allowed_ids = [s["chunk_id"] for s in sources]
     raw_cites = [{"chunk_id": m.group(1)} for m in _INLINE_CITATION_RE.finditer(answer_md)]
     citations = _sanitize_citations(raw_cites, allowed_ids)
+    # Strip fabricated inline [[id]] markers and canonicalize resolvable ones so
+    # the streamed answer can't render a citation to a chunk that was never in
+    # SOURCES (the blocking path already does this).
+    answer_md = _sanitize_inline_citations(answer_md, allowed_ids)
 
     answer_md = _shorten_chunk_refs(answer_md, root)
 
@@ -3093,6 +3228,42 @@ def _render_contracts_for_prompt(contracts: Any) -> str:
     if isinstance(skeleton, str) and skeleton.strip():
         sections.append("Project Skeleton:\n" + skeleton.strip())
 
+    # External-dependency grounding fetched from the real package registry.
+    # Provenance-scoped labels: introspected (``verified``) metadata is an
+    # authority to implement against; registry text is an UNVERIFIED excerpt --
+    # it narrows the model to the real package/names but exact signatures must
+    # still be confirmed with tools. Never presented as "do not stub" over what
+    # may be truncated prose.
+    ext_ref = contracts.get("external_api_reference")
+    if isinstance(ext_ref, dict) and ext_ref:
+        verified_lines: List[str] = []
+        unverified_lines: List[str] = []
+        for name, ref in ext_ref.items():
+            if not isinstance(ref, dict):
+                continue
+            eco = str(ref.get("ecosystem") or "").strip()
+            summary = str(ref.get("summary") or "").strip()
+            detail = str(ref.get("detail") or "").strip()
+            head = f"- {name}" + (f" ({eco})" if eco else "")
+            if summary:
+                head += f": {summary}"
+            body = ("\n" + _compact_json_fragment(detail, max_chars=1200)
+                    ) if detail else ""
+            (verified_lines if ref.get("verified")
+             else unverified_lines).append(head + body)
+        if verified_lines:
+            sections.append(
+                "EXTERNAL DEPENDENCY REFERENCE (verified real API -- implement "
+                "against THIS, do not guess or stub):\n"
+                + "\n".join(verified_lines))
+        if unverified_lines:
+            sections.append(
+                "EXTERNAL DEPENDENCY REFERENCE (real package metadata fetched "
+                "for you -- UNVERIFIED excerpt: use it to implement against the "
+                "REAL package and names, but confirm exact signatures with "
+                "tools; do NOT invent an API that contradicts this):\n"
+                + "\n".join(unverified_lines))
+
     if not sections:
         return ""
     return ("PROJECT CONTRACTS (shared interfaces every file MUST honour "
@@ -3903,6 +4074,7 @@ def generate_single_scaffold_file(
     depends_on: Optional[List[str]] = None,
     contracts: Optional[Dict[str, Any]] = None,
     manifest_paths: Optional[List[str]] = None,
+    import_hint: str = "",
 ) -> Dict[str, Any]:
     """Generate the content of a single file in a new-project scaffold.
 
@@ -4079,6 +4251,12 @@ def generate_single_scaffold_file(
     required_block = _render_required_symbols_for_file(path, contracts)
     if required_block:
         parts.append(required_block)
+    # Deterministic, verified import lines for this file's dependencies (see
+    # swarm_skeleton.render_import_hints) -- collapses the dotted-path / symbol
+    # -name guesswork a weak model gets wrong. Advisory; unused lines are
+    # stripped downstream.
+    if import_hint:
+        parts.append(import_hint)
     # Per-call prompt + response budget scaled to the active provider's
     # model context window. Local 8K models get tight caps; cloud
     # models with 200K+ windows get generous ones. See
@@ -5505,10 +5683,10 @@ def _regenerate_scaffold_file(
 
 _LOGIC_REPAIR_SYSTEM = (
     "You are a senior software engineer repairing a project whose automated "
-    "tests FAIL.\n\n"
+    "checks FAIL -- this may be a test runner, a compiler, or a build tool.\n\n"
     "You will be given:\n"
     "- The project goal\n"
-    "- The failing test output (pytest / test-runner)\n"
+    "- The failing check output (test runner, compiler, or build tool)\n"
     "- The CURRENT complete contents of the most relevant source and test "
     "files\n\n"
     "Diagnose the failure and return corrected COMPLETE file contents for "
@@ -5523,6 +5701,13 @@ _LOGIC_REPAIR_SYSTEM = (
     "rewrite THAT test instead -- assert an invariant or round-trip against "
     "the real API rather than forcing the source to emit an impossible value. "
     "Return the corrected test file's complete content.\n"
+    "- Decide which side is correct FOR THE PROJECT GOAL and fix ONLY the "
+    "wrong file. NEVER weaken, delete, or trivialize a correct test just to "
+    "make it pass -- do not replace a real assertion with `assert True`, "
+    "`pass`, or a no-op, and do not loosen an expected value to whatever the "
+    "buggy code happens to return. Likewise never break a correct "
+    "implementation to satisfy a wrong test. A test that encodes a genuine "
+    "requirement is the oracle: fix the implementation to meet it.\n"
     "- Output the COMPLETE file content for every file you return -- no "
     "stubs, placeholders, ellipsis, or unified-diff markers.\n"
     "- Only return files that appear in the provided file list, and only "

@@ -26,11 +26,21 @@ _STORE_CACHE: Dict[str, Any] = {}
 
 
 def _get_store(project_root: str) -> Any:
-    """Return a cached SessionStore for ``project_root`` (opened on first use)."""
+    """Return a cached SessionStore for ``project_root`` (opened on first use).
+
+    ``SessionStore``'s first positional parameter is ``db_path``; passing the
+    project directory there made it try to open the directory itself as a SQLite
+    file, which raised inside ``__init__`` and was swallowed by ``swarm_beat``'s
+    best-effort guard -- so SWARM_BEAT facts silently never persisted and the
+    live agent view never saw a single sub-agent beat. Passing ``project_root``
+    by keyword resolves to ``<project_root>/.cgx/sessions.db`` (the same file the
+    webui runner uses) and shares the process-global event bus, so the fact both
+    persists and emits FACT_ADDED to the SSE stream.
+    """
     store = _STORE_CACHE.get(project_root)
     if store is None:
         from cgx.session.store import SessionStore
-        store = SessionStore(project_root)
+        store = SessionStore(project_root=project_root)
         _STORE_CACHE[project_root] = store
     return store
 
@@ -67,14 +77,17 @@ def swarm_beat(project_root: Optional[str], role: str, phase: str,
             task_id = ctx.get("task_id")
             if session_id and task_id:
                 store = _get_store(project_root)
+                now = time.time()
                 fact = Fact(
                     fact_id="fact_" + uuid.uuid4().hex[:16],
                     session_id=session_id,
                     kind=FactKind.SWARM_BEAT,
                     content=payload,
                     surfaced_in_task_id=task_id,
-                    created_at=int(time.time()),
-                    updated_at=int(time.time())
+                    # Float epoch (not int) to match every other fact's timestamp
+                    # so the merged fact/LLM_CALL timeline sorts consistently.
+                    created_at=now,
+                    updated_at=now,
                 )
                 store.add_fact(fact)
     except Exception:  # pragma: no cover - DB write is best-effort here

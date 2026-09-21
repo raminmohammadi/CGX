@@ -231,3 +231,33 @@ def test_enumerate_intent_requires_both_cue_and_keyword():
     # api keyword but no enumeration cue -> not enumerate.
     assert detect_intent("how does the api work?") != "enumerate"
     assert detect_intent("what is scanai?") != "enumerate"
+
+
+def test_debug_intent_on_failures_and_errors():
+    assert detect_intent("why is parse_codebase raising a KeyError") == "debug"
+    assert detect_intent("the indexer keeps failing with a traceback") == "debug"
+    assert detect_intent("fix the crash in build_faiss_index") == "debug"
+    assert detect_intent("getting a ValueError from load_indices, why") == "debug"
+    assert detect_intent("my test throws an error, what's wrong with it") == "debug"
+
+
+def test_debug_intent_does_not_hijack_conceptual_questions():
+    # "error" without a diagnostic verb is a conceptual question, not debugging.
+    assert detect_intent("how does error handling work in the parser") != "debug"
+    # Adding error handling is a change, not a diagnosis.
+    assert detect_intent("add error handling to the loader") != "debug"
+    # "why does X <do-something>" with no failure signal stays conceptual.
+    assert detect_intent("why does the tokenizer split camelCase") != "debug"
+
+
+def test_enumerate_does_not_hijack_conceptual_api_questions():
+    # Weak cues (which / what are the / all the) only enumerate when the noun is
+    # endpoint/route -- not bare "api" -- so conceptual API questions are spared.
+    assert detect_intent("which API framework should I use") != "enumerate"
+    assert detect_intent("what are the main API abstractions") != "enumerate"
+    assert detect_intent("all the api design patterns in use") != "enumerate"
+    assert detect_intent("how does the api work") != "enumerate"
+    # But genuine endpoint/route enumeration still routes correctly.
+    assert detect_intent("which endpoints exist?") == "enumerate"
+    assert detect_intent("what are the routes") == "enumerate"
+    assert detect_intent("how many endpoints are there") == "enumerate"

@@ -1969,3 +1969,102 @@ def test_answer_with_llm_accepts_markdown_prose_and_extracts_inline_citations(tm
 
 
 
+
+
+def test_cap_forced_symbol_hits_caps_ambiguous_names():
+    from cgx.answer.engine import _cap_forced_symbol_hits, _MAX_FORCED_SYMBOL_CHUNKS
+    # 20 distinct same-named homonyms, each with an intent + impl row.
+    raw = []
+    for i in range(20):
+        cid = f"pkg/m{i}.py::method::C{i}.save"
+        raw.append({"chunk_id": cid, "score": 2.0, "view": "intent"})
+        raw.append({"chunk_id": cid, "score": 2.0, "view": "impl"})
+    hits, ambiguous = _cap_forced_symbol_hits(raw)
+    assert ambiguous is True
+    distinct = {h["chunk_id"] for h in hits}
+    assert len(distinct) == _MAX_FORCED_SYMBOL_CHUNKS  # capped, not flooded
+    # Both views of a kept chunk are preserved (dedup is by chunk_id, not row).
+    assert len(hits) == 2 * _MAX_FORCED_SYMBOL_CHUNKS
+
+
+def test_cap_forced_symbol_hits_keeps_all_when_unambiguous():
+    from cgx.answer.engine import _cap_forced_symbol_hits
+    raw = [{"chunk_id": f"pkg/a.py::function::f{i}", "score": 2.0, "view": "intent"}
+           for i in range(3)]
+    hits, ambiguous = _cap_forced_symbol_hits(raw)
+    assert ambiguous is False
+    assert len(hits) == 3
+
+
+def test_citation_resolution_tolerates_shortened_ids():
+    from cgx.answer.engine import (
+        _resolve_citation, _sanitize_inline_citations, _sanitize_citations,
+    )
+    allowed = ["/home/u/repo/pkg/foo.py::function::bar",
+               "/home/u/repo/pkg/baz.py::class::Widget"]
+    # Exact, repo-relative (dropped abs prefix), and bare kind::symbol tail all map
+    # back to the canonical id; unknown -> None.
+    assert _resolve_citation(allowed[0], allowed) == allowed[0]
+    assert _resolve_citation("pkg/foo.py::function::bar", allowed) == allowed[0]
+    assert _resolve_citation("function::bar", allowed) == allowed[0]
+    assert _resolve_citation("nope::qux", allowed) is None
+    # Inline: shortened citations are canonicalized, fabricated ones stripped.
+    out = _sanitize_inline_citations(
+        "See [[pkg/foo.py::function::bar]], [[fabricated::thing]], [[class::Widget]].",
+        allowed,
+    )
+    assert "[[/home/u/repo/pkg/foo.py::function::bar]]" in out
+    assert "fabricated" not in out
+    assert "[[/home/u/repo/pkg/baz.py::class::Widget]]" in out
+    # Structured citations are canonicalized too.
+    assert _sanitize_citations([{"chunk_id": "function::bar"}, {"chunk_id": "x"}],
+                               allowed) == [{"chunk_id": allowed[0]}]
+
+
+def test_citation_resolution_drops_ambiguous_tail():
+    from cgx.answer.engine import _resolve_citation
+    # Same symbol name in two files -> ambiguous tail -> not resolved (no guess).
+    allowed = ["a/x.py::method::A.save", "b/y.py::method::B.save"]
+    assert _resolve_citation("save", allowed) is None
+    # But a fuller path-suffix disambiguates.
+    assert _resolve_citation("x.py::method::A.save", allowed) == allowed[0]
+
+
+def test_window_text_centers_on_densest_region_not_first_mention():
+    from cgx.answer.engine import _window_text
+    lines = ["# note: retry helper below"] + [f"pad line number {i}" for i in range(2, 20)] + \
+            ["    for attempt in range(retries):",
+             "        do_retry_now()",
+             "        exponential_backoff(retry)"] + \
+            [f"tail line number {i}" for i in range(23, 40)]
+    text = "\n".join(lines)
+    out = _window_text(text, ["retry", "backoff", "retries"], max_chars=200, context_lines=3)
+    # Lands on the cluster of matches, not the single early comment mention.
+    assert "exponential_backoff(retry)" in out
+    assert "for attempt in range(retries)" in out
+    assert "note: retry helper" not in out
+
+
+def test_overview_loads_repo_map_render(tmp_path):
+    """Overview grounding pulls the persisted whole-repo map that sits beside
+    the index dir; absent map -> empty string (no crash)."""
+    from cgx.answer.repo_map import build_repo_map, save_repo_map
+    from cgx.answer.engine import _load_repo_map_render
+    records = [
+        {"id": "/r/pkg/a.py::file", "type": "file", "name": "a.py",
+         "file": "/r/pkg/a.py", "module_path": "pkg.a",
+         "doc_first_sentence": "Alpha module.", "metrics": {"n_loc": 10}},
+        {"id": "/r/pkg/a.py::function::run", "type": "function", "name": "run",
+         "file": "/r/pkg/a.py", "signature": "(x)", "doc_first_sentence": "Run it.",
+         "start_line": 3, "end_line": 5},
+    ]
+    rm = build_repo_map(records)
+    idx = tmp_path / "idx"
+    idx.mkdir()
+    save_repo_map(str(tmp_path / "repo_map.json"), rm)
+    out = _load_repo_map_render(str(idx))
+    assert "Repo map:" in out and "def run(x)" in out
+    # No map beside a different dir -> empty, no error.
+    empty_idx = tmp_path / "other" / "idx"
+    empty_idx.mkdir(parents=True)
+    assert _load_repo_map_render(str(empty_idx)) == ""

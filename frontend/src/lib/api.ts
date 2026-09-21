@@ -207,6 +207,7 @@ export type TaskKind =
   | "bootstrap_env"
   | "repair"
   | "summarize"
+  | "swarm_assess"
   | "swarm_tech_lead"
   | "swarm_developer"
   | "swarm_verify";
@@ -245,7 +246,8 @@ export type DecisionKind =
   | "approve"
   | "freeform"
   | "clarify_answers"
-  | "approve_plan";
+  | "approve_plan"
+  | "relocate";
 
 export type SessionStatusValue =
   | "active" | "paused" | "completed" | "abandoned";
@@ -734,6 +736,7 @@ export const api = {
     provider: ProviderConfig;
     run_initial_task?: boolean;
     skills?: string[];
+    require_plan_approval?: boolean;
   }) => jsonReq<AgentSessionState>("/api/agent-session", "POST", body),
   agentSessionList: (projectRoot?: string | null) => {
     const q = projectRoot

@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
-import type { IndexLocation, ProviderConfig } from "../lib/api";
+import { api, type IndexLocation, type ProfileSummary, type ProviderConfig } from "../lib/api";
 
 // Workspace store: per-browser persistence of the provider config, the
 // active index location, and the selected session. The page components
@@ -11,6 +11,9 @@ export interface WorkspaceState {
   index: IndexLocation;
   projectRoot: string;
   selectedSessionId: string | null;
+  // One-shot guard so ``bootstrapProvider`` adopts a saved profile only on the
+  // first run in a browser and never clobbers a deliberate later choice.
+  providerInitialized: boolean;
   setProvider: (patch: Partial<ProviderConfig>) => void;
   setIndex: (patch: Partial<IndexLocation>) => void;
   setProjectRoot: (root: string) => void;
@@ -50,6 +53,7 @@ export const useWorkspace = create<WorkspaceState>()(
       index: defaultIndex,
       projectRoot: "",
       selectedSessionId: null,
+      providerInitialized: false,
       setProvider: (patch) =>
         set((s) => ({ provider: { ...s.provider, ...patch } })),
       setIndex: (patch) => set((s) => ({ index: { ...s.index, ...patch } })),
@@ -86,3 +90,62 @@ export const useWorkspace = create<WorkspaceState>()(
     },
   ),
 );
+
+// Adopt a saved profile as the active provider on first run.
+//
+// The default provider is a placeholder (``qwen2.5-coder:3b``, ``use_profile:
+// false``) that a user may never have installed. Without this, someone whose
+// only saved profile is, say, a 14B GGUF would open the app pointed at a model
+// that isn't on disk -- the "it's saved but won't connect" trap -- because
+// ``applyProfile`` only ever ran on a manual click in Settings. This runs once
+// per browser (guarded by ``providerInitialized``) so it fixes the cold start
+// without ever overriding a deliberate later choice.
+export async function bootstrapProvider(): Promise<void> {
+  if (useWorkspace.getState().providerInitialized) return;
+
+  let profiles: ProfileSummary[];
+  try {
+    profiles = await api.listProfiles();
+  } catch {
+    // Backend not up yet (the status poller is still retrying). Leave the flag
+    // unset so a later shell mount / reload can try again.
+    return;
+  }
+
+  // Mark handled regardless of the adoption outcome below: we only get one
+  // shot at "first run", and re-running on every mount would clobber a user
+  // who later picks an inline config on purpose.
+  useWorkspace.setState({ providerInitialized: true });
+  if (profiles.length === 0) return;
+
+  const active = useWorkspace.getState().provider;
+  const apply = useWorkspace.getState().applyProfile;
+
+  // Respect (and refresh) an explicit, still-existing profile selection.
+  if (active.use_profile && active.profile_name) {
+    const current = profiles.find((p) => p.name === active.profile_name);
+    if (current) {
+      apply(current);
+      return;
+    }
+  }
+
+  // Otherwise adopt the best available profile: prefer an Ollama profile whose
+  // model is actually installed locally so we land on something that connects
+  // immediately; fall back to the first Ollama profile, then any profile.
+  const ollama = profiles.filter((p) => p.kind === "ollama");
+  for (const p of ollama) {
+    try {
+      const r = await api.setupModels(p.base_url);
+      const has = (r.installed || []).some(
+        (m) => m.toLowerCase() === p.model.toLowerCase());
+      if (has) {
+        apply(p);
+        return;
+      }
+    } catch {
+      // Daemon unreachable for this base_url — try the next profile.
+    }
+  }
+  apply(ollama[0] ?? profiles[0]);
+}

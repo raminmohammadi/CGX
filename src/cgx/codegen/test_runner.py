@@ -453,7 +453,22 @@ def run_pytest_paths(
     if not tests:
         return TestRunOutcome(ran=False, skipped_reason="no tests located")
     python_exe = python_exe or _project_python_exe(root)
-    cmd = [python_exe, "-m", "pytest", *list(extra_pytest_args), *tests]
+    # Pin rootdir to the project and pass test targets RELATIVE to it. Without
+    # ``--rootdir`` pytest infers one by walking up from the (absolute) test
+    # args, which for a project with no ini file resolved to the *parent*
+    # directory (e.g. ``Downloads``) and then reported every test as
+    # "not found (no match in [<Dir Downloads>])" -- so a correctly-generated
+    # suite never ran. Relative targets under ``cwd=root`` also sidestep a
+    # path-case mismatch on case-insensitive filesystems.
+    rel_tests: List[str] = []
+    for t in tests:
+        try:
+            rp = os.path.relpath(t, root)
+            rel_tests.append(rp if not rp.startswith("..") else t)
+        except Exception:
+            rel_tests.append(t)
+    cmd = [python_exe, "-m", "pytest", f"--rootdir={root}",
+           *list(extra_pytest_args), *rel_tests]
     try:
         proc = subprocess.run(
             cmd, cwd=root, capture_output=True, text=True, timeout=timeout_seconds,

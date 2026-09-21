@@ -237,84 +237,162 @@ def _metrics_meta(meta: Dict[str, Any]) -> Tuple[Optional[int], Optional[int], b
 # Intent view
 # ---------------------------
 
+def _is_method_chunk(ctype: str, cid: str) -> bool:
+    """Python methods are emitted with ``type='function'`` and a ``::method::``
+    id segment; treat both encodings as methods so the class name is never lost."""
+    return ctype == "method" or (ctype == "function" and "::method::" in str(cid))
+
+
+def _location_label(chunk: Dict[str, Any]) -> str:
+    """Prefer the clean dotted ``module_path`` (e.g. ``net.client``) over the
+    absolute filesystem path so the embedded text carries a portable, semantic
+    location instead of machine/directory tokens. Falls back to the file's
+    basename (never the full path)."""
+    mp = chunk.get("module_path")
+    if isinstance(mp, str) and mp.strip():
+        return mp.strip()
+    f = str(chunk.get("file") or "")
+    return f.replace("\\", "/").rsplit("/", 1)[-1]
+
+
+def _structured_doc_lines(meta: Dict[str, Any]) -> List[str]:
+    """Render the parsed docstring (params/returns/raises) as short NL lines.
+
+    Includes the signal the old card discarded (it kept only the first docstring
+    sentence). Degrades to nothing when ``doc_parsed`` is absent."""
+    dp = meta.get("doc_parsed")
+    if not isinstance(dp, dict):
+        return []
+    out: List[str] = []
+    params = dp.get("params")
+    if isinstance(params, list) and params:
+        rendered = []
+        for it in params:
+            if isinstance(it, dict):
+                nm = str(it.get("name") or "").strip()
+                desc = str(it.get("description") or it.get("desc") or "").strip()
+                if nm and desc:
+                    rendered.append(f"{nm}: {desc}")
+                elif nm:
+                    rendered.append(nm)
+            elif isinstance(it, str) and it.strip():
+                rendered.append(it.strip())
+        if rendered:
+            out.append("parameters: " + "; ".join(rendered))
+    returns = dp.get("returns")
+    if isinstance(returns, str) and returns.strip():
+        out.append("returns: " + returns.strip())
+    raises = dp.get("raises")
+    if isinstance(raises, list) and raises:
+        names = []
+        for it in raises:
+            if isinstance(it, dict):
+                nm = str(it.get("name") or it.get("type") or "").strip()
+                desc = str(it.get("description") or it.get("desc") or "").strip()
+                names.append(f"{nm}: {desc}".strip(": ").strip() if desc else nm)
+            elif isinstance(it, str):
+                names.append(it.strip())
+        names = [n for n in names if n]
+        if names:
+            out.append("raises: " + "; ".join(names))
+    return out
+
+
 def build_intent_view(chunk: Dict[str, Any], G=None, *, topk_callees: int = 10) -> str:
     """
-    Build the text version / NL-friendly "card" per your template, deterministically.
+    Build the natural-language "intent" text for a chunk, deterministically.
 
-    This view is later passed to **embedding models** (see `build_embeddings` in
-    `cgx/embeddings/build.py`). It is the main "semantic search" input.
+    This view is the primary **semantic search** input embedded by
+    ``build_embeddings`` (see ``cgx/embeddings/build.py``). It is written as
+    readable prose -- an identity line, the FULL docstring, structured
+    params/returns/raises, and compact behavioural signals (calls, uses,
+    route) -- rather than a fixed ``key: value`` metadata card.
 
-    Template:
-        type: {type}
-        symbol: {id}
-        name: {name}
-        file: {file}
-        class: {class_name}
-        signature: {signature}
-        summary: {first_sentence_of_docstring_or_empty}
-        ...
+    The old card embedded a rigid scaffold (``type:/symbol:/file:/class:/
+    called_by_count:/metrics:``) shared verbatim across every chunk, plus the
+    absolute file path twice; those constant tokens dominated the vector and
+    pulled all chunks toward a common point (embedding-space collapse), while
+    the real signal (a one-line docstring summary) was a fraction of the text.
+    This builder drops the scaffold and the absolute path, keeps only lines
+    that carry per-chunk meaning, and never emits an all-boilerplate card.
     """
     try:
         ctype = chunk.get("type", "")
         cid = chunk.get("id", "")
-        name = chunk.get("name", "")
-        file = chunk.get("file", "")
+        name = chunk.get("name", "") or ""
         meta = chunk.get("meta") or {}
 
-        class_name = ""
-        signature = ""
-        if ctype in {"method", "function"}:
-            class_name = (meta.get("class_name") or "") if ctype == "method" else ""
-            signature = meta.get("signature") or ""
+        is_method = _is_method_chunk(ctype, cid)
+        kind = "method" if is_method else (ctype or "symbol")
+        class_name = (meta.get("class_name") or "") if is_method else ""
+        signature = meta.get("signature") or "" if ctype in {"method", "function"} else ""
+        location = _location_label(chunk)
 
-        summary = _doc_first_sentence(meta)
-        imports = _imports_fullnames(meta)
-        reads = _attribute_roots_read(meta)
-        writes = _attribute_roots_written(meta)
-        raises = _raises_list(meta)
-        calls_out = _topk_callee_names(meta, k=topk_callees)
-        n_called_by = _called_by_count(cid, G)
-        n_loc, n_params, is_async, is_gen = _metrics_meta(meta)
-
-        lines: List[str] = []
-        lines.append(f"type: {ctype}")
-        lines.append(f"symbol: {cid}")
-        lines.append(f"name: {name}")
-        lines.append(f"file: {file}")
-        if ctype == "method":
-            lines.append(f"class: {class_name}")
-        else:
-            lines.append("class: ")
-        if ctype in {"function", "method"}:
-            lines.append(f"signature: {signature}")
-        else:
-            lines.append("signature: ")
-        lines.append(f"summary: {summary}")
-
-        # deterministic comma joins
+        # deterministic comma join
         def cj(xs: Iterable[str]) -> str:
             try:
                 return ", ".join([x for x in xs if isinstance(x, str) and x])
             except Exception:
                 return ""
 
-        lines.append(f"imports: {cj(imports)}")
-        lines.append(f"reads: {cj(reads)}")
-        lines.append(f"writes: {cj(writes)}")
-        lines.append(f"raises: {cj(raises)}")
-        lines.append(f"calls_out: {cj(calls_out)}")
-        lines.append(f"called_by_count: {n_called_by}")
-        lines.append(
-            "metrics: "
-            f"n_loc={str(n_loc) if n_loc is not None else ''}, "
-            f"n_params={str(n_params) if n_params is not None else ''}, "
-            f"async={str(is_async)}, generator={str(is_gen)}"
-        )
+        lines: List[str] = []
+
+        # 1) Human-readable identity line: "<kind> <Class.name><sig> in <module>"
+        qual = f"{class_name}.{name}" if (is_method and class_name) else name
+        head = f"{kind} {qual}".rstrip()
+        if signature:
+            head += signature if signature.startswith("(") else f" {signature}"
+        if location:
+            head += f" in {location}"
+        lines.append(head)
+
+        # 2) HTTP route (endpoint queries have text to match against)
+        route = meta.get("route")
+        if isinstance(route, dict):
+            methods = "/".join(m for m in (route.get("methods") or []) if isinstance(m, str))
+            path = str(route.get("path") or "").strip()
+            if methods or path:
+                lines.append(f"HTTP endpoint {methods} {path}".strip())
+
+        # 3) Decorators (skip the trivial/no-op case)
+        decs = [str(d) for d in (meta.get("decorators") or []) if d]
+        if decs:
+            lines.append("decorators: " + cj(decs))
+
+        # 4) FULL docstring, then structured params/returns/raises
+        doc = meta.get("docstring")
+        if isinstance(doc, str) and doc.strip():
+            lines.append(doc.strip())
+        lines.extend(_structured_doc_lines(meta))
+
+        # 5) Return annotation when the docstring did not describe returns
+        ret = meta.get("returns_annotation")
+        if isinstance(ret, str) and ret.strip() and not any(l.startswith("returns:") for l in lines):
+            lines.append(f"returns: {ret.strip()}")
+
+        # 6) Compact behavioural signals (only when non-empty -- no scaffold)
+        calls_out = _topk_callee_names(meta, k=topk_callees)
+        if calls_out:
+            lines.append("calls: " + cj(calls_out))
+        imports = _imports_fullnames(meta)
+        if imports:
+            lines.append("uses: " + cj(imports))
+        raises = _raises_list(meta)
+        if raises:
+            lines.append("raises: " + cj(raises))
+
+        # 7) Class/file containers: surface members so a container query matches.
+        if ctype == "class":
+            bases = [str(b) for b in (meta.get("bases") or []) if b]
+            if bases:
+                lines.append("inherits: " + cj(bases))
+
         return "\n".join(lines)
     except Exception as e:
         logger.error("build_intent_view failed for chunk %r: %s", chunk.get("id"), e)
-        # Return a minimal, safe card
-        return f"type: {chunk.get('type','')}\nsymbol: {chunk.get('id','')}\nname: {chunk.get('name','')}\nfile: {chunk.get('file','')}"
+        # Return a minimal, safe NL line (no absolute path).
+        nm = chunk.get("name", "") or ""
+        return f"{chunk.get('type','symbol')} {nm}".strip()
 
 
 # ---------------------------

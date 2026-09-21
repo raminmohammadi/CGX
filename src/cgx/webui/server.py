@@ -252,10 +252,22 @@ def _mount_spa(app: FastAPI) -> None:
             return FileResponse(str(svg), media_type="image/svg+xml")
         return JSONResponse({"detail": "no favicon"}, status_code=404)
 
+    def _index_response() -> FileResponse:
+        # index.html must NEVER be served stale: it references content-hashed
+        # asset URLs (index-<hash>.js), so a browser-cached index.html points at
+        # an OLD bundle -- the "UI shows the old version until I hard-refresh"
+        # bug. ``no-cache`` forces revalidation on every load (cheap via the
+        # ETag/Last-Modified FileResponse sets); the hashed /assets stay
+        # immutably cacheable because a new build changes their URLs.
+        return FileResponse(
+            str(STATIC_DIR / "index.html"),
+            headers={"Cache-Control": "no-cache, must-revalidate"},
+        )
+
     @app.get("/", include_in_schema=False, response_model=None)
     def _root():
         if has_static:
-            return FileResponse(str(STATIC_DIR / "index.html"))
+            return _index_response()
         return JSONResponse(
             {
                 "detail": "CGX frontend bundle not found.",
@@ -280,7 +292,7 @@ def _mount_spa(app: FastAPI) -> None:
                 and os.path.isfile(candidate)):
             return FileResponse(candidate)
         if has_static:
-            return FileResponse(str(STATIC_DIR / "index.html"))
+            return _index_response()
         return JSONResponse(
             {"detail": "frontend not built", "path": full_path},
             status_code=503,

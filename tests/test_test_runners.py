@@ -240,3 +240,120 @@ def test_run_project_tests_aggregates_worst_case_returncode(tmp_path):
     assert outcome.returncode == 1
     assert outcome.tests_selected == ["a", "b"]
     assert "== npm ==" in outcome.stderr
+
+
+def test_run_pytest_paths_pins_rootdir_and_uses_relative_targets(tmp_path, monkeypatch):
+    """Regression: pytest is invoked with --rootdir pinned to the project and
+    test targets relative to it, so rootdir inference can't drift to a parent
+    dir (which produced 'no tests ran / no match in [<parent>]')."""
+    import cgx.codegen.test_runner as tr
+    (tmp_path / "tests").mkdir()
+    tf = tmp_path / "tests" / "test_x.py"
+    tf.write_text("def test_x():\n    assert True\n")
+    captured = {}
+
+    class _Proc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(cmd, **kw):
+        captured["cmd"] = cmd
+        captured["cwd"] = kw.get("cwd")
+        return _Proc()
+
+    monkeypatch.setattr(tr.subprocess, "run", fake_run)
+    tr.run_pytest_paths(str(tmp_path), [str(tf)], python_exe="python3")
+    cmd = captured["cmd"]
+    assert any(str(a).startswith("--rootdir=") for a in cmd)
+    assert "tests/test_x.py" in cmd  # relative target, not the absolute path
+    assert str(tf) not in cmd
+
+
+def test_is_toolchain_missing_classifies_vite_not_found():
+    from cgx.codegen.test_runners import _is_toolchain_missing
+    assert _is_toolchain_missing("sh: vite: command not found")
+    assert _is_toolchain_missing("npm ERR! ENOENT")
+    assert not _is_toolchain_missing("SyntaxError: Unexpected token in App.jsx")
+
+
+def test_npm_install_failure_is_skipped_not_failed(tmp_path, monkeypatch):
+    import cgx.codegen.test_runners as tr
+    (tmp_path / "package.json").write_text('{"scripts":{"build":"vite build"}}')
+
+    class _Proc:
+        returncode = 1
+        stdout = ""
+        stderr = "npm ERR! network request failed"
+
+    monkeypatch.setattr(tr.subprocess, "run", lambda cmd, **kw: _Proc())
+    monkeypatch.setattr(tr.shutil, "which", lambda x: "/usr/bin/npm")
+    out = tr.NpmRunner()._run_in_dir(str(tmp_path), timeout_seconds=30,
+                                     tests_present=False)
+    assert out.ran is False
+    assert "toolchain" in (out.skipped_reason or "").lower()
+
+
+def test_npm_build_tool_not_found_is_skipped(tmp_path, monkeypatch):
+    import cgx.codegen.test_runners as tr
+    (tmp_path / "package.json").write_text('{"scripts":{"build":"vite build"}}')
+    (tmp_path / "node_modules").mkdir()  # present -> install is skipped
+
+    class _Proc:
+        returncode = 1
+        stdout = ""
+        stderr = "sh: vite: command not found"
+
+    monkeypatch.setattr(tr.subprocess, "run", lambda cmd, **kw: _Proc())
+    monkeypatch.setattr(tr.shutil, "which", lambda x: "/usr/bin/npm")
+    out = tr.NpmRunner()._run_in_dir(str(tmp_path), timeout_seconds=30,
+                                     tests_present=False)
+    assert out.ran is False
+    assert "not found" in (out.skipped_reason or "").lower()
+
+
+def test_is_npm_auth_error_detects_registry_auth_failures():
+    from cgx.codegen.test_runners import _is_npm_auth_error
+    assert _is_npm_auth_error("npm error code E401\nUnable to authenticate")
+    assert _is_npm_auth_error("401 Unauthorized")
+    assert not _is_npm_auth_error("npm ERR! ETARGET No matching version found")
+
+
+def test_npm_install_retries_public_registry_on_auth_error(tmp_path, monkeypatch):
+    import cgx.codegen.test_runners as tr
+    calls = []
+
+    class _P:
+        def __init__(self, rc, out=""):
+            self.returncode = rc
+            self.stdout = out
+            self.stderr = out
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        if "--registry" in cmd:            # retry against the public registry
+            return _P(0)
+        return _P(1, "npm error code E401 Unable to authenticate")  # private fail
+
+    monkeypatch.setattr(tr.subprocess, "run", fake_run)
+    ok, _out = tr._npm_install(tmp_path, timeout=30)
+    assert ok is True
+    assert any("--registry" in c and tr._PUBLIC_NPM_REGISTRY in c for c in calls)
+
+
+def test_npm_install_no_public_retry_on_non_auth_error(tmp_path, monkeypatch):
+    import cgx.codegen.test_runners as tr
+    calls = []
+
+    class _P:
+        returncode = 1
+        stdout = ""
+        stderr = "npm ERR! ETARGET No matching version"
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        return _P()
+
+    monkeypatch.setattr(tr.subprocess, "run", fake_run)
+    ok, _out = tr._npm_install(tmp_path, timeout=30)
+    assert ok is False and len(calls) == 1   # no retry for a non-auth failure

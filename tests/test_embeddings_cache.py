@@ -32,6 +32,42 @@ def test_hash_text_is_stable():
     assert hash_text("foo") != hash_text("bar")
 
 
+def test_changing_max_length_invalidates_cache(tmp_path):
+    """A truncation-length change must re-embed: the text hash is unchanged, so
+    without max_length in the key the old (clipped) vectors would be reused."""
+    cache_path = str(tmp_path / "emb.npz")
+    encode, calls = _fake_encode_factory()
+    texts = ["alpha", "beta"]
+
+    _, s1 = embed_with_cache(texts, encode_fn=encode, cache_path=cache_path,
+                             model_name="fake", normalize=False, max_length=256)
+    assert s1["misses"] == 2
+
+    # Same texts + model, but a different truncation length -> cache is stale.
+    _, s2 = embed_with_cache(texts, encode_fn=encode, cache_path=cache_path,
+                             model_name="fake", normalize=False, max_length=8192)
+    assert s2["misses"] == 2, "max_length change must invalidate the cache"
+
+    # Re-embedding at the same length hits again.
+    _, s3 = embed_with_cache(texts, encode_fn=encode, cache_path=cache_path,
+                             model_name="fake", normalize=False, max_length=8192)
+    assert s3["hits"] == 2
+
+
+def test_max_length_wildcard_reads_legacy_cache(tmp_path):
+    """A caller that doesn't pin max_length (wildcard 0) still reads a cache
+    written with a concrete length -- backward compatible."""
+    cache_path = str(tmp_path / "emb.npz")
+    encode, _ = _fake_encode_factory()
+    texts = ["alpha"]
+    embed_with_cache(texts, encode_fn=encode, cache_path=cache_path,
+                     model_name="fake", normalize=False, max_length=512)
+    # max_length omitted (defaults to 0 wildcard) -> still a hit.
+    _, s = embed_with_cache(texts, encode_fn=encode, cache_path=cache_path,
+                            model_name="fake", normalize=False)
+    assert s["hits"] == 1
+
+
 def test_first_call_misses_then_subsequent_call_hits(tmp_path):
     cache_path = str(tmp_path / "emb.npz")
     encode, calls = _fake_encode_factory()

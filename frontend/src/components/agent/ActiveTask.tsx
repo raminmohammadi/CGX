@@ -74,14 +74,17 @@ export function ActiveTaskPanel(props: ActiveTaskProps) {
       {linked && (task.kind !== "ask_user" || resolvedDecision !== undefined) && (
         <ArtifactPreview artifact={linked} />
       )}
-      {llmFacts.length > 0 && (
-        <ErrorBoundary label="llm-traces">
-          <LLMTraces facts={llmFacts} />
-        </ErrorBoundary>
-      )}
+      {/* Per-file swarm steps (generate -> gate -> write, pass/fail) are the
+          primary signal for a build task, so they render ABOVE the raw LLM
+          call log rather than being buried under it. */}
       {swarmBeats.length > 0 && (
         <ErrorBoundary label="swarm-beats">
           <SwarmBeats beats={swarmBeats} />
+        </ErrorBoundary>
+      )}
+      {llmFacts.length > 0 && (
+        <ErrorBoundary label="llm-traces">
+          <LLMTraces facts={llmFacts} />
         </ErrorBoundary>
       )}
     </div>

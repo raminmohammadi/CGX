@@ -112,22 +112,23 @@ def test_phantom_import_is_stripped_before_return(monkeypatch):
     assert "import os" not in out.content and "x = 1" in out.content
 
 
-def test_phantom_import_triggers_reask(monkeypatch):
+def test_unused_import_is_stripped_not_reasked(monkeypatch):
+    # An unused import is no longer a gate failure that forces a wasted re-ask
+    # (that churned nearly every test file over its `import pytest`); the
+    # accepted body is sanitized instead.
     calls = {"n": 0}
 
     def fake(path, description, provider, **kw):
         calls["n"] += 1
-        # First body has a phantom import (gate failure -> re-ask); the second
-        # is clean and short-circuits.
-        content = "import os\nx = 1\n" if calls["n"] == 1 else "y = 2\n"
-        return {"file": path, "content": content, "syntax_ok": True,
+        return {"file": path, "content": "import os\nx = 1\n", "syntax_ok": True,
                 "syntax_error": ""}
     monkeypatch.setattr(engine, "generate_single_scaffold_file", fake)
     out = sg.generate_file(
         path="src/app.py", description="x", depends_on=[], contracts={},
         goal="demo", root=".", provider=StubProvider())
-    assert out.ok and calls["n"] == 2
-    assert out.content == "y = 2\n"
+    assert out.ok and calls["n"] == 1          # accepted first try, no re-ask
+    assert "import os" not in out.content       # unused import stripped
+    assert "x = 1" in out.content
 
 
 def test_requirements_generated_from_real_imports(tmp_path):
@@ -234,3 +235,137 @@ def test_body_is_stub_true_and_false():
     assert engine._body_is_stub(stub)
     assert engine._body_is_stub(docstring_only)
     assert not engine._body_is_stub(real)
+
+
+# --------------------- C3: existing-repo safety + grounding ---------------------
+
+def test_edit_file_backs_up_existing_and_keeps_pristine(tmp_path):
+    from cgx.session.tasks.swarm_tools import edit_file
+    (tmp_path / "a.py").write_text("original\n")
+    edit_file("a.py", "new1\n", str(tmp_path))
+    bak = tmp_path / ".cgx-backups" / "swarm" / "a.py"
+    assert bak.read_text() == "original\n"
+    assert (tmp_path / "a.py").read_text() == "new1\n"
+    edit_file("a.py", "new2\n", str(tmp_path))  # second write keeps 1st backup
+    assert bak.read_text() == "original\n"
+
+
+def test_edit_file_no_backup_for_new_file(tmp_path):
+    from cgx.session.tasks.swarm_tools import edit_file
+    edit_file("b.py", "hi\n", str(tmp_path))
+    assert not (tmp_path / ".cgx-backups").exists()
+
+
+def test_dev_tools_query_codebase_index_awareness():
+    from cgx.session.tasks.swarm_generate import _dev_tools
+    assert "query_codebase" not in _dev_tools(None)
+
+    class _DepsIdx:
+        index_dir = "/tmp/x"
+        records_path = "/tmp/y"
+    assert "query_codebase" in _dev_tools(_DepsIdx())
+
+
+def test_generate_file_modify_existing_grounds_on_current(tmp_path, monkeypatch):
+    import cgx.answer.engine as engine
+    import cgx.session.tasks.swarm_generate as sg
+    (tmp_path / "svc.py").write_text("def keep():\n    return 1\n")
+    captured = {}
+
+    def fake_gen(path, description, provider, **kw):
+        captured["description"] = description
+        return {"content": "def keep():\n    return 1\n", "syntax_ok": True}
+
+    monkeypatch.setattr(engine, "generate_single_scaffold_file", fake_gen)
+
+    class _P:
+        def chat(self, *a, **k):
+            return {"content": "", "syntax_ok": True}
+
+    out = sg.generate_file(path="svc.py", description="add feature X",
+                           depends_on=[], contracts={}, goal="g",
+                           root=str(tmp_path), provider=_P(),
+                           modify_existing=True)
+    assert out.ok
+    assert "ALREADY EXISTS" in captured["description"]
+    assert "def keep()" in captured["description"]
+
+
+# ---------- gate no longer thrashes on framework/unused imports (PIP fixes) ----------
+
+def test_gate_allows_undeclared_third_party_import(tmp_path):
+    """An undeclared but real third-party import (e.g. flask) is advisory, not a
+    gate failure -- verify's dependency reconcile installs/pins it."""
+    from cgx.session.tasks.swarm_generate import _gate_generated_content
+    content = "import flask\napp = flask.Flask(__name__)\n"
+    err = _gate_generated_content(
+        "backend/app.py", content, contracts={"third_party_dependencies": []},
+        manifest_paths=["backend/app.py"], root=str(tmp_path))
+    assert err is None
+
+
+def test_gate_still_flags_missing_first_party_symbol(tmp_path):
+    """A first-party import of a symbol no planned file defines still gates."""
+    from cgx.session.tasks.swarm_generate import _gate_generated_content
+    # `backend.ghost` is not a planned path and not on disk -> a first-party
+    # import that resolves against neither still gates (a genuine bug).
+    content = "from backend.ghost import Thing\n"
+    err = _gate_generated_content(
+        "backend/app.py", content, contracts={},
+        manifest_paths=["backend/app.py"], root=str(tmp_path))
+    assert err is not None
+
+
+def test_generate_file_accepts_unused_pytest_import(tmp_path, monkeypatch):
+    """A test file importing pytest but not referencing it is accepted (the
+    sanitizer strips the unused import) rather than rejected + regenerated."""
+    import cgx.answer.engine as engine
+    import cgx.session.tasks.swarm_generate as sg
+    calls = {"n": 0}
+
+    def fake_gen(path, description, provider, **kw):
+        calls["n"] += 1
+        return {"content": "import pytest\n\ndef test_ok():\n    assert True\n",
+                "syntax_ok": True}
+
+    monkeypatch.setattr(engine, "generate_single_scaffold_file", fake_gen)
+
+    class _P:
+        def chat(self, *a, **k):
+            return {"content": "", "syntax_ok": True}
+
+    out = sg.generate_file(path="tests/test_ok.py", description="a test",
+                           depends_on=[], contracts={}, goal="g",
+                           root=str(tmp_path), provider=_P())
+    assert out.ok and out.method == "full-file"
+    assert calls["n"] == 1          # accepted on the first attempt, no regen churn
+    assert "import pytest" not in out.content  # unused import stripped
+
+
+def test_dev_tools_include_search_web():
+    """The Developer can look up a real API (to implement it, not stub it)."""
+    from cgx.session.tasks.swarm_generate import _dev_tools
+    assert "search_web" in _dev_tools(None)
+
+
+def test_render_structure_is_accurate_tree():
+    from cgx.session.tasks.swarm_generate import _render_structure
+    s = _render_structure(["backend/app.py", "backend/routes.py",
+                           "frontend/src/App.jsx", "README.md"])
+    assert "## Project structure" in s
+    assert "backend/" in s and "app.py" in s
+    assert "frontend/" in s and "src/" in s and "App.jsx" in s
+
+
+def test_readme_keeps_prose_and_appends_real_structure():
+    import cgx.session.tasks.swarm_generate as sg
+
+    class _P:
+        def chat(self, *a, **k):
+            return {"content": "# My App\n\nA thing that does things.\n"}
+
+    out = sg._readme_content("readme", "build my app", _P(),
+                             ["backend/app.py", "frontend/src/App.jsx"])
+    assert "# My App" in out                 # model prose kept
+    assert "## Project structure" in out     # accurate structure appended
+    assert "app.py" in out and "App.jsx" in out
