@@ -571,6 +571,7 @@ def _resolve_mode(req: AgentSessionCreateRequest) -> SessionMode:
 @router.get("", response_model=List[Dict[str, Any]])
 async def list_agent_sessions(
         project_root: Optional[str] = Query(default=None)) -> List[Dict[str, Any]]:
+    _enforce_project_root_base(normalized_project_root)
     normalized_project_root = _validate_project_root_for_read(project_root)
     # A project_root that doesn't exist on disk has no sessions -- and merely
     # opening a runner for it would create ``<root>/.cgx`` via the store's
