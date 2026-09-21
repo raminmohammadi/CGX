@@ -456,17 +456,21 @@ def _normalize_project_root(project_root: Optional[str]) -> Optional[str]:
 # --------------------- routes ---------------------
 
 def _enforce_project_root_base(project_root: Optional[str]) -> None:
-    """Optionally constrain project roots to a configured safe base directory.
+    """Constrain project roots to a configured safe base directory.
 
-    Set ``CGX_PROJECT_ROOT_BASE`` to an absolute/relative path to require all
-    caller-supplied project roots to stay within that tree. If unset, no base
-    restriction is applied.
+    ``project_root`` is user-controlled input and must not be allowed to point
+    at arbitrary filesystem locations. ``CGX_PROJECT_ROOT_BASE`` therefore
+    defines the allowed root tree and is required whenever ``project_root`` is
+    supplied.
     """
     if project_root is None:
         return
     configured_base = os.getenv("CGX_PROJECT_ROOT_BASE")
     if not configured_base:
-        return
+        raise HTTPException(
+            status_code=400,
+            detail=("Project root override is disabled until "
+                    "CGX_PROJECT_ROOT_BASE is configured."))
     base_root = os.path.abspath(os.path.expanduser(configured_base))
     candidate = os.path.abspath(os.path.expanduser(project_root))
     try:
