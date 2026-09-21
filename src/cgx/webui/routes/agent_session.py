@@ -437,6 +437,20 @@ def _normalize_project_root(project_root: Optional[str]) -> Optional[str]:
     return normalized
 
 
+def _validate_project_root_for_read(project_root: Optional[str]) -> Optional[str]:
+    """Validate caller-provided project root before read-only fs checks."""
+    normalized = _normalize_project_root(project_root)
+    if normalized is None:
+        return None
+    if not normalized.strip():
+        raise HTTPException(status_code=400, detail="project_root cannot be empty")
+    if "\x00" in normalized:
+        raise HTTPException(status_code=400, detail="project_root contains NUL byte")
+    if not os.path.isabs(normalized):
+        raise HTTPException(status_code=400, detail="project_root must be absolute")
+    return normalized
+
+
 # --------------------- routes ---------------------
 
 def _enforce_project_root_base(project_root: Optional[str]) -> None:
@@ -551,7 +565,7 @@ def _resolve_mode(req: AgentSessionCreateRequest) -> SessionMode:
 @router.get("", response_model=List[Dict[str, Any]])
 async def list_agent_sessions(
         project_root: Optional[str] = Query(default=None)) -> List[Dict[str, Any]]:
-    normalized_project_root = _normalize_project_root(project_root)
+    normalized_project_root = _validate_project_root_for_read(project_root)
     # A project_root that doesn't exist on disk has no sessions -- and merely
     # opening a runner for it would create ``<root>/.cgx`` via the store's
     # mkdir, resurrecting a folder the user deleted. (A stale ``projectRoot``
