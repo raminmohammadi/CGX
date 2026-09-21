@@ -433,6 +433,34 @@ def _normalize_project_root(project_root: Optional[str]) -> Optional[str]:
 
 # --------------------- routes ---------------------
 
+def _enforce_project_root_base(project_root: Optional[str]) -> None:
+    """Optionally constrain project roots to a configured safe base directory.
+
+    Set ``CGX_PROJECT_ROOT_BASE`` to an absolute/relative path to require all
+    caller-supplied project roots to stay within that tree. If unset, no base
+    restriction is applied.
+    """
+    if project_root is None:
+        return
+    configured_base = os.getenv("CGX_PROJECT_ROOT_BASE")
+    if not configured_base:
+        return
+    base_root = os.path.abspath(os.path.expanduser(configured_base))
+    candidate = os.path.abspath(os.path.expanduser(project_root))
+    try:
+        if os.path.commonpath([base_root, candidate]) != base_root:
+            raise HTTPException(
+                status_code=400,
+                detail=(f"Project root must be within configured base "
+                        f"directory: {base_root!r}"))
+    except ValueError:
+        # Different drives on Windows, or malformed path composition.
+        raise HTTPException(
+            status_code=400,
+            detail=(f"Project root must be within configured base "
+                    f"directory: {base_root!r}"))
+
+
 def _validate_project_root_writable(project_root: Optional[str]) -> None:
     """Reject an unusable project root with a clean 400 (not an opaque 500).
 
@@ -471,6 +499,7 @@ def _validate_project_root_writable(project_root: Optional[str]) -> None:
 @router.post("", response_model=AgentSessionState)
 async def create_session(req: AgentSessionCreateRequest) -> AgentSessionState:
     project_root = _normalize_project_root(req.project_root)
+    _enforce_project_root_base(project_root)
     _validate_project_root_writable(project_root)
     runner = _get_runner(project_root)
     mode = _resolve_mode(req)
