@@ -53,10 +53,15 @@ def mode_from_env() -> ApprovalMode:
 
 @dataclass
 class ApprovalDecision:
-    """The outcome of an approval request."""
+    """The outcome of an approval request.
+
+    ``confidence`` carries the programmable-policy confidence when a decision
+    originated there (JEV #5); human/terminal decisions leave it at ``1.0``.
+    """
 
     approved: bool
     reason: str = ""
+    confidence: float = 1.0
 
 
 @dataclass
