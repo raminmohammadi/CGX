@@ -122,6 +122,61 @@ class TaskKind(str, enum.Enum):
     SWARM_VERIFY = "swarm_verify"
 
 
+class TaskAccess(str, enum.Enum):
+    """Whether a :class:`TaskKind` only READS the workspace or may WRITE it.
+
+    JEV types reads vs writes so read-only work can be deduplicated / share a
+    single retrieval pass and can never contend on shared state (the paper's
+    "read-only tasks never contend"). Pure metadata today; the subgoal-dedup
+    cache and any future parallelism consume it. Classification is
+    CONSERVATIVE -- anything that writes files, installs packages, or executes
+    code is WRITE, and any kind absent from the map defaults to WRITE, so
+    sharing must opt in and is never assumed.
+    """
+
+    READ = "read"
+    WRITE = "write"
+
+
+_TASK_ACCESS: Dict[TaskKind, TaskAccess] = {
+    # Side-effect-free analysis / retrieval / planning (safe to share/dedup).
+    TaskKind.EXPLORE: TaskAccess.READ,
+    TaskKind.INVESTIGATE: TaskAccess.READ,
+    TaskKind.RECOMMEND: TaskAccess.READ,
+    TaskKind.SEARCH: TaskAccess.READ,
+    TaskKind.SUMMARIZE: TaskAccess.READ,
+    TaskKind.PLAN_CHANGE: TaskAccess.READ,       # emits a plan; APPLY writes
+    TaskKind.CLARIFY_REQUIREMENTS: TaskAccess.READ,
+    TaskKind.ASK_USER: TaskAccess.READ,          # a structured pause
+    TaskKind.SWARM_ASSESS: TaskAccess.READ,      # judges relevance
+    TaskKind.SWARM_TECH_LEAD: TaskAccess.READ,   # plans; Developer writes
+    TaskKind.DIAGNOSE: TaskAccess.READ,          # proposes; never mutates
+    # Writes files, installs packages, or executes code (never shared/cached).
+    TaskKind.APPLY: TaskAccess.WRITE,
+    TaskKind.SCAFFOLD: TaskAccess.WRITE,
+    TaskKind.AST_REGENERATE: TaskAccess.WRITE,
+    TaskKind.SWARM_DEVELOPER: TaskAccess.WRITE,
+    TaskKind.REPAIR: TaskAccess.WRITE,           # patch applied downstream
+    TaskKind.BOOTSTRAP_ENV: TaskAccess.WRITE,    # installs dependencies
+    TaskKind.API_CHECK: TaskAccess.WRITE,        # imports / executes
+    TaskKind.SMOKE: TaskAccess.WRITE,            # executes
+    TaskKind.VERIFY: TaskAccess.WRITE,           # runs the test suite
+    TaskKind.RUNTIME_VERIFY: TaskAccess.WRITE,   # boots the app
+    TaskKind.RE_VERIFY: TaskAccess.WRITE,
+    TaskKind.UNKNOWN: TaskAccess.WRITE,
+}
+
+
+def task_access(kind: TaskKind) -> TaskAccess:
+    """READ vs WRITE classification for ``kind`` (defaults to WRITE)."""
+    return _TASK_ACCESS.get(kind, TaskAccess.WRITE)
+
+
+def is_read_only(kind: TaskKind) -> bool:
+    """True when ``kind`` only reads the workspace (safe to dedup / share)."""
+    return task_access(kind) is TaskAccess.READ
+
+
 class FactKind(str, enum.Enum):
     FILE = "file"
     SYMBOL = "symbol"

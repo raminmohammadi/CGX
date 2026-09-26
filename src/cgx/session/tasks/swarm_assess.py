@@ -18,10 +18,11 @@ layout + a sample of source file paths), never the whole repo.
 
 from __future__ import annotations
 
-import json
 import os
-from typing import Any, Dict, List
+from typing import List
 
+from cgx.answer.jev import decide
+from cgx.answer.schemas import SWARM_RELEVANCE_SCHEMA
 from cgx.session.mode import _IGNORE_DIRS
 from cgx.session.models import TaskKind
 from cgx.session.tasks.base import (
@@ -92,17 +93,15 @@ def swarm_assess(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     if deps.provider is not None:
         user = (f"OBJECTIVE:\n{goal}\n\nEXISTING REPO FILES:\n{summary}\n\n"
                 "Is this repo relevant to the objective?")
-        try:
-            res = deps.provider.chat(
-                messages=[{"role": "system", "content": _SYSTEM},
-                          {"role": "user", "content": user}],
-                force_json=True)
-            parsed = _parse_verdict(str(res.get("content") or ""))
-            if parsed is not None:
-                relevant = bool(parsed.get("relevant", True))
-                reason = str(parsed.get("reason") or "").strip() or reason
-        except Exception:  # pragma: no cover - judge is best-effort
-            relevant = True
+        d = decide(deps.provider,
+                   [{"role": "system", "content": _SYSTEM},
+                    {"role": "user", "content": user}],
+                   SWARM_RELEVANCE_SCHEMA, decision_key="relevant")
+        # Conservative default: only a confident, well-formed verdict diverts
+        # the build; any parse/model failure leaves relevant=True (proceed).
+        if d.ok and isinstance(d.value, bool):
+            relevant = d.value
+            reason = str(d.raw.get("reason") or "").strip() or reason
 
     swarm_beat(project_root, "assess", "verdict", relevant=relevant,
                reason=reason[:200])
@@ -115,25 +114,3 @@ def swarm_assess(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         # Threaded so the downstream Tech Lead keeps the session's approval mode.
         "require_plan_approval": bool(task.inputs.get("require_plan_approval")),
     })
-
-
-def _parse_verdict(text: str) -> Dict[str, Any] | None:
-    """Extract the ``{relevant, reason}`` object from a possibly-fenced reply."""
-    t = (text or "").strip()
-    if not t:
-        return None
-    if "```" in t:
-        # Strip a ```json fence if present.
-        import re
-        m = re.search(r"```[a-zA-Z]*\s*(.*?)\s*```", t, re.DOTALL)
-        if m:
-            t = m.group(1).strip()
-    try:
-        obj = json.loads(t)
-        return obj if isinstance(obj, dict) else None
-    except Exception:
-        # Last resort: a bare "relevant": false anywhere in the text.
-        low = t.lower()
-        if '"relevant"' in low:
-            return {"relevant": "false" not in low.split('"relevant"', 1)[1][:12]}
-        return None

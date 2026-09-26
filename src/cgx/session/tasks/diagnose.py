@@ -448,11 +448,20 @@ def _react_diagnose(
     """
     if deps.provider is None:
         return _escalate(fc), False
+    from cgx.answer.model_caps import effective_context_window
+    from cgx.session.context_budget import fit_react_messages
+    ectx = effective_context_window(deps.provider)
     messages = [
         {"role": "system", "content": _SYSTEM_PROMPT},
         {"role": "user", "content": _render_context(fc, ledger)},
     ]
     for tool_calls in range(DIAGNOSE_STEPS + 1):
+        # Deterministic num_ctx guard (default preserve-behavior: the existing
+        # per-append [:1500]/[:3000] caps mean nothing is trimmed in the common
+        # case; this only fires if the running prompt would overflow).
+        messages = fit_react_messages(
+            messages, effective_ctx=ectx, reserve_output=900,
+            keep_recent=4, per_msg_cap_chars=3000)
         parsed = _diagnose_call(deps.provider, messages)
         if not isinstance(parsed, dict):
             return _escalate(fc), True
@@ -492,17 +501,23 @@ def _render_context(fc: FailureContext, ledger: RepairLedger) -> str:
 def _diagnose_call(
         provider: Any, messages: List[Dict[str, str]]
 ) -> Optional[Dict[str, Any]]:
-    """One schema-constrained provider turn; ``None`` on crash/unparseable."""
-    try:
-        resp = provider.chat(messages=messages, temperature=0.0,
-                             max_tokens=800, force_json=True)
-    except Exception:  # pragma: no cover - defensive: provider hiccup
-        logger.exception("DIAGNOSE: provider call crashed")
-        return None
-    raw = (resp or {}).get("content", "") if isinstance(resp, dict) else ""
-    from cgx.answer.engine import _extract_json_object
-    parsed = _extract_json_object(raw or "")
-    return parsed if isinstance(parsed, dict) else None
+    """One schema-constrained provider turn; ``None`` on crash/unparseable.
+
+    A DIAGNOSE turn is either a read-only tool call or the final typed verdict,
+    so :data:`~cgx.answer.schemas.DIAGNOSIS_SCHEMA` permits both shapes and
+    constrains only the ``tool`` / ``minimal_action`` enums. Routing through
+    :func:`cgx.answer.jev.decide` means a weak local model can no longer emit
+    an out-of-enum action that silently degrades to ``escalate``: the schema is
+    enforced at decode time on capable backends and re-checked here (with one
+    bounded corrective re-ask). Returns the parsed object -- the loop
+    dispatches tool-call vs verdict -- or ``None`` on crash/empty so the loop
+    escalates exactly as before.
+    """
+    from cgx.answer.jev import decide
+    from cgx.answer.schemas import DIAGNOSIS_SCHEMA
+    d = decide(provider, messages, DIAGNOSIS_SCHEMA,
+               temperature=0.0, max_tokens=800)
+    return d.raw if d.ok and d.raw else None
 
 
 # --------------------- read-only tools ---------------------

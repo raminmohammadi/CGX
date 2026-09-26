@@ -78,6 +78,17 @@ CGX ensures all data, embeddings, and executions remain strictly on your machine
   [Session-based Agent](#session-based-agent-agent) and
   [docs/Agent.md](docs/Agent.md).
 - **Swarm Agent.** A deterministic, plan-driven agent architecture that replaces free-form loops with a Tech Lead (planner), Developer (implementer), and Verifier (tester). Features an advanced **Swarm Operations Dashboard** with live telemetry, and multiple Auto-Repair capabilities (AST Import Injection, AST Function Logic Repair, Contract Renegotiation, Semantic Repair with Dynamic Temperature Scaling) to ensure reliable, compilation-ready code.
+- **JEV -- typed decision layer.** The leverage in a coding agent isn't the
+  loop, it's *what the loop feeds the model each turn*. JEV
+  (`cgx.answer.jev.decide`) turns those high-frequency per-turn choices into
+  **typed** decisions beside the model: a per-query context **visibility
+  ladder** (hide/short/long/full), a deterministic **`num_ctx`**
+  reuse-vs-rebuild guard, a **programmable, content-inspecting permission**
+  policy (allow/ask/deny + confidence), **tiered tool disclosure** with argument
+  validation, a shared **file-sensitivity** scorer, and **conditional**
+  `GOTCHAS.md` loading. Deterministic by default; probability gates stay off
+  until calibrated, with opt-in **local logprobs** via a llama-server endpoint.
+  See [docs/jev.md](docs/jev.md).
 - **New project generation.** Give CGX a plain-language idea
   (*"create a FastAPI todo app"*, *"create a React calculator app"*),
   point it at an empty folder, and the greenfield agent scaffolds a
@@ -800,6 +811,44 @@ The server URL is read from the `cgx.ui.url` setting (default
 start it with `cgx-ui` (or `python app.py`) first.
 
 See [`extension/README.md`](extension/README.md) for the full setup.
+
+---
+
+## JEV -- the typed decision layer
+
+A coding agent is a loop around a model, and the leverage is **not in the
+loop** -- it is in *what the loop feeds the model each turn*. JEV makes those
+per-turn choices **explicit and typed**: the harness hands `cgx.answer.jev.decide`
+a fixed **question** plus the current **state**, and it returns a **typed**
+answer -- an enum choice, a score, or a bool -- with a probability, so the
+harness validates it, thresholds on it, and branches **deterministically**
+instead of parsing prose. JEV *decides*; the model, tools, and plain code do the
+work. CGX already assembles context per query, so it was most of the way here.
+
+The six decision points, and where each stands:
+
+| Decision point | Question | Typed answer | In CGX |
+|---|---|---|---|
+| Context | How visible should this chunk be for this query? | hide / short / long / full | ✅ visibility ladder |
+| Cache | Reuse the running context or rebuild it? | fits / trim (`num_ctx`) | ✅ deterministic guard |
+| Tools | Which tool fits this intent, with what args? | schema on demand + validate | ✅ tiered MCP disclosure |
+| Permissions | Should this command run? | allow / ask / deny + confidence | ✅ programmable policy |
+| Security | Which files will this task touch? | public / standard / restricted | ✅ sensitivity scorer |
+| Routing | Can this subtask leave the main model? | choice + cost | ⏳ deferred (local-first) |
+
+**Deterministic by default.** Every thousands-per-session decision runs as plain
+code over signals CGX already has; a model call is added only where it pays for
+itself, behind a flag. **Probability gates stay off until calibrated** -- a local
+model's confidence is a ranking hint, not a gate, until a reliability curve is
+mined from trace history. On a local-first tool, **routing** and
+**trust-routing** largely collapse (nowhere cheaper to route, and local is the
+most private option), while context, cache, tools, and permissions become *more*
+valuable on a window-bound model.
+
+Opt-in pieces: `CGX_POLICY_MODE=enforce` (permissions) and
+`CGX_JEV_BASE_URL=...` (real constrained-choice logprobs from a llama.cpp
+`llama-server` / vLLM endpoint). Full write-up: [docs/jev.md](docs/jev.md) and
+[docs/jev-decision-provider.md](docs/jev-decision-provider.md).
 
 ---
 

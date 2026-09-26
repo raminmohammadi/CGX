@@ -209,6 +209,19 @@ class StaticSiteSkill(Skill):
                 broken.append(f"{ref} (referenced by {src_file})")
         return broken
 
+    def forbids_scaffold_path(self, path: str) -> bool:
+        """Veto build/framework files from deterministic scaffolding.
+
+        A build-less static site has no ``package.json`` / bundler config, so
+        the polyglot scaffolder must NOT inject one for this component --
+        otherwise it injects a file this skill's :meth:`validate_plan` then
+        rejects, and the Tech Lead loops until it fails. Mirrors the
+        ``_FRAMEWORK_FILES`` / ``_FRAMEWORK_EXTS`` the validator screens.
+        """
+        base = (path or "").replace("\\", "/").rsplit("/", 1)[-1].lower()
+        return base in _FRAMEWORK_FILES or (path or "").lower().endswith(
+            _FRAMEWORK_EXTS)
+
     def validate_plan(self, diffs: List[Dict[str, Any]],
                       goal: str = "") -> Optional[SkillVerdict]:
         paths = [p.lower() for p in file_paths(diffs)]

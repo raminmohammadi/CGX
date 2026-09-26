@@ -162,6 +162,29 @@ class ToolRegistry:
         if spec is None:
             return (f"Unknown tool: {call.name!r}. "
                     f"Available: {', '.join(self.names())}")
+        # Programmable content-inspecting policy (JEV #5): inspect the action's
+        # arguments/content, not just its static RiskLevel. A hard 'deny'
+        # (SSRF, ~/.ssh/.env, secret literal) refuses regardless of the human
+        # gate; in 'enforce' mode a clear read-only 'allow' skips the gate to
+        # cut prompts. Must never crash dispatch.
+        policy_allow = False
+        try:
+            from cgx.guardrails.command import (
+                HARD_DENY, evaluate_action, policy_mode)
+            mode = policy_mode()
+            if mode != "off":
+                scope = (ctx.extra.get("task_scope")
+                         if isinstance(ctx.extra, dict) else None)
+                pol = evaluate_action(spec.name, call.args, risk=spec.risk,
+                                      task_scope=scope)
+                if pol.verdict == "deny" and (pol.confidence >= HARD_DENY
+                                              or mode == "enforce"):
+                    logger.warning("policy denied %s: %s", spec.name, pol.reason)
+                    return (f"Tool call '{spec.name}' denied by policy: "
+                            f"{pol.reason}")
+                policy_allow = mode == "enforce" and pol.verdict == "allow"
+        except Exception:  # pragma: no cover - policy must never break dispatch
+            policy_allow = False
         # Prefer an explicit gate on the context; otherwise use the
         # context-local gate a front-end installed for this session (if any).
         gate = ctx.approval_gate
@@ -171,7 +194,7 @@ class ToolRegistry:
                 gate = current_gate()
             except Exception:  # pragma: no cover - approval module optional
                 gate = None
-        if gate is not None:
+        if gate is not None and not policy_allow:
             decision = gate.request(spec.name, call.args, spec.risk)
             if not decision.approved:
                 return (f"Tool call '{spec.name}' was not approved: "

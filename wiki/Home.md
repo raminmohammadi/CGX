@@ -34,7 +34,9 @@ Pick the path that matches what you need right now.
 | Script CGX from the terminal                  | **[[CLI Reference]]** |
 | Drive the multi-step agent                    | **[[Session Based Agent]]** |
 | Run the plan-driven multi-role build engine   | **[[Swarm Agent]]** |
+| Build a static website by describing it        | **[[Site Studio]]** |
 | Generate and auto-validate code changes       | **[[Self Testing Code Generation]]** |
+| Understand the typed decision layer            | **[[JEV]]** |
 | Teach CGX a new framework                     | **[[Skills Registry]]** |
 | Choose a provider / model for my hardware     | **[[Providers and Models]]** |
 | Tune retrieval, caching, or rate limits       | **[[Configuration and Tuning]]** |
@@ -80,6 +82,16 @@ Pick the path that matches what you need right now.
   build/test) — each stage propose-then-validate, with bounded auto-repair
   (AST import injection, contract renegotiation, semantic repair with a
   dynamic temperature ramp).
+- **JEV — typed decision layer.** The high-frequency per-turn choices (which
+  chunks to show, whether a command may run, which tool + arguments) are made
+  as **typed** decisions beside the model: a per-query context visibility
+  ladder, a `num_ctx` reuse-vs-rebuild guard, a content-inspecting permission
+  policy, tiered tool disclosure, and a file-sensitivity scorer. Deterministic
+  by default. See **[[JEV]]**.
+- **Site Studio.** Describe a website in plain English and CGX plans it, builds
+  a complete static HTML/CSS/JS site (no framework/build step), and renders it
+  **live** in a sandboxed preview — then refine it with feedback. See
+  **[[Site Studio]]**.
 - **Self-testing code generation.** Diffs are parsed, syntax-checked, and
   optionally run against impacted tests in a sandbox before you ever see
   them.
@@ -123,6 +135,8 @@ The wiki is the curated, navigable entry point. The in-repo `docs/` set
 holds the authoritative deep dives that individual wiki pages link into:
 
 - [`docs/architecture.md`](https://github.com/raminmohammadi/CGX/blob/main/docs/architecture.md) — full architecture reference
+- [`docs/jev.md`](https://github.com/raminmohammadi/CGX/blob/main/docs/jev.md) — the typed decision layer (JEV)
+- [`docs/site-studio.md`](https://github.com/raminmohammadi/CGX/blob/main/docs/site-studio.md) — describe-a-website builder
 - [`docs/mlops.md`](https://github.com/raminmohammadi/CGX/blob/main/docs/mlops.md) — production MLOps operator guide
 - [`docs/usage.md`](https://github.com/raminmohammadi/CGX/blob/main/docs/usage.md) — exhaustive usage guide
 - [`docs/Agent.md`](https://github.com/raminmohammadi/CGX/blob/main/docs/Agent.md) — session-agent internals

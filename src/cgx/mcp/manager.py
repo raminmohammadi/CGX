@@ -28,6 +28,31 @@ _SDK_HINT = ("The MCP SDK is not installed. Install it with "
 _TOOLS_CACHE: Dict[str, Tuple[str, float]] = {}
 _TOOLS_TTL = 300.0
 
+# Tiered disclosure (JEV #4): the model sees only tool names + descriptions
+# (Tier 1) until it picks one; the full argument schema is fetched on demand
+# (Tier 2, mcp_describe_tool) and re-checked before dispatch, so a wrong
+# argument type is an actionable error rather than a silent server failure.
+# {server -> {tool -> inputSchema}}, populated whenever a server is listed.
+_TOOL_SCHEMAS: Dict[str, Dict[str, Any]] = {}
+
+
+def _args_schema_violations(server: str, tool: str,
+                            arguments: Dict[str, Any]) -> List[str]:
+    """Best-effort validation of MCP call arguments against the cached schema.
+
+    Uses the same draft-07 subset validator the rest of CGX uses; unknown
+    JSON-Schema keywords are ignored (no false rejects). Empty list when no
+    object schema is known for the tool or the arguments conform.
+    """
+    schema = (_TOOL_SCHEMAS.get(server) or {}).get(tool)
+    if not isinstance(schema, dict) or schema.get("type") != "object":
+        return []
+    try:
+        from cgx.answer.schemas import validate_json_schema
+        return validate_json_schema(arguments, schema)
+    except Exception:  # pragma: no cover - validation is best-effort
+        return []
+
 
 def _have_sdk() -> bool:
     try:
@@ -85,6 +110,30 @@ def list_tools(args: Dict[str, Any], _ctx: Any) -> str:
     return result
 
 
+def describe_tool(args: Dict[str, Any], ctx: Any) -> str:
+    """Tier-2 disclosure: the JSON argument schema for ONE MCP tool, on demand.
+
+    The model sees only names + descriptions (Tier 1) until it picks a tool;
+    this returns that tool's full ``inputSchema`` so it can construct correct
+    arguments -- and :func:`call_tool` re-validates against it, so a wrong
+    argument type becomes an actionable error rather than a silent failure.
+    """
+    name = str(args.get("server") or "")
+    tool = str(args.get("tool") or "")
+    if not tool:
+        return "mcp_describe_tool requires a 'tool' name."
+    if name not in _TOOL_SCHEMAS:
+        # Populate the schema cache by listing the server's tools first.
+        list_tools({"server": name}, ctx)
+    schema = (_TOOL_SCHEMAS.get(name) or {}).get(tool)
+    if schema is None:
+        return (f"No schema for tool {tool!r} on server {name!r}. "
+                "Run mcp_list_tools first, or check the names.")
+    return (f"Argument schema for {name}/{tool}:\n"
+            + json.dumps(schema, indent=2)
+            + "\nConstruct 'arguments' to match, then call mcp_call.")
+
+
 def call_tool(args: Dict[str, Any], _ctx: Any) -> str:
     """Invoke ``tool`` on ``server`` with ``arguments`` (a dict)."""
     name = str(args.get("server") or "")
@@ -116,6 +165,12 @@ def call_tool(args: Dict[str, Any], _ctx: Any) -> str:
                         "CGX_FETCH_ALLOW_ANY to permit it.")
     except Exception:  # pragma: no cover - guardrail is best-effort
         pass
+    # Tier-2 arg validation against the cached inputSchema: a wrong argument
+    # type/shape is an actionable error, not a silent server failure (JEV #4).
+    violations = _args_schema_violations(name, tool, arguments)
+    if violations:
+        return (f"[INVALID ARGS] MCP {name}/{tool}: " + "; ".join(violations[:8])
+                + ". Call mcp_describe_tool to see the expected schema.")
     try:
         import asyncio
         result = asyncio.run(_call_tool_async(server, tool, arguments))
@@ -161,11 +216,18 @@ async def _list_tools_async(server: MCPServerConfig) -> str:
             await session.initialize()
             resp = await session.list_tools()
             tools = getattr(resp, "tools", []) or []
+            # Cache each tool's argument schema for Tier-2 disclosure +
+            # pre-dispatch validation, but keep the Tier-1 listing to
+            # names + descriptions so the prompt stays small.
+            _TOOL_SCHEMAS[server.name] = {
+                t.name: (getattr(t, "inputSchema", None) or {}) for t in tools}
             if not tools:
                 return f"{server.name}: (no tools)"
             lines = [f"- {t.name}: {getattr(t, 'description', '') or ''}"
                      for t in tools]
-            return f"Tools on {server.name}:\n" + "\n".join(lines)
+            return (f"Tools on {server.name}:\n" + "\n".join(lines)
+                    + "\n(Call mcp_describe_tool for a tool's argument schema "
+                    "before mcp_call.)")
 
 
 async def _call_tool_async(server: MCPServerConfig, tool: str,
@@ -200,6 +262,11 @@ def register_mcp_tools() -> None:
         arg_hint='{"server": "..."}',
         description="List the tools a named MCP server exposes.",
         handler=list_tools))
+    REGISTRY.register(ToolSpec(
+        name="mcp_describe_tool", risk=RiskLevel.LOW,
+        arg_hint='{"server": "...", "tool": "..."}',
+        description="Show one MCP tool's JSON argument schema (Tier-2, on demand).",
+        handler=describe_tool))
     REGISTRY.register(ToolSpec(
         name="mcp_call", risk=RiskLevel.HIGH,
         arg_hint='{"server": "...", "tool": "...", "arguments": {}}',

@@ -31,6 +31,10 @@ _SKILLS_HEADER = (
     "PROJECT SKILLS (user-authored guidance; apply the ones relevant to the "
     "question):"
 )
+_NOTES_HEADER = (
+    "DIRECTORY NOTES (footguns for the specific directories this task touches -- "
+    "follow them for files in those dirs):"
+)
 _TRUNC = "\n[... truncated ...]"
 
 
@@ -50,13 +54,17 @@ def build_instruction_preamble(
     *,
     surface: str = "chat",
     max_chars: int = 4000,
+    files_touched: Optional[List[str]] = None,
 ) -> str:
     """Return the composed ``CGX.md`` + active-skills preamble, or ``""``.
 
     ``surface`` is currently ``"chat"`` (conversational answering + read-only
     agent tasks). ``pinned_skills`` forces a specific skill set; when ``None``
     skills are keyword-detected from ``question`` (plus any ``always_on`` /
-    per-repo skills). Never raises -- a failure yields ``""``.
+    per-repo skills). ``files_touched`` (JEV conditional instructions) pulls in
+    per-directory ``GOTCHAS.md`` notes for exactly the dirs those files live in,
+    appended at the TAIL so the always-on CGX.md + skills prefix stays stable.
+    Never raises -- a failure yields ``""``.
     """
     if max_chars <= 0:
         return ""
@@ -84,7 +92,20 @@ def build_instruction_preamble(
     except Exception as e:  # noqa: BLE001
         logger.debug("instructions: skill composition failed: %s", e)
 
-    if not cgx_text and not skill_text:
+    # Conditional directory notes (JEV Section VIII): footguns for exactly the
+    # dirs this task touches. Loaded on its own small budget so it never eats
+    # the CGX.md/skills budget, and appended at the TAIL below.
+    notes_text = ""
+    if files_touched:
+        try:
+            from cgx.context_files import load_directory_notes
+            notes_text = load_directory_notes(
+                project_root, files_touched,
+                max_chars=min(1500, max(300, max_chars // 3)))
+        except Exception as e:  # noqa: BLE001
+            logger.debug("instructions: directory notes failed: %s", e)
+
+    if not cgx_text and not skill_text and not notes_text:
         return ""
 
     # Budget split: keep CGX.md primary (it is the always-on repo contract),
@@ -101,4 +122,6 @@ def build_instruction_preamble(
         parts.append(f"{_CGX_HEADER}\n{cgx_text}")
     if skill_text:
         parts.append(f"{_SKILLS_HEADER}\n{skill_text}")
+    if notes_text:
+        parts.append(f"{_NOTES_HEADER}\n{notes_text}")
     return "\n\n".join(parts)

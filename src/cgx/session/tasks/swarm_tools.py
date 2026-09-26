@@ -4,6 +4,7 @@ import json
 import logging
 from typing import Any, Dict
 
+from cgx.answer.context_map import load_records_by_id
 from cgx.pipeline.auto import run_query_auto
 from cgx.session.tasks.base import ExecutorDeps
 
@@ -23,16 +24,28 @@ def query_codebase(query: str, deps: ExecutorDeps) -> str:
             embedder=deps.provider, # Attempt to use the provider if it supports embeddings
             top_k_per_view=5
         )
-        # Format the result to a readable string for the LLM
+        # Format the result for the LLM. Retrieval hits carry only
+        # {chunk_id, score, rank, provenance} -- the file path is embedded in
+        # the chunk_id ("path::kind::symbol") and the body lives in records --
+        # so resolve both here instead of reading absent 'file'/'text' keys,
+        # which silently produced "File: unknown / Content snippet: (empty)".
         hits = result.get("hits", [])
         if not hits:
             return "No relevant files found."
-        
+
+        records = load_records_by_id(deps.records_path)
         output = []
         for hit in hits:
-            path = hit.get("file", "unknown")
-            text = hit.get("text", "")
-            output.append(f"File: {path}\nContent snippet:\n{text}\n---")
+            cid = str(hit.get("chunk_id") or "")
+            parts = cid.split("::")
+            path = parts[0] if parts and parts[0] else "unknown"
+            symbol = parts[2] if len(parts) > 2 else ""
+            rec = records.get(cid) or {}
+            body = str(rec.get("text") or rec.get("code")
+                       or rec.get("signature") or "").strip()
+            snippet = body[:800] if body else "(body unavailable)"
+            label = f"{path} :: {symbol}" if symbol else path
+            output.append(f"File: {label}\nContent snippet:\n{snippet}\n---")
         return "\n".join(output)
     except Exception as e:
         logger.exception("query_codebase failed")

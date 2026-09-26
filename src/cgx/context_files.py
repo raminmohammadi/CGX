@@ -30,11 +30,18 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "CONTEXT_FILE_CANDIDATES",
     "DEFAULT_CONTEXT_FILENAME",
+    "DIRECTORY_NOTES_FILENAME",
     "find_context_file",
     "load_project_context",
+    "load_directory_notes",
     "default_context_path",
     "clear_cache",
 ]
+
+#: Per-directory "footguns" file (JEV conditional instructions): loaded only
+#: when a task touches a file in (or under) that directory, so a rule that
+#: matters for ``billing/`` never costs context while working elsewhere.
+DIRECTORY_NOTES_FILENAME: str = "GOTCHAS.md"
 
 #: Search order, relative to the project root. First match wins.
 CONTEXT_FILE_CANDIDATES: Tuple[str, ...] = (
@@ -115,3 +122,86 @@ def load_project_context(project_root: Optional[str],
     if len(text) > max_chars:
         text = text[:max_chars].rstrip() + "\n\n[... context file truncated ...]"
     return text
+
+
+def load_directory_notes(
+    project_root: Optional[str],
+    files_touched,
+    *,
+    max_chars: int = 2000,
+    per_file_chars: int = 800,
+) -> str:
+    """Return concatenated ``GOTCHAS.md`` notes for the dirs a task touches, or ``""``.
+
+    JEV conditional instructions (Section VIII): instead of loading every rule
+    up front, a directory's footguns file is pulled in only when the task
+    touches a file in (or under) that directory. Notes are gathered
+    nearest-directory-first, mtime-cached, and bounded. Intended to be appended
+    at the TAIL of the instruction preamble so the always-on CGX.md + skills
+    prefix stays byte-identical across tasks (prompt-cache friendly). Fail-soft.
+    """
+    if not project_root or not files_touched:
+        return ""
+    try:
+        root = Path(project_root).resolve()
+    except (TypeError, ValueError, OSError):
+        return ""
+
+    ordered_dirs: list = []
+    seen_dirs: set = set()
+    for f in files_touched:
+        if not f:
+            continue
+        try:
+            raw = str(f)
+            p = (Path(raw) if os.path.isabs(raw) else root / raw).resolve()
+        except (ValueError, OSError):
+            continue
+        cur = p.parent if p.suffix else p
+        while True:
+            try:
+                cur.relative_to(root)
+            except ValueError:
+                break  # climbed out of the repo
+            if cur not in seen_dirs:
+                seen_dirs.add(cur)
+                ordered_dirs.append(cur)
+            if cur == root:
+                break
+            cur = cur.parent
+
+    parts: list = []
+    used = 0
+    for d in ordered_dirs:
+        gp = d / DIRECTORY_NOTES_FILENAME
+        key = os.path.realpath(str(gp))
+        try:
+            if not gp.is_file():
+                continue
+            mtime = gp.stat().st_mtime
+        except OSError:
+            continue
+        cached = _cache.get(key)
+        if cached is not None and cached[0] == mtime:
+            text = cached[1]
+        else:
+            try:
+                text = gp.read_text(encoding="utf-8", errors="replace")
+            except Exception:  # noqa: BLE001 - a bad notes file is skipped
+                continue
+            _cache[key] = (mtime, text)
+        text = text.strip()
+        if not text:
+            continue
+        if len(text) > per_file_chars:
+            text = text[:per_file_chars].rstrip() + " [...]"
+        try:
+            rel = d.relative_to(root).as_posix() or "."
+        except ValueError:  # pragma: no cover - guarded above
+            rel = str(d)
+        block = f"### {rel}/{DIRECTORY_NOTES_FILENAME}\n{text}"
+        if parts and used + len(block) > max_chars:
+            break
+        parts.append(block)
+        used += len(block)
+    return "\n\n".join(parts)
