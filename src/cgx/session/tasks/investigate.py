@@ -33,6 +33,7 @@ from cgx.session.tasks.base import (
     ExecutorDeps,
     ExecutorResult,
     register_executor,
+    session_skills,
 )
 
 logger = logging.getLogger(__name__)
@@ -62,6 +63,8 @@ def run_investigate(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             records_path=deps.records_path,
             question=question,
             provider=deps.provider,
+            project_root=deps.project_root,
+            skills=session_skills(task, deps),
         )
     except Exception as exc:
         logger.exception("INVESTIGATE: answer_with_llm crashed")

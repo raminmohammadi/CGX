@@ -747,6 +747,20 @@ def _get_system_prompt(mode: str) -> str:
     return SYSTEM_PROMPTS.get(mode, SYSTEM)
 
 
+def _with_preamble(base_system: str, prep: Dict[str, Any]) -> str:
+    """Append the user-instruction preamble (CGX.md + skills) to ``base_system``.
+
+    The preamble is built (and budget-reserved) once in
+    :func:`_prepare_answer_request` and carried on ``prep``; it is appended
+    *after* the base rules so the JSON/Markdown contract stays primary and
+    the project's own instructions read as an override layer on top.
+    """
+    pre = (prep or {}).get("instruction_preamble") or ""
+    if not pre:
+        return base_system
+    return f"{base_system}\n\n{pre}"
+
+
 # Streaming variants of the system prompts. JSON mode forces the whole
 # response to land as a single payload, which both delays first-token
 # emission and triggers the provider's read-timeout on slow local models.
@@ -881,6 +895,8 @@ def _prepare_answer_request(
     top_k: int = 20,
     hits: Optional[List[Dict[str, Any]]] = None,
     mode_override: Optional[str] = None,
+    project_root: Optional[str] = None,
+    skills: Optional[List[str]] = None,
 ) -> Tuple[str, Dict[str, Any]]:
     """Shared retrieval + prompt-context prep for sync and streaming answer paths.
 
@@ -1069,8 +1085,29 @@ def _prepare_answer_request(
         int(((h.get("provenance") or {}) if isinstance(h, dict) else {}).get("graph_depth", 0) or 0) >= 1
         for h in merged_hits
     )
+    # Resolve the project root up front (needed both for the CGX.md/skills
+    # preamble and the README lead below) and build the user-instruction
+    # block. Its length is subtracted from the SOURCES budget so injected
+    # instructions can never silently truncate retrieved citations on a
+    # small-``num_ctx`` local model.
+    root = project_root or _guess_root(indices)
+    instruction_preamble = ""
+    # ``clarify_paths`` renders from validated slots (see _answer_clarify_paths)
+    # and ignores the preamble, so building it there only wastes budget.
+    if mode != "clarify_paths":
+        try:
+            from cgx.answer.instructions import build_instruction_preamble
+            instruction_preamble = build_instruction_preamble(
+                root, question, skills, surface="chat")
+        except Exception as e:  # noqa: BLE001 - must never break answering
+            logger.debug("instruction preamble build failed: %s", e)
+
     from cgx.answer.model_caps import get_context_map_budget
     budget = get_context_map_budget(provider)
+    if instruction_preamble and isinstance(budget, dict) and budget.get("total_chars"):
+        reserve = len(instruction_preamble) + 200  # + headroom for framing
+        budget = {**budget,
+                  "total_chars": max(1200, int(budget["total_chars"]) - reserve)}
     if _has_neighbors:
         from cgx.answer.context_map import build_tiered_context, load_records_by_id
         sources = build_tiered_context(
@@ -1104,7 +1141,6 @@ def _prepare_answer_request(
                 "debug": {"mode": mode, "target_symbol": target, "sources": sources, "hits": merged_hits},
             }
 
-    root = _guess_root(indices)
     readme = _read_readme(root)
 
     context = "QUESTION:\n" + (question or "").strip() + "\n\n"
@@ -1138,6 +1174,7 @@ def _prepare_answer_request(
         "merged_hits": merged_hits,
         "root": root,
         "readme": readme,
+        "instruction_preamble": instruction_preamble,
     }
 
 
@@ -1522,6 +1559,8 @@ def answer_with_llm(
     top_k: int = 20,
     hits: Optional[List[Dict[str, Any]]] = None,
     mode_override: Optional[str] = None,
+    project_root: Optional[str] = None,
+    skills: Optional[List[str]] = None,
     **_ignored: Any,
 ) -> Dict[str, Any]:
     """
@@ -1529,12 +1568,16 @@ def answer_with_llm(
 
     ``mode_override`` lets the agent loop force a specific prompt mode
     (e.g. ``"clarify_paths"``) regardless of the question's surface form.
+    ``project_root`` / ``skills`` drive the user-instruction preamble
+    (CGX.md + active skills) prepended to the system prompt; both are
+    optional so callers that don't want instruction injection can omit them.
     Extra kwargs are accepted and ignored so task-level ``inputs`` dicts
     can carry agent-only hints (``goal``, …) without breaking the call.
     """
     kind, payload = _prepare_answer_request(
         index_dir, records_path, question, provider,
         top_k=top_k, hits=hits, mode_override=mode_override,
+        project_root=project_root, skills=skills,
     )
     if kind == "done":
         return payload
@@ -1558,7 +1601,8 @@ def answer_with_llm(
         return _answer_clarify_paths(prep, question, provider, root)
 
     messages = [
-        {"role": "system", "content": _get_system_prompt(mode)},
+        {"role": "system",
+         "content": _with_preamble(_get_system_prompt(mode), prep)},
         {"role": "user", "content": prep["context"]},
     ]
 
@@ -1638,6 +1682,8 @@ def answer_with_llm_stream(
     temperature: float = 0.2,
     max_tokens: Optional[int] = None,
     mode_override: Optional[str] = None,
+    project_root: Optional[str] = None,
+    skills: Optional[List[str]] = None,
     **_ignored: Any,
 ) -> Iterator[Tuple[str, Dict[str, Any]]]:
     """Stream the grounded answer as ``(event, data)`` tuples.
@@ -1655,6 +1701,7 @@ def answer_with_llm_stream(
     kind, payload = _prepare_answer_request(
         index_dir, records_path, question, provider,
         top_k=top_k, hits=hits, mode_override=mode_override,
+        project_root=project_root, skills=skills,
     )
     if kind == "done":
         yield "answer", payload
@@ -1669,7 +1716,8 @@ def answer_with_llm_stream(
     readme = prep["readme"]
 
     messages = [
-        {"role": "system", "content": _get_stream_system_prompt(mode)},
+        {"role": "system",
+         "content": _with_preamble(_get_stream_system_prompt(mode), prep)},
         {"role": "user", "content": prep["context"]},
     ]
 

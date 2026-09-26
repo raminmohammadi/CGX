@@ -30,9 +30,29 @@ from cgx.session.tasks.base import (
     ExecutorDeps,
     ExecutorResult,
     register_executor,
+    session_skills,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _recommend_system_prompt(task: TaskNode, deps: ExecutorDeps) -> str:
+    """``_SYSTEM_PROMPT`` plus the project's CGX.md/skills preamble (if any)."""
+    objective = ""
+    try:
+        if deps.store is not None:
+            session = deps.store.get_session(task.session_id)
+            objective = getattr(session, "original_objective", "") or ""
+    except Exception:  # noqa: BLE001
+        objective = ""
+    try:
+        from cgx.answer.instructions import build_instruction_preamble
+        pre = build_instruction_preamble(
+            deps.project_root, objective, session_skills(task, deps),
+            surface="chat")
+    except Exception:  # noqa: BLE001 - never block a recommendation
+        pre = ""
+    return f"{_SYSTEM_PROMPT}\n\n{pre}" if pre else _SYSTEM_PROMPT
 
 
 _ALLOWED_KINDS = {"investigate_more", "plan_change", "ask_followup", "done"}
@@ -78,7 +98,8 @@ def run_recommend(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     try:
         resp = deps.provider.chat(
             messages=[
-                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "system",
+                 "content": _recommend_system_prompt(task, deps)},
                 {"role": "user", "content": user_context},
             ],
             temperature=0.2,

@@ -364,6 +364,7 @@ def stream_ask(
             index_dir, records, question, prov,
             hits=hits, temperature=float(temperature),
             max_tokens=int(num_predict) if num_predict else None,
+            project_root=project_root,
         ):
             if cancel_event and cancel_event.is_set():
                 yield "cancelled", {"message": "Cancelled during answer"}

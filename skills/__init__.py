@@ -48,7 +48,12 @@ from skills.django import DjangoSkill
 from skills.express import ExpressSkill
 from skills.fastapi import FastAPISkill
 from skills.flask import FlaskSkill
-from skills.loader import load_custom_skills
+from skills.loader import (
+    load_custom_skills,
+    load_markdown_skills,
+    load_repo_markdown_skills,
+)
+from skills.markdown_skill import MarkdownSkill
 from skills.nextjs import NextJsSkill
 from skills.python_cli import PythonCliSkill
 from skills.react import ReactSkill
@@ -81,37 +86,73 @@ SKILLS: List[Skill] = [
 ]
 
 
-def _all_skills() -> List[Skill]:
-    """Built-in skills plus any user-authored custom skills.
+def _all_skills(project_root: Optional[str] = None) -> List[Skill]:
+    """Built-in skills plus every user-authored skill in scope.
 
-    Custom-skill loading fails soft to just the built-ins on any error
-    so a broken loader/directory never breaks detection or resolution.
+    Three user tiers merge on top of the built-ins:
+
+    * Python custom skills   (``~/.cgx/skills/*.py``)
+    * global markdown skills (``~/.cgx/skills/<name>/SKILL.md``)
+    * per-repo markdown skills (``<project_root>/.cgx/skills/``) -- only when
+      ``project_root`` is supplied.
+
+    Loading fails soft to just the built-ins on any error so a broken
+    loader/directory never breaks detection or resolution.
     """
     try:
-        return list(SKILLS) + load_custom_skills()
+        skills = list(SKILLS) + load_custom_skills() + load_markdown_skills()
     except Exception:
         return list(SKILLS)
+    if project_root:
+        try:
+            skills += load_repo_markdown_skills(project_root)
+        except Exception:
+            pass
+    return skills
 
 
-def describe_skills() -> List[Dict[str, Any]]:
-    """UI-facing listing: name/role/aliases/description/is_custom per skill."""
+def _skill_format(s: Skill, builtin_names: set) -> str:
+    """Classify a skill by its authoring format for the UI."""
+    if s.name in builtin_names:
+        return "builtin"
+    if isinstance(s, MarkdownSkill):
+        return "markdown"
+    return "python"
+
+
+def describe_skills(project_root: Optional[str] = None) -> List[Dict[str, Any]]:
+    """UI-facing listing of every skill in scope.
+
+    Each entry carries ``format`` (builtin/python/markdown), and, for
+    markdown skills, the ``surfaces`` it targets, whether it is ``always_on``
+    and its ``scope`` (global/repo) so the Skills tab can render all three
+    tiers side by side.
+    """
     builtin_names = {s.name for s in SKILLS}
-    return [
-        {
+    out: List[Dict[str, Any]] = []
+    for s in _all_skills(project_root):
+        fmt = _skill_format(s, builtin_names)
+        entry: Dict[str, Any] = {
             "name": s.name,
             "role": s.role,
             "aliases": list(s.aliases),
             "description": getattr(s, "description", ""),
             "is_custom": s.name not in builtin_names,
+            "format": fmt,
         }
-        for s in _all_skills()
-    ]
+        if fmt == "markdown":
+            entry["surfaces"] = list(getattr(s, "surfaces", ()))
+            entry["always_on"] = bool(getattr(s, "always_on", False))
+            entry["scope"] = getattr(s, "scope", "global")
+        out.append(entry)
+    return out
 
 
-def known_skill_names(exclude: Optional[str] = None) -> set:
+def known_skill_names(exclude: Optional[str] = None,
+                      project_root: Optional[str] = None) -> set:
     """Lower-cased set of every skill's name + aliases, for collision checks."""
     out: set = set()
-    for s in _all_skills():
+    for s in _all_skills(project_root):
         if s.name == exclude:
             continue
         out.add(s.name.lower())
@@ -129,10 +170,13 @@ def read_skill_source(name: str) -> Optional[str]:
     ones. Read-only either way -- editing/deleting is still restricted
     to custom skills at the route layer.
     """
-    from skills.loader import read_custom_skill_source
+    from skills.loader import read_custom_skill_source, read_markdown_skill_source
     custom = read_custom_skill_source(name)
     if custom is not None:
         return custom
+    md = read_markdown_skill_source(name)
+    if md is not None:
+        return md
     for s in SKILLS:
         if s.name == name:
             try:
@@ -144,23 +188,30 @@ def read_skill_source(name: str) -> Optional[str]:
 
 
 def detect_skills(goal: str,
-                  threshold: float = SKILL_DETECT_THRESHOLD) -> List[Skill]:
+                  threshold: float = SKILL_DETECT_THRESHOLD,
+                  project_root: Optional[str] = None) -> List[Skill]:
     """Return skills whose ``detect(goal)`` score meets ``threshold``.
 
-    Results are sorted by descending detection confidence so callers
-    that need a "primary" skill can take the head of the list.
+    Results are sorted by descending detection confidence, then by a
+    skill's ``priority`` (markdown skills only; default 0), so callers that
+    need a "primary" skill can take the head of the list. ``always_on``
+    markdown skills score 1.0 and therefore always lead. Pass
+    ``project_root`` to also consider per-repo markdown skills.
     """
+    pool = _all_skills(project_root)
     if not goal or not goal.strip():
-        return []
+        # always_on skills activate even for an empty goal (they are the
+        # scoped equivalent of an always-loaded CGX.md).
+        return [s for s in pool if getattr(s, "always_on", False)]
     scored: List[Tuple[Skill, float]] = []
-    for s in _all_skills():
+    for s in pool:
         try:
             score = float(s.detect(goal))
         except Exception:
             score = 0.0
         if score >= threshold:
             scored.append((s, score))
-    scored.sort(key=lambda x: -x[1])
+    scored.sort(key=lambda x: (-x[1], -int(getattr(x[0], "priority", 0))))
     return [s for s, _ in scored]
 
 
@@ -169,7 +220,8 @@ def skill_names(skills: List[Skill]) -> List[str]:
     return [s.name for s in skills]
 
 
-def skills_by_names(names: List[str]) -> List[Skill]:
+def skills_by_names(names: List[str],
+                    project_root: Optional[str] = None) -> List[Skill]:
     """Resolve a list of skill ``name`` strings to ``Skill`` instances.
 
     Unknown names are silently skipped so a stale ``task.inputs['skills']``
@@ -178,7 +230,7 @@ def skills_by_names(names: List[str]) -> List[Skill]:
     """
     if not names:
         return []
-    lookup: Dict[str, Skill] = {s.name: s for s in _all_skills()}
+    lookup: Dict[str, Skill] = {s.name: s for s in _all_skills(project_root)}
     out: List[Skill] = []
     for n in names:
         s = lookup.get(str(n).strip())
@@ -197,6 +249,22 @@ def compose_plan_prompt(skills: List[Skill]) -> str:
     """Join non-empty ``plan_system_prompt`` fragments with blank lines."""
     parts = [s.plan_system_prompt().strip() for s in skills]
     return "\n\n".join(p for p in parts if p)
+
+
+def compose_ask_prompt(skills: List[Skill]) -> str:
+    """Join non-empty ``ask_system_prompt`` fragments with blank lines.
+
+    Used to inject knowledge/house-style skills into conversational
+    surfaces (the Ask chatbot and read-only agent tasks). Each fragment is
+    headed by the skill name so a weak model can tell them apart.
+    """
+    parts: List[str] = []
+    for s in skills:
+        frag = s.ask_system_prompt().strip()
+        if frag:
+            name = getattr(s, "name", "") or "skill"
+            parts.append(f"### {name}\n{frag}")
+    return "\n\n".join(parts)
 
 
 def validate_scaffold(skills: List[Skill],
@@ -261,9 +329,11 @@ def validate_plan(skills: List[Skill],
 __all__ = [
     "SKILLS",
     "SKILL_DETECT_THRESHOLD",
+    "MarkdownSkill",
     "Skill",
     "SkillVerdict",
     "collect_scaffold_warnings",
+    "compose_ask_prompt",
     "compose_plan_prompt",
     "compose_scaffold_prompt",
     "describe_skills",
