@@ -166,3 +166,39 @@ def test_usage_route(monkeypatch):
 
     s = asyncio.run(_asgi(app, "GET", "/api/usage/summary"))
     assert json.loads(s["body"])["count"] == 1
+
+
+def test_governed_chat_stream_threads_force_json_regression():
+    """Regression: every provider's chat_stream (incl. the GovernedProvider
+    wrapper) takes a REQUIRED keyword-only ``force_json``. The plain-text
+    streaming callers (grounded answer, thought/sketch panels) once omitted it,
+    so a governed provider raised "missing 1 required keyword-only argument:
+    'force_json'" and the whole Ask stream died with nothing shown in the UI.
+    Prove the fixed call pattern streams and the old (bare) pattern still fails
+    fast so the drift can't silently return."""
+    import pytest
+    from cgx.governance.provider import govern
+
+    class _Stub:
+        stream_json_capable = False
+        model_name = "stub"
+
+        def chat(self, messages, temperature=0.2, max_tokens=None, force_json=False, **kw):
+            return {"content": "hi"}
+
+        def chat_stream(self, messages, temperature=0.2, max_tokens=None, *,
+                        force_json, **kw):
+            assert isinstance(force_json, bool)
+            for tok in ("hel", "lo"):
+                yield tok
+
+    gov = govern(_Stub())
+    msgs = [{"role": "user", "content": "x"}]
+
+    # Fixed call pattern (what the answer/thought/sketch streams now use).
+    assert list(gov.chat_stream(msgs, temperature=0.2, max_tokens=8,
+                                force_json=False)) == ["hel", "lo"]
+
+    # Old bare pattern must still error (guards against re-introducing the bug).
+    with pytest.raises(TypeError):
+        list(gov.chat_stream(msgs, temperature=0.2, max_tokens=8))

@@ -102,6 +102,16 @@ CGX ensures all data, embeddings, and executions remain strictly on your machine
   [docs/usage.md](docs/usage.md#skills-technology-aware-scaffolding)
   for the full table and [docs/architecture.md](docs/architecture.md#skills)
   for the protocol.
+- **Bring-your-own skills & project context.** Beyond the built-in
+  technology skills, you can author **markdown skills** (`SKILL.md` --
+  frontmatter + a plain instruction body) and a repo-level **`CGX.md`**
+  context file (CGX's `CLAUDE.md`). Both are consumed by the chatbot *and*
+  the agents, activate **deterministically** (keyword triggers / always-on /
+  an explicit pin -- no model-side selection, so small local models use them
+  reliably), and are size-capped so they never crowd out retrieved
+  citations. No code runs. Author them in the UI (**Agent → New Skill /
+  Context File**) or commit them to the repo. See
+  [docs/skills-and-context.md](docs/skills-and-context.md).
 - **Persistent chat sessions.** Conversations are saved as JSONL
   threads under `~/.cgx/sessions/`; resume them later from the
   Contextual Ask page's session sidebar.

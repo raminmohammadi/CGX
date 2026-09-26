@@ -190,16 +190,17 @@ def run_index_auto(
 
     # Truncation length for the embedder. Historically hard-coded to 256, which
     # silently clipped the tail of every function/class longer than ~256 tokens
-    # before it was ever embedded -- even though the model (jina v2 code)
-    # supports 8192 and EmbeddingConfig.max_length already defaults to it. Honour
-    # the configured value so long bodies embed in full; the cache key now
-    # includes it (see embed_with_cache) so a change re-embeds instead of
-    # serving clipped vectors.
-    try:
-        from cgx.config import EmbeddingConfig
-        embed_max_length = int(EmbeddingConfig().max_length)
-    except Exception:
-        embed_max_length = 8192
+    # Sequence length + batch size are auto-tuned to the machine's memory so a
+    # large-repo index can't OOM the box. The default code embedder uses O(L^2)
+    # attention, so (batch=64, max_length=8192) needed ~206 GB and froze laptops;
+    # resolve_embed_budget derives a safe pair from detected RAM/VRAM (unified vs
+    # dedicated) and honours explicit CGX_EMBED_MAXLEN / CGX_EMBED_BATCH. The
+    # cache key includes max_length (see embed_with_cache), so a change in the
+    # tuned length re-embeds rather than serving clipped/stale vectors.
+    from cgx.embeddings.autotune import resolve_embed_budget
+    _embed_budget = resolve_embed_budget()
+    embed_max_length = _embed_budget["max_length"]
+    embed_batch_size = _embed_budget["batch_size"]
 
     # Cache identity must reflect the ACTUAL embedder, not the declared
     # model_name string: a BYO encoder (tests, custom models) reusing the
@@ -259,7 +260,7 @@ def run_index_auto(
                         model_name=model_name,
                         backend="auto",
                         normalize=normalize,
-                        batch_size=batch_size,
+                        batch_size=embed_batch_size,
                         field_strategy="auto",
                         max_length=embed_max_length,
                         progress_cb=progress_cb,
@@ -279,7 +280,7 @@ def run_index_auto(
                 else:
                     embs = build_embeddings(
                         rows, model_name=model_name, backend="auto",
-                        normalize=normalize, batch_size=batch_size,
+                        normalize=normalize, batch_size=embed_batch_size,
                         field_strategy="auto", max_length=embed_max_length,
                         progress_cb=_make_progress_cb(view_name),
                     )
@@ -449,14 +450,14 @@ def run_query_auto(
             self.batch_size = batch_size
             self.normalize = normalize
             if max_length is None:
-                # Match the index-time truncation length (configurable) so a long
-                # query -- e.g. a pasted code snippet -- is not clipped to 256
-                # tokens while the documents it must match were embedded in full.
+                # Use the same hardware-tuned length the index was built with, so
+                # a long query (e.g. a pasted snippet) is embedded consistently
+                # and can't itself trigger an O(L^2) memory spike at query time.
                 try:
-                    from cgx.config import EmbeddingConfig
-                    max_length = int(EmbeddingConfig().max_length)
+                    from cgx.embeddings.autotune import resolve_embed_budget
+                    max_length = resolve_embed_budget()["max_length"]
                 except Exception:
-                    max_length = 8192
+                    max_length = 1024
             self.max_length = max_length
         def encode(self, texts: List[str]) -> np.ndarray:
             rows = [{"text": t} for t in texts]

@@ -108,6 +108,16 @@ class Skill(ABC):
         """Prompt fragment to add when planning a code change."""
         return ""
 
+    def ask_system_prompt(self) -> str:
+        """Prompt fragment to add on conversational surfaces.
+
+        Injected into the Ask/chat answering path and the read-only agent
+        tasks (investigate / recommend / clarify). Built-in technology
+        skills return ``""`` (they only shape codegen); markdown knowledge
+        skills use this to teach the chatbot domain rules / house style.
+        """
+        return ""
+
     # ---- Optional: post-generation validation ------------------------
     def validate_scaffold(self, diffs: List[Dict[str, Any]],
                           goal: str = "") -> Optional[SkillVerdict]:

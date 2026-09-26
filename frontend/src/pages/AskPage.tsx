@@ -75,12 +75,20 @@ export default function AskPage() {
         resetAsk();
         return;
       }
-      // Same session the store already holds -- possibly mid-stream after a tab
-      // switch, or the brand-new session send() just tagged before the server
-      // has persisted anything. Keep local state; the stream owns the store and
-      // a re-fetch here would blank the in-flight question + answer. This single
-      // check covers both the first-question self-switch and tab remounts.
-      if (useTasks.getState().ask.sessionId === selectedSessionId) return;
+      // Skip the re-fetch only when the store GENUINELY holds this session's
+      // conversation, or a stream is actively filling it:
+      //   * mid-stream after a tab switch (busy) -- the stream owns the store and
+      //     a re-fetch would blank the in-flight question + answer;
+      //   * already-loaded history (messages present) -- nothing to reload.
+      // But if the sessionId matches yet there are NO messages and nothing is
+      // streaming, the store is stale-empty -- the persisted store rehydrated
+      // without messages, or the (VS Code) webview reloaded and remounted us on
+      // a session whose answers live only on the server. The old guard returned
+      // here and left the panel blank forever even though /messages has the full
+      // thread; fall through and load it instead.
+      const cached = useTasks.getState().ask;
+      if (cached.sessionId === selectedSessionId
+          && (cached.messages.length > 0 || cached.busy)) return;
       // Genuine switch to a *different* session (sidebar click / new session).
       // Stop any stream still running for the previous session so its deltas
       // can't bleed into the one we're about to load, then fetch its history.

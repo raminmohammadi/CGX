@@ -344,7 +344,8 @@ def stream_ask(
         logger.info("stream_ask: streaming thought tokens")
         try:
             for delta in prov.chat_stream(messages, temperature=float(temperature),
-                                          max_tokens=min(int(num_predict), 512)):
+                                          max_tokens=min(int(num_predict), 512),
+                                          force_json=False):  # plain thought text
                 if cancel_event and cancel_event.is_set():
                     yield "cancelled", {"message": "Cancelled during thought"}
                     return
@@ -363,6 +364,7 @@ def stream_ask(
             index_dir, records, question, prov,
             hits=hits, temperature=float(temperature),
             max_tokens=int(num_predict) if num_predict else None,
+            project_root=project_root,
         ):
             if cancel_event and cancel_event.is_set():
                 yield "cancelled", {"message": "Cancelled during answer"}
@@ -449,7 +451,8 @@ def stream_plan(
     logger.info("stream_plan: streaming sketch thoughts")
     try:
         for delta in prov.chat_stream(sketch, temperature=float(temperature),
-                                      max_tokens=min(int(num_predict), 400)):
+                                      max_tokens=min(int(num_predict), 400),
+                                      force_json=False):  # plain sketch text
             if cancel_event and cancel_event.is_set():
                 yield "cancelled", {"message": "Cancelled during sketch"}
                 return

@@ -87,7 +87,12 @@ logger = get_logger(__name__)
 #     path is dropped from the posting stream (only the file stem is kept) to
 #     stop shared directory/machine tokens polluting every posting. v5 indices
 #     match only on symbol names and MUST be rebuilt to retrieve on content.
-SCHEMA_VERSION = 6
+# v7: Config / CI / infra ingestion. YAML/JSON/TOML/Dockerfile/etc. are now
+#     parsed into 'doc' chunks (cgx.parser.config_parser), so CI pipelines
+#     (bitbucket-pipelines.yml, .github/workflows/*), build config, and infra
+#     files become retrievable. v6 indices lack these files; rebuild to gain
+#     coverage of config/CI questions.
+SCHEMA_VERSION = 7
 
 
 # ---------------------------

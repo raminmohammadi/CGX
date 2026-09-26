@@ -25,12 +25,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
+from skills import markdown_skill as _md
 from skills.base import Skill
 
 logger = logging.getLogger(__name__)
 
 CONFIG_DIR = Path(os.environ.get("CGX_CONFIG_DIR", str(Path.home() / ".cgx")))
 CUSTOM_SKILLS_DIR = CONFIG_DIR / "skills"
+
+#: Per-repo skills live here, relative to a project root, so a team can
+#: commit shared skills alongside the code they describe.
+REPO_SKILLS_SUBDIR = os.path.join(".cgx", "skills")
 
 _PROBE_PATH = Path(__file__).resolve().parent / "_skill_probe.py"
 _PROBE_TIMEOUT_SECONDS = 8
@@ -246,3 +251,194 @@ def delete_custom_skill(name: str) -> bool:
         return False
     path.unlink()
     return True
+
+
+# ---------------------------------------------------------------------------
+# Markdown skills (SKILL.md) -- the code-free, Anthropic-style skill format.
+#
+# On disk, either form is accepted under a skills root:
+#     <root>/<name>/SKILL.md   (preferred; may sit beside references/, scripts/)
+#     <root>/<name>.md         (quick single-file skill)
+# The global root is CUSTOM_SKILLS_DIR (managed by the CRUD helpers below);
+# a per-repo root is <project_root>/.cgx/skills (discovered, not CRUD-managed).
+# ---------------------------------------------------------------------------
+
+
+def _safe_markdown_skill_dir(name: str) -> Path:
+    """Resolve the directory ``<name>/`` under :data:`CUSTOM_SKILLS_DIR`.
+
+    Reuses the Python-skill path-injection barrier (identifier allowlist +
+    realpath containment) so a hostile ``name`` cannot escape the skills dir.
+    """
+    if not _SKILL_NAME_RE.match(name or ""):
+        raise ValueError(f"invalid skill name: {name!r}")
+    base = os.path.realpath(str(CUSTOM_SKILLS_DIR))
+    candidate = os.path.realpath(os.path.join(base, name))
+    if not candidate.startswith(base + os.sep):
+        raise ValueError(f"invalid skill name: {name!r}")
+    return Path(candidate)
+
+
+def _markdown_skill_file(root: Path, name: str) -> Optional[Path]:
+    """Return the SKILL.md (dir form) or ``<name>.md`` (flat form), if present."""
+    dir_form = root / name / "SKILL.md"
+    if dir_form.is_file():
+        return dir_form
+    flat = root / f"{name}.md"
+    if flat.is_file():
+        return flat
+    return None
+
+
+def _iter_markdown_skill_files(root: Path):
+    """Yield ``(name, path)`` for every markdown skill directly under ``root``.
+
+    ``name`` is the on-disk directory/file stem; the loaded skill may adopt a
+    different ``name:`` from its frontmatter. References/ and scripts/ inside a
+    skill directory are intentionally not scanned.
+    """
+    if not root.exists():
+        return
+    try:
+        entries = sorted(root.iterdir())
+    except OSError:
+        return
+    for entry in entries:
+        try:
+            if entry.is_dir():
+                skill_md = entry / "SKILL.md"
+                if skill_md.is_file():
+                    yield entry.name, skill_md
+            elif entry.suffix.lower() == ".md" and entry.name != "SKILL.md":
+                yield entry.stem, entry
+        except OSError:
+            continue
+
+
+def _markdown_signature(root: Path) -> float:
+    files = [p for _, p in _iter_markdown_skill_files(root)]
+    return max((f.stat().st_mtime for f in files), default=0.0)
+
+
+# Memoized per resolved root path -> (signature, skills), mirroring the
+# Python-skill cache so per-task detect_skills() calls stay cheap.
+_md_cache: Dict[str, "tuple"] = {}
+
+
+def load_markdown_skills(root: Optional[Path] = None,
+                         scope: str = "global",
+                         force: bool = False) -> List[Skill]:
+    """Load every markdown skill under ``root`` (default: the global dir).
+
+    Fails soft per file: a skill that cannot be read/parsed is logged and
+    skipped, never raised, since this runs on the hot detection path.
+    """
+    base = Path(root) if root is not None else CUSTOM_SKILLS_DIR
+    key = os.path.realpath(str(base))
+    sig = _markdown_signature(base)
+    cached = _md_cache.get(key)
+    if not force and cached is not None and cached[0] == sig:
+        return list(cached[1])
+    out: List[Skill] = []
+    for name, path in _iter_markdown_skill_files(base):
+        try:
+            content = path.read_text(encoding="utf-8")
+            out.append(_md.from_source(
+                content, name_hint=name, scope=scope, source_path=str(path)))
+        except Exception as e:  # noqa: BLE001 - one bad skill must not break all
+            logger.warning("skills.loader: failed to load markdown skill %s: %s: %s",
+                           path, type(e).__name__, e)
+    _md_cache[key] = (sig, out)
+    return list(out)
+
+
+def load_repo_markdown_skills(project_root: str) -> List[Skill]:
+    """Load markdown skills committed under ``<project_root>/.cgx/skills``."""
+    if not project_root:
+        return []
+    root = Path(project_root) / ".cgx" / "skills"
+    return load_markdown_skills(root=root, scope="repo")
+
+
+def list_markdown_skill_names() -> List[str]:
+    """Names of global (CRUD-managed) markdown skills."""
+    return [name for name, _ in _iter_markdown_skill_files(CUSTOM_SKILLS_DIR)]
+
+
+def read_markdown_skill_source(name: str) -> Optional[str]:
+    """Return the raw ``SKILL.md`` text for a global markdown skill."""
+    try:
+        _safe_markdown_skill_dir(name)  # validate name shape only
+    except ValueError:
+        return None
+    path = _markdown_skill_file(CUSTOM_SKILLS_DIR, name)
+    if path is None:
+        return None
+    try:
+        return path.read_text(encoding="utf-8")
+    except Exception:
+        return None
+
+
+def validate_markdown_skill_source(content: str,
+                                   known_names: Set[str],
+                                   name_hint: str = "") -> SkillValidationResult:
+    """Validate a candidate ``SKILL.md`` before persisting it.
+
+    No code is executed -- markdown skills are parsed and checked statically,
+    so they are strictly safer than Python skills. ``known_names`` should
+    already be lower-cased.
+    """
+    ok, kind, detail, meta = _md.check_source(
+        content, name_hint=name_hint, known_names=known_names)
+    if not ok:
+        return SkillValidationResult(ok=False, error_kind=kind, error_detail=detail)
+    return SkillValidationResult(ok=True, meta=meta)
+
+
+def save_markdown_skill(name: str, content: str) -> None:
+    """Persist a global markdown skill at ``<dir>/<name>/SKILL.md`` (0600)."""
+    _ensure_dir()
+    skill_dir = _safe_markdown_skill_dir(name)
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(skill_dir, 0o700)
+    except OSError:
+        pass
+    # If a flat <name>.md exists, migrate to the canonical dir form.
+    flat = CUSTOM_SKILLS_DIR / f"{name}.md"
+    if flat.exists():
+        try:
+            flat.unlink()
+        except OSError:
+            pass
+    path = skill_dir / "SKILL.md"
+    path.write_text(content, encoding="utf-8")
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    _md_cache.pop(os.path.realpath(str(CUSTOM_SKILLS_DIR)), None)
+
+
+def delete_markdown_skill(name: str) -> bool:
+    """Delete a global markdown skill (dir form or flat form)."""
+    try:
+        skill_dir = _safe_markdown_skill_dir(name)
+    except ValueError:
+        return False
+    removed = False
+    if skill_dir.is_dir():
+        import shutil
+        shutil.rmtree(skill_dir, ignore_errors=True)
+        removed = True
+    flat = CUSTOM_SKILLS_DIR / f"{name}.md"
+    if flat.is_file():
+        try:
+            flat.unlink()
+            removed = True
+        except OSError:
+            pass
+    if removed:
+        _md_cache.pop(os.path.realpath(str(CUSTOM_SKILLS_DIR)), None)
+    return removed

@@ -61,11 +61,25 @@ export type SkillSummary = {
   aliases: string[];
   description: string;
   is_custom: boolean;
+  // "builtin" | "python" | "markdown"
+  format: "builtin" | "python" | "markdown";
+  surfaces: string[];
+  always_on: boolean;
+  scope: string;
 };
 
 export type SkillValidationError = {
   error_kind: string;
   error_detail: string;
+};
+
+export type ContextFile = {
+  project_root: string;
+  exists: boolean;
+  path: string;
+  filename: string;
+  content: string;
+  candidates: string[];
 };
 
 export type RunningModel = {
@@ -705,6 +719,34 @@ export const api = {
     jsonReq<SkillSummary>(`/api/skills/${encodeURIComponent(name)}`, "PUT", { source }),
   deleteSkill: (name: string) =>
     jsonReq<{ deleted: string }>(`/api/skills/${encodeURIComponent(name)}`, "DELETE"),
+
+  // Markdown (SKILL.md) skills -- the code-free format. Share the list /
+  // source / delete endpoints with Python skills; only create/update differ.
+  createMarkdownSkill: (content: string, name = "") =>
+    jsonReq<SkillSummary>("/api/skills/markdown", "POST", { content, name }),
+  updateMarkdownSkill: (name: string, content: string) =>
+    jsonReq<SkillSummary>(
+      `/api/skills/markdown/${encodeURIComponent(name)}`,
+      "PUT",
+      { content },
+    ),
+
+  // Repo-level CGX.md context file (the CLAUDE.md analogue).
+  getContextFile: (projectRoot: string) =>
+    jsonReq<ContextFile>(
+      `/api/context-file?project_root=${encodeURIComponent(projectRoot)}`,
+    ),
+  writeContextFile: (projectRoot: string, content: string) =>
+    jsonReq<{ path: string; filename: string; bytes: number }>(
+      "/api/context-file",
+      "PUT",
+      { project_root: projectRoot, content },
+    ),
+  deleteContextFile: (projectRoot: string) =>
+    jsonReq<{ deleted: string }>(
+      `/api/context-file?project_root=${encodeURIComponent(projectRoot)}`,
+      "DELETE",
+    ),
 
   pingProvider: (body: {
     kind: string;
