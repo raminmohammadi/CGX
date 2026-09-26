@@ -83,6 +83,14 @@ class LLMProvider:
     # fan out safely; a single local GPU (Ollama) does not, so intra-layer
     # scaffold parallelism defaults off here and only opts in per provider.
     parallel_scaffold_capable: bool = False
+
+    # Whether this endpoint returns per-token logprobs for a completion. Ollama
+    # does not; an OpenAI-compatible server (llama.cpp ``llama-server``, vLLM,
+    # LM Studio, OpenAI) does. The JEV decision layer prefers a provider with
+    # this set so an enum/bool decision can carry the TRUE constrained-choice
+    # probability instead of a self-reported field (JEV #2 calibration input).
+    supports_logprobs: bool = False
+
     def chat(
         self,
         messages: List[Dict[str, str]],
@@ -576,8 +584,13 @@ class OpenAICompatProvider(LLMProvider):
         max_retries: int = 3,
         endpoint_path: str = "/v1/chat/completions",
         allow_no_auth: bool = False,
+        supports_logprobs: bool = False,
     ) -> None:
         self.model = model
+        # Per-endpoint capability: a local llama.cpp llama-server / vLLM /
+        # LM Studio (or OpenAI) returns logprobs; set True to let JEV request
+        # and read the constrained-choice probability of a decision token.
+        self.supports_logprobs = bool(supports_logprobs)
         self.base_url = base_url.rstrip("/")
         self.endpoint_path = endpoint_path or "/v1/chat/completions"
         self.allow_no_auth = bool(allow_no_auth)
@@ -619,6 +632,14 @@ class OpenAICompatProvider(LLMProvider):
         # temperature/max_tokens regardless of internal engine defaults.
         if self.extra_options:
             body.update(self.extra_options)
+        # Constrained-choice logprobs for JEV typed decisions (opt-in per
+        # endpoint; ignored unless this server was flagged supports_logprobs).
+        if self.supports_logprobs and kwargs.get("logprobs"):
+            body["logprobs"] = True
+            try:
+                body["top_logprobs"] = int(kwargs.get("top_logprobs") or 5)
+            except (TypeError, ValueError):
+                body["top_logprobs"] = 5
 
         def _do_post(b: Dict[str, Any]):
             return request_with_retry(
@@ -665,17 +686,23 @@ class OpenAICompatProvider(LLMProvider):
 
         data = resp.json()
         content = ""
+        logprobs = None
         try:
-            content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
+            choice0 = (data.get("choices") or [{}])[0]
+            content = choice0.get("message", {}).get("content", "") or ""
+            logprobs = choice0.get("logprobs")
         except Exception:
             content = ""
 
-        return {
+        out: Dict[str, Any] = {
             "content": content,
             "provider": "openai-compat",
             "model": self.model,
             "raw": data,
         }
+        if logprobs:  # present only when this endpoint returned them
+            out["logprobs"] = logprobs
+        return out
 
     def chat_stream(
         self,

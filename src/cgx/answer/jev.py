@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Union
 
@@ -160,6 +161,33 @@ def _as_messages(
     return list(prompt)
 
 
+def decision_provider() -> Any:
+    """A logprob-capable LOCAL decision endpoint, or ``None``.
+
+    Built from ``CGX_JEV_BASE_URL`` -- a llama.cpp ``llama-server`` / vLLM /
+    LM Studio OpenAI-compatible endpoint (see docs/jev-decision-provider.md).
+    Ollama stays the default for chat; only JEV decisions called with
+    ``prefer_logprobs=True`` route here, so an enum/bool decision can carry a
+    true constrained-choice probability. Returns ``None`` when unset or
+    unbuildable -- :func:`decide` then falls back to the passed provider.
+    """
+    base = (os.environ.get("CGX_JEV_BASE_URL") or "").strip()
+    if not base:
+        return None
+    try:
+        from cgx.answer.providers import OpenAICompatProvider
+        return OpenAICompatProvider(
+            model=os.environ.get("CGX_JEV_MODEL") or "local",
+            base_url=base,
+            api_key=os.environ.get("CGX_JEV_API_KEY") or None,
+            allow_no_auth=True,
+            supports_logprobs=True,
+        )
+    except Exception:  # pragma: no cover - a misconfig must not break decisions
+        logger.debug("jev: decision provider build failed", exc_info=True)
+        return None
+
+
 def decide(
     provider: Any,
     prompt: Union[str, Messages],
@@ -186,6 +214,14 @@ def decide(
     Never raises on a provider/parse failure.
     """
     messages = _as_messages(prompt, system)
+
+    # A decision asking for logprobs prefers a logprob-capable local endpoint
+    # (llama-server / vLLM) when one is configured; otherwise it stays on the
+    # passed provider (e.g. Ollama) with a self-reported probability.
+    if prefer_logprobs and not getattr(provider, "supports_logprobs", False):
+        dp = decision_provider()
+        if dp is not None:
+            provider = dp
 
     def _call(msgs: Messages) -> Dict[str, Any]:
         kwargs: Dict[str, Any] = dict(
