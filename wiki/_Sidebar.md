@@ -12,6 +12,7 @@
 - [[CLI Reference]]
 - [[Session Based Agent]]
 - [[Swarm Agent]]
+- [[Site Studio]]
 - [[Self Testing Code Generation]]
 
 **Configure & extend**
@@ -25,6 +26,7 @@
 - [[MLOps and Production]]
 
 **Trust & internals**
+- [[JEV]]
 - [[Privacy and Security]]
 - [[Architecture]]
 - [[Contributing]]

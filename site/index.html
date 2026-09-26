@@ -40,6 +40,8 @@
       <a href="#retrieval" data-label="Retrieval"><span class="rail-dot"></span></a>
       <a href="#agent" data-label="Agent"><span class="rail-dot"></span></a>
       <a href="#swarm" data-label="Swarm"><span class="rail-dot"></span></a>
+      <a href="#jev" data-label="JEV"><span class="rail-dot"></span></a>
+      <a href="#studio" data-label="Site Studio"><span class="rail-dot"></span></a>
       <a href="#surfaces" data-label="Surfaces"><span class="rail-dot"></span></a>
       <a href="#ops" data-label="Ops"><span class="rail-dot"></span></a>
       <a href="#install" data-label="Install"><span class="rail-dot"></span></a>
@@ -67,6 +69,8 @@
           <a href="#retrieval">Retrieval</a>
           <a href="#agent">Agent</a>
           <a href="#swarm">Swarm</a>
+          <a href="#jev">JEV</a>
+          <a href="#studio">Site Studio</a>
           <a href="#surfaces">Surfaces</a>
           <a href="#ops">Ops</a>
           <a href="#trust">Trust</a>
@@ -620,6 +624,246 @@ flowchart LR
               suite under a hard ceiling. Deterministic invariants gate every stage.
             </figcaption>
           </figure>
+        </div>
+      </section>
+
+      <!-- ============================================================= jev -->
+      <section id="jev">
+        <div class="shell">
+          <div class="section-head">
+            <p class="eyebrow">The decision layer</p>
+            <h2>JEV — typed decisions, not a bigger prompt.</h2>
+            <p class="lede">
+              A coding agent is a loop around a model, and the leverage is not in the loop — it is in
+              <em>what the loop feeds the model each turn</em>. JEV is the layer that decides that: a fixed
+              question plus the current state go in, and a <strong>typed</strong> answer comes back — an
+              enum choice, a score, or a bool, each with a probability — so the harness can validate it,
+              apply a threshold, and branch <strong>deterministically</strong> instead of parsing prose. It
+              sits beside the model (<code class="inline">cgx.answer.jev.decide</code>); it never replaces
+              it. CGX already assembles context per query rather than accumulating a transcript, so it was
+              already most of the way here — JEV makes those per-turn choices explicit and typed.
+            </p>
+          </div>
+
+          <div class="table-wrap reveal">
+            <table>
+              <thead>
+                <tr>
+                  <th scope="col">Decision point</th>
+                  <th scope="col">Question to JEV</th>
+                  <th scope="col">Typed answer</th>
+                  <th scope="col">In CGX</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr><td>Context</td><td>How visible should this chunk be for this query?</td><td>hide / short / long / full</td><td><span class="pill pill-neon">shipped</span></td></tr>
+                <tr><td>Cache</td><td>Reuse the running context or rebuild it?</td><td>fits / trim (num_ctx)</td><td><span class="pill pill-neon">shipped</span></td></tr>
+                <tr><td>Tools</td><td>Which tool fits this intent, with what arguments?</td><td>schema on demand + validate</td><td><span class="pill pill-neon">shipped</span></td></tr>
+                <tr><td>Permissions</td><td>Should this command run?</td><td>allow / ask / deny + confidence</td><td><span class="pill pill-neon">shipped</span></td></tr>
+                <tr><td>Security</td><td>Which files will this task touch?</td><td>public / standard / restricted</td><td><span class="pill pill-neon">shipped</span></td></tr>
+                <tr><td>Routing</td><td>Can this subtask leave the main model?</td><td>choice + cost estimate</td><td><span class="pill">deferred</span></td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="section-head" style="margin-top: 2.75rem">
+            <p class="eyebrow">What ships today</p>
+            <h2 style="font-size: clamp(1.4rem, 3.2vw, 1.9rem)">Sharper context, safer actions — deterministic by default.</h2>
+          </div>
+
+          <div class="grid grid-3">
+            <article class="card reveal">
+              <span class="pill pill-neon">Context</span>
+              <h3>Visibility ladder</h3>
+              <p>
+                Every retrieved chunk is shown <code class="inline">full</code>,
+                <code class="inline">long</code>, <code class="inline">short</code>, or hidden — banded by
+                its relevance to <em>this</em> query, for <em>every</em> query. The top hit is always full;
+                weak matches collapse to a one-line signature stub or drop out. Since reading dominates the
+                token budget, spending a small window on the right chunks is the single biggest lever.
+              </p>
+            </article>
+            <article class="card reveal">
+              <span class="pill pill-neon">Cache</span>
+              <h3>num_ctx guard</h3>
+              <p>
+                Inside the agent's reasoning loops, the system + objective prefix is kept byte-identical
+                (so the local prompt cache stays warm) while the <em>oldest</em> tool observations are
+                elided before they overflow the window — so one large tool result can no longer silently
+                truncate the model's own reasoning off the tail.
+              </p>
+            </article>
+            <article class="card reveal">
+              <span class="pill pill-neon">Permissions</span>
+              <h3>Programmable policy</h3>
+              <p>
+                A command is judged by its <em>content</em>, not just its name: SSRF hosts,
+                <code class="inline">~/.ssh</code>/<code class="inline">.env</code>, secret-shaped
+                literals, and network egress in executed code are inspected before it runs, returning a
+                typed <code class="inline">allow</code> / <code class="inline">ask</code> /
+                <code class="inline">deny</code> + confidence. A shared file-sensitivity scorer supplies the
+                trust axis.
+              </p>
+            </article>
+            <article class="card reveal">
+              <span class="pill">Tools</span>
+              <h3>Tiered disclosure</h3>
+              <p>
+                The model sees one-line tool descriptions; it fetches a tool's full argument schema only
+                once it has picked that tool, and the harness validates the arguments against the schema
+                before the call. A wrong argument type becomes an actionable error, not a silent
+                server-side failure.
+              </p>
+            </article>
+            <article class="card reveal">
+              <span class="pill">Instructions</span>
+              <h3>Conditional context</h3>
+              <p>
+                A directory's <code class="inline">GOTCHAS.md</code> loads only when a task actually touches
+                a file in that directory, appended at the tail so the always-on
+                <code class="inline">CGX.md</code> prefix stays stable. Small-window models stop paying for
+                rules that don't apply to the work in front of them.
+              </p>
+            </article>
+            <article class="card reveal">
+              <span class="pill">Probability</span>
+              <h3>Real local logprobs</h3>
+              <p>
+                Point CGX at a llama.cpp <code class="inline">llama-server</code> / vLLM endpoint
+                (<code class="inline">CGX_JEV_BASE_URL</code>) and a typed decision carries the true
+                constrained-choice logprob instead of a self-reported number — the calibration input for
+                turning thresholds on. Ollama stays the default for everything else.
+              </p>
+            </article>
+          </div>
+
+          <ul class="checks reveal" style="margin-top: 1.5rem">
+              <li>
+                <strong>Deterministic by default.</strong> Every thousands-per-session decision runs as
+                plain code over signals CGX already has; a model call is added only where it clearly pays
+                for itself, behind a flag.
+              </li>
+              <li>
+                <strong>Probability gates stay off until calibrated.</strong> A local model's self-reported
+                confidence is uncalibrated, so it is treated as a ranking hint — never a gate — until a
+                reliability curve is mined from trace history.
+              </li>
+              <li>
+                <strong>Local-first re-frames routing.</strong> With one local model there is nowhere
+                cheaper to route, and local is already the most private option — so routing and
+                trust-routing largely collapse, while context, cache, tools and permissions become
+                <em>more</em> valuable on a window-bound model.
+              </li>
+              <li>
+                <strong>Reproducibility preserved.</strong> CGX stays plan-driven and replayable; any
+                model-answered decision is flagged and kept out of the determinism-critical paths.
+              </li>
+            </ul>
+
+            <figure class="reveal" style="margin-top: 2.5rem; text-align: center;">
+              <div class="mermaid">
+flowchart LR
+    S[State<br/>goal · context · rules · actions] --> J[JEV.decide<br/>typed answer + probability]
+    Q[Fixed question<br/>per decision point] --> J
+    J -->|validate · threshold| B[Harness branches<br/>deterministically]
+    B --> C[Context ladder<br/>hide / short / long / full]
+    B --> K[Reuse vs rebuild<br/>num_ctx]
+    B --> T[Tiered tools<br/>schema on demand]
+    B --> P[Permissions<br/>allow / ask / deny]
+
+    style J fill:#0b1220,stroke:#34d399,color:#fff
+    style S fill:#0b1220,stroke:#38bdf8,color:#fff
+    style Q fill:#0b1220,stroke:#38bdf8,color:#fff
+    style B fill:#0b1220,stroke:#f59e0b,color:#fff
+    style C fill:#0b1220,stroke:#a78bfa,color:#fff
+    style K fill:#0b1220,stroke:#a78bfa,color:#fff
+    style T fill:#0b1220,stroke:#a78bfa,color:#fff
+    style P fill:#0b1220,stroke:#a78bfa,color:#fff
+              </div>
+              <figcaption>
+                JEV sits beside the model: state + a fixed question in, a typed answer out, the harness
+                branches deterministically. The model still does the work.
+              </figcaption>
+            </figure>
+        </div>
+      </section>
+
+      <!-- ========================================================== studio -->
+      <section id="studio">
+        <div class="shell">
+          <div class="section-head">
+            <p class="eyebrow">Build → Site Studio</p>
+            <h2>Describe a website. Watch it build.</h2>
+            <p class="lede">
+              Site Studio (route <code class="inline">/studio</code>) turns a plain-English description into
+              a working static HTML/CSS/JS website, renders it live in a sandboxed preview beside the build,
+              and lets you refine it by giving feedback — all locally, on any model, small ones included. No
+              framework, no build step, no path to type: the folder is created for you under
+              <code class="inline">~/.cgx/sites/&lt;slug&gt;</code>, and the output is real files on disk.
+            </p>
+          </div>
+
+          <div class="pipeline-rail" aria-hidden="true"></div>
+          <div class="pipeline reveal">
+            <div class="stage">
+              <span class="stage-n">01</span>
+              <h4>Describe</h4>
+              <p>Name the site and say what it should contain — "a coffee-shop site with menu, story, hours and contact; dark and modern".</p>
+            </div>
+            <div class="stage">
+              <span class="stage-n">02</span>
+              <h4>Collaborate</h4>
+              <p>CGX asks a few clarifying questions and shows you the file plan to <strong>approve</strong> before it writes anything.</p>
+            </div>
+            <div class="stage">
+              <span class="stage-n">03</span>
+              <h4>Build</h4>
+              <p>A coherent multi-page site — <code class="inline">index.html</code> per route, one shared stylesheet and script, an identical header/footer, and links that resolve.</p>
+            </div>
+            <div class="stage">
+              <span class="stage-n">04</span>
+              <h4>Render</h4>
+              <p>The site appears in a sandboxed preview pane (desktop or mobile width), reloading each time files are written.</p>
+            </div>
+            <div class="stage">
+              <span class="stage-n">05</span>
+              <h4>Feedback</h4>
+              <p>"Make the header sticky", "add a pricing page" — CGX revises the files and the preview reloads. Repeat until it's right.</p>
+            </div>
+          </div>
+
+          <div class="grid grid-3" style="margin-top: 2.5rem">
+            <article class="card reveal">
+              <h3>The static_site skill keeps it honest</h3>
+              <p>
+                A built-in skill pins generation to a build-less, multi-page layout and <em>validates</em>
+                the result — requires an <code class="inline">index.html</code>, rejects stray framework /
+                build files (<code class="inline">package.json</code>, bundler configs), and resolves every
+                local <code class="inline">href</code>/<code class="inline">src</code> to a page that
+                actually exists. A failed check drives a targeted regenerate, so even a small local model
+                ships a real site instead of a broken React app.
+              </p>
+            </article>
+            <article class="card reveal">
+              <h3>Sandboxed, read-only preview</h3>
+              <p>
+                The preview is served read-only over a loopback route that refuses to leave the site's
+                folder and serves only web content, inside a sandboxed iframe
+                (<code class="inline">allow-scripts</code>, <em>not</em>
+                <code class="inline">allow-same-origin</code>) — generated JavaScript runs but is isolated
+                in its own origin and cannot touch the CGX app, its cookies, or its API.
+              </p>
+            </article>
+            <article class="card reveal">
+              <h3>Real files, your loop</h3>
+              <p>
+                Studio drives the normal greenfield agent loop with the skill pinned and plan-approval on,
+                so cancel, resume, and the task graph all apply. Rendering uses <em>your</em> browser — no
+                headless dependency. For framework sites (React / Vue / Next), use the Agent Loop with the
+                matching skill instead.
+              </p>
+            </article>
+          </div>
         </div>
       </section>
 
