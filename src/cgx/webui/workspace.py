@@ -21,6 +21,13 @@ _SLUG_STRIP_RE = re.compile(r"[^a-z0-9]+")
 _MAX_SLUG_LEN = 48
 
 
+def _validate_slug(slug: str) -> str:
+    """Validate a slug used as a single directory name component."""
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", slug or ""):
+        raise ValueError(f"invalid site slug: {slug!r}")
+    return slug
+
+
 def slugify(name: str) -> str:
     """Turn a human name into a safe, lower-kebab directory slug."""
     s = _SLUG_STRIP_RE.sub("-", (name or "").strip().lower()).strip("-")
@@ -39,18 +46,17 @@ def _sites_root_real() -> str:
 
 def site_path(slug: str) -> Path:
     """Resolve ``<sites>/<slug>`` with a containment guard (raises ValueError)."""
-    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", slug or ""):
-        raise ValueError(f"invalid site slug: {slug!r}")
+    safe_slug = _validate_slug(slug)
     base = _sites_root_real()
-    candidate = os.path.realpath(os.path.join(base, slug))
+    candidate = os.path.realpath(os.path.join(base, safe_slug))
     if candidate != base and not candidate.startswith(base + os.sep):
-        raise ValueError(f"invalid site slug: {slug!r}")
+        raise ValueError(f"invalid site slug: {safe_slug!r}")
     return Path(candidate)
 
 
 def create_site(name: str) -> Dict[str, str]:
     """Create (idempotently) a workspace for ``name`` and return its info."""
-    slug = slugify(name)
+    slug = _validate_slug(slugify(name))
     path = site_path(slug)
     path.mkdir(parents=True, exist_ok=True)
     return {"name": name or slug, "slug": slug, "project_root": str(path)}
