@@ -156,6 +156,21 @@ class Skill(ABC):
         """
         return []
 
+    # ---- Optional: veto deterministic scaffolding --------------------
+    def forbids_scaffold_path(self, path: str) -> bool:
+        """Return True if this skill forbids ``path`` from a plan's scaffolding.
+
+        The deterministic scaffolder (``ensure_scaffolding``) injects files the
+        model may not decline (README / dependency manifest / conftest). A skill
+        that governs a component with different rules -- e.g. the static-site
+        skill on a build-less frontend, which has no ``package.json`` -- vetoes
+        the offending file here so the scaffolder never injects something the
+        skill's :meth:`validate_plan` would then reject. Without this, the
+        injector and the validator contradict and the Tech Lead loops
+        inject-then-reject until it gives up. Default: forbid nothing.
+        """
+        return False
+
     # ---- Convenience helpers -----------------------------------------
     def __repr__(self) -> str:  # pragma: no cover - trivial
         return f"<Skill {self.name!r} role={self.role}>"

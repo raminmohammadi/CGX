@@ -276,6 +276,18 @@ def _auto_repair_plan_dependencies(plan: Dict[str, Any]) -> Dict[str, Any]:
     return plan
 
 
+def _rejection_stalled(history: List[frozenset]) -> bool:
+    """True when the two most recent rejections are identical.
+
+    A correction that produces the SAME set of problems again means the model
+    could not act on it -- almost always because the blocker is deterministic
+    (a plan gate or scaffolding rule contradicting an active skill), not a
+    model mistake. The caller stops retrying and surfaces a diagnostic instead
+    of exhausting attempts and reporting a generic failure.
+    """
+    return len(history) >= 2 and history[-1] == history[-2]
+
+
 @register_executor(TaskKind.SWARM_TECH_LEAD)
 def swarm_tech_lead(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     """Author, validate, and persist the swarm WORK_PLAN."""
@@ -321,6 +333,28 @@ def swarm_tech_lead(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     plan: Dict[str, Any] = {}
     paths: List[str] = []
     problems: List[str] = []
+    problem_history: List[frozenset] = []
+    stalled = False
+
+    def _reject(probs: List[str]) -> bool:
+        """Record a rejection; return True if the loop should STOP early.
+
+        Sets the corrective ``correction`` and emits the ``plan_rejected``
+        beat. When the same rejection repeats (see :func:`_rejection_stalled`)
+        it emits ``plan_stalled`` and returns True so the caller breaks rather
+        than blaming the model for a constraint it cannot satisfy.
+        """
+        nonlocal correction, stalled
+        correction = "; ".join(probs)
+        problem_history.append(frozenset(probs))
+        if _rejection_stalled(problem_history):
+            stalled = True
+            swarm_beat(project_root, "tech_lead", "plan_stalled",
+                       attempt=attempt, problems=probs)
+            return True
+        swarm_beat(project_root, "tech_lead", "plan_rejected",
+                   attempt=attempt, problems=probs)
+        return False
 
     is_debate = deps.extra.get("multi_agent_debate", False)
     
@@ -355,32 +389,32 @@ def swarm_tech_lead(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         # call are appended, so a weak model dropping either can no longer ship
         # an untested tree or abort planning over missing boilerplate. Coverage
         # runs first so the manifest the scaffolding scans includes the tests.
-        plan = ensure_scaffolding(ensure_test_coverage(normalize_plan(draft)))
+        plan = ensure_scaffolding(
+            ensure_test_coverage(normalize_plan(draft)), skills=active_skills)
         plan = _auto_repair_plan_dependencies(plan)
         paths = ordered_paths(plan)
         swarm_beat(project_root, "tech_lead", "normalize",
                    attempt=attempt, file_count=len(paths))
         if not paths:
             problems = ["the plan listed no valid files"]
-            correction = problems[0]
+            if _reject(problems):
+                break
             continue
         # Propose-then-validate: a plan that could not build coherently
         # (unsafe paths, mixed rooting, a dependency cycle, an orphan test)
         # is re-asked with the exact problems before any Developer is spawned.
         problems = verify_plan(plan)
         if problems:
-            correction = "; ".join(problems)
-            swarm_beat(project_root, "tech_lead", "plan_rejected",
-                       attempt=attempt, problems=problems)
+            if _reject(problems):
+                break
             continue
         # Anti-template-copy: a plan that left the schema's <placeholder> names
         # in real file/symbol slots is re-asked before any Developer is spawned
         # (domain-agnostic; no per-example tokens).
         problems = _template_copy_problems(plan)
         if problems:
-            correction = "; ".join(problems)
-            swarm_beat(project_root, "tech_lead", "plan_rejected",
-                       attempt=attempt, problems=problems)
+            if _reject(problems):
+                break
             continue
         # Framework-level validation: a skill can veto a plan that omits what
         # the stack requires (e.g. the React skill flags a plan with no
@@ -389,9 +423,8 @@ def swarm_tech_lead(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
                                 goal)
         if verdict is not None and not verdict.passed:
             problems = [f"{verdict.skill or 'skill'}: {verdict.rationale}"]
-            correction = "; ".join(problems)
-            swarm_beat(project_root, "tech_lead", "plan_rejected",
-                       attempt=attempt, problems=problems)
+            if _reject(problems):
+                break
             continue
         break
 
@@ -400,11 +433,19 @@ def swarm_tech_lead(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         # ends the session FAILED rather than spawning an empty Developer
         # chain. (A hard failure would also work, but this keeps the
         # partial plan visible for debugging.)
-        swarm_beat(project_root, "tech_lead", "report", ok=False,
-                   reason=correction or "no buildable plan")
+        reason = correction or "Tech Lead could not produce a buildable plan."
+        if stalled:
+            # The correction never changed the outcome -> the blocker is not
+            # something the model can fix. Surface an actionable diagnosis
+            # instead of a generic "no buildable plan".
+            reason = ("Tech Lead could not converge: the same rejection "
+                      "survived a correction, so the blocker is not something "
+                      "the model can fix (most likely a deterministic "
+                      "scaffolding rule conflicting with an active skill). "
+                      "Details: " + correction)
+        swarm_beat(project_root, "tech_lead", "report", ok=False, reason=reason)
         return ExecutorResult(
-            outputs={"file_count": 0, "reason": correction
-                     or "Tech Lead could not produce a buildable plan."})
+            outputs={"file_count": 0, "reason": reason, "stalled": stalled})
 
     # Ground every DECLARED third-party dependency against its real package
     # registry (PyPI / npm) so the Developer implements against real metadata

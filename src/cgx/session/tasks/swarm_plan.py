@@ -45,14 +45,30 @@ _SOURCE_EXT = (".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java")
 # test convention, so these drive which scaffolding a plan must ship.
 _PY_EXT = (".py",)
 _JS_EXT = (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".vue")
+# JS/TS extensions that imply a build/framework toolchain (JSX, TS, single-file
+# components), i.e. a real Node component that needs a package.json. A plain
+# browser <script> file (.js/.mjs/.cjs) with NO manifest is not a Node project:
+# a build-less static site legitimately ships vanilla scripts, and treating
+# them as "node" forces a package.json the static_site skill then rejects --
+# an unwinnable inject-then-reject loop in the Tech Lead planner.
+_JS_BUILD_EXT = (".jsx", ".ts", ".tsx", ".vue", ".svelte")
 
 
 def _langs_present(plan: Dict[str, Any]) -> Dict[str, bool]:
-    """Which ecosystems the plan's non-test source files belong to."""
+    """Which ecosystems the plan's non-test source files belong to.
+
+    ``node`` requires a real build signal -- a framework/TS source
+    (:data:`_JS_BUILD_EXT`) or a JS manifest/config already declared in the plan
+    (:data:`_JS_MANIFESTS`). A vanilla ``.js`` alone is a build-less browser
+    script, not a Node project, so it never pulls in a ``package.json``.
+    """
     srcs = _source_paths(plan)
+    bases = {(f.get("path") or "").replace("\\", "/").rsplit("/", 1)[-1].lower()
+             for f in _flatten_files(plan)}
+    has_js_manifest = bool(bases & set(_JS_MANIFESTS))
     return {
         "python": any(p.endswith(_PY_EXT) for p in srcs),
-        "node": any(p.endswith(_JS_EXT) for p in srcs),
+        "node": any(p.endswith(_JS_BUILD_EXT) for p in srcs) or has_js_manifest,
     }
 
 
@@ -295,7 +311,19 @@ def _colocate_js_manifests(plan: Dict[str, Any]) -> Dict[str, Any]:
     return {**plan, "layers": layers} if changed else plan
 
 
-def ensure_scaffolding(plan: Dict[str, Any]) -> Dict[str, Any]:
+def _skill_forbids(skills: Optional[List[Any]], path: str) -> bool:
+    """True if any active skill vetoes ``path`` from deterministic scaffolding."""
+    for s in skills or []:
+        try:
+            if s.forbids_scaffold_path(path):
+                return True
+        except Exception:  # pragma: no cover - a skill must not break scaffolding
+            continue
+    return False
+
+
+def ensure_scaffolding(plan: Dict[str, Any], *,
+                       skills: Optional[List[Any]] = None) -> Dict[str, Any]:
     """Inject any missing README / dependency manifest / conftest into the plan.
 
     Structural completeness is a deterministic guarantee, not a request the
@@ -308,6 +336,12 @@ def ensure_scaffolding(plan: Dict[str, Any]) -> Dict[str, Any]:
     ``README.md``), so the plan only has to declare them. ``README.md`` and
     ``requirements.txt`` depend on every planned ``.py`` file so they are
     generated last, after the sources they describe and scan exist on disk.
+
+    ``skills`` (the plan's active skills) may veto an injected file: a skill
+    that governs a component with different rules -- e.g. the static-site skill
+    on a build-less frontend, which forbids ``package.json`` -- filters it out
+    so the injector never adds a file that skill's ``validate_plan`` then
+    rejects (which would loop the Tech Lead inject-then-reject until failure).
     """
     # Co-locate the JS manifest/config with its component root *before*
     # inspecting the plan, so a manifest the model stranded at the repo root
@@ -360,6 +394,12 @@ def ensure_scaffolding(plan: Dict[str, Any]) -> Dict[str, Any]:
                             "and how to run the tests."),
             "depends_on": list(py_paths) + list(js_paths)})
 
+    if injected and skills:
+        # An active skill can veto an injected file (e.g. static_site forbids a
+        # package.json). Filter here so the scaffolder never adds a file the
+        # skill's validator would then reject.
+        injected = [f for f in injected
+                    if not _skill_forbids(skills, f.get("path") or "")]
     if injected:
         layers = list(plan.get("layers") or [])
         layers = layers + [{"name": "scaffolding", "files": injected}]
