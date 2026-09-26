@@ -133,3 +133,23 @@ def test_validate_plan_rejects_package_json(skill):
 def test_scaffold_warning_when_no_css(skill):
     warns = skill.scaffold_warnings([_diff("index.html")])
     assert warns and warns[0].severity == "warning"
+
+
+# --- greenfield generation gating -----------------------------------------
+
+def test_static_site_skips_mandatory_test_file_injection():
+    """A build-less static site must NOT get a pytest/Vitest file injected."""
+    from cgx.answer.engine import _inject_required_test_file
+
+    layers = [{"name": "site", "files": [
+        {"path": "index.html"}, {"path": "css/style.css"}, {"path": "js/script.js"},
+    ]}]
+    # Without the static-site flag the .js triggers a JS test-file injection...
+    injected = _inject_required_test_file(list(layers), goal="html site")
+    all_paths = [f["path"] for lyr in injected for f in lyr.get("files", [])]
+    assert any("test" in p.lower() for p in all_paths)
+    # ...but with static_site=True nothing is added.
+    kept = _inject_required_test_file(list(layers), goal="html site",
+                                      static_site=True)
+    kept_paths = [f["path"] for lyr in kept for f in lyr.get("files", [])]
+    assert not any("test" in p.lower() for p in kept_paths)
