@@ -30,11 +30,14 @@ _MAX_BYTES = 15 * 1024 * 1024
 
 def serve_web_file(root_real: str, rel_path: str) -> Response:
     """Serve ``root_real/rel_path`` (defaulting to index.html) safely."""
+    root = os.path.realpath(root_real)
+    if not os.path.isdir(root):
+        raise HTTPException(status_code=404, detail="site root not found")
     rel = (rel_path or "").strip()
     if not rel or rel.endswith("/"):
         rel = (rel + "index.html").lstrip("/")
-    candidate = os.path.realpath(os.path.join(root_real, rel))
-    if not (candidate == root_real or candidate.startswith(root_real + os.sep)):
+    candidate = os.path.realpath(os.path.join(root, rel))
+    if not (candidate == root or candidate.startswith(root + os.sep)):
         raise HTTPException(status_code=403, detail="path escapes site root")
     ext = os.path.splitext(candidate)[1].lower()
     if ext not in PREVIEW_ALLOWED_EXT:
