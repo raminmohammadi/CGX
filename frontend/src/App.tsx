@@ -8,6 +8,7 @@ const OverviewPage = lazy(() => import("./pages/OverviewPage"));
 const AskPage = lazy(() => import("./pages/AskPage"));
 const PlanPage = lazy(() => import("./pages/PlanPage"));
 const AgentPage = lazy(() => import("./pages/AgentPage"));
+const SiteStudioPage = lazy(() => import("./pages/SiteStudioPage"));
 const IndexPage = lazy(() => import("./pages/IndexPage"));
 const OpsPage = lazy(() => import("./pages/OpsPage"));
 const ActivityPage = lazy(() => import("./pages/ActivityPage"));
@@ -58,6 +59,14 @@ export default function App() {
           element={
             <Suspense fallback={<RouteFallback />}>
               <AgentPage />
+            </Suspense>
+          }
+        />
+        <Route
+          path="/studio"
+          element={
+            <Suspense fallback={<RouteFallback />}>
+              <SiteStudioPage />
             </Suspense>
           }
         />

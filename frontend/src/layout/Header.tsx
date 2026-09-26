@@ -25,6 +25,7 @@ const PAGE_TITLES: Record<string, string> = {
   "/ask": "Ask",
   "/plan": "Plan",
   "/agent": "Agent",
+  "/studio": "Site Studio",
   "/index": "Index",
   "/settings": "Settings",
 };

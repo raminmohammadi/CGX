@@ -82,6 +82,13 @@ export type ContextFile = {
   candidates: string[];
 };
 
+export type SiteInfo = {
+  slug: string;
+  project_root: string;
+  has_index: boolean;
+  modified: number;
+};
+
 export type RunningModel = {
   name: string;
   model?: string;
@@ -822,6 +829,18 @@ export const api = {
   // the native ``EventSource`` (GET); the dev proxy forwards /api to :8765.
   agentSessionEventsUrl: (sid: string) =>
     `/api/agent-session/${encodeURIComponent(sid)}/events`,
+
+  // Same-origin URL that serves a session's generated site files (read-only,
+  // web-content only). Rendered inside a sandboxed iframe by the Site Studio.
+  agentSessionPreviewUrl: (sid: string, path = "") => {
+    const rel = path.replace(/^\/+/, "");
+    return `/api/agent-session/${encodeURIComponent(sid)}/preview${rel ? `/${rel}` : ""}`;
+  },
+
+  // Managed site workspaces (~/.cgx/sites/<slug>) for the Site Studio.
+  listSites: () => jsonReq<SiteInfo[]>("/api/sites"),
+  createSite: (name: string) =>
+    jsonReq<SiteInfo>("/api/sites", "POST", { name }),
   agentSessionCancel: (sid: string) =>
     jsonReq<AgentSessionState>(
       `/api/agent-session/${encodeURIComponent(sid)}/cancel`,
