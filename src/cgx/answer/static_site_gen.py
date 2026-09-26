@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -106,26 +106,32 @@ def generate_site(
     provider: Any,
     *,
     flavor: str = "modern",
+    theme_key: Optional[str] = None,
     current_html: Optional[str] = None,
     feedback: Optional[str] = None,
     max_tokens: int = DEFAULT_MAX_TOKENS,
 ) -> str:
     """Return a complete self-contained ``index.html`` for ``brief``.
 
-    In *revise* mode (``current_html`` + ``feedback`` given) the current
-    document is edited per the feedback and the full updated document is
-    returned. Raises ``ValueError`` if the model returns nothing usable.
+    Generation is constrained to a curated design theme (selected from the
+    brief, or ``theme_key``) so the palette/fonts are professional rather than
+    model-improvised. In *revise* mode (``current_html`` + ``feedback``) the
+    document is edited per the feedback, keeping the same theme. Raises
+    ``ValueError`` if the model returns nothing usable.
     """
+    from cgx.answer.web_themes import select_theme, theme_prompt_block
+    theme = select_theme(brief or (feedback or ""), theme_key)
+    theme_block = theme_prompt_block(theme)
     style = FLAVOR_STYLE.get(flavor, FLAVOR_STYLE["modern"])
     if current_html and feedback:
-        system = f"{_REVISE_RULES}\n{style}"
+        system = f"{_REVISE_RULES}\n{style}\n\n{theme_block}"
         user = (
             f"CURRENT index.html:\n{current_html}\n\n"
             f"REQUESTED CHANGE:\n{feedback}\n\n"
             "Return the full updated index.html."
         )
     else:
-        system = f"{_BASE_RULES}{style}"
+        system = f"{_BASE_RULES}{style}\n\n{theme_block}"
         user = f"Build the website for: {brief.strip()}."
 
     resp = provider.chat(
@@ -136,4 +142,75 @@ def generate_site(
     html = _strip_fences(resp.get("content") if isinstance(resp, dict) else "")
     if "<" not in html or "html" not in html.lower():
         raise ValueError("model did not return an HTML document")
+    return html
+
+
+# ---------------------------------------------------------------------------
+# Agentic design critique -> self-repair. A one-shot ships its first draft;
+# the agent reviews its own output against a rubric and revises until it
+# passes (bounded). Text-only for now (no headless browser to screenshot);
+# a vision model on a rendered screenshot is the future upgrade.
+# ---------------------------------------------------------------------------
+
+_CRITIC_SYSTEM = (
+    "You are a strict senior design reviewer. You are given an HTML document "
+    "and the design theme it MUST follow. Judge whether the page looks "
+    "professionally designed and actually uses the theme. Check for these "
+    "common AI failure modes:\n"
+    "- Low-contrast / invisible text (light-on-light, dark-on-dark).\n"
+    "- Bland: not using the theme palette (--primary/--accent), default look, "
+    "gray-on-white.\n"
+    "- Weak hierarchy / not using the theme fonts.\n"
+    "- Empty voids / thin content / too few sections.\n"
+    "- A hero with no designed background (should use the theme gradient).\n"
+    "- Missing hover/spacing polish.\n"
+    "Reply with EITHER the single word PASS (if it is genuinely well-designed "
+    "and on-theme), OR up to 6 short, SPECIFIC, actionable fixes as plain "
+    "lines (no numbering, no prose)."
+)
+
+
+def critique_site(html: str, theme: Any, provider: Any) -> List[str]:
+    """Return a list of specific design fixes, or ``[]`` when it passes."""
+    try:
+        from cgx.answer.web_themes import theme_prompt_block
+        resp = provider.chat(
+            messages=[{"role": "system", "content": _CRITIC_SYSTEM},
+                      {"role": "user", "content":
+                       f"THEME:\n{theme_prompt_block(theme)}\n\nHTML:\n{html}"}],
+            temperature=0.0, force_json=False, max_tokens=600)
+        text = (resp.get("content") if isinstance(resp, dict) else "") or ""
+    except Exception as e:  # noqa: BLE001
+        logger.debug("design critique failed: %s", e)
+        return []
+    if text.strip().upper().startswith("PASS"):
+        return []
+    fixes: List[str] = []
+    for ln in text.splitlines():
+        s = ln.strip().lstrip("-*•0123456789. ").strip()
+        if len(s) > 4:
+            fixes.append(s)
+    return fixes[:6]
+
+
+def refine_site(
+    html: str, provider: Any, *, flavor: str = "modern",
+    theme_key: Optional[str] = None, rounds: int = 1,
+) -> str:
+    """Critique the page and self-repair design issues (bounded rounds)."""
+    from cgx.answer.web_themes import select_theme
+    theme = select_theme("", theme_key) if theme_key else select_theme(html[:400])
+    for _ in range(max(0, rounds)):
+        fixes = critique_site(html, theme, provider)
+        if not fixes:
+            break
+        feedback = ("A design review flagged these issues -- fix ALL of them "
+                    "while keeping the theme and everything that works:\n- "
+                    + "\n- ".join(fixes))
+        try:
+            html = generate_site("", provider, flavor=flavor,
+                                 theme_key=theme.key, current_html=html,
+                                 feedback=feedback)
+        except ValueError:
+            break
     return html

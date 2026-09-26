@@ -19,7 +19,7 @@ from typing import List
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import Response
 
-from cgx.answer.static_site_gen import generate_site
+from cgx.answer.static_site_gen import generate_site, refine_site
 from cgx.webui import workspace
 from cgx.webui.helpers import build_provider, provider_from_profile_name
 from cgx.webui.models import (
@@ -59,6 +59,13 @@ def _write_index(project_root: str, html: str) -> int:
     return len(html.encode("utf-8"))
 
 
+@router.get("/sites/themes")
+def list_themes() -> dict:
+    """Curated design themes for the Studio's theme picker."""
+    from cgx.answer.web_themes import theme_summaries
+    return {"themes": theme_summaries()}
+
+
 @router.get("/sites", response_model=List[SiteInfo])
 def list_sites() -> List[SiteInfo]:
     return [SiteInfo(**s) for s in workspace.list_sites()]
@@ -88,7 +95,13 @@ def generate(req: SiteGenerateRequest) -> GeneratedSite:
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
     try:
-        html = generate_site(brief, _provider(req.provider), flavor=req.flavor)
+        prov = _provider(req.provider)
+        theme_key = (req.theme or "").strip() or None
+        html = generate_site(brief, prov, flavor=req.flavor, theme_key=theme_key)
+        # Agentic design pass: critique the draft against the theme and
+        # self-repair once before it reaches the user.
+        html = refine_site(html, prov, flavor=req.flavor, theme_key=theme_key,
+                           rounds=1)
     except Exception as e:  # noqa: BLE001
         logger.exception("site generate failed")
         raise HTTPException(status_code=502,
@@ -113,6 +126,7 @@ def revise(req: SiteReviseRequest) -> GeneratedSite:
     current = index.read_text(encoding="utf-8", errors="replace")
     try:
         html = generate_site("", _provider(req.provider), flavor=req.flavor,
+                             theme_key=(req.theme or "").strip() or None,
                              current_html=current, feedback=feedback)
     except Exception as e:  # noqa: BLE001
         logger.exception("site revise failed")

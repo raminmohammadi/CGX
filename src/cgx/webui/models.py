@@ -202,6 +202,7 @@ class SiteGenerateRequest(BaseModel):
     name: str
     brief: str
     flavor: str = "modern"  # simple | modern | interactive
+    theme: str = ""  # theme key; "" = auto-select from the brief
     provider: ProviderConfig = Field(default_factory=ProviderConfig)
 
 
@@ -210,6 +211,7 @@ class SiteReviseRequest(BaseModel):
     slug: str
     feedback: str
     flavor: str = "modern"
+    theme: str = ""
     provider: ProviderConfig = Field(default_factory=ProviderConfig)
 
 
