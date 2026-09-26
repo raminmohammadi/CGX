@@ -49,9 +49,15 @@ def test_registry_contains_python_parser():
     assert isinstance(parser, PythonASTParser)
 
 
-def test_registry_keys_are_lowercase_with_dot():
-    for ext in _PARSER_REGISTRY.keys():
-        assert ext.startswith(".") and ext == ext.lower()
+def test_registry_keys_are_extension_or_known_basename():
+    # Keys are EITHER a lowercase dotted extension (the common case) OR an exact
+    # basename for an extensionless config file (Dockerfile, Makefile, ...),
+    # which the walker matches via its basename fallback.
+    from cgx.parser.config_parser import ConfigParser
+    allowed_basenames = set(ConfigParser.filenames)
+    for key in _PARSER_REGISTRY.keys():
+        is_ext = key.startswith(".") and key == key.lower()
+        assert is_ext or key in allowed_basenames, f"unexpected registry key: {key!r}"
 
 
 def test_python_parser_advertises_py_extension():

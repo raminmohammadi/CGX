@@ -1184,7 +1184,9 @@ def _iter_source_files(
 
         for fname in files:
             ext = os.path.splitext(fname)[1].lower()
-            parser = _PARSER_REGISTRY.get(ext)
+            # Fall back to an exact-basename match so extensionless files with a
+            # registered parser (Dockerfile, Makefile, ...) are still ingested.
+            parser = _PARSER_REGISTRY.get(ext) or _PARSER_REGISTRY.get(fname)
             if parser is None:
                 continue
             filepath = os.path.join(root, fname)
@@ -1332,6 +1334,20 @@ def _register_default_parsers() -> None:
     md = MarkdownParser()
     for ext in md.extensions:
         _PARSER_REGISTRY[ext] = md
+
+    # Config / CI / infra files (yml/yaml/toml/json/Dockerfile/...). Pure-python
+    # and always registered: CI pipelines and config carry facts users ask about
+    # that source + docs omit, and were previously never ingested. Registered by
+    # extension AND by exact basename (for extensionless files like Dockerfile,
+    # which the walker's splitext-based lookup can't key on).
+    from cgx.parser.config_parser import ConfigParser
+
+    cfg = ConfigParser()
+    for ext in cfg.extensions:
+        # Don't clobber a language parser that already owns this extension.
+        _PARSER_REGISTRY.setdefault(ext, cfg)
+    for fname in cfg.filenames:
+        _PARSER_REGISTRY.setdefault(fname, cfg)
 
     # Multi-language parsers are gated on the optional tree-sitter dependency.
     # Each is registered only when its grammar can actually be loaded so that,

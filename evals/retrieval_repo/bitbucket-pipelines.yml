@@ -1,0 +1,17 @@
+image: node:20
+
+pipelines:
+  default:
+    - step:
+        name: Test and build
+        script:
+          - npm ci
+          - npm test
+          - npm run build
+  branches:
+    main:
+      - step:
+          name: Deploy to production
+          deployment: production
+          script:
+            - ./deploy.sh
