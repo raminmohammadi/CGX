@@ -816,25 +816,37 @@ def _serve_from_project(root_real: str, rel_path: str) -> Response:
     rel = (rel_path or "").strip()
     if not rel or rel.endswith("/"):
         rel = rel + "index.html"
-    # Force user input to be treated as a relative path and reject traversal.
-    rel = rel.lstrip("/\\")
-    if os.path.isabs(rel) or any(part == ".." for part in rel.replace("\\", "/").split("/")):
+
+    # Normalize to slash-separated relative segments and reject traversal/meta segments.
+    rel = rel.replace("\\", "/").lstrip("/")
+    parts = [p for p in rel.split("/") if p]
+    if not parts or any(p in (".", "..") for p in parts):
         raise HTTPException(status_code=403, detail="path escapes project root")
 
     root_path = Path(root_real).resolve(strict=False)
-    candidate_path = (root_path / rel).resolve(strict=False)
+    candidate_path = root_path.joinpath(*parts)
+
+    # Check containment on lexical path first.
     try:
         candidate_path.relative_to(root_path)
     except ValueError:
         raise HTTPException(status_code=403, detail="path escapes project root")
 
-    candidate = str(candidate_path)
+    if not candidate_path.is_file():
+        raise HTTPException(status_code=404, detail="file not found")
+
+    # Resolve existing target (follows symlinks) and enforce containment again.
+    try:
+        candidate_real = candidate_path.resolve(strict=True)
+        candidate_real.relative_to(root_path)
+    except (OSError, ValueError):
+        raise HTTPException(status_code=403, detail="path escapes project root")
+
+    candidate = str(candidate_real)
     ext = os.path.splitext(candidate)[1].lower()
     if ext not in _PREVIEW_ALLOWED_EXT:
         raise HTTPException(status_code=404,
                             detail=f"{ext or 'file'} is not previewable")
-    if not os.path.isfile(candidate):
-        raise HTTPException(status_code=404, detail="file not found")
     try:
         if os.path.getsize(candidate) > _PREVIEW_MAX_BYTES:
             raise HTTPException(status_code=413, detail="file too large to preview")
