@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import mimetypes
 import os
 import threading
 import time
@@ -31,6 +32,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.responses import FileResponse, Response
 from sse_starlette.sse import EventSourceResponse
 
 # Importing the tasks package side-effect-registers Phase 1 executors.
@@ -777,3 +779,77 @@ def _resolve_runner_for(sid: str) -> SessionRunner:
     with _RUNNERS_LOCK:
         _SESSION_TO_RUNNER[sid] = default_runner
     return default_runner
+
+
+# ---------------------------------------------------------------------------
+# Live site preview: serve a session's generated files (read-only) so the UI
+# can render the built static site in a sandboxed iframe. This is the "render
+# for the user" half of the HTML-site-builder loop.
+# ---------------------------------------------------------------------------
+
+# Only web content is served, so the preview endpoint can never be turned into
+# a general read of arbitrary project files (e.g. .env, secrets, source of a
+# non-static project). Anything else 404s.
+_PREVIEW_ALLOWED_EXT = frozenset({
+    ".html", ".htm", ".css", ".js", ".mjs", ".json", ".map", ".txt",
+    ".svg", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif", ".ico", ".bmp",
+    ".woff", ".woff2", ".ttf", ".otf", ".eot", ".webmanifest",
+})
+_PREVIEW_MAX_BYTES = 15 * 1024 * 1024  # refuse to stream huge files
+
+
+def _session_project_root(sid: str) -> str:
+    """Return the absolute, canonical project_root for ``sid`` (or 404/400)."""
+    runner = _resolve_runner_for(sid)
+    session = runner.store.get_session(sid)
+    if session is None:
+        raise HTTPException(status_code=404, detail=f"session {sid!r} not found")
+    root = getattr(session, "project_root", None)
+    if not root:
+        raise HTTPException(status_code=400,
+                            detail="session has no project_root to preview")
+    return os.path.realpath(str(root))
+
+
+def _serve_from_project(root_real: str, rel_path: str) -> Response:
+    """Serve ``root_real/rel_path`` with path containment + a type allowlist."""
+    rel = (rel_path or "").strip()
+    if not rel or rel.endswith("/"):
+        rel = (rel + "index.html").lstrip("/")
+    # Canonicalize and containment-check via the recognized startswith prefix
+    # guard before any filesystem access (blocks ../ traversal / absolute paths).
+    candidate = os.path.realpath(os.path.join(root_real, rel))
+    if not (candidate == root_real or candidate.startswith(root_real + os.sep)):
+        raise HTTPException(status_code=403, detail="path escapes project root")
+    ext = os.path.splitext(candidate)[1].lower()
+    if ext not in _PREVIEW_ALLOWED_EXT:
+        raise HTTPException(status_code=404,
+                            detail=f"{ext or 'file'} is not previewable")
+    if not os.path.isfile(candidate):
+        raise HTTPException(status_code=404, detail="file not found")
+    try:
+        if os.path.getsize(candidate) > _PREVIEW_MAX_BYTES:
+            raise HTTPException(status_code=413, detail="file too large to preview")
+    except OSError:
+        raise HTTPException(status_code=404, detail="file not found") from None
+    media_type = mimetypes.guess_type(candidate)[0] or "application/octet-stream"
+    # nosniff + a conservative CSP; actual isolation comes from the frontend
+    # rendering this inside a sandboxed iframe (no allow-same-origin).
+    headers = {
+        "X-Content-Type-Options": "nosniff",
+        "Cache-Control": "no-store",
+    }
+    return FileResponse(candidate, media_type=media_type, headers=headers)
+
+
+@router.get("/{sid}/preview", include_in_schema=False, response_model=None)
+def preview_index(sid: str) -> Response:
+    """Serve the site entry (index.html) for ``sid``."""
+    return _serve_from_project(_session_project_root(sid), "index.html")
+
+
+@router.get("/{sid}/preview/{path:path}", include_in_schema=False,
+            response_model=None)
+def preview_file(sid: str, path: str) -> Response:
+    """Serve an arbitrary web asset from the session's project root."""
+    return _serve_from_project(_session_project_root(sid), path)

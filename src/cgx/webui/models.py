@@ -185,6 +185,18 @@ class ContextFileWriteRequest(BaseModel):
     content: str
 
 
+class SiteCreateRequest(BaseModel):
+    """Create a managed site workspace from a human name."""
+    name: str
+
+
+class SiteInfo(BaseModel):
+    slug: str
+    project_root: str
+    has_index: bool = False
+    modified: float = 0.0
+
+
 class SessionCreateRequest(BaseModel):
     title: Optional[str] = None
 
