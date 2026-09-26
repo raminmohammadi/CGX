@@ -99,6 +99,22 @@ class Skill(ABC):
     def detect(self, goal: str) -> float:
         """Return ``[0.0, 1.0]`` confidence the goal involves this skill."""
 
+    # ---- Optional: conditional activation by working context ---------
+    def detect_context(self, ctx: Dict[str, Any]) -> float:
+        """Confidence in ``[0,1]`` that this skill applies to the CURRENT
+        working context (e.g. the files a task touches / the active dir),
+        independent of the goal text.
+
+        Default ``0.0``: built-in technology skills activate from the goal via
+        :meth:`detect`. This additive hook lets a skill bind to a *condition*
+        (touching ``*.css``, working under ``billing/`` ...) so condition-scoped
+        guidance loads only while its condition holds -- the JEV "keep this in
+        memory" instruction, distinct from a "do this now" skill. Overriding is
+        optional; the built-ins do not, so their signatures are unchanged.
+        ``ctx`` is a free-form dict (e.g. ``{"files": [...], "exts": {...}}``).
+        """
+        return 0.0
+
     # ---- Optional: prompt composition --------------------------------
     def scaffold_system_prompt(self) -> str:
         """Prompt fragment to add when scaffolding a project."""

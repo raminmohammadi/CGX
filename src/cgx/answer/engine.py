@@ -1092,8 +1092,13 @@ def _prepare_answer_request(
     if mode != "clarify_paths":
         try:
             from cgx.answer.instructions import build_instruction_preamble
+            # Files this turn is grounded in -> per-directory GOTCHAS notes load
+            # conditionally for exactly those dirs (JEV conditional instructions).
+            touched = [str(h.get("chunk_id", "")).split("::")[0]
+                       for h in merged_hits[:8] if isinstance(h, dict)]
             instruction_preamble = build_instruction_preamble(
-                root, question, skills, surface="chat")
+                root, question, skills, surface="chat",
+                files_touched=[t for t in touched if t] or None)
         except Exception as e:  # noqa: BLE001 - must never break answering
             logger.debug("instruction preamble build failed: %s", e)
 
