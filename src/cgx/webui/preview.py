@@ -30,7 +30,12 @@ _MAX_BYTES = 15 * 1024 * 1024
 
 def serve_web_file(root_real: str, rel_path: str) -> Response:
     """Serve ``root_real/rel_path`` (defaulting to index.html) safely."""
-    root = os.path.realpath(root_real)
+    if not (root_real or "").strip():
+        raise HTTPException(status_code=404, detail="site root not found")
+    root_input = os.path.abspath(root_real)
+    if os.path.islink(root_input):
+        raise HTTPException(status_code=403, detail="site root must not be a symlink")
+    root = os.path.realpath(root_input)
     if not os.path.isdir(root):
         raise HTTPException(status_code=404, detail="site root not found")
     rel = (rel_path or "").strip()
