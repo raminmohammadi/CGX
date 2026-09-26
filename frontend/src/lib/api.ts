@@ -89,6 +89,13 @@ export type SiteInfo = {
   modified: number;
 };
 
+export type GeneratedSite = {
+  slug: string;
+  project_root: string;
+  entry: string;
+  bytes: number;
+};
+
 export type RunningModel = {
   name: string;
   model?: string;
@@ -841,6 +848,19 @@ export const api = {
   listSites: () => jsonReq<SiteInfo[]>("/api/sites"),
   createSite: (name: string) =>
     jsonReq<SiteInfo>("/api/sites", "POST", { name }),
+
+  // Site Studio one-shot build + revise (bypasses the greenfield pipeline).
+  generateSite: (body: {
+    name: string; brief: string; flavor: string; provider: unknown;
+  }) => jsonReq<GeneratedSite>("/api/sites/generate", "POST", body),
+  reviseSite: (body: {
+    slug: string; feedback: string; flavor: string; provider: unknown;
+  }) => jsonReq<GeneratedSite>("/api/sites/revise", "POST", body),
+  // Trailing slash so a page's relative links resolve under /preview/.
+  sitePreviewUrl: (slug: string, path = "") => {
+    const rel = path.replace(/^\/+/, "");
+    return `/api/sites/${encodeURIComponent(slug)}/preview/${rel}`;
+  },
   agentSessionCancel: (sid: string) =>
     jsonReq<AgentSessionState>(
       `/api/agent-session/${encodeURIComponent(sid)}/cancel`,

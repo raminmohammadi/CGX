@@ -197,6 +197,29 @@ class SiteInfo(BaseModel):
     modified: float = 0.0
 
 
+class SiteGenerateRequest(BaseModel):
+    """One-shot build of a self-contained static site from a brief."""
+    name: str
+    brief: str
+    flavor: str = "modern"  # simple | modern | interactive
+    provider: ProviderConfig = Field(default_factory=ProviderConfig)
+
+
+class SiteReviseRequest(BaseModel):
+    """Revise an existing site in place from plain-language feedback."""
+    slug: str
+    feedback: str
+    flavor: str = "modern"
+    provider: ProviderConfig = Field(default_factory=ProviderConfig)
+
+
+class GeneratedSite(BaseModel):
+    slug: str
+    project_root: str
+    entry: str = "index.html"
+    bytes: int = 0
+
+
 class SessionCreateRequest(BaseModel):
     title: Optional[str] = None
 

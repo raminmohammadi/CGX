@@ -90,8 +90,19 @@ class StaticSiteSkill(Skill):
         return (
             "STATIC WEBSITE -- no build step (no bundler/npm/package.json).\n"
             "IMPORTANT: ignore any earlier instruction to use Vite, a bundler, "
-            "or a `/src/main.jsx` entry. This site is served by opening the "
-            "files (or a plain static server) with NOTHING to compile.\n"
+            "a `/src/main.jsx` entry, OR to split the app into 'core_logic'/"
+            "'auth'/'api' layers or to add unit-test files. This is a "
+            "front-end website, not a backend app: there is NO auth, NO server "
+            "logic, and NO test files -- do not plan or generate any.\n"
+            "CONTENT & SCOPE -- build a REAL, substantial site, not a stub. A "
+            "landing page must be a rich single `index.html` with several full "
+            "sections in this order: a header/nav, a compelling HERO (headline "
+            "+ subtext + call-to-action), 2-4 content sections appropriate to "
+            "the topic (e.g. for a coffee shop: featured menu with items + "
+            "prices, about/story, opening hours, gallery, a location/contact "
+            "block), and a footer -- with real, specific copy (not 'Lorem "
+            "ipsum' and not a single bare form). Only build separate pages when "
+            "the request clearly needs them.\n"
             "- `index.html` MUST exist at the project root and be the home page. "
             "Each page is a complete document: <!DOCTYPE html>, "
             "<html lang=\"en\">, <head> with <meta charset> + responsive "
@@ -240,10 +251,15 @@ class StaticSiteSkill(Skill):
                 rationale=("static_site skill: framework/build files leaked "
                            "into a plain static site -- remove: "
                            + ", ".join(sorted(set(leaked)))))
+        # Broken links are advisory, NOT fatal: SCAFFOLD can only regenerate
+        # files the manifest already lists, so a reference to a file the plan
+        # omitted is unfixable by regenerate -- a fatal verdict would just
+        # death-spiral the build into FAILED. Surface it as a warning (and the
+        # on-disk StaticSiteRunner still gives VERIFY a real signal).
         broken = self._broken_links(diffs)
         if broken:
             return SkillVerdict(
-                passed=False, confidence=0.85,
+                passed=False, confidence=0.85, severity="warning",
                 rationale=("static_site skill: broken local references -- "
                            "these point at files the site does not include: "
                            + "; ".join(broken[:8])))
