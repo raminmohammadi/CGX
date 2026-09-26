@@ -820,11 +820,15 @@ def _serve_from_project(root_real: str, rel_path: str) -> Response:
     rel = rel.lstrip("/\\")
     if os.path.isabs(rel) or any(part == ".." for part in rel.replace("\\", "/").split("/")):
         raise HTTPException(status_code=403, detail="path escapes project root")
-    # Canonicalize and containment-check via the recognized startswith prefix
-    # guard before any filesystem access (blocks ../ traversal / absolute paths).
-    candidate = os.path.realpath(os.path.join(root_real, rel))
-    if not (candidate == root_real or candidate.startswith(root_real + os.sep)):
+
+    root_path = Path(root_real).resolve(strict=False)
+    candidate_path = (root_path / rel).resolve(strict=False)
+    try:
+        candidate_path.relative_to(root_path)
+    except ValueError:
         raise HTTPException(status_code=403, detail="path escapes project root")
+
+    candidate = str(candidate_path)
     ext = os.path.splitext(candidate)[1].lower()
     if ext not in _PREVIEW_ALLOWED_EXT:
         raise HTTPException(status_code=404,
