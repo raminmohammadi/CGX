@@ -1679,6 +1679,12 @@ def answer_with_llm_stream(
             messages,
             temperature=float(temperature),
             max_tokens=max_tokens,
+            # The streamed answer is plain Markdown (see SYSTEM_STREAM), not a
+            # JSON object. force_json is a REQUIRED keyword-only arg on every
+            # provider's chat_stream (incl. the GovernedProvider wrapper), so
+            # omitting it raised "missing 1 required keyword-only argument:
+            # 'force_json'" and killed the whole answer stream.
+            force_json=False,
         ):
             if not delta:
                 continue
