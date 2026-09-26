@@ -815,7 +815,11 @@ def _serve_from_project(root_real: str, rel_path: str) -> Response:
     """Serve ``root_real/rel_path`` with path containment + a type allowlist."""
     rel = (rel_path or "").strip()
     if not rel or rel.endswith("/"):
-        rel = (rel + "index.html").lstrip("/")
+        rel = rel + "index.html"
+    # Force user input to be treated as a relative path and reject traversal.
+    rel = rel.lstrip("/\\")
+    if os.path.isabs(rel) or any(part == ".." for part in rel.replace("\\", "/").split("/")):
+        raise HTTPException(status_code=403, detail="path escapes project root")
     # Canonicalize and containment-check via the recognized startswith prefix
     # guard before any filesystem access (blocks ../ traversal / absolute paths).
     candidate = os.path.realpath(os.path.join(root_real, rel))
