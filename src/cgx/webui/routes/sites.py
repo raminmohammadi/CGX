@@ -53,7 +53,11 @@ def _provider(pc: ProviderConfig):
 
 
 def _write_index(project_root: str, html: str) -> int:
-    path = os.path.join(project_root, "index.html")
+    base = workspace._sites_root_real()
+    root = os.path.realpath(project_root)
+    if root != base and not root.startswith(base + os.sep):
+        raise ValueError(f"invalid project root: {project_root!r}")
+    path = os.path.join(root, "index.html")
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(html)
     return len(html.encode("utf-8"))
