@@ -13,11 +13,51 @@ import { ActiveTaskPanel } from "../components/agent/ActiveTask";
 import { TextArea } from "../components/Input";
 import { cn } from "../lib/utils";
 
+// Build flavors -- all NO build step, so every one renders instantly in the
+// sandboxed preview. The flavor is conveyed to the model as a styling
+// directive appended to the objective; all pin the static_site skill.
+type Flavor = "simple" | "modern" | "interactive";
+
+const FLAVORS: { key: Flavor; label: string; hint: string; directive: string }[] = [
+  {
+    key: "simple",
+    label: "Simple",
+    hint: "Hand-written HTML/CSS, works fully offline",
+    directive:
+      "Build this as a hand-written static HTML/CSS/JS site with NO external "
+      + "libraries (it must work by opening the files directly). Clean, "
+      + "semantic, responsive.",
+  },
+  {
+    key: "modern",
+    label: "Modern",
+    hint: "Tailwind + fonts via CDN, polished",
+    directive:
+      "Build this as a static site with NO build step, styled with Tailwind "
+      + "CSS via the Play CDN (https://cdn.tailwindcss.com) and a Google Font. "
+      + "Aim for a modern, polished, responsive design: strong visual "
+      + "hierarchy, generous spacing, a cohesive color palette, and tasteful "
+      + "hover/transition details.",
+  },
+  {
+    key: "interactive",
+    label: "Interactive",
+    hint: "Modern + Alpine.js for dynamic UI",
+    directive:
+      "Build this as a static site with NO build step, styled with Tailwind "
+      + "CSS via the Play CDN and made interactive with Alpine.js via CDN "
+      + "(menus, tabs, toggles, simple client-side state). Modern, polished, "
+      + "responsive. No bundler.",
+  },
+];
+
 // Site Studio: a build-on-the-left, live-preview-on-the-right workspace for
-// creating a plain static HTML/CSS/JS website end to end. It drives a normal
-// greenfield agent session (pinned to the static_site skill) and renders the
-// generated files from the sandboxed preview endpoint, reloading on each new
-// applied_changes. Feedback is a plain follow-up that re-drives the build.
+// creating a static website end to end. It drives a normal greenfield agent
+// session (pinned to the static_site skill) and renders the generated files
+// from the sandboxed preview endpoint, reloading on each new applied_changes.
+// Feedback is a plain follow-up that re-drives the build. All flavors are
+// build-less so the preview is always live; full React/Vue apps (which need a
+// build) live in the Agent Loop instead.
 export default function SiteStudioPage() {
   const { provider, index } = useWorkspace();
 
@@ -29,6 +69,7 @@ export default function SiteStudioPage() {
 
   const [siteName, setSiteName] = useState("");
   const [brief, setBrief] = useState("");
+  const [flavor, setFlavor] = useState<Flavor>("modern");
   const [feedback, setFeedback] = useState("");
   const [sites, setSites] = useState<SiteInfo[]>([]);
   const [viewport, setViewport] = useState<"desktop" | "mobile">("desktop");
@@ -90,8 +131,9 @@ export default function SiteStudioPage() {
     setPending(true); setError(null);
     try {
       const site = await api.createSite(name);
+      const directive = FLAVORS.find((f) => f.key === flavor)?.directive ?? "";
       const next = await api.agentSessionCreate({
-        objective,
+        objective: `${objective}\n\n${directive}`,
         project_root: site.project_root,
         title: name,
         mode: "greenfield",
@@ -106,7 +148,7 @@ export default function SiteStudioPage() {
     } catch (e) {
       setError(String((e as Error)?.message || e));
     } finally { setPending(false); }
-  }, [siteName, brief, index, provider, refreshSites]);
+  }, [siteName, brief, flavor, index, provider, refreshSites]);
 
   const openExisting = useCallback(async (site: SiteInfo) => {
     setPending(true); setError(null);
@@ -227,6 +269,36 @@ export default function SiteStudioPage() {
                 + "modern, dark theme, responsive."}
             />
           </label>
+          <div className="space-y-1.5">
+            <span className="text-[11px] font-mono uppercase tracking-wider text-slate-400">
+              Style
+            </span>
+            <div className="grid grid-cols-3 gap-2">
+              {FLAVORS.map((f) => (
+                <button
+                  key={f.key}
+                  type="button"
+                  onClick={() => setFlavor(f.key)}
+                  className={cn(
+                    "text-left rounded-lg border px-3 py-2 transition",
+                    flavor === f.key
+                      ? "border-emerald-500/40 bg-emerald-500/10"
+                      : "border-white/10 bg-slate-950/40 hover:border-white/20",
+                  )}
+                >
+                  <p className={cn("text-xs font-medium",
+                    flavor === f.key ? "text-emerald-300" : "text-slate-200")}>
+                    {f.label}
+                  </p>
+                  <p className="text-[10px] text-slate-500 leading-snug mt-0.5">{f.hint}</p>
+                </button>
+              ))}
+            </div>
+            <p className="text-[10px] font-mono text-slate-600">
+              All flavors are build-less and preview instantly. Need a full
+              React/Vue app with a build step? Use the Agent Loop.
+            </p>
+          </div>
           {error && <p className="text-xs text-red-300 font-mono">{error}</p>}
           <div className="flex justify-end">
             <button className="av-btn-primary" onClick={startBuild} disabled={pending}>
