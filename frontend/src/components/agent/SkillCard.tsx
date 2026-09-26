@@ -48,16 +48,45 @@ export function SkillCard({
               eyebrow={skill.role}
               title={skill.name}
               right={
-                <Pill tone={skill.is_custom ? "purple" : "slate"}>
-                  {skill.is_custom ? "custom" : "built-in"}
+                <Pill
+                  tone={
+                    skill.format === "markdown"
+                      ? "neon"
+                      : skill.format === "python"
+                        ? "purple"
+                        : "slate"
+                  }
+                >
+                  {skill.format === "builtin" ? "built-in" : skill.format}
                 </Pill>
               }
             />
             <p className="text-xs text-slate-400">
               {skill.description || "No description provided."}
             </p>
-            {skill.aliases.length > 0 && (
+            {(skill.aliases.length > 0 ||
+              skill.always_on ||
+              (skill.surfaces && skill.surfaces.length > 0) ||
+              skill.scope === "repo") && (
               <div className="flex flex-wrap gap-1 mt-2">
+                {skill.scope === "repo" && (
+                  <span className="text-[9px] font-mono text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 rounded px-1.5 py-0.5">
+                    repo
+                  </span>
+                )}
+                {skill.always_on && (
+                  <span className="text-[9px] font-mono text-amber-400 bg-amber-500/10 border border-amber-500/20 rounded px-1.5 py-0.5">
+                    always-on
+                  </span>
+                )}
+                {(skill.surfaces || []).map((s) => (
+                  <span
+                    key={`surf-${s}`}
+                    className="text-[9px] font-mono text-slate-400 bg-slate-950 border border-white/5 rounded px-1.5 py-0.5"
+                  >
+                    {s}
+                  </span>
+                ))}
                 {skill.aliases.map((a) => (
                   <span
                     key={a}

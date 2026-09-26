@@ -40,6 +40,7 @@ from cgx.webui.routes import (
     agent_session,
     approvals as approvals_route,
     ask,
+    context_file as context_file_route,
     embed,
     feedback as feedback_route,
     govdata as govdata_route,
@@ -196,6 +197,7 @@ def create_app() -> FastAPI:
     app.include_router(agent_session.router, prefix="/api")
     app.include_router(agent_profiles.router, prefix="/api")
     app.include_router(skills_route.router, prefix="/api")
+    app.include_router(context_file_route.router, prefix="/api")
     app.include_router(tasks.router, prefix="/api")
     app.include_router(rollback.router, prefix="/api")
     app.include_router(settings_route.router, prefix="/api")

@@ -35,6 +35,10 @@ DEFAULT_IGNORE_DIRS = (
     "node_modules",
     "build", "dist", ".eggs", "site-packages",
     ".idea", ".vscode",
+    # CGX's own per-repo state (session DBs, logs) and instruction files
+    # (CGX.md-adjacent skills under .cgx/skills). These are instructions and
+    # bookkeeping, not searchable corpus, so keep them out of the index.
+    ".cgx",
     # Generated static-site / docs output (near-universally vendored artefacts).
     "_site", ".docusaurus",
 )

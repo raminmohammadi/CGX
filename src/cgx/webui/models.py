@@ -165,6 +165,26 @@ class SkillUpdateRequest(BaseModel):
     source: str
 
 
+class MarkdownSkillCreateRequest(BaseModel):
+    """A ``SKILL.md`` document (YAML frontmatter + instruction body).
+
+    ``name`` is an optional fallback used only when the frontmatter omits a
+    ``name:``; the frontmatter's own ``name`` always wins when present.
+    """
+    content: str
+    name: str = ""
+
+
+class MarkdownSkillUpdateRequest(BaseModel):
+    content: str
+
+
+class ContextFileWriteRequest(BaseModel):
+    """Create/replace a project's CGX.md context file."""
+    project_root: str
+    content: str
+
+
 class SessionCreateRequest(BaseModel):
     title: Optional[str] = None
 
@@ -261,6 +281,12 @@ class SkillSummary(BaseModel):
     aliases: List[str] = Field(default_factory=list)
     description: str = ""
     is_custom: bool = False
+    # "builtin" | "python" | "markdown" -- lets the UI pick the right editor
+    # and endpoint. Markdown skills additionally carry surface/scope info.
+    format: str = "python"
+    surfaces: List[str] = Field(default_factory=list)
+    always_on: bool = False
+    scope: str = "global"
 
 
 class SessionSummary(BaseModel):
