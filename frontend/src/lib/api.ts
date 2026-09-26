@@ -82,6 +82,20 @@ export type ContextFile = {
   candidates: string[];
 };
 
+export type SiteInfo = {
+  slug: string;
+  project_root: string;
+  has_index: boolean;
+  modified: number;
+};
+
+export type GeneratedSite = {
+  slug: string;
+  project_root: string;
+  entry: string;
+  bytes: number;
+};
+
 export type RunningModel = {
   name: string;
   model?: string;
@@ -822,6 +836,31 @@ export const api = {
   // the native ``EventSource`` (GET); the dev proxy forwards /api to :8765.
   agentSessionEventsUrl: (sid: string) =>
     `/api/agent-session/${encodeURIComponent(sid)}/events`,
+
+  // Same-origin URL that serves a session's generated site files (read-only,
+  // web-content only). Rendered inside a sandboxed iframe by the Site Studio.
+  agentSessionPreviewUrl: (sid: string, path = "") => {
+    const rel = path.replace(/^\/+/, "");
+    return `/api/agent-session/${encodeURIComponent(sid)}/preview${rel ? `/${rel}` : ""}`;
+  },
+
+  // Managed site workspaces (~/.cgx/sites/<slug>) for the Site Studio.
+  listSites: () => jsonReq<SiteInfo[]>("/api/sites"),
+  createSite: (name: string) =>
+    jsonReq<SiteInfo>("/api/sites", "POST", { name }),
+
+  // Site Studio one-shot build + revise (bypasses the greenfield pipeline).
+  generateSite: (body: {
+    name: string; brief: string; flavor: string; provider: unknown;
+  }) => jsonReq<GeneratedSite>("/api/sites/generate", "POST", body),
+  reviseSite: (body: {
+    slug: string; feedback: string; flavor: string; provider: unknown;
+  }) => jsonReq<GeneratedSite>("/api/sites/revise", "POST", body),
+  // Trailing slash so a page's relative links resolve under /preview/.
+  sitePreviewUrl: (slug: string, path = "") => {
+    const rel = path.replace(/^\/+/, "");
+    return `/api/sites/${encodeURIComponent(slug)}/preview/${rel}`;
+  },
   agentSessionCancel: (sid: string) =>
     jsonReq<AgentSessionState>(
       `/api/agent-session/${encodeURIComponent(sid)}/cancel`,

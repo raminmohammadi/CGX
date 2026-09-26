@@ -2832,6 +2832,8 @@ def plan_scaffold_manifest(
             "plan_md": str(parsed.get("plan_md") or idea_clean),
             "layers": [{"name": "project", "files": []}],
         }
+    is_static_site = any(
+        getattr(s, "name", "") == "static_site" for s in active_skills)
     layers = _normalize_manifest_paths(parsed["layers"])
     layers = _inject_required_manifest_files(
         layers,
@@ -2842,6 +2844,7 @@ def plan_scaffold_manifest(
         layers,
         goal=goal_clean or idea_clean,
         skill_names=skills,
+        static_site=is_static_site,
     )
     layers = _inject_python_package_inits(layers)
     layers = _inject_readme(layers, goal=goal_clean or idea_clean)
@@ -3443,6 +3446,7 @@ def _inject_required_test_file(
     *,
     goal: str = "",
     skill_names: Optional[List[str]] = None,
+    static_site: bool = False,
 ) -> List[Any]:
     """Guarantee every greenfield manifest carries at least one test file.
 
@@ -3451,7 +3455,15 @@ def _inject_required_test_file(
     skip tests despite the prompt; rather than burn a retry on the Judge's
     required-test check, we inject a stack-appropriate test entry whose
     content the per-file generator fills in later.
+
+    Skipped entirely for a static site: a build-less HTML/CSS/JS site has no
+    test runner (pytest/Vitest would both be nonsensical there), and the
+    static-site skill's own link/asset validator is the pass/fail signal
+    instead. Injecting a test file only produces an unrunnable artifact the
+    skill validator would then reject.
     """
+    if static_site:
+        return layers
     paths: List[str] = []
     for lay in layers or []:
         if not isinstance(lay, dict):

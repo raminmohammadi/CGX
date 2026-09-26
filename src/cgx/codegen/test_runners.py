@@ -330,7 +330,77 @@ class NpmRunner(TestRunner):
 
 
 # Registry of default runners, checked in order. Append new stacks here.
-_TEST_RUNNER_REGISTRY: List[TestRunner] = [PytestRunner(), NpmRunner()]
+class StaticSiteRunner(TestRunner):
+    """Static HTML/CSS/JS site: verify links + assets actually resolve.
+
+    A build-less site has no pytest/npm suite, so without this it VERIFYs as
+    an accidental "skipped" -- green having checked nothing. This runner
+    gives it a real signal: it parses every ``.html``/``.css`` in the tree
+    and checks that each local ``href``/``src``/``link``/``url(...)`` target
+    resolves to a file on disk. A broken reference (the #1 way a "finished"
+    static site is actually broken) fails VERIFY and routes into the repair
+    loop with the offending references named. It runs no code and opens no
+    browser -- rendering is the user's job in the sandboxed preview.
+
+    Structural HTML nits (unclosed optional tags, etc.) are intentionally
+    NOT failures: HTML is lenient, so flagging them would trigger wasteful
+    regenerates. Only unambiguous broken references fail.
+    """
+
+    name = "static_site"
+    _MAX_FILES = 400
+    _MAX_BYTES = 2 * 1024 * 1024
+    _WEB_ASSET_EXT = (
+        ".html", ".htm", ".css", ".js", ".mjs", ".json", ".svg", ".png",
+        ".jpg", ".jpeg", ".gif", ".webp", ".avif", ".ico", ".bmp", ".woff",
+        ".woff2", ".ttf", ".otf", ".eot", ".webmanifest", ".map", ".txt",
+    )
+
+    def detect(self, project_root: str) -> bool:
+        root = Path(project_root)
+        if not (root / "index.html").is_file():
+            return False
+        # Defer to the real toolchains when this is actually a framework/
+        # Python project that merely also has an index.html (e.g. Vite).
+        if (root / "package.json").is_file():
+            return False
+        for m in ("pyproject.toml", "setup.py", "setup.cfg", "requirements.txt"):
+            if (root / m).is_file():
+                return False
+        try:
+            next(root.rglob("test_*.py"))
+            return False
+        except StopIteration:
+            return True
+
+    def run(
+        self, project_root: str, changed_files: Sequence[str], *,
+        timeout_seconds: float = 180.0, python_exe: Optional[str] = None,
+    ) -> TestRunOutcome:
+        from cgx.codegen.static_site_check import check_static_site
+        try:
+            broken, checked = check_static_site(
+                project_root, max_files=self._MAX_FILES,
+                max_bytes=self._MAX_BYTES)
+        except Exception as exc:  # pragma: no cover - defensive
+            return TestRunOutcome(
+                ran=False, ran_tests=False,
+                skipped_reason=f"static_site check error: {exc}")
+        if broken:
+            lines = [f"  {ref}  <- referenced by {src}" for src, ref in broken]
+            return TestRunOutcome(
+                ran=True, returncode=1, ran_tests=True, tests_present=True,
+                stderr="Static site has broken local references "
+                       f"({len(broken)}):\n" + "\n".join(lines[:40]),
+                stdout=f"static_site: checked {checked} file(s)")
+        return TestRunOutcome(
+            ran=True, returncode=0, ran_tests=True, tests_present=True,
+            stdout=f"static_site: {checked} file(s) checked, "
+                   "all local links/assets resolve")
+
+
+_TEST_RUNNER_REGISTRY: List[TestRunner] = [
+    PytestRunner(), NpmRunner(), StaticSiteRunner()]
 
 
 def detect_test_runners(project_root: str) -> List[TestRunner]:

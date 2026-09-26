@@ -112,6 +112,14 @@ CGX ensures all data, embeddings, and executions remain strictly on your machine
   citations. No code runs. Author them in the UI (**Agent → New Skill /
   Context File**) or commit them to the repo. See
   [docs/skills-and-context.md](docs/skills-and-context.md).
+- **Site Studio.** Describe a website in plain English and CGX clarifies
+  requirements, plans the pages, builds a complete static HTML/CSS/JS site
+  (no framework/build step), and **renders it live** beside the build in a
+  sandboxed preview -- then you refine it with feedback ("make the header
+  sticky", "add a pricing page") and watch it update. A built-in
+  `static_site` skill enforces a coherent multi-page layout and validates
+  that every local link/asset resolves. Everything stays local; the preview
+  runs in your own browser. See [docs/site-studio.md](docs/site-studio.md).
 - **Persistent chat sessions.** Conversations are saved as JSONL
   threads under `~/.cgx/sessions/`; resume them later from the
   Contextual Ask page's session sidebar.
