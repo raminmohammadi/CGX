@@ -319,8 +319,8 @@ def _fmt_source(s: Dict[str, Any]) -> str:
     if pcid:
         extras.append(f"parent_class={pcid}")
     tier = s.get("tier") or ""
-    if tier == "neighbor":
-        extras.append("tier=neighbor")
+    if tier:
+        extras.append(f"tier={tier}")
     if extras:
         head += "  [" + ", ".join(extras) + "]"
     body = s.get("text", "") or ""
@@ -1073,7 +1073,6 @@ def _prepare_answer_request(
         }
 
     # --- SOURCES for LLM ---
-    max_chars = 1400 if mode == "symbol_explain" else 900
     focus_terms: List[str] = []
     if target:
         focus_terms.append(target)
@@ -1081,10 +1080,6 @@ def _prepare_answer_request(
         if t and t not in focus_terms:
             focus_terms.append(t)
 
-    _has_neighbors = any(
-        int(((h.get("provenance") or {}) if isinstance(h, dict) else {}).get("graph_depth", 0) or 0) >= 1
-        for h in merged_hits
-    )
     # Resolve the project root up front (needed both for the CGX.md/skills
     # preamble and the README lead below) and build the user-instruction
     # block. Its length is subtracted from the SOURCES budget so injected
@@ -1108,21 +1103,15 @@ def _prepare_answer_request(
         reserve = len(instruction_preamble) + 200  # + headroom for framing
         budget = {**budget,
                   "total_chars": max(1200, int(budget["total_chars"]) - reserve)}
-    if _has_neighbors:
-        from cgx.answer.context_map import build_tiered_context, load_records_by_id
-        sources = build_tiered_context(
-            merged_hits, cmap, load_records_by_id(records_path),
-            budget=budget, focus_terms=focus_terms or None,
-        )
-    else:
-        sources = _as_sources_with_meta(
-            merged_hits,
-            cmap,
-            max_chunks=40 if mode == "symbol_explain" else 24,
-            max_chars=max_chars,
-            focus_terms=focus_terms or None,
-            total_chars_budget=budget.get("total_chars") if isinstance(budget, dict) else None,
-        )
+    # Visibility ladder is the DEFAULT assembly path for EVERY query, not just
+    # graph-expanded ones: each retrieved chunk is shown full / long / short or
+    # hidden by its per-query relevance, so a small num_ctx window is spent on
+    # the chunks that matter (see context_map.decide_visibility).
+    from cgx.answer.context_map import build_tiered_context, load_records_by_id
+    sources = build_tiered_context(
+        merged_hits, cmap, load_records_by_id(records_path),
+        budget=budget, focus_terms=focus_terms or None,
+    )
 
     if target and target_matched and mode in _SYMBOL_TARGETED_MODES:
         covers = [
@@ -1849,26 +1838,16 @@ def generate_code_plan(
     indices = load_indices(index_dir)
     cmap = _chunk_map(indices)
     task_focus = _symbol_tokens(task or "")
-    # Tiered context kicks in when the orchestrator surfaced graph neighbors,
-    # so plan prompts spend their budget on full bodies for primary hits and
-    # compact stubs for graph-expanded neighbors.
-    _has_neighbors = any(
-        int(((h.get("provenance") or {}) if isinstance(h, dict) else {}).get("graph_depth", 0) or 0) >= 1
-        for h in hits
+    # Visibility ladder is the default plan-context path for every query: plan
+    # prompts spend their num_ctx budget on full bodies for the most relevant
+    # hits and compact stubs (or nothing) for the rest.
+    from cgx.answer.context_map import build_tiered_context, load_records_by_id
+    from cgx.answer.model_caps import get_context_map_budget
+    budget = get_context_map_budget(provider)
+    sources = build_tiered_context(
+        hits, cmap, load_records_by_id(records_path),
+        budget=budget, focus_terms=task_focus or None,
     )
-    if _has_neighbors:
-        from cgx.answer.context_map import build_tiered_context, load_records_by_id
-        from cgx.answer.model_caps import get_context_map_budget
-        budget = get_context_map_budget(provider)
-        sources = build_tiered_context(
-            hits, cmap, load_records_by_id(records_path),
-            budget=budget, focus_terms=task_focus or None,
-        )
-    else:
-        sources = _as_sources_with_meta(
-            hits, cmap, max_chunks=24, max_chars=900,
-            focus_terms=task_focus or None,
-        )
 
     SYSTEM2 = (
         "You are a principal engineer. Propose a step-by-step change plan and unified diffs "

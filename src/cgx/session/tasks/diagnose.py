@@ -448,11 +448,20 @@ def _react_diagnose(
     """
     if deps.provider is None:
         return _escalate(fc), False
+    from cgx.answer.model_caps import effective_context_window
+    from cgx.session.context_budget import fit_react_messages
+    ectx = effective_context_window(deps.provider)
     messages = [
         {"role": "system", "content": _SYSTEM_PROMPT},
         {"role": "user", "content": _render_context(fc, ledger)},
     ]
     for tool_calls in range(DIAGNOSE_STEPS + 1):
+        # Deterministic num_ctx guard (default preserve-behavior: the existing
+        # per-append [:1500]/[:3000] caps mean nothing is trimmed in the common
+        # case; this only fires if the running prompt would overflow).
+        messages = fit_react_messages(
+            messages, effective_ctx=ectx, reserve_output=900,
+            keep_recent=4, per_msg_cap_chars=3000)
         parsed = _diagnose_call(deps.provider, messages)
         if not isinstance(parsed, dict):
             return _escalate(fc), True

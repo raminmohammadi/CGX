@@ -1,29 +1,29 @@
-"""Tests for cgx.answer.context_map (tiered SLM source builder)."""
+"""Tests for cgx.answer.context_map (visibility-ladder SLM source builder)."""
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict, List
-
-import pytest
+from typing import Any, Dict
 
 from cgx.answer.context_map import (
     build_tiered_context,
     classify_hits,
+    decide_visibility,
     format_neighbor_stub,
     load_records_by_id,
 )
 
 
 # ---------------------------------------------------------------------------
-# fixtures
+# fixtures / helpers
 # ---------------------------------------------------------------------------
-def _make_hit(cid: str, *, depth: int = 0, score: float = 1.0) -> Dict[str, Any]:
-    prov: Dict[str, Any] = {}
+def _make_hit(cid: str, *, depth: int = 0, score: float = 1.0,
+              **prov: Any) -> Dict[str, Any]:
+    p: Dict[str, Any] = dict(prov)
     if depth:
-        prov["graph_depth"] = depth
-    return {"chunk_id": cid, "score": score, "provenance": prov}
+        p["graph_depth"] = depth
+    return {"chunk_id": cid, "score": score, "provenance": p}
 
 
 def _make_row(cid: str, text: str) -> Dict[str, Any]:
@@ -36,67 +36,26 @@ def _make_record(cid: str, **fields: Any) -> Dict[str, Any]:
     return base
 
 
-@pytest.fixture
-def synth_corpus():
-    """Three primary chunks + two graph-expanded neighbors."""
-    cmap = {
-        "src/a.py::function::primary_one": _make_row(
-            "src/a.py::function::primary_one",
-            "\n".join(f"primary_one_line_{i}" for i in range(30)),
-        ),
-        "src/a.py::function::primary_two": _make_row(
-            "src/a.py::function::primary_two",
-            "\n".join(f"primary_two_line_{i}" for i in range(30)),
-        ),
-        "src/b.py::function::primary_three": _make_row(
-            "src/b.py::function::primary_three",
-            "primary_three_body",
-        ),
-        "src/c.py::function::neighbor_one": _make_row(
-            "src/c.py::function::neighbor_one",
-            "neighbor_one_body_text",
-        ),
-        "src/c.py::method::Helper.neighbor_two": _make_row(
-            "src/c.py::method::Helper.neighbor_two",
-            "neighbor_two_body_text",
-        ),
-    }
-    records = {
-        "src/a.py::function::primary_one": _make_record(
-            "src/a.py::function::primary_one",
-            signature="(x: int) -> int",
-            doc_first_sentence="Add one to x.",
-        ),
-        "src/c.py::function::neighbor_one": _make_record(
-            "src/c.py::function::neighbor_one",
-            signature="(payload: dict) -> None",
-            doc_first_sentence="Persist payload to disk.",
-        ),
-        "src/c.py::method::Helper.neighbor_two": _make_record(
-            "src/c.py::method::Helper.neighbor_two",
-            signature="(self, kind: str) -> str",
-            doc_first_sentence="Resolve a kind to its display label.",
-            class_name="Helper",
-        ),
-    }
-    hits = [
-        _make_hit("src/a.py::function::primary_one", score=2.0),
-        _make_hit("src/a.py::function::primary_two", score=1.5),
-        _make_hit("src/b.py::function::primary_three", score=1.0),
-        _make_hit("src/c.py::function::neighbor_one", depth=1, score=0.5),
-        _make_hit("src/c.py::method::Helper.neighbor_two", depth=2, score=0.3),
-    ]
-    return cmap, records, hits
+def _ranked_hits(n: int) -> list:
+    """n hits, RRF-ordered (descending score), no extra provenance signals."""
+    return [_make_hit(f"src/m.py::function::f{i}", score=float(n - i))
+            for i in range(n)]
+
+
+_BUDGET = {
+    "primary_chars": 300, "long_chars": 150, "neighbor_chars": 80,
+    "primary_max": 8, "neighbor_max": 8, "total_chars": 100_000,
+}
 
 
 # ---------------------------------------------------------------------------
-# classify_hits
+# classify_hits (retained legacy graph-depth split)
 # ---------------------------------------------------------------------------
 def test_classify_hits_splits_by_graph_depth():
     hits = [
         _make_hit("a", depth=0),
         _make_hit("b", depth=1),
-        _make_hit("c"),  # no provenance
+        _make_hit("c"),
         _make_hit("d", depth=2),
     ]
     primary, neighbors = classify_hits(hits)
@@ -105,7 +64,6 @@ def test_classify_hits_splits_by_graph_depth():
 
 
 def test_classify_hits_handles_non_int_depth():
-    # Non-integer / missing provenance must not raise.
     hits = [{"chunk_id": "x", "provenance": {"graph_depth": "1"}},
             {"chunk_id": "y", "provenance": None},
             {"chunk_id": "z"}]
@@ -167,90 +125,126 @@ def test_load_records_by_id_missing_path_returns_empty():
 
 
 # ---------------------------------------------------------------------------
+# decide_visibility -- the ladder
+# ---------------------------------------------------------------------------
+def test_decide_visibility_empty():
+    assert decide_visibility([], budget=_BUDGET) == []
+
+
+def test_decide_visibility_rank1_always_full():
+    leveled = decide_visibility(_ranked_hits(10), budget=_BUDGET)
+    assert leveled[0][1] == "full"
+
+
+def test_decide_visibility_bands_by_quantile():
+    # n=10: full_cut=2, long_cut=5, short_cut=8 (top 20/30/30/rest).
+    levels = [lvl for _, lvl in decide_visibility(_ranked_hits(10), budget=_BUDGET)]
+    assert levels[0] == "full" and levels[1] == "full"
+    assert levels[2] == "long" and levels[4] == "long"
+    assert levels[5] == "short" and levels[7] == "short"
+    assert levels[8] == "hide" and levels[9] == "hide"
+
+
+def test_decide_visibility_strong_signal_bumps_up():
+    hits = _ranked_hits(10)
+    hits[5]["provenance"]["symbol_match"] = True   # base short -> long
+    hits[6]["provenance"]["intent_rank"] = 1       # base short -> long
+    levels = [lvl for _, lvl in decide_visibility(hits, budget=_BUDGET)]
+    assert levels[5] == "long"
+    assert levels[6] == "long"
+
+
+def test_decide_visibility_deep_or_demoted_bumps_down():
+    hits = _ranked_hits(10)
+    hits[2]["provenance"]["graph_depth"] = 3       # base long -> short
+    hits[3]["provenance"]["scope_demoted"] = True  # base long -> short
+    levels = [lvl for _, lvl in decide_visibility(hits, budget=_BUDGET)]
+    assert levels[2] == "short"
+    assert levels[3] == "short"
+
+
+def test_decide_visibility_primary_max_caps_full():
+    hits = _ranked_hits(10)
+    for i in range(5):  # first five all want full via symbol_match
+        hits[i]["provenance"]["symbol_match"] = True
+    levels = [lvl for _, lvl in decide_visibility(hits, budget={**_BUDGET,
+                                                                "primary_max": 2})]
+    assert levels.count("full") == 2  # overflow demoted to long
+    assert levels[2] == "long"
+
+
+# ---------------------------------------------------------------------------
 # build_tiered_context -- wiring & invariants
 # ---------------------------------------------------------------------------
-def test_build_tiered_context_orders_primary_before_neighbor(synth_corpus):
-    cmap, records, hits = synth_corpus
-    budget = {
-        "primary_chars": 200, "neighbor_chars": 120,
-        "primary_max": 4, "neighbor_max": 4,
-        "total_chars": 10_000,
-    }
-    out = build_tiered_context(hits, cmap, records, budget=budget)
+def _corpus(n: int, body: str = None):
+    hits = _ranked_hits(n)
+    cmap = {h["chunk_id"]: _make_row(
+        h["chunk_id"],
+        body if body is not None else "\n".join(f"body_{i}_{j}" for j in range(40)))
+        for i, h in enumerate(hits)}
+    records = {h["chunk_id"]: _make_record(
+        h["chunk_id"], signature="(x)", doc_first_sentence="Does the thing.")
+        for h in hits}
+    return cmap, records, hits
+
+
+def test_build_tiered_context_levels_and_ordering():
+    cmap, records, hits = _corpus(10)
+    out = build_tiered_context(hits, cmap, records, budget=_BUDGET)
     tiers = [s["tier"] for s in out]
-    # all primaries first, then all neighbors
-    split = tiers.index("neighbor") if "neighbor" in tiers else len(tiers)
-    assert all(t == "primary" for t in tiers[:split])
-    assert all(t == "neighbor" for t in tiers[split:])
-    assert tiers.count("primary") == 3
-    assert tiers.count("neighbor") == 2
+    # only ladder levels appear; 'hide' never rendered, legacy names gone.
+    assert set(tiers) <= {"full", "long", "short"}
+    # most-visible first
+    order = {"full": 0, "long": 1, "short": 2}
+    assert tiers == sorted(tiers, key=lambda t: order[t])
+    # rank-1 is full and rendered first with its real body.
+    assert out[0]["tier"] == "full"
+    assert out[0]["chunk_id"] == hits[0]["chunk_id"]
+    assert "body_0_" in out[0]["text"]
+    # hidden tail dropped -> fewer sources than hits.
+    assert len(out) < len(hits)
 
 
-def test_build_tiered_context_neighbor_uses_stub_not_body(synth_corpus):
-    cmap, records, hits = synth_corpus
-    budget = {
-        "primary_chars": 2_000, "neighbor_chars": 400,
-        "primary_max": 8, "neighbor_max": 8,
-        "total_chars": 20_000,
-    }
-    out = build_tiered_context(hits, cmap, records, budget=budget)
-    neighbors = [s for s in out if s["tier"] == "neighbor"]
-    assert neighbors, "expected at least one neighbor stub"
-    for s in neighbors:
-        # stub should be the formatted signature+doc string, NOT the raw body
-        assert "neighbor_one_body_text" not in s["text"]
-        assert "neighbor_two_body_text" not in s["text"]
-        assert s["signature"]  # carried over from records
+def test_build_tiered_context_short_uses_stub_not_body():
+    cmap, records, hits = _corpus(10, body="UNIQUE_BODY_MARKER")
+    out = build_tiered_context(hits, cmap, records, budget=_BUDGET)
+    shorts = [s for s in out if s["tier"] == "short"]
+    assert shorts, "expected some short stubs at this corpus size"
+    for s in shorts:
+        assert "UNIQUE_BODY_MARKER" not in s["text"]  # stub, not raw body
+        assert s["signature"]  # carried from records
 
 
-def test_build_tiered_context_enforces_total_chars_budget(synth_corpus):
-    cmap, records, hits = synth_corpus
-    # tiny ceiling forces truncation after the first primary
-    budget = {
-        "primary_chars": 500, "neighbor_chars": 200,
-        "primary_max": 8, "neighbor_max": 8,
-        "total_chars": 200,
-    }
+def test_build_tiered_context_full_and_long_carry_bodies():
+    cmap, records, hits = _corpus(10)
+    out = build_tiered_context(hits, cmap, records, budget=_BUDGET)
+    longs = [s for s in out if s["tier"] == "long"]
+    assert longs
+    # long bodies are shorter than full bodies (mid-window) but non-empty.
+    assert all(s["text"] for s in longs)
+    full = next(s for s in out if s["tier"] == "full")
+    assert len(full["text"]) >= max(len(s["text"]) for s in longs)
+
+
+def test_build_tiered_context_enforces_total_chars_budget():
+    cmap, records, hits = _corpus(10, body="X" * 500)
+    budget = {**_BUDGET, "primary_chars": 500, "long_chars": 300,
+              "total_chars": 600}
     out = build_tiered_context(hits, cmap, records, budget=budget)
     assert len(out) >= 1
-    assert sum(len(s.get("text") or "") for s in out) <= 500 + 200  # at most one slot beyond cap
+    total = sum(len(s.get("text") or "") for s in out)
+    assert total <= 600 + 500  # at most one slot beyond the cap
 
 
-def test_build_tiered_context_caps_per_tier(synth_corpus):
-    cmap, records, hits = synth_corpus
-    budget = {
-        "primary_chars": 1_000, "neighbor_chars": 200,
-        "primary_max": 1, "neighbor_max": 1,
-        "total_chars": 100_000,
-    }
-    out = build_tiered_context(hits, cmap, records, budget=budget)
-    tiers = [s["tier"] for s in out]
-    assert tiers.count("primary") == 1
-    assert tiers.count("neighbor") == 1
-
-
-def test_build_tiered_context_neighbor_stub_truncates(synth_corpus):
-    cmap, records, hits = synth_corpus
-    budget = {
-        "primary_chars": 1_000, "neighbor_chars": 12,
-        "primary_max": 4, "neighbor_max": 4,
-        "total_chars": 100_000,
-    }
-    out = build_tiered_context(hits, cmap, records, budget=budget)
-    for s in out:
-        if s["tier"] == "neighbor":
-            assert len(s["text"]) <= 12
-
-
-def test_build_tiered_context_no_neighbors_returns_only_primaries():
+def test_build_tiered_context_single_hit_is_full_with_backfilled_sig():
+    hits = [_make_hit("f::function::g")]
     cmap = {"f::function::g": _make_row("f::function::g", "body")}
     records = {"f::function::g": _make_record("f::function::g", signature="(x)")}
-    hits = [_make_hit("f::function::g")]
-    out = build_tiered_context(
-        hits, cmap, records,
-        budget={"primary_chars": 100, "neighbor_chars": 50,
-                "primary_max": 4, "neighbor_max": 4, "total_chars": 1_000},
-    )
+    out = build_tiered_context(hits, cmap, records, budget=_BUDGET)
     assert len(out) == 1
-    assert out[0]["tier"] == "primary"
+    assert out[0]["tier"] == "full"
     assert out[0]["signature"] == "(x)"  # backfilled from record
+
+
+def test_build_tiered_context_empty_hits():
+    assert build_tiered_context([], {}, {}, budget=_BUDGET) == []

@@ -164,7 +164,18 @@ def _ask_for_plan(provider: Any, goal: str,
         {"role": "user", "content": user},
     ]
     ctx = ToolContext(root=project_root or ".", log_root=project_root)
+    from cgx.answer.model_caps import effective_context_window
+    from cgx.session.context_budget import fit_react_messages
+    ectx = effective_context_window(provider)
     for _ in range(5):
+        # Deterministic num_ctx guard: cap oversized tool observations and, if
+        # the running prompt would overflow the window, elide the OLDEST middle
+        # turns while keeping the system+objective head and the most recent
+        # turns -- so a large tool_response can no longer silently truncate the
+        # planner's own reasoning off the tail (JEV #2 CACHE).
+        messages = fit_react_messages(
+            messages, effective_ctx=ectx, reserve_output=1200,
+            keep_recent=4, per_msg_cap_chars=4000)
         try:
             # force_json=False so a tool tag isn't rejected by strict-JSON
             # providers; the plan is parsed leniently from the final reply.

@@ -270,24 +270,30 @@ _SCAFFOLD_OUTPUT_TOKENS: Dict[CapabilityTier, int] = {
     "xlarge": 16_000,
 }
 
+# Per-tier char/count budgets for the visibility ladder
+# (:func:`cgx.answer.context_map.build_tiered_context`). ``primary_chars`` caps
+# a "full" chunk body, ``long_chars`` a mid-window "long" chunk (~0.4x full),
+# and ``neighbor_chars`` a "short" signature/doc stub. ``primary_max`` caps how
+# many chunks may be "full"; ``neighbor_max`` caps "short" stubs; ``total_chars``
+# is the hard ceiling on the concatenated bodies across all levels.
 _CONTEXT_MAP_BUDGETS: Dict[CapabilityTier, Dict[str, int]] = {
     "small": {
-        "primary_chars": 900,  "neighbor_chars": 220,
+        "primary_chars": 900,  "long_chars": 380,  "neighbor_chars": 220,
         "primary_max": 8,      "neighbor_max": 12,
         "total_chars": 6_000,
     },
     "medium": {
-        "primary_chars": 1_400, "neighbor_chars": 320,
+        "primary_chars": 1_400, "long_chars": 600,  "neighbor_chars": 320,
         "primary_max": 12,      "neighbor_max": 24,
         "total_chars": 18_000,
     },
     "large": {
-        "primary_chars": 2_200, "neighbor_chars": 420,
+        "primary_chars": 2_200, "long_chars": 950,  "neighbor_chars": 420,
         "primary_max": 20,      "neighbor_max": 40,
         "total_chars": 48_000,
     },
     "xlarge": {
-        "primary_chars": 3_500, "neighbor_chars": 520,
+        "primary_chars": 3_500, "long_chars": 1_500, "neighbor_chars": 520,
         "primary_max": 32,      "neighbor_max": 60,
         "total_chars": 120_000,
     },
@@ -345,11 +351,12 @@ def get_context_map_budget(provider: Any) -> Dict[str, int]:
     magic numbers in the call sites.
 
     Keys returned:
-      * ``primary_chars``  -- per-chunk char cap for primary (full-window) sources
-      * ``neighbor_chars`` -- per-chunk char cap for neighbor stub sources
-      * ``primary_max``    -- max number of primary chunks
-      * ``neighbor_max``   -- max number of neighbor stubs
-      * ``total_chars``    -- hard ceiling on the concatenated body text across tiers
+      * ``primary_chars``  -- per-chunk char cap for "full" (full-window) sources
+      * ``long_chars``     -- per-chunk char cap for "long" (mid-window) sources
+      * ``neighbor_chars`` -- per-chunk char cap for "short" stub sources
+      * ``primary_max``    -- max number of "full" chunks
+      * ``neighbor_max``   -- max number of "short" stubs
+      * ``total_chars``    -- hard ceiling on the concatenated body text across levels
     """
     return dict(_CONTEXT_MAP_BUDGETS[get_capability_tier(provider)])
 
