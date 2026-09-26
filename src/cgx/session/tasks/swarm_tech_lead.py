@@ -106,11 +106,10 @@ _SYSTEM_PROMPT = (
     "initializes it (e.g. a Python 'app = Flask(__name__)'/'FastAPI()' module,\n"
     "or a JS 'src/main.jsx' that mounts the app). Do NOT expect tests to run\n"
     "without an application instance to import.\n"
-    "THIRD-PARTY LIBRARIES: if you use third-party libraries, you MAY search\n"
-    "the web to retrieve their latest API signatures and include them in the\n"
-    "contracts. Use tools by outputting: "
-    "<call_tool name=\"search_web\">{\"query\": \"...\"}</call_tool>.\n"
-    "If you call a tool, wait for the response before outputting the final JSON.\n"
+    "THIRD-PARTY LIBRARIES: if you use third-party libraries, you MAY use the\n"
+    "available tools (listed below) to retrieve their latest API signatures\n"
+    "and include them in the contracts. If you call a tool, wait for the\n"
+    "<tool_response> before outputting the final JSON.\n"
     "Follow any ACTIVE SKILL guidance below for the specific frameworks.\n"
     "Output ONLY the JSON when you are ready to finalize the plan."
 )
@@ -153,12 +152,18 @@ def _ask_for_plan(provider: Any, goal: str,
         # Flask's app/blueprint conventions) for the stacks detected in the
         # goal -- this is what teaches the planner to include the frontend.
         system += "\n\nACTIVE SKILLS (follow this guidance):\n" + skill_prompt
+    # Advertise EXACTLY the tools the planner can dispatch (search_web +
+    # fetch_url + any configured MCP tools), rendered from the registry so the
+    # prompt can never drift from what _planner_tools() actually runs.
+    planner_tools = _planner_tools()
+    tool_block = REGISTRY.describe_for_prompt(planner_tools)
+    if tool_block:
+        system += "\n\n" + tool_block
     messages = [
         {"role": "system", "content": system},
         {"role": "user", "content": user},
     ]
     ctx = ToolContext(root=project_root or ".", log_root=project_root)
-    planner_tools = _planner_tools()
     for _ in range(5):
         try:
             # force_json=False so a tool tag isn't rejected by strict-JSON

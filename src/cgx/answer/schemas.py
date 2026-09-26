@@ -144,6 +144,50 @@ REPAIR_FILES_SCHEMA: Dict[str, Any] = {
 }
 
 
+# DIAGNOSE per-turn output (JEV typed decision). A turn is EITHER a read-only
+# tool call (``{"tool": <enum>, "path"/"pattern": ...}``) OR the final typed
+# verdict (``{"minimal_action": <enum>, ...}``). NEITHER key is required -- the
+# model picks one shape per turn -- but when a key IS present its enum is
+# constrained, so a weak local model can no longer emit an out-of-enum
+# tool/action that silently degrades to ``escalate`` (the bug this closes).
+# The ``tool`` enum mirrors ``diagnose._DIAGNOSE_TOOLS`` and ``minimal_action``
+# mirrors ``diagnose.MINIMAL_ACTIONS``; a unit test asserts they stay in sync.
+DIAGNOSIS_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "tool": {"type": "string",
+                 "enum": ["read_file", "grep_files", "inspect_packages"]},
+        "path": {"type": "string"},
+        "pattern": {"type": "string"},
+        "minimal_action": {
+            "type": "string",
+            "enum": ["patch_files", "add_dependency", "remove_dependency",
+                     "adjust_manifest", "regenerate_files", "escalate"],
+        },
+        "root_cause": {"type": "string"},
+        "target_files": {"type": "array", "items": {"type": "string"}},
+        "add_dependencies": {"type": "array", "items": {"type": "string"}},
+        "remove_dependencies": {"type": "array", "items": {"type": "string"}},
+        "remove_tests": {"type": "array", "items": {"type": "string"}},
+        "manifest_edits": {"type": "array"},
+        "rationale": {"type": "string"},
+        "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+    },
+}
+
+# SWARM_ASSESS relevance verdict (JEV typed decision): does the existing repo
+# match the build objective? ``relevant`` is the decision the router branches
+# on; ``reason`` is a one-line justification surfaced in the swarm log.
+SWARM_RELEVANCE_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "relevant": {"type": "boolean"},
+        "reason": {"type": "string"},
+    },
+    "required": ["relevant"],
+}
+
+
 # ---------------------------------------------------------------------------
 # Boundary validation (pure)
 # ---------------------------------------------------------------------------
@@ -156,7 +200,8 @@ def validate_json_schema(
     schema (older Ollama, ``json_object``-only servers), so executors re-check
     the parsed reply here and fold the returned violations into a bounded
     re-ask. Supports exactly the keys the schemas above use (``type``,
-    ``properties``, ``required``, ``items``, ``minItems``, ``enum``); each
+    ``properties``, ``required``, ``items``, ``minItems``, ``enum``,
+    ``minimum``, ``maximum``); each
     violation is a human-readable ``"$.layers[0].files: ..."`` string the
     model can act on. Empty list means conforming.
     """
@@ -194,6 +239,16 @@ def validate_json_schema(
     elif t == "boolean":
         if not isinstance(obj, bool):
             errs.append(f"{path}: expected a boolean, got {type(obj).__name__}")
+    minimum = schema.get("minimum")
+    if (isinstance(minimum, (int, float)) and not isinstance(minimum, bool)
+            and isinstance(obj, (int, float)) and not isinstance(obj, bool)
+            and obj < minimum):
+        errs.append(f"{path}: expected >= {minimum}, got {obj!r}")
+    maximum = schema.get("maximum")
+    if (isinstance(maximum, (int, float)) and not isinstance(maximum, bool)
+            and isinstance(obj, (int, float)) and not isinstance(obj, bool)
+            and obj > maximum):
+        errs.append(f"{path}: expected <= {maximum}, got {obj!r}")
     enum = schema.get("enum")
     if isinstance(enum, list) and enum and obj not in enum:
         errs.append(f"{path}: expected one of {enum!r}")
