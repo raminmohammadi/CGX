@@ -36,7 +36,12 @@ def serve_web_file(root_real: str, rel_path: str) -> Response:
     rel = (rel_path or "").strip()
     if not rel or rel.endswith("/"):
         rel = (rel + "index.html").lstrip("/")
-    candidate = os.path.realpath(os.path.join(root, rel))
+    if os.path.isabs(rel):
+        raise HTTPException(status_code=403, detail="absolute paths are not allowed")
+    norm_rel = os.path.normpath("/" + rel).lstrip("/")
+    if norm_rel.startswith(".."):
+        raise HTTPException(status_code=403, detail="path escapes site root")
+    candidate = os.path.realpath(os.path.join(root, norm_rel))
     if not (candidate == root or candidate.startswith(root + os.sep)):
         raise HTTPException(status_code=403, detail="path escapes site root")
     ext = os.path.splitext(candidate)[1].lower()
