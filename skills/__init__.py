@@ -314,6 +314,29 @@ def collect_scaffold_warnings(skills: List[Skill],
     return out
 
 
+def apply_scaffold_repairs(skills: List[Skill],
+                           files: List[Dict[str, Any]]
+                           ) -> Dict[str, str]:
+    """Merge every active skill's deterministic :meth:`Skill.repair_scaffold`.
+
+    The Layer-1 fast-path the VERIFY loop runs *before* spending any LLM repair
+    round: each skill returns ``{path: fixed_content}`` for the mechanical bugs
+    it can fix with certainty (Flask double-prefix, ...). Later skills win on a
+    path collision (rare; skills govern disjoint file classes). Each skill is
+    isolated -- one that raises is skipped, never sinking the pass.
+    """
+    out: Dict[str, str] = {}
+    for s in skills:
+        try:
+            fixes = s.repair_scaffold(files) or {}
+        except Exception:  # pragma: no cover - a skill repair must never crash verify
+            continue
+        for path, content in fixes.items():
+            if isinstance(path, str) and isinstance(content, str):
+                out[path] = content
+    return out
+
+
 def validate_plan(skills: List[Skill],
                   diffs: List[Dict[str, Any]],
                   goal: str = "") -> Optional[SkillVerdict]:
@@ -335,6 +358,7 @@ __all__ = [
     "MarkdownSkill",
     "Skill",
     "SkillVerdict",
+    "apply_scaffold_repairs",
     "collect_scaffold_warnings",
     "compose_ask_prompt",
     "compose_plan_prompt",
