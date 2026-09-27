@@ -11,7 +11,7 @@ cgx <command> [flags]
 
 ---
 
-## Commands at a glance
+## Core commands at a glance
 
 | Command      | What it does                                                   |
 |--------------|----------------------------------------------------------------|
@@ -29,6 +29,46 @@ cgx <command> [flags]
 Braille spinner and **cancel on Ctrl-C** (exit code `130`); any other
 failure exits `1`. Colour follows the TTY / `NO_COLOR` /
 `CGX_FORCE_COLOR` rules, so piping to a file yields clean text.
+
+## Management & operations commands
+
+Everything the web UI can do is also a scriptable subcommand. These follow a
+`git`-style **noun-verb** shape, print **JSON by default** (add `--table` on
+`list`-style verbs for a human view), and map errors to a non-zero exit code
+(`2` = not found, `3` = validation/forbidden). Each is a thin adapter over the
+same engine the web UI's REST routes call.
+
+| Command group | Verbs | Mirrors |
+|---------------|-------|---------|
+| `cgx skills` | `list` · `show` · `create` · `edit` · `delete` (`--markdown`) | Skills registry |
+| `cgx profile` | `list` · `show` · `add` · `rm` | LLM connection presets |
+| `cgx agent-profile` | `list` · `show` · `add` · `rm` | Saved `{objective, skills}` bundles |
+| `cgx context` | `show` · `edit` · `rm` | Repo `CGX.md` context file |
+| `cgx site` | `list` · `new` · `generate` · `revise` · `path` · `themes` | Site Studio |
+| `cgx session` | `list` · `show` · `rm` · `send` · `decide` | Agent sessions: inspect, drive, decide |
+| `cgx model` | `list` · `matrix` · `fit` · `pull` · `embed-list` · `embed-pull` | Model discovery / pull |
+| `cgx mcp` | `list` · `enable` · `disable` · `tools` | MCP tool servers |
+| `cgx activity` | `runs` · `summary` · `show` | Per-run observation store |
+| `cgx usage` | `show` · `summary` | Cost & quota governance |
+| `cgx feedback` | `stats` · `list` · `add` | Thumbs-up/down feedback |
+| `cgx monitor` | `alerts` | AIOps quality/drift/cost alerts |
+| `cgx govdata` | `policy` · `scan` · `purge` · `erase` | Data governance / PII |
+| `cgx admin` | `overview` · `logs` · `metrics` · `purge-logs` | Admin logs / metrics |
+| `cgx trace` | `status` · `on` · `off` | Runtime trace toggle |
+| `cgx approvals` | `pending` · `resolve` | Human-in-the-loop approvals (in-process) |
+| `cgx rollback` | (restore from an APPLY backup dir) | Undo applied changes |
+| `cgx health` | (liveness + readiness; non-zero exit when not ready) | `/healthz` · `/readyz` |
+| `cgx metrics` | (Prometheus text, or `--json` snapshot) | `/api/metrics` |
+
+Run `cgx <group> --help` and `cgx <group> <verb> --help` for the authoritative
+flags. Notes: `session send`/`decide` **drive** an existing session (stream live,
+Ctrl-C cancels) — `send` posts a follow-up message, `decide --task-id --chosen
+'{"approved": true}'` answers an open decision; run from the project dir (or pass
+`--project-root`) so the session id resolves. `cgx agent` (unattended) and
+`cgx dash` (interactive) remain the ways to *start* a session; `approvals resolve` acts
+on an in-process gate, so for terminal runs prefer `cgx agent --approve`;
+`govdata purge`/`erase` and `admin purge-logs` are destructive and require an
+explicit scope flag.
 
 ---
 

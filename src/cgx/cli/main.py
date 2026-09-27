@@ -22,7 +22,7 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Any, Callable, Dict
+from typing import Any, Callable
 
 from cgx.pipeline.auto import run_index_auto, run_query_auto
 from cgx.config import EmbeddingConfig, FaissConfig, HybridSearchConfig
@@ -270,7 +270,12 @@ def _add_provider_flags(p: argparse.ArgumentParser) -> None:
                    help="Override auto-detected session mode.")
 
 
-def main(argv: list[str] | None = None) -> None:
+def build_parser() -> argparse.ArgumentParser:
+    """Construct the full ``cgx`` argument parser.
+
+    Split out from :func:`main` so tests can introspect the command surface
+    (e.g. the CLI<->UI parity guard) without invoking the CLI.
+    """
     parser = argparse.ArgumentParser(prog="cgx", description="Codebase RAG CLI")
     # No subcommand -> launch the interactive dashboard (the friendly
     # default surface). Explicit subcommands remain for scripted use.
@@ -373,6 +378,16 @@ def main(argv: list[str] | None = None) -> None:
     _add_provider_flags(p_st)
     p_st.set_defaults(func=_cmd_status)
 
+    # UI-parity command groups (skills, sites, ...). Each self-registers a
+    # noun-verb group over engine functions -- see cgx.cli.commands.
+    from cgx.cli.commands import register_all
+    register_all(sub)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = build_parser()
     args = parser.parse_args(argv)
     # Bare `cgx` (no subcommand) opens the dashboard.
     if getattr(args, "func", None) is None:

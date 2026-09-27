@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import os
 import re
-from typing import List, Optional
+from typing import List
 
 from cgx.cli.tui import ansi
 
@@ -50,7 +50,7 @@ def render_tips(*, enabled: bool = True) -> str:
         head,
         f"1. {cmd('/index')} builds the code graph so answers are grounded.",
         f"2. {cmd('/ask')} a question for a fast, read-only grounded answer.",
-        f"3. Type a change to make and the agent plans + executes it live.",
+        "3. Type a change to make and the agent plans + executes it live.",
         f"4. Press {cmd('Ctrl-C')} to cancel a running task; {cmd('/quit')} exits.",
     ]
     return "\n".join(lines)
