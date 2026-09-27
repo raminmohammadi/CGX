@@ -725,16 +725,33 @@ def swarm_verify(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
                     or deps.project_root or ".")
 
     swarm_beat(project_root, "verify", "structural", total=len(paths))
+    # Every defect the run encountered, for the Layer-2 post-mortem to learn
+    # from (prevention lessons are valuable even for defects that WERE fixed).
+    incidents: List[Dict[str, Any]] = []
     # Layer-1 fast-path FIRST: deterministically fix the mechanical, decidable
     # bugs (Flask double-prefix, ...) with no model call, so the structural scan
     # below sees a cleaner tree and the LLM repair budget is spent only on what
     # genuinely needs a model.
-    _apply_deterministic_repairs(paths, project_root, skills)
+    autofixed = _apply_deterministic_repairs(paths, project_root, skills)
+    if autofixed:
+        incidents.append({
+            "phase": "autofix", "fixed": True, "files": autofixed,
+            "detail": ("Deterministically fixed a mechanical defect (e.g. a "
+                       "blueprint route repeating its own url_prefix) in: "
+                       + ", ".join(autofixed))})
     rounds = 0
+    first_scan = True
     while True:
         contents = _collect_contents(paths, project_root)
         gaps, import_w, phantom_w, contract_w = _structural_scan(
             paths, contents, contracts, project_root, skills, goal)
+        if first_scan:
+            first_scan = False
+            for w in import_w:
+                incidents.append({
+                    "phase": "structural", "fixed": True,  # repaired below (best-effort)
+                    "files": [w.get("define_in") or w.get("file") or ""],
+                    "detail": str(w.get("reason") or "structural break")})
         targets = _regen_targets(gaps, import_w)
         if not targets or rounds >= _MAX_VERIFY_ROUNDS:
             break
@@ -906,6 +923,30 @@ def swarm_verify(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     swarm_beat(project_root, "verify", "report", ok=verify_ok,
                gaps=len(gaps), imports=len(import_w),
                contracts=len(contract_w), tests=env.get("outcome"))
+
+    # LAYER 2 -- learn from this run. Record what stayed broken as an unresolved
+    # incident, then run ONE bounded post-mortem (gated by CGX_SWARM_LEARNING)
+    # that distils generalised lessons and auto-appends them to the skill/project
+    # stores, so the next run avoids the mistake at generation time. Best-effort:
+    # learning never changes this run's verdict.
+    if not verify_ok:
+        incidents.append({
+            "phase": "unresolved", "fixed": False, "files": still_failed,
+            "signature": sorted(_failure_signature(str(env.get("output") or ""))),
+            "detail": "Run did not reach green: " + summary})
+    if incidents:
+        try:
+            from cgx.learning.postmortem import run_postmortem
+            recorded = run_postmortem(
+                deps.provider, goal=goal, skills=skills, root=project_root,
+                incidents=incidents, session_id=task.session_id,
+                task_id=task.task_id)
+            for r in recorded:
+                swarm_beat(project_root, "verify", "lesson_recorded",
+                           scope=r["scope"], skill=r.get("skill", ""),
+                           lesson=r["lesson"][:160])
+        except Exception as e:  # pragma: no cover - learning is best-effort
+            swarm_beat(project_root, "verify", "learn_error", error=repr(e))
     return ExecutorResult(
         artifact=artifact,
         outputs={"verify_ok": verify_ok,

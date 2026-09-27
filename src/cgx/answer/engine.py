@@ -2502,7 +2502,8 @@ def generate_project_scaffold(
     active_skills = _resolve_skills(skills, detect_text)
     try:
         import skills as _sk
-        skill_fragment = _sk.compose_scaffold_prompt(active_skills)
+        skill_fragment = _sk.compose_scaffold_prompt(
+            active_skills, project_root=project_root)
         skill_names_str = ", ".join(s.name for s in active_skills)
     except Exception:  # pragma: no cover - defensive
         skill_fragment = ""

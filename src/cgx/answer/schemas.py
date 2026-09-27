@@ -188,6 +188,36 @@ SWARM_RELEVANCE_SCHEMA: Dict[str, Any] = {
 }
 
 
+# LESSON extraction (JEV typed decision, run as a bounded post-mortem after a
+# failed/repaired Swarm run). The model distils each concrete failure into a
+# GENERALISED, durable rule and picks its scope: ``skill`` when the lesson
+# applies to every future run of that technology (a stack gotcha), ``project``
+# when it is specific to this repo. ``generalizable`` lets the harness drop a
+# lesson the model itself flags as one-off. Empty ``lessons`` is valid ("nothing
+# durable to learn"), so the post-mortem never invents noise.
+LESSON_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "lessons": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "scope": {"type": "string",
+                              "enum": ["project", "skill"]},
+                    "skill": {"type": "string"},
+                    "root_cause": {"type": "string"},
+                    "lesson": {"type": "string"},
+                    "generalizable": {"type": "boolean"},
+                },
+                "required": ["scope", "lesson"],
+            },
+        },
+    },
+    "required": ["lessons"],
+}
+
+
 # ---------------------------------------------------------------------------
 # Boundary validation (pure)
 # ---------------------------------------------------------------------------
