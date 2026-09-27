@@ -102,14 +102,15 @@ CGX ensures all data, embeddings, and executions remain strictly on your machine
   `skills/django/`, `skills/express/`, `skills/python_cli/`,
   `skills/sqlite/`) and bundles three things: detection from the goal,
   the prompt fragment the LLM sees while generating, and a structural
-  validator that runs on the produced diffs. The SCAFFOLD executor
-  invokes `skills.validate_scaffold` after each generation, and a fatal
-  verdict (e.g. a React goal that emitted no JS/TS source) drives a
-  whole-tree regenerate rather than silently applying a Python-only
-  output. Multi-skill goals compose naturally -- *"React UI
-  + FastAPI backend"* activates both, so the scaffold prompt carries
-  both layouts and both validators run. Adding a new framework is a single-folder change with
-  no agent-layer edits. See
+  validator that **gates** the produced diffs. Both the greenfield SCAFFOLD
+  executor **and the Swarm verify path** invoke `skills.validate_scaffold`, and
+  a fatal verdict drives a corrective regenerate rather than silently applying a
+  wrong-shaped output. Beyond per-skill checks, a shared layer catches
+  **circular imports** (a routes↔app cycle that breaks even test collection) and
+  **undeclared dependencies** across every backend stack. Multi-skill goals
+  compose naturally -- *"React UI + FastAPI backend"* activates both, so the
+  scaffold prompt carries both layouts and both validators run. Adding a new
+  framework is a single-folder change with no agent-layer edits. See
   [docs/usage.md](docs/usage.md#skills-technology-aware-scaffolding)
   for the full table and [docs/architecture.md](docs/architecture.md#skills)
   for the protocol.
@@ -120,7 +121,11 @@ CGX ensures all data, embeddings, and executions remain strictly on your machine
   the agents, activate **deterministically** (keyword triggers / always-on /
   an explicit pin -- no model-side selection, so small local models use them
   reliably), and are size-capped so they never crowd out retrieved
-  citations. No code runs. Author them in the UI (**Agent → New Skill /
+  citations. No code runs. A markdown skill can also carry lightweight
+  **declarative validation** (`require_files` / `forbid_files` /
+  `require_patch_regex`) and file-condition activation (`context_globs` /
+  `context_exts`), so even a code-free skill can *reject* a bad diff, not just
+  steer it. Author them in the UI (**Agent → New Skill /
   Context File**) or commit them to the repo. See
   [docs/skills-and-context.md](docs/skills-and-context.md).
 - **Site Studio.** Describe a website in plain English and CGX clarifies

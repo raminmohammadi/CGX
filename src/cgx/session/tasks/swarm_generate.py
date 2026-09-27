@@ -307,6 +307,28 @@ def _gate_generated_content(path: str, content: str,
     return f"Contract compliance failed for {path}: {errs}"
 
 
+def _regate_repaired(path: str, content: str, contracts: Dict[str, Any],
+                     manifest_paths: Optional[List[str]],
+                     root: str) -> Optional[str]:
+    """Re-run the gate on semantic-repaired content: syntax (Python) + the
+    shared contract / first-party-import gate. ``None`` when clean, else the
+    error string.
+
+    A semantic repair only *attempts* a fix; without re-gating, a repair that
+    did not actually resolve the defect was written with ``ok=True`` (the write
+    beat then overstated success). Re-gating lets the caller mark the write
+    truthfully and hand a still-broken file to VERIFY for regeneration.
+    """
+    if path.endswith(".py"):
+        import ast
+        try:
+            ast.parse(content)
+        except SyntaxError as e:
+            return (f"Contract compliance failed for {path}: still a syntax "
+                    f"error after repair: {e}")
+    return _gate_generated_content(path, content, contracts, manifest_paths, root)
+
+
 def _full_file_attempt(path: str, description: str, depends_on: List[str],
                        contracts: Dict[str, Any], goal: str, root: str,
                        provider: Any, layer: str,
@@ -660,21 +682,43 @@ def generate_file(*, path: str, description: str, depends_on: List[str],
         content = _sanitize_phantoms(content, path, log_root)
         return GenerationOutcome(path, content, True, "full-file")
 
+    # The `renegotiate` / `semantic_repair` beats report their OUTCOME (ok +
+    # triggered_by), not just the error that triggered them -- an attempt beat
+    # carrying `error` read as a terminal FAILURE in the live feed even when the
+    # rung then succeeded. `triggered_by` gives the reason as context without
+    # mislabelling a successful repair.
+    trigger = str(err)[:200]
     if "Contract compliance failed" in err:
-        swarm_beat(log_root, "developer", "renegotiate", file=path, error=err)
         renegotiated_contracts = _renegotiate_contracts(
             path, last_broken_content, err, contracts, goal, provider)
         if renegotiated_contracts is not None:
-            # We return the content because it's syntactically valid!
-            return GenerationOutcome(path, last_broken_content, True, "renegotiated", renegotiated_contracts=renegotiated_contracts)
-    
-    swarm_beat(log_root, "developer", "semantic_repair", file=path, error=err)
+            # Syntactically-valid content whose contracts were amended to match.
+            swarm_beat(log_root, "developer", "renegotiate", file=path,
+                       ok=True, triggered_by=trigger)
+            return GenerationOutcome(path, last_broken_content, True,
+                                     "renegotiated",
+                                     renegotiated_contracts=renegotiated_contracts)
+        swarm_beat(log_root, "developer", "renegotiate", file=path,
+                   ok=False, triggered_by=trigger)
+
     repaired_content, repair_err = _semantic_repair_fallback(
         path, last_broken_content, err, goal, root, provider)
     if repaired_content:
         repaired_content = _sanitize_phantoms(repaired_content, path, log_root)
-        return GenerationOutcome(path, repaired_content, True, "semantic-repair")
-    
+        # Re-gate: a repair that did not actually fix the defect must NOT be
+        # written as a success. On a clean re-gate we accept it; otherwise we
+        # report a truthful failure and let VERIFY regenerate the file.
+        regate_err = _regate_repaired(path, repaired_content, contracts,
+                                      manifest_paths, root)
+        if not regate_err:
+            swarm_beat(log_root, "developer", "semantic_repair", file=path,
+                       ok=True, triggered_by=trigger)
+            return GenerationOutcome(path, repaired_content, True,
+                                     "semantic-repair")
+        repair_err = regate_err
+
+    swarm_beat(log_root, "developer", "semantic_repair", file=path, ok=False,
+               triggered_by=trigger, error=str(repair_err or err)[:200])
     return GenerationOutcome(path, "", False, "failed",
                              error=repair_err or err)
 

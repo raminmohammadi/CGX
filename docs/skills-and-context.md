@@ -108,6 +108,38 @@ isn't `always_on`, it's **pin-only**.
 Default is `chat`, so authoring a knowledge skill never perturbs the
 JSON-strict codegen prompts unless you opt in.
 
+### Optional: catch bad output, and bind to touched files
+
+A codegen skill (`surfaces: [scaffold]` / `[plan]`) can go beyond steering the
+prompt and **validate** the generated diffs declaratively — so it can *reject* a
+bad output, not just describe the right one. All fields are optional:
+
+```markdown
+---
+name: house-flask
+surfaces: [scaffold, plan]
+forbid_files: ["package.json", "*.env"]          # no diff file may match
+require_files: ["backend/extensions.py"]         # scaffold must include one
+forbid_patch_regex: ["from .*app import .*db"]   # no diff body may match
+require_patch_regex: ["create_app"]              # some diff body must match
+validate_surfaces: [scaffold]                    # default: this skill's non-chat surfaces
+context_globs: ["billing/**", "*.tf"]            # activate when a task touches these
+context_exts: [".css", ".scss"]                  # ...or files with these extensions
+---
+```
+
+- **File checks** run over the diff paths; **patch-regex checks** over the diff
+  bodies. A violation is a fatal verdict that drives a corrective regenerate,
+  the same as a built-in skill's validator. (`require_*` runs on a full
+  scaffold; on an incremental **plan** edit only `forbid_files` applies, so a
+  small edit is never rejected for lacking a required file.)
+- `context_globs` / `context_exts` are **condition-bound activation**: the skill
+  turns on when the current task touches a matching file, even without a goal
+  keyword — useful for a "when working under `billing/`" or "when editing CSS"
+  house rule.
+- Regexes are validated when you save the skill; an uncompilable pattern is
+  rejected with a clear error.
+
 ---
 
 ## Managing skills & context via the API

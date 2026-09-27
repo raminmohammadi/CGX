@@ -30,6 +30,11 @@ from cgx.session.tasks.swarm_plan import (
 # (unparseable / not buildable) before the plan is declared a dead end.
 _MAX_PLAN_ATTEMPTS = 3
 
+# Ceiling on composed skill guidance injected into the planner prompt, so a
+# large (esp. markdown) skill body can't crowd the objective + contracts off a
+# small model's num_ctx window.
+_MAX_SKILL_PROMPT_CHARS = 4000
+
 _SYSTEM_PROMPT = (
     "You are the Tech Lead in a two-agent swarm. You do NOT write code.\n"
     "You author a build PLAN as a single JSON object and nothing else.\n\n"
@@ -314,7 +319,11 @@ def swarm_tech_lead(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
                         detect_skills, skill_names, skills_by_names,
                         validate_plan)
     pinned = _session_skills(task, deps)
-    active_skills = skills_by_names(pinned) if pinned else detect_skills(goal)
+    # Thread project_root so repo-scoped markdown skills (<repo>/.cgx/skills/*.md
+    # with surfaces incl. scaffold/plan) activate during a Swarm build, not just
+    # in chat.
+    active_skills = (skills_by_names(pinned, project_root=project_root) if pinned
+                     else detect_skills(goal, project_root=project_root))
     # The planner needs the framework's *structural* requirements (e.g. React's
     # Vite layout mandates an index.html entry + main.jsx + package.json), which
     # live in the scaffold fragment; the plan fragment adds modify-time rules.
@@ -324,6 +333,11 @@ def swarm_tech_lead(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     _struct = compose_scaffold_prompt(active_skills)
     _rules = compose_plan_prompt(active_skills)
     skill_prompt = "\n\n".join(p for p in (_struct, _rules) if p.strip())
+    # Clip composed skill guidance so a large (esp. markdown) skill body can't
+    # crowd the objective + contracts off a small model's num_ctx window.
+    if len(skill_prompt) > _MAX_SKILL_PROMPT_CHARS:
+        skill_prompt = (skill_prompt[:_MAX_SKILL_PROMPT_CHARS].rstrip()
+                        + "\n[... skill guidance truncated ...]")
     active_skill_names = skill_names(active_skills)
     if active_skill_names:
         swarm_beat(project_root, "tech_lead", "skills",

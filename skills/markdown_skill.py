@@ -25,9 +25,10 @@ gated by ``surfaces`` so a "how we write code here" skill can target
 from __future__ import annotations
 
 import re
+from fnmatch import fnmatch
 from typing import Any, Dict, List, Optional, Tuple
 
-from skills.base import ROLES, Skill
+from skills.base import ROLES, Skill, SkillVerdict, file_paths
 from skills.frontmatter import parse_frontmatter
 
 __all__ = [
@@ -109,6 +110,31 @@ def _build_trigger_matcher(triggers: List[str],
         return None
 
 
+def _compile_all(patterns: List[str]) -> List[Tuple[re.Pattern, str]]:
+    """Compile regex patterns, silently dropping any that don't compile.
+
+    ``check_source`` validates these at save time; this stays lenient so a
+    slightly-malformed skill never throws during detection/validation.
+    """
+    out: List[Tuple[re.Pattern, str]] = []
+    for p in patterns or []:
+        try:
+            out.append((re.compile(p), p))
+        except re.error:
+            continue
+    return out
+
+
+def _diff_body(d: Dict[str, Any]) -> str:
+    return str(d.get("patch") or d.get("diff") or d.get("content")
+               or d.get("new_content") or "")
+
+
+def _matches_glob(path: str, pattern: str) -> bool:
+    p = path.replace("\\", "/")
+    return fnmatch(p, pattern) or fnmatch(p.rsplit("/", 1)[-1], pattern)
+
+
 class MarkdownSkill(Skill):
     """A :class:`Skill` backed by a ``SKILL.md`` document.
 
@@ -120,6 +146,13 @@ class MarkdownSkill(Skill):
                  triggers: Optional[List[str]] = None, trigger_regex: str = "",
                  surfaces: Tuple[str, ...] = DEFAULT_SURFACES,
                  always_on: bool = False, priority: int = 0,
+                 require_files: Optional[List[str]] = None,
+                 forbid_files: Optional[List[str]] = None,
+                 require_patch_regex: Optional[List[str]] = None,
+                 forbid_patch_regex: Optional[List[str]] = None,
+                 validate_surfaces: Tuple[str, ...] = (),
+                 context_globs: Optional[List[str]] = None,
+                 context_exts: Optional[List[str]] = None,
                  scope: str = "global", source_path: str = "") -> None:
         self.name = name
         self.description = description
@@ -134,6 +167,18 @@ class MarkdownSkill(Skill):
         #: "global" (~/.cgx/skills), "repo" (<root>/.cgx/skills) or "builtin".
         self.scope = scope
         self.source_path = source_path
+        # Declarative, lightweight validation (the only way a markdown skill can
+        # CATCH a bad diff rather than only steer via its prompt body).
+        self.require_files = list(require_files or [])
+        self.forbid_files = list(forbid_files or [])
+        self.validate_surfaces = tuple(validate_surfaces or ())
+        self._require_pat = _compile_all(require_patch_regex or [])
+        self._forbid_pat = _compile_all(forbid_patch_regex or [])
+        # Condition-bound activation: files the current task touches (globs) or
+        # their extensions (JEV conditional instructions -- detect_context).
+        self.context_globs = list(context_globs or [])
+        self.context_exts = tuple(
+            "." + e.lstrip(".*").lower() for e in (context_exts or []) if e.strip())
         self._matcher = _build_trigger_matcher(self.triggers, self.trigger_regex)
 
     # ---- detection ---------------------------------------------------
@@ -156,6 +201,82 @@ class MarkdownSkill(Skill):
 
     def plan_system_prompt(self) -> str:
         return self.body if self._wants("plan") else ""
+
+    # ---- conditional activation by working context ------------------
+    def detect_context(self, ctx: Dict[str, Any]) -> float:
+        """Activate when the current task touches a matching file (JEV
+        conditional instructions): a glob in ``context_globs`` or an extension
+        in ``context_exts``. ``ctx`` carries ``files`` / ``files_touched``.
+        """
+        if not (self.context_globs or self.context_exts):
+            return 0.0
+        files = []
+        if isinstance(ctx, dict):
+            files = ctx.get("files") or ctx.get("files_touched") or []
+        for f in files or []:
+            fp = str(f).replace("\\", "/")
+            if self.context_exts and fp.lower().endswith(self.context_exts):
+                return _MATCH_CONFIDENCE
+            if any(_matches_glob(fp, g) for g in self.context_globs):
+                return _MATCH_CONFIDENCE
+        return 0.0
+
+    # ---- declarative validation (gated by validate_surfaces) --------
+    def _validates(self, surface: str) -> bool:
+        # Validate on the codegen surfaces this skill targets (never chat --
+        # there are no diffs there). A chat-only skill has no non-chat surface
+        # and so validates nothing.
+        surfs = self.validate_surfaces or tuple(
+            s for s in self.surfaces if s != "chat")
+        return bool(surfs) and ("all" in surfs or surface in surfs)
+
+    def _forbidden_file(self, diffs: List[Dict[str, Any]]) -> Optional[SkillVerdict]:
+        paths = [str(p) for p in file_paths(diffs)]
+        for g in self.forbid_files:
+            for p in paths:
+                if _matches_glob(p, g):
+                    return SkillVerdict(
+                        passed=False, confidence=0.8, skill=self.name,
+                        rationale=(f"{self.name} skill: '{p}' matches the "
+                                   f"forbidden file pattern '{g}'."))
+        return None
+
+    def validate_plan(self, diffs: List[Dict[str, Any]],
+                      goal: str = "") -> Optional[SkillVerdict]:
+        # Paths-only at plan time -> only the safe direction (forbid_files);
+        # require_files would false-positive on a small incremental edit.
+        if not self.forbid_files or not self._validates("plan"):
+            return None
+        return self._forbidden_file(diffs)
+
+    def validate_scaffold(self, diffs: List[Dict[str, Any]],
+                          goal: str = "") -> Optional[SkillVerdict]:
+        if not self._validates("scaffold"):
+            return None
+        forb = self._forbidden_file(diffs)
+        if forb is not None:
+            return forb
+        paths = [str(p) for p in file_paths(diffs)]
+        for g in self.require_files:
+            if not any(_matches_glob(p, g) for p in paths):
+                return SkillVerdict(
+                    passed=False, confidence=0.8, skill=self.name,
+                    rationale=(f"{self.name} skill: no file matches the required "
+                               f"pattern '{g}'."))
+        bodies = [_diff_body(d) for d in (diffs or []) if isinstance(d, dict)]
+        for rx, src in self._forbid_pat:
+            if any(rx.search(b) for b in bodies):
+                return SkillVerdict(
+                    passed=False, confidence=0.8, skill=self.name,
+                    rationale=(f"{self.name} skill: generated content matches the "
+                               f"forbidden pattern /{src}/."))
+        for rx, src in self._require_pat:
+            if not any(rx.search(b) for b in bodies):
+                return SkillVerdict(
+                    passed=False, confidence=0.8, skill=self.name,
+                    rationale=(f"{self.name} skill: no generated content matches "
+                               f"the required pattern /{src}/."))
+        return None
 
     def __repr__(self) -> str:  # pragma: no cover - trivial
         return (f"<MarkdownSkill {self.name!r} scope={self.scope} "
@@ -186,6 +307,15 @@ def _normalize_meta(meta: Dict[str, Any], body: str,
         "trigger_regex": str(meta.get("trigger_regex") or "").strip(),
         "always_on": bool(meta.get("always_on") or False),
         "priority": priority,
+        "require_files": _as_str_list(meta.get("require_files")),
+        "forbid_files": _as_str_list(meta.get("forbid_files")),
+        "require_patch_regex": _as_str_list(meta.get("require_patch_regex")),
+        "forbid_patch_regex": _as_str_list(meta.get("forbid_patch_regex")),
+        "validate_surfaces": tuple(
+            s for s in _as_str_list(meta.get("validate_surfaces"))
+            if s in VALID_SURFACES),
+        "context_globs": _as_str_list(meta.get("context_globs")),
+        "context_exts": _as_str_list(meta.get("context_exts")),
         "body": body,
     }
 
@@ -251,6 +381,13 @@ def check_source(content: str, *, name_hint: str = "",
         except re.error as e:
             return (False, "invalid_field",
                     f"trigger_regex does not compile: {e}", {})
+    for key in ("require_patch_regex", "forbid_patch_regex"):
+        for pat in _as_str_list(meta.get(key)):
+            try:
+                re.compile(pat)
+            except re.error as e:
+                return (False, "invalid_field",
+                        f"{key} entry {pat!r} does not compile: {e}", {})
 
     if known_names:
         low = name.lower()

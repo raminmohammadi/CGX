@@ -59,6 +59,17 @@ _IMPORT_TO_PYPI: Dict[str, str] = {
     "OpenSSL": "pyOpenSSL",
     "serial": "pyserial",
     "usb": "pyusb",
+    # Web-framework extensions whose import name differs from the pip name --
+    # otherwise the reconciler installs the wrong package (or nothing) and the
+    # build ships broken (see the Flask case study: flask_sqlalchemy/flask_cors).
+    "flask_sqlalchemy": "flask-sqlalchemy",
+    "flask_cors": "flask-cors",
+    "flask_migrate": "flask-migrate",
+    "flask_login": "flask-login",
+    "flask_jwt_extended": "flask-jwt-extended",
+    "flask_marshmallow": "flask-marshmallow",
+    "rest_framework": "djangorestframework",
+    "corsheaders": "django-cors-headers",
 }
 
 # Top-level names that are themselves namespace packages -- pip-installing

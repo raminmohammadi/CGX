@@ -1589,6 +1589,20 @@ Django, Express, Python CLI, and SQLite.
   failing the task. `cgx.session.tasks.plan_change` runs
   `validate_plan` and surfaces the verdict at the approval gate
   (advisory, since plans are user-approved rather than auto-looped).
+- **Swarm gate**: `cgx.session.tasks.swarm_verify` runs the same
+  `validate_scaffold(active, diffs)` over the generated tree on the **Swarm**
+  path (previously skill validators fired only on greenfield), plus two shared
+  structural gates — a cross-file **circular-import** detector (AST/SCC; a
+  routes↔app cycle is regenerated as a whole, since one-file-at-a-time repair
+  can't break a 2-node cycle) and a **declared-vs-imported** dependency check.
+  Reusable cross-stack checks live in `skills/_structural.py`
+  (`app_backimports`, `undeclared_python_deps`); the import-name→pip-name map in
+  `cgx.codegen.env_manager` covers framework extensions (`flask_sqlalchemy` →
+  `flask-sqlalchemy`, `rest_framework` → `djangorestframework`, …). Markdown
+  skills (`skills/markdown_skill.py`) may additionally carry declarative
+  `require_files` / `forbid_files` / `require_patch_regex` validation and
+  `context_globs` / `context_exts` activation, so a code-free skill can gate a
+  diff too.
 
 Adding a new skill: create `skills/<name>/__init__.py` with a single
 `Skill` subclass, import it from `skills/__init__.py`, and append an
