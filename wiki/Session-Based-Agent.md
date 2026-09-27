@@ -219,6 +219,22 @@ task = runner.run_next(session_id=session.session_id, deps=deps)
 # `task` is now an ASK_USER waiting on a `choose_path` decision.
 ```
 
+### From the terminal (no Python)
+
+The same lifecycle is scriptable via `cgx session` — see **[[CLI Reference]]**:
+
+```bash
+cgx session list --table                      # sessions for the project
+cgx session show <sid>                         # tasks / artifacts / facts / decisions
+cgx session send <sid> "focus on the parser"   # follow-up message, drives one turn (live)
+cgx session decide <sid> --task-id <tid> \      # answer an open ASK_USER
+  --chosen '{"approved": true}'
+cgx session rm <sid>                            # delete
+```
+
+`send`/`decide` reuse the exact drive path as `cgx agent`; run from the
+project directory (or pass `--project-root`) so the session id resolves.
+
 ---
 
 ## Safety

@@ -121,6 +121,28 @@ authoritative flag list; this section is the reference.
 | `cgx serve`   | Launch the FastAPI + React web UI (`--host` / `--port`).            |
 | `cgx dash`    | Launch the interactive terminal dashboard.                          |
 
+**Management & operations command groups** — everything the web UI can do,
+as `git`-style noun-verb subcommands (JSON by default; `--table` on `list`
+verbs; exit codes `2`=not-found, `3`=validation). Each adapts the same engine
+the matching REST route uses:
+
+| Group | Verbs |
+| ----- | ----- |
+| `cgx skills` | `list` · `show` · `create` · `edit` · `delete` (`--markdown`) |
+| `cgx profile` / `cgx agent-profile` | `list` · `show` · `add` · `rm` |
+| `cgx context` | `show` · `edit` · `rm` (repo `CGX.md`) |
+| `cgx site` | `list` · `new` · `generate` · `revise` · `path` · `themes` |
+| `cgx session` | `list` · `show` · `rm` · `send` · `decide` |
+| `cgx model` | `list` · `matrix` · `fit` · `pull` · `embed-list` · `embed-pull` |
+| `cgx mcp` | `list` · `enable` · `disable` · `tools` |
+| `cgx activity` / `cgx usage` / `cgx feedback` / `cgx monitor` | observability reads (+ `feedback add`) |
+| `cgx govdata` / `cgx admin` | `policy`/`scan`/`purge`/`erase` · `overview`/`logs`/`metrics`/`purge-logs` |
+| `cgx trace` · `cgx metrics` · `cgx health` · `cgx rollback` · `cgx approvals` | runtime toggles, probes, undo, HITL |
+
+`session send`/`decide` and the core verbs stream live; destructive verbs
+(`govdata purge`/`erase`, `admin purge-logs`) require an explicit scope flag.
+See [CLI-Reference](../wiki/CLI-Reference.md) for the full matrix.
+
 `ask`, `plan`, `agent`, and `status` stream the same way the dashboard
 does: tokens and task events arrive live under a Braille spinner, and
 **Ctrl-C** cancels the running task

@@ -425,13 +425,28 @@ cgx agent "Add docstrings to every public function in cgx.parser"
 cgx status
 ```
 
+Beyond those core verbs, **everything the web UI can do is also a scriptable
+`git`-style command group** (JSON by default, `--table` on lists):
+
+```bash
+cgx skills list                      # registry: also show/create/edit/delete
+cgx profile add prod --kind openai   # LLM connection presets (list/show/rm)
+cgx site generate landing -b "..."   # Site Studio (list/new/revise/themes)
+cgx session list                     # inspect/drive: show/rm/send/decide
+cgx mcp list                         # MCP servers (enable/disable/tools)
+cgx model matrix --table             # model discovery/pull, hardware fit
+cgx usage summary                    # activity · usage · feedback · monitor
+cgx govdata policy                   # govdata · admin · trace · metrics · health · rollback · approvals
+```
+
 `ask`, `plan`, `agent`, and `status` share provider flags
 (`--provider`, `--model`, `--base-url`, `--profile`) and auto-discover the
 index at `<project-root>/.cgx/index` (override with
 `--index-dir` / `--records`). They stream tokens live and cancel cleanly
 on **Ctrl-C**. See [docs/usage.md](docs/usage.md#the-cli-non-interactive-subcommands)
-for the full reference. `cgx serve` launches the web UI; bare `cgx` (or
-`cgx dash`) opens the interactive dashboard.
+and the [CLI Reference wiki](wiki/CLI-Reference.md) for the full command matrix.
+`cgx serve` launches the web UI; bare `cgx` (or `cgx dash`) opens the
+interactive dashboard (its `/cgx <subcommand>` reaches the full CLI surface).
 
 ### Python
 
