@@ -93,6 +93,20 @@ def test_undefined_order_detected_with_mined_columns():
     assert not any(r["name"] == "Member" for r in refs)
 
 
+def test_orm_ref_to_a_bound_nonmodel_is_not_flagged():
+    # `Session.query(...)` where Session is IMPORTED (a real, non-Model class)
+    # must NOT be mistaken for a missing model -- a false FATAL would block a
+    # valid build. The raw-SQL branch still catches genuinely-missing tables.
+    diffs = [
+        {"path": "svc.py", "content":
+            "from sqlalchemy.orm import Session\n"
+            "from myapp.helpers import Report\n"
+            "def f(s):\n    Report.query.all()\n"
+            "    return Session.query(object)\n"},
+    ]
+    assert undefined_model_refs(diffs) == []
+
+
 def test_double_prefix_detected_across_alias_hop():
     hits = blueprint_prefix_collisions(_diffs())
     routes = sorted(h["route"] for h in hits)

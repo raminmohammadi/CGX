@@ -177,6 +177,48 @@ _SQL_TABLE_RE = re.compile(
     r"(?:FROM|JOIN|UPDATE|INTO|DELETE\s+FROM)\s+([A-Za-z_]\w*)", re.I)
 
 
+# Names that are "bound" in a body: imported, or defined as class/def/assignment.
+_BIND_RE = re.compile(
+    r"^\s*(?:from\s+[\w.]+\s+import\s+([\w,* \t]+)"     # from x import a, b
+    r"|import\s+([\w.]+(?:\s+as\s+\w+)?)"               # import x [as y]
+    r"|class\s+(\w+)"                                    # class A
+    r"|def\s+(\w+)"                                      # def a
+    r"|(\w+)\s*=)",                                       # a = ...
+    re.M)
+
+
+def _bound_names(diffs: List[Dict[str, Any]]) -> set:
+    """Every top-level name bound across the diffs (import/class/def/assign).
+
+    Used to distinguish a genuinely-undefined ORM reference from one that simply
+    is not a ``db.Model``. Best-effort textual scan (a name that exists ANYWHERE
+    counts), so it errs toward *not* flagging -- the safe direction for a gate.
+    """
+    names: set = set()
+    for d in diffs or []:
+        if not _path(d).endswith(".py"):
+            continue
+        for m in _BIND_RE.finditer(_body(d)):
+            imp, mod, cls, fn, asn = m.groups()
+            if imp:
+                for part in imp.split(","):
+                    p = part.strip()
+                    if " as " in p:
+                        p = p.split(" as ")[-1].strip()
+                    if p and p != "*":
+                        names.add(p)
+            if mod:
+                # ``import a.b as c`` -> c; ``import a.b`` -> a
+                if " as " in mod:
+                    names.add(mod.split(" as ")[-1].strip())
+                else:
+                    names.add(mod.strip().split(".")[0])
+            for g in (cls, fn, asn):
+                if g:
+                    names.add(g)
+    return names
+
+
 def _norm_table(name: str) -> str:
     """Fold a class/table name to a comparison key: lowercased, de-pluralised."""
     n = (name or "").lower()
@@ -244,6 +286,14 @@ def undefined_model_refs(
     """
     defined = defined_orm_models(diffs)
     known = set(defined) | {_norm_table(k) for k in defined}
+    # Names bound ANYWHERE in the tree (imported, or defined as a class/def/
+    # assignment) exist -- so an ORM-position use of one is NOT a missing model,
+    # at worst a non-Model class, which is too speculative to flag. Skipping them
+    # keeps the ORM branch high-precision (only genuinely-dangling references),
+    # while the raw-SQL branch still catches a table with no model. (A symbol
+    # imported from a first-party module that fails to define it is the generic
+    # cross-check's job, not this one.)
+    bound = _bound_names(diffs)
     target = _models_target(diffs, defined)
     out: Dict[str, Dict[str, Any]] = {}
 
@@ -269,10 +319,11 @@ def undefined_model_refs(
         if not path.endswith(".py"):
             continue
         body = _body(d)
-        # 1) ORM-position class references (Order.query, session.get(Order, ...)).
+        # 1) ORM-position class references (Order.query, session.get(Order, ...)),
+        #    but only names that are NOT bound anywhere (else they exist).
         for m in _ORM_USE_RE.finditer(body):
             cls = m.group(1) or m.group(2) or m.group(3)
-            if not cls:
+            if not cls or cls in bound:
                 continue
             _note(cls, _norm_table(cls), path, via="orm")
         # 2) Raw-SQL tables -- only within string literals that carry a DML verb,
