@@ -50,13 +50,20 @@ def _sites_root_real() -> str:
 
 
 def site_path(slug: str) -> Path:
-    """Resolve ``<sites>/<slug>`` with a containment guard (raises ValueError)."""
-    safe_slug = _validate_slug(slug)
+    """Resolve ``<sites>/<slug>`` with a containment guard (raises ValueError).
+
+    ``safe_slug`` already matches ``^[a-z0-9][a-z0-9-]{0,63}$`` (a single path
+    component), and ``os.path.basename`` strips any residual separator so the
+    join can never escape ``base`` -- the primary sanitizer. The realpath +
+    containment check is defense in depth.
+    """
+    safe_slug = os.path.basename(_validate_slug(slug))
     base = _sites_root_real()
-    candidate = os.path.realpath(os.path.join(base, safe_slug))
-    if candidate != base and not candidate.startswith(base + os.sep):
+    joined = os.path.join(base, safe_slug)
+    real = os.path.realpath(joined)
+    if real != base and not real.startswith(base + os.sep):
         raise ValueError(f"invalid site slug: {safe_slug!r}")
-    return Path(candidate)
+    return Path(joined)
 
 
 def create_site(name: str) -> Dict[str, str]:
