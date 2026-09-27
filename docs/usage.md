@@ -1284,6 +1284,19 @@ missing test file) ride along without failing the task, and
 PLAN_CHANGE runs `skills.validate_plan` to surface a verdict at the
 approval gate.
 
+The **Swarm** verify path (`swarm_verify`) runs the same
+`skills.validate_scaffold` over the generated tree (previously skill validators
+fired only on greenfield), plus two shared structural gates that apply across
+every backend stack: a cross-file **circular-import** detector (a routes↔app /
+model↔app cycle that breaks even test collection — regenerated as a whole, since
+a one-file fix can't break a cycle) and a **declared-vs-imported** dependency
+check (backed by an import-name→pip-name map, so `flask_sqlalchemy` →
+`flask-sqlalchemy` etc. install correctly). Common checks live in
+`skills/_structural.py`. Markdown skills (`SKILL.md`) can also carry declarative
+`require_files` / `forbid_files` / `require_patch_regex` validation and
+`context_globs` / `context_exts` activation — see
+[skills-and-context.md](skills-and-context.md).
+
 | Skill        | Activates on (examples)                                  | Structural check            |
 |--------------|----------------------------------------------------------|-----------------------------|
 | `react`      | "react app", "react component", "react ui"               | At least one `.jsx`/`.tsx`/`.js`/`.ts` file; `package.json` with `react` dep |

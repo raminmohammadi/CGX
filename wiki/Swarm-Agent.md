@@ -91,15 +91,21 @@ Runs a graded verification ladder over the finished tree.
   while the app lives under `frontend/` is moved to the component root next to
   `index.html`, so the Vite build resolves its entry instead of failing to find
   one.
-- **Static** structural checks next. Only **two** findings gate the build:
-  test-coverage gaps (a planned test that defines nothing to run) and
-  first-party import breaks. **Phantom third-party imports** (an import not in
-  the plan's declared dependencies) and **contract warnings** are now
-  **advisory**, not gating. Rationale: reconciliation installs every real
-  import, so a truly hallucinated package fails the real install anyway, and a
-  legitimate-but-under-declared dependency (e.g. `uvicorn`) must not fail a
-  build whose tests actually pass — **the real build/test is the authority**.
-  Named files still drive a bounded targeted regeneration.
+- **Static** structural checks next. Findings that gate the build: test-coverage
+  gaps (a planned test that defines nothing to run), first-party import breaks, a
+  cross-file **circular import** (a routes↔app / model↔app cycle pytest can't
+  even collect — found via the AST/SCC import graph and regenerated as a unit,
+  since a one-file-at-a-time fix can't break a 2-node cycle), and the active
+  **skills' `validate_scaffold`** verdicts (stack-specific structural checks now
+  run on the Swarm path, not just greenfield — e.g. Flask's circular-import /
+  undeclared-extension gate). **Phantom third-party imports** and **contract
+  warnings** stay **advisory**, not gating. Rationale: reconciliation installs
+  every real import (with a fixed import-name→pip-name map, so
+  `flask_sqlalchemy`→`flask-sqlalchemy`, `rest_framework`→`djangorestframework`
+  etc. install correctly), so a truly hallucinated package fails the real install
+  anyway, and a legitimate-but-under-declared dependency (e.g. `uvicorn`) must not
+  fail a build whose tests actually pass — **the real build/test is the
+  authority**. Named files still drive a bounded targeted regeneration.
 - **Dynamic** dry-run only if static passes: install missing dependencies,
   then run the **polyglot test runner** instead of a pytest-only pass. A Python
   component is exercised with `pytest`; a JS/TS component gets a real

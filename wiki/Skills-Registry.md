@@ -40,10 +40,17 @@ validators run.
 - `cgx.answer.engine` calls `detect_skills(goal)` and composes the
   matching skills' prompt fragments into the scaffold / plan system
   prompt.
-- `cgx.session.tasks.scaffold` runs `validate_scaffold` over the produced
-  diffs. A **fatal** verdict (e.g. a React goal that emitted no JS/TS
+- `cgx.session.tasks.scaffold` (greenfield) runs `validate_scaffold` over the
+  produced diffs. A **fatal** verdict (e.g. a React goal that emitted no JS/TS
   source) drives a whole-tree regenerate rather than silently applying a
   wrong-shaped output.
+- `cgx.session.tasks.swarm_verify` runs the **same** `validate_scaffold` over
+  the generated tree on the **Swarm** path too (previously skill validators only
+  fired on greenfield), plus two shared structural gates: a cross-file
+  **circular-import** detector — a routes↔app / model↔app cycle that breaks even
+  test collection now fails fast with an actionable message and a regenerate
+  target, instead of burning repair rounds — and a **declared-vs-imported**
+  dependency check.
 - `cgx.session.tasks.plan_change` runs `validate_plan` and surfaces the
   verdict at the approval gate.
 - The **[[Swarm Agent]]**'s Tech Lead is skill-aware: it resolves the goal's
@@ -56,6 +63,16 @@ Detection is scored: a skill's `detect(goal)` must meet
 `SKILL_DETECT_THRESHOLD` to activate. Verdicts marked
 `severity="warning"` are advisory (missing tests/README) and do not fail
 the scaffold; only non-warning failures do.
+
+Validators run over the diffs' paths + patch text (a best-effort textual/AST
+check, not a full project graph). Common cross-stack checks — a leaf module
+importing the app entrypoint back, or a used-but-undeclared dependency — live in
+`skills/_structural.py`, so every backend skill (Flask, FastAPI, Django, …)
+reuses them. **Markdown skills** can also carry lightweight *declarative*
+validation (`require_files` / `forbid_files` / `require_patch_regex`) and
+condition-bound activation (`context_globs` / `context_exts`), so even a
+code-free skill can reject a bad diff — see
+[docs/skills-and-context.md](https://github.com/raminmohammadi/CGX/blob/main/docs/skills-and-context.md).
 
 ---
 

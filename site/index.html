@@ -548,8 +548,9 @@ flowchart TD
               <h3>Verifier — the real build is the authority</h3>
               <p>
                 Reconciles each component's manifest against its actual imports, runs static structural
-                checks, then a <strong>polyglot</strong> dry-run: <code class="inline">pytest</code> for
-                a Python component, <code class="inline">npm test</code> /
+                checks — including a cross-file <strong>circular-import gate</strong> and the active
+                skills' own validators — then a <strong>polyglot</strong> dry-run:
+                <code class="inline">pytest</code> for a Python component, <code class="inline">npm test</code> /
                 <code class="inline">npm run build</code> for JS/TS. A red suite on a clean tree drives
                 failure-driven repair rather than a false pass.
               </p>
@@ -1284,9 +1285,12 @@ flowchart TB
                 <code class="inline">flask</code>, <code class="inline">django</code>,
                 <code class="inline">express</code>, <code class="inline">python_cli</code>,
                 <code class="inline">sqlite</code>) bundles detection from the goal, the prompt fragment
-                the model sees, and a structural validator for the diffs it produces. Multi-skill goals
-                compose — "React UI + FastAPI backend" activates both. Adding a framework needs no
-                agent-layer edits.
+                the model sees, and a structural validator that <strong>gates</strong> the diffs it
+                produces — catching circular imports (a routes↔app cycle that breaks test collection),
+                undeclared dependencies, and wrong-shaped output, on <em>both</em> the greenfield and
+                Swarm paths. Multi-skill goals compose — "React UI + FastAPI backend" activates both.
+                Even code-free <code class="inline">SKILL.md</code> skills can validate declaratively
+                (required / forbidden files and patterns). Adding a framework needs no agent-layer edits.
               </p>
             </article>
             <article class="card reveal">

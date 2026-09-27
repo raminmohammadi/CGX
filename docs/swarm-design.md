@@ -113,7 +113,13 @@ Each Developer task implements exactly one file (`file_index` into the plan):
 The ladder moves from fast static analysis to slow dynamic execution:
 1. **Static structural checks** (via `scaffold_validate` helpers): coverage
    gaps (a planned test module that parses but defines no collectible test is a
-   gap), first-party import coherence, and contract compliance. Named files
+   gap), first-party import coherence, a cross-file **circular-import** gate
+   (reusing the AST/SCC detector — a routes↔app / model↔app cycle that pytest
+   cannot even collect now fails fast and names a file to regenerate, instead of
+   the one-file-at-a-time repair loop that can never break a 2-node cycle), the
+   active **skills' `validate_scaffold`** verdicts (stack-specific structural
+   checks — e.g. Flask's circular-import / undeclared-extension checks — now run
+   on the Swarm path, not just greenfield), and contract compliance. Named files
    drive a bounded targeted regeneration (`_MAX_VERIFY_ROUNDS`) before the
    dynamic step.
 2. **Environment dry-run** (only when hard structural checks pass):
