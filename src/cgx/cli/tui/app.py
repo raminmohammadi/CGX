@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable, Optional
 
 from cgx.cli.tui import ansi, ops, render
@@ -103,6 +103,12 @@ class Dashboard:
             return self._set_provider(rest)
         if cmd == "/project":
             return self._set_project(rest)
+        if cmd == "/cgx":
+            if not rest:
+                return DispatchResult(
+                    output="usage: /cgx <subcommand> [args]  "
+                           "(e.g. /cgx skills list, /cgx session list --table)")
+            return DispatchResult(action="cgx", arg=rest)
         return DispatchResult(output=f"unknown command: {cmd} (try /help)")
 
     def _set_provider(self, name: str) -> DispatchResult:
@@ -215,6 +221,35 @@ class Dashboard:
         if res.action == "agent":
             self._stream(lambda ce: ops.agent_events(
                 self.state, res.arg, cancel_event=ce))
+            return
+        if res.action == "cgx":
+            self._run_cgx_subcommand(res.arg)
+
+    def _run_cgx_subcommand(self, arg: str) -> None:
+        """Run any parity subcommand (`cgx <group> <verb>`) inline and show its
+        output, so the interactive dashboard reaches the full CLI surface."""
+        import contextlib
+        import io
+        import shlex
+
+        from cgx.cli.main import main as _cli_main
+
+        try:
+            argv = shlex.split(arg)
+        except ValueError as exc:
+            self._emit(f"error: {exc}")
+            return
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                _cli_main(argv)
+        except SystemExit:
+            pass  # argparse / _render.die exit codes -- output already captured
+        except Exception as exc:  # noqa: BLE001
+            self._emit(f"error: {type(exc).__name__}: {exc}")
+            return
+        out = buf.getvalue().rstrip("\n")
+        self._emit(out or "(no output)")
 
     def run(self) -> None:
         """Blocking read-eval-print loop."""

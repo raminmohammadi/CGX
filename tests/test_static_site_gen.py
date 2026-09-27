@@ -56,7 +56,9 @@ def test_revise_mode_passes_current_and_feedback():
 
 def test_generate_requests_large_token_budget_via_route(monkeypatch, tmp_path):
     # The route must not let the default 1024 num_predict truncate a page.
-    monkeypatch.setattr(workspace, "SITES_DIR", tmp_path / "sites")
+    # Site-workspace logic lives in cgx.sites (webui.workspace re-exports it),
+    # so redirect the dir at its real home.
+    monkeypatch.setattr("cgx.sites.SITES_DIR", tmp_path / "sites")
     captured = {}
 
     def fake_build_provider(**kw):
@@ -75,7 +77,7 @@ def test_generate_requests_large_token_budget_via_route(monkeypatch, tmp_path):
 @pytest.fixture()
 def sites_dir(tmp_path, monkeypatch):
     d = tmp_path / "sites"
-    monkeypatch.setattr(workspace, "SITES_DIR", d)
+    monkeypatch.setattr("cgx.sites.SITES_DIR", d)
     monkeypatch.setattr(sroutes, "_provider", lambda pc: _FakeProvider(_HTML))
     return d
 

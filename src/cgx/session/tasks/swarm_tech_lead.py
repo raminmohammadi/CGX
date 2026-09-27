@@ -330,7 +330,7 @@ def swarm_tech_lead(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     # Composing both is what makes the plan include a buildable file set (the
     # missing-index.html build failure came from planning with the terse plan
     # fragment alone).
-    _struct = compose_scaffold_prompt(active_skills)
+    _struct = compose_scaffold_prompt(active_skills, project_root=project_root)
     _rules = compose_plan_prompt(active_skills)
     skill_prompt = "\n\n".join(p for p in (_struct, _rules) if p.strip())
     # Clip composed skill guidance so a large (esp. markdown) skill body can't

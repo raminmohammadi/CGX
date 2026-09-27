@@ -293,6 +293,49 @@ def agent_events(state: Any, text: str, *, index_dir: Optional[str] = None,
                               auto=auto, cancel_event=cancel_event)
 
 
+def decide_events(state: Any, task_id: str, chosen: Dict[str, Any], *,
+                  rationale: Optional[str] = None,
+                  index_dir: Optional[str] = None, records: Optional[str] = None,
+                  auto: bool = False, cancel_event=None) -> Iterator[Event]:
+    """Submit a *structured* decision to an open ASK_USER, then drive the turn.
+
+    The scriptable counterpart to :func:`_answer_pending_ask` (which parses a
+    freeform reply): ``chosen`` is the decision payload verbatim -- e.g.
+    ``{"approved": true}`` or ``{"path": "..."}``. Mirrors the web UI's
+    ``POST /agent-session/{sid}/decision``: resolve the task via
+    :func:`build_decision`, ``runner.post_decision``, then drain to the next
+    pause. Requires ``state.agent_session_id`` to be set to an existing session.
+    """
+    from cgx.session.tasks.ask import build_decision
+
+    runner = _session_runner(state.project_root)
+    store = runner.store
+    sid = getattr(state, "agent_session_id", None)
+    if not sid or store.get_session(sid) is None:
+        yield "error", {"message": f"session {sid!r} not found"}
+        return
+    try:
+        deps = _session_deps(state, index_dir=index_dir, records=records,
+                             store=store)
+    except ValueError as exc:
+        yield "error", {"message": str(exc)}
+        return
+    task = store.get_task(task_id)
+    if task is None:
+        yield "error", {"message": f"task {task_id!r} not found"}
+        return
+    try:
+        decision = build_decision(session_id=sid, task=task, chosen=chosen,
+                                  rationale=rationale)
+    except ValueError as exc:
+        yield "error", {"message": str(exc)}
+        return
+    runner.post_decision(session_id=sid, decision=decision)
+    state.pending_ask = None
+    yield from _drive_session(state, runner, sid, deps, auto=auto,
+                              cancel_event=cancel_event)
+
+
 def _answer_pending_ask(state: Any, runner: Any, session: Any,
                         pending: Dict[str, Any], text: str):
     """Resolve the open ASK_USER from a freeform reply. Returns True on

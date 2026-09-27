@@ -135,6 +135,345 @@ def undeclared_python_deps(
     return missing
 
 
+# ------------------------- ORM model / table coherence -------------------------
+#
+# The generic first-party import checker
+# (:func:`cgx.session.scaffold_validate.cross_check_first_party_imports`) catches
+# ``from x.models import Order`` when ``Order`` is undefined -- but it is blind to
+# the two *other* ways generated code references a model that was never created:
+#
+#   * an ORM-position use of a class name (``Order.query``, ``db.session.get(Order,
+#     ...)``) with no ``class Order(db.Model)`` anywhere, and
+#   * a *raw-SQL* table (``INSERT INTO orders (...)`` / ``... FROM orders``) that no
+#     model maps to, so ``db.create_all()`` never creates it -> runtime
+#     ``OperationalError: no such table``.
+#
+# Both are exactly the coffee-shop failure: routes/tests reference an ``Order`` /
+# ``orders`` that ``models.py`` never defines, and the old repair loop *stripped*
+# the reference (symptom) instead of *adding the model* (cause). These helpers let
+# a skill detect the gap AND mine the columns straight from the SQL, so verify can
+# drive a targeted, additive regen of the defining module instead of a blind pass.
+
+# A ``class X(db.Model)`` / ``class X(Base)`` / ``class X(Model)`` declaration.
+_MODEL_CLASS_RE = re.compile(
+    r"^\s*class\s+(\w+)\s*\(\s*[^)]*\b(?:db\.Model|Model|Base)\b", re.M)
+# An explicit ``__tablename__ = "orders"`` inside a model body.
+_TABLENAME_RE = re.compile(r"__tablename__\s*=\s*['\"](\w+)['\"]")
+# ORM-position uses of a *capitalised* name: ``Order.query``, ``db.session.get(
+# Order, ...)``, ``db.session.query(Order)``, ``session.query(Order)``.
+_ORM_USE_RE = re.compile(
+    r"\b([A-Z]\w+)\.query\b"
+    r"|\bsession\.get\(\s*([A-Z]\w+)"
+    r"|\bsession\.query\(\s*([A-Z]\w+)")
+# Raw-SQL table references, scanned ONLY inside string literals that are an
+# actual SQL statement -- the literal must START (after whitespace) with a DML
+# verb, so ordinary UI/error copy that merely CONTAINS a word like "select" or
+# "update ... from the list" ("Please select a category from the list") is never
+# mistaken for SQL. ``INSERT INTO t (cols...)`` additionally yields the columns.
+_STRING_LIT_RE = re.compile(r"['\"]([^'\"\n]*)['\"]")
+_SQL_STMT_RE = re.compile(
+    r"^\s*(?:SELECT\b|INSERT\s+INTO\b|UPDATE\b|DELETE\s+FROM\b|WITH\b)", re.I)
+_SQL_INSERT_RE = re.compile(
+    r"INSERT\s+INTO\s+([A-Za-z_]\w*)\s*\(([^)]*)\)", re.I)
+_SQL_TABLE_RE = re.compile(
+    r"(?:FROM|JOIN|UPDATE|INTO|DELETE\s+FROM)\s+([A-Za-z_]\w*)", re.I)
+# Common English words that can follow FROM/INTO/etc. in prose -- a second guard
+# so even a mis-detected SQL-ish string can never mint a phantom model.
+_SQL_STOPWORDS = frozenset({
+    "the", "a", "an", "this", "that", "these", "those", "your", "our", "my",
+    "their", "his", "her", "its", "list", "here", "there", "them", "it", "us",
+    "me", "you", "now", "below", "above", "select", "where", "and", "or"})
+
+
+# Names that are "bound" in a body: imported, or defined as class/def/assignment.
+_BIND_RE = re.compile(
+    r"^\s*(?:from\s+[\w.]+\s+import\s+([\w,* \t]+)"     # from x import a, b
+    r"|import\s+([\w.]+(?:\s+as\s+\w+)?)"               # import x [as y]
+    r"|class\s+(\w+)"                                    # class A
+    r"|def\s+(\w+)"                                      # def a
+    r"|(\w+)\s*=)",                                       # a = ...
+    re.M)
+
+
+def _bound_names(diffs: List[Dict[str, Any]]) -> set:
+    """Every top-level name bound across the diffs (import/class/def/assign).
+
+    Used to distinguish a genuinely-undefined ORM reference from one that simply
+    is not a ``db.Model``. Best-effort textual scan (a name that exists ANYWHERE
+    counts), so it errs toward *not* flagging -- the safe direction for a gate.
+    """
+    names: set = set()
+    for d in diffs or []:
+        if not _path(d).endswith(".py"):
+            continue
+        for m in _BIND_RE.finditer(_body(d)):
+            imp, mod, cls, fn, asn = m.groups()
+            if imp:
+                for part in imp.split(","):
+                    p = part.strip()
+                    if " as " in p:
+                        p = p.split(" as ")[-1].strip()
+                    if p and p != "*":
+                        names.add(p)
+            if mod:
+                # ``import a.b as c`` -> c; ``import a.b`` -> a
+                if " as " in mod:
+                    names.add(mod.split(" as ")[-1].strip())
+                else:
+                    names.add(mod.strip().split(".")[0])
+            for g in (cls, fn, asn):
+                if g:
+                    names.add(g)
+    return names
+
+
+def _norm_table(name: str) -> str:
+    """Fold a class/table name to a comparison key: lowercased, de-pluralised."""
+    n = (name or "").lower()
+    if n.endswith("ies"):
+        return n[:-3] + "y"
+    return n[:-1] if n.endswith("s") else n
+
+
+def defined_orm_models(diffs: List[Dict[str, Any]]) -> Dict[str, str]:
+    """Map every declared ORM model to the diff path that defines it.
+
+    A "model" is a class deriving from ``db.Model`` / ``Model`` / ``Base``. The
+    return also folds in each model's ``__tablename__`` (when declared) and the
+    Flask-SQLAlchemy default table name, so a raw-SQL table reference can be
+    matched against a model even when the names differ (``class Order`` ->
+    table ``order``/``orders``).
+    """
+    defined: Dict[str, str] = {}
+    for d in diffs or []:
+        path = _path(d)
+        if not path.endswith(".py"):
+            continue
+        body = _body(d)
+        for m in _MODEL_CLASS_RE.finditer(body):
+            cls = m.group(1)
+            defined[cls] = path
+            defined[_norm_table(cls)] = path
+        for m in _TABLENAME_RE.finditer(body):
+            defined[_norm_table(m.group(1))] = path
+    return defined
+
+
+def _models_target(diffs: List[Dict[str, Any]],
+                   defined: Dict[str, str]) -> str:
+    """Best path for the module that SHOULD define models (for a regen target).
+
+    An existing ``models.py`` (or the file already defining models) wins;
+    otherwise fall back to a conventional ``models.py`` beside the app package.
+    """
+    for d in diffs or []:
+        p = _path(d)
+        if p.rsplit("/", 1)[-1] == "models.py":
+            return p
+    if defined:
+        # Reuse whatever file already holds models.
+        return sorted(set(defined.values()))[0]
+    # Conventional default under the first python package seen.
+    for d in diffs or []:
+        p = _path(d)
+        if "/" in p and p.endswith(".py"):
+            return p.rsplit("/", 1)[0] + "/models.py"
+    return "models.py"
+
+
+def undefined_model_refs(
+        diffs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Models/tables referenced by the code but defined by no ORM model.
+
+    Returns ``[{name, table, columns, referenced_in, define_in, via}]`` -- one
+    entry per missing model, deduped by folded name. ``columns`` is mined from
+    ``INSERT INTO t (c1, c2, ...)`` when available (the precise spec for an
+    additive regen of the defining module); empty otherwise. High precision: a
+    reference that matches ANY defined model (by class name or table name, incl.
+    singular/plural) is never flagged.
+    """
+    defined = defined_orm_models(diffs)
+    known = set(defined) | {_norm_table(k) for k in defined}
+    # Names bound ANYWHERE in the tree (imported, or defined as a class/def/
+    # assignment) exist -- so an ORM-position use of one is NOT a missing model,
+    # at worst a non-Model class, which is too speculative to flag. Skipping them
+    # keeps the ORM branch high-precision (only genuinely-dangling references),
+    # while the raw-SQL branch still catches a table with no model. (A symbol
+    # imported from a first-party module that fails to define it is the generic
+    # cross-check's job, not this one.)
+    bound = _bound_names(diffs)
+    target = _models_target(diffs, defined)
+    out: Dict[str, Dict[str, Any]] = {}
+
+    def _note(display: str, key: str, ref_path: str, via: str,
+              table: str = "", columns: Optional[List[str]] = None) -> None:
+        if key in known:
+            return
+        cur = out.get(key)
+        if cur is None:
+            out[key] = {"name": display, "table": table, "columns": columns or [],
+                        "referenced_in": [ref_path], "define_in": target,
+                        "via": via}
+        else:
+            if ref_path not in cur["referenced_in"]:
+                cur["referenced_in"].append(ref_path)
+            if columns and not cur["columns"]:
+                cur["columns"] = columns
+            if table and not cur["table"]:
+                cur["table"] = table
+
+    for d in diffs or []:
+        path = _path(d)
+        if not path.endswith(".py"):
+            continue
+        body = _body(d)
+        # 1) ORM-position class references (Order.query, session.get(Order, ...)),
+        #    but only names that are NOT bound anywhere (else they exist).
+        for m in _ORM_USE_RE.finditer(body):
+            cls = m.group(1) or m.group(2) or m.group(3)
+            if not cls or cls in bound:
+                continue
+            _note(cls, _norm_table(cls), path, via="orm")
+        # 2) Raw-SQL tables -- only within string literals that ARE a SQL
+        #    statement (start with a DML verb), with columns mined from any
+        #    INSERT and an English-stopword guard on the extracted table name.
+        sql_blobs = [s for s in _STRING_LIT_RE.findall(body)
+                     if _SQL_STMT_RE.match(s)]
+        cols_by_table: Dict[str, List[str]] = {}
+        for blob in sql_blobs:
+            for m in _SQL_INSERT_RE.finditer(blob):
+                cols = [c.strip() for c in m.group(2).split(",") if c.strip()]
+                cols_by_table.setdefault(_norm_table(m.group(1)), cols)
+        for blob in sql_blobs:
+            for m in _SQL_TABLE_RE.finditer(blob):
+                tbl = m.group(1)
+                key = _norm_table(tbl)
+                if key in _SQL_STOPWORDS or tbl.lower() in _SQL_STOPWORDS:
+                    continue
+                _note(key.capitalize(), key, path, via="sql", table=tbl,
+                      columns=cols_by_table.get(key))
+    return list(out.values())
+
+
+# ------------------------- Flask routing / config coherence -------------------------
+#
+# Two deterministically-fixable Flask bugs the old loop left to a weak model:
+#   * a route decorated ``/api/x`` on a blueprint *also* registered with
+#     ``url_prefix="/api"`` -> the live path is ``/api/api/x`` (every request 404s);
+#   * a *relative* SQLite URI (``sqlite:///./data/app.db``) -> ``unable to open
+#     database file`` whenever the process CWD differs from the app dir.
+# Detected here (pure), fixed deterministically by the skill's ``repair_scaffold``.
+
+_REGISTER_BP_RE = re.compile(
+    r"register_blueprint\(\s*(\w+)[^)]*?url_prefix\s*=\s*['\"]([^'\"]+)['\"]")
+_ROUTE_RE = re.compile(r"@(\w+)\.route\(\s*['\"]([^'\"]+)['\"]")
+# ``from a.b.c import bp as members_bp`` / ``from a.b.c import bp`` -- the alias
+# hop between where a blueprint is registered and where it is defined+decorated.
+_IMPORT_ALIAS_RE = re.compile(
+    r"^\s*from\s+([\w.]+)\s+import\s+(\w+)(?:\s+as\s+(\w+))?", re.M)
+_SQLITE_REL_RE = re.compile(
+    r"sqlite:///(?!/)(?!:memory:)(\.?/?[^'\"]*\.(?:db|sqlite3?|sqlite))")
+
+
+def _module_of(path: str) -> str:
+    """Dotted module name for a diff path (``a/b/c.py`` -> ``a.b.c``)."""
+    p = (path or "").replace("\\", "/")
+    if p.endswith("/__init__.py"):
+        p = p[: -len("/__init__.py")]
+    elif p.endswith(".py"):
+        p = p[:-3]
+    return p.strip("/").replace("/", ".")
+
+
+def blueprint_prefix_collisions(
+        diffs: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    """Routes whose path already begins with the blueprint's ``url_prefix``.
+
+    Correlates ``register_blueprint(bp, url_prefix=P)`` with each
+    ``@bp.route(path)`` -- resolving the common **import-alias hop**
+    (``from routes.members import bp as members_bp`` then
+    ``register_blueprint(members_bp, url_prefix="/api")``, while the decorator in
+    ``members.py`` is ``@bp.route("/api/members")``) -- and flags routes where
+    ``path`` starts with ``P``, the double-prefix that makes the live URL
+    ``P + P + ...`` (every request 404s). Returns
+    ``[{file, prefix, route, blueprint}]``.
+
+    Correlation is deliberately STRICT to avoid a false collision: a route file
+    is matched to a registration only via (a) the resolved import-alias source,
+    or (b) a registration in the SAME module on the same variable. The old
+    ``var == regvar`` global match cross-linked every module that used the
+    near-universal ``bp`` name -- so a prefix-less blueprint's absolute route
+    (``@bp.route('/api/stats')`` on an admin blueprint registered with no prefix)
+    got falsely flagged against an UNRELATED ``/api`` registration. Only the
+    blueprint actually registered under ``P`` is considered.
+    """
+    # 1) alias used at registration -> (source module, original local name).
+    alias_to_src: Dict[str, tuple] = {}
+    for d in diffs or []:
+        for m in _IMPORT_ALIAS_RE.finditer(_body(d)):
+            src_mod, orig, alias = m.group(1), m.group(2), m.group(3)
+            alias_to_src[alias or orig] = (src_mod, orig)
+    # 2) registrations WITH the module they appear in, so a same-file bare-var
+    #    registration binds to that file's routes -- never another module's.
+    regs: List[tuple] = []  # (regvar, prefix, reg_module)
+    for d in diffs or []:
+        mod = _module_of(_path(d))
+        for m in _REGISTER_BP_RE.finditer(_body(d)):
+            regs.append((m.group(1), "/" + m.group(2).strip("/"), mod))
+    if not regs:
+        return []
+    # 3) route decorators, indexed by (module, local var).
+    routes_by_key: Dict[tuple, List[tuple]] = {}
+    for d in diffs or []:
+        path = _path(d)
+        if not path.endswith(".py"):
+            continue
+        mod = _module_of(path)
+        for m in _ROUTE_RE.finditer(_body(d)):
+            routes_by_key.setdefault((mod, m.group(1)), []).append(
+                (path, m.group(2)))
+    out: List[Dict[str, str]] = []
+    seen: set = set()
+    for regvar, prefix, reg_mod in regs:
+        # Candidate (module, var) keys THIS registration could point at:
+        #  - the import-alias source (aliased or bare import from another module)
+        #  - a same-module registration on the bare variable
+        cand = set()
+        src = alias_to_src.get(regvar)
+        if src:
+            cand.add(src)
+        cand.add((reg_mod, regvar))
+        for key in cand:
+            for (path, route) in routes_by_key.get(key, []):
+                r = "/" + route.strip("/")
+                if r == prefix or r.startswith(prefix + "/"):
+                    sig = (path, route, prefix)
+                    if sig not in seen:
+                        seen.add(sig)
+                        out.append({"file": path, "prefix": prefix,
+                                    "route": route, "blueprint": key[1]})
+    return out
+
+
+def relative_sqlite_uris(diffs: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    """Config lines binding SQLAlchemy to a *relative* SQLite path.
+
+    Returns ``[{file, uri}]`` for each ``sqlite:///./x.db`` (or ``sqlite:///x.db``)
+    -- a CWD-dependent path that fails to open under pytest. An absolute path or
+    ``sqlite:///:memory:`` is never flagged.
+    """
+    out: List[Dict[str, str]] = []
+    for d in diffs or []:
+        path = _path(d)
+        if not path.endswith(".py"):
+            continue
+        for m in _SQLITE_REL_RE.finditer(_body(d)):
+            out.append({"file": path, "uri": m.group(0)})
+    return out
+
+
 __all__ = [
     "body_of", "any_body_matches", "app_backimports", "undeclared_python_deps",
+    "defined_orm_models", "undefined_model_refs", "blueprint_prefix_collisions",
+    "relative_sqlite_uris",
 ]

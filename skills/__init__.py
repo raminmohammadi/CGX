@@ -242,14 +242,56 @@ def skills_by_names(names: List[str],
     return out
 
 
-def compose_scaffold_prompt(skills: List[Skill]) -> str:
-    """Join non-empty ``scaffold_system_prompt`` fragments with blank lines."""
+def _lessons_addendum(skills: List[Skill],
+                      project_root: Optional[str]) -> str:
+    """Learned-lesson blocks to append to a composed prompt (Layer-2 feedback).
+
+    Per-skill lessons (stack gotchas that apply to every run of that technology)
+    plus, when a ``project_root`` is threaded, this repo's project lessons. This
+    is the injection seam that closes the learning loop: a mistake recorded by
+    the post-mortem after one run conditions the next. Silent/no-op when the
+    learning package is unavailable or nothing has been learned yet.
+    """
+    try:
+        from cgx.learning.lessons import (project_lessons_text,
+                                          skill_lessons_text)
+    except Exception:  # pragma: no cover - learning layer is optional
+        return ""
+    blocks: List[str] = []
+    for s in skills:
+        txt = skill_lessons_text(getattr(s, "name", "") or "")
+        if txt:
+            blocks.append(txt)
+    if project_root:
+        ptxt = project_lessons_text(project_root)
+        if ptxt:
+            blocks.append(ptxt)
+    return "\n\n".join(blocks)
+
+
+def compose_scaffold_prompt(skills: List[Skill],
+                            project_root: Optional[str] = None) -> str:
+    """Join non-empty ``scaffold_system_prompt`` fragments, plus learned lessons.
+
+    Learned lessons (skill-scoped always; project-scoped when ``project_root`` is
+    given) are appended AFTER the static fragments so a hard-won "avoid this"
+    rule wins on conflict -- the Layer-2 feedback that prevents a repeated
+    mistake at generation time.
+    """
     parts = [s.scaffold_system_prompt().strip() for s in skills]
-    return "\n\n".join(p for p in parts if p)
+    base = "\n\n".join(p for p in parts if p)
+    lessons = _lessons_addendum(skills, project_root)
+    return (base + "\n\n" + lessons).strip() if lessons else base
 
 
-def compose_plan_prompt(skills: List[Skill]) -> str:
-    """Join non-empty ``plan_system_prompt`` fragments with blank lines."""
+def compose_plan_prompt(skills: List[Skill],
+                        project_root: Optional[str] = None) -> str:
+    """Join non-empty ``plan_system_prompt`` fragments with blank lines.
+
+    Lessons are NOT appended here: callers that compose both prompts (the Tech
+    Lead) add them once via :func:`compose_scaffold_prompt` to avoid a duplicate
+    block; a caller using only the plan prompt gets them via ``project_root``.
+    """
     parts = [s.plan_system_prompt().strip() for s in skills]
     return "\n\n".join(p for p in parts if p)
 
@@ -314,6 +356,29 @@ def collect_scaffold_warnings(skills: List[Skill],
     return out
 
 
+def apply_scaffold_repairs(skills: List[Skill],
+                           files: List[Dict[str, Any]]
+                           ) -> Dict[str, str]:
+    """Merge every active skill's deterministic :meth:`Skill.repair_scaffold`.
+
+    The Layer-1 fast-path the VERIFY loop runs *before* spending any LLM repair
+    round: each skill returns ``{path: fixed_content}`` for the mechanical bugs
+    it can fix with certainty (Flask double-prefix, ...). Later skills win on a
+    path collision (rare; skills govern disjoint file classes). Each skill is
+    isolated -- one that raises is skipped, never sinking the pass.
+    """
+    out: Dict[str, str] = {}
+    for s in skills:
+        try:
+            fixes = s.repair_scaffold(files) or {}
+        except Exception:  # pragma: no cover - a skill repair must never crash verify
+            continue
+        for path, content in fixes.items():
+            if isinstance(path, str) and isinstance(content, str):
+                out[path] = content
+    return out
+
+
 def validate_plan(skills: List[Skill],
                   diffs: List[Dict[str, Any]],
                   goal: str = "") -> Optional[SkillVerdict]:
@@ -335,6 +400,7 @@ __all__ = [
     "MarkdownSkill",
     "Skill",
     "SkillVerdict",
+    "apply_scaffold_repairs",
     "collect_scaffold_warnings",
     "compose_ask_prompt",
     "compose_plan_prompt",

@@ -57,7 +57,6 @@ mcp = ["mcp>=1.2"]
 parsers = [
   "tree-sitter>=0.21",
   "tree-sitter-language-pack>=0.2",
-  "mcp>=1.2",
 ]
 dev = [
   "pytest>=7.4",

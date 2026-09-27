@@ -619,6 +619,14 @@ def cross_check_first_party_imports(
                         "file": path,
                         "module": target,
                         "name": name,
+                        # ``define_in`` (the module that SHOULD define ``name``)
+                        # is deliberately NOT set here: a bare import break is as
+                        # often an importer-side typo (``Ghost`` -> ``User``) as a
+                        # genuinely-missing definition, so the safe default stays
+                        # "fix the importer". Retarget-to-definer is opt-in, driven
+                        # by a skill that has corroborating evidence the symbol is
+                        # real (e.g. Flask's undefined_model_refs, which also mines
+                        # the columns) and sets ``regen_file`` + ``directive``.
                         "reason": f"{name!r} not defined in {target_path}",
                     })
     return warnings

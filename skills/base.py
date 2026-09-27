@@ -68,6 +68,15 @@ class SkillVerdict:
     rationale: str
     skill: str = ""  # filled by registry helpers when missing
     severity: str = "error"  # "error" (fatal) or "warning" (advisory)
+    #: When set, the file the VERIFY loop should REGENERATE to resolve this
+    #: verdict -- which is often NOT the file that tripped it. The coffee-shop
+    #: lesson: ``Order.query`` fails in a route/test, but the fix is to DEFINE
+    #: ``Order`` in ``models.py``. Carrying the definer here lets verify target
+    #: an *additive* regen of the right file instead of stripping the reference.
+    regen_file: str = ""
+    #: A precise, additive instruction appended to that file's regen prompt
+    #: (e.g. "define Order(db.Model) with columns order_id, member_id, ...").
+    directive: str = ""
 
 
 class Skill(ABC):
@@ -155,6 +164,22 @@ class Skill(ABC):
         ``severity="warning"`` and ``passed=False``.
         """
         return []
+
+    # ---- Optional: deterministic self-repair -------------------------
+    def repair_scaffold(self, files: List[Dict[str, Any]]
+                        ) -> Dict[str, str]:
+        """Deterministically fix a bounded class of stack bugs, no model call.
+
+        Given the current file bundle (``[{path, content}]``), return
+        ``{path: new_content}`` for every file this skill can fix *with
+        certainty* -- the mechanical, 100%-decidable defects that a weak model
+        otherwise fumbles across many repair rounds (e.g. a Flask blueprint
+        route repeating its own ``url_prefix`` -> ``/api/api/...``). This is the
+        Layer-1 fast-path beside the model: certain, instant, free. Return an
+        empty dict for "nothing to fix" (the default). Never raises: a skill
+        that cannot parse the bundle simply declines.
+        """
+        return {}
 
     # ---- Optional: veto deterministic scaffolding --------------------
     def forbids_scaffold_path(self, path: str) -> bool:
