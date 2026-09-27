@@ -44,13 +44,22 @@ _MAX_INJECT_CHARS = 1500   # clip when injected into a prompt (num_ctx guard)
 # --------------------------------------------------------------------------- #
 # Paths
 # --------------------------------------------------------------------------- #
-def _skill_dir(skill: str) -> str:
-    return os.path.join(_SKILLS_DIR, re.sub(r"[^\w\-]", "", skill or ""))
+def _safe_skill(skill: str) -> str:
+    """Sanitise a skill name to a safe path segment ('' if nothing survives)."""
+    return re.sub(r"[^\w\-]", "", skill or "")
+
+
+def _skill_dir(skill: str) -> Optional[str]:
+    safe = _safe_skill(skill)
+    return os.path.join(_SKILLS_DIR, safe) if safe else None
 
 
 def _ledger_path(scope: str, skill: str, root: Optional[str]) -> Optional[str]:
-    if scope == "skill" and skill:
-        return os.path.join(_skill_dir(skill), "lessons.jsonl")
+    if scope == "skill":
+        # A skill whose name sanitises to nothing must NOT write a stray ledger
+        # at the skills package root -- refuse it.
+        sdir = _skill_dir(skill)
+        return os.path.join(sdir, "lessons.jsonl") if sdir else None
     if scope == "project" and root:
         return os.path.join(root, ".cgx", "lessons.jsonl")
     return None
@@ -109,6 +118,21 @@ def _render_md(scope: str, skill: str, entries: List[Dict[str, Any]]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _atomic_write(path: str, text: str) -> None:
+    """Write ``text`` to ``path`` atomically (temp file + os.replace).
+
+    A concurrent verify run must never observe a half-written ledger: os.replace
+    is atomic on the same filesystem, so a reader sees either the old file or the
+    complete new one -- never a torn/corrupt JSONL. (A lost update between two
+    racing writers is still possible but benign: a lesson is simply re-learned
+    next run; the file never corrupts.)
+    """
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    os.replace(tmp, path)
+
+
 def _rewrite(scope: str, skill: str, root: Optional[str],
              entries: List[Dict[str, Any]]) -> None:
     ledger = _ledger_path(scope, skill, root)
@@ -117,12 +141,10 @@ def _rewrite(scope: str, skill: str, root: Optional[str],
         return
     try:
         os.makedirs(os.path.dirname(ledger), exist_ok=True)
-        with open(ledger, "w", encoding="utf-8") as fh:
-            for e in entries:
-                fh.write(json.dumps(e, ensure_ascii=False) + "\n")
+        _atomic_write(ledger, "".join(
+            json.dumps(e, ensure_ascii=False) + "\n" for e in entries))
         if md:
-            with open(md, "w", encoding="utf-8") as fh:
-                fh.write(_render_md(scope, skill, entries))
+            _atomic_write(md, _render_md(scope, skill, entries))
     except Exception:  # pragma: no cover - store write is best-effort
         pass
 
@@ -151,8 +173,8 @@ def record_lesson(scope: str, lesson: str, *, skill: str = "",
     lesson = (lesson or "").strip()
     if not lesson or scope not in ("project", "skill"):
         return None
-    if scope == "skill" and not skill:
-        return None
+    if scope == "skill" and not _safe_skill(skill):
+        return None          # name sanitises to nothing -> unaddressable
     if scope == "project" and not root:
         return None
     entries = read_lessons(scope, skill=skill, root=root)
@@ -196,17 +218,24 @@ def prune_lesson(lesson_id: str, *, scope: str, skill: str = "",
 def _inject_text(entries: List[Dict[str, Any]], header: str) -> str:
     if not entries:
         return ""
-    bullets = []
-    for e in entries:
-        lesson = str(e.get("lesson") or "").strip()
-        if lesson:
-            bullets.append(f"- {lesson}")
+    # Ledger is oldest-first (newest appended last). Render NEWEST-first so that
+    # when we clip to the char budget it is the OLDEST lessons that fall off the
+    # end -- the newest, most relevant lessons are always kept (the previous
+    # tail-clip silently dropped exactly the lessons just learned).
+    bullets = [f"- {ls}" for ls in
+               (str(e.get("lesson") or "").strip() for e in reversed(entries))
+               if ls]
     if not bullets:
         return ""
-    body = header + "\n" + "\n".join(bullets)
-    if len(body) > _MAX_INJECT_CHARS:
-        body = body[:_MAX_INJECT_CHARS].rstrip() + "\n- [... older lessons omitted ...]"
-    return body
+    kept: List[str] = []
+    used = len(header) + 1
+    for b in bullets:
+        if used + len(b) + 1 > _MAX_INJECT_CHARS and kept:
+            kept.append("- [... older lessons omitted ...]")
+            break
+        kept.append(b)
+        used += len(b) + 1
+    return header + "\n" + "\n".join(kept)
 
 
 def skill_lessons_text(skill: str) -> str:

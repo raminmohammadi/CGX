@@ -4126,6 +4126,7 @@ def generate_single_scaffold_file(
     contracts: Optional[Dict[str, Any]] = None,
     manifest_paths: Optional[List[str]] = None,
     import_hint: str = "",
+    project_root: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Generate the content of a single file in a new-project scaffold.
 
@@ -4235,7 +4236,8 @@ def generate_single_scaffold_file(
     active_skills = _resolve_skills(skills, detect_text)
     try:
         import skills as _sk
-        skill_fragment = _sk.compose_scaffold_prompt(active_skills)
+        skill_fragment = _sk.compose_scaffold_prompt(
+            active_skills, project_root=project_root)
         skill_names_str = ", ".join(s.name for s in active_skills)
     except Exception:  # pragma: no cover - defensive
         skill_fragment = ""

@@ -61,6 +61,41 @@ def test_project_lesson_needs_root():
     assert L.record_lesson("project", "no root given", root=None) is None
 
 
+def test_injection_keeps_newest_when_clipped(tmp_path, monkeypatch):
+    # Regression: the clip must drop the OLDEST lessons, not the newest. Record
+    # many long lessons; the injected text must contain the last one and not the
+    # first, and carry the omission marker.
+    monkeypatch.setattr(L, "_MAX_INJECT_CHARS", 200)
+    root = str(tmp_path)
+    for i in range(20):
+        L.record_lesson("project", f"lesson {i:02d} " + "x" * 40, root=root,
+                        now=float(i))
+    txt = L.project_lessons_text(root)
+    assert "lesson 19" in txt          # newest kept
+    assert "lesson 00" not in txt      # oldest dropped
+    assert "older lessons omitted" in txt
+
+
+def test_empty_skill_name_writes_no_stray_ledger(tmp_path, monkeypatch):
+    monkeypatch.setattr(L, "_SKILLS_DIR", str(tmp_path / "skills"))
+    # A skill name that sanitises to nothing must be refused, not written at the
+    # skills package root.
+    assert L.record_lesson("skill", "x", skill="/./") is None
+    assert not (tmp_path / "skills" / "lessons.jsonl").exists()
+
+
+def test_no_active_skills_demotes_skill_lesson_to_project(tmp_path, monkeypatch):
+    monkeypatch.setattr(L, "_SKILLS_DIR", str(tmp_path / "skills"))
+    monkeypatch.setenv("CGX_SWARM_LEARNING", "on")
+    # Model claims scope=skill=flask but the run used NO skills -> cannot attribute.
+    provider = _FakeProvider({"lessons": [
+        {"scope": "skill", "skill": "flask", "lesson": "unattributable rule"}]})
+    recorded = run_postmortem(provider, goal="g", skills=[], root=str(tmp_path),
+                              incidents=[{"detail": "x"}])
+    assert recorded and recorded[0]["scope"] == "project"
+    assert L.skill_lessons_text("flask") == ""   # never bound to flask
+
+
 # --------------------------------------------------------------------------- #
 # Skill scope + feedback injection into the scaffold prompt
 # --------------------------------------------------------------------------- #

@@ -359,6 +359,7 @@ def _full_file_attempt(path: str, description: str, depends_on: List[str],
             contracts=contracts or {},
             manifest_paths=manifest_paths,
             import_hint=import_hint,
+            project_root=root,
         )
     except Exception as exc:  # pragma: no cover
         return "", f"{type(exc).__name__}: {exc}"

@@ -101,11 +101,16 @@ def run_postmortem(provider: Any, *, goal: str, skills: List[str],
             continue
         skill = str(item.get("skill") or "").strip()
         if scope == "skill":
-            # Bind to an active skill; fall back to the sole active skill.
-            if skill not in known:
-                skill = active[0] if len(active) == 1 else ""
-            if not skill or (active and skill not in active):
-                # Cannot safely attribute a stack lesson -> demote to project.
+            # A stack lesson may ONLY bind to a skill the run actually used --
+            # otherwise it would poison an unrelated stack. When the run used
+            # exactly one skill, an unnamed/mismatched target is unambiguous, so
+            # snap it to that skill. In every other case (no active skills, or a
+            # name not in the active set) we cannot safely attribute it -> demote
+            # to a project lesson. (``known`` is only a sanity check that the name
+            # is a real skill; membership in ``active`` is what actually gates.)
+            if len(active) == 1 and (skill not in active):
+                skill = active[0]
+            if not skill or skill not in active or skill not in known:
                 scope, skill = "project", ""
         if scope not in ("project", "skill"):
             scope = "project"

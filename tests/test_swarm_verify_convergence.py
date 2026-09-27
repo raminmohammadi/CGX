@@ -180,6 +180,47 @@ def test_converge_then_escalate_stops_fast_not_five_rounds(
     assert res.outputs["verify_ok"] is False
 
 
+def test_hard_signature_excludes_tests_includes_errors_and_toolcodes():
+    # Pure assertion failure -> no HARD signature (soft only); iterating on it is
+    # progress, not a stall.
+    assert sv._hard_signature("FAILED tests/t.py::test_a\nassert 1 == 2") == \
+        frozenset()
+    # Python error + missing symbol -> hard.
+    h = sv._hard_signature("OperationalError: no such table orders")
+    assert any(t.startswith("err:") for t in h)
+    assert any(t.startswith("miss:") for t in h)
+    # Non-Python toolchains fingerprint via their error CODES (else empty ->
+    # spuriously 'stalled'): tsc / rustc / MSVC.
+    assert sv._hard_signature("src/x.ts(3,5): error TS2322: bad") != frozenset()
+    assert sv._hard_signature("error[E0308]: mismatched types") != frozenset()
+
+
+def test_soft_only_failure_uses_full_repair_budget(tmp_path, monkeypatch):
+    # A pure assertion failure (no hard signature) must NOT trip the stall guard:
+    # it gets the full repair-temperature ramp, not a 2-round cut.
+    (tmp_path / "app.py").write_text("x = 1\n", encoding="utf-8")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_x.py").write_text(
+        "def test_foo():\n    assert False\n", encoding="utf-8")
+    calls = {"n": 0}
+
+    def _env(paths, root):
+        calls["n"] += 1
+        return {"ran": True, "outcome": "failed",
+                "output": (f"FAILED tests/test_x.py::test_foo\n"
+                           f"assert {calls['n']} == {calls['n'] + 1}")}
+
+    monkeypatch.setattr(sv, "_run_env_dryrun", _env)
+    monkeypatch.setattr(sv, "generate_file",
+                        lambda **kw: type("O", (), {"ok": True,
+                                                     "content": ""})())
+    monkeypatch.setattr(sv, "_dynamic_repair", lambda *a, **k: [])
+    res = _run(tmp_path, _plan(tmp_path, ["app.py", "tests/test_x.py"]))
+    # No hard signal -> full budget (5), unlike the hard-stall case (<=2).
+    assert res.artifact.content["dynamic_regen_rounds"] == \
+        sv._MAX_DYNAMIC_REPAIR_ROUNDS
+
+
 def test_failure_signature_is_temperature_invariant():
     a = ("FAILED tests/t.py::test_a\nOperationalError: no such table orders\n"
          "# nonce 1  at 0x7f00")

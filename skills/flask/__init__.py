@@ -11,6 +11,7 @@ from skills._structural import (
     any_body_matches,
     app_backimports,
     blueprint_prefix_collisions,
+    relative_sqlite_uris,
     undeclared_python_deps,
     undefined_model_refs,
 )
@@ -247,15 +248,22 @@ class FlaskSkill(Skill):
             new = body
             for c in cols:
                 prefix, route = c["prefix"], c["route"]
+                var = c.get("blueprint") or ""
                 # The route with the leading prefix stripped (keep a leading /).
                 stripped = route[len(prefix):] or "/"
                 if not stripped.startswith("/"):
                     stripped = "/" + stripped
-                # Replace only inside the @bp.route("...") decorator literal, so
-                # an identical string elsewhere is never touched.
+                # Rewrite only the decorator of the SPECIFIC blueprint var that
+                # collided (``@members_bp.route("...")``), so an identically
+                # named route on a *different*, non-colliding blueprint in the
+                # same file is never touched. Fall back to a bare ``.route`` match
+                # only when the var is unknown (older callers).
                 for q in ("'", '"'):
-                    new = new.replace(f".route({q}{route}{q}",
-                                      f".route({q}{stripped}{q}")
+                    needle = (f"@{var}.route({q}{route}{q}" if var
+                              else f".route({q}{route}{q}")
+                    repl = (f"@{var}.route({q}{stripped}{q}" if var
+                            else f".route({q}{stripped}{q}")
+                    new = new.replace(needle, repl)
             if new != body:
                 out[path] = new
         return out
@@ -265,14 +273,32 @@ class FlaskSkill(Skill):
         paths = file_paths(diffs)
         if not paths or not any(p.endswith(".py") for p in paths):
             return []
-        if has_python_test_file(paths):
-            return []
-        return [SkillVerdict(
-            passed=False, confidence=0.7, severity="warning",
-            rationale=("Flask skill: no test file generated. Add a "
-                       "tests/test_app.py that builds the app via create_app() "
-                       "and uses `app.test_client()` to exercise the routes."),
-        )]
+        out: List[SkillVerdict] = []
+        if not has_python_test_file(paths):
+            out.append(SkillVerdict(
+                passed=False, confidence=0.7, severity="warning",
+                rationale=("Flask skill: no test file generated. Add a "
+                           "tests/test_app.py that builds the app via "
+                           "create_app() and uses `app.test_client()` to "
+                           "exercise the routes."),
+            ))
+        # A relative SQLite URI (sqlite:///./x.db) opens relative to the CWD, so
+        # it fails ("unable to open database file") whenever tests run from a
+        # different directory. Advisory (non-blocking) + a targeted directive so
+        # a regen anchors the path absolutely instead of a risky text rewrite.
+        rel = relative_sqlite_uris(diffs)
+        if rel:
+            out.append(SkillVerdict(
+                passed=False, confidence=0.75, severity="warning",
+                rationale=(f"Flask skill: relative SQLite URI '{rel[0]['uri']}' "
+                           "is CWD-dependent and fails under pytest. Anchor it "
+                           "absolutely, e.g. "
+                           "`os.path.join(app.instance_path, 'app.db')` (create "
+                           "the dir with os.makedirs(app.instance_path, "
+                           "exist_ok=True)), or use 'sqlite:///:memory:' in "
+                           "tests."),
+            ))
+        return out
 
 
 __all__ = ["FlaskSkill"]

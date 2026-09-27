@@ -165,16 +165,24 @@ _ORM_USE_RE = re.compile(
     r"\b([A-Z]\w+)\.query\b"
     r"|\bsession\.get\(\s*([A-Z]\w+)"
     r"|\bsession\.query\(\s*([A-Z]\w+)")
-# Raw-SQL table references, scanned ONLY inside string literals that actually
-# contain a SQL DML verb -- so a Python ``from x import y`` (which reads like a
-# SQL ``FROM x`` to a naive regex) can never be mistaken for a table.
-# ``INSERT INTO t (cols...)`` additionally yields the column list.
+# Raw-SQL table references, scanned ONLY inside string literals that are an
+# actual SQL statement -- the literal must START (after whitespace) with a DML
+# verb, so ordinary UI/error copy that merely CONTAINS a word like "select" or
+# "update ... from the list" ("Please select a category from the list") is never
+# mistaken for SQL. ``INSERT INTO t (cols...)`` additionally yields the columns.
 _STRING_LIT_RE = re.compile(r"['\"]([^'\"\n]*)['\"]")
-_SQL_DML_RE = re.compile(r"\b(?:INSERT|SELECT|UPDATE|DELETE)\b", re.I)
+_SQL_STMT_RE = re.compile(
+    r"^\s*(?:SELECT\b|INSERT\s+INTO\b|UPDATE\b|DELETE\s+FROM\b|WITH\b)", re.I)
 _SQL_INSERT_RE = re.compile(
     r"INSERT\s+INTO\s+([A-Za-z_]\w*)\s*\(([^)]*)\)", re.I)
 _SQL_TABLE_RE = re.compile(
     r"(?:FROM|JOIN|UPDATE|INTO|DELETE\s+FROM)\s+([A-Za-z_]\w*)", re.I)
+# Common English words that can follow FROM/INTO/etc. in prose -- a second guard
+# so even a mis-detected SQL-ish string can never mint a phantom model.
+_SQL_STOPWORDS = frozenset({
+    "the", "a", "an", "this", "that", "these", "those", "your", "our", "my",
+    "their", "his", "her", "its", "list", "here", "there", "them", "it", "us",
+    "me", "you", "now", "below", "above", "select", "where", "and", "or"})
 
 
 # Names that are "bound" in a body: imported, or defined as class/def/assignment.
@@ -326,10 +334,11 @@ def undefined_model_refs(
             if not cls or cls in bound:
                 continue
             _note(cls, _norm_table(cls), path, via="orm")
-        # 2) Raw-SQL tables -- only within string literals that carry a DML verb,
-        #    with columns mined from any INSERT.
+        # 2) Raw-SQL tables -- only within string literals that ARE a SQL
+        #    statement (start with a DML verb), with columns mined from any
+        #    INSERT and an English-stopword guard on the extracted table name.
         sql_blobs = [s for s in _STRING_LIT_RE.findall(body)
-                     if _SQL_DML_RE.search(s)]
+                     if _SQL_STMT_RE.match(s)]
         cols_by_table: Dict[str, List[str]] = {}
         for blob in sql_blobs:
             for m in _SQL_INSERT_RE.finditer(blob):
@@ -339,6 +348,8 @@ def undefined_model_refs(
             for m in _SQL_TABLE_RE.finditer(blob):
                 tbl = m.group(1)
                 key = _norm_table(tbl)
+                if key in _SQL_STOPWORDS or tbl.lower() in _SQL_STOPWORDS:
+                    continue
                 _note(key.capitalize(), key, path, via="sql", table=tbl,
                       columns=cols_by_table.get(key))
     return list(out.values())
@@ -384,7 +395,17 @@ def blueprint_prefix_collisions(
     ``register_blueprint(members_bp, url_prefix="/api")``, while the decorator in
     ``members.py`` is ``@bp.route("/api/members")``) -- and flags routes where
     ``path`` starts with ``P``, the double-prefix that makes the live URL
-    ``P + P + ...`` (every request 404s). Returns ``[{file, prefix, route}]``.
+    ``P + P + ...`` (every request 404s). Returns
+    ``[{file, prefix, route, blueprint}]``.
+
+    Correlation is deliberately STRICT to avoid a false collision: a route file
+    is matched to a registration only via (a) the resolved import-alias source,
+    or (b) a registration in the SAME module on the same variable. The old
+    ``var == regvar`` global match cross-linked every module that used the
+    near-universal ``bp`` name -- so a prefix-less blueprint's absolute route
+    (``@bp.route('/api/stats')`` on an admin blueprint registered with no prefix)
+    got falsely flagged against an UNRELATED ``/api`` registration. Only the
+    blueprint actually registered under ``P`` is considered.
     """
     # 1) alias used at registration -> (source module, original local name).
     alias_to_src: Dict[str, tuple] = {}
@@ -392,15 +413,16 @@ def blueprint_prefix_collisions(
         for m in _IMPORT_ALIAS_RE.finditer(_body(d)):
             src_mod, orig, alias = m.group(1), m.group(2), m.group(3)
             alias_to_src[alias or orig] = (src_mod, orig)
-    # 2) registered url_prefix per blueprint variable (as named at registration).
-    prefixes: Dict[str, str] = {}
+    # 2) registrations WITH the module they appear in, so a same-file bare-var
+    #    registration binds to that file's routes -- never another module's.
+    regs: List[tuple] = []  # (regvar, prefix, reg_module)
     for d in diffs or []:
+        mod = _module_of(_path(d))
         for m in _REGISTER_BP_RE.finditer(_body(d)):
-            prefixes[m.group(1)] = "/" + m.group(2).strip("/")
-    if not prefixes:
+            regs.append((m.group(1), "/" + m.group(2).strip("/"), mod))
+    if not regs:
         return []
-    # 3) route decorators, indexed by (module, local var) so an aliased
-    #    registration resolves to the file+var that actually carries the routes.
+    # 3) route decorators, indexed by (module, local var).
     routes_by_key: Dict[tuple, List[tuple]] = {}
     for d in diffs or []:
         path = _path(d)
@@ -412,16 +434,15 @@ def blueprint_prefix_collisions(
                 (path, m.group(2)))
     out: List[Dict[str, str]] = []
     seen: set = set()
-    for regvar, prefix in prefixes.items():
-        src = alias_to_src.get(regvar)
-        # Candidate (module, var) keys the registration could point at: the
-        # resolved import source, plus a same-file registration on the bare var.
+    for regvar, prefix, reg_mod in regs:
+        # Candidate (module, var) keys THIS registration could point at:
+        #  - the import-alias source (aliased or bare import from another module)
+        #  - a same-module registration on the bare variable
         cand = set()
+        src = alias_to_src.get(regvar)
         if src:
-            cand.add(src)  # (module, orig local name)
-        for (mod, var) in routes_by_key:
-            if var == regvar or (src and var == src[1] and mod == src[0]):
-                cand.add((mod, var))
+            cand.add(src)
+        cand.add((reg_mod, regvar))
         for key in cand:
             for (path, route) in routes_by_key.get(key, []):
                 r = "/" + route.strip("/")
@@ -430,7 +451,7 @@ def blueprint_prefix_collisions(
                     if sig not in seen:
                         seen.add(sig)
                         out.append({"file": path, "prefix": prefix,
-                                    "route": route})
+                                    "route": route, "blueprint": key[1]})
     return out
 
 

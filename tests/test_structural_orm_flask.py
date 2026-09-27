@@ -125,6 +125,45 @@ def test_no_prefix_collision_when_routes_are_relative():
     assert blueprint_prefix_collisions(good) == []
 
 
+def test_plain_english_ui_strings_are_not_mistaken_for_sql():
+    # Regression: a route returning user copy that merely CONTAINS select/update/
+    # from must NOT mint phantom tables (which would be a FATAL blocking a valid
+    # build). The literal has to BE a SQL statement (start with a DML verb).
+    diffs = [
+        {"path": "r.py", "content":
+            "from flask import jsonify\n"
+            "def v():\n"
+            "    return jsonify({'msg': 'Please select a category from the "
+            "list to update your cart'})\n"
+            "def w():\n    return 'Insert your details into the form below'\n"},
+    ]
+    assert undefined_model_refs(diffs) == []
+
+
+def test_prefixless_blueprint_with_absolute_route_not_flagged():
+    # Regression: an admin blueprint registered with NO url_prefix, whose route
+    # is the absolute '/api/stats', must not be falsely matched against an
+    # UNRELATED '/api' registration of a different blueprint that shares the
+    # near-universal variable name `bp`.
+    diffs = [
+        {"path": "app.py", "content":
+            "from routes.public import bp\n"
+            "from routes.admin import bp as admin_bp\n"
+            "app.register_blueprint(bp, url_prefix='/api')\n"
+            "app.register_blueprint(admin_bp)\n"},
+        {"path": "routes/public.py", "content":
+            "bp = Blueprint('public', __name__)\n@bp.route('/api/list')\ndef a(): ...\n"},
+        {"path": "routes/admin.py", "content":
+            "bp = Blueprint('admin', __name__)\n@bp.route('/api/stats')\ndef s(): ...\n"},
+    ]
+    hits = blueprint_prefix_collisions(diffs)
+    files = sorted(h["file"] for h in hits)
+    assert files == ["routes/public.py"], hits   # admin's absolute route is fine
+    # And the repair only rewrites the colliding blueprint's file.
+    from skills.flask import FlaskSkill
+    assert list(FlaskSkill().repair_scaffold(diffs)) == ["routes/public.py"]
+
+
 def test_relative_sqlite_detected_absolute_and_memory_ignored():
     assert relative_sqlite_uris(_diffs())[0]["uri"] == "sqlite:///./data/app.db"
     ok = [
@@ -132,3 +171,23 @@ def test_relative_sqlite_detected_absolute_and_memory_ignored():
         {"path": "b.py", "content": "URI='sqlite:///:memory:'"},
     ]
     assert relative_sqlite_uris(ok) == []
+
+
+def test_relative_sqlite_is_surfaced_as_advisory_not_fatal():
+    # The detector must be WIRED (finding #7 was that it was dead code): a
+    # relative URI rides along as a non-fatal warning that steers a regen.
+    from skills.flask import FlaskSkill
+    diffs = [
+        {"path": "backend/app.py", "content":
+            "from flask import Flask\n"
+            "def create_app():\n    app = Flask(__name__)\n"
+            "    app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///./data/app.db'\n"
+            "    return app\n"},
+        {"path": "tests/test_app.py", "content": "def test_x(): pass\n"},
+        {"path": "requirements.txt", "content": "flask\n"},
+    ]
+    s = FlaskSkill()
+    assert s.validate_scaffold(diffs) is None      # not fatal
+    warns = s.scaffold_warnings(diffs)
+    assert any("relative SQLite URI" in w.rationale and w.severity == "warning"
+               for w in warns)
