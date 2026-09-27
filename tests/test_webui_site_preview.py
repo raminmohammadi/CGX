@@ -17,7 +17,8 @@ from cgx.webui.routes import sites as sites_routes
 @pytest.fixture()
 def sites_dir(tmp_path, monkeypatch):
     d = tmp_path / "sites"
-    monkeypatch.setattr(workspace, "SITES_DIR", d)
+    # Site-workspace logic lives in cgx.sites (webui.workspace re-exports it).
+    monkeypatch.setattr("cgx.sites.SITES_DIR", d)
     return d
 
 
