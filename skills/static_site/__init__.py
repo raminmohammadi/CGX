@@ -56,6 +56,15 @@ _FRAMEWORK_EXTS = (".jsx", ".tsx", ".vue", ".svelte", ".ts")
 _HREF_SRC_RE = re.compile(
     r"""(?:href|src)\s*=\s*["']([^"'#?]+)["']""", re.IGNORECASE)
 _CSS_URL_RE = re.compile(r"""url\(\s*["']?([^"')#?]+)["']?\s*\)""", re.IGNORECASE)
+# Local page references emitted from JavaScript. The skill's own recommended
+# multi-page layout builds the ENTIRE nav as a string inside ``js/layout.js``
+# (injected into every page's <header>), so an HTML/CSS-only reference scan
+# never reads those links -- a broken nav then "ships green". Beyond the
+# href=/src= attributes that live inside HTML template strings (caught by
+# ``_HREF_SRC_RE``), also catch bare quoted URLs to a local .html/.htm page
+# (e.g. ``location.href = 'thankyou.html'`` or ``['index.html', './x.html']``).
+_JS_PAGE_URL_RE = re.compile(
+    r"""["']([^"'\n?#]*?\.html?)(?:[?#][^"'\n]*)?["']""", re.IGNORECASE)
 
 
 def _is_external(ref: str) -> bool:
@@ -192,6 +201,11 @@ class StaticSiteSkill(Skill):
                 found = _HREF_SRC_RE.findall(body)
             elif low.endswith(".css"):
                 found = _CSS_URL_RE.findall(body)
+            elif low.endswith(".js") and not low.endswith(".min.js"):
+                # href=/src= (inside HTML template strings the layout injects)
+                # PLUS bare quoted local page URLs -- js/layout.js is the one
+                # file the HTML/CSS scan never reads.
+                found = _HREF_SRC_RE.findall(body) + _JS_PAGE_URL_RE.findall(body)
             else:
                 continue
             for ref in found:
@@ -199,14 +213,49 @@ class StaticSiteSkill(Skill):
                     refs.append((path, ref))
         return emitted, refs
 
+    def _link_bases(self, src_file: str, emitted: Set[str]) -> List[str]:
+        """Directories a reference in ``src_file`` may be relative to.
+
+        An HTML/CSS reference resolves against the file's own directory. A
+        reference emitted from JS is different: the nav string in
+        ``js/layout.js`` is injected into whatever PAGE loads the script, so
+        its links resolve relative to that page's URL -- NOT the .js file's
+        directory. Resolving a JS ref only against ``js/`` would false-positive
+        the recommended layout (``href="about.html"`` in ``js/layout.js`` ->
+        root ``about.html``). So for JS we try the site root and every emitted
+        page's directory as candidate bases; a ref is broken only if it
+        resolves against none of them.
+        """
+        if src_file.lower().endswith(".js"):
+            html_dirs = {posixpath.dirname(p) for p in emitted
+                         if p.lower().endswith((".html", ".htm"))}
+            return [posixpath.dirname(src_file), ""] + sorted(html_dirs)
+        return [posixpath.dirname(src_file)]
+
+    def _resolve_ref(self, src_file: str, ref: str,
+                     emitted: Set[str]) -> Optional[str]:
+        """Emitted target ``ref`` resolves to, or ``None`` when it is broken.
+
+        Returns ``""`` for a reference that resolves to the site root / current
+        directory (still "not broken"); a concrete path when it hits an emitted
+        file; ``None`` only when no candidate base resolves to an emitted file.
+        """
+        for base in self._link_bases(src_file, emitted):
+            target = posixpath.normpath(posixpath.join(base, ref)).lstrip("./")
+            if not target or target in emitted:
+                return target
+        return None
+
     def _broken_links(self, diffs: List[Dict[str, Any]]) -> List[str]:
         emitted, refs = self._emitted_and_refs(diffs)
         broken: List[str] = []
+        seen: Set[str] = set()
         for src_file, ref in refs:
-            base = posixpath.dirname(src_file)
-            target = posixpath.normpath(posixpath.join(base, ref)).lstrip("./")
-            if target and target not in emitted and f"{target}" not in broken:
-                broken.append(f"{ref} (referenced by {src_file})")
+            if self._resolve_ref(src_file, ref, emitted) is None:
+                entry = f"{ref} (referenced by {src_file})"
+                if entry not in seen:
+                    seen.add(entry)
+                    broken.append(entry)
         return broken
 
     def forbids_scaffold_path(self, path: str) -> bool:
@@ -290,4 +339,27 @@ class StaticSiteSkill(Skill):
                 passed=False, confidence=0.6, severity="warning",
                 rationale=("static_site skill: no stylesheet was generated -- "
                            "the site will be unstyled.")))
+        # Orphan pages: on a MULTI-page site, a page that no nav/page links to
+        # is unreachable dead weight. The nav often lives in js/layout.js (now
+        # scanned), so a page missing from that string strands with no inbound
+        # link. Advisory only: home (index.html) is the entry point, and a
+        # false positive here must never fail the build.
+        emitted, refs = self._emitted_and_refs(diffs)
+        pages = {p for p in emitted if p.lower().endswith((".html", ".htm"))}
+        if len(pages) > 1:
+            linked: Set[str] = set()
+            for src_file, ref in refs:
+                tgt = self._resolve_ref(src_file, ref, emitted)
+                if tgt in pages:
+                    linked.add(tgt)
+            home = {p for p in pages
+                    if p.rsplit("/", 1)[-1].lower() == "index.html"}
+            orphans = sorted(pages - linked - home)
+            if orphans:
+                warns.append(SkillVerdict(
+                    passed=False, confidence=0.6, severity="warning",
+                    rationale=("static_site skill: multi-page site has pages "
+                               "linked from no nav/page (orphaned) -- wire them "
+                               "into the shared nav (js/layout.js) or a page: "
+                               + ", ".join(orphans[:8]))))
         return warns
