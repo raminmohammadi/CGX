@@ -188,7 +188,8 @@ def _check_phantom_third_party_imports(paths: List[str], contents: Dict[str, str
 
 def _structural_scan(
         paths: List[str], contents: Dict[str, str],
-        contracts: Dict[str, Any], root: str) -> Tuple[
+        contracts: Dict[str, Any], root: str,
+        skills: Optional[List[str]] = None, goal: str = "") -> Tuple[
             List[str], List[Dict[str, Any]], List[Dict[str, Any]],
             List[Dict[str, Any]]]:
     """Run the structural checks; never raises (each gate is defensive).
@@ -239,7 +240,46 @@ def _structural_scan(
         swarm_beat(root, "verify", "gate_error", gate="phantom_third_party",
                    error=repr(e))
         phantom_3p_w = []
-    import_breaks = _merge_import_warnings(symbol_w, resolve_w, crossref_w)
+    # Cross-file CIRCULAR-IMPORT gate (the case-study failure): reuse the AST/SCC
+    # detector so a routes<->app / model<->app cycle -- which pytest cannot even
+    # collect -- gates HARD and names a file to regenerate, instead of burning
+    # dynamic-repair rounds one file at a time (which can never break a cycle).
+    try:
+        from cgx.session.tasks.scaffold import _circular_import_failures
+        py_files = [{"path": p, "content": c} for p, c in contents.items()
+                    if p.endswith(".py")]
+        cycle_w = [{"file": e.get("file", ""), "reason": e.get("error", ""),
+                    "kind": "circular_import"}
+                   for e in (_circular_import_failures(py_files) or [])]
+        if cycle_w:
+            swarm_beat(root, "verify", "circular_import",
+                       files=[w["file"] for w in cycle_w])
+    except Exception as e:  # pragma: no cover - gate is best-effort
+        swarm_beat(root, "verify", "gate_error", gate="circular_import",
+                   error=repr(e))
+        cycle_w = []
+    # Skill structural validators now run on the SWARM path too (previously only
+    # greenfield): a stack-specific FATAL verdict (e.g. Flask's circular-import /
+    # undeclared-dep / no-real-app checks) gates with an actionable message.
+    skill_w: List[Dict[str, Any]] = []
+    try:
+        if skills:
+            import skills as _sk
+            diffs = [{"path": p, "patch": c} for p, c in contents.items()]
+            fatal = _sk.validate_scaffold(_sk.skills_by_names(skills), diffs,
+                                          goal=goal)
+            if fatal is not None and not fatal.passed:
+                skill_w = [{"file": "", "reason": fatal.rationale,
+                            "kind": "skill_verdict",
+                            "skill": getattr(fatal, "skill", "") or ""}]
+                swarm_beat(root, "verify", "skill_verdict",
+                           skill=skill_w[0]["skill"],
+                           reason=fatal.rationale[:200])
+    except Exception as e:  # pragma: no cover - gate is best-effort
+        swarm_beat(root, "verify", "gate_error", gate="skill_validate",
+                   error=repr(e))
+    import_breaks = _merge_import_warnings(symbol_w, resolve_w, crossref_w,
+                                           cycle_w, skill_w)
     try:
         contract = check_contract_compliance(contents, contracts)
     except Exception as e:  # pragma: no cover - the gate is best-effort
@@ -591,7 +631,7 @@ def swarm_verify(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     while True:
         contents = _collect_contents(paths, project_root)
         gaps, import_w, phantom_w, contract_w = _structural_scan(
-            paths, contents, contracts, project_root)
+            paths, contents, contracts, project_root, skills, goal)
         targets = _regen_targets(gaps, import_w)
         if not targets or rounds >= _MAX_VERIFY_ROUNDS:
             break
@@ -645,7 +685,7 @@ def swarm_verify(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
                         deps.provider, paths, skills)
         contents = _collect_contents(paths, project_root)
         gaps, import_w, phantom_w, contract_w = _structural_scan(
-            paths, contents, contracts, project_root)
+            paths, contents, contracts, project_root, skills, goal)
         structural_ok = not (gaps or import_w)
         env = _run_env_dryrun(paths, project_root)
         # Stop early when a round cannot make progress: nothing to act on (no

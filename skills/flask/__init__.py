@@ -7,12 +7,30 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Optional
 
-from skills.base import (
-    Skill, SkillVerdict, file_paths, file_with_content, has_python_test_file,
+from skills._structural import (
+    any_body_matches,
+    app_backimports,
+    undeclared_python_deps,
 )
-
+from skills.base import Skill, SkillVerdict, file_paths, has_python_test_file
 
 _FLASK_RE = re.compile(r"\bflask\b", re.IGNORECASE)
+
+# Flask extensions whose import name differs from the pip package name, used to
+# flag a use that was never declared (a phantom dependency that ships broken).
+_FLASK_EXT_PIP = {
+    "flask_sqlalchemy": "flask-sqlalchemy",
+    "flask_cors": "flask-cors",
+    "flask_migrate": "flask-migrate",
+    "flask_login": "flask-login",
+    "flask_jwt_extended": "flask-jwt-extended",
+    "flask_marshmallow": "flask-marshmallow",
+}
+
+# Persistence intent in the goal -> the plan should include an extensions.py +
+# models.py so routes never import db/app back from the app module.
+_DB_INTENT = ("db", "database", "model", "sqlalchemy", "persist", "member",
+              "order", "payment", "user", "account", "store", "record")
 
 
 class FlaskSkill(Skill):
@@ -29,26 +47,54 @@ class FlaskSkill(Skill):
     def scaffold_system_prompt(self) -> str:
         return (
             "BACKEND -- Flask service\n"
-            "- Single application module at backend/app.py (or app/__init__.py "
-            "if using the application-factory pattern) creating "
-            "`app = Flask(__name__)` and exposing routes with "
-            "`@app.route(\"/...\", methods=[...])`.\n"
-            "- Return JSON via `flask.jsonify(...)` for API endpoints.\n"
-            "- requirements.txt must pin `flask` (and `flask-cors` when this "
-            "service is paired with a separate frontend skill).\n"
-            "- Provide a `if __name__ == \"__main__\":` block that calls "
-            "`app.run(host=\"0.0.0.0\", port=5000, debug=False)`.\n"
-            "- Tests under tests/test_*.py using `app.test_client()`."
+            "STRUCTURE (avoid circular imports -- the #1 Flask codegen failure):\n"
+            "- Put extension objects in their OWN module `backend/extensions.py`, "
+            "constructed WITHOUT an app: `db = SQLAlchemy()` (and `cors = CORS()`, "
+            "etc.).\n"
+            "- Build the app in `backend/app.py` with an application factory: "
+            "`def create_app(): app = Flask(__name__); db.init_app(app); "
+            "register blueprints; return app` (a module-level `app = create_app()` "
+            "for `flask run` is fine).\n"
+            "- Group routes as Blueprints in their own modules "
+            "(`bp = Blueprint(\"members\", __name__)`, `@bp.route(...)`); app.py "
+            "imports the blueprints and calls `app.register_blueprint(bp)`.\n"
+            "- A route/model/db module MUST NEVER do `from backend.app import app` "
+            "or `from backend.app import db` -- that is a circular import that "
+            "breaks even pytest collection. Import `db` from `backend.extensions`, "
+            "and use `flask.current_app` if you need the app inside a request.\n"
+            "MODELS are CLASSES: `class Member(db.Model): ...` in backend/models.py, "
+            "importing `db` from backend.extensions. Declare each model under the "
+            "plan's contracts.schemas, NEVER under contracts.functions.\n"
+            "DEPENDENCIES: any use of flask-sqlalchemy "
+            "(`from flask_sqlalchemy import SQLAlchemy`) or flask-cors "
+            "(`from flask_cors import CORS`) MUST be pinned in requirements.txt AND "
+            "listed in the plan's third_party_dependencies. Import names "
+            "(flask_sqlalchemy, flask_cors) differ from pip names "
+            "(flask-sqlalchemy, flask-cors).\n"
+            "- Return JSON via `flask.jsonify(...)`. requirements.txt pins `flask` "
+            "(plus the extensions above whenever they are imported).\n"
+            "- Provide `if __name__ == \"__main__\": app.run(host=\"0.0.0.0\", "
+            "port=5000, debug=False)`.\n"
+            "- Tests under tests/test_*.py: build the app via `create_app()`, wrap "
+            "DB setup in `with app.app_context(): db.create_all()`, and drive "
+            "routes with `app.test_client()`."
         )
 
     def plan_system_prompt(self) -> str:
         return (
-            "When modifying a Flask project:\n"
-            "- Attach new routes to the existing `app` (or blueprint) via "
-            "`@app.route` decorators; don't create a parallel Flask() "
-            "instance.\n"
-            "- Use blueprints for grouping related routes when the file "
-            "grows past ~5 endpoints."
+            "When planning or modifying a Flask project:\n"
+            "- Plan `backend/extensions.py` (holds `db = SQLAlchemy()` etc.), "
+            "`backend/app.py` (a create_app factory calling db.init_app and "
+            "registering blueprints), `backend/models.py` (model CLASSES importing "
+            "db from extensions), and one blueprint module per route group.\n"
+            "- Route/model/db modules MUST NOT import `app` or `db` from "
+            "backend.app -- that is a circular import. Import db from "
+            "backend.extensions.\n"
+            "- Declare model classes under contracts.schemas (not functions), and "
+            "list flask / flask-sqlalchemy / flask-cors in "
+            "third_party_dependencies whenever they are used.\n"
+            "- Attach new routes to a Blueprint (or the existing app); never create "
+            "a parallel Flask() instance."
         )
 
     def validate_scaffold(self, diffs: List[Dict[str, Any]],
@@ -62,20 +108,68 @@ class FlaskSkill(Skill):
                 rationale=("Flask skill: scaffold has no Python files. "
                            "Flask requires .py modules."),
             )
-        if file_with_content(diffs, "flask") is None:
+        # A REAL application instance, not merely the word "flask" somewhere.
+        if not any_body_matches(
+                diffs, r"Flask\(\s*(?:__name__|import_name)|def\s+create_app",
+                only_ext=(".py",)):
             return SkillVerdict(
                 passed=False, confidence=0.85,
-                rationale=("Flask skill: no generated file imports or "
-                           "references `flask`. Add backend/app.py with "
-                           "`from flask import Flask`."),
+                rationale=("Flask skill: no real Flask application instance. Add "
+                           "backend/app.py with `app = Flask(__name__)` or a "
+                           "`create_app()` factory."),
+            )
+        # THE case-study failure: a leaf module importing app/db back from the
+        # app entrypoint = circular import that breaks even test collection.
+        cyc = app_backimports(diffs)
+        if cyc:
+            worst = cyc[0]
+            return SkillVerdict(
+                passed=False, confidence=0.9,
+                rationale=(f"Flask skill: circular import -- {worst['file']} does "
+                           f"`from ...{worst['from_module']} import "
+                           f"{worst['imported']}`. A route/model module must not "
+                           "import app/db back from the app entrypoint. Move `db` "
+                           "to backend/extensions.py, import it from there, and "
+                           "register blueprints in create_app()."),
+            )
+        # Extensions used but never declared -> ships broken at install/import.
+        missing = undeclared_python_deps(diffs, _FLASK_EXT_PIP)
+        if missing:
+            names = ", ".join(sorted({m["pip"] for m in missing}))
+            return SkillVerdict(
+                passed=False, confidence=0.8,
+                rationale=(f"Flask skill: {names} is imported but not pinned in "
+                           "requirements.txt. Add it (note pip name differs from "
+                           "the import name) and list it in "
+                           "third_party_dependencies."),
             )
         if not any(p.endswith("requirements.txt")
                    or p.endswith("pyproject.toml") for p in paths):
             return SkillVerdict(
                 passed=False, confidence=0.8,
-                rationale=("Flask skill: scaffold is missing "
-                           "requirements.txt (or pyproject.toml) pinning "
-                           "`flask`."),
+                rationale=("Flask skill: scaffold is missing requirements.txt "
+                           "(or pyproject.toml) pinning `flask`."),
+            )
+        return None
+
+    def validate_plan(self, diffs: List[Dict[str, Any]],
+                      goal: str = "") -> Optional[SkillVerdict]:
+        # Paths-only at plan time. When the goal needs persistence, steer to the
+        # extensions.py + models.py layout so routes never import db/app back.
+        paths = [p.replace("\\", "/") for p in file_paths(diffs)]
+        if not paths:
+            return None
+        bases = {p.rsplit("/", 1)[-1] for p in paths}
+        lg = (goal or "").lower()
+        if any(w in lg for w in _DB_INTENT) \
+                and "extensions.py" not in bases and "models.py" not in bases:
+            return SkillVerdict(
+                passed=False, confidence=0.7,
+                rationale=("Flask skill: a Flask app with persistence must plan a "
+                           "backend/extensions.py (holding `db = SQLAlchemy()`) and "
+                           "a backend/models.py (model classes importing db from "
+                           "extensions), so routes never import db/app back from "
+                           "the app module (a circular import). Add them."),
             )
         return None
 
@@ -89,8 +183,8 @@ class FlaskSkill(Skill):
         return [SkillVerdict(
             passed=False, confidence=0.7, severity="warning",
             rationale=("Flask skill: no test file generated. Add a "
-                       "tests/test_app.py using `app.test_client()` to "
-                       "exercise the registered routes."),
+                       "tests/test_app.py that builds the app via create_app() "
+                       "and uses `app.test_client()` to exercise the routes."),
         )]
 
 

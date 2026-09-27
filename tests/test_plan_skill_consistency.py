@@ -27,6 +27,9 @@ _COFFEE_GOAL = ("build a coffee shop html website with a python flask backend "
 
 
 def _coffee_plan():
+    # The SANCTIONED Flask layout: db in extensions.py, model classes in
+    # models.py importing db from extensions, a create_app app.py, and a
+    # blueprint route module -- no routes<->app cycle.
     return normalize_plan({"goal": _COFFEE_GOAL, "layers": [
         {"name": "frontend", "files": [
             {"path": "frontend/index.html", "description": "home page"},
@@ -34,9 +37,13 @@ def _coffee_plan():
             {"path": "frontend/script.js", "description": "vanilla interactivity"},
         ]},
         {"name": "backend", "files": [
-            {"path": "backend/app.py", "description": "flask app"},
-            {"path": "backend/routes.py", "description": "routes",
-             "depends_on": ["backend/app.py"]},
+            {"path": "backend/extensions.py", "description": "db = SQLAlchemy()"},
+            {"path": "backend/models.py", "description": "model classes",
+             "depends_on": ["backend/extensions.py"]},
+            {"path": "backend/app.py", "description": "create_app factory",
+             "depends_on": ["backend/extensions.py", "backend/models.py"]},
+            {"path": "backend/routes/members.py", "description": "members blueprint",
+             "depends_on": ["backend/extensions.py"]},
         ]},
     ]})
 
@@ -134,3 +141,83 @@ def test_rejection_stalled():
     # progress then repeat: only the final repeat stalls.
     assert _rejection_stalled(
         [frozenset({"a"}), frozenset({"b"}), frozenset({"b"})]) is True
+
+
+# --- Flask skill hardening (the SWARM_VERIFY case study) -----------------
+
+def test_flask_scaffold_catches_circular_import():
+    from skills.flask import FlaskSkill
+    diffs = [
+        {"path": "backend/app.py",
+         "content": "from flask import Flask\nfrom backend.routes.members import bp\napp = Flask(__name__)\n"},
+        {"path": "backend/routes/members.py",
+         "content": "from backend.app import app, db\nbp = None\n"},
+        {"path": "requirements.txt", "content": "flask\n"},
+    ]
+    v = FlaskSkill().validate_scaffold(diffs, goal="members")
+    assert v is not None and not v.passed and "circular import" in v.rationale
+
+
+def test_flask_scaffold_catches_undeclared_extension():
+    from skills.flask import FlaskSkill
+    diffs = [
+        {"path": "backend/app.py",
+         "content": ("from flask import Flask\nfrom flask_sqlalchemy import "
+                     "SQLAlchemy\napp = Flask(__name__)\ndb = SQLAlchemy(app)\n")},
+        {"path": "requirements.txt", "content": "flask\n"},
+    ]
+    v = FlaskSkill().validate_scaffold(diffs, goal="members")
+    assert v is not None and not v.passed and "flask-sqlalchemy" in v.rationale
+
+
+def test_flask_sanctioned_layout_passes():
+    from skills.flask import FlaskSkill
+    diffs = [
+        {"path": "backend/extensions.py",
+         "content": "from flask_sqlalchemy import SQLAlchemy\ndb = SQLAlchemy()\n"},
+        {"path": "backend/models.py",
+         "content": "from backend.extensions import db\nclass Member(db.Model):\n    id = db.Column(db.Integer, primary_key=True)\n"},
+        {"path": "backend/routes/members.py",
+         "content": "from flask import Blueprint, jsonify\nfrom backend.extensions import db\nbp = Blueprint('m', __name__)\n"},
+        {"path": "backend/app.py",
+         "content": "from flask import Flask\nfrom backend.extensions import db\ndef create_app():\n    app = Flask(__name__)\n    db.init_app(app)\n    return app\n"},
+        {"path": "requirements.txt", "content": "flask\nflask-sqlalchemy\n"},
+    ]
+    assert FlaskSkill().validate_scaffold(diffs, goal="members") is None
+
+
+def test_flask_plan_steers_missing_extensions():
+    from skills import detect_skills as _ds
+    from skills import validate_plan as _vp
+    bad = normalize_plan({"goal": _COFFEE_GOAL, "layers": [{"name": "b", "files": [
+        {"path": "backend/app.py", "description": "flask app"},
+        {"path": "backend/routes.py", "description": "routes"}]}]})
+    skills = _ds(_COFFEE_GOAL)
+    v = _vp(skills, [{"path": p} for p in ordered_paths(bad)], _COFFEE_GOAL)
+    assert v is not None and not v.passed and "extensions" in v.rationale
+
+
+def test_import_to_pypi_maps_flask_extensions():
+    from cgx.codegen.env_manager import _IMPORT_TO_PYPI
+    assert _IMPORT_TO_PYPI.get("flask_sqlalchemy") == "flask-sqlalchemy"
+    assert _IMPORT_TO_PYPI.get("flask_cors") == "flask-cors"
+    assert _IMPORT_TO_PYPI.get("rest_framework") == "djangorestframework"
+
+
+def test_swarm_structural_scan_gates_circular_import(tmp_path):
+    """The Swarm verify path now HARD-gates a routes<->app cycle (previously it
+    burned dynamic-repair rounds and reported a generic failure)."""
+    from cgx.session.tasks.swarm_verify import _structural_scan
+    contents = {
+        "backend/app.py": ("from flask import Flask\n"
+                           "from backend.routes.members import bp\n"
+                           "app = Flask(__name__)\n"),
+        "backend/routes/members.py": ("from backend.app import app, db\n"
+                                      "bp = None\n"),
+    }
+    paths = list(contents)
+    gaps, import_w, phantom_w, contract_w = _structural_scan(
+        paths, contents, {}, str(tmp_path), ["flask"], "members orders")
+    kinds = {w.get("kind") for w in import_w}
+    assert import_w, "cycle must gate (structural_ok = not (gaps or import_w))"
+    assert "circular_import" in kinds or "skill_verdict" in kinds
