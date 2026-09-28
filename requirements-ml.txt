@@ -39,6 +39,6 @@
 # sentence-transformers 6.x hard-requires transformers>=5. Holding both on the
 # last jina-compatible line (transformers 4.57.x / sentence-transformers 5.7.x)
 # avoids an ImportError at model load on a fresh install.
-sentence-transformers>=2.7,<6
-transformers>=4.40,<5
+sentence-transformers>=2.7,<7
+transformers>=4.40,<6
 torch>=2.13.0
