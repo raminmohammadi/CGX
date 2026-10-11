@@ -34,7 +34,6 @@ Pick the path that matches what you need right now.
 | Script CGX from the terminal                  | **[[CLI Reference]]** |
 | Drive the multi-step agent                    | **[[Session Based Agent]]** |
 | Run the plan-driven multi-role build engine   | **[[Swarm Agent]]** |
-| Build a static website by describing it        | **[[Site Studio]]** |
 | Generate and auto-validate code changes       | **[[Self Testing Code Generation]]** |
 | Understand the typed decision layer            | **[[JEV]]** |
 | Teach CGX a new framework                     | **[[Skills Registry]]** |
@@ -88,10 +87,14 @@ Pick the path that matches what you need right now.
   ladder, a `num_ctx` reuse-vs-rebuild guard, a content-inspecting permission
   policy, tiered tool disclosure, and a file-sensitivity scorer. Deterministic
   by default. See **[[JEV]]**.
-- **Site Studio.** Describe a website in plain English and CGX plans it, builds
-  a complete static HTML/CSS/JS site (no framework/build step), and renders it
-  **live** in a sandboxed preview — then refine it with feedback. See
-  **[[Site Studio]]**.
+- **Design-aware builds.** A UI-bearing objective gets a deterministic design
+  brief (archetype, screens, components, checkable UX requirements, a
+  contrast-verified theme), a design-tokens stylesheet CGX writes itself, and
+  a Verifier that gates on UI quality. See
+  [`docs/design.md`](https://github.com/raminmohammadi/CGX/blob/main/docs/design.md).
+- **MCP tool catalog.** One-click add for the MCP servers developers use
+  (GitHub, Playwright, Context7, databases, Stripe, Sentry ...), keyring
+  secrets, connection tests and agent hints. See **[[Providers and Models]]**.
 - **Self-testing code generation.** Diffs are parsed, syntax-checked, and
   optionally run against impacted tests in a sandbox before you ever see
   them.
@@ -136,7 +139,8 @@ holds the authoritative deep dives that individual wiki pages link into:
 
 - [`docs/architecture.md`](https://github.com/raminmohammadi/CGX/blob/main/docs/architecture.md) — full architecture reference
 - [`docs/jev.md`](https://github.com/raminmohammadi/CGX/blob/main/docs/jev.md) — the typed decision layer (JEV)
-- [`docs/site-studio.md`](https://github.com/raminmohammadi/CGX/blob/main/docs/site-studio.md) — describe-a-website builder
+- [`docs/design.md`](https://github.com/raminmohammadi/CGX/blob/main/docs/design.md) — design-aware UI builds (the `cgx.design` layer)
+- [`docs/mcp.md`](https://github.com/raminmohammadi/CGX/blob/main/docs/mcp.md) — MCP tool servers and the catalog
 - [`docs/mlops.md`](https://github.com/raminmohammadi/CGX/blob/main/docs/mlops.md) — production MLOps operator guide
 - [`docs/usage.md`](https://github.com/raminmohammadi/CGX/blob/main/docs/usage.md) — exhaustive usage guide
 - [`docs/Agent.md`](https://github.com/raminmohammadi/CGX/blob/main/docs/Agent.md) — session-agent internals

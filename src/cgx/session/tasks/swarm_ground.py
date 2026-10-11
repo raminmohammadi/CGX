@@ -19,6 +19,7 @@ from cgx.parser.parse_codebase import (
     _build_file_code_stub,
     _collect_top_level_members,
 )
+from cgx.session import js_symbols as _js
 
 # Grounding blocks are injected into a prompt, so bound the size of any single
 # dependency summary; a widely-imported module must not swamp the context.
@@ -69,6 +70,10 @@ def file_skeleton(path: str, root: str = ".") -> str:
     source = _safe_read(path, root)
     if source is None:
         return ""
+    if _js.is_js_path(path):
+        # JS/TS: imports + the REAL export surface (names + signatures), so the
+        # Developer imports what exists instead of guessing a shape.
+        return _js.skeleton(source, path)
     summary = _summarize(source)
     if summary is None:
         head = source.strip().splitlines()[:20]
@@ -79,6 +84,8 @@ def file_skeleton(path: str, root: str = ".") -> str:
 def list_symbols(path: str, root: str = ".") -> List[Dict[str, str]]:
     """Top-level functions and classes of a file as ``{name, kind, signature}``."""
     source = _safe_read(path, root)
+    if source is not None and _js.is_js_path(path):
+        return _js.symbol_list(source)
     summary = _summarize(source) if source is not None else None
     if summary is None:
         return []
@@ -107,6 +114,13 @@ def describe_file(path: str, root: str = ".") -> Dict[str, Any]:
     if source is None:
         return {"path": path, "exists": False, "docstring": None,
                 "symbols": [], "imports": [], "skeleton": ""}
+    if _js.is_js_path(path):
+        return {
+            "path": path, "exists": True, "parses": True, "docstring": None,
+            "imports": [s.spec for s in _js.js_imports(source)],
+            "symbols": _js.symbol_list(source),
+            "skeleton": _js.skeleton(source, path),
+        }
     summary = _summarize(source)
     members = summary["members"] if summary else {}
     return {

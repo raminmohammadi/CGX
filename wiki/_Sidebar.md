@@ -12,7 +12,6 @@
 - [[CLI Reference]]
 - [[Session Based Agent]]
 - [[Swarm Agent]]
-- [[Site Studio]]
 - [[Self Testing Code Generation]]
 
 **Configure & extend**

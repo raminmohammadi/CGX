@@ -1,12 +1,12 @@
 """Guards against plan-gate vs skill contradictions (the coffee-shop failure).
 
 The failure: for a "static HTML frontend + Flask backend" goal, ensure_scaffolding
-force-injected `frontend/package.json` (any .js -> "node" component), while the
-active static_site skill rejects any package.json -- an unwinnable
-inject-then-reject loop that failed the session after 3 attempts. These tests
-lock in the three fixes: skill-aware scaffolding (veto), narrower node
-detection (vanilla .js != node), and the invariant-vs-skill consistency check
-that catches the whole class.
+force-injected `frontend/package.json` (any .js -> "node" component), while an
+active skill governing the build-less frontend rejected any package.json -- an
+unwinnable inject-then-reject loop that failed the session after 3 attempts.
+These tests lock in the three fixes: skill-aware scaffolding (veto), narrower
+node detection (vanilla .js != node), and the invariant-vs-skill consistency
+check that catches the whole class.
 """
 
 from __future__ import annotations
@@ -20,7 +20,22 @@ from cgx.session.tasks.swarm_plan import (
 )
 from cgx.session.tasks.swarm_tech_lead import _rejection_stalled
 from skills import detect_skills, validate_plan
-from skills.static_site import StaticSiteSkill
+from skills.base import Skill
+
+
+class _BuildlessFrontendSkill(Skill):
+    """A stand-in for any skill that keeps a build-less frontend free of Node
+    scaffolding: it vetoes ``package.json`` and framework sources."""
+
+    name = "buildless_frontend"
+    role = "frontend"
+
+    def detect(self, goal: str) -> float:
+        return 0.0
+
+    def forbids_scaffold_path(self, path: str) -> bool:
+        base = path.replace("\\", "/").rsplit("/", 1)[-1].lower()
+        return base == "package.json" or base.endswith((".jsx", ".tsx"))
 
 _COFFEE_GOAL = ("build a coffee shop html website with a python flask backend "
                 "for member info and payments")
@@ -78,21 +93,13 @@ def test_declared_manifest_is_node():
 
 # --- skill veto (fix 3a) -------------------------------------------------
 
-def test_static_site_forbids_framework_files():
-    s = StaticSiteSkill()
-    assert s.forbids_scaffold_path("frontend/package.json") is True
-    assert s.forbids_scaffold_path("frontend/App.jsx") is True
-    assert s.forbids_scaffold_path("frontend/index.html") is False
-    assert s.forbids_scaffold_path("style.css") is False
-
-
 def test_scaffolder_respects_skill_veto_even_when_node():
     # A .ts source makes node=True, so ensure_scaffolding WOULD inject a
     # package.json -- but a vetoing skill must filter it out.
     plan = normalize_plan({"goal": "x", "layers": [{"name": "ui", "files": [
         {"path": "frontend/index.html", "description": "home"},
         {"path": "frontend/app.ts", "description": "typed script"}]}]})
-    out = ensure_scaffolding(plan, skills=[StaticSiteSkill()])
+    out = ensure_scaffolding(plan, skills=[_BuildlessFrontendSkill()])
     paths = {f["path"] for lay in out["layers"] for f in lay["files"]}
     assert not any(p.endswith("package.json") for p in paths)
 
@@ -102,7 +109,7 @@ def test_scaffolder_respects_skill_veto_even_when_node():
 def test_coffee_shop_plan_no_package_json_injected():
     skills = detect_skills(_COFFEE_GOAL)
     names = {getattr(s, "name", "") for s in skills}
-    assert "static_site" in names and "flask" in names, names
+    assert "flask" in names, names
     plan = _finalize(_coffee_plan(), skills)
     paths = ordered_paths(plan)
     assert not any(p.endswith("package.json") for p in paths), paths

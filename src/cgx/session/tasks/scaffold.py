@@ -104,6 +104,9 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     contracts = content.get("contracts")
     if not isinstance(contracts, dict) or not contracts:
         contracts = None
+    # The design brief DECOMPOSE persisted (None for a non-UI build): per-file
+    # UI guidance + the deterministic tokens stylesheet (see cgx.design).
+    design = content.get("design") if isinstance(content.get("design"), dict) else None
 
     # Explicit skill selection (e.g. from an Agent Profile) pinned on the
     # session; ``None`` when unset so the generator falls back to
@@ -306,7 +309,7 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
                         _generate_one, p, d, layer_name,
                         list(context_snapshot), deps.provider, goal,
                         depends_on=dep, contracts=contracts, skills=skills,
-                        manifest_paths=manifest_paths): i
+                        manifest_paths=manifest_paths, design=design): i
                     for i, (p, d, dep) in enumerate(pending)
                 }
                 for fut in as_completed(fut_to_idx):
@@ -332,7 +335,7 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
                     p, d, layer_name, list(existing_with_content),
                     deps.provider, goal, on_token=on_token,
                     depends_on=dep, contracts=contracts, skills=skills,
-                    manifest_paths=manifest_paths)
+                    manifest_paths=manifest_paths, design=design)
                 elapsed_ms = int((time.time() - started) * 1000)
                 layer_results.append((ok, fail))
                 if ok is not None:
@@ -789,6 +792,26 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         skill_verdict = None
         skill_warnings = []
 
+    # Design-quality checks (advisory on the greenfield path): the generated
+    # UI is read against the design brief -- stylesheet present + imported,
+    # components styled, navigation, persistence, hard-coded endpoints ... --
+    # and every finding rides along as a warning with a concrete fix.
+    design_issues: List[Dict[str, Any]] = []
+    try:
+        if design and design.get("applies"):
+            from cgx.design import check_tree
+            tree = {str(e.get("path") or ""): str(e.get("content") or "")
+                    for e in existing_with_content if e.get("path")}
+            for issue in check_tree(design, tree):
+                row = issue.as_dict()
+                design_issues.append(row)
+                skill_warnings.append({
+                    "skill": "design", "confidence": 0.9,
+                    "rationale": f"[{row['id']}] {row['message']} -- {row['directive']}",
+                    "severity": "warning"})
+    except Exception:  # pragma: no cover - checks are best-effort
+        logger.exception("SCAFFOLD: design checks raised; skipping")
+
     # Finalise the checkpoint artifact in place: pin validation reassigns
     # ``diffs`` to a new list, so re-point the content at it, attach the
     # adjustment log, and flip ``complete``. Same artifact_id, so the
@@ -801,6 +824,7 @@ def run_scaffold(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     artifact.content["contract_warnings"] = contract_warnings
     artifact.content["skill_verdict"] = skill_verdict
     artifact.content["skill_warnings"] = skill_warnings
+    artifact.content["design_issues"] = design_issues
     artifact.content["reconciled_count"] = reconciled_count
     artifact.content["js_deps_added"] = js_deps_added
     artifact.content["js_specs_relaxed"] = js_specs_relaxed
@@ -1706,6 +1730,7 @@ def _generate_one(
         contracts: Optional[Dict[str, Any]] = None,
         skills: Optional[List[str]] = None,
         manifest_paths: Optional[List[str]] = None,
+        design: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, str]]]:
     """Generate one scaffold file. Returns ``(ok_entry, fail_entry)``.
 
@@ -1735,6 +1760,7 @@ def _generate_one(
             depends_on=depends_on,
             contracts=contracts,
             manifest_paths=manifest_paths,
+            design=design,
         )
         emit_trace("scaffold_result", path=path, result=result)
     except Exception as exc:

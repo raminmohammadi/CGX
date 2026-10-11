@@ -161,6 +161,61 @@ It writes a `SWARM_VERIFY_REPORT` artifact (`coverage_gaps`, `import_warnings`,
 outcome, and `verify_ok`) identifying the specific files implicated by any
 static or dynamic failure.
 
+## Design layer -- product + design intelligence for UI builds
+**Files:** `src/cgx/design/` -- see [`design.md`](design.md).
+
+A UI-bearing objective (a chat app, a dashboard, a website, "an app") gets a
+deterministic **design brief** derived from the goal and the active skills:
+archetype (layout, screens, component inventory, checkable UX requirements,
+integration rules), framework, styling, a contrast-verified theme and the
+canonical files a real frontend ships. It is persisted in the `WORK_PLAN`
+(`content["design"]`) and used by all three roles:
+
+1. **Tech Lead** -- the planner prompt carries the *UI/UX PRODUCT SPEC* and
+   the file-plan requirements; `ensure_ui_scaffolding` (swarm_plan.py) injects
+   the tokens stylesheet, app stylesheet, entry, shell, API client and storage
+   helper the draft omitted; `design.plan_problems` rejects a UI plan with no
+   screen components. A goal that named no framework activates the React skill
+   when the brief resolves to React.
+2. **Developer** -- the tokens stylesheet is emitted deterministically
+   (`generate_file` / `generate_single_scaffold_file`, no model call); every
+   other UI file gets `design.file_block` appended to its system prompt (rules
+   for its kind, the theme as hard constraints, a *UI COMPLETENESS* override of
+   the minimalism rule) and a 1.5x output budget.
+3. **Verifier** -- `design.check_tree` runs beside the structural scan; fatal
+   issues (`D01`-`D09`, `D17`, `D18`) become regen targets with additive
+   directives; a missing tokens file is written by CGX; one bounded
+   design-critic call (`critique_ui`) yields per-file fixes regenerated the
+   same way; a fatal issue surviving the rounds fails the verdict
+   (`CGX_DESIGN_GATE=0` -> advisory) and is named in the summary. After a
+   green build, the **runtime smoke** (`cgx/codegen/browser_smoke.py`,
+   optional Chromium) serves `dist/`, loads every route headlessly with an
+   injected error collector, repairs a blank/crashing route once, and gates
+   on the result; with an Ollama vision model installed the **vision critic**
+   (`cgx/design/vision.py`) reviews the screenshots for one more targeted
+   round.
+
+## JS/TS symbol intelligence
+**File:** `src/cgx/session/js_symbols.py`
+
+The frontend twin of the Python grounding + first-party symbol gate:
+`list_symbols` / `file_skeleton` show a JS module's real export surface,
+`render_import_hints` emits ready-to-paste imports for JS dependencies, and the
+structural scan gains a **JS symbol gate** -- a named/default import no
+dependency exports, a React or router identifier used but never imported, a
+lowercase namespace called like a module but never imported, and a `<Router>`
+nested inside the entry's `<BrowserRouter>` -- each row regenerating the
+importer with the real exports as its directive. The React skill's
+`repair_scaffold` fixes the certain cases without a model call
+(`react-router-dom` -> `react-router`, dangling `./X.css` imports, missing
+`StrictMode`/hook imports).
+
+**Tool-loop hardening:** a stray `<call_tool>` tag can no longer become a
+file's content -- the engine rejects it (one hardened retry), semantic-repair
+output is re-gated through the JS syntax check, and the Developer's tool loop
+ends with an explicit "budget exhausted -- emit the file" turn (and answers a
+lookup of the file being written instead of dispatching it).
+
 ## Plan-aware drain ceiling
 A drain pass carries a flat 64-step safety valve for explore/greenfield. A
 SWARM plan spawns one Developer task per file plus a Verify, so
@@ -204,10 +259,15 @@ loop is unchanged.
 ## MCP tool servers
 **Files:** `src/cgx/mcp/` -- see [`mcp.md`](mcp.md).
 
-External tools over the Model Context Protocol, exposed to the swarm as three
-registry tools (`mcp_list_servers` / `mcp_list_tools` / `mcp_call`) with lazy
-discovery. Servers are a local `~/.cgx/mcp.json` roster; the tools are only
-advertised when at least one server is enabled.
+External tools over the Model Context Protocol, exposed to the swarm as four
+registry tools (`mcp_list_servers` / `mcp_list_tools` / `mcp_describe_tool` /
+`mcp_call`) with lazy, tiered discovery, plus a prompt block listing the
+enabled servers with each one's **agent hint** (when to use it). Servers are a
+local `~/.cgx/mcp.json` roster, normally filled from the curated **catalog**
+(`cgx/mcp/catalog.py`: GitHub, Playwright, Context7, Brave Search, databases,
+Supabase, Stripe, Sentry, Figma, Notion, the reference servers ...); secrets
+live in the keyring (`cgx/mcp/secrets.py`), never in the roster. The tools are
+only advertised when at least one server is enabled.
 
 ## Human-in-the-loop approval
 **File:** `src/cgx/session/approval.py` -- see [`Agent.md`](Agent.md).

@@ -323,16 +323,32 @@ so the **token is never stored in the JSON**:
 }
 ```
 
-The swarm gets three registry tools — `mcp_list_servers`, `mcp_list_tools`, and
-`mcp_call` (HIGH risk, so gated by the approval gate when active). Discovery is
-**lazy** so many servers don't flood the prompt, and MCP tools are only
-advertised to the agent when at least one server is configured.
+**Catalog.** You rarely edit the JSON by hand: the MCP page (and `cgx mcp
+catalog` / `cgx mcp add <id>`) offers a curated catalog of the servers
+developers use — the official reference servers (filesystem, git, fetch,
+memory, sequential-thinking, time), GitHub, Playwright, Brave Search, Context7,
+AWS and Microsoft Learn docs, MarkItDown, PostgreSQL, SQLite, MongoDB, Redis,
+Supabase, Stripe, Sentry, Figma and Notion. Adding one fills the roster entry
+from the template; parameters (an allowed directory, a project ref) are asked
+for, and secrets go to the **OS keyring** (or a `0600` secrets file) — the
+roster only ever holds `${VAR}` references, resolved at launch from the
+environment first. **Test** connects and lists a server's tools; a server with
+a missing secret shows *needs VAR*.
 
-It **degrades gracefully**: without the `mcp` SDK installed, discovery from the
-config still works and the call tools return an "install `cgx[mcp]`" message
-rather than failing. Over the web API, `GET /api/mcp/servers` lists the servers
-with an `sdk_installed` flag and `POST /api/mcp/toggle` enables/disables one.
-See **[[Swarm Agent]]** and **[[Privacy and Security]]**.
+The swarm gets four registry tools — `mcp_list_servers`, `mcp_list_tools`,
+`mcp_describe_tool` and `mcp_call` (HIGH risk, so gated by the approval gate
+when active) — plus a prompt block listing the enabled servers with each one's
+**agent hint** (when to use it), so a local model actually reaches for a docs
+server or a browser. Discovery is **lazy** so many servers don't flood the
+prompt, and MCP tools are only advertised when at least one server is enabled.
+
+It **degrades gracefully**: without the `mcp` SDK installed, the roster and
+catalog still work and the call tools return an "install `cgx[mcp]`" message.
+Over the web API: `GET /api/mcp/servers`, `GET /api/mcp/catalog`,
+`POST /api/mcp/servers`, `POST /api/mcp/servers/{name}/env|test`,
+`POST /api/mcp/toggle`, `DELETE /api/mcp/servers/{name}`. See
+[`docs/mcp.md`](https://github.com/raminmohammadi/CGX/blob/main/docs/mcp.md),
+**[[Swarm Agent]]** and **[[Privacy and Security]]**.
 
 ---
 

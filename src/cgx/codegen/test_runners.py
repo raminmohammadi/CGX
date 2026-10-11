@@ -147,22 +147,29 @@ def _find_package_json_dirs(project_root: str, max_depth: int = 4) -> List[str]:
     return found
 
 
-def _npm_script_command(project_root: str) -> Optional[List[str]]:
+def _npm_script_command(project_root: str,
+                        tests_present: Optional[bool] = None) -> Optional[List[str]]:
     """Choose an npm invocation: prefer a real ``test`` script, else ``build``.
 
     npm's init placeholder (``echo "Error: no test specified"``) is treated
     as *absent* so a JS project that never wired up tests still gets a
-    build-smoke signal rather than an automatic failure. Returns ``None``
-    when neither a usable test nor a build script exists.
+    build-smoke signal rather than an automatic failure. Likewise, a
+    ``vitest``/``jest`` test script with NO test files in the tree would fail
+    on "No test files found" -- an environmental verdict, not a code defect --
+    so when ``tests_present`` is False the build script is preferred. Returns
+    ``None`` when neither a usable test nor a build script exists.
     """
     pkg = _load_package_json(project_root)
     if not pkg:
         return None
     scripts = pkg.get("scripts") if isinstance(pkg.get("scripts"), dict) else {}
     test_script = str(scripts.get("test") or "")
-    if test_script and "no test specified" not in test_script:
+    build_script = str(scripts.get("build") or "")
+    runner_needs_files = any(tok in test_script for tok in ("vitest", "jest", "mocha", "ava"))
+    if (test_script and "no test specified" not in test_script
+            and not (runner_needs_files and tests_present is False and build_script)):
         return ["npm", "test", "--silent"]
-    if str(scripts.get("build") or ""):
+    if build_script:
         return ["npm", "run", "build", "--silent"]
     return None
 
@@ -243,7 +250,7 @@ class NpmRunner(TestRunner):
         self, pkg_dir: str, *, timeout_seconds: float, tests_present: bool,
     ) -> TestRunOutcome:
         """Install deps and run the test/build script in one package dir."""
-        cmd = _npm_script_command(pkg_dir)
+        cmd = _npm_script_command(pkg_dir, tests_present=tests_present)
         if cmd is None:
             return TestRunOutcome(
                 ran=False, skipped_reason="no npm test or build script",
@@ -330,77 +337,7 @@ class NpmRunner(TestRunner):
 
 
 # Registry of default runners, checked in order. Append new stacks here.
-class StaticSiteRunner(TestRunner):
-    """Static HTML/CSS/JS site: verify links + assets actually resolve.
-
-    A build-less site has no pytest/npm suite, so without this it VERIFYs as
-    an accidental "skipped" -- green having checked nothing. This runner
-    gives it a real signal: it parses every ``.html``/``.css`` in the tree
-    and checks that each local ``href``/``src``/``link``/``url(...)`` target
-    resolves to a file on disk. A broken reference (the #1 way a "finished"
-    static site is actually broken) fails VERIFY and routes into the repair
-    loop with the offending references named. It runs no code and opens no
-    browser -- rendering is the user's job in the sandboxed preview.
-
-    Structural HTML nits (unclosed optional tags, etc.) are intentionally
-    NOT failures: HTML is lenient, so flagging them would trigger wasteful
-    regenerates. Only unambiguous broken references fail.
-    """
-
-    name = "static_site"
-    _MAX_FILES = 400
-    _MAX_BYTES = 2 * 1024 * 1024
-    _WEB_ASSET_EXT = (
-        ".html", ".htm", ".css", ".js", ".mjs", ".json", ".svg", ".png",
-        ".jpg", ".jpeg", ".gif", ".webp", ".avif", ".ico", ".bmp", ".woff",
-        ".woff2", ".ttf", ".otf", ".eot", ".webmanifest", ".map", ".txt",
-    )
-
-    def detect(self, project_root: str) -> bool:
-        root = Path(project_root)
-        if not (root / "index.html").is_file():
-            return False
-        # Defer to the real toolchains when this is actually a framework/
-        # Python project that merely also has an index.html (e.g. Vite).
-        if (root / "package.json").is_file():
-            return False
-        for m in ("pyproject.toml", "setup.py", "setup.cfg", "requirements.txt"):
-            if (root / m).is_file():
-                return False
-        try:
-            next(root.rglob("test_*.py"))
-            return False
-        except StopIteration:
-            return True
-
-    def run(
-        self, project_root: str, changed_files: Sequence[str], *,
-        timeout_seconds: float = 180.0, python_exe: Optional[str] = None,
-    ) -> TestRunOutcome:
-        from cgx.codegen.static_site_check import check_static_site
-        try:
-            broken, checked = check_static_site(
-                project_root, max_files=self._MAX_FILES,
-                max_bytes=self._MAX_BYTES)
-        except Exception as exc:  # pragma: no cover - defensive
-            return TestRunOutcome(
-                ran=False, ran_tests=False,
-                skipped_reason=f"static_site check error: {exc}")
-        if broken:
-            lines = [f"  {ref}  <- referenced by {src}" for src, ref in broken]
-            return TestRunOutcome(
-                ran=True, returncode=1, ran_tests=True, tests_present=True,
-                stderr="Static site has broken local references "
-                       f"({len(broken)}):\n" + "\n".join(lines[:40]),
-                stdout=f"static_site: checked {checked} file(s)")
-        return TestRunOutcome(
-            ran=True, returncode=0, ran_tests=True, tests_present=True,
-            stdout=f"static_site: {checked} file(s) checked, "
-                   "all local links/assets resolve")
-
-
-_TEST_RUNNER_REGISTRY: List[TestRunner] = [
-    PytestRunner(), NpmRunner(), StaticSiteRunner()]
+_TEST_RUNNER_REGISTRY: List[TestRunner] = [PytestRunner(), NpmRunner()]
 
 
 def detect_test_runners(project_root: str) -> List[TestRunner]:

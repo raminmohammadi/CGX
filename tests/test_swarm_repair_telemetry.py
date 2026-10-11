@@ -25,9 +25,12 @@ def test_regate_repaired_python_syntax(tmp_path):
         "a.py", "def f():\n    return 1\n", {}, None, str(tmp_path)) is None
     err = sg._regate_repaired("a.py", "def f(:\n", {}, None, str(tmp_path))
     assert err and "syntax" in err.lower()
-    # non-Python bodies aren't gated here (VERIFY's polyglot build is authority)
+    # JS/TS bodies are re-gated through the same syntax check as the full-file
+    # rung: a "repair" that still does not parse is never written as success.
+    err = sg._regate_repaired("a.js", "const x = ;", {}, None, str(tmp_path))
+    assert err and "syntax" in err.lower()
     assert sg._regate_repaired(
-        "a.js", "const x = ;", {}, None, str(tmp_path)) is None
+        "a.js", "export const x = 1;\n", {}, None, str(tmp_path)) is None
 
 
 def test_semantic_repair_success_is_reported_truthfully(tmp_path, monkeypatch):

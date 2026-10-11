@@ -2,7 +2,7 @@
 
 Covers the three legitimate Tailwind setups -- CDN/build-less, v4
 (`@import "tailwindcss";`), and v3 (config + PostCSS + directives) -- plus
-the specific static_site deadlock the skill must NOT create.
+the build-less CDN page the skill must accept rather than reject.
 """
 
 from __future__ import annotations
@@ -93,14 +93,11 @@ def test_no_package_json_is_buildless_and_abstains(skill):
     assert skill.validate_scaffold(diffs) is None
 
 
-# --- (2b) the exact tailwind + static_site deadlock ------------------------
+# --- (2b) CDN Tailwind on a build-less page is accepted ---------------------
 
-def test_static_site_plus_tailwind_do_not_deadlock():
-    """static_site emits a CDN-Tailwind, package.json-free site; the tailwind
-    skill must accept it (return None) so neither skill fatally rejects the
-    other's valid output."""
-    from skills.static_site import StaticSiteSkill
-
+def test_cdn_tailwind_buildless_page_is_accepted():
+    """A package.json-free page that loads the Play CDN is valid Tailwind usage;
+    the skill must accept it (return None) rather than demand a config."""
     site_diffs = [
         {"file": "index.html", "patch": (
             '<!DOCTYPE html><html lang="en"><head>'
@@ -111,13 +108,9 @@ def test_static_site_plus_tailwind_do_not_deadlock():
         {"file": "css/style.css", "patch": "body{margin:0}"},
         {"file": "js/script.js", "patch": "console.log('hi');"},
     ]
-    # static_site accepts its own output ...
-    assert StaticSiteSkill().validate_scaffold(site_diffs) is None
-    # ... and tailwind must NOT reject it.
     assert TailwindSkill().validate_scaffold(site_diffs) is None
-
     # And via the registry fatal-verdict gate (warnings excluded): no fatal.
-    active = registry.skills_by_names(["static_site", "tailwind"])
+    active = registry.skills_by_names(["tailwind"])
     assert registry.validate_scaffold(active, site_diffs) is None
 
 

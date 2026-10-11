@@ -78,6 +78,22 @@ CGX ensures all data, embeddings, and executions remain strictly on your machine
   [Session-based Agent](#session-based-agent-agent) and
   [docs/Agent.md](docs/Agent.md).
 - **Swarm Agent.** A deterministic, plan-driven agent architecture that replaces free-form loops with a Tech Lead (planner), Developer (implementer), and Verifier (tester). Features an advanced **Swarm Operations Dashboard** with live telemetry, and multiple Auto-Repair capabilities (AST Import Injection, AST Function Logic Repair, Contract Renegotiation, Semantic Repair with Dynamic Temperature Scaling) to ensure reliable, compilation-ready code.
+- **Design-aware builds.** Any UI-bearing objective (a chat app, a dashboard,
+  a landing site, a tool) gets what a senior product designer and front-end
+  lead would bring: a deterministic **design brief** (product archetype with
+  screens, components and checkable UX requirements; a contrast-verified
+  theme; the canonical files a real frontend ships), a **design-tokens
+  stylesheet CGX writes itself**, per-file UI guidance for the model, and a
+  Verifier that **gates on UI quality** (unstyled components, no stylesheet,
+  hard-coded endpoints, no persistence, missing navigation ...) plus one
+  bounded design-critic pass. Works with small local models because nothing
+  is left to taste. See [docs/design.md](docs/design.md).
+- **MCP tool catalog.** A curated catalog of the MCP servers developers use
+  (GitHub, Playwright, Context7, Brave Search, Postgres, Supabase, Stripe,
+  Sentry, Figma, the official reference servers ...) with one-click add,
+  keyring-stored secrets, connection tests, and **agent hints** so the Tech
+  Lead and Developer know *when* to reach for each server. See
+  [docs/mcp.md](docs/mcp.md).
 - **JEV -- typed decision layer.** The leverage in a coding agent isn't the
   loop, it's *what the loop feeds the model each turn*. JEV
   (`cgx.answer.jev.decide`) turns those high-frequency per-turn choices into
@@ -128,14 +144,6 @@ CGX ensures all data, embeddings, and executions remain strictly on your machine
   steer it. Author them in the UI (**Agent → New Skill /
   Context File**) or commit them to the repo. See
   [docs/skills-and-context.md](docs/skills-and-context.md).
-- **Site Studio.** Describe a website in plain English and CGX clarifies
-  requirements, plans the pages, builds a complete static HTML/CSS/JS site
-  (no framework/build step), and **renders it live** beside the build in a
-  sandboxed preview -- then you refine it with feedback ("make the header
-  sticky", "add a pricing page") and watch it update. A built-in
-  `static_site` skill enforces a coherent multi-page layout and validates
-  that every local link/asset resolves. Everything stays local; the preview
-  runs in your own browser. See [docs/site-studio.md](docs/site-studio.md).
 - **Persistent chat sessions.** Conversations are saved as JSONL
   threads under `~/.cgx/sessions/`; resume them later from the
   Contextual Ask page's session sidebar.
@@ -431,9 +439,8 @@ Beyond those core verbs, **everything the web UI can do is also a scriptable
 ```bash
 cgx skills list                      # registry: also show/create/edit/delete
 cgx profile add prod --kind openai   # LLM connection presets (list/show/rm)
-cgx site generate landing -b "..."   # Site Studio (list/new/revise/themes)
 cgx session list                     # inspect/drive: show/rm/send/decide
-cgx mcp list                         # MCP servers (enable/disable/tools)
+cgx mcp catalog --table              # MCP servers: add/rm/set-env/test/enable/disable/tools
 cgx model matrix --table             # model discovery/pull, hardware fit
 cgx usage summary                    # activity · usage · feedback · monitor
 cgx govdata policy                   # govdata · admin · trace · metrics · health · rollback · approvals

@@ -2,6 +2,83 @@
 
 All notable changes are documented here. Versions follow semver-ish.
 
+## Unreleased -- Design-aware builds, MCP catalog, JS symbol intelligence
+
+The swarm shipped an unstyled white page with two buttons for "a chatbot app
+with an API-key profile tab" -- and called it verified. This release teaches
+CGX what a real product looks like, generally, and makes the frontend side of
+the pipeline as grounded as the Python side.
+
+* **Design layer** (`cgx/design/`, see `docs/design.md`). A UI-bearing
+  objective gets a deterministic **design brief**: product archetype (chat
+  app, admin/CRUD dashboard, analytics dashboard, tasks tool, landing site,
+  shop, form/wizard, SaaS app, docs site, developer tool, portfolio, game) with
+  layout, screens, component inventory and *checkable* UX requirements; the
+  framework (named, server-rendered templates for Flask/Django/FastAPI, plain
+  HTML for a website, React + Vite for an app); a contrast-verified theme; and
+  the canonical files a real frontend ships. The Tech Lead receives the spec
+  and the plan is **injected** with the tokens stylesheet, app stylesheet,
+  entry, shell, API client and storage helper it omitted; the Developer gets
+  per-file UI guidance (and a 1.5x output budget for UI files); the **tokens
+  stylesheet is written by CGX itself** (no model call). The Verifier runs
+  deterministic UI checks (`D01`-`D16`: no stylesheet, unstyled component,
+  no navigation, `ReactDOM.render` on React 19, hard-coded `/api`, no
+  persistence, console.log-only handler ...) that drive targeted regenerations
+  with directives, one bounded LLM **design critic** pass, and a **design
+  gate** (`CGX_DESIGN_GATE`, `CGX_DESIGN_CRITIC`). Greenfield gets the brief,
+  the injected files and the deterministic tokens file too.
+* **JS/TS symbol intelligence** (`cgx/session/js_symbols.py`). `list_symbols`
+  / `file_skeleton` now show a JS module's real exports; import hints are
+  rendered for JS dependencies; the structural scan gains a **JS symbol gate**
+  (a named/default import no dependency exports, a React or router identifier
+  used but never imported, a `<Router>` nested inside the entry's
+  `<BrowserRouter>`, a lowercase namespace called like a module but never
+  imported) whose rows regenerate the importer with the real export list.
+* **Runtime smoke for frontends** (`cgx/codegen/browser_smoke.py`). With an
+  installed Chromium-family browser (optional; `CGX_BROWSER`, `CGX_BROWSER_SMOKE=0`)
+  the Verifier serves the built bundle, loads every route headlessly, and
+  treats a blank root / uncaught console error as a repair signal (one bounded
+  round, rebuild, re-check) and a verdict gate; screenshots land in
+  `.cgx/screenshots/`. Catches the render-time crashes no text gate can see.
+* **Seeded sample data** for data-bearing archetypes (dashboards, admin, shop,
+  tasks, content) with no backend: the plan gets `lib/sampleData.js` and the
+  storage helper seeds it on first run, so the first render is populated
+  instead of `0` / `NaN%` / an empty chart. Archetype-specific layout classes
+  (KPI grid, chart area, board columns, full-width top bar ...) are now spelled
+  out for the app stylesheet.
+* **Vision critic** (`cgx/design/vision.py`, optional). When Ollama has a
+  vision-capable model (`CGX_VISION_MODEL=auto|<name>|off`), the Verifier shows
+  it the route screenshots and the brief, regenerates the files it flags,
+  rebuilds and re-runs the smoke -- one bounded round.
+* **React skill**: React 19 / `createRoot` / `react-router` / `pages` +
+  `components` + `lib` layout / stylesheet import / vitest prompt;
+  deterministic repairs (`react-router-dom` -> `react-router` when the manifest
+  has v7, dangling `./X.css` imports dropped, missing `StrictMode`/hook imports
+  added).
+* **Tool-loop hardening**: a stray `<call_tool>` tag can no longer become a
+  file's content (engine gate + one hardened retry, then a **tool-free**
+  full-file retry before any semantic repair; the semantic-repair result is
+  re-gated through the JS syntax check); the Developer's tool loop ends with an
+  explicit "budget exhausted -- emit the file" turn and answers a lookup of the
+  file being written instead of dispatching it. A placeholder component that
+  renders nothing is a fatal design issue (`D17-stub-component`).
+* **`sqlite` skill** detection needs two signals (a persistence action AND a
+  data noun) and stands down for browser-only frontends -- "the user provides
+  an API key" no longer drags a database layer into a React plan.
+* **MCP catalog** (`cgx/mcp/catalog.py`, `docs/mcp.md`). A curated catalog of
+  the MCP servers developers use (official reference servers, GitHub,
+  Playwright, Brave Search, Context7, AWS/Microsoft docs, MarkItDown,
+  PostgreSQL, SQLite, MongoDB, Redis, Supabase, Stripe, Sentry, Figma, Notion)
+  with one-click add on the MCP page and `cgx mcp catalog|add|add-custom|rm|
+  set-env|test`. Roster entries carry `${VAR}` references only; secrets go to
+  the OS keyring (or a `0600` file) via `cgx.mcp.secrets`; a server with a
+  missing secret shows *needs VAR*; **Test** lists a server's tools. The agent
+  now sees `mcp_describe_tool` and a prompt block of the enabled servers with
+  each one's **agent hint** (when to use it).
+* **Removed: Site Studio.** The one-shot HTML site builder (page, routes, CLI
+  `cgx site`, `static_site` skill, workspace/preview modules, docs) is gone;
+  its design-system insight lives on, generalised, in `cgx/design/`.
+
 ## Unreleased -- Swarm self-healing (manifest reconciliation, honest gates)
 
 Follows the polyglot work below: the swarm now makes a generated project

@@ -1,7 +1,7 @@
 """Parity subcommands for the ``cgx`` CLI.
 
 Each module here exposes a ``register(subparsers)`` function that attaches a
-noun-verb command group (``cgx skills ...``, ``cgx site ...``) whose leaves
+noun-verb command group (``cgx skills ...``, ``cgx mcp ...``) whose leaves
 are thin adapters over the same engine functions the web-UI routes call --
 never over ``cgx.webui`` -- so the base ``cgx`` install needs no FastAPI.
 
@@ -20,7 +20,6 @@ COMMAND_MODULES: list[str] = [
     "skills",
     "profile",
     "agent_profile",
-    "site",
     "session",
     "context",
     "mcp",

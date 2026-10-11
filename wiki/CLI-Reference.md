@@ -44,10 +44,9 @@ same engine the web UI's REST routes call.
 | `cgx profile` | `list` · `show` · `add` · `rm` | LLM connection presets |
 | `cgx agent-profile` | `list` · `show` · `add` · `rm` | Saved `{objective, skills}` bundles |
 | `cgx context` | `show` · `edit` · `rm` | Repo `CGX.md` context file |
-| `cgx site` | `list` · `new` · `generate` · `revise` · `path` · `themes` | Site Studio |
 | `cgx session` | `list` · `show` · `rm` · `send` · `decide` | Agent sessions: inspect, drive, decide |
 | `cgx model` | `list` · `matrix` · `fit` · `pull` · `embed-list` · `embed-pull` | Model discovery / pull |
-| `cgx mcp` | `list` · `enable` · `disable` · `tools` | MCP tool servers |
+| `cgx mcp` | `list` · `catalog` · `add` · `add-custom` · `rm` · `set-env` · `test` · `enable` · `disable` · `tools` | MCP tool servers + catalog |
 | `cgx activity` | `runs` · `summary` · `show` | Per-run observation store |
 | `cgx usage` | `show` · `summary` | Cost & quota governance |
 | `cgx feedback` | `stats` · `list` · `add` | Thumbs-up/down feedback |

@@ -6,7 +6,6 @@ import {
   ChevronRight,
   CircleCheck,
   Database,
-  Globe,
   LayoutDashboard,
   Loader2,
   MessageSquareDot,
@@ -40,7 +39,6 @@ const navGroups: { eyebrow: string; tabs: NavTab[] }[] = [
   {
     eyebrow: "Build",
     tabs: [
-      { to: "/studio", label: "Site Studio", icon: Globe, pageKey: null },
       { to: "/plan", label: "Self-Testing Plan", icon: Wand2, pageKey: "plan" },
       { to: "/agent", label: "Agent Loop", icon: Bot, pageKey: null },
     ],

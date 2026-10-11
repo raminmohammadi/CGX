@@ -131,10 +131,9 @@ the matching REST route uses:
 | `cgx skills` | `list` · `show` · `create` · `edit` · `delete` (`--markdown`) |
 | `cgx profile` / `cgx agent-profile` | `list` · `show` · `add` · `rm` |
 | `cgx context` | `show` · `edit` · `rm` (repo `CGX.md`) |
-| `cgx site` | `list` · `new` · `generate` · `revise` · `path` · `themes` |
 | `cgx session` | `list` · `show` · `rm` · `send` · `decide` |
 | `cgx model` | `list` · `matrix` · `fit` · `pull` · `embed-list` · `embed-pull` |
-| `cgx mcp` | `list` · `enable` · `disable` · `tools` |
+| `cgx mcp` | `list` · `catalog` · `add` · `add-custom` · `rm` · `set-env` · `test` · `enable` · `disable` · `tools` |
 | `cgx activity` / `cgx usage` / `cgx feedback` / `cgx monitor` | observability reads (+ `feedback add`) |
 | `cgx govdata` / `cgx admin` | `policy`/`scan`/`purge`/`erase` · `overview`/`logs`/`metrics`/`purge-logs` |
 | `cgx trace` · `cgx metrics` · `cgx health` · `cgx rollback` · `cgx approvals` | runtime toggles, probes, undo, HITL |

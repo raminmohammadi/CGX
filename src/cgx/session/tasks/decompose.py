@@ -194,6 +194,10 @@ def run_decompose(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             "project_complexity": scope.complexity,
             "scope": scope.as_dict(),
             "unmet_features": list(unmet),
+            # The design brief (None for a non-UI build) -- SCAFFOLD renders
+            # it into per-file UI guidance + the deterministic tokens file.
+            "design": ((result or {}).get("design")
+                       if isinstance((result or {}).get("design"), dict) else None),
         },
     )
     return ExecutorResult(

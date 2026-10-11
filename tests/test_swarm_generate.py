@@ -64,9 +64,13 @@ def test_non_python_file_gets_repair_path(monkeypatch):
     # Polyglot swarm: a non-Python file is no longer refused -- semantic repair
     # is language-aware and produces content (the old ".py only" guard is gone).
     _stub_full_file(monkeypatch, "", False)
+    # The repair must come back as VALID JS: the semantic-repair result is
+    # re-gated through the JS/TS syntax check like the full-file rung.
     out = sg.generate_file(
         path="src/app.js", description="x", depends_on=[], contracts={},
-        goal="demo", root=".", provider=StubProvider())
+        goal="demo", root=".",
+        provider=StubProvider(header="import os from 'os';",
+                              symbol="export function run() { return 1; }"))
     assert out.ok
     assert out.method == "semantic-repair"
 

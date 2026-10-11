@@ -138,10 +138,14 @@ grid. The catalogue is pure-offline. Details in **[[Providers and Models]]**.
 
 A **Control** group in the sidebar adds two pages:
 
-- **MCP Servers** (`/mcp`) -- lists the tool servers configured in
-  `~/.cgx/mcp.json`, shows whether the optional SDK is installed and the config
-  path, and toggles a server on/off. Backed by `GET /api/mcp/servers` and
-  `POST /api/mcp/toggle`. See **[[Providers and Models]]**.
+- **MCP Servers** (`/mcp`) -- your roster (ready / *needs VAR* status, Test,
+  Secrets, toggle, Remove) plus a **catalog** of well-known developer servers
+  (GitHub, Playwright, Context7, databases, Stripe, Sentry ...) you add in one
+  click, supplying parameters and secrets (stored in the keyring) when asked;
+  a custom stdio/http server form for anything else. Backed by
+  `GET /api/mcp/servers`, `GET /api/mcp/catalog`, `POST /api/mcp/servers`,
+  `POST /api/mcp/servers/{name}/env|test`, `POST /api/mcp/toggle`,
+  `DELETE /api/mcp/servers/{name}`. See **[[Providers and Models]]**.
 - **Approvals** (`/approvals`) -- lists risky tool calls awaiting a human
   decision (polled) with Approve/Deny. The Agent run view also surfaces its own
   session's pending approvals inline while it runs. Backed by

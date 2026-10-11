@@ -101,20 +101,32 @@ class ReactSkill(Skill):
 
     def scaffold_system_prompt(self) -> str:
         return (
-            "FRONTEND -- React project\n"
-            "- Use a modern Vite-style layout: src/main.jsx mounts the app, "
-            "src/App.jsx is the root component, src/components/*.jsx for "
-            "individual UI pieces. No webpack/babel config files.\n"
-            "- index.html at the project root with a single "
-            "`<div id=\"root\"></div>` and "
-            "`<script type=\"module\" src=\"/src/main.jsx\"></script>`.\n"
-            "- package.json must list `react` and `react-dom` (^18) under "
-            "dependencies and `vite` + `@vitejs/plugin-react` under "
-            "devDependencies. Include `scripts.dev`, `scripts.build`, "
-            "`scripts.preview`.\n"
-            "- vite.config.js with the React plugin.\n"
-            "- Use functional components and hooks (useState, useEffect). "
-            "No class components.\n"
+            "FRONTEND -- React project (React 19 + Vite)\n"
+            "- Layout (relative to the frontend component root): index.html (Vite "
+            "entry: viewport meta, a specific <title>, `<div id=\"root\"></div>`, "
+            "`<script type=\"module\" src=\"/src/main.jsx\"></script>`); "
+            "src/main.jsx mounts the app; src/App.jsx is the app shell (header/nav "
+            "+ routes); src/pages/<Screen>.jsx holds ONE file per screen; "
+            "src/components/<Piece>.jsx holds shared UI pieces; src/lib/*.js holds "
+            "non-UI modules (API client, storage helpers); src/styles/*.css holds "
+            "the stylesheets. No webpack/babel config files.\n"
+            "- package.json: `react` + `react-dom` ^19 under dependencies "
+            "(`react-router` ^7 too when the app has more than one screen); "
+            "`vite` + `@vitejs/plugin-react` under devDependencies, plus `vitest`, "
+            "`jsdom` and `@testing-library/react` when tests are planned; "
+            "`\"type\": \"module\"`; scripts dev/build/preview/test.\n"
+            "- vite.config.js with the React plugin (add `test: { environment: "
+            "'jsdom' }` when tests exist).\n"
+            "- The entry MUST use `import { createRoot } from 'react-dom/client'` "
+            "and `createRoot(document.getElementById('root')).render(<StrictMode>"
+            "<App /></StrictMode>)`; wrap in `<BrowserRouter>` (from 'react-router') "
+            "for multi-screen apps. `ReactDOM.render` was REMOVED in React 19 and "
+            "renders a blank page -- never use it.\n"
+            "- main.jsx imports the project stylesheet(s) (e.g. "
+            "`import './styles/tokens.css'`) so styles actually load.\n"
+            "- Functional components and hooks only (useState, useEffect, custom "
+            "hooks); no class components. Style with className against the "
+            "project stylesheet -- never ship unstyled markup.\n"
             "- Do NOT emit Python files for the UI layer."
         )
 
@@ -255,6 +267,50 @@ class ReactSkill(Skill):
                 return src
         return None
 
+    # ---- deterministic repairs (Layer-1, no model call) ----------------
+    def repair_scaffold(self, files: List[Dict[str, Any]]) -> Dict[str, str]:
+        """Fix the mechanical frontend defects a weak model ships every run.
+
+        * ``react-router-dom`` imports when ``package.json`` depends on
+          ``react-router`` (v7 is one package) -- the build cannot resolve the
+          module otherwise;
+        * a relative stylesheet import (``./Chat.css``) whose file was never
+          generated -- the bundle aborts on it; the shared stylesheets carry
+          the styles, so the dangling import is dropped;
+        * a React / React Router API (``StrictMode``, ``useState`` ...) used
+          but never imported -- a ReferenceError and a blank page.
+        Pure text rewrites, each certain; returns ``{path: new_content}``.
+        """
+        from cgx.session import js_symbols as _js
+        bundle = {str(f.get("path") or f.get("file") or "").replace("\\", "/"):
+                  str(f.get("content") or f.get("patch") or "") for f in (files or [])}
+        bundle = {p: c for p, c in bundle.items() if p}
+        deps: set = set()
+        for p, c in bundle.items():
+            if p.rsplit("/", 1)[-1] == "package.json":
+                try:
+                    import json as _json
+                    pkg = _json.loads(c)
+                    deps |= set((pkg.get("dependencies") or {}).keys())
+                    deps |= set((pkg.get("devDependencies") or {}).keys())
+                except Exception:
+                    continue
+        fixes: Dict[str, str] = {}
+        for path, content in bundle.items():
+            if not _js.is_js_path(path):
+                continue
+            new = content
+            if ("react-router" in deps and "react-router-dom" not in deps
+                    and "react-router-dom" in new):
+                new = new.replace("'react-router-dom'", "'react-router'").replace(
+                    '"react-router-dom"', '"react-router"')
+            new = _strip_dangling_stylesheet_imports(new, path, bundle)
+            new = _add_missing_react_imports(new, path)
+            new = _fix_namespace_calls(new, path, bundle)
+            if new != content:
+                fixes[path] = new
+        return fixes
+
     def scaffold_warnings(self, diffs: List[Dict[str, Any]],
                           goal: str = "") -> List[SkillVerdict]:
         paths = file_paths(diffs)
@@ -268,6 +324,125 @@ class ReactSkill(Skill):
                        "tests/<Component>.test.jsx that exercises the "
                        "primary component with @testing-library/react."),
         )]
+
+
+_STYLE_IMPORT_LINE_RE = re.compile(
+    r"""^\s*import\s+['"](\.[^'"]+\.(?:css|scss|sass|less|styl))['"]\s*;?\s*$\n?""", re.M)
+
+
+def _strip_dangling_stylesheet_imports(content: str, path: str,
+                                       bundle: Dict[str, str]) -> str:
+    """Drop ``import './x.css'`` lines whose stylesheet is not in the bundle."""
+    import posixpath
+
+    def _keep(m: "re.Match[str]") -> str:
+        spec = m.group(1)
+        target = posixpath.normpath(posixpath.join(posixpath.dirname(path), spec)).lstrip("./")
+        return m.group(0) if target in bundle else ""
+
+    return _STYLE_IMPORT_LINE_RE.sub(_keep, content)
+
+
+def _add_missing_react_imports(content: str, path: str) -> str:
+    """Import React / router APIs the file uses but never imported."""
+    from cgx.session import js_symbols as _js
+    if not path.lower().endswith((".jsx", ".tsx", ".js", ".ts")):
+        return content
+    declared = _js._declared_names(content)
+    body = _js._strip_comments(content)
+    needed: Dict[str, List[str]] = {}
+    for name, module in _js.REACT_API.items():
+        if name in declared:
+            continue
+        if re.search(r"<" + name + r"\b", body) or re.search(r"\b" + name + r"\s*\(", body):
+            needed.setdefault(module, []).append(name)
+    if not needed:
+        return content
+    out = content
+    for module, names in needed.items():
+        line_re = re.compile(r"""^(\s*import\s+)([^;'"\n]*?)(\s*from\s*['"]""" + re.escape(module) + r"""['"]\s*;?)""", re.M)
+        m = line_re.search(out)
+        if m and "{" in m.group(2):
+            clause = m.group(2)
+            inner_start, inner_end = clause.index("{") + 1, clause.rindex("}")
+            inner = clause[inner_start:inner_end].strip()
+            merged = ", ".join([x for x in [inner] if x] + names)
+            new_clause = clause[:inner_start] + " " + merged + " " + clause[inner_end:]
+            out = out[:m.start(2)] + new_clause + out[m.end(2):]
+        elif m:
+            new_clause = m.group(2).strip() + ", { " + ", ".join(names) + " }"
+            out = out[:m.start(2)] + new_clause + out[m.end(2):]
+        else:
+            out = f"import {{ {', '.join(names)} }} from '{module}';\n" + out
+    return out
+
+
+_IMPORT_LINE_RE = re.compile(r"^\s*import\b[^;\n]*(?:;|$)", re.M)
+
+
+def _fix_namespace_calls(content: str, path: str, bundle: Dict[str, str]) -> str:
+    """Rewrite ``storage.loadSettings()`` (no ``storage`` in scope) into a named
+    import + direct call when a sibling module named ``storage`` exports it.
+
+    The single most repeated weak-model habit on the frontend: calling helpers
+    through a module-like namespace that was never imported (a ReferenceError
+    and a blank page). Only rewrites when EVERY call on that namespace resolves
+    to a named export of exactly one bundle module whose basename matches, so
+    the rewrite is certain; anything else is left to the symbol gate + model.
+    """
+    from cgx.session import js_symbols as _js
+    import posixpath
+    body = _js._strip_comments(content)
+    declared = _js._declared_names(content)
+    uses: Dict[str, set] = {}
+    for m in re.finditer(r"(?<![\w$.])([a-z_$][\w$]*)\.([A-Za-z_$][\w$]*)\s*\(", body):
+        ns, fn = m.group(1), m.group(2)
+        if ns in declared or ns in _js._GLOBALS or len(ns) < 2:
+            continue
+        uses.setdefault(ns, set()).add(fn)
+    if not uses:
+        return content
+    out = content
+    for ns, fns in uses.items():
+        targets = [p for p in bundle if _js.is_js_path(p)
+                   and posixpath.splitext(posixpath.basename(p))[0] == ns and p != path]
+        if len(targets) != 1:
+            continue
+        target = targets[0]
+        exports = set(_js.js_exports(bundle[target])["named"])
+        if not fns <= exports:
+            continue
+        names = sorted(fns)
+        out = re.sub(r"(?<![\w$.])" + re.escape(ns) + r"\.(" + "|".join(map(re.escape, names)) + r")\s*\(",
+                     r"\1(", out)
+        spec = _js._rel_spec(path, target)
+        # merge into an existing import of the same module, else add one
+        merged = False
+        for stmt in _js.js_imports(out):
+            if stmt.side_effect or _js.resolve_relative(stmt.spec, path, list(bundle)) != target:
+                continue
+            have = {i for i, _ in stmt.named}
+            missing = [n for n in names if n not in have]
+            if not missing:
+                merged = True
+                break
+            pat = re.compile(r"(import\s+(?:[^;'\"]*?)\{)([^}]*)(\}\s*from\s*['\"]" + re.escape(stmt.spec) + r"['\"])")
+            m = pat.search(out)
+            if m:
+                inner = m.group(2).strip()
+                new_inner = ", ".join([x for x in [inner] if x] + missing)
+                out = out[:m.start(2)] + " " + new_inner + " " + out[m.end(2):]
+                merged = True
+            break
+        if not merged:
+            line = f"import {{ {', '.join(names)} }} from '{spec}';\n"
+            imports = list(_IMPORT_LINE_RE.finditer(out))
+            if imports:
+                last = imports[-1]
+                out = out[:last.end()] + "\n" + line.rstrip("\n") + out[last.end():]
+            else:
+                out = line + out
+    return out
 
 
 __all__ = ["ReactSkill"]

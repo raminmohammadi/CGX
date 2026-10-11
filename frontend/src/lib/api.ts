@@ -82,20 +82,6 @@ export type ContextFile = {
   candidates: string[];
 };
 
-export type SiteInfo = {
-  slug: string;
-  project_root: string;
-  has_index: boolean;
-  modified: number;
-};
-
-export type GeneratedSite = {
-  slug: string;
-  project_root: string;
-  entry: string;
-  bytes: number;
-};
-
 export type RunningModel = {
   name: string;
   model?: string;
@@ -575,18 +561,97 @@ export type HfHubModel = {
 
 // --- MCP / Approvals ---
 
+export type McpCatalogEnv = {
+  name: string;
+  description: string;
+  secret: boolean;
+  required: boolean;
+};
+
+export type McpCatalogParam = {
+  name: string;
+  description: string;
+  placeholder: string;
+  required: boolean;
+};
+
+export type McpCatalogEntry = {
+  id: string;
+  name: string;
+  vendor: string;
+  category: string;
+  category_label?: string;
+  description: string;
+  agent_hint: string;
+  transport: "stdio" | "http";
+  command?: string;
+  args?: string[];
+  url?: string;
+  env: McpCatalogEnv[];
+  params: McpCatalogParam[];
+  auth?: Record<string, unknown>;
+  docs_url: string;
+  status: "official" | "vendor" | "community" | "archived";
+  risk: "read" | "write" | "execute";
+  installed?: boolean;
+};
+
+export type McpCatalogResponse = {
+  categories: Record<string, string>;
+  servers: McpCatalogEntry[];
+  config_path: string;
+  sdk_installed: boolean;
+};
+
 export type McpServer = {
   name: string;
-  transport: string;
-  url: string | null;
-  command: string | null;
+  transport: "stdio" | "http";
   enabled: boolean;
+  url?: string;
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  auth?: Record<string, unknown>;
+  catalog_id?: string;
+  description?: string;
+  agent_hint?: string;
+  catalog?: {
+    id: string; name: string; vendor: string; category: string; category_label: string;
+    docs_url: string; status: string; risk: string; env: McpCatalogEnv[];
+  } | null;
+  env_vars: string[];
+  missing_env: string[];
+  ready: boolean;
 };
 
 export type McpServersResponse = {
   sdk_installed: boolean;
   config_path: string;
   servers: McpServer[];
+};
+
+export type McpTestResult = {
+  ok: boolean;
+  tools: { name: string; description: string }[];
+  error: string;
+  missing_env: string[];
+  sdk_installed: boolean;
+};
+
+export type McpAddBody = {
+  catalog_id?: string;
+  name?: string;
+  params?: Record<string, string>;
+  env?: Record<string, string>;
+  enabled?: boolean;
+  replace?: boolean;
+  transport?: "stdio" | "http";
+  command?: string;
+  args?: string[];
+  url?: string;
+  auth?: Record<string, unknown>;
+  description?: string;
+  agent_hint?: string;
 };
 
 export type ApprovalRisk = "low" | "medium" | "high";
@@ -604,6 +669,19 @@ export const api = {
   status: () => jsonReq<StatusResponse>("/api/status"),
   // --- MCP tool servers ---
   mcpServers: () => jsonReq<McpServersResponse>("/api/mcp/servers"),
+  mcpCatalog: (category?: string) =>
+    jsonReq<McpCatalogResponse>(
+      `/api/mcp/catalog${category ? `?category=${encodeURIComponent(category)}` : ""}`,
+    ),
+  mcpAdd: (body: McpAddBody) => jsonReq<McpServer>("/api/mcp/servers", "POST", body),
+  mcpRemove: (name: string) =>
+    jsonReq<{ ok: boolean; removed_secrets: number }>(
+      `/api/mcp/servers/${encodeURIComponent(name)}`, "DELETE"),
+  mcpSetEnv: (name: string, env: Record<string, string>) =>
+    jsonReq<{ ok: boolean; stored: Record<string, string>; missing_env: string[] }>(
+      `/api/mcp/servers/${encodeURIComponent(name)}/env`, "POST", { env }),
+  mcpTest: (name: string) =>
+    jsonReq<McpTestResult>(`/api/mcp/servers/${encodeURIComponent(name)}/test`, "POST"),
   mcpToggle: (body: { name: string; enabled: boolean }) =>
     jsonReq<{ ok: boolean; reason?: string }>("/api/mcp/toggle", "POST", body),
   // --- Human-in-the-loop approvals ---
@@ -837,30 +915,6 @@ export const api = {
   agentSessionEventsUrl: (sid: string) =>
     `/api/agent-session/${encodeURIComponent(sid)}/events`,
 
-  // Same-origin URL that serves a session's generated site files (read-only,
-  // web-content only). Rendered inside a sandboxed iframe by the Site Studio.
-  agentSessionPreviewUrl: (sid: string, path = "") => {
-    const rel = path.replace(/^\/+/, "");
-    return `/api/agent-session/${encodeURIComponent(sid)}/preview${rel ? `/${rel}` : ""}`;
-  },
-
-  // Managed site workspaces (~/.cgx/sites/<slug>) for the Site Studio.
-  listSites: () => jsonReq<SiteInfo[]>("/api/sites"),
-  createSite: (name: string) =>
-    jsonReq<SiteInfo>("/api/sites", "POST", { name }),
-
-  // Site Studio one-shot build + revise (bypasses the greenfield pipeline).
-  generateSite: (body: {
-    name: string; brief: string; flavor: string; provider: unknown;
-  }) => jsonReq<GeneratedSite>("/api/sites/generate", "POST", body),
-  reviseSite: (body: {
-    slug: string; feedback: string; flavor: string; provider: unknown;
-  }) => jsonReq<GeneratedSite>("/api/sites/revise", "POST", body),
-  // Trailing slash so a page's relative links resolve under /preview/.
-  sitePreviewUrl: (slug: string, path = "") => {
-    const rel = path.replace(/^\/+/, "");
-    return `/api/sites/${encodeURIComponent(slug)}/preview/${rel}`;
-  },
   agentSessionCancel: (sid: string) =>
     jsonReq<AgentSessionState>(
       `/api/agent-session/${encodeURIComponent(sid)}/cancel`,

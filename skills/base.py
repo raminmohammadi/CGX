@@ -187,9 +187,9 @@ class Skill(ABC):
 
         The deterministic scaffolder (``ensure_scaffolding``) injects files the
         model may not decline (README / dependency manifest / conftest). A skill
-        that governs a component with different rules -- e.g. the static-site
-        skill on a build-less frontend, which has no ``package.json`` -- vetoes
-        the offending file here so the scaffolder never injects something the
+        that governs a component with different rules -- e.g. one keeping a
+        build-less frontend free of ``package.json`` -- vetoes the offending
+        file here so the scaffolder never injects something the
         skill's :meth:`validate_plan` would then reject. Without this, the
         injector and the validator contradict and the Tech Lead loops
         inject-then-reject until it gives up. Default: forbid nothing.

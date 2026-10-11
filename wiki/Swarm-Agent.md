@@ -130,6 +130,22 @@ Runs a graded verification ladder over the finished tree.
   bounded repair can't fix; when that happens the session honestly reports
   **FAILED** — it never falsely passes a red suite.
 
+## Design-aware UI builds
+
+A UI-bearing objective (a chat app, a dashboard, a website, "an app") gets a
+deterministic **design brief** before planning: the product archetype (layout,
+screens, component inventory, checkable UX requirements, integration rules),
+the framework, a contrast-verified theme and the canonical files a real
+frontend ships. The Tech Lead receives it as a binding spec and the plan is
+injected with the design-system files it omitted; the Developer gets per-file
+UI guidance and a **tokens stylesheet CGX writes itself**; the Verifier runs
+deterministic UI-quality checks (no stylesheet, unstyled component, no
+navigation, hard-coded endpoint, no persistence ...), one bounded design-critic
+pass, and gates the verdict on the result. The frontend side is also grounded
+like the Python side now: JS modules' real exports are shown to the Developer,
+and a JS symbol gate regenerates files whose imports name symbols that do not
+exist. See [`docs/design.md`](https://github.com/raminmohammadi/CGX/blob/main/docs/design.md).
+
 ## Tools: one registry, tolerant dispatch
 
 Every swarm role now shares a single **tool registry**
@@ -154,10 +170,13 @@ generation loop changes.
 
 ### MCP tools and human approval
 
-When at least one **MCP server** is configured (`~/.cgx/mcp.json`), the swarm
-also gains `mcp_list_servers`, `mcp_list_tools`, and `mcp_call` (HIGH risk).
-Discovery is lazy so many servers don't flood the prompt, and MCP tools are only
-advertised when a server is actually configured. See **[[Providers and Models]]**.
+When at least one **MCP server** is enabled (`~/.cgx/mcp.json`, normally added
+from the catalog on the MCP page or with `cgx mcp add <id>`), the swarm also
+gains `mcp_list_servers`, `mcp_list_tools`, `mcp_describe_tool` and `mcp_call`
+(HIGH risk), plus a prompt block naming each enabled server and *when* to use
+it. Discovery is lazy and tiered so many servers don't flood the prompt, and
+MCP tools are only advertised when a server is enabled. See
+**[[Providers and Models]]**.
 
 Risky tool calls (code execution, file writes, MCP calls) can be gated behind an
 opt-in **human-in-the-loop approval** step — off by default, enabled with

@@ -402,7 +402,21 @@ def mcp_tools_if_configured() -> tuple:
     try:
         from cgx.mcp.config import enabled_servers
         if enabled_servers():
-            return ("mcp_list_servers", "mcp_list_tools", "mcp_call")
+            return ("mcp_list_servers", "mcp_list_tools", "mcp_describe_tool",
+                    "mcp_call")
     except Exception:  # pragma: no cover
         pass
     return ()
+
+
+def mcp_prompt_block() -> str:
+    """The enabled servers + WHEN to use each, for a role's system prompt.
+
+    Empty when no server is enabled (or the MCP layer is unavailable), so a
+    prompt never advertises a capability the agent cannot reach.
+    """
+    try:
+        from cgx.mcp.manager import servers_prompt_block
+        return servers_prompt_block()
+    except Exception:  # pragma: no cover
+        return ""

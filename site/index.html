@@ -41,7 +41,6 @@
       <a href="#agent" data-label="Agent"><span class="rail-dot"></span></a>
       <a href="#swarm" data-label="Swarm"><span class="rail-dot"></span></a>
       <a href="#jev" data-label="JEV"><span class="rail-dot"></span></a>
-      <a href="#studio" data-label="Site Studio"><span class="rail-dot"></span></a>
       <a href="#surfaces" data-label="Surfaces"><span class="rail-dot"></span></a>
       <a href="#ops" data-label="Ops"><span class="rail-dot"></span></a>
       <a href="#install" data-label="Install"><span class="rail-dot"></span></a>
@@ -70,7 +69,6 @@
           <a href="#agent">Agent</a>
           <a href="#swarm">Swarm</a>
           <a href="#jev">JEV</a>
-          <a href="#studio">Site Studio</a>
           <a href="#surfaces">Surfaces</a>
           <a href="#ops">Ops</a>
           <a href="#trust">Trust</a>
@@ -789,85 +787,6 @@ flowchart LR
         </div>
       </section>
 
-      <!-- ========================================================== studio -->
-      <section id="studio">
-        <div class="shell">
-          <div class="section-head">
-            <p class="eyebrow">Build → Site Studio</p>
-            <h2>Describe a website. Watch it build.</h2>
-            <p class="lede">
-              Site Studio (route <code class="inline">/studio</code>) turns a plain-English description into
-              a working static HTML/CSS/JS website, renders it live in a sandboxed preview beside the build,
-              and lets you refine it by giving feedback — all locally, on any model, small ones included. No
-              framework, no build step, no path to type: the folder is created for you under
-              <code class="inline">~/.cgx/sites/&lt;slug&gt;</code>, and the output is real files on disk.
-            </p>
-          </div>
-
-          <div class="pipeline-rail" aria-hidden="true"></div>
-          <div class="pipeline reveal">
-            <div class="stage">
-              <span class="stage-n">01</span>
-              <h4>Describe</h4>
-              <p>Name the site and say what it should contain — "a coffee-shop site with menu, story, hours and contact; dark and modern".</p>
-            </div>
-            <div class="stage">
-              <span class="stage-n">02</span>
-              <h4>Collaborate</h4>
-              <p>CGX asks a few clarifying questions and shows you the file plan to <strong>approve</strong> before it writes anything.</p>
-            </div>
-            <div class="stage">
-              <span class="stage-n">03</span>
-              <h4>Build</h4>
-              <p>A coherent multi-page site — <code class="inline">index.html</code> per route, one shared stylesheet and script, an identical header/footer, and links that resolve.</p>
-            </div>
-            <div class="stage">
-              <span class="stage-n">04</span>
-              <h4>Render</h4>
-              <p>The site appears in a sandboxed preview pane (desktop or mobile width), reloading each time files are written.</p>
-            </div>
-            <div class="stage">
-              <span class="stage-n">05</span>
-              <h4>Feedback</h4>
-              <p>"Make the header sticky", "add a pricing page" — CGX revises the files and the preview reloads. Repeat until it's right.</p>
-            </div>
-          </div>
-
-          <div class="grid grid-3" style="margin-top: 2.5rem">
-            <article class="card reveal">
-              <h3>The static_site skill keeps it honest</h3>
-              <p>
-                A built-in skill pins generation to a build-less, multi-page layout and <em>validates</em>
-                the result — requires an <code class="inline">index.html</code>, rejects stray framework /
-                build files (<code class="inline">package.json</code>, bundler configs), and resolves every
-                local <code class="inline">href</code>/<code class="inline">src</code> to a page that
-                actually exists. A failed check drives a targeted regenerate, so even a small local model
-                ships a real site instead of a broken React app.
-              </p>
-            </article>
-            <article class="card reveal">
-              <h3>Sandboxed, read-only preview</h3>
-              <p>
-                The preview is served read-only over a loopback route that refuses to leave the site's
-                folder and serves only web content, inside a sandboxed iframe
-                (<code class="inline">allow-scripts</code>, <em>not</em>
-                <code class="inline">allow-same-origin</code>) — generated JavaScript runs but is isolated
-                in its own origin and cannot touch the CGX app, its cookies, or its API.
-              </p>
-            </article>
-            <article class="card reveal">
-              <h3>Real files, your loop</h3>
-              <p>
-                Studio drives the normal greenfield agent loop with the skill pinned and plan-approval on,
-                so cancel, resume, and the task graph all apply. Rendering uses <em>your</em> browser — no
-                headless dependency. For framework sites (React / Vue / Next), use the Agent Loop with the
-                matching skill instead.
-              </p>
-            </article>
-          </div>
-        </div>
-      </section>
-
       <!-- ======================================================== surfaces -->
       <section id="surfaces">
         <div class="shell">
@@ -934,9 +853,9 @@ flowchart LR
 <span class="p">$</span> cgx
 
 <span class="c"># everything the web UI can do, as scriptable command groups</span>
-<span class="p">$</span> cgx skills list <span class="c"># + profile · agent-profile · context · site</span>
+<span class="p">$</span> cgx skills list <span class="c"># + profile · agent-profile · context</span>
 <span class="p">$</span> cgx session list <span class="c"># inspect/drive: show · rm · send · decide</span>
-<span class="p">$</span> cgx mcp list <span class="c"># + model · activity · usage · feedback · monitor</span>
+<span class="p">$</span> cgx mcp catalog <span class="c"># add · test · set-env + model · activity · usage</span>
 <span class="p">$</span> cgx govdata policy <span class="c"># + admin · trace · metrics · health · rollback</span></code></pre>
             </div>
           </div>

@@ -23,8 +23,8 @@ from cgx.session.tasks.base import (
     ExecutorDeps, ExecutorResult, TaskNode, register_executor)
 from cgx.session.tasks.swarm_log import swarm_beat
 from cgx.session.tasks.swarm_plan import (
-    ensure_scaffolding, ensure_test_coverage, normalize_plan, ordered_paths,
-    parse_plan_reply, verify_plan)
+    ensure_scaffolding, ensure_test_coverage, ensure_ui_scaffolding,
+    normalize_plan, ordered_paths, parse_plan_reply, verify_plan)
 
 # Bounded re-asks: the model gets one corrective retry per failure mode
 # (unparseable / not buildable) before the plan is declared a dead end.
@@ -135,7 +135,8 @@ def _planner_tools() -> tuple:
 def _ask_for_plan(provider: Any, goal: str,
                   correction: str,
                   project_root: Optional[str] = None,
-                  skill_prompt: str = "") -> Dict[str, Any]:
+                  skill_prompt: str = "",
+                  design_prompt: str = "") -> Dict[str, Any]:
     """Prompt the model for a draft plan JSON (empty dict on failure).
 
     Tool calls (``search_web``) are resolved through the shared tool registry,
@@ -157,6 +158,11 @@ def _ask_for_plan(provider: Any, goal: str,
         # Flask's app/blueprint conventions) for the stacks detected in the
         # goal -- this is what teaches the planner to include the frontend.
         system += "\n\nACTIVE SKILLS (follow this guidance):\n" + skill_prompt
+    if design_prompt.strip():
+        # The design layer's product spec + file-plan requirements for a
+        # UI-bearing objective (see cgx.design): what screens/components a real
+        # version of this app has, and the design-system files it must ship.
+        system += "\n\n" + design_prompt
     # Advertise EXACTLY the tools the planner can dispatch (search_web +
     # fetch_url + any configured MCP tools), rendered from the registry so the
     # prompt can never drift from what _planner_tools() actually runs.
@@ -164,6 +170,11 @@ def _ask_for_plan(provider: Any, goal: str,
     tool_block = REGISTRY.describe_for_prompt(planner_tools)
     if tool_block:
         system += "\n\n" + tool_block
+    if any(t.startswith("mcp_") for t in planner_tools):
+        from cgx.session.tasks.swarm_tools import mcp_prompt_block
+        mcp_block = mcp_prompt_block()
+        if mcp_block:
+            system += "\n\n" + mcp_block
     messages = [
         {"role": "system", "content": system},
         {"role": "user", "content": user},
@@ -324,6 +335,32 @@ def swarm_tech_lead(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     # in chat.
     active_skills = (skills_by_names(pinned, project_root=project_root) if pinned
                      else detect_skills(goal, project_root=project_root))
+    # Design layer: for a UI-bearing objective, derive the product + design
+    # brief (archetype, screens, components, UX requirements, theme, canonical
+    # UI files) deterministically from the goal. It shapes the plan here, every
+    # UI file the Developer writes, and what the Verifier gates on.
+    design_prompt = ""
+    brief = None
+    try:
+        from cgx import design as _design
+        brief = _design.build_brief(goal, skill_names(active_skills))
+        if brief.applies:
+            if (brief.framework == "react"
+                    and not ({"react", "nextjs", "vue"} & set(skill_names(active_skills)))):
+                # The objective named no framework; the brief resolved it to
+                # React + Vite. Activate the React skill so its structural
+                # requirements and validators apply to the plan.
+                active_skills = list(active_skills) + skills_by_names(
+                    ["react"], project_root=project_root)
+            design_prompt = _design.planner_block(brief)
+            swarm_beat(project_root, "tech_lead", "design",
+                       archetype=brief.archetype, theme=brief.theme,
+                       framework=brief.framework, styling=brief.styling,
+                       product=brief.product_name)
+    except Exception as e:  # pragma: no cover - the design layer must never block planning
+        swarm_beat(project_root, "tech_lead", "design_error", error=repr(e))
+        brief = None
+        design_prompt = ""
     # The planner needs the framework's *structural* requirements (e.g. React's
     # Vite layout mandates an index.html entry + main.jsx + package.json), which
     # live in the scaffold fragment; the plan fragment adds modify-time rules.
@@ -375,8 +412,10 @@ def swarm_tech_lead(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     for attempt in range(1, _MAX_PLAN_ATTEMPTS + 1):
         if is_debate:
             swarm_beat(project_root, "tech_lead", "debate_generation", attempt=attempt)
-            draft1 = _ask_for_plan(deps.provider, goal, correction, project_root, skill_prompt)
-            draft2 = _ask_for_plan(deps.provider, goal, correction, project_root, skill_prompt)
+            draft1 = _ask_for_plan(deps.provider, goal, correction, project_root,
+                                   skill_prompt, design_prompt)
+            draft2 = _ask_for_plan(deps.provider, goal, correction, project_root,
+                                   skill_prompt, design_prompt)
             
             # Judge decides
             judge_prompt = (
@@ -394,7 +433,8 @@ def swarm_tech_lead(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             swarm_beat(project_root, "tech_lead", "debate_decision",
                        decision=decision, reason=reason)
         else:
-            draft = _ask_for_plan(deps.provider, goal, correction, project_root, skill_prompt)
+            draft = _ask_for_plan(deps.provider, goal, correction, project_root,
+                                  skill_prompt, design_prompt)
 
         # Test coverage and scaffolding are injected deterministically rather
         # than re-asked: a pytest module is added for every uncovered source
@@ -405,6 +445,13 @@ def swarm_tech_lead(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         # runs first so the manifest the scaffolding scans includes the tests.
         plan = ensure_scaffolding(
             ensure_test_coverage(normalize_plan(draft)), skills=active_skills)
+        # Design-system completeness: re-anchor the brief on the draft's real
+        # UI root (frontend/ vs repo root, .jsx vs .tsx) and inject the tokens
+        # stylesheet, app stylesheet, entry/shell, API client and storage helper
+        # the plan is missing -- a guarantee, not a request.
+        if brief is not None and brief.applies:
+            brief = brief.resolved_for_paths(ordered_paths(plan))
+            plan = ensure_ui_scaffolding(plan, brief.to_dict(), skills=active_skills)
         plan = _auto_repair_plan_dependencies(plan)
         paths = ordered_paths(plan)
         swarm_beat(project_root, "tech_lead", "normalize",
@@ -440,6 +487,19 @@ def swarm_tech_lead(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             if _reject(problems):
                 break
             continue
+        # Design gate: the few UI invariants that cannot be injected (a UI
+        # brief whose plan has no screen components at all) re-ask the planner
+        # with the exact problem, like any other structural rejection.
+        if brief is not None and brief.applies:
+            try:
+                from cgx import design as _design
+                problems = _design.plan_problems(brief, paths)
+            except Exception:  # pragma: no cover
+                problems = []
+            if problems:
+                if _reject(problems):
+                    break
+                continue
         break
 
     if not paths or problems:
@@ -493,6 +553,11 @@ def swarm_tech_lead(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             # (skill-guided generation, polyglot verification) without
             # re-detecting per file.
             "skills": active_skill_names,
+            # The design brief (None for a non-UI build): the Developer renders
+            # it into per-file guidance and the Verifier checks the tree
+            # against it, so all three roles share one product spec.
+            "design": (brief.to_dict() if brief is not None and brief.applies
+                       else None),
         },
     )
     swarm_beat(project_root, "tech_lead", "report", ok=True,
@@ -504,4 +569,6 @@ def swarm_tech_lead(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
                  "file_count": len(paths),
                  "goal": goal,
                  "project_root": project_root,
-                 "skills": active_skill_names})
+                 "skills": active_skill_names,
+                 "design": (brief.to_dict() if brief is not None and brief.applies
+                            else None)})
