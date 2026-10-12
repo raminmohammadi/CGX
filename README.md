@@ -359,8 +359,9 @@ glance; the groups below hold the working pages:
    **Cancel** button is available while planning is in progress; page switching
    is non-destructive.
 3. **Build → Agent Loop** (`/agent`) -- the **session-based** view. Start a
-   session with an objective, pick a **mode** (auto / explore /
-   greenfield -- *auto* defers to `detect_mode`), and watch the
+   session with an objective, pick a **mode** (auto / swarm /
+   explore -- *auto* defers to `detect_mode`, which picks swarm for an
+   empty folder), and watch the
    agent walk the appropriate chain. Explore mode runs
    `EXPLORE → INVESTIGATE → RECOMMEND → PLAN_CHANGE → APPLY →
    VERIFY` against an existing codebase; greenfield mode runs
@@ -454,7 +455,7 @@ Beyond those core verbs, **everything the web UI can do is also a scriptable
 ```bash
 cgx skills list                      # registry: also show/create/edit/delete
 cgx profile add prod --kind openai   # LLM connection presets (list/show/rm)
-cgx session list                     # inspect/drive: show/rm/send/decide
+cgx session list                     # inspect/drive: show/rm/send/decide/preview
 cgx session preview <sid>            # review a finished build: verdict, screenshots, live preview
 cgx session send <sid> "make the top bar full width"   # feedback on a finished build -> revise + re-verify
 cgx session send <sid> "tighten the copy" --profile <name>   # same, but this turn runs on a saved profile (--model overrides its model)
@@ -587,8 +588,9 @@ under the plan in the UI.
 The default Agent tab drives a **persistent, session-shaped** loop
 defined in `cgx.session`. Every interaction belongs to a `Session`
 whose state survives process restarts under
-`<project_root>/.cgx/sessions.db`. A session walks one of two
-chains -- the **mode** is auto-detected by
+`<project_root>/.cgx/sessions.db`. A session walks one of three
+chains (explore and greenfield below; the swarm build is described in
+[docs/swarm-design.md](docs/swarm-design.md)) -- the **mode** is auto-detected by
 `cgx.session.mode.detect_mode` at session creation (or set
 explicitly via the launcher / API), and dictates which root task
 the router seeds. Both shapes pause at every `ASK_USER` for a typed
@@ -665,9 +667,14 @@ session-level budget (`max_task_runs` / `max_wall_seconds`) backstops
 the whole autonomous run: interactive sessions pause on an `ASK_USER`
 when spent, headless ones end terminally `FAILED`.
 
-The HTTP surface at `/api/agent-session/*` has eight endpoints:
-seven JSON (create / list / get / message / decision / cancel /
-delete) plus a `GET /{sid}/events` **SSE** stream. Mutating endpoints
+The HTTP surface at `/api/agent-session/*` has eleven endpoints:
+ten JSON (create / list / get / message / decision / cancel /
+delete, plus the swarm build-review trio `GET /{sid}/screenshots/{name}`
+and `POST` / `DELETE /{sid}/preview`) and a `GET /{sid}/events` **SSE**
+stream. On a finished swarm build `POST /{sid}/message` is *feedback*:
+the session reopens and `SWARM_REVISE -> SWARM_VERIFY` run (`409` while
+a build is still mid-chain), and the request's `provider` picks the
+model for that turn. Mutating endpoints
 return the full `AgentSessionState` snapshot so the React UI
 re-renders the tree in one round-trip; `DELETE /api/agent-session/
 {sid}` discards a session and its aggregate (`ON DELETE CASCADE`)

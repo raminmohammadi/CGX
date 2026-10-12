@@ -711,9 +711,12 @@ Three pieces of code own every transition:
   persists their `outputs`, `facts`, and `artifact` after the call so
   executors are unit-testable without a database.
 
-The HTTP surface (`/api/agent-session`) has eight endpoints -- seven
-JSON (create / list / get / message / decision / cancel / delete) plus
-a `GET /{sid}/events` **SSE** stream. Mutating endpoints return the
+The HTTP surface (`/api/agent-session`) has eleven endpoints -- ten
+JSON (create / list / get / message / decision / cancel / delete, plus
+the swarm build-review trio: `GET /{sid}/screenshots/{name}` and `POST`
+/ `DELETE /{sid}/preview`) and a `GET /{sid}/events` **SSE** stream. A
+message on a finished swarm build is feedback and runs `SWARM_REVISE ->
+SWARM_VERIFY` (see [swarm-design.md](swarm-design.md)). Mutating endpoints return the
 full `AgentSessionState` snapshot, so the React UI re-renders the whole
 tree in one round-trip; `DELETE` returns `{deleted: sid}` and the UI
 refreshes the session list. While a task is `IN_PROGRESS` (other than

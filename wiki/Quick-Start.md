@@ -41,6 +41,11 @@ right through the tabs:
    code graph.
 3. **Ask** — type a natural-language question and read the streamed,
    cited answer.
+4. **Agent** — to build something new, give an objective (*"a chatbot app
+   with an API key settings tab, React frontend"*) and an empty folder.
+   When the swarm build finishes, review the screenshots or **Open live
+   preview**, then type what to change and press **Revise**; pick a
+   different model for that message in the composer if you like.
 
 The full tab-by-tab tour is in the **[[Web UI Guide]]**.
 
@@ -60,6 +65,12 @@ cgx plan "Add a --json flag to the query command" --self-test --run-tests
 
 # 4. Run one unattended turn of the session agent
 cgx agent "Add docstrings to every public function in cgx.parser"
+
+# 5. Build a new app, review it, and send feedback (same session, any model)
+cgx agent --mode swarm --project-root ./chatbot "a chatbot app with an API key settings tab, React frontend"
+cgx session list --project-root ./chatbot --table           # find the session id
+cgx session preview <sid> --project-root ./chatbot          # verdict, screenshots, live preview
+cgx session send <sid> "make the top bar span the full width" --project-root ./chatbot --profile <name>
 ```
 
 `ask`, `plan`, `agent`, and `status` auto-discover the index at

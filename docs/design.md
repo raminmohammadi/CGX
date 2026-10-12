@@ -134,6 +134,10 @@ steers to a dark theme.
 |----------|---------|--------|
 | `CGX_DESIGN_CRITIC` | `1` | run the one-call LLM design review in the Verifier |
 | `CGX_DESIGN_GATE` | `1` | fatal design issues fail the verify verdict (`0` = advisory) |
+| `CGX_BROWSER_SMOKE` | `1` | load every route of the built frontend headlessly and screenshot it (`0` = skip) |
+| `CGX_BROWSER` | _(auto)_ | path to a specific Chromium-family binary for the smoke |
+| `CGX_VISION_MODEL` | `auto` | Ollama vision model for the screenshot critic and the feedback check (`off` = disable) |
+| `CGX_FEEDBACK_AUTOFIX` | `1` | automatic follow-up revisions when the feedback check says the ask was not visibly met (max `3`, `off` = disable) |
 
 ## Extending
 
@@ -177,6 +181,25 @@ shows it the brief plus up to three route screenshots and asks for concrete
 per-file CSS/markup fixes, regenerates those files, rebuilds and re-runs the
 smoke. One round, after the runtime smoke passed; taste never gates the
 verdict, the re-check does.
+
+## Feedback on a built UI
+
+The design layer keeps working after the first verdict. When the user reviews
+the build (screenshots and live preview on the Agent page, or `cgx session
+preview`) and asks for a change, `SWARM_REVISE` uses the brief to map the
+feedback to files: concern words resolve to the brief's file *roles*
+(`file_kind`: visual words -> the app stylesheet, navigation words -> the
+shell, connection words -> the API client, "remember after reload" -> the
+storage helper), and the tokens stylesheet is never a model target -- "dark
+mode" or a named theme rewrites it deterministically from `themes.py`. For
+layout feedback the reviser shows the model each implicated component's DOM
+ancestry with the CSS rules on every ring, and a deterministic diagnosis names
+the ring that actually constrains the element (a centring flex `body`, a
+`max-width` cap, an unstyled `#root`). After the revision the Verifier
+re-screenshots every route and the vision model compares the BEFORE and AFTER
+screenshots against the user's own words (`vision.check_feedback`), which can
+trigger one automatic follow-up. Full loop:
+[`swarm-design.md`](swarm-design.md#feedback-loop----review-revise-re-verify).
 
 ## Frontend symbol intelligence
 

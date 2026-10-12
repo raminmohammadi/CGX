@@ -166,6 +166,14 @@ installed; otherwise in `~/.cgx/secrets.json` with `0600` permissions.
 from the environment or the keyring-backed store. See
 **[[Privacy and Security]]**.
 
+**Switching models per message.** The provider is chosen per request, not
+per session. On the Agent page the composer's **Model for the next
+message** selector applies a saved profile to the active provider, so the
+next follow-up or feedback revision runs on it (a run already in progress
+keeps its model). On the CLI every `ask` / `plan` / `agent` / `session send`
+/ `session decide` takes `--profile <name>`; add `--model <id>` to keep the
+profile's server, key and sampling but swap only the model.
+
 ---
 
 ## Schema-constrained decoding

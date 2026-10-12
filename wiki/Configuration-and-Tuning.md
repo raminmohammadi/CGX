@@ -49,6 +49,16 @@ unset). The most useful:
 | `CGX_TELEMETRY` | `0` (off) | Set `1` to enable the anonymous startup ping. |
 | `CGX_APPROVAL_MODE` | `risky` | Human-in-the-loop gate for swarm tools: `off`, `risky` (gate MEDIUM/HIGH tools), or `all`. Only takes effect once a gate is installed (`cgx agent --approve` or the web approvals API). See **[[Privacy and Security]]**. |
 | `CGX_MCP_CONFIG` | `~/.cgx/mcp.json` | Path to the local MCP tool-server roster. |
+| `CGX_NPM_REGISTRY` | _(unset)_ | npm registry for `npx`-launched MCP servers (e.g. `https://registry.npmjs.org/`) when your `~/.npmrc` points at a private registry; your npmrc is not touched. See [docs/mcp.md](../docs/mcp.md). |
+| `CGX_FETCH_ALLOWLIST` / `CGX_FETCH_ALLOW_ANY` | _(unset)_ | Extra domains (CSV) the swarm's `fetch_url` tool may read, or `1` to allow any public host. Private/loopback hosts stay blocked either way. |
+| `CGX_DESIGN_GATE` | `1` | Fatal UI-design defects (no stylesheet, unstyled component, hard-coded endpoint ...) block a swarm build's *verified* verdict. `0` makes them advisory. See [docs/design.md](../docs/design.md). |
+| `CGX_DESIGN_CRITIC` | `1` | One bounded LLM design-critic pass over a UI build's files. `0` skips it. |
+| `CGX_BROWSER_SMOKE` | `1` | Load every route of a built frontend in headless Chrome/Chromium, screenshot it, and repair a blank or crashing route once. `0` skips the runtime smoke. |
+| `CGX_BROWSER` | _(auto)_ | Path to a specific Chromium-family browser binary for the runtime smoke. |
+| `CGX_VISION_MODEL` | `auto` | Ollama vision model that reviews the screenshots (and judges whether feedback was visibly addressed). `auto` picks an installed one such as `qwen3-vl`; a name pins it; `off` disables. |
+| `CGX_FEEDBACK_AUTOFIX` | `1` | Automatic follow-up revisions per piece of feedback when the screenshot review says the ask was **not** visibly met (max `3`); `off` disables. See **[[Swarm Agent]]**. |
+| `CGX_PREVIEW_HOST` | `127.0.0.1` | Bind host for the live preview of a finished build (Agent page **Open live preview**, `cgx session preview`). Set `0.0.0.0` only on a trusted network. |
+| `CGX_SWARM_LEARNING` | `on` | Post-mortem lessons a swarm run records into the skill/project stores. `off` disables. |
 | `CGX_WEB_APPROVAL` | _(unset)_ | When set, the web session drive installs an approval gate so risky tool calls surface at `/approvals`. Off by default so web runs never block. Gated tools follow `CGX_APPROVAL_MODE`. |
 | `NO_COLOR` / `CGX_NO_COLOR` / `CGX_FORCE_COLOR` | — | Terminal colour control. |
 

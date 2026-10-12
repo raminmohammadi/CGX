@@ -38,8 +38,10 @@ Two surfaces sit on top: the **CLI** (`cli/`) and the **web UI**
 | `graph/` | Import/call graph construction (`build_graph`, `backend`, `aggregation`) used for graph-expansion during retrieval. |
 | `retrieval/` | Hybrid search: FAISS ANN (`index`), lexical/BM25 (`lexical`), RRF fusion (`rrf`), optional cross-encoder (`reranker`), all wired by the `orchestrator`. |
 | `answer/` | LLM provider abstraction (`providers`), the answer/plan `engine`, prompt/context assembly (`context_map`, `repo_map`), profiles, rate limiting, hardware matrix. |
-| `codegen/` | Diff parsing/apply (`diff_apply`, `disk_apply`), validation (`validate`), self-test loop (`pipeline`, `test_runner(s)`), dynamic deps (`env_manager`), AST insertion (`ast_insert`), AST scaffolding fallback (`ast_gluer`). |
-| `session/` | The persistent agent orchestrator: `router` (pure state machine), `runner`, `store`, `tasks/` (executors), `repair/`, `budget`, `mode`. |
+| `codegen/` | Diff parsing/apply (`diff_apply`, `disk_apply`), validation (`validate`), self-test loop (`pipeline`, `test_runner(s)`), dynamic deps (`env_manager`), AST insertion (`ast_insert`), AST scaffolding fallback (`ast_gluer`), headless-browser runtime smoke + live-preview server for built frontends (`browser_smoke`). |
+| `session/` | The persistent agent orchestrator: `router` (pure state machine), `runner`, `store`, `tasks/` (executors, incl. the swarm `swarm_tech_lead` / `swarm_developer` / `swarm_verify` / `swarm_revise`), `revise` (pure feedback localization), `js_symbols` (JS/TS export/import grounding), `repair/`, `budget`, `mode`. |
+| `design/` | Product + design intelligence for UI-bearing builds: deterministic design brief (archetype, theme, canonical files), CGX-written tokens stylesheet, UI checks, design critic, screenshot vision critic. See [`docs/design.md`](https://github.com/raminmohammadi/CGX/blob/main/docs/design.md). |
+| `mcp/` | Model Context Protocol tool servers: roster, curated catalog, keyring-backed secrets, tiered discovery tools for the swarm. See [`docs/mcp.md`](https://github.com/raminmohammadi/CGX/blob/main/docs/mcp.md). |
 | `pipeline/` | High-level entry points that wire parsing → embedding → indexing (`auto.run_index_auto`, `run`). |
 | `webui/` | FastAPI app (`server`), `routes/`, SSE (`sse`), task store, and the launcher (`launch`). Serves the built SPA from `static/`. |
 | `cli/` | The `cgx` command (`main`) and the interactive terminal dashboard (`tui/`). |
@@ -77,8 +79,13 @@ The agent is a **persistent DAG of typed tasks** with three clean layers:
 - `tasks/*` — one executor per `TaskKind`; the **only** layer that calls
   the LLM or touches disk.
 
-State persists to `<project_root>/.cgx/sessions.db`. Full walkthrough:
-**[[Session Based Agent]]**.
+State persists to `<project_root>/.cgx/sessions.db`. A **swarm** session
+(the default for an empty folder) builds with Tech Lead → Developer →
+Verifier and then stays open for feedback: each follow-up becomes a
+`SWARM_REVISE` that localizes the change to the exact files and re-runs
+`SWARM_VERIFY`. Every message carries its own provider, so a follow-up can
+use a different model. Full walkthroughs: **[[Session Based Agent]]** and
+**[[Swarm Agent]]**.
 
 ---
 

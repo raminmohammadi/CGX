@@ -33,7 +33,9 @@ CGX only makes outbound network calls in these cases:
 | Path | When it happens |
 |------|-----------------|
 | **Cloud LLM provider** | You explicitly select OpenAI, Gemini, Hugging Face Inference, an OpenAI-compatible endpoint, or a custom server. Your prompt (which includes retrieved code snippets) is sent to that provider. |
-| **Browse Hugging Face** | The Settings panel lists GGUF repositories from `huggingface.co/api/models`; **Pull** delegates the download to your local Ollama daemon (`hf.co/<repo>`), which then re-aliases the model to a clean local name via loopback `POST /api/copy` + `DELETE /api/delete` (no extra outbound traffic). |
+| **Browse Hugging Face** | The Settings panel lists GGUF repositories from `huggingface.co/api/models`, one page per request (**Load more** sends the Hub's own pagination cursor, charset-validated and forwarded only to the fixed Hub host); **Pull** delegates the download to your local Ollama daemon (`hf.co/<repo>`), which then re-aliases the model to a clean local name via loopback `POST /api/copy` + `DELETE /api/delete` (no extra outbound traffic). |
+| **Swarm web tools** | The swarm's `search_web` / `fetch_url` tools, when a build needs a real third-party API's docs. `fetch_url` reads only allow-listed documentation / registry / code-host domains by default (`CGX_FETCH_ALLOWLIST` adds more, `CGX_FETCH_ALLOW_ANY=1` opens any public host); private and loopback hosts are always refused, on every redirect hop. |
+| **Dependency installs** | A swarm or greenfield build's `pip` / `npm` installs reach the package registries your environment points at. |
 | **Provider Ping** | The Setup tab / `POST /api/provider/ping` runs a live reachability check against the configured provider. |
 | **Model discovery** | Listing available models for a cloud provider, restricted to an allow-list of approved hosts (SSRF barrier in `webui/routes/setup.py`). |
 | **First-run model download** | Hugging Face downloads the embedding model once, then caches it. |
@@ -94,6 +96,15 @@ configured Project Root.
   **trusted LAN/VPN** or **behind an auth-enforcing reverse proxy**.
 - CORS is permissive only for the Vite dev origin (`localhost:5173`);
   production builds are same-origin.
+- The **live preview** of a finished swarm build (`POST
+  /api/agent-session/{sid}/preview`, `cgx session preview`) serves that
+  build's `dist/` folder on a separate ephemeral port bound to
+  `CGX_PREVIEW_HOST` (default `127.0.0.1`). It serves static files only,
+  but anything that can reach the port can load the app; keep it on
+  loopback unless the network is trusted. It stops when the session is
+  deleted or the CLI command exits.
+- Build **screenshots** are served from `<project_root>/.cgx/screenshots/`
+  only for bare `*.png` names whose resolved path stays inside that folder.
 
 ---
 
@@ -131,15 +142,20 @@ reach the outside world. An **opt-in approval gate**
 See **[[Configuration and Tuning]]** for the env var and **[[CLI Reference]]**
 for the flag.
 
-## MCP tool servers (local config, env-held secrets)
+## MCP tool servers (local config, keyring-held secrets)
 
 The optional **MCP (Model Context Protocol)** tool layer follows the same
-local-first, secrets-in-env posture as the rest of CGX:
+local-first posture as the rest of CGX:
 
 - The server roster is a **local JSON file** at `~/.cgx/mcp.json` (override with
-  `CGX_MCP_CONFIG`). Adding a tool server is a config edit, not a code change.
-- **Bearer tokens are never stored in the JSON.** A server entry names an env
-  var via `token_env`; the token is read from that variable at call time.
+  `CGX_MCP_CONFIG`). Adding a tool server is a config edit (or one click from
+  the curated catalog on the MCP page / `cgx mcp add <id>`), not a code change.
+- **Secrets are never stored in the JSON.** The roster holds only `${VAR}`
+  references (in `env`, `args`, `url` or `auth.token_env`). Each resolves from
+  the process environment first, then from the OS keyring (service `cgx-mcp`;
+  a `0600` `~/.cgx/mcp-secrets.json` only when no keyring backend exists).
+  Values typed on the MCP page or passed with `--env` / `set-env` go straight
+  to that store.
 - MCP calls (`mcp_call`) are HIGH risk, so they are gated by the approval gate
   above when it is active. See **[[Providers and Models]]**.
 

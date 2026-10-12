@@ -81,6 +81,11 @@ Pick the path that matches what you need right now.
   build/test) — each stage propose-then-validate, with bounded auto-repair
   (AST import injection, contract renegotiation, semantic repair with a
   dynamic temperature ramp).
+- **Build → review → feedback loop.** A finished swarm build shows the
+  verdict, a screenshot per route and a live preview; your next message
+  ("make the top bar span the full width") becomes a precise revision of
+  the exact files, rebuilt and re-verified. Pick a different model for any
+  follow-up right in the composer. See **[[Swarm Agent]]**.
 - **JEV — typed decision layer.** The high-frequency per-turn choices (which
   chunks to show, whether a command may run, which tool + arguments) are made
   as **typed** decisions beside the model: a per-query context visibility
@@ -141,6 +146,7 @@ holds the authoritative deep dives that individual wiki pages link into:
 - [`docs/jev.md`](https://github.com/raminmohammadi/CGX/blob/main/docs/jev.md) — the typed decision layer (JEV)
 - [`docs/design.md`](https://github.com/raminmohammadi/CGX/blob/main/docs/design.md) — design-aware UI builds (the `cgx.design` layer)
 - [`docs/mcp.md`](https://github.com/raminmohammadi/CGX/blob/main/docs/mcp.md) — MCP tool servers and the catalog
+- [`docs/swarm-design.md`](https://github.com/raminmohammadi/CGX/blob/main/docs/swarm-design.md) — the swarm build engine and its feedback loop
 - [`docs/mlops.md`](https://github.com/raminmohammadi/CGX/blob/main/docs/mlops.md) — production MLOps operator guide
 - [`docs/usage.md`](https://github.com/raminmohammadi/CGX/blob/main/docs/usage.md) — exhaustive usage guide
 - [`docs/Agent.md`](https://github.com/raminmohammadi/CGX/blob/main/docs/Agent.md) — session-agent internals
