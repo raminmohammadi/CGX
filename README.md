@@ -78,6 +78,33 @@ CGX ensures all data, embeddings, and executions remain strictly on your machine
   [Session-based Agent](#session-based-agent-agent) and
   [docs/Agent.md](docs/Agent.md).
 - **Swarm Agent.** A deterministic, plan-driven agent architecture that replaces free-form loops with a Tech Lead (planner), Developer (implementer), and Verifier (tester). Features an advanced **Swarm Operations Dashboard** with live telemetry, and multiple Auto-Repair capabilities (AST Import Injection, AST Function Logic Repair, Contract Renegotiation, Semantic Repair with Dynamic Temperature Scaling) to ensure reliable, compilation-ready code.
+- **Design-aware builds.** Any UI-bearing objective (a chat app, a dashboard,
+  a landing site, a tool) gets what a senior product designer and front-end
+  lead would bring: a deterministic **design brief** (product archetype with
+  screens, components and checkable UX requirements; a contrast-verified
+  theme; the canonical files a real frontend ships), a **design-tokens
+  stylesheet CGX writes itself**, per-file UI guidance for the model, and a
+  Verifier that **gates on UI quality** (unstyled components, no stylesheet,
+  hard-coded endpoints, no persistence, missing navigation ...) plus one
+  bounded design-critic pass. Works with small local models because nothing
+  is left to taste. See [docs/design.md](docs/design.md).
+- **Build -> review -> feedback loop.** A finished swarm build is not the end
+  of the conversation. The Agent page shows a **Build result** panel -- the
+  verdict, a screenshot per route, a **live preview** of the real bundle --
+  and your feedback (*"make the top bar span the full width"*, *"remember the
+  API key after a reload"*) becomes a precise **revision**: CGX localizes it
+  to the exact files (named components, routes, quoted UI copy, the file role
+  a concern maps to, the routes that failed), asks the model for a per-file
+  instruction, applies it as a grounded modification, then rebuilds,
+  re-smokes and re-screenshots. Every revision reports what changed where
+  and why, with diffs; `cgx session send <sid> "..."` does the same from the
+  terminal. See [docs/swarm-design.md](docs/swarm-design.md#feedback-loop----review-revise-re-verify).
+- **MCP tool catalog.** A curated catalog of the MCP servers developers use
+  (GitHub, Playwright, Context7, Brave Search, Postgres, Supabase, Stripe,
+  Sentry, Figma, the official reference servers ...) with one-click add,
+  keyring-stored secrets, connection tests, and **agent hints** so the Tech
+  Lead and Developer know *when* to reach for each server. See
+  [docs/mcp.md](docs/mcp.md).
 - **JEV -- typed decision layer.** The leverage in a coding agent isn't the
   loop, it's *what the loop feeds the model each turn*. JEV
   (`cgx.answer.jev.decide`) turns those high-frequency per-turn choices into
@@ -128,14 +155,6 @@ CGX ensures all data, embeddings, and executions remain strictly on your machine
   steer it. Author them in the UI (**Agent → New Skill /
   Context File**) or commit them to the repo. See
   [docs/skills-and-context.md](docs/skills-and-context.md).
-- **Site Studio.** Describe a website in plain English and CGX clarifies
-  requirements, plans the pages, builds a complete static HTML/CSS/JS site
-  (no framework/build step), and **renders it live** beside the build in a
-  sandboxed preview -- then you refine it with feedback ("make the header
-  sticky", "add a pricing page") and watch it update. A built-in
-  `static_site` skill enforces a coherent multi-page layout and validates
-  that every local link/asset resolves. Everything stays local; the preview
-  runs in your own browser. See [docs/site-studio.md](docs/site-studio.md).
 - **Persistent chat sessions.** Conversations are saved as JSONL
   threads under `~/.cgx/sessions/`; resume them later from the
   Contextual Ask page's session sidebar.
@@ -388,6 +407,10 @@ glance; the groups below hold the working pages:
      against your hardware with **Check fit**, and **Pull**s them straight into
      your local Ollama daemon, re-aliasing each download to a clean local name
      (e.g. `ornith-1.0-9b-gguf`) instead of the full `hf.co/<repo>` web address.
+     Results arrive **40 per page** in the chosen sort order and **Load more**
+     follows the Hub's own cursor; the list is GGUF-only because every pull
+     goes through Ollama's `hf.co/<repo>` loader, and a Hub error (including
+     the HTTP 429 rate limit) is shown inline rather than as an empty list.
    - **Observability** -- a single **tracing toggle** (equivalent to
      `CGX_TRACE=1`) that turns on the rich `@traced` records read by the Ops
      hub's Trace tab.
@@ -431,9 +454,11 @@ Beyond those core verbs, **everything the web UI can do is also a scriptable
 ```bash
 cgx skills list                      # registry: also show/create/edit/delete
 cgx profile add prod --kind openai   # LLM connection presets (list/show/rm)
-cgx site generate landing -b "..."   # Site Studio (list/new/revise/themes)
 cgx session list                     # inspect/drive: show/rm/send/decide
-cgx mcp list                         # MCP servers (enable/disable/tools)
+cgx session preview <sid>            # review a finished build: verdict, screenshots, live preview
+cgx session send <sid> "make the top bar full width"   # feedback on a finished build -> revise + re-verify
+cgx session send <sid> "tighten the copy" --profile <name>   # same, but this turn runs on a saved profile (--model overrides its model)
+cgx mcp catalog --table              # MCP servers: add/rm/set-env/test/enable/disable/tools
 cgx model matrix --table             # model discovery/pull, hardware fit
 cgx usage summary                    # activity · usage · feedback · monitor
 cgx govdata policy                   # govdata · admin · trace · metrics · health · rollback · approvals

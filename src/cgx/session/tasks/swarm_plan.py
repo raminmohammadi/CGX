@@ -48,9 +48,9 @@ _JS_EXT = (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".vue")
 # JS/TS extensions that imply a build/framework toolchain (JSX, TS, single-file
 # components), i.e. a real Node component that needs a package.json. A plain
 # browser <script> file (.js/.mjs/.cjs) with NO manifest is not a Node project:
-# a build-less static site legitimately ships vanilla scripts, and treating
-# them as "node" forces a package.json the static_site skill then rejects --
-# an unwinnable inject-then-reject loop in the Tech Lead planner.
+# a build-less plain-HTML frontend legitimately ships vanilla scripts, and
+# treating them as "node" would force a package.json onto a project that has
+# no build step (an inject-then-reject loop in the Tech Lead planner).
 _JS_BUILD_EXT = (".jsx", ".ts", ".tsx", ".vue", ".svelte")
 
 
@@ -338,8 +338,8 @@ def ensure_scaffolding(plan: Dict[str, Any], *,
     generated last, after the sources they describe and scan exist on disk.
 
     ``skills`` (the plan's active skills) may veto an injected file: a skill
-    that governs a component with different rules -- e.g. the static-site skill
-    on a build-less frontend, which forbids ``package.json`` -- filters it out
+    that governs a component with different rules -- e.g. one that keeps a
+    build-less frontend free of ``package.json`` -- filters it out
     so the injector never adds a file that skill's ``validate_plan`` then
     rejects (which would loop the Tech Lead inject-then-reject until failure).
     """
@@ -395,9 +395,9 @@ def ensure_scaffolding(plan: Dict[str, Any], *,
             "depends_on": list(py_paths) + list(js_paths)})
 
     if injected and skills:
-        # An active skill can veto an injected file (e.g. static_site forbids a
-        # package.json). Filter here so the scaffolder never adds a file the
-        # skill's validator would then reject.
+        # An active skill can veto an injected file (a skill governing a
+        # build-less component may forbid a package.json). Filter here so the
+        # scaffolder never adds a file the skill's validator would then reject.
         injected = [f for f in injected
                     if not _skill_forbids(skills, f.get("path") or "")]
     if injected:
@@ -405,6 +405,38 @@ def ensure_scaffolding(plan: Dict[str, Any], *,
         layers = layers + [{"name": "scaffolding", "files": injected}]
         plan = {**plan, "layers": layers}
     return plan
+
+
+def ensure_ui_scaffolding(plan: Dict[str, Any], brief: Optional[Dict[str, Any]], *,
+                          skills: Optional[List[Any]] = None) -> Dict[str, Any]:
+    """Inject the design-system files a UI brief mandates when the plan lacks them.
+
+    The design layer (:mod:`cgx.design`) turns a UI-bearing objective into a
+    brief naming the canonical files every real frontend ships: the tokens
+    stylesheet (which CGX generates itself), the app stylesheet, the Vite entry
+    + app shell, the API client and the storage helper. A weak planner routinely
+    omits all of them -- the "two bare components, no CSS" failure -- so, like
+    :func:`ensure_scaffolding`, they are appended deterministically rather than
+    re-asked. Screens/components stay the planner's job (``plan_problems`` gates
+    those). Skills may still veto an injected path.
+    """
+    if not isinstance(brief, dict) or not brief.get("applies"):
+        return plan
+    try:
+        from cgx.design import ui_files_to_inject
+    except Exception:  # pragma: no cover - design layer is optional at runtime
+        return plan
+    paths = [(f.get("path") or "").replace("\\", "/") for f in _flatten_files(plan)]
+    injected = ui_files_to_inject(brief, paths)
+    if injected and skills:
+        injected = [f for f in injected if not _skill_forbids(skills, f.get("path") or "")]
+    if not injected:
+        return plan
+    known = set(paths) | {f["path"] for f in injected}
+    for f in injected:
+        f["depends_on"] = [d for d in (f.get("depends_on") or []) if d in known and d != f["path"]]
+    layers = list(plan.get("layers") or []) + [{"name": "design-system", "files": injected}]
+    return {**plan, "layers": layers}
 
 
 def ensure_test_coverage(plan: Dict[str, Any]) -> Dict[str, Any]:

@@ -11,10 +11,10 @@ recipe:
 
 * **Build-less / CDN** -- a static site loads the Play CDN
   (``<script src="https://cdn.tailwindcss.com">``) and just uses utility
-  classes. There is NO ``package.json``, NO config, NO PostCSS. This is
-  exactly the shape the ``static_site`` skill emits, so requiring a config
-  here would deadlock the two skills (each fatally rejecting the other's
-  valid output). Tailwind therefore ABSTAINS whenever the site is build-less.
+  classes. There is NO ``package.json``, NO config, NO PostCSS. A plain
+  HTML page is a legitimate Tailwind consumer, so requiring a config here
+  would reject valid output. Tailwind therefore ABSTAINS whenever the site
+  is build-less.
 * **Built, Tailwind v4** -- a single ``@import "tailwindcss";`` in the entry
   CSS is a complete setup; v4 needs NO ``tailwind.config.js`` and NO
   ``@tailwind base/components/utilities`` directives.
@@ -101,8 +101,8 @@ class TailwindSkill(Skill):
         Either a CDN Tailwind is loaded (definitive), or there is no
         ``package.json`` anywhere in the diffs (no build system -> the config
         files a build would need are irrelevant). In both cases the skill must
-        not require -- or reject over -- a missing config, otherwise it
-        deadlocks with the build-less ``static_site`` skill.
+        not require -- or reject over -- a missing config: a build-less page
+        is valid Tailwind usage.
         """
         if any_body_matches(diffs, _CDN_TAILWIND_RE):
             return True
@@ -119,8 +119,8 @@ class TailwindSkill(Skill):
             return None
 
         # (A) Build-less / CDN Tailwind needs no config, no PostCSS, no build
-        # directives -- abstain entirely (this is the static_site skill's
-        # valid output; requiring a config here deadlocks the two skills).
+        # directives -- abstain entirely (a plain CDN page is valid output;
+        # requiring a config here would reject it).
         if self._is_buildless(diffs, paths):
             return None
 

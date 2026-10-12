@@ -33,6 +33,9 @@ stateDiagram-v2
     SWARM_DEVELOPER --> SWARM_VERIFY : all files attempted
     SWARM_VERIFY --> SWARM_VERIFY : red suite -> targeted regen / failure-driven repair (bounded)
     SWARM_VERIFY --> [*] : report (COMPLETED / FAILED)
+    [*] --> SWARM_REVISE : user feedback on the finished build (session reopened)
+    SWARM_REVISE --> SWARM_VERIFY : files changed -> rebuild, re-smoke, re-screenshot
+    SWARM_REVISE --> [*] : nothing to change (prior verdict restored, reason on the task)
 ```
 
 - `--mode swarm` seeds the session with a `SWARM_TECH_LEAD` root task.
@@ -44,6 +47,17 @@ stateDiagram-v2
   using dynamic temperature scaling, and falls back to dynamic regeneration for structural logic.
 - Terminal session actions set COMPLETED when no `failed_paths` remain, else
   FAILED; `on_task_failed` ends a SWARM session FAILED.
+- **Feedback loop.** A message posted to a SWARM session that already holds a
+  build (`cgx.session.revise.latest_build`) is a *revision*, not a new
+  objective: `on_user_message` spawns `SWARM_REVISE` (top-level, "Apply
+  feedback #n") and reopens a COMPLETED/FAILED session to ACTIVE. A revision
+  that changed files chains to `SWARM_VERIFY`, whose report carries the
+  `revision_artifact_id`; one that changed nothing restores the session's
+  prior status and stamps the reason on the task. A question-shaped message
+  without change words ("how does the login work?") still routes to
+  investigation; a message while the build is mid-chain yields an empty plan,
+  which the web route turns into `409` and the CLI into an error, so a build
+  is never forked. See *Feedback loop* below.
 
 ## Tech Lead -- propose-then-validate planner
 **File:** `src/cgx/session/tasks/swarm_tech_lead.py`
@@ -161,6 +175,216 @@ It writes a `SWARM_VERIFY_REPORT` artifact (`coverage_gaps`, `import_warnings`,
 outcome, and `verify_ok`) identifying the specific files implicated by any
 static or dynamic failure.
 
+## Feedback loop -- review, revise, re-verify
+**Files:** `src/cgx/session/revise.py` (pure core), `src/cgx/session/tasks/swarm_revise.py`
+(executor), router edges in `router.py`, UI in `frontend/src/components/agent/BuildResult.tsx`.
+
+A build is rarely right the first time, and a user's feedback is rarely a
+file name: *"make the top bar span the full width"*, *"the Send button should
+be level with the textarea"*, *"remember the API key after a reload"*, *"why is
+the settings page blank?"*. The loop the swarm closes is
+
+```
+user asks -> swarm builds -> user reviews (screenshots, live preview)
+          -> user gives feedback -> SWARM_REVISE knows exactly WHERE + HOW to apply it
+          -> SWARM_VERIFY rebuilds, re-smokes, re-screenshots -> user reviews again ...
+```
+
+**1. Localize deterministically** (`revise.rank_files`). Every planned file is
+scored against the feedback with evidence, each hit carrying a reason that is
+shown in the report:
+
+- the feedback names the file, its stem words (`TopBar.jsx` <- "top bar",
+  `SettingsForm.jsx` <- "settings form") or an exported symbol;
+- it names a route or screen ("settings page", "/settings", "main page") ->
+  the files that implement that `<Route>` (routed component first, its
+  first-party imports as a second ring);
+- a quoted string or Capitalised word appears as UI copy in the file
+  ("the 'Send' button");
+- a concern keyword maps to a file *role* from the design brief: visual words
+  -> the app stylesheet, navigation words -> the shell, connection words ->
+  the API client, "remember after reload" -> the storage helper, "readme" ->
+  `README.md`, build/dependency words -> `package.json`;
+- a structural element word ("header", "composer", "textarea") -> the
+  components that render it; generic ones ("button") only break ties;
+- a problem report ("blank", "crash", "error") -> the files behind the routes
+  the last runtime smoke flagged;
+- weak: overlap with the file's planned description.
+
+The deterministic tokens stylesheet is never a target. Strong candidates
+(score >= 6, at most four) win; otherwise the top two weak ones; an empty
+list means "could not localize", which is reported as such instead of
+guessing.
+
+**1b. Split multi-part feedback** (`revise.split_feedback`). "Make the top
+bar full width, and put the Send button level with the textarea" is two asks
+that land in different files; each part is localized on its own, and after
+the model's plan every part must be covered by at least one change
+(`ensure_part_coverage`) -- an uncovered part gets its own strong candidate
+with the part text as the instruction, so a two-part message never silently
+loses its second half.
+
+**2. Refine with one bounded model call** (`swarm_revise.refine_with_model`).
+The Tech-Lead-shaped prompt sees the goal, the product brief, the previous
+revisions, the numbered feedback parts with their likely files, the ranked
+candidates with *why*, their exported symbols and the numbered source lines
+that mention the feedback, plus the full planned file list. Stylesheets are
+shown as **whole CSS rules** (a `max-width` means nothing without its
+selector) and a component comes with the rules that style its classes *and
+its container's* -- which is how the model learns that a header is narrow
+because the parent is `align-items: center`, not because of the header's own
+rule. It returns strict JSON `{changes: [{path, part, instruction, why}],
+note}`, one change per (file, part); paths outside the plan (or the tokens
+file) are dropped, deterministic candidates keep priority, and a provider
+failure or an empty answer falls back to the ranked candidates with the part
+text as the instruction.
+
+**3. Apply as a grounded modification** (`swarm_revise.apply_change`). Each
+instruction runs through the Developer's `generate_file` with
+`modify_existing=True` and a revision-sized `existing_limit`, so the model sees
+the **whole current file**, the design brief, the contracts and the import
+hints, and is asked for exactly that change with everything else preserved.
+The prompt is grounded in the file as it is: a selector the instruction names
+that has no rule in the stylesheet (or an identifier absent from a source
+file) is called out as something to ADD (`swarm_revise.grounding_notes`) --
+the third live round showed a model told to "edit `.app` in place" echoing
+the file back four times because no `.app` rule existed. Two checkable rules
+then decide whether it was applied: the result must differ from the current
+body, and when the instruction names concrete things (a selector, a CSS
+property, a prop, a quoted string -- `revise.instruction_tokens`) the diff
+must touch at least one of them (`revise.diff_covers`). A miss earns one
+firmer re-ask naming exactly what was skipped; a second miss is reported as
+`partial` in the revision and in the note ("Caution: app.css did not touch
+`.topbar`"), never counted as done. Deterministic repairs run afterwards. A
+theme request ("dark mode", a named theme) rewrites the tokens stylesheet
+without a model call (`revise.theme_from_feedback`).
+
+**4. Report** a `SWARM_REVISION` artifact: the feedback, every candidate with
+its score and reasons, every change with its instruction, *why this file*,
+outcome (`changed` / `unchanged` / `failed`) and a capped unified diff, the
+theme switch if any, and a one-line note. The WORK_PLAN gains a `revisions`
+history that the next round's prompt sees.
+
+**5. Re-verify -- without undoing the feedback.** The router chains to
+`SWARM_VERIFY` on the same plan, so the revised tree goes through the
+structural + design gates, the real build, the browser smoke and the vision
+critic; its report links the revision so the Build result panel pairs the
+fresh screenshots with the feedback they answer. Every regeneration the
+verifier performs reads the plan's revision history (`_revision_notes`): a
+file the user had revised is regenerated as a *modification of its current
+body* with the applied asks spelled out as must-preserve, never from the bare
+spec -- the first live round showed a non-gating prop-drift row quietly
+rewriting a just-revised component from scratch.
+
+**6. Judge the feedback itself, and self-correct once.** Executing the
+instruction is not the same as satisfying the user: "remove `.main`'s
+max-width" can be carried out perfectly while the header stays narrow because
+`body` centres its flex children. So the reviser snapshots the pre-revision
+screenshots (`.cgx/screenshots/before-rev<n>/`), and the verifier, when a
+vision model is available, shows the BEFORE and AFTER screenshots of each
+route to the model together with the user's own words
+(`cgx.design.vision.check_feedback`) and records `SATISFIED` / `NOT SATISFIED:
+<what is still wrong>` / `UNDECIDABLE` on the report (`feedback_check`), the
+revision (`visual_check`) and the summary line ("feedback NOT visibly
+addressed (...)"). It never gates the build verdict. On NOT SATISFIED the
+router spends **one bounded automatic follow-up revision**
+(`CGX_FEEDBACK_AUTOFIX`, default 1, `off` to disable) with the evidence
+appended to the feedback -- the agent corrects itself instead of making the
+user repeat the same sentence -- then hands back with the verdict visible.
+For layout feedback the localizer also shows the component's **DOM ancestry**
+(`html > body > #root > .app > .topbar`, derived from the document, the entry's
+mount call and the import graph) with each ring's rules -- or "NO rule in any
+stylesheet (content-sized)" -- because the constraint that narrows a header is
+often a centring `body` or an unstyled mount root, two or three levels above
+the component the user named. The judge is told that size, position and
+colour requests are always decidable from pixels, and a hedged `UNDECIDABLE`
+on a layout request gets one firmer re-ask.
+
+**7. Deterministic layout knowledge at plan time.** For "X should span the
+full width" complaints the ancestry is also *diagnosed* without a model
+(`revise.diagnose_width_constraints`): a row flex ring with
+`justify-content: center`, a column flex ring with `align-items: center`, a
+`max-width` cap, a content-sized `display: inline-*`, or an unstyled ring under
+a centring parent (the classic `#root`) -- each with the exact CSS fix at its
+own ring. The executor drops a model instruction that would change nothing
+(`instruction_is_noop`: ".app already has align-items: stretch") and, when no
+planned change touches the diagnosed ring, queues the diagnosed fix on the app
+stylesheet itself (`source: diagnosis`). Five live rounds on a 14B model
+showed why: it kept editing the header and its direct wrapper while the
+constraint was a centring `body` two rings up.
+
+**Surfaces.** Web UI: the Agent page's **Build result** panel (verdict, one
+screenshot per route via `GET /{sid}/screenshots/{name}`, a **live preview** of
+the real bundle via `POST /{sid}/preview` -- the smoke's SPA server on an
+ephemeral port, `CGX_PREVIEW_HOST` to bind beyond loopback -- and the revision
+history with diffs); the composer reads *Describe what to change* and the
+button *Revise*. CLI: `cgx session preview <sid>` prints the verdict, screenshot paths and
+revision history and serves the bundle on a local port; `cgx session send <sid>
+"feedback"` continues the finished session (it no longer starts a new one) and
+prints `✎ revision #n: changed ...` followed by the verifier's verdict. The
+composer's **Model for the next message** selector applies a saved profile as
+the active provider so the revision runs on it; `_schedule_drain` coalesces
+onto a drain already in flight, which keeps the deps it started with, so a
+running build keeps its model (and a build mid-chain answers `409`). The CLI
+makes the same per-turn choice with `--profile <name>` or `--provider --model
+--base-url` on `session send`/`decide`, where `--model` overrides the profile's
+model via `provider_from_profile_name(model=...)`.
+
+## Design layer -- product + design intelligence for UI builds
+**Files:** `src/cgx/design/` -- see [`design.md`](design.md).
+
+A UI-bearing objective (a chat app, a dashboard, a website, "an app") gets a
+deterministic **design brief** derived from the goal and the active skills:
+archetype (layout, screens, component inventory, checkable UX requirements,
+integration rules), framework, styling, a contrast-verified theme and the
+canonical files a real frontend ships. It is persisted in the `WORK_PLAN`
+(`content["design"]`) and used by all three roles:
+
+1. **Tech Lead** -- the planner prompt carries the *UI/UX PRODUCT SPEC* and
+   the file-plan requirements; `ensure_ui_scaffolding` (swarm_plan.py) injects
+   the tokens stylesheet, app stylesheet, entry, shell, API client and storage
+   helper the draft omitted; `design.plan_problems` rejects a UI plan with no
+   screen components. A goal that named no framework activates the React skill
+   when the brief resolves to React.
+2. **Developer** -- the tokens stylesheet is emitted deterministically
+   (`generate_file` / `generate_single_scaffold_file`, no model call); every
+   other UI file gets `design.file_block` appended to its system prompt (rules
+   for its kind, the theme as hard constraints, a *UI COMPLETENESS* override of
+   the minimalism rule) and a 1.5x output budget.
+3. **Verifier** -- `design.check_tree` runs beside the structural scan; fatal
+   issues (`D01`-`D09`, `D17`, `D18`) become regen targets with additive
+   directives; a missing tokens file is written by CGX; one bounded
+   design-critic call (`critique_ui`) yields per-file fixes regenerated the
+   same way; a fatal issue surviving the rounds fails the verdict
+   (`CGX_DESIGN_GATE=0` -> advisory) and is named in the summary. After a
+   green build, the **runtime smoke** (`cgx/codegen/browser_smoke.py`,
+   optional Chromium) serves `dist/`, loads every route headlessly with an
+   injected error collector, repairs a blank/crashing route once, and gates
+   on the result; with an Ollama vision model installed the **vision critic**
+   (`cgx/design/vision.py`) reviews the screenshots for one more targeted
+   round.
+
+## JS/TS symbol intelligence
+**File:** `src/cgx/session/js_symbols.py`
+
+The frontend twin of the Python grounding + first-party symbol gate:
+`list_symbols` / `file_skeleton` show a JS module's real export surface,
+`render_import_hints` emits ready-to-paste imports for JS dependencies, and the
+structural scan gains a **JS symbol gate** -- a named/default import no
+dependency exports, a React or router identifier used but never imported, a
+lowercase namespace called like a module but never imported, and a `<Router>`
+nested inside the entry's `<BrowserRouter>` -- each row regenerating the
+importer with the real exports as its directive. The React skill's
+`repair_scaffold` fixes the certain cases without a model call
+(`react-router-dom` -> `react-router`, dangling `./X.css` imports, missing
+`StrictMode`/hook imports).
+
+**Tool-loop hardening:** a stray `<call_tool>` tag can no longer become a
+file's content -- the engine rejects it (one hardened retry), semantic-repair
+output is re-gated through the JS syntax check, and the Developer's tool loop
+ends with an explicit "budget exhausted -- emit the file" turn (and answers a
+lookup of the file being written instead of dispatching it).
+
 ## Plan-aware drain ceiling
 A drain pass carries a flat 64-step safety valve for explore/greenfield. A
 SWARM plan spawns one Developer task per file plus a Verify, so
@@ -204,10 +428,15 @@ loop is unchanged.
 ## MCP tool servers
 **Files:** `src/cgx/mcp/` -- see [`mcp.md`](mcp.md).
 
-External tools over the Model Context Protocol, exposed to the swarm as three
-registry tools (`mcp_list_servers` / `mcp_list_tools` / `mcp_call`) with lazy
-discovery. Servers are a local `~/.cgx/mcp.json` roster; the tools are only
-advertised when at least one server is enabled.
+External tools over the Model Context Protocol, exposed to the swarm as four
+registry tools (`mcp_list_servers` / `mcp_list_tools` / `mcp_describe_tool` /
+`mcp_call`) with lazy, tiered discovery, plus a prompt block listing the
+enabled servers with each one's **agent hint** (when to use it). Servers are a
+local `~/.cgx/mcp.json` roster, normally filled from the curated **catalog**
+(`cgx/mcp/catalog.py`: GitHub, Playwright, Context7, Brave Search, databases,
+Supabase, Stripe, Sentry, Figma, Notion, the reference servers ...); secrets
+live in the keyring (`cgx/mcp/secrets.py`), never in the roster. The tools are
+only advertised when at least one server is enabled.
 
 ## Human-in-the-loop approval
 **File:** `src/cgx/session/approval.py` -- see [`Agent.md`](Agent.md).

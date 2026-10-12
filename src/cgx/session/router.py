@@ -54,6 +54,8 @@ from cgx.session.greenfield_edges import (
     _verify_lesson_actions,
 )
 from cgx.session.repair.classify import DIAGNOSE_CLASSIFICATIONS
+from cgx.session.revise import (
+    BuildRef, is_change_request, latest_build, prior_status_value)
 from cgx.session.models import (
     Decision,
     DecisionKind,
@@ -1239,8 +1241,158 @@ def _swarm_developer_to_successors(parent: TaskNode) -> List[TaskNode]:
 
 
 def _swarm_verify_to_successors(parent: TaskNode) -> List[TaskNode]:
-    """SWARM_VERIFY is terminal -- it owns the session's final status."""
-    return []
+    """SWARM_VERIFY is terminal -- unless a revision's ask was visibly not met.
+
+    A plain build verify spawns nothing and the terminal edge sets the session
+    status. A verify that followed a revision may spawn ONE bounded automatic
+    follow-up revision (see :func:`_swarm_verify_auto_followup`).
+    """
+    return _swarm_verify_auto_followup(parent)
+
+
+def _status_from_value(value: str, default: SessionStatus) -> SessionStatus:
+    try:
+        return SessionStatus(value)
+    except ValueError:
+        return default
+
+
+def _make_revise(session: Session, message: str, build: BuildRef) -> TaskNode:
+    """A SWARM_REVISE task for one piece of user feedback on ``build``.
+
+    Top-level (no parent) so the task tree reads as a timeline: the original
+    build, then "Apply feedback #1" with its own verification underneath, and
+    so on. Carries everything the executor and the terminal edge need: the
+    plan and last report ids, the goal/root, the revision number, and the
+    session's status before the feedback so a no-op or crashed revision can
+    restore it.
+    """
+    n = build.revisions + 1
+    return TaskNode.new(
+        session_id=session.session_id,
+        kind=TaskKind.SWARM_REVISE,
+        name=f"Apply feedback #{n}",
+        description=message if len(message) <= 200 else message[:197] + "...",
+        inputs={
+            "feedback": message,
+            "work_plan_artifact_id": build.work_plan_artifact_id,
+            "verify_report_artifact_id": build.verify_report_artifact_id,
+            "goal": build.goal or session.original_objective,
+            "original_objective": session.original_objective,
+            "project_root": build.project_root or session.project_root,
+            "revision_index": n,
+            "prior_status": prior_status_value(session.status),
+            # Bounded automatic follow-up: when the verifier's screenshot
+            # review says the ask was NOT visibly addressed, the router may
+            # spend this many extra revision rounds before handing back.
+            "auto_round": 0,
+            "auto_rounds_max": feedback_autofix_rounds(),
+        },
+    )
+
+
+def feedback_autofix_rounds() -> int:
+    """Automatic follow-up revisions allowed per piece of feedback (``CGX_FEEDBACK_AUTOFIX``)."""
+    import os
+    raw = (os.environ.get("CGX_FEEDBACK_AUTOFIX") or "1").strip().lower()
+    if raw in ("0", "off", "false", "no"):
+        return 0
+    try:
+        return max(0, min(3, int(raw)))
+    except ValueError:
+        return 1
+
+
+def _swarm_verify_auto_followup(completed: TaskNode) -> List[TaskNode]:
+    """One bounded automatic revision when the ask was visibly NOT addressed.
+
+    The verifier compared the pre-/post-revision screenshots against the
+    user's own words. When it says NOT SATISFIED and the per-feedback budget
+    (``auto_rounds_max``) is not spent, re-run the revision with the vision
+    evidence appended -- the agent corrects itself instead of making the user
+    repeat the same feedback. Otherwise nothing is spawned and the normal
+    terminal edge sets the session status.
+    """
+    outputs = completed.outputs or {}
+    inputs = completed.inputs or {}
+    if not outputs.get("revision_artifact_id"):
+        return []
+    if outputs.get("feedback_satisfied") is not False:
+        return []
+    auto_round = int(outputs.get("auto_round") or inputs.get("auto_round") or 0)
+    budget = int(outputs.get("auto_rounds_max") or inputs.get("auto_rounds_max") or 0)
+    if auto_round >= budget:
+        return []
+    feedback = str(outputs.get("feedback") or inputs.get("feedback") or "").strip()
+    if not feedback:
+        return []
+    evidence = str(outputs.get("feedback_evidence") or "").strip()
+    n = int(outputs.get("revision_index") or inputs.get("revision_index") or 0) + 1
+    message = feedback + (
+        f"\n\n(automatic follow-up #{auto_round + 1}: a screenshot review after the previous "
+        f"revision found the request still not met -- {evidence})" if evidence else
+        f"\n\n(automatic follow-up #{auto_round + 1}: a screenshot review after the previous "
+        "revision found the request still not met)")
+    return [TaskNode.new(
+        session_id=completed.session_id,
+        kind=TaskKind.SWARM_REVISE,
+        name=f"Apply feedback #{n} (auto follow-up)",
+        description=feedback if len(feedback) <= 200 else feedback[:197] + "...",
+        parent_task_id=completed.task_id,
+        inputs={
+            "feedback": message,
+            "work_plan_artifact_id": outputs.get("work_plan_artifact_id")
+            or inputs.get("work_plan_artifact_id"),
+            "verify_report_artifact_id": outputs.get("verify_report_artifact_id"),
+            "goal": outputs.get("goal") or inputs.get("goal"),
+            "project_root": outputs.get("project_root") or inputs.get("project_root"),
+            "revision_index": n,
+            "prior_status": inputs.get("prior_status") or "completed",
+            "auto_round": auto_round + 1,
+            "auto_rounds_max": budget,
+        },
+    )]
+
+
+def _swarm_revise_to_successors(parent: TaskNode) -> List[TaskNode]:
+    """A revision that changed files hands the tree to SWARM_VERIFY.
+
+    The verifier re-runs the whole ladder on the revised tree (structural +
+    design checks, real build, browser smoke, screenshots) so the user reviews
+    a verified result, and its report carries the revision id so the UI pairs
+    the fresh screenshots with the feedback they answer. A revision that
+    changed nothing has no successor; the terminal edge restores the prior
+    verdict.
+    """
+    outputs = parent.outputs or {}
+    if not (outputs.get("changed") or []):
+        return []
+    return [TaskNode.new(
+        session_id=parent.session_id,
+        kind=TaskKind.SWARM_VERIFY,
+        name="Verify revised tree",
+        description="Rebuild, re-check and re-screenshot the revised app.",
+        parent_task_id=parent.task_id,
+        inputs={
+            "work_plan_artifact_id": outputs.get("work_plan_artifact_id")
+            or parent.inputs.get("work_plan_artifact_id"),
+            "failed_paths": list(outputs.get("failed_paths") or []),
+            "goal": outputs.get("goal") or parent.inputs.get("goal"),
+            "project_root": (outputs.get("project_root")
+                             or parent.inputs.get("project_root")),
+            "revision_artifact_id": outputs.get("revision_artifact_id"),
+            "revision_index": outputs.get("revision_index")
+            or parent.inputs.get("revision_index"),
+            # For the verifier's feedback check and the router's bounded
+            # automatic follow-up decision.
+            "feedback": parent.inputs.get("feedback"),
+            "prior_status": parent.inputs.get("prior_status"),
+            "auto_round": int(outputs.get("auto_round")
+                              or parent.inputs.get("auto_round") or 0),
+            "auto_rounds_max": int(outputs.get("auto_rounds_max")
+                                   or parent.inputs.get("auto_rounds_max") or 0),
+        },
+    )]
 
 
 def _swarm_terminal_session_actions(
@@ -1255,6 +1407,22 @@ def _swarm_terminal_session_actions(
     Mirrors :func:`_verify_terminal_session_actions`.
     """
     outputs = completed.outputs or {}
+    if completed.kind is TaskKind.SWARM_REVISE:
+        # A revision that changed nothing (feedback it could not map to a
+        # file) leaves the build exactly as verified before: restore the prior
+        # verdict and surface WHY on the task so the user can rephrase.
+        prior = _status_from_value(
+            str(completed.inputs.get("prior_status") or ""),
+            SessionStatus.COMPLETED)
+        actions: List[RouterAction] = []
+        reason = str(outputs.get("reason") or outputs.get("note") or "").strip()
+        if reason:
+            actions.append(UpdateTaskStatus(
+                task_id=completed.task_id, status=completed.status,
+                error=reason))
+        actions.append(UpdateSessionStatus(session_id=completed.session_id,
+                                           status=prior))
+        return actions
     if completed.kind is TaskKind.SWARM_TECH_LEAD:
         green = False
     elif completed.kind is TaskKind.SWARM_VERIFY:
@@ -1262,7 +1430,7 @@ def _swarm_terminal_session_actions(
     else:
         green = not (outputs.get("failed_paths") or [])
     status = SessionStatus.COMPLETED if green else SessionStatus.FAILED
-    actions: List[RouterAction] = []
+    actions = []
     # On a not-green terminal, stamp the terminal task with the run's concrete
     # summary ("partial build: built N/M files; tests failed: <names>") so the
     # CLI epilogue and the live dashboard show what actually happened and what
@@ -1310,6 +1478,7 @@ TASK_SUCCESSOR = {
     TaskKind.SWARM_TECH_LEAD: _swarm_tech_lead_to_successors,
     TaskKind.SWARM_DEVELOPER: _swarm_developer_to_successors,
     TaskKind.SWARM_VERIFY: _swarm_verify_to_successors,
+    TaskKind.SWARM_REVISE: _swarm_revise_to_successors,
 }
 
 
@@ -1374,6 +1543,26 @@ class Router:
         pending_ask = _first_pending_ask(tasks)
         if pending_ask is not None:
             return plan
+        # Feedback loop: a message on a SWARM session that already holds a
+        # build is a *revision* of that build, not a fresh objective. The user
+        # reviewed the app and asked for a change -> SWARM_REVISE localizes
+        # the feedback to the exact planned files, applies it and chains to
+        # SWARM_VERIFY. A terminal (COMPLETED/FAILED) session is reopened. A
+        # build still mid-chain is never forked: the caller sees an empty plan
+        # and reports "busy". A pure question still routes to investigation.
+        if session.mode is SessionMode.SWARM:
+            build = latest_build(tasks)
+            if build is not None:
+                if build.in_flight:
+                    return plan
+                if is_change_request(message):
+                    plan.actions.append(CreateTask(
+                        _make_revise(session, message, build)))
+                    if session.status is not SessionStatus.ACTIVE:
+                        plan.actions.append(UpdateSessionStatus(
+                            session_id=session.session_id,
+                            status=SessionStatus.ACTIVE))
+                    return plan
         plan.actions.append(CreateTask(_make_root(session, message)))
         return plan
 
@@ -1426,7 +1615,8 @@ class Router:
                 _preverify_gate_terminal_actions(completed))
         if (completed.kind in (TaskKind.SWARM_TECH_LEAD,
                                TaskKind.SWARM_DEVELOPER,
-                               TaskKind.SWARM_VERIFY)
+                               TaskKind.SWARM_VERIFY,
+                               TaskKind.SWARM_REVISE)
                 and not children):
             plan.actions.extend(
                 _swarm_terminal_session_actions(completed))
@@ -1480,11 +1670,17 @@ class Router:
             return plan
         # A swarm executor that crashed or errored has no automated recovery;
         # end the session FAILED so it reaches a terminal status instead of
-        # hanging in ``active`` with a dead leaf (mirrors greenfield).
+        # hanging in ``active`` with a dead leaf (mirrors greenfield). A crashed
+        # *revision* did not destroy the build it was asked to tweak, so the
+        # session goes back to the verdict it had before the feedback.
         if session.mode is SessionMode.SWARM:
+            status = SessionStatus.FAILED
+            if failed.kind is TaskKind.SWARM_REVISE:
+                status = _status_from_value(
+                    str(failed.inputs.get("prior_status") or ""),
+                    SessionStatus.FAILED)
             plan.actions.append(UpdateSessionStatus(
-                session_id=session.session_id,
-                status=SessionStatus.FAILED))
+                session_id=session.session_id, status=status))
             return plan
         if session.mode is not SessionMode.GREENFIELD:
             return plan

@@ -114,12 +114,20 @@ def provider_kwargs(state: Any) -> Dict[str, Any]:
     A saved profile takes precedence (``use_profile``); otherwise the raw
     kind/model/base_url from the dashboard are forwarded and the handler's
     :func:`build_provider` resolves any API key from the environment.
+
+    ``model`` is forwarded on the profile path too, on purpose: ``state.model``
+    is the profile's own model unless ``--model`` (``_state_from_args``) or
+    ``/model`` replaced it, and the factory keeps the profile's model for an
+    equal or empty value, so this is how ``--profile x --model y`` reaches the
+    provider instead of being a silent no-op.
     """
     use_profile = bool(getattr(state, "profile_name", None))
     return {
         "use_profile": use_profile,
         "profile_name": getattr(state, "profile_name", None),
         "kind": state.provider_kind,
+        # On the profile path: the --model override, or the profile's own
+        # model (which the factory treats as "no override").
         "model": state.model,
         "base_url": state.base_url,
         "api_key": None,
@@ -264,7 +272,11 @@ def agent_events(state: Any, text: str, *, index_dir: Optional[str] = None,
     if session is not None and session.status in (SessionStatus.COMPLETED,
                                                   SessionStatus.FAILED,
                                                   SessionStatus.ABANDONED):
-        session = None
+        # A finished SWARM build stays open for feedback: the message becomes
+        # a revision of that build (the router reopens the session) instead
+        # of starting an unrelated new session. Anything else is closed.
+        if _revisable_build(store, session) is None:
+            session = None
 
     if session is None:
         state.pending_ask = None
@@ -287,10 +299,49 @@ def agent_events(state: Any, text: str, *, index_dir: Optional[str] = None,
             if not ok:
                 return
         else:
-            runner.post_message(session_id=session.session_id, message=text)
+            plan = runner.post_message(session_id=session.session_id,
+                                       message=text)
+            if not plan.actions and _swarm_busy(store, session):
+                yield "error", {"message": (
+                    "this build is still running; wait for it to finish "
+                    "(or stop it) before sending feedback")}
+                return
+            yield "status", {"message": _message_status(store, session)}
 
     yield from _drive_session(state, runner, session.session_id, deps,
                               auto=auto, cancel_event=cancel_event)
+
+
+def _revisable_build(store: Any, session: Any):
+    """The finished swarm build a follow-up message would revise, else ``None``."""
+    from cgx.session.models import SessionMode
+    from cgx.session.revise import latest_build
+
+    if session.mode is not SessionMode.SWARM:
+        return None
+    try:
+        return latest_build(store.list_tasks(session.session_id))
+    except Exception:  # pragma: no cover - defensive
+        return None
+
+
+def _swarm_busy(store: Any, session: Any) -> bool:
+    """True when the swarm session has a build still mid-chain."""
+    build = _revisable_build(store, session)
+    return bool(build is not None and build.in_flight)
+
+
+def _message_status(store: Any, session: Any) -> str:
+    """One status line saying how the follow-up message was routed."""
+    from cgx.session.models import TaskKind, TaskNodeStatus
+
+    ready = [t for t in store.list_tasks(session.session_id)
+             if t.status is TaskNodeStatus.READY]
+    if any(t.kind is TaskKind.SWARM_REVISE for t in ready):
+        n = max((int((t.inputs or {}).get("revision_index") or 0) for t in ready
+                 if t.kind is TaskKind.SWARM_REVISE), default=0)
+        return f"revising the build (feedback #{n}): locating the files to change…"
+    return "follow-up posted"
 
 
 def decide_events(state: Any, task_id: str, chosen: Dict[str, Any], *,
@@ -385,6 +436,10 @@ def _drive_session(state: Any, runner: Any, sid: str, deps: Any, *,
     bus_q: "queue_mod.Queue[Any]" = queue_mod.Queue()
     unsubscribe = get_default_bus().subscribe(
         "*", lambda ev: bus_q.put(ev) if ev.session_id == sid else None)
+    # A DONE task is re-saved when the router stamps a summary/error on it, and
+    # the store emits TASK_COMPLETED on every save of a DONE task; render each
+    # completion once.
+    seen_done: set = set()
     # Snapshot the session's LLM_CALL facts up front so the epilogue records
     # only this turn's calls as a kind="agent" activity run (Subsystem C),
     # mirroring the webui drain. Best-effort; never affects the drive.
@@ -414,14 +469,14 @@ def _drive_session(state: Any, runner: Any, sid: str, deps: Any, *,
                     ev = bus_q.get(timeout=0.2)
                 except queue_mod.Empty:
                     continue
-                yield from _bus_to_tui(ev)
+                yield from _bus_to_tui(ev, seen_done)
             worker.join()
             while True:
                 try:
                     ev = bus_q.get_nowait()
                 except queue_mod.Empty:
                     break
-                yield from _bus_to_tui(ev)
+                yield from _bus_to_tui(ev, seen_done)
             if "error" in holder:
                 exc = holder["error"]
                 yield "error", {"message": f"{type(exc).__name__}: {exc}"}
@@ -482,8 +537,13 @@ def _record_agent_turn(store: Any, sid: str, seen_before: set,
         pass
 
 
-def _bus_to_tui(ev: Any) -> Iterator[Event]:
-    """Translate a session bus event into the dashboard's vocabulary."""
+def _bus_to_tui(ev: Any, seen_done: Optional[set] = None) -> Iterator[Event]:
+    """Translate a session bus event into the dashboard's vocabulary.
+
+    ``seen_done`` (optional) de-duplicates completion renders per task id: the
+    store emits ``TASK_COMPLETED`` on every save of a DONE task, and the router
+    re-saves a finished task to stamp its summary or reason on it.
+    """
     from cgx.session.events import EventType
 
     p = ev.payload or {}
@@ -494,7 +554,24 @@ def _bus_to_tui(ev: Any) -> Iterator[Event]:
         if str(p.get("status") or "") == "in_progress":
             yield "task_start", {"name": p.get("name"), "kind": kind}
     elif ev.type is EventType.TASK_COMPLETED:
+        tid = str(p.get("task_id") or "")
+        if seen_done is not None and tid:
+            if tid in seen_done:
+                return
+            seen_done.add(tid)
         yield "task_done", {"kind": kind}
+        outputs = p.get("outputs") or {}
+        if kind == "swarm_revise":
+            yield "revision", {
+                "changed": list(outputs.get("changed") or []),
+                "unchanged": list(outputs.get("unchanged") or []),
+                "failed": list(outputs.get("failed_paths") or []),
+                "note": outputs.get("note") or outputs.get("reason") or "",
+                "index": outputs.get("revision_index"),
+            }
+        elif kind == "swarm_verify" and outputs.get("summary"):
+            yield "verdict", {"summary": outputs.get("summary"),
+                              "ok": bool(outputs.get("verify_ok"))}
     elif ev.type is EventType.TASK_FAILED:
         yield "task_failed", {"kind": kind, "error": p.get("error")}
     elif ev.type is EventType.TASK_OUTPUT_PARTIAL:
@@ -799,6 +876,27 @@ def map_event(etype: str, payload: Optional[Dict[str, Any]], *,
         return Render("status", f"working…{secs}")
     if etype == "task_done":
         return Render("line", c("  ✔ ", "green") + str(payload.get("kind") or "done"))
+    if etype == "revision":
+        changed = [str(x) for x in (payload.get("changed") or [])]
+        unchanged = [str(x) for x in (payload.get("unchanged") or [])]
+        failed = [str(x) for x in (payload.get("failed") or [])]
+        idx = payload.get("index")
+        head = c(f"  ✎ revision{f' #{idx}' if idx else ''}: ", "cyan")
+        if changed:
+            body = "changed " + ", ".join(changed)
+        else:
+            body = "nothing changed"
+        if unchanged:
+            body += ansi.dim(f"  (unchanged: {', '.join(unchanged)})", enabled=enabled)
+        if failed:
+            body += c(f"  (failed: {', '.join(failed)})", "red")
+        note = str(payload.get("note") or "").strip()
+        tail = ("\n      " + note) if note else ""
+        return Render("line", head + body + tail)
+    if etype == "verdict":
+        ok = bool(payload.get("ok"))
+        return Render("line", (c("  ✔ ", "green") if ok else c("  ✖ ", "red"))
+                      + str(payload.get("summary") or ""))
     if etype == "task_failed":
         return Render("line", c("  ✖ ", "red")
                       + str(payload.get("error") or payload.get("kind") or "failed"))

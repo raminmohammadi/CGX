@@ -48,7 +48,7 @@ from cgx.session.tasks.swarm_log import swarm_beat
 from cgx.session.tasks.swarm_plan import plan_specs
 from cgx.session.tasks.swarm_tools import edit_file
 
-_MAX_VERIFY_ROUNDS = 2
+_MAX_VERIFY_ROUNDS = 3
 # Failure-driven repair re-runs against the *current* red suite each round, so
 # a defect unmasked only after an earlier fix (a logic bug hidden behind an
 # import error that aborted collection) earns its own targeted repair rather
@@ -210,6 +210,17 @@ def _structural_scan(
     * ``contract`` -- soft contract-compliance advisories (also non-gating).
     """
     gaps = _coverage_gaps(paths, contents)
+    # JS/TS coverage: a frontend file that does not parse, or whose body is a
+    # leaked <call_tool> tag, is as missing as an unparseable Python module --
+    # previously only the real build saw it, and the repair loop then had to
+    # localise the diagnostic. Treat it as a coverage gap -> regenerate.
+    try:
+        js_broken = _js_broken_files(contents)
+        if js_broken:
+            swarm_beat(root, "verify", "js_broken", files=js_broken[:8])
+            gaps = list(gaps) + [p for p in js_broken if p not in gaps]
+    except Exception as e:  # pragma: no cover - the gate is best-effort
+        swarm_beat(root, "verify", "gate_error", gate="js_broken", error=repr(e))
     try:
         symbol_w = cross_check_first_party_imports(contents)
     except Exception as e:  # pragma: no cover - the gate is best-effort
@@ -234,6 +245,21 @@ def _structural_scan(
         swarm_beat(root, "verify", "gate_error", gate="cross_ref",
                    error=repr(e))
         crossref_w = []
+    # JS/TS symbol gate (the Python first-party-symbol gate's twin): a named /
+    # default import no dependency exports, a React or router identifier used
+    # but never imported, a Router nested inside the entry's BrowserRouter.
+    # Each row names the importer to regenerate and carries the real exports
+    # as an additive directive.
+    try:
+        from cgx.session.js_symbols import js_symbol_breaks
+        js_w = js_symbol_breaks(contents, paths)
+        if js_w:
+            swarm_beat(root, "verify", "js_symbols",
+                       files=sorted({w["file"] for w in js_w})[:8],
+                       reasons=[w["reason"][:120] for w in js_w[:4]])
+    except Exception as e:  # pragma: no cover - the gate is best-effort
+        swarm_beat(root, "verify", "gate_error", gate="js_symbols", error=repr(e))
+        js_w = []
     try:
         phantom_3p_w = _check_phantom_third_party_imports(paths, contents, contracts.get("third_party_dependencies") or [], root)
     except Exception as e:  # pragma: no cover - the gate is best-effort
@@ -287,7 +313,7 @@ def _structural_scan(
         swarm_beat(root, "verify", "gate_error", gate="skill_validate",
                    error=repr(e))
     import_breaks = _merge_import_warnings(symbol_w, resolve_w, crossref_w,
-                                           cycle_w, skill_w)
+                                           js_w, cycle_w, skill_w)
     try:
         contract = check_contract_compliance(contents, contracts)
     except Exception as e:  # pragma: no cover - the gate is best-effort
@@ -295,6 +321,36 @@ def _structural_scan(
                    error=repr(e))
         contract = []
     return gaps, import_breaks, phantom_3p_w, contract
+
+
+def _gating(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The import rows that may fail the verdict (``gating`` defaults to True)."""
+    return [w for w in rows if w.get("gating", True)]
+
+
+def _js_broken_files(contents: Dict[str, str]) -> List[str]:
+    """JS/TS files that cannot be the real file: unparseable or a tool-call leak."""
+    out: List[str] = []
+    try:
+        from cgx.answer.engine import _JS_TS_GRAMMAR_BY_EXT
+        from cgx.codegen.validate import validate_js_ts_source
+    except ImportError:  # pragma: no cover - grammar optional
+        _JS_TS_GRAMMAR_BY_EXT, validate_js_ts_source = {}, None  # type: ignore[assignment]
+    for path, content in (contents or {}).items():
+        ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+        if ext not in ("js", "jsx", "ts", "tsx", "mjs", "cjs", "vue"):
+            continue
+        body = content or ""
+        if "<call_tool" in body or "<tool_response" in body or not body.strip():
+            out.append(path)
+            continue
+        if validate_js_ts_source is not None and ext in _JS_TS_GRAMMAR_BY_EXT:
+            try:
+                if not validate_js_ts_source(path, body, _JS_TS_GRAMMAR_BY_EXT[ext]).ok:
+                    out.append(path)
+            except Exception:  # pragma: no cover
+                continue
+    return out
 
 
 def _regen_targets(gaps: List[str],
@@ -353,16 +409,52 @@ def _regen_directives(import_warnings: List[Dict[str, Any]]) -> Dict[str, str]:
     return out
 
 
+#: How much of a user-revised file is quoted back when the verifier has to
+#: regenerate it -- the whole file, so the applied feedback survives the fix.
+_REVISED_EXISTING_LIMIT = 16_000
+
+
+def _revision_notes(plan: Dict[str, Any]) -> Dict[str, List[str]]:
+    """``{path: [user asks already applied to it]}`` from the plan's revision history.
+
+    A file the user had revised ("make the top bar full width") must not be
+    regenerated from its original spec when a later gate implicates it -- that
+    would silently undo the feedback. The notes are threaded into every
+    regeneration so the fix is made ON the revised body and preserves the ask.
+    """
+    out: Dict[str, List[str]] = {}
+    for rev in plan.get("revisions") or []:
+        if not isinstance(rev, dict):
+            continue
+        instructions = rev.get("instructions") or {}
+        feedback = str(rev.get("feedback") or "").strip()
+        for path in rev.get("changed") or []:
+            asks = [str(x) for x in (instructions.get(path) or []) if str(x).strip()]
+            if not asks and feedback:
+                asks = [feedback]
+            for a in asks:
+                if a not in out.setdefault(str(path), []):
+                    out[str(path)].append(a)
+    return out
+
+
 def _regenerate(targets: List[str], specs: Dict[str, Any],
                 contracts: Dict[str, Any], goal: str, root: str,
                 provider: Any, all_paths: List[str],
                 skills: Optional[List[str]] = None,
-                directives: Optional[Dict[str, str]] = None) -> List[str]:
+                directives: Optional[Dict[str, str]] = None,
+                design: Optional[Dict[str, Any]] = None,
+                revisions: Optional[Dict[str, List[str]]] = None) -> List[str]:
     """Re-run the generation ladder on ``targets``; return the still-failing.
 
     ``directives`` optionally appends a targeted, additive instruction to a
-    file's description (from a skill verdict or import break), so a regen ADDS
-    the missing definition instead of re-emitting the same shape.
+    file's description (from a skill verdict, import break, design check or
+    design critic), so a regen ADDS the missing definition instead of
+    re-emitting the same shape. ``design`` is the build's design brief so a
+    regenerated UI file keeps its product/theme guidance. ``revisions`` maps a
+    path to the user asks already applied to it (see :func:`_revision_notes`):
+    such a file is regenerated as a *modification of its current body* with
+    those asks spelled out as must-preserve, never from the bare spec.
     """
     still_bad: List[str] = []
     for path in targets:
@@ -372,11 +464,18 @@ def _regenerate(targets: List[str], specs: Dict[str, Any],
         if extra:
             desc = (desc + "\n\nREQUIRED FIX (additive -- do not remove existing "
                     "code): " + extra).strip()
+        asks = (revisions or {}).get(path) or []
+        if asks:
+            desc = (desc + "\n\nUSER FEEDBACK ALREADY APPLIED TO THIS FILE -- you MUST "
+                    "preserve these changes while making the fix above:\n"
+                    + "\n".join(f"- {a}" for a in asks[:6])).strip()
         outcome = generate_file(
             path=path, description=desc,
             depends_on=list(spec.get("depends_on") or []), contracts=contracts,
             goal=goal, root=root, provider=provider, layer=path,
-            manifest_paths=all_paths, log_root=root, skills=skills)
+            manifest_paths=all_paths, log_root=root, skills=skills,
+            design=design, modify_existing=bool(asks),
+            existing_limit=_REVISED_EXISTING_LIMIT if asks else None)
         if outcome.ok:
             edit_file(path, outcome.content, root)
         else:
@@ -737,6 +836,109 @@ def _dynamic_repair(env: Dict[str, Any], localized: List[str],
     return written
 
 
+def _resolve_design(plan: Dict[str, Any], goal: str, skills: List[str],
+                    paths: List[str]) -> Optional[Dict[str, Any]]:
+    """The build's design brief: the persisted one, else derived from the goal.
+
+    ``None`` for a non-UI build (or when the design layer is unavailable), so
+    every design step below is a no-op for backend-only projects.
+    """
+    design = plan.get("design")
+    if isinstance(design, dict) and design.get("applies"):
+        return design
+    if not goal:
+        return None
+    try:
+        from cgx.design import build_brief
+        brief = build_brief(goal, skills, plan_paths=paths)
+        return brief.to_dict() if brief.applies else None
+    except Exception:  # pragma: no cover - design layer must never break verify
+        return None
+
+
+def _ensure_design_tokens(design: Optional[Dict[str, Any]], paths: List[str],
+                          root: str) -> Optional[str]:
+    """Write the deterministic tokens stylesheet if the tree lacks it.
+
+    The design system is a guarantee: if the plan dropped the tokens file (or
+    the Developer failed it), CGX writes it itself -- no model call -- and
+    adds it to the verified path set so the checks and the summary see it.
+    Returns the path written, else ``None``.
+    """
+    if not design or not design.get("applies"):
+        return None
+    tokens_path = str(design.get("tokens_path") or "")
+    if not tokens_path:
+        return None
+    full = os.path.join(root, tokens_path)
+    if os.path.isfile(full) and os.path.getsize(full) > 0:
+        if tokens_path not in paths:
+            paths.append(tokens_path)
+        return None
+    try:
+        from cgx.design import tokens_content
+        edit_file(tokens_path, tokens_content(design), root)
+    except Exception as e:  # pragma: no cover - best-effort
+        swarm_beat(root, "verify", "design_tokens_error", error=repr(e))
+        return None
+    if tokens_path not in paths:
+        paths.append(tokens_path)
+    swarm_beat(root, "verify", "autofix", file=tokens_path, method="design-tokens")
+    return tokens_path
+
+
+def _design_scan(design: Optional[Dict[str, Any]], contents: Dict[str, str],
+                 root: str) -> List[Any]:
+    """Run the deterministic UI-quality checks; ``[]`` when not a UI build."""
+    if not design or not design.get("applies"):
+        return []
+    try:
+        from cgx.design import check_tree
+        issues = check_tree(design, contents)
+    except Exception as e:  # pragma: no cover - checks are best-effort
+        swarm_beat(root, "verify", "gate_error", gate="design", error=repr(e))
+        return []
+    if issues:
+        swarm_beat(root, "verify", "design_check",
+                   fatal=sum(1 for i in issues if i.severity == "fatal"),
+                   warnings=sum(1 for i in issues if i.severity != "fatal"),
+                   ids=sorted({i.id for i in issues})[:12])
+    return issues
+
+
+def _design_rows(issues: List[Any]) -> List[Dict[str, Any]]:
+    """Fatal design issues in the regen-target row shape (``define_in`` + ``directive``)."""
+    try:
+        from cgx.design import fatal_issues, issues_as_warnings
+        return issues_as_warnings(fatal_issues(issues))
+    except Exception:  # pragma: no cover
+        return []
+
+
+def _run_design_critic(design: Optional[Dict[str, Any]], paths: List[str],
+                       root: str, provider: Any) -> Dict[str, str]:
+    """One bounded LLM design review -> ``{planned path: fix directive}``."""
+    if not design or not design.get("applies") or provider is None:
+        return {}
+    try:
+        from cgx.design import critic_enabled, critique_ui
+        if not critic_enabled():
+            return {}
+        contents = _collect_contents(paths, root)
+        fixes = critique_ui(design, contents, provider)
+    except Exception as e:  # pragma: no cover - the critic is best-effort
+        swarm_beat(root, "verify", "design_critic_error", error=repr(e))
+        return {}
+    # Never regenerate a path the plan does not own.
+    fixes = {p: f for p, f in (fixes or {}).items() if p in paths}
+    if fixes:
+        swarm_beat(root, "verify", "design_critic",
+                   fixes={p: f[:160] for p, f in fixes.items()})
+    else:
+        swarm_beat(root, "verify", "design_critic", fixes={}, verdict="pass")
+    return fixes
+
+
 @register_executor(TaskKind.SWARM_VERIFY)
 def swarm_verify(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     """Verify the generated tree, regenerate broken files, dry-run the env."""
@@ -755,11 +957,22 @@ def swarm_verify(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     project_root = (task.inputs.get("project_root")
                     or plan.get("project_root")
                     or deps.project_root or ".")
+    # The design brief (UI builds only): drives the deterministic UI-quality
+    # checks, the tokens-file guarantee, the design critic and the design gate.
+    design = _resolve_design(plan, goal, skills, paths)
+    # Files the user has revised through the feedback loop, with their asks:
+    # every regeneration below preserves them (see _revision_notes).
+    revision_notes = _revision_notes(plan)
 
     swarm_beat(project_root, "verify", "structural", total=len(paths))
     # Every defect the run encountered, for the Layer-2 post-mortem to learn
     # from (prevention lessons are valuable even for defects that WERE fixed).
     incidents: List[Dict[str, Any]] = []
+    tokens_written = _ensure_design_tokens(design, paths, project_root)
+    if tokens_written:
+        incidents.append({
+            "phase": "autofix", "fixed": True, "files": [tokens_written],
+            "detail": "Design tokens stylesheet was missing; CGX wrote it deterministically."})
     # Layer-1 fast-path FIRST: deterministically fix the mechanical, decidable
     # bugs (Flask double-prefix, ...) with no model call, so the structural scan
     # below sees a cleaner tree and the LLM repair budget is spent only on what
@@ -773,10 +986,17 @@ def swarm_verify(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
                        + ", ".join(autofixed))})
     rounds = 0
     first_scan = True
+    design_issues: List[Any] = []
     while True:
         contents = _collect_contents(paths, project_root)
         gaps, import_w, phantom_w, contract_w = _structural_scan(
             paths, contents, contracts, project_root, skills, goal)
+        # Design-quality checks run beside the structural scan: a FATAL design
+        # defect (no stylesheet import, an unstyled component, a hard-coded
+        # endpoint, no persistence ...) names the file to regenerate and the
+        # additive fix, exactly like an import break does.
+        design_issues = _design_scan(design, contents, project_root)
+        d_rows = _design_rows(design_issues)
         if first_scan:
             first_scan = False
             for w in import_w:
@@ -784,18 +1004,65 @@ def swarm_verify(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
                     "phase": "structural", "fixed": True,  # repaired below (best-effort)
                     "files": [w.get("define_in") or w.get("file") or ""],
                     "detail": str(w.get("reason") or "structural break")})
-        targets = _regen_targets(gaps, import_w, paths)
+            for w in d_rows:
+                incidents.append({
+                    "phase": "design", "fixed": True,  # repaired below (best-effort)
+                    "files": [w.get("define_in") or w.get("file") or ""],
+                    "detail": f"[{w.get('id')}] {w.get('reason') or 'design defect'}"})
+        targets = _regen_targets(gaps, import_w + d_rows, paths)
         if not targets or rounds >= _MAX_VERIFY_ROUNDS:
             break
         rounds += 1
         # A break carries WHERE to fix (define_in) and WHAT to add (directive);
         # regenerate the DEFINER additively (grow models.py to define Order),
         # never the file that merely referenced the missing symbol.
-        directives = _regen_directives(import_w)
+        directives = _regen_directives(import_w + d_rows)
         swarm_beat(project_root, "verify", "regenerate", round=rounds,
-                   targets=targets)
+                   targets=targets,
+                   design=sorted({str(w.get("id")) for w in d_rows})[:8])
         _regenerate(targets, specs, contracts, goal, project_root,
-                    deps.provider, paths, skills, directives=directives)
+                    deps.provider, paths, skills, directives=directives,
+                    design=design, revisions=revision_notes)
+        # A regenerated file can carry a certain, mechanical defect (a hook
+        # used without its import, a dangling stylesheet import): fix those
+        # without a model call before the next scan so the bounded rounds are
+        # spent on defects only a model can fix.
+        _apply_deterministic_repairs(paths, project_root, skills)
+
+    # Design critic (UI builds): one bounded review of the UI files against the
+    # brief -> targeted, additive regenerations. The deterministic checks catch
+    # what is mechanically wrong; the critic catches what is merely weak (a
+    # settings page that is one input, a chat with no composer, no hierarchy).
+    # Runs BEFORE the build/test dry-run so the final build validates its output.
+    critic_fixes = _run_design_critic(design, paths, project_root, deps.provider)
+    if critic_fixes:
+        rounds += 1
+        swarm_beat(project_root, "verify", "regenerate", round=rounds,
+                   targets=list(critic_fixes), source="design_critic")
+        _regenerate(list(critic_fixes), specs, contracts, goal, project_root,
+                    deps.provider, paths, skills, directives=critic_fixes,
+                    design=design, revisions=revision_notes)
+        _apply_deterministic_repairs(paths, project_root, skills)
+        # A regenerated file must still clear the structural + design gates;
+        # one more targeted round if the critic's rewrite introduced a defect.
+        contents = _collect_contents(paths, project_root)
+        gaps, import_w, phantom_w, contract_w = _structural_scan(
+            paths, contents, contracts, project_root, skills, goal)
+        design_issues = _design_scan(design, contents, project_root)
+        d_rows = _design_rows(design_issues)
+        post = _regen_targets(gaps, import_w + d_rows, paths)
+        if post:
+            rounds += 1
+            swarm_beat(project_root, "verify", "regenerate", round=rounds,
+                       targets=post, source="post_critic")
+            _regenerate(post, specs, contracts, goal, project_root,
+                        deps.provider, paths, skills,
+                        directives=_regen_directives(import_w + d_rows),
+                        design=design, revisions=revision_notes)
+            contents = _collect_contents(paths, project_root)
+            gaps, import_w, phantom_w, contract_w = _structural_scan(
+                paths, contents, contracts, project_root, skills, goal)
+            design_issues = _design_scan(design, contents, project_root)
 
     env = _run_env_dryrun(paths, project_root)
     # Only *hard* signals gate the build: missing/unparseable files (gaps) and
@@ -803,7 +1070,9 @@ def swarm_verify(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     # advisory -- a build whose tests + real build actually pass must not be
     # failed because the model under-declared a (working, installed) dependency
     # like ``uvicorn``; a truly hallucinated package fails the real install.
-    structural_ok = not (gaps or import_w)
+    # Prop-contract drift rows (``gating: False``) steer regeneration rounds but
+    # never fail a build the real build + runtime smoke accept.
+    structural_ok = not (gaps or _gating(import_w))
 
     # A structurally-clean tree whose suite is nonetheless red is exactly the
     # case the static gates cannot see: an import that resolves on paper but
@@ -849,7 +1118,8 @@ def swarm_verify(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
                            round=dyn_rounds, targets=st_targets)
                 _regenerate(st_targets, specs, contracts, goal, project_root,
                             deps.provider, paths, skills,
-                            directives=_regen_directives(iw2))
+                            directives=_regen_directives(iw2), design=design,
+                            revisions=revision_notes)
         # Re-read AFTER any escalation write so the repairer sees the current
         # tree (never the pre-escalation bodies -- that would clobber the fix).
         contents = _collect_contents(paths, project_root)
@@ -864,11 +1134,12 @@ def swarm_verify(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
                                    specs, dyn_rounds)
         if not repaired and dyn_targets:
             _regenerate(dyn_targets, specs, contracts, goal, project_root,
-                        deps.provider, paths, skills)
+                        deps.provider, paths, skills, design=design,
+                        revisions=revision_notes)
         contents = _collect_contents(paths, project_root)
         gaps, import_w, phantom_w, contract_w = _structural_scan(
             paths, contents, contracts, project_root, skills, goal)
-        structural_ok = not (gaps or import_w)
+        structural_ok = not (gaps or _gating(import_w))
         env = _run_env_dryrun(paths, project_root)
         # Stop early when a round cannot make progress: nothing to act on (no
         # repair and no regen target), or the failure is byte-for-byte
@@ -896,6 +1167,27 @@ def swarm_verify(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
                 break
         else:
             stall = 0
+
+    # Runtime smoke (UI builds, optional browser): a green build whose routes
+    # render a blank page is NOT a working app. Serve the bundle, load every
+    # route headlessly, and turn an empty root / uncaught error into one
+    # bounded repair round against the route's files before the verdict.
+    smoke = _browser_smoke_and_repair(design, paths, project_root, goal, deps.provider,
+                                      specs, env, skills=skills, revisions=revision_notes)
+    if smoke is not None and smoke.get("rebuilt"):
+        env = smoke["env"]
+        contents = _collect_contents(paths, project_root)
+        gaps, import_w, phantom_w, contract_w = _structural_scan(
+            paths, contents, contracts, project_root, skills, goal)
+        structural_ok = not (gaps or _gating(import_w))
+
+    # Feedback acceptance (revision verifies only): did the change the user asked
+    # for visibly land? A vision model compares the pre-revision screenshots with
+    # the fresh ones against the user's own words. Never gates the build verdict
+    # -- the build may be fine while the ask is not met -- but it is surfaced in
+    # the summary, the report and the revision, and the router may spend one
+    # bounded automatic follow-up revision on a NOT SATISFIED.
+    feedback_check = _check_feedback_addressed(task, deps, smoke, project_root)
 
     tests_red = env.get("outcome") == "failed"
     built = [p for p in paths if p not in gaps]
@@ -932,19 +1224,48 @@ def swarm_verify(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         accept = _run_acceptance(contracts, project_root)
     acceptance_ok = accept.ok if accept is not None else True
 
-    verify_ok = structurally_green and acceptance_ok
+    # Design gate (UI builds): judge the FINAL tree -- the dynamic repair loop
+    # may have rewritten UI files -- and refuse to call an app "verified" while
+    # a fatal design defect remains (an unstyled screen, no stylesheet import,
+    # a hard-coded endpoint). Advisory-only with CGX_DESIGN_GATE=0.
+    design_issues = _design_scan(design, _collect_contents(paths, project_root),
+                                 project_root)
+    design_fatal = [i for i in design_issues if getattr(i, "severity", "") == "fatal"]
+    design_warn = [i for i in design_issues if getattr(i, "severity", "") != "fatal"]
+    try:
+        from cgx.design import gate_enabled as _design_gate_enabled
+        design_gated = _design_gate_enabled()
+    except Exception:  # pragma: no cover
+        design_gated = True
+    design_ok = not design_fatal or not design_gated
+
+    runtime_ok = not (smoke is not None and smoke.get("ran") and not smoke.get("ok"))
+    verify_ok = structurally_green and acceptance_ok and design_ok and runtime_ok
 
     # A human-readable one-liner so a not-green run explains itself concretely
     # ("built N/M files; tests failed: <names>") instead of the UI / CLI showing
     # a bare "session failed". Surfaced on the terminal task by the router
     # (see _swarm_terminal_session_actions) and shown in the dashboard.
     summary = _verify_summary(paths, built, gaps, still_failed, env, verify_ok,
-                              accept)
+                              accept, design_fatal=design_fatal,
+                              design_warnings=design_warn,
+                              design_applies=bool(design), runtime=smoke,
+                              feedback_check=feedback_check)
 
+    if smoke is not None and smoke.get("vision_model"):
+        design_critic_note = {"vision_model": smoke.get("vision_model"),
+                              "vision_fixes": smoke.get("vision_fixes") or {}}
+    else:
+        design_critic_note = None
     content = {
         "work_plan_artifact_id": work_plan_id,
         "project_root": project_root,
         "paths": paths,
+        # Set when this verification follows a feedback revision (the Build
+        # result panel pairs the fresh screenshots with the feedback they answer).
+        "revision_artifact_id": task.inputs.get("revision_artifact_id"),
+        "revision_index": task.inputs.get("revision_index"),
+        "feedback_check": feedback_check,
         "coverage_gaps": gaps,
         "import_warnings": import_w,
         "phantom_third_party": phantom_w,   # advisory (non-gating)
@@ -957,6 +1278,18 @@ def swarm_verify(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         "acceptance": ({"outcome": accept.outcome, "reason": accept.reason,
                         "failures": accept.failures}
                        if accept is not None else None),
+        "design": ({"applies": True,
+                    "archetype": design.get("archetype"),
+                    "theme": design.get("theme"),
+                    "framework": design.get("framework"),
+                    "tokens_written": tokens_written,
+                    "critic_fixes": critic_fixes,
+                    "issues": [i.as_dict() for i in design_issues],
+                    "fatal_remaining": len(design_fatal),
+                    "gated": design_gated}
+                   if design else {"applies": False}),
+        "runtime": (smoke.get("result") if smoke else None),
+        "vision": design_critic_note,
         "verify_ok": verify_ok,
         "summary": summary,
     }
@@ -965,7 +1298,8 @@ def swarm_verify(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
         kind=ArtifactKind.SWARM_VERIFY_REPORT, content=content)
     swarm_beat(project_root, "verify", "report", ok=verify_ok,
                gaps=len(gaps), imports=len(import_w),
-               contracts=len(contract_w), tests=env.get("outcome"))
+               contracts=len(contract_w), tests=env.get("outcome"),
+               design_fatal=len(design_fatal), design_warnings=len(design_warn))
 
     # LAYER 2 -- learn from this run. Record what stayed broken as an unresolved
     # incident, then run ONE bounded post-mortem (gated by CGX_SWARM_LEARNING)
@@ -977,6 +1311,14 @@ def swarm_verify(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             "phase": "unresolved", "fixed": False, "files": still_failed,
             "signature": sorted(_failure_signature(str(env.get("output") or ""))),
             "detail": "Run did not reach green: " + summary})
+    for i in design_fatal:
+        incidents.append({
+            "phase": "design", "fixed": False, "files": [i.regen_file or i.file],
+            "detail": f"[{i.id}] {i.message}"})
+    if smoke is not None and smoke.get("ran") and not smoke.get("ok"):
+        incidents.append({
+            "phase": "runtime", "fixed": False, "files": list(smoke.get("targets") or []),
+            "detail": "Runtime smoke: " + "; ".join(smoke.get("failures") or [])[:400]})
     if incidents:
         try:
             from cgx.learning.postmortem import run_postmortem
@@ -990,14 +1332,271 @@ def swarm_verify(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
                            lesson=r["lesson"][:160])
         except Exception as e:  # pragma: no cover - learning is best-effort
             swarm_beat(project_root, "verify", "learn_error", error=repr(e))
-    return ExecutorResult(
-        artifact=artifact,
-        outputs={"verify_ok": verify_ok,
-                 "verify_report_artifact_id": artifact.artifact_id,
-                 "coverage_gaps": gaps,
-                 "failed_paths": still_failed,
-                 "summary": summary,
-                 "project_root": project_root})
+    outputs: Dict[str, Any] = {
+        "verify_ok": verify_ok,
+        "verify_report_artifact_id": artifact.artifact_id,
+        "coverage_gaps": gaps,
+        "failed_paths": still_failed,
+        "summary": summary,
+        "project_root": project_root,
+        "work_plan_artifact_id": work_plan_id,
+        "goal": goal,
+    }
+    if task.inputs.get("revision_artifact_id"):
+        # Threaded so the pure router can decide on a bounded automatic
+        # follow-up revision without reading artifacts.
+        outputs.update({
+            "revision_index": task.inputs.get("revision_index"),
+            "revision_artifact_id": task.inputs.get("revision_artifact_id"),
+            "feedback": task.inputs.get("feedback"),
+            "auto_round": int(task.inputs.get("auto_round") or 0),
+            "auto_rounds_max": int(task.inputs.get("auto_rounds_max") or 0),
+            "feedback_satisfied": (feedback_check or {}).get("satisfied") if feedback_check else None,
+            "feedback_evidence": (feedback_check or {}).get("evidence") if feedback_check else "",
+        })
+    return ExecutorResult(artifact=artifact, outputs=outputs)
+
+
+def _check_feedback_addressed(task: TaskNode, deps: ExecutorDeps, smoke: Optional[Dict[str, Any]],
+                              root: str) -> Optional[Dict[str, Any]]:
+    """Vision verdict on the revision's feedback (``None`` when not applicable).
+
+    Applies only to a verify that follows a revision (``revision_artifact_id``
+    set), when the smoke produced screenshots and a vision model resolves. The
+    pre-revision screenshots come from the revision artifact
+    (``before_screenshots``, keyed by route slug); the fresh ones from the smoke
+    result. The verdict is also written onto the revision artifact as
+    ``visual_check`` so the Build result panel shows it beside the feedback.
+    """
+    rev_id = str(task.inputs.get("revision_artifact_id") or "")
+    if not rev_id or deps.store is None or not smoke or not smoke.get("ran"):
+        return None
+    try:
+        rev = deps.store.get_artifact(rev_id)
+    except Exception:  # pragma: no cover - store best-effort
+        rev = None
+    if rev is None or not isinstance(rev.content, dict):
+        return None
+    feedback = str(rev.content.get("feedback") or task.inputs.get("feedback") or "").strip()
+    if not feedback:
+        return None
+    result = smoke.get("result") or {}
+    after: Dict[str, str] = {}
+    for r in (result.get("routes") or []) if isinstance(result, dict) else []:
+        shot = r.get("screenshot")
+        if shot and os.path.isfile(str(shot)):
+            slug = os.path.basename(str(shot))[:-4]
+            after[slug] = str(shot)
+    if not after:
+        return None
+    before = {k: v for k, v in (rev.content.get("before_screenshots") or {}).items()
+              if isinstance(v, str) and os.path.isfile(v)}
+    try:
+        from cgx.design.vision import check_feedback
+        verdict = check_feedback(feedback, before, after, deps.provider)
+    except Exception as e:  # pragma: no cover - vision is best-effort
+        swarm_beat(root, "verify", "feedback_check_error", error=repr(e))
+        return None
+    if verdict is None:
+        swarm_beat(root, "verify", "feedback_check", outcome="skipped")
+        return None
+    swarm_beat(root, "verify", "feedback_check", outcome=verdict.get("verdict"),
+               evidence=str(verdict.get("evidence") or "")[:200], model=verdict.get("model"))
+    try:
+        rev.content["visual_check"] = verdict
+        deps.store.save_artifact(rev)
+    except Exception:  # pragma: no cover - best-effort
+        pass
+    return verdict
+
+
+def _route_component_files(route: str, contents: Dict[str, str],
+                           paths: List[str]) -> List[str]:
+    """Planned files that implement ``route``: the routed component + its imports."""
+    from cgx.session.js_symbols import js_imports, resolve_relative
+    targets: List[str] = []
+    rx = re.compile(r"""<Route\b[^>]*\bpath\s*=\s*['"]""" + re.escape(route)
+                    + r"""['"][^>]*\belement\s*=\s*\{\s*<([A-Z]\w*)""", re.S)
+    for path, src in contents.items():
+        for m in rx.finditer(src or ""):
+            comp = m.group(1)
+            for stmt in js_imports(src):
+                if stmt.default == comp or any(l == comp for _, l in stmt.named):
+                    hit = resolve_relative(stmt.spec, path, paths)
+                    if hit and hit not in targets:
+                        targets.append(hit)
+    # the component's own first-party imports are where a wrong call usually lives
+    for t in list(targets):
+        for stmt in js_imports(contents.get(t, "")):
+            hit = resolve_relative(stmt.spec, t, paths)
+            if hit and hit not in targets and hit.lower().endswith((".js", ".jsx", ".ts", ".tsx")):
+                targets.append(hit)
+    return targets
+
+
+def _vision_round(design: Dict[str, Any], smoke: Any, paths: List[str], root: str,
+                  goal: str, provider: Any, specs: Dict[str, Any],
+                  skills: Optional[List[str]] = None,
+                  revisions: Optional[Dict[str, List[str]]] = None) -> Optional[Dict[str, Any]]:
+    """One bounded screenshot review -> targeted regenerations -> rebuild -> re-smoke."""
+    try:
+        from cgx.codegen.browser_smoke import run_browser_smoke
+        from cgx.design.prompts import file_kind
+        from cgx.design.vision import critique_screenshots, resolve_vision_model
+    except Exception:  # pragma: no cover
+        return None
+    model = resolve_vision_model(provider)
+    if not model:
+        return None
+    shots = {r.route: r.screenshot for r in smoke.results if r.screenshot}
+    ui_files = [p for p in paths if file_kind(design, p) in ("component", "app", "stylesheet", "html")]
+    fixes = critique_screenshots(design, shots, ui_files, provider, model=model)
+    fixes = {p: f for p, f in fixes.items() if p in paths}
+    swarm_beat(root, "verify", "vision_critic", model=model[1],
+               fixes={p: f[:160] for p, f in fixes.items()} or {}, verdict="pass" if not fixes else "fixes")
+    if not fixes:
+        return {"vision_model": model[1], "vision_fixes": {}}
+    _regenerate(list(fixes), specs, {}, goal, root, provider, paths, skills,
+                directives=fixes, design=design, revisions=revisions)
+    _apply_deterministic_repairs(paths, root, skills or [str(design.get("framework") or "react")])
+    env2 = _run_env_dryrun(paths, root)
+    result: Dict[str, Any] = {"vision_model": model[1], "vision_fixes": fixes, "rebuilt": True, "env": env2}
+    if env2.get("outcome") == "passed":
+        try:
+            smoke2 = run_browser_smoke(root, [r.route for r in smoke.results],
+                                       ui_root=str(design.get("app_root") or ""))
+        except Exception:  # pragma: no cover
+            smoke2 = None
+        if smoke2 is not None and smoke2.ran:
+            failures2 = smoke2.failures()
+            swarm_beat(root, "verify", "runtime_smoke", outcome="passed" if not failures2 else "failed",
+                       routes=[r.route for r in smoke2.results], after="vision",
+                       blank=[r.route for r in failures2 if not r.mounted],
+                       errors=[e for r in failures2 for e in r.errors][:4])
+            result["result"] = smoke2.as_dict()
+            result["ok"] = not failures2
+            result["failures"] = [f"{r.route}: {'blank' if not r.mounted else 'errors'}" for r in failures2]
+            return result
+    result["ok"] = False
+    result["failures"] = ["build or smoke failed after the vision round"]
+    return result
+
+
+def _browser_smoke_and_repair(design: Optional[Dict[str, Any]], paths: List[str],
+                              root: str, goal: str, provider: Any,
+                              specs: Dict[str, Any], env: Dict[str, Any],
+                              skills: Optional[List[str]] = None,
+                              revisions: Optional[Dict[str, List[str]]] = None
+                              ) -> Optional[Dict[str, Any]]:
+    """Load the built app's routes in a headless browser; repair a blank route once.
+
+    Returns ``None`` when not applicable (non-UI build, red build, no bundle),
+    else ``{ran, ok, result, failures, targets, rebuilt, env}``.
+    """
+    if not design or not design.get("applies") or design.get("framework") not in ("react", "vue"):
+        return None
+    if env.get("outcome") != "passed":
+        return None
+    try:
+        from cgx.codegen.browser_smoke import (routes_from_sources, run_browser_smoke,
+                                               smoke_enabled)
+    except Exception:  # pragma: no cover
+        return None
+    if not smoke_enabled():
+        return None
+    contents = _collect_contents(paths, root)
+    routes = routes_from_sources(contents)
+    ui_root = str(design.get("app_root") or "")
+    out: Dict[str, Any] = {"ran": False, "ok": True, "result": None, "failures": [],
+                           "targets": [], "rebuilt": False, "env": env}
+    try:
+        smoke = run_browser_smoke(root, routes, ui_root=ui_root)
+    except Exception as e:  # pragma: no cover - smoke is best-effort
+        swarm_beat(root, "verify", "runtime_smoke_error", error=repr(e))
+        return None
+    out["result"] = smoke.as_dict()
+    if not smoke.ran:
+        swarm_beat(root, "verify", "runtime_smoke", outcome="skipped",
+                   reason=smoke.skipped_reason)
+        return out
+    out["ran"] = True
+    failures = smoke.failures()
+    swarm_beat(root, "verify", "runtime_smoke", outcome="passed" if not failures else "failed",
+               routes=[r.route for r in smoke.results],
+               blank=[r.route for r in failures if not r.mounted],
+               errors=[e for r in failures for e in r.errors][:4])
+    if not failures:
+        # Vision critic (optional local vision model): LOOK at the rendered
+        # screens, regenerate what it flags, rebuild, and re-check. Taste never
+        # gates the verdict; the smoke re-check does.
+        vision = _vision_round(design, smoke, paths, root, goal, provider, specs, skills=skills,
+                               revisions=revisions)
+        if vision:
+            out.update(vision)
+        return out
+    # ONE bounded repair round: the failing routes' component files + their
+    # first-party imports, with the console error as the diagnostic.
+    lines = []
+    targets: List[str] = []
+    for r in failures:
+        why = ("rendered an EMPTY page (the app crashed during render)" if not r.mounted
+               else "logged uncaught errors")
+        lines.append(f"- route {r.route}: {why}" + (": " + " | ".join(r.errors[:3]) if r.errors else ""))
+        for t in _route_component_files(r.route, contents, paths):
+            if t not in targets:
+                targets.append(t)
+    # Every route blank = a GLOBAL failure (no router provider, a crashing shell,
+    # a bad mount): the entry, the shell and the HTML entry are the suspects,
+    # not the individual pages.
+    if len(failures) == len(smoke.results) and all(not r.mounted for r in failures):
+        for key in ("entry_path", "app_path", "html_path"):
+            p = str(design.get(key) or "")
+            if p in paths and p not in targets:
+                targets.insert(0, p)
+    if not targets:
+        entry = str(design.get("app_path") or "")
+        targets = [p for p in (entry,) if p in paths]
+    # Keep the round focused: a weak repairer handed ten files rewrites them
+    # all badly; four (global suspects first, then the failing route's files)
+    # is what it can actually fix.
+    targets = targets[:4]
+    out["failures"] = [ln.lstrip("- ") for ln in lines]
+    out["targets"] = targets
+    failure_text = (
+        "RUNTIME SMOKE FAILURE: the production build compiled, but loading it in a browser showed:\n"
+        + "\n".join(lines)
+        + "\n\nA blank page means a component threw during render (a wrong helper call returning "
+        "undefined, a missing import, a prop contract mismatch, a nested <Router>). Fix the "
+        "IMPLEMENTATION in the implicated files so every route renders; keep the design system "
+        "classes and the existing behaviour.")
+    swarm_beat(root, "verify", "runtime_repair", targets=targets)
+    repaired = _dynamic_repair({"output": failure_text}, targets, contents, goal, root,
+                               provider, paths, specs)
+    if not repaired and targets:
+        _regenerate(targets, specs, {}, goal, root, provider, paths, skills,
+                    directives={t: failure_text for t in targets}, design=design,
+                    revisions=revisions)
+    _apply_deterministic_repairs(paths, root, skills or [str(design.get("framework") or "react")])
+    env2 = _run_env_dryrun(paths, root)
+    out["rebuilt"] = True
+    out["env"] = env2
+    if env2.get("outcome") == "passed":
+        try:
+            smoke2 = run_browser_smoke(root, routes, ui_root=ui_root)
+        except Exception:  # pragma: no cover
+            smoke2 = None
+        if smoke2 is not None and smoke2.ran:
+            out["result"] = smoke2.as_dict()
+            failures2 = smoke2.failures()
+            swarm_beat(root, "verify", "runtime_smoke", outcome="passed" if not failures2 else "failed",
+                       routes=[r.route for r in smoke2.results], after="repair",
+                       blank=[r.route for r in failures2 if not r.mounted],
+                       errors=[e for r in failures2 for e in r.errors][:4])
+            out["ok"] = not failures2
+            out["failures"] = [f"{r.route}: {'blank' if not r.mounted else 'errors'}" for r in failures2]
+            return out
+    out["ok"] = False
+    return out
 
 
 def _run_acceptance(contracts: Dict[str, Any], root: str):
@@ -1023,7 +1622,12 @@ def _run_acceptance(contracts: Dict[str, Any], root: str):
 
 def _verify_summary(paths: List[str], built: List[str], gaps: List[str],
                     still_failed: List[str], env: Dict[str, Any],
-                    verify_ok: bool, accept: Any = None) -> str:
+                    verify_ok: bool, accept: Any = None, *,
+                    design_fatal: Optional[List[Any]] = None,
+                    design_warnings: Optional[List[Any]] = None,
+                    design_applies: bool = False,
+                    runtime: Optional[Dict[str, Any]] = None,
+                    feedback_check: Optional[Dict[str, Any]] = None) -> str:
     """A concise, human-readable outcome line for a swarm run.
 
     Distinguishes a green build from a *partial* one (most files built, one
@@ -1054,5 +1658,28 @@ def _verify_summary(paths: List[str], built: List[str], gaps: List[str],
         parts.append(f"acceptance failed: {accept.reason}")
     elif accept is not None and getattr(accept, "outcome", "") == "passed":
         parts.append("acceptance passed")
+    # Design verdict (UI builds only): name the remaining fatal defects by id so
+    # the user sees WHY a styled-looking build was not called verified.
+    if design_applies:
+        if design_fatal:
+            ids = ", ".join(sorted({getattr(i, "id", "?") for i in design_fatal})[:4])
+            parts.append(f"design: {len(design_fatal)} fatal issue(s) ({ids})")
+        else:
+            n_warn = len(design_warnings or [])
+            parts.append("design ok" + (f" ({n_warn} advisory)" if n_warn else ""))
+    if runtime and runtime.get("ran"):
+        res = runtime.get("result") or {}
+        routes = res.get("routes") or []
+        if runtime.get("ok"):
+            parts.append(f"runtime ok ({len(routes)} route{'s' if len(routes) != 1 else ''} render)")
+        else:
+            bad = [r.get("route") for r in routes if not (r.get("mounted") and not r.get("errors"))]
+            parts.append("runtime: " + ", ".join(str(b) for b in bad[:3]) + " blank/crashed")
+    if feedback_check:
+        if feedback_check.get("satisfied") is True:
+            parts.append("feedback visibly addressed")
+        elif feedback_check.get("satisfied") is False:
+            ev = str(feedback_check.get("evidence") or "").strip()
+            parts.append("feedback NOT visibly addressed" + (f" ({ev[:160]})" if ev else ""))
     head = "verified" if verify_ok else "partial build"
     return f"{head}: " + "; ".join(parts)

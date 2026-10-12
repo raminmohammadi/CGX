@@ -16,6 +16,11 @@ import {
   type ProviderKind,
 } from "./providerKinds";
 
+// The Hugging Face router only serves what Inference Providers host, so the
+// preset list is the complete set of routable ids, not a sample of the Hub.
+const HF_PRESETS_HINT =
+  "Only models served by Hugging Face Inference Providers work through the router; any other id can still be typed.";
+
 export function ActiveProviderCard({
   provider,
   setProvider,
@@ -93,7 +98,7 @@ export function ActiveProviderCard({
           </Select>
         </Field>
 
-        <Field label="Model">
+        <Field label="Model" hint={kind === "huggingface" ? HF_PRESETS_HINT : undefined}>
           <div className="flex gap-2">
             <TextInput
               value={provider.model}
@@ -107,9 +112,11 @@ export function ActiveProviderCard({
                   const v = (e.target as any).value;
                   if (v) setProvider({ model: v, use_profile: false });
                 }}
-                className="w-40"
+                className={kind === "huggingface" ? "w-56" : "w-40"}
               >
-                <option value="">presets…</option>
+                <option value="">
+                  {kind === "huggingface" ? `Inference Providers (${models.length})` : "presets…"}
+                </option>
                 {models.map((m) => (
                   <option key={m} value={m}>
                     {m}

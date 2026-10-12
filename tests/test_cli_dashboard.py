@@ -396,3 +396,100 @@ def test_cli_state_from_args_prefers_profile(monkeypatch, tmp_path):
     state = cli_main._state_from_args(args)
     assert state.profile_name == "cloud" and state.provider_kind == "openai"
     assert state.model == "gpt-4o" and state.base_url == "https://api.example"
+
+
+# --- provider resolution: --model must really override a profile -----------
+
+def _profile(**overrides):
+    """A saved-profile stand-in. ``openai-compat`` so no Ollama probe runs
+    (``_ensure_model`` only fills a default for an empty Ollama model)."""
+    from cgx.answer.profiles import Profile
+
+    fields = dict(name="prod", kind="openai-compat", model="gpt-4o",
+                  base_url="https://api.example", temperature=0.2,
+                  num_predict=1024)
+    fields.update(overrides)
+    return Profile(**fields)
+
+
+def test_provider_from_profile_name_model_override(monkeypatch):
+    from cgx.answer import provider_factory
+
+    monkeypatch.setattr(provider_factory, "get_profile", lambda name: _profile())
+    plain = provider_factory.provider_from_profile_name("prod")
+    assert plain.model == "gpt-4o"
+    other = provider_factory.provider_from_profile_name("prod", model="other")
+    # the model is swapped; everything else still comes from the profile
+    assert other.model == "other"
+    assert other.base_url == plain.base_url == "https://api.example"
+    # empty means "the profile's", exactly like a missing --model
+    assert provider_factory.provider_from_profile_name(
+        "prod", model="").model == "gpt-4o"
+
+
+def test_resolve_provider_threads_model_override_on_profile_path(monkeypatch):
+    from types import SimpleNamespace
+
+    from cgx.webui import handlers
+
+    seen: dict = {}
+
+    def fake_from_profile(name, *, model=None):
+        seen.update(name=name, model=model)
+        return SimpleNamespace(model=model or "gpt-4o")
+
+    monkeypatch.setattr(handlers, "provider_from_profile_name", fake_from_profile)
+    common = dict(kind="ollama", base_url="http://localhost:11434",
+                  api_key=None, temperature=0.2, num_predict=1024)
+    handlers._resolve_provider(use_profile=True, profile_name="prod",
+                               model="other", **common)
+    assert seen == {"name": "prod", "model": "other"}
+    # an empty model (dashboard state before any pick) is not an override
+    handlers._resolve_provider(use_profile=True, profile_name="prod",
+                               model="", **common)
+    assert seen["model"] is None
+
+
+class _StubStore:
+    """Stand-in for ``SessionStore``: the ``send`` guard only needs
+    ``get_session`` to find the sid and ``close`` to release the handle."""
+
+    def get_session(self, sid):
+        return object()
+
+    def close(self):
+        return None
+
+
+def _run_session_send(monkeypatch, tmp_path, *extra) -> dict:
+    seen: dict = {}
+
+    def fake_agent_events(state, text, *, index_dir=None, records=None,
+                          auto=False, mode=None, cancel_event=None):
+        seen.update(profile_name=state.profile_name, kind=state.provider_kind,
+                    model=state.model, sid=state.agent_session_id, text=text)
+        yield "session_done", {"status": "completed"}
+
+    monkeypatch.setattr("cgx.answer.profiles.get_profile",
+                        lambda name: _profile())
+    monkeypatch.setattr("cgx.cli.commands.session._open_store",
+                        lambda root: _StubStore())
+    monkeypatch.setattr(ops, "agent_events", fake_agent_events)
+    cli_main.main(["session", "send", "sid1", "make", "it", "blue",
+                   "--project-root", str(tmp_path), "--profile", "prod", *extra])
+    return seen
+
+
+def test_cli_session_send_wires_profile(monkeypatch, tmp_path):
+    seen = _run_session_send(monkeypatch, tmp_path)
+    assert seen["text"] == "make it blue" and seen["sid"] == "sid1"
+    assert seen["profile_name"] == "prod" and seen["kind"] == "openai-compat"
+    # no --model: the turn runs on the profile's own model
+    assert seen["model"] == "gpt-4o"
+
+
+def test_cli_session_send_model_overrides_profile(monkeypatch, tmp_path):
+    seen = _run_session_send(monkeypatch, tmp_path, "--model", "other")
+    # the profile still supplies kind/key/base_url; only the model changes
+    assert seen["profile_name"] == "prod" and seen["kind"] == "openai-compat"
+    assert seen["model"] == "other"

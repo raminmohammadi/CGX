@@ -15,6 +15,11 @@ import {
   type ProviderKind,
 } from "./providerKinds";
 
+// The Hugging Face router only serves what Inference Providers host, so the
+// preset list is the complete set of routable ids, not a sample of the Hub.
+const HF_PRESETS_HINT =
+  "Only models served by Hugging Face Inference Providers work through the router; any other id can still be typed.";
+
 export function ProfileEditModal({
   initial,
   onClose,
@@ -230,7 +235,11 @@ export function ProfileEditModal({
               </Select>
             </Field>
 
-            <Field label="Model" className="col-span-2">
+            <Field
+              label="Model"
+              className="col-span-2"
+              hint={edit.kind === "huggingface" ? HF_PRESETS_HINT : undefined}
+            >
               <div className="flex gap-2">
                 <TextInput
                   value={edit.model}
@@ -253,9 +262,11 @@ export function ProfileEditModal({
                       const v = (e.target as any).value;
                       if (v) setEdit({ ...edit, model: v });
                     }}
-                    className="w-40"
+                    className={edit.kind === "huggingface" ? "w-56" : "w-40"}
                   >
-                    <option value="">presets…</option>
+                    <option value="">
+                      {edit.kind === "huggingface" ? `Inference Providers (${editModels.length})` : "presets…"}
+                    </option>
                     {editModels.map((m) => (
                       <option key={m} value={m}>
                         {m}

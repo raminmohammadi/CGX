@@ -130,6 +130,72 @@ Runs a graded verification ladder over the finished tree.
   bounded repair can't fix; when that happens the session honestly reports
   **FAILED** — it never falsely passes a red suite.
 
+### 4. The Reviser (`SWARM_REVISE`) -- the feedback loop
+
+A build is rarely right the first time. When a swarm build finishes, the
+Agent page shows a **Build result** panel -- the verdict, one screenshot per
+route, an **Open live preview** button that serves the real production bundle
+-- and the composer turns into a feedback box (*Describe what to change* /
+**Revise**). The message does **not** start a new plan:
+
+1. **Localize** the feedback to the exact planned files, deterministically and
+   with reasons: the component / route / screen it names ("top bar",
+   "settings page"), the UI copy it quotes ("the 'Send' button"), the file
+   *role* a concern maps to (visual words → the app stylesheet, connection
+   words → the API client, "remember after reload" → the storage helper,
+   "readme" → `README.md`), the elements it mentions ("textarea", "header"),
+   and the routes the last runtime smoke flagged for a problem report
+   ("the settings page is blank").
+2. **Refine** with one bounded model call that sees the ranked candidates,
+   their exported symbols and the source lines that mention the feedback, and
+   returns a per-file instruction restricted to planned files (deterministic
+   fallback if the model declines or fails).
+3. **Apply** each instruction as a grounded modification of the **whole
+   current file** through the Developer's ladder; a file handed back unchanged
+   is re-asked once, then reported as unchanged -- never counted as done.
+   "Dark mode" / a named theme switches the deterministic tokens stylesheet
+   with no model call.
+4. **Report** a `SWARM_REVISION` artifact: every candidate with score and
+   reasons, every change with instruction, *why this file*, outcome and a
+   diff; the plan keeps a revision history the next round sees.
+5. **Re-verify**: the router chains to `SWARM_VERIFY`, so the revised app is
+   rebuilt, smoke-tested and **re-screenshotted** before you see it -- and a
+   user-revised file is regenerated as a modification that preserves the ask.
+6. **Judge the ask, self-correct once**: with a vision model the verifier
+   compares before/after screenshots against your words ("feedback visibly
+   addressed" / "NOT visibly addressed: ..."); on a miss CGX spends one
+   automatic follow-up revision (`CGX_FEEDBACK_AUTOFIX`, default 1) before
+   handing back.
+
+Feedback that cannot be mapped to any file is reported with the reason (the
+build keeps its verdict) so you can name the screen or element; a pure
+question still routes to investigation; feedback while a build is mid-chain
+is refused (`409` / CLI error) rather than forking the build. Same loop from
+the terminal: `cgx session send <sid> "make the top bar full width"`.
+
+The composer's **Model for the next message** selector lists your saved
+profiles; picking one sets the active provider (workspace-wide, as Settings
+does) so the revision runs on it -- a run already in progress keeps its model,
+and a build still mid-chain answers `409`, so wait or **Stop** first. On the
+CLI, `--profile <name>` (or `--provider --model --base-url`) on `session
+send`/`decide` makes the same per-turn choice.
+
+## Design-aware UI builds
+
+A UI-bearing objective (a chat app, a dashboard, a website, "an app") gets a
+deterministic **design brief** before planning: the product archetype (layout,
+screens, component inventory, checkable UX requirements, integration rules),
+the framework, a contrast-verified theme and the canonical files a real
+frontend ships. The Tech Lead receives it as a binding spec and the plan is
+injected with the design-system files it omitted; the Developer gets per-file
+UI guidance and a **tokens stylesheet CGX writes itself**; the Verifier runs
+deterministic UI-quality checks (no stylesheet, unstyled component, no
+navigation, hard-coded endpoint, no persistence ...), one bounded design-critic
+pass, and gates the verdict on the result. The frontend side is also grounded
+like the Python side now: JS modules' real exports are shown to the Developer,
+and a JS symbol gate regenerates files whose imports name symbols that do not
+exist. See [`docs/design.md`](https://github.com/raminmohammadi/CGX/blob/main/docs/design.md).
+
 ## Tools: one registry, tolerant dispatch
 
 Every swarm role now shares a single **tool registry**
@@ -154,10 +220,13 @@ generation loop changes.
 
 ### MCP tools and human approval
 
-When at least one **MCP server** is configured (`~/.cgx/mcp.json`), the swarm
-also gains `mcp_list_servers`, `mcp_list_tools`, and `mcp_call` (HIGH risk).
-Discovery is lazy so many servers don't flood the prompt, and MCP tools are only
-advertised when a server is actually configured. See **[[Providers and Models]]**.
+When at least one **MCP server** is enabled (`~/.cgx/mcp.json`, normally added
+from the catalog on the MCP page or with `cgx mcp add <id>`), the swarm also
+gains `mcp_list_servers`, `mcp_list_tools`, `mcp_describe_tool` and `mcp_call`
+(HIGH risk), plus a prompt block naming each enabled server and *when* to use
+it. Discovery is lazy and tiered so many servers don't flood the prompt, and
+MCP tools are only advertised when a server is enabled. See
+**[[Providers and Models]]**.
 
 Risky tool calls (code execution, file writes, MCP calls) can be gated behind an
 opt-in **human-in-the-loop approval** step — off by default, enabled with
@@ -170,6 +239,9 @@ Use the `--mode swarm` flag in the CLI:
 
 ```bash
 python -m cgx.cli.main agent --model qwen2.5-coder:7b-instruct --mode swarm "your objective here"
+# review the result (screenshots in <root>/.cgx/screenshots/, or the Agent page's live preview), then:
+cgx session send <sid> "make the top bar span the full width"   # -> revision + re-verify
+cgx session send <sid> "tighten the copy" --profile <name>      # -> same, this turn on a saved profile (--model overrides its model)
 ```
 
 ## Extending the stack matrix

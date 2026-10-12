@@ -84,12 +84,15 @@ class ToolWrapper:
     """
 
     def __init__(self, p, root_dir, *, tools=None, deps=None,
-                 approval_gate=None):
+                 approval_gate=None, target_path=None):
         self.p = p
         self.root = root_dir
         self.tools = tuple(tools) if tools is not None else _dev_tools()
         self.deps = deps
         self.approval_gate = approval_gate
+        # The file being generated: a model that asks for ITS OWN skeleton (a
+        # file that does not exist yet) is told so instead of burning tool turns.
+        self.target_path = (target_path or "").replace("\\", "/").lstrip("./")
 
     def chat(self, messages, **kwargs):
         from cgx.session.tasks.swarm_log import swarm_beat
@@ -99,6 +102,10 @@ class ToolWrapper:
         # imported so the registry is populated even if nothing else pulled it.
         import cgx.session.tasks.swarm_tools  # noqa: F401
 
+        if not self.tools:
+            # Tool-free mode: no protocol text, no loop -- a plain generation.
+            kwargs["force_json"] = kwargs.get("force_json", False)
+            return self.p.chat(messages=messages, **kwargs)
         if messages and messages[0].get("role") == "system":
             if "<call_tool" not in messages[0].get("content", ""):
                 messages[0]["content"] += (
@@ -114,11 +121,20 @@ class ToolWrapper:
                     "it for real.\n"
                     + REGISTRY.describe_for_prompt(self.tools)
                 )
+                if any(t.startswith("mcp_") for t in self.tools):
+                    # Tell the model WHICH servers exist and WHEN each helps;
+                    # a local model never discovers a docs server on its own.
+                    from cgx.session.tasks.swarm_tools import mcp_prompt_block
+                    block = mcp_prompt_block()
+                    if block:
+                        messages[0]["content"] += "\n\n" + block
 
         ctx = ToolContext(root=self.root, deps=self.deps,
                           log_root=self.root,
                           approval_gate=self.approval_gate)
         kwargs["force_json"] = False
+        res: Dict[str, Any] = {}
+        text = ""
         for _ in range(_MAX_TOOL_ITERS):
             res = self.p.chat(messages=messages, **kwargs)
             text = str(res.get("content", ""))
@@ -129,12 +145,28 @@ class ToolWrapper:
             for call in calls:  # honour every requested call, not just the first
                 swarm_beat(self.root, "developer", "tool_call",
                            tool=call.name, args=call.raw_args)
-                out = _truncate(REGISTRY.dispatch(call, ctx),
-                                _TOOL_OUTPUT_LIMIT)
+                asked = str((call.args or {}).get("path") or "").replace("\\", "/").lstrip("./")
+                if (self.target_path and asked == self.target_path
+                        and call.name in ("file_skeleton", "list_symbols")):
+                    out = (f"{asked} is the file you are writing RIGHT NOW -- it does not "
+                           "exist yet, so there is nothing to look up. Write it from the "
+                           "specification, then output the final JSON.")
+                else:
+                    out = _truncate(REGISTRY.dispatch(call, ctx), _TOOL_OUTPUT_LIMIT)
                 messages.append({
                     "role": "user",
                     "content": f"<tool_response name=\"{call.name}\">\n{out}\n"
                                "</tool_response>"})
+        # Tool budget exhausted while the model is still asking for tools: one
+        # final, explicit "no more tools -- emit the file" turn. Without it the
+        # last reply (a bare <call_tool> tag) became the file's content.
+        messages.append({
+            "role": "user",
+            "content": ("TOOL BUDGET EXHAUSTED: no further tool calls are available. "
+                        "Output the final file content NOW in the required JSON format. "
+                        "A <call_tool> tag is NOT file content and will be rejected.")})
+        swarm_beat(self.root, "developer", "tool_budget_exhausted",
+                   file=self.target_path or "")
         return self.p.chat(messages=messages, **kwargs)
 
     def chat_stream(self, *args, **kwargs):
@@ -319,6 +351,9 @@ def _regate_repaired(path: str, content: str, contracts: Dict[str, Any],
     beat then overstated success). Re-gating lets the caller mark the write
     truthfully and hand a still-broken file to VERIFY for regeneration.
     """
+    if "<call_tool" in content or "<tool_response" in content:
+        return (f"Contract compliance failed for {path}: the repaired body contains a "
+                "<call_tool>/<tool_response> tag -- a tool call is not file content")
     if path.endswith(".py"):
         import ast
         try:
@@ -326,6 +361,20 @@ def _regate_repaired(path: str, content: str, contracts: Dict[str, Any],
         except SyntaxError as e:
             return (f"Contract compliance failed for {path}: still a syntax "
                     f"error after repair: {e}")
+    else:
+        # The JS/TS family gets the same re-gate the full-file rung applies:
+        # a "repair" that still does not parse must not be written as success.
+        try:
+            from cgx.answer.engine import _JS_TS_GRAMMAR_BY_EXT
+            from cgx.codegen.validate import validate_js_ts_source
+            ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+            if ext in _JS_TS_GRAMMAR_BY_EXT:
+                diag = validate_js_ts_source(path, content, _JS_TS_GRAMMAR_BY_EXT[ext])
+                if not diag.ok:
+                    return (f"Contract compliance failed for {path}: still a syntax "
+                            f"error after repair: {diag.error}")
+        except ImportError:  # pragma: no cover - grammar optional
+            pass
     return _gate_generated_content(path, content, contracts, manifest_paths, root)
 
 
@@ -334,7 +383,9 @@ def _full_file_attempt(path: str, description: str, depends_on: List[str],
                        provider: Any, layer: str,
                        manifest_paths: Optional[List[str]],
                        skills: Optional[List[str]] = None,
-                       deps: Any = None) -> Any:
+                       deps: Any = None,
+                       design: Optional[Dict[str, Any]] = None,
+                       tools: Optional[tuple] = None) -> Any:
     from cgx.answer.engine import generate_single_scaffold_file
 
     context = _dep_context(depends_on, root)
@@ -348,7 +399,11 @@ def _full_file_attempt(path: str, description: str, depends_on: List[str],
     import_hint = render_import_hints(path, dep_sources)
     try:
         # Advertise query_codebase only when deps carries an index (see _dev_tools).
-        wrapped = ToolWrapper(provider, root, tools=_dev_tools(deps), deps=deps)
+        # ``tools=()`` runs a tool-free attempt: the fallback when the model kept
+        # answering with <call_tool> tags instead of the file.
+        wrapped = ToolWrapper(provider, root,
+                              tools=(_dev_tools(deps) if tools is None else tools),
+                              deps=deps, target_path=path)
         result = generate_single_scaffold_file(
             path, description, wrapped,
             layer=layer,
@@ -360,6 +415,7 @@ def _full_file_attempt(path: str, description: str, depends_on: List[str],
             manifest_paths=manifest_paths,
             import_hint=import_hint,
             project_root=root,
+            design=design,
         )
     except Exception as exc:  # pragma: no cover
         return "", f"{type(exc).__name__}: {exc}"
@@ -445,7 +501,9 @@ def _semantic_repair_fallback(
         f"Code:\n```{lang}\n{content}\n```\n\n"
         "Fix the error (e.g., add missing imports) WITHOUT removing any business "
         f"logic or functions. Output ONLY the fixed code inside a ```{lang} "
-        "block and nothing else."
+        "block and nothing else -- never a <call_tool> tag, never prose. If the "
+        "code shown IS a tool call or is empty, write the complete file from "
+        "scratch to satisfy its stated purpose instead."
     )
 
     try:
@@ -628,8 +686,20 @@ def generate_file(*, path: str, description: str, depends_on: List[str],
                   log_root: Optional[str] = None,
                   skills: Optional[List[str]] = None,
                   deps: Any = None,
-                  modify_existing: bool = False) -> GenerationOutcome:
+                  modify_existing: bool = False,
+                  design: Optional[Dict[str, Any]] = None,
+                  existing_limit: Optional[int] = None) -> GenerationOutcome:
     """Run the full-file -> AST fallback ladder for a single file.
+
+    ``existing_limit`` caps how much of an existing file body is quoted back
+    when ``modify_existing`` is set (default :data:`_DEP_CONTENT_LIMIT`). A
+    *revision* of a finished file passes a much larger cap: the model must see
+    the whole current file to change one thing and preserve the rest.
+
+    ``design`` is the WORK_PLAN's design brief (see :mod:`cgx.design`). The
+    brief's tokens stylesheet is emitted deterministically here -- a curated,
+    contrast-verified design system the model never has to invent -- and every
+    other UI file gets the brief rendered into its generation prompt.
 
     A planned non-source deliverable (``requirements.txt``, ``conftest.py``,
     ``README.md`` and other doc/config files) has no Python symbols to
@@ -642,6 +712,16 @@ def generate_file(*, path: str, description: str, depends_on: List[str],
     the final rung yields is sanitised so a surviving phantom is stripped
     deterministically before the outcome is returned.
     """
+    if design:
+        try:
+            from cgx.design import is_tokens_path, tokens_content
+            if is_tokens_path(design, path):
+                content = tokens_content(design)
+                swarm_beat(log_root, "developer", "non_source", file=path,
+                           method="design-tokens", bytes=len(content))
+                return GenerationOutcome(path, content, True, "template")
+        except Exception:  # pragma: no cover - design layer must not break generation
+            pass
     if _is_non_source(path):
         return _generate_non_source(path, description, goal, root, provider,
                                     manifest_paths, log_root)
@@ -658,7 +738,7 @@ def generate_file(*, path: str, description: str, depends_on: List[str],
                 + "\n\nIMPORTANT: this file ALREADY EXISTS. MODIFY it to satisfy "
                 "the requirements while PRESERVING all unrelated existing code, "
                 "imports, and public symbols. Do not delete working code. "
-                "Current content:\n" + _truncate(existing, _DEP_CONTENT_LIMIT))
+                "Current content:\n" + _truncate(existing, existing_limit or _DEP_CONTENT_LIMIT))
             swarm_beat(log_root, "developer", "modify_existing", file=path,
                        bytes=len(existing))
     content = err = ""
@@ -666,7 +746,7 @@ def generate_file(*, path: str, description: str, depends_on: List[str],
     for attempt in range(2):
         content, err = _full_file_attempt(
             path, description, depends_on, contracts, goal, root, provider,
-            layer, manifest_paths, skills, deps)
+            layer, manifest_paths, skills, deps, design)
         if err:
             last_broken_content = content or last_broken_content
             swarm_beat(log_root, "developer", "gate", file=path, ok=False,
@@ -682,6 +762,22 @@ def generate_file(*, path: str, description: str, depends_on: List[str],
     if content:
         content = _sanitize_phantoms(content, path, log_root)
         return GenerationOutcome(path, content, True, "full-file")
+
+    # A tool-call LEAK (the model answered with <call_tool> tags instead of the
+    # file) is not a code defect the semantic repairer can fix -- it has no
+    # spec and turns the tag into an empty placeholder component. Re-run the
+    # full-file rung once with NO tools advertised, so the only possible reply
+    # is the file itself.
+    if "<call_tool" in str(err) or "<tool_response" in str(err):
+        swarm_beat(log_root, "developer", "tool_free_retry", file=path)
+        content, err2 = _full_file_attempt(
+            path, description, depends_on, contracts, goal, root, provider,
+            layer, manifest_paths, skills, deps, design, tools=())
+        if content and not err2:
+            content = _sanitize_phantoms(content, path, log_root)
+            return GenerationOutcome(path, content, True, "full-file")
+        err = err2 or err
+        last_broken_content = content or last_broken_content
 
     # The `renegotiate` / `semantic_repair` beats report their OUTCOME (ok +
     # triggered_by), not just the error that triggered them -- an attempt beat

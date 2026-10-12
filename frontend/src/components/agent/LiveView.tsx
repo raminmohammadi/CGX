@@ -1,18 +1,19 @@
 import {
   History, PanelLeftClose, PanelRightClose,
-  Plus, RefreshCw, Send, Square, Trash2,
+  Plus, RefreshCw, Trash2,
 } from "lucide-react";
 import type {
-  AgentSessionState, AgentSessionSummary, SessionModeValue, TaskNodeDTO,
-  TaskProgress,
+  AgentSessionState, AgentSessionSummary, ProfileSummary, ProviderConfig,
+  SessionModeValue, TaskNodeDTO, TaskProgress,
 } from "../../lib/api";
 import { TaskTree } from "./TaskTree";
 import { ActiveTaskPanel } from "./ActiveTask";
+import { BuildResult, latestVerifyReport } from "./BuildResult";
+import { FollowUpBar } from "./FollowUpBar";
 import { SessionDashboard } from "./SessionDashboard";
 import { SidePanel } from "./SidePanel";
 import { ResizeHandle } from "./ResizeHandle";
 import { CollapsedRail } from "../CollapsedRail";
-import { TextArea } from "../Input";
 import { ErrorBoundary } from "../ErrorBoundary";
 import { cn, formatRelative } from "../../lib/utils";
 import { useAgentSession } from "../../store/agentSession";
@@ -38,6 +39,7 @@ export function activeTask(state: AgentSessionState): TaskNodeDTO | null {
 export function LiveView({
   state, sessions, pending, error, progress, running,
   runModel, selectedModel,
+  profiles, provider, onPickProfile,
   reply, setReply,
   selectedTaskId, setSelectedTaskId,
   onDecide, onSend, onCancel, onSwitch, onNew, onRefresh, onDelete,
@@ -54,6 +56,11 @@ export function LiveView({
   // into the running drain and can't be hot-swapped).
   runModel?: string | null;
   selectedModel?: string;
+  // Saved LLM profiles the composer offers for the next message, the
+  // workspace provider it reflects, and the action that applies a pick.
+  profiles: ProfileSummary[];
+  provider: ProviderConfig;
+  onPickProfile: (p: ProfileSummary) => void;
   reply: string;
   setReply: (s: string) => void;
   selectedTaskId: string | null;
@@ -79,6 +86,13 @@ export function LiveView({
   // drain at dispatch, so a profile switch mid-run applies only to the next.
   const providerMismatch = !!running && !!runModel && !!selectedModel
     && runModel !== selectedModel;
+  // A swarm session that holds a verified (or partial) build is in the
+  // feedback loop: the centre pane leads with the Build result (verdict,
+  // screenshots, live preview, revisions) and the composer takes feedback
+  // that SWARM_REVISE maps to the exact files.
+  const hasBuild = state.session.mode === "swarm"
+    && latestVerifyReport(state.artifacts) !== null;
+  const revisable = hasBuild && !running;
   return (
     <div className="flex h-full w-full overflow-hidden">
       {sessionBarCollapsed ? (
@@ -161,6 +175,11 @@ export function LiveView({
               && focused.status === "in_progress" && (
               <LiveProgress p={progress[focused.task_id]} taskKind={focused.kind} />
             )}
+            {hasBuild && (
+              <ErrorBoundary label="build-result">
+                <BuildResult sid={state.session.session_id} state={state} />
+              </ErrorBoundary>
+            )}
             <ErrorBoundary label="active-task">
               <ActiveTaskPanel
                 task={focused ?? null}
@@ -177,6 +196,8 @@ export function LiveView({
           reply={reply} setReply={setReply}
           onSend={onSend} pending={pending}
           running={!!running} onCancel={onCancel}
+          revisable={revisable}
+          profiles={profiles} provider={provider} onPickProfile={onPickProfile}
         />
       </div>
       {sidePanelCollapsed ? (
@@ -284,39 +305,6 @@ function SessionBar({
   );
 }
 
-function FollowUpBar({
-  reply, setReply, onSend, pending, running, onCancel,
-}: {
-  reply: string; setReply: (s: string) => void; onSend: () => void;
-  pending: boolean; running?: boolean;
-  onCancel?: () => void | Promise<void>;
-}) {
-  return (
-    <div className="px-4 pt-2.5 pb-3 border-t border-muted bg-slate-950/60 flex items-end gap-2">
-      <TextArea
-        rows={2}
-        value={reply}
-        onChange={(e) => setReply(e.target.value)}
-        placeholder="Post a follow-up objective…"
-        disabled={pending}
-        className="flex-1"
-      />
-      {running && onCancel && (
-        <button
-          type="button" onClick={() => { void onCancel(); }}
-          title="Stop after the current step"
-          className="av-btn-ghost text-red-300 hover:text-red-200"
-        ><Square className="h-3 w-3" /> Stop</button>
-      )}
-      <button
-        type="button" onClick={onSend}
-        disabled={pending || !reply.trim()}
-        className="av-btn-primary"
-      ><Send className="h-3 w-3" /> Send</button>
-    </div>
-  );
-}
-
 export function PriorSessions({
   sessions, onPick, onDelete,
 }: {
@@ -383,6 +371,7 @@ function LiveProgress({ p, taskKind }: { p: TaskProgress; taskKind?: string }) {
   let prefix = "Generating";
   if (kind === "swarm_tech_lead") prefix = "Planning";
   if (kind === "swarm_verify") prefix = "Verifying";
+  if (kind === "swarm_revise") prefix = "Revising";
   
   return (
     <div className={`mb-3 rounded-lg border p-3 ${isFailed

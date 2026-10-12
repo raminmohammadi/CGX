@@ -23,12 +23,30 @@ _SQLITE_RE = re.compile(r"\bsqlite(?:3)?\b", re.IGNORECASE)
 
 # Generic persistence intent: a goal that clearly wants to keep data around but
 # names no engine. We take these (embedded SQLite is the sensible default) so
-# the DB structural guidance loads.
-_PERSIST_RE = re.compile(
-    r"\b(?:members?|orders?|stores?|stored|persist(?:s|ed|ing|ence)?|"
-    r"databases?|records?|users?|accounts?|inventory|inventories)\b",
+# the DB structural guidance loads. Detection needs TWO signals -- a
+# persistence verb/noun ("store", "track", "database" ...) AND a data noun
+# ("users", "orders", "records" ...) -- so a UI goal that merely mentions "the
+# user" (the chat-app false positive) does not drag a database layer into the
+# plan.
+_PERSIST_ACTION_RE = re.compile(
+    r"\b(?:stores?|stored|storing|saves?|saved|saving|persist(?:s|ed|ing|ence)?|"
+    r"tracks?|tracked|tracking|manages?|managed|managing|keeps?|kept|"
+    r"records?|recorded|recording|databases?|db|crud|inventory|inventories|catalog)\b",
     re.IGNORECASE,
 )
+_PERSIST_DATA_RE = re.compile(
+    r"\b(?:members?|orders?|records?|users?|accounts?|inventory|inventories|"
+    r"data|items?|products?|customers?|entries|notes?|tasks?|history)\b",
+    re.IGNORECASE,
+)
+# A browser-only frontend (React/Vue/plain HTML with no backend named) cannot
+# use sqlite3 at all -- persistence there is localStorage. Stand down.
+_FRONTEND_ONLY_RE = re.compile(
+    r"\b(?:react|vue|next\.?js|svelte|frontend|front-end|browser|client-side|"
+    r"single.page|spa|local ?storage|html|css)\b", re.IGNORECASE)
+_BACKEND_SIGNAL_RE = re.compile(
+    r"\b(?:backend|back-end|server|api|flask|fastapi|django|express|node\.?js|"
+    r"python|rest|graphql|sqlalchemy|orm|database|db)\b", re.IGNORECASE)
 
 # A competing engine named in the goal means it belongs to that engine's skill;
 # never steal it (keep detection high-precision).
@@ -76,9 +94,13 @@ class SQLiteSkill(Skill):
         # A goal that names another engine belongs to that engine's skill.
         if _COMPETING_ENGINE_RE.search(text):
             return 0.0
+        # A browser-only frontend has no place for sqlite3 (persistence there
+        # is localStorage) -- never fire on it.
+        if _FRONTEND_ONLY_RE.search(text) and not _BACKEND_SIGNAL_RE.search(text):
+            return 0.0
         # Generic persistence intent, no engine named -> load DB guidance with a
-        # sensible embedded default.
-        if _PERSIST_RE.search(text):
+        # sensible embedded default. Two signals required (see above).
+        if _PERSIST_ACTION_RE.search(text) and _PERSIST_DATA_RE.search(text):
             return 0.55
         return 0.0
 

@@ -46,6 +46,7 @@ from cgx.session.tasks import swarm_assess as _swarm_assess  # noqa: F401
 from cgx.session.tasks import swarm_tech_lead as _swarm_tech_lead  # noqa: F401
 from cgx.session.tasks import swarm_developer as _swarm_developer  # noqa: F401
 from cgx.session.tasks import swarm_verify as _swarm_verify  # noqa: F401
+from cgx.session.tasks import swarm_revise as _swarm_revise  # noqa: F401
 
 __all__ = [
     "ExecutorDeps",

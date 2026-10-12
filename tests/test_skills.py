@@ -155,9 +155,8 @@ def test_tailwind_missing_config_not_fatal():
     # @tailwind directives with no tailwind.config and no package.json are no
     # longer a FATAL verdict: with no build system the skill abstains, because
     # the project could legitimately be v4 (`@import "tailwindcss"`) or CDN /
-    # build-less (the static_site skill's valid output). Fatally rejecting here
-    # deadlocked tailwind against static_site. (The build-project warning path
-    # is covered in tests/test_skill_tailwind.py.)
+    # build-less. (The build-project warning path is covered in
+    # tests/test_skill_tailwind.py.)
     tw = skills.skills_by_names(["tailwind"])
     diffs = [_diff("src/index.css",
                    "@tailwind base;\n@tailwind components;\n@tailwind utilities;")]

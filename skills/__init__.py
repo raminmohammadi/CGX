@@ -58,7 +58,6 @@ from skills.nextjs import NextJsSkill
 from skills.python_cli import PythonCliSkill
 from skills.react import ReactSkill
 from skills.sqlite import SQLiteSkill
-from skills.static_site import StaticSiteSkill
 from skills.tailwind import TailwindSkill
 from skills.vue import VueSkill
 
@@ -84,8 +83,6 @@ SKILLS: List[Skill] = [
     SQLiteSkill(),
     # Styling addons
     TailwindSkill(),
-    # Plain static site (no framework/build)
-    StaticSiteSkill(),
 ]
 
 

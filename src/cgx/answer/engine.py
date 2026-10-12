@@ -2717,6 +2717,21 @@ def plan_scaffold_manifest(
             "Apply the technology-specific file layout below.\n\n"
         )
         system = _MANIFEST_SYSTEM + header + skill_fragment
+    # Design layer: a UI-bearing idea gets the product + design brief (what a
+    # real version of this app contains, and the design-system files it must
+    # ship) so the manifest carries screens, a shell, styles and an API client
+    # instead of two bare components. See cgx.design.
+    design_brief = None
+    try:
+        from cgx import design as _design
+        design_brief = _design.build_brief(
+            detect_text, [getattr(s, "name", "") for s in active_skills])
+        if design_brief.applies:
+            system = system + "\n\n" + _design.planner_block(design_brief)
+        else:
+            design_brief = None
+    except Exception:  # pragma: no cover - design layer must never block planning
+        design_brief = None
 
     parts: List[str] = []
     if goal_clean and goal_clean != idea_clean:
@@ -2817,8 +2832,6 @@ def plan_scaffold_manifest(
             "plan_md": str(parsed.get("plan_md") or idea_clean),
             "layers": [{"name": "project", "files": []}],
         }
-    is_static_site = any(
-        getattr(s, "name", "") == "static_site" for s in active_skills)
     layers = _normalize_manifest_paths(parsed["layers"])
     layers = _inject_required_manifest_files(
         layers,
@@ -2829,14 +2842,32 @@ def plan_scaffold_manifest(
         layers,
         goal=goal_clean or idea_clean,
         skill_names=skills,
-        static_site=is_static_site,
     )
     layers = _inject_python_package_inits(layers)
     layers = _inject_readme(layers, goal=goal_clean or idea_clean)
+    # Design-system completeness (deterministic, like the README/test
+    # injection above): re-anchor the brief on the manifest's UI root and
+    # append the tokens stylesheet, app stylesheet, entry/shell, API client
+    # and storage helper the planner omitted.
+    design_dict = None
+    if design_brief is not None:
+        try:
+            from cgx import design as _design
+            flat = [str(f.get("path") or "") for lay in layers
+                    if isinstance(lay, dict) for f in (lay.get("files") or [])
+                    if isinstance(f, dict) and f.get("path")]
+            design_brief = design_brief.resolved_for_paths(flat)
+            inject = _design.ui_files_to_inject(design_brief, flat)
+            if inject:
+                layers = list(layers) + [{"name": "design-system", "files": inject}]
+            design_dict = design_brief.to_dict()
+        except Exception:  # pragma: no cover
+            design_dict = None
     return {
         "plan_md": str(parsed.get("plan_md") or "").strip(),
         "contracts": _normalize_contracts(parsed.get("contracts")),
         "layers": layers,
+        "design": design_dict,
     }
 
 
@@ -3431,7 +3462,6 @@ def _inject_required_test_file(
     *,
     goal: str = "",
     skill_names: Optional[List[str]] = None,
-    static_site: bool = False,
 ) -> List[Any]:
     """Guarantee every greenfield manifest carries at least one test file.
 
@@ -3440,15 +3470,7 @@ def _inject_required_test_file(
     skip tests despite the prompt; rather than burn a retry on the Judge's
     required-test check, we inject a stack-appropriate test entry whose
     content the per-file generator fills in later.
-
-    Skipped entirely for a static site: a build-less HTML/CSS/JS site has no
-    test runner (pytest/Vitest would both be nonsensical there), and the
-    static-site skill's own link/asset validator is the pass/fail signal
-    instead. Injecting a test file only produces an unrunnable artifact the
-    skill validator would then reject.
     """
-    if static_site:
-        return layers
     paths: List[str] = []
     for lay in layers or []:
         if not isinstance(lay, dict):
@@ -3837,6 +3859,14 @@ _SINGLE_FILE_SYSTEM = (
     "fixes that value (a documented constant or a stated formula result).\n"
 )
 
+_TOOL_LEAK_RETRY_INSTR = (
+    "\n\nCRITICAL: your previous reply was a <call_tool> tag instead of the file. "
+    "Tool calls are NOT file content and no further tool calls are available. "
+    "Output the COMPLETE file now as {\"content\": \"...\"}; if you lack "
+    "information about a sibling file, write this file against the PROJECT "
+    "CONTRACTS and the import names listed in the context."
+)
+
 _SINGLE_FILE_FREEFORM_SYSTEM = (
     "You are a senior software engineer generating EXACTLY ONE source file.\n\n"
     "Output the complete file content inside a fenced code block with the path:\n"
@@ -4127,8 +4157,16 @@ def generate_single_scaffold_file(
     manifest_paths: Optional[List[str]] = None,
     import_hint: str = "",
     project_root: Optional[str] = None,
+    design: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Generate the content of a single file in a new-project scaffold.
+
+    ``design`` (optional) is the build's design brief (:mod:`cgx.design`): the
+    brief's tokens stylesheet is emitted deterministically, and every other UI
+    file gets the brief rendered into its system prompt (product context,
+    component/stylesheet/entry rules, theme constraints) with a larger output
+    budget, so a weak model produces a complete, styled screen instead of a
+    minimal unstyled one.
 
     Each call generates exactly one file. The signatures of previously
     generated files are provided as context so imports resolve correctly;
@@ -4228,6 +4266,27 @@ def generate_single_scaffold_file(
             "confidence": 1.0,
         }
 
+    # Deterministic short-circuit for the design-tokens stylesheet: CGX writes
+    # the curated, contrast-verified design system itself (palette/type/
+    # spacing variables, base element styles, component classes) -- the model
+    # only ever *uses* it, which is what makes a weak model's UI look designed.
+    if design:
+        try:
+            from cgx.design import is_tokens_path, tokens_content
+            if is_tokens_path(design, path):
+                content = tokens_content(design)
+                patch = _content_to_new_file_patch(path, content)
+                return {
+                    "file": path,
+                    "patch": patch,
+                    "content": content,
+                    "diffs": [{"file": path, "patch": patch}],
+                    "syntax_ok": True,
+                    "confidence": 1.0,
+                }
+        except Exception:  # pragma: no cover - design layer must not break generation
+            logger.debug("design tokens short-circuit failed", exc_info=True)
+
     # Feed the file path into skill detection so an explicit .jsx/.tsx/.vue
     # extension can pull in the matching frontend skill even when the goal
     # text was ambiguous or contained a typo. _JSX_RE / Vue regex match on
@@ -4260,6 +4319,20 @@ def generate_single_scaffold_file(
     if _project_uses_pydantic(goal, description,
                               existing_files_with_content, skill_names_str):
         system = system + "\n\n" + _PYDANTIC_IMPORT_PIN
+
+    # Design brief -> per-file UI guidance (empty for non-UI files such as a
+    # backend module or a test): product context, rules for this kind of file
+    # (entry / shell / component / stylesheet / API client / storage) and the
+    # theme as hard constraints.
+    design_fragment = ""
+    if design:
+        try:
+            from cgx.design import file_block
+            design_fragment = file_block(design, path, description)
+        except Exception:  # pragma: no cover
+            design_fragment = ""
+    if design_fragment:
+        system = system + "\n\n" + design_fragment
 
     emit_trace("scaffold_rules", rules=system)
 
@@ -4316,6 +4389,11 @@ def generate_single_scaffold_file(
     # :mod:`cgx.answer.model_caps`.
     from cgx.answer.model_caps import get_scaffold_budget
     budget = get_scaffold_budget(provider)
+    if design_fragment:
+        # A complete, styled screen/stylesheet is longer than a minimal module;
+        # give UI files headroom so the output is not truncated mid-component.
+        budget = dict(budget)
+        budget["output_tokens"] = int(budget["output_tokens"] * 1.5)
 
     if existing_files_with_content:
         # Send a *structural summary* of each prior file (imports +
@@ -4389,6 +4467,8 @@ def generate_single_scaffold_file(
         ff_system = _SINGLE_FILE_FREEFORM_SYSTEM
         if skill_fragment:
             ff_system = _SINGLE_FILE_FREEFORM_SYSTEM + header + skill_fragment
+        if design_fragment:
+            ff_system = ff_system + "\n\n" + design_fragment
         ff_raw = provider.chat(
             messages=[
                 {"role": "system", "content": ff_system},
@@ -4453,6 +4533,19 @@ def generate_single_scaffold_file(
     # "invalid syntax" the retry can never localise.
     if content:
         content = _unwrap_wrapping_code_fence(content)
+    # Tool-call leak gate: a model that ran out of tool turns (or ignored the
+    # tool protocol) can return a bare ``<call_tool>`` tag, which previously
+    # flowed through as the file's content and even survived "semantic repair".
+    # One hardened retry, else fail the file so VERIFY regenerates it.
+    if content and ("<call_tool" in content or "<tool_response" in content):
+        retry = _regenerate_scaffold_file(
+            provider, system, context, budget, _TOOL_LEAK_RETRY_INSTR)
+        if retry and "<call_tool" not in retry and "<tool_response" not in retry:
+            content = retry
+        else:
+            syntax_ok = False
+            syntax_error = ("content contains a <call_tool>/<tool_response> tag -- a "
+                            "tool call is not file content; write the complete file")
     # Reject unified-diff fragments that leak through the freeform parser
     # into the file body (`--- /dev/null`, `+++ b/...`, `@@ ...`).
     if content:

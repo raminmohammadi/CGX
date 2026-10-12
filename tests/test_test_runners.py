@@ -357,3 +357,16 @@ def test_npm_install_no_public_retry_on_non_auth_error(tmp_path, monkeypatch):
     monkeypatch.setattr(tr.subprocess, "run", fake_run)
     ok, _out = tr._npm_install(tmp_path, timeout=30)
     assert ok is False and len(calls) == 1   # no retry for a non-auth failure
+
+
+def test_npm_command_prefers_build_when_vitest_has_no_test_files(tmp_path):
+    # ``vitest run`` with no test files exits 1 ("No test files found") -- an
+    # environmental verdict, not a code defect -- so the build smoke wins.
+    _write(tmp_path, "package.json", '{"scripts": {"test": "vitest run", "build": "vite build"}}')
+    assert _npm_script_command(str(tmp_path), tests_present=False) == ["npm", "run", "build", "--silent"]
+    assert _npm_script_command(str(tmp_path), tests_present=True) == ["npm", "test", "--silent"]
+    # unknown presence keeps the legacy preference
+    assert _npm_script_command(str(tmp_path)) == ["npm", "test", "--silent"]
+    # a custom test script (not a file-driven runner) is still preferred
+    _write(tmp_path, "package.json", '{"scripts": {"test": "node check.js", "build": "vite build"}}')
+    assert _npm_script_command(str(tmp_path), tests_present=False) == ["npm", "test", "--silent"]

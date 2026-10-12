@@ -214,3 +214,26 @@ def test_no_warning_for_relative_paths(skill):
               "conn.execute('SELECT 1')\n"),
     ]
     assert skill.scaffold_warnings(diffs) == []
+
+
+# --- false positives the two-signal rule must reject -------------------------
+
+@pytest.mark.parametrize("goal", [
+    # The chat-app failure: "user" alone (a UI actor) is not persistence intent.
+    "create an app for a chatbot in which user provides a API address and a key "
+    "on the profile tab and then navigates to the main page and can interact "
+    "with the chat. Use React frontend",
+    # A browser-only frontend persists in localStorage, never sqlite3.
+    "a React notes app that saves notes in localStorage",
+    "build a Vue kanban board that stores tasks per column",
+    # A data noun without any persistence action.
+    "show the current user their profile picture",
+])
+def test_two_signal_rule_rejects_ui_only_goals(skill, goal):
+    assert skill.detect(goal) == 0.0
+
+
+def test_backend_persistence_still_detected_with_frontend_words(skill):
+    # Frontend words beside an explicit backend/data signal still count.
+    assert skill.detect("a React frontend with a Flask backend that stores "
+                        "user accounts") == pytest.approx(0.55)

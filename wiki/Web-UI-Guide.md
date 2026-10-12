@@ -60,6 +60,21 @@ Artifacts. Nothing reaches disk until you tick the approval checkpoint, and an
 its own sub-tabs for **Agent Profiles**, **Skills** and **New Skill**. Full
 walkthrough: **[[Session Based Agent]]**.
 
+**Build result & feedback (swarm).** When a swarm build finishes, the centre
+pane leads with a **Build result** panel: the verifier's verdict, one
+**screenshot per route** (click to enlarge), **Open live preview** / **Preview
+here** (the real production bundle served on a local port, inline or in a new
+tab), and the **revision history**. The composer reads *Describe what to
+change* and its button **Revise**: your feedback is localized to the exact
+files, applied, rebuilt and re-screenshotted, and each revision row lists the
+files touched with the instruction, *why that file*, and a diff -- plus how
+the files were located. A **Model for the next message** selector beside
+**Send**/**Revise** lists your saved profiles; picking one sets the active
+provider (workspace-wide, as Settings does) so the next message -- a revision
+or a follow-up objective -- runs on it, while a run already in progress keeps
+its model and a build still mid-chain answers `409` (wait, or **Stop** first).
+See **[[Swarm Agent]]**.
+
 **Swarm view fixes.** When a run is in `swarm` mode, the task tree now renders
 Developer tasks as **siblings under the Tech Lead** instead of a deepening
 parent chain that indented one level per file (with a defensive indentation
@@ -91,7 +106,9 @@ The settings page is a left category list. Search filters the categories.
 Choose a **Provider Type** (Ollama, OpenAI, Google Gemini, Hugging Face, or
 Custom Server), fill in the model and credentials, and click **Ping** to verify
 the connection with a live latency check. API keys are stored in your OS
-keyring. See **[[Providers and Models]]**.
+keyring. For the Hugging Face kind the presets dropdown reads **Inference
+Providers (N)**: only models the router serves work through it, though any
+other id can still be typed. See **[[Providers and Models]]**.
 
 ### Saved Profiles
 Save provider configurations for any supported kind, then **Use / Edit /
@@ -103,7 +120,11 @@ auth** toggle for private-subnet servers. Optional per-profile `rate_limit` and
 ### Browse Hugging Face
 Search the Hub for GGUF repositories, size them against your hardware with
 **Check fit**, and **Pull** them straight into your local Ollama daemon (no HF
-token needed). Full panel breakdown in **[[Providers and Models]]**.
+token needed). The list is GGUF-only because pulls go through Ollama's
+`hf.co/<repo>` loader; results arrive **40 per page** in the chosen sort order,
+**Load more** follows the Hub's cursor, and a Hub error (including the HTTP 429
+rate limit) is shown inline instead of an empty list. Full panel breakdown in
+**[[Providers and Models]]**.
 
 ### Observability
 A single **tracing toggle**. Turning it on is equivalent to `CGX_TRACE=1`: from
@@ -138,10 +159,14 @@ grid. The catalogue is pure-offline. Details in **[[Providers and Models]]**.
 
 A **Control** group in the sidebar adds two pages:
 
-- **MCP Servers** (`/mcp`) -- lists the tool servers configured in
-  `~/.cgx/mcp.json`, shows whether the optional SDK is installed and the config
-  path, and toggles a server on/off. Backed by `GET /api/mcp/servers` and
-  `POST /api/mcp/toggle`. See **[[Providers and Models]]**.
+- **MCP Servers** (`/mcp`) -- your roster (ready / *needs VAR* status, Test,
+  Secrets, toggle, Remove) plus a **catalog** of well-known developer servers
+  (GitHub, Playwright, Context7, databases, Stripe, Sentry ...) you add in one
+  click, supplying parameters and secrets (stored in the keyring) when asked;
+  a custom stdio/http server form for anything else. Backed by
+  `GET /api/mcp/servers`, `GET /api/mcp/catalog`, `POST /api/mcp/servers`,
+  `POST /api/mcp/servers/{name}/env|test`, `POST /api/mcp/toggle`,
+  `DELETE /api/mcp/servers/{name}`. See **[[Providers and Models]]**.
 - **Approvals** (`/approvals`) -- lists risky tool calls awaiting a human
   decision (polled) with Approve/Deny. The Agent run view also surfaces its own
   session's pending approvals inline while it runs. Backed by

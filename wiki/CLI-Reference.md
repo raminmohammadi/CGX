@@ -44,10 +44,9 @@ same engine the web UI's REST routes call.
 | `cgx profile` | `list` · `show` · `add` · `rm` | LLM connection presets |
 | `cgx agent-profile` | `list` · `show` · `add` · `rm` | Saved `{objective, skills}` bundles |
 | `cgx context` | `show` · `edit` · `rm` | Repo `CGX.md` context file |
-| `cgx site` | `list` · `new` · `generate` · `revise` · `path` · `themes` | Site Studio |
-| `cgx session` | `list` · `show` · `rm` · `send` · `decide` | Agent sessions: inspect, drive, decide |
+| `cgx session` | `list` · `show` · `rm` · `send` · `decide` · `preview` | Agent sessions: inspect, drive, decide, review a build |
 | `cgx model` | `list` · `matrix` · `fit` · `pull` · `embed-list` · `embed-pull` | Model discovery / pull |
-| `cgx mcp` | `list` · `enable` · `disable` · `tools` | MCP tool servers |
+| `cgx mcp` | `list` · `catalog` · `add` · `add-custom` · `rm` · `set-env` · `test` · `enable` · `disable` · `tools` | MCP tool servers + catalog |
 | `cgx activity` | `runs` · `summary` · `show` | Per-run observation store |
 | `cgx usage` | `show` · `summary` | Cost & quota governance |
 | `cgx feedback` | `stats` · `list` · `add` | Thumbs-up/down feedback |
@@ -62,8 +61,15 @@ same engine the web UI's REST routes call.
 
 Run `cgx <group> --help` and `cgx <group> <verb> --help` for the authoritative
 flags. Notes: `session send`/`decide` **drive** an existing session (stream live,
-Ctrl-C cancels) — `send` posts a follow-up message, `decide --task-id --chosen
-'{"approved": true}'` answers an open decision; run from the project dir (or pass
+Ctrl-C cancels) — `send` posts a follow-up message (on a **finished swarm build** it is
+*feedback*: a precise revision of the exact files plus re-verification, not a
+new session), `decide --task-id --chosen '{"approved": true}'` answers an open
+decision; both take the shared provider flags (`--profile`, or `--provider
+--model --base-url`) **per turn**, so a follow-up can run on a different model
+than the original build — `--model` overrides a saved profile's model instead
+of being ignored next to `--profile`; `session preview <sid>` prints a finished swarm build's verdict,
+screenshot paths and revision history and serves its production bundle on a
+local port (`--no-serve` for JSON); run from the project dir (or pass
 `--project-root`) so the session id resolves. `cgx agent` (unattended) and
 `cgx dash` (interactive) remain the ways to *start* a session; `approvals resolve` acts
 on an in-process gate, so for terminal runs prefer `cgx agent --approve`;

@@ -1,44 +1,95 @@
 """MCP server management surface.
 
-Lists the configured MCP tool servers (from ``~/.cgx/mcp.json``) and reports
-whether the optional SDK is installed. Read-oriented: editing the roster is a
-config-file edit (the feature's "easy to extend" contract), so this exposes
-listing plus a lightweight enable/disable toggle written back to the file.
+Lists the configured MCP tool servers (from ``~/.cgx/mcp.json``) with their
+catalog metadata and secret status, exposes the curated **catalog** of
+well-known developer servers, and lets the operator add a server from the
+catalog (or a custom definition), set its secrets, test the connection,
+toggle it, or remove it. All logic lives in :mod:`cgx.mcp.ops` so the
+``cgx mcp`` CLI does exactly the same things.
 """
 
 from __future__ import annotations
 
-import json
+from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter
-from pydantic import BaseModel
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, Field
 
-from cgx.mcp.config import default_config_path, load_mcp_config
+from cgx.mcp import ops
+from cgx.mcp.config import default_config_path
 
 router = APIRouter(tags=["mcp"])
 
 
-def _sdk_installed() -> bool:
-    try:
-        import mcp  # noqa: F401
-        return True
-    except Exception:
-        return False
-
-
 @router.get("/mcp/servers")
 def servers() -> dict:
-    """Configured MCP servers and SDK availability."""
-    cfg = load_mcp_config()
+    """Configured MCP servers (with catalog metadata + missing secrets) and SDK availability."""
     return {
-        "sdk_installed": _sdk_installed(),
+        "sdk_installed": ops.sdk_installed(),
         "config_path": str(default_config_path()),
-        "servers": [
-            {"name": s.name, "transport": s.transport, "url": s.url,
-             "command": s.command, "enabled": s.enabled}
-            for s in cfg
-        ],
+        "servers": ops.server_rows(),
     }
+
+
+@router.get("/mcp/catalog")
+def catalog(category: Optional[str] = None) -> dict:
+    """The curated catalog of developer MCP servers (one-click add templates)."""
+    return ops.catalog_payload(category)
+
+
+class AddServerBody(BaseModel):
+    """Add from the catalog (``catalog_id`` + ``params``/``env``) or a custom server."""
+    catalog_id: Optional[str] = None
+    name: Optional[str] = None
+    params: Dict[str, str] = Field(default_factory=dict)
+    # Secret values to store in the keyring/secret file -- never in the roster.
+    env: Dict[str, str] = Field(default_factory=dict)
+    enabled: bool = True
+    replace: bool = False
+    transport: Optional[str] = None
+    command: Optional[str] = None
+    args: List[str] = Field(default_factory=list)
+    url: Optional[str] = None
+    auth: Dict[str, Any] = Field(default_factory=dict)
+    description: str = ""
+    agent_hint: str = ""
+
+
+@router.post("/mcp/servers")
+def add(body: AddServerBody) -> dict:
+    try:
+        return ops.add_from_request(**body.model_dump())
+    except ValueError as exc:
+        code = 409 if "already exists" in str(exc) else 400
+        raise HTTPException(status_code=code, detail=str(exc)) from exc
+
+
+@router.delete("/mcp/servers/{name}")
+def remove(name: str) -> dict:
+    out = ops.remove(name)
+    if not out["ok"]:
+        raise HTTPException(status_code=404, detail=f"server {name!r} not found")
+    return out
+
+
+class EnvBody(BaseModel):
+    env: Dict[str, str]
+
+
+@router.post("/mcp/servers/{name}/env")
+def set_env(name: str, body: EnvBody) -> dict:
+    """Store (or clear, with an empty value) a server's secret variables."""
+    try:
+        return ops.set_env(name, body.env)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/mcp/servers/{name}/test")
+def test(name: str) -> dict:
+    """Connect to the server and list its tools (or explain why it cannot)."""
+    from cgx.mcp.manager import test_server
+    return test_server(name)
 
 
 class ToggleBody(BaseModel):
@@ -49,17 +100,4 @@ class ToggleBody(BaseModel):
 @router.post("/mcp/toggle")
 def toggle(body: ToggleBody) -> dict:
     """Enable or disable a configured server, persisting to the JSON roster."""
-    path = default_config_path()
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {"ok": False, "reason": "no readable mcp.json"}
-    changed = False
-    for entry in data.get("servers", []):
-        if isinstance(entry, dict) and entry.get("name") == body.name:
-            entry["enabled"] = body.enabled
-            changed = True
-    if not changed:
-        return {"ok": False, "reason": f"server {body.name!r} not found"}
-    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    return {"ok": True}
+    return ops.toggle(body.name, body.enabled)

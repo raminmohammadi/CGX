@@ -68,14 +68,22 @@ The model dropdown is populated from the router's **public**
 `/v1/models` list (no token required to browse), so you can see what's
 available before pasting a key; the token is only needed for the actual
 inference call. Ping validates the token with a 1-token completion when a
-model is set, or falls back to the public model list otherwise.
+model is set, or falls back to the public model list otherwise. That presets
+dropdown is labelled **Inference Providers (N)** because only models the
+router actually serves work through it — any other id can still be typed into
+the Model field.
 
 ### Browse Hugging Face → pull GGUFs locally
 
 The **Settings → Browse Hugging Face** panel lists GGUF repositories from
 the Hub and pulls any one of them straight into your local Ollama daemon.
 No HF token is required to browse or to pull — the download goes through
-Ollama's `hf.co/<repo>` mechanism.
+Ollama's `hf.co/<repo>` mechanism. That mechanism is also why the list is
+GGUF-only: the loader accepts nothing else. Results arrive **40 per page** in
+the chosen sort order and are never auto-paged — the unauthenticated Hub
+budget is 500 requests per 5 minutes, so one click costs one request — and a
+Hub error (including that HTTP 429 rate limit) is shown inline instead of an
+empty list.
 
 **Panel controls, element by element:**
 
@@ -84,6 +92,7 @@ Ollama's `hf.co/<repo>` mechanism.
 | **Search box** | Free-text Hub search (`llama`, `qwen`, `gemma`, …). Submitting the form (or **Refresh**) reloads the list. |
 | **Sort** dropdown | **Trending** (default) · **Most downloaded** · **Most liked** · **Recently updated**. Changing it reloads immediately. |
 | **Refresh** | Re-runs the current search/sort. |
+| **Load more** | Fetches the next 40 with the Hub's own cursor (the footer reads *Showing N GGUF repos · more available*); gone once the Hub has no further page. A new search or sort starts over from page one. |
 
 **Each model row shows:** the repo id (a link to `huggingface.co/<repo>`),
 a **downloads** count and a **likes** count (compacted, e.g. `12.3k`), and a
@@ -323,16 +332,32 @@ so the **token is never stored in the JSON**:
 }
 ```
 
-The swarm gets three registry tools — `mcp_list_servers`, `mcp_list_tools`, and
-`mcp_call` (HIGH risk, so gated by the approval gate when active). Discovery is
-**lazy** so many servers don't flood the prompt, and MCP tools are only
-advertised to the agent when at least one server is configured.
+**Catalog.** You rarely edit the JSON by hand: the MCP page (and `cgx mcp
+catalog` / `cgx mcp add <id>`) offers a curated catalog of the servers
+developers use — the official reference servers (filesystem, git, fetch,
+memory, sequential-thinking, time), GitHub, Playwright, Brave Search, Context7,
+AWS and Microsoft Learn docs, MarkItDown, PostgreSQL, SQLite, MongoDB, Redis,
+Supabase, Stripe, Sentry, Figma and Notion. Adding one fills the roster entry
+from the template; parameters (an allowed directory, a project ref) are asked
+for, and secrets go to the **OS keyring** (or a `0600` secrets file) — the
+roster only ever holds `${VAR}` references, resolved at launch from the
+environment first. **Test** connects and lists a server's tools; a server with
+a missing secret shows *needs VAR*.
 
-It **degrades gracefully**: without the `mcp` SDK installed, discovery from the
-config still works and the call tools return an "install `cgx[mcp]`" message
-rather than failing. Over the web API, `GET /api/mcp/servers` lists the servers
-with an `sdk_installed` flag and `POST /api/mcp/toggle` enables/disables one.
-See **[[Swarm Agent]]** and **[[Privacy and Security]]**.
+The swarm gets four registry tools — `mcp_list_servers`, `mcp_list_tools`,
+`mcp_describe_tool` and `mcp_call` (HIGH risk, so gated by the approval gate
+when active) — plus a prompt block listing the enabled servers with each one's
+**agent hint** (when to use it), so a local model actually reaches for a docs
+server or a browser. Discovery is **lazy** so many servers don't flood the
+prompt, and MCP tools are only advertised when at least one server is enabled.
+
+It **degrades gracefully**: without the `mcp` SDK installed, the roster and
+catalog still work and the call tools return an "install `cgx[mcp]`" message.
+Over the web API: `GET /api/mcp/servers`, `GET /api/mcp/catalog`,
+`POST /api/mcp/servers`, `POST /api/mcp/servers/{name}/env|test`,
+`POST /api/mcp/toggle`, `DELETE /api/mcp/servers/{name}`. See
+[`docs/mcp.md`](https://github.com/raminmohammadi/CGX/blob/main/docs/mcp.md),
+**[[Swarm Agent]]** and **[[Privacy and Security]]**.
 
 ---
 

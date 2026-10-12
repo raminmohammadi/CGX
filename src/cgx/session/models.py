@@ -120,6 +120,11 @@ class TaskKind(str, enum.Enum):
     SWARM_TECH_LEAD = "swarm_tech_lead"
     SWARM_DEVELOPER = "swarm_developer"
     SWARM_VERIFY = "swarm_verify"
+    # Feedback loop: the user reviewed a finished swarm build and asked for a
+    # change. Localizes the feedback to the exact planned files, applies it
+    # as grounded modifications, then chains to SWARM_VERIFY so the revised
+    # tree is rebuilt, smoke-tested and screenshotted again.
+    SWARM_REVISE = "swarm_revise"
 
 
 class TaskAccess(str, enum.Enum):
@@ -156,6 +161,7 @@ _TASK_ACCESS: Dict[TaskKind, TaskAccess] = {
     TaskKind.SCAFFOLD: TaskAccess.WRITE,
     TaskKind.AST_REGENERATE: TaskAccess.WRITE,
     TaskKind.SWARM_DEVELOPER: TaskAccess.WRITE,
+    TaskKind.SWARM_REVISE: TaskAccess.WRITE,     # rewrites planned files
     TaskKind.REPAIR: TaskAccess.WRITE,           # patch applied downstream
     TaskKind.BOOTSTRAP_ENV: TaskAccess.WRITE,    # installs dependencies
     TaskKind.API_CHECK: TaskAccess.WRITE,        # imports / executes
@@ -212,6 +218,9 @@ class ArtifactKind(str, enum.Enum):
     DIAGNOSIS = "diagnosis"
     SWARM_STATE = "swarm_state"
     SWARM_VERIFY_REPORT = "swarm_verify_report"
+    # Typed output of SWARM_REVISE: the feedback, the files it was localized
+    # to (with the per-file instruction + why), and what actually changed.
+    SWARM_REVISION = "swarm_revision"
 
 
 class DecisionKind(str, enum.Enum):

@@ -116,6 +116,9 @@ def swarm_developer(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
     # authored with the right framework conventions (React Vite layout, Flask
     # routes, package.json shape, ...) instead of Python defaults.
     skills = list(content.get("skills") or [])
+    # The design brief the Tech Lead persisted (None for a non-UI build):
+    # rendered into per-file UI guidance + the deterministic tokens stylesheet.
+    design = content.get("design") if isinstance(content.get("design"), dict) else None
 
     swarm_beat(project_root, "developer", "generate", file=path,
                index=file_index + 1, total=file_count)
@@ -133,15 +136,15 @@ def swarm_developer(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             depends_on=list(spec.get("depends_on") or []), contracts=contracts,
             goal=goal, root=project_root, provider=deps.provider,
             layer=path, manifest_paths=paths, log_root=project_root,
-            skills=skills, deps=deps, modify_existing=True)
+            skills=skills, deps=deps, modify_existing=True, design=design)
 
         outcome2 = generate_file(
             path=path, description=str(spec.get("description") or ""),
             depends_on=list(spec.get("depends_on") or []), contracts=contracts,
             goal=goal, root=project_root, provider=deps.provider,
             layer=path, manifest_paths=paths, log_root=project_root,
-            skills=skills, deps=deps, modify_existing=True)
-            
+            skills=skills, deps=deps, modify_existing=True, design=design)
+
         if outcome1.ok and outcome2.ok:
             judge_prompt = (
                 "You are the Lead Code Reviewer. Two developers have written code for the following file:\n"
@@ -167,7 +170,7 @@ def swarm_developer(task: TaskNode, deps: ExecutorDeps) -> ExecutorResult:
             depends_on=list(spec.get("depends_on") or []), contracts=contracts,
             goal=goal, root=project_root, provider=deps.provider,
             layer=path, manifest_paths=paths, log_root=project_root,
-            skills=skills, deps=deps, modify_existing=True)
+            skills=skills, deps=deps, modify_existing=True, design=design)
 
     if outcome.ok:
         if outcome.renegotiated_contracts and deps.store:

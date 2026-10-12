@@ -185,43 +185,6 @@ class ContextFileWriteRequest(BaseModel):
     content: str
 
 
-class SiteCreateRequest(BaseModel):
-    """Create a managed site workspace from a human name."""
-    name: str
-
-
-class SiteInfo(BaseModel):
-    slug: str
-    project_root: str
-    has_index: bool = False
-    modified: float = 0.0
-
-
-class SiteGenerateRequest(BaseModel):
-    """One-shot build of a self-contained static site from a brief."""
-    name: str
-    brief: str
-    flavor: str = "modern"  # simple | modern | interactive
-    theme: str = ""  # theme key; "" = auto-select from the brief
-    provider: ProviderConfig = Field(default_factory=ProviderConfig)
-
-
-class SiteReviseRequest(BaseModel):
-    """Revise an existing site in place from plain-language feedback."""
-    slug: str
-    feedback: str
-    flavor: str = "modern"
-    theme: str = ""
-    provider: ProviderConfig = Field(default_factory=ProviderConfig)
-
-
-class GeneratedSite(BaseModel):
-    slug: str
-    project_root: str
-    entry: str = "index.html"
-    bytes: int = 0
-
-
 class SessionCreateRequest(BaseModel):
     title: Optional[str] = None
 
@@ -274,6 +237,14 @@ class AgentSessionDecisionRequest(BaseModel):
     index: IndexLocation = Field(default_factory=IndexLocation)
     provider: ProviderConfig = Field(default_factory=ProviderConfig)
     run_initial_task: bool = False
+
+
+class AgentPreviewState(BaseModel):
+    """A live preview server for a finished swarm build's production bundle."""
+    url: str
+    port: int
+    dist: str
+    host: str
 
 
 class AgentSessionState(BaseModel):

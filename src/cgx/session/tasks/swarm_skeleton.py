@@ -49,7 +49,13 @@ def render_import_hints(path: str, dep_sources: Dict[str, str]) -> str:
     or when nothing usable can be derived.
     """
     if not path.endswith(".py"):
-        return ""
+        # JS/TS dependencies: the same grounded hint from the module's real
+        # export surface (named + default), so the frontend never guesses.
+        try:
+            from cgx.session.js_symbols import import_hints
+            return import_hints(path, dep_sources)
+        except Exception:  # pragma: no cover - advisory only
+            return ""
     lines = []
     for dep_path, src in (dep_sources or {}).items():
         if not dep_path.endswith(".py") or not isinstance(src, str) or not src:

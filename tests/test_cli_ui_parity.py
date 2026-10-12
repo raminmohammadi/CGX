@@ -47,7 +47,6 @@ PARITY_MAP = {
     "rollback": "rollback",
     "settings": "trace",     # settings/trace runtime toggle
     "setup": "model",        # model list / pull
-    "sites": "site",
     "skills": "skills",
     "status": "status",
     "usage": "usage",

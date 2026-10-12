@@ -13,14 +13,14 @@ provider configuration before saving it.
 from __future__ import annotations
 
 import time
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import asyncio
 import json as _json
 import logging
 import re
 import threading
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from fastapi import APIRouter
 from pydantic import BaseModel
@@ -310,15 +310,19 @@ _OPENAI_FALLBACK = [
 ]
 # Short list of strong chat/coder models served by HF Inference Providers,
 # used when the live router listing is unavailable so the dropdown is never
-# empty for a user who just picked the Hugging Face kind.
+# empty for a user who just picked the Hugging Face kind. Every id MUST be
+# present in ``GET https://router.huggingface.co/v1/models``: a fallback the
+# router no longer serves looks fine in the dropdown and then fails on the
+# first chat request, which is worse than an empty list. Re-verify against
+# that endpoint whenever this changes (last checked 2026-10-11).
 _HF_FALLBACK = [
     "openai/gpt-oss-20b",
     "openai/gpt-oss-120b",
     "Qwen/Qwen2.5-Coder-32B-Instruct",
-    "Qwen/Qwen3-Coder-480B-A35B-Instruct",
+    "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+    "Qwen/Qwen3-235B-A22B-Instruct-2507",
     "deepseek-ai/DeepSeek-V3-0324",
     "meta-llama/Llama-3.3-70B-Instruct",
-    "zai-org/GLM-4.5",
 ]
 
 # OpenAI returns every model id including embeddings/audio/image; this filter
@@ -762,28 +766,71 @@ class HfHubModel(BaseModel):
 
 class HfModelsResponse(BaseModel):
     models: List[HfHubModel] = []
+    # One Hub page per response. ``next_cursor`` is the opaque token the Hub
+    # hands back in its ``Link: ...; rel="next"`` header; the client passes it
+    # straight back as ``?cursor=`` for the following page. Pages are never
+    # auto-followed server-side: the unauthenticated Hub budget is 500
+    # requests / 5 min, so one click must cost one request.
+    next_cursor: Optional[str] = None
+    has_more: bool = False
+    # Effective (clamped) page size, so the client can tell a short last page
+    # from a full one.
+    limit: int = 0
+    # Human-readable reason when the Hub could not be queried (rate limit,
+    # offline). ``models`` is empty in that case; without this the panel
+    # rendered an HTTP 429 as "No models found".
+    error: Optional[str] = None
 
 
-def _hf_hub_gguf_list(search: str, sort: str, limit: int) -> List[HfHubModel]:
-    """Browse GGUF repositories on the Hub that Ollama can pull directly.
+# Alphabet of the Hub's opaque pagination token (URL-safe base64 as it comes
+# back decoded from the ``Link`` header). A cursor outside this set is dropped
+# rather than forwarded: the params mapping URL-encodes it anyway, but keeping
+# the SSRF barrier an allowlist means a crafted value can't smuggle anything
+# into the outbound request even if that encoding ever changes.
+_HF_CURSOR_RE = re.compile(r"[A-Za-z0-9+/=_%-]{1,2048}")
+
+
+def _hf_page_size(limit: int) -> int:
+    """Clamp a requested page size to the Hub's per-request maximum of 100."""
+    return max(1, min(int(limit or 30), 100))
+
+
+def _hf_hub_gguf_list(
+    search: str, sort: str, limit: int, cursor: Optional[str] = None,
+) -> Tuple[List[HfHubModel], Optional[str]]:
+    """Browse one page of GGUF repositories on the Hub that Ollama can pull.
 
     Queries the public Hub catalog at ``huggingface.co/api/models`` filtered
     to ``gguf`` models. The host is a fixed constant and every user value goes
     through the ``params`` mapping (URL-encoded), so nothing attacker-supplied
-    can redirect the request off-host (SSRF barrier).
+    can redirect the request off-host (SSRF barrier). Returns the page plus
+    the cursor for the next one (``None`` on the last page).
     """
     import requests as _req
 
     sort_key = _HF_HUB_SORTS.get(sort, "trendingScore")
-    n = max(1, min(int(limit or 30), 100))
+    n = _hf_page_size(limit)
     params = {"filter": "gguf", "sort": sort_key, "limit": n, "full": "true"}
     if search.strip():
         params["search"] = search.strip()
+    if cursor and _HF_CURSOR_RE.fullmatch(cursor):
+        params["cursor"] = cursor
     r = _req.get(f"{_HF_HUB_BASE}/api/models", params=params, timeout=15)
     r.raise_for_status()
+    # The Hub paginates via ``Link: <url>; rel="next"``. That URL is never
+    # followed -- only its ``cursor`` is lifted out, and only when the link
+    # points back at the Hub and the token would pass the same check applied
+    # above on the way back in, so ``has_more`` never advertises a cursor the
+    # client can't actually use.
+    nxt: Optional[str] = None
+    link = r.links.get("next", {}).get("url")
+    if link and urlparse(link).netloc == "huggingface.co":
+        nxt = parse_qs(urlparse(link).query).get("cursor", [None])[0]
+        if nxt and not _HF_CURSOR_RE.fullmatch(nxt):
+            nxt = None
     data = r.json() if r.content else []
     if not isinstance(data, list):
-        return []
+        return [], None
     out: List[HfHubModel] = []
     for m in data:
         if not isinstance(m, dict):
@@ -810,19 +857,41 @@ def _hf_hub_gguf_list(search: str, sort: str, limit: int) -> List[HfHubModel]:
             pull_tag=f"hf.co/{mid}",
             quants=quants,
         ))
-    return out
+    return out, nxt
 
 
 @router.get("/setup/hf_models", response_model=HfModelsResponse)
-def hf_models(search: str = "", sort: str = "trending_score", limit: int = 30) -> HfModelsResponse:
+def hf_models(
+    search: str = "",
+    sort: str = "trending_score",
+    limit: int = 30,
+    cursor: Optional[str] = None,
+) -> HfModelsResponse:
     """List GGUF models on the Hugging Face Hub for one-click Ollama pulls.
 
     Powers the Settings "Browse Hugging Face" panel. Each entry carries a
     ready-to-use ``pull_tag`` (``hf.co/<repo>``) plus any detected quant
-    labels so the user can pull a specific quantization. Returns an empty
-    list on any upstream failure so the panel degrades gracefully.
+    labels so the user can pull a specific quantization.
+
+    Serves exactly one Hub page per call; ``cursor`` is the ``next_cursor``
+    from a previous response (a malformed one is ignored, which yields the
+    first page). Upstream failures still answer HTTP 200 with an empty list so
+    the panel degrades gracefully, but ``error`` carries the reason -- the
+    Hub's HTTP 429 rate limit used to be indistinguishable from "no matches".
     """
+    import requests as _req
+
     try:
-        return HfModelsResponse(models=_hf_hub_gguf_list(search, sort, limit))
-    except Exception:
-        return HfModelsResponse(models=[])
+        models, nxt = _hf_hub_gguf_list(search, sort, limit, cursor)
+    except _req.HTTPError as exc:
+        status = getattr(exc.response, "status_code", None) or "error"
+        logger.warning("hf_models: Hub returned HTTP %s", status)
+        return HfModelsResponse(
+            models=[], error=f"Hugging Face Hub returned HTTP {status}",
+        )
+    except Exception as exc:
+        logger.warning("hf_models: Hub unreachable: %s", exc)
+        return HfModelsResponse(models=[], error="Hugging Face Hub unreachable")
+    return HfModelsResponse(
+        models=models, next_cursor=nxt, has_more=bool(nxt), limit=_hf_page_size(limit),
+    )

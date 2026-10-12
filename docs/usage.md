@@ -131,15 +131,20 @@ the matching REST route uses:
 | `cgx skills` | `list` · `show` · `create` · `edit` · `delete` (`--markdown`) |
 | `cgx profile` / `cgx agent-profile` | `list` · `show` · `add` · `rm` |
 | `cgx context` | `show` · `edit` · `rm` (repo `CGX.md`) |
-| `cgx site` | `list` · `new` · `generate` · `revise` · `path` · `themes` |
-| `cgx session` | `list` · `show` · `rm` · `send` · `decide` |
+| `cgx session` | `list` · `show` · `rm` · `send` · `decide` · `preview` |
 | `cgx model` | `list` · `matrix` · `fit` · `pull` · `embed-list` · `embed-pull` |
-| `cgx mcp` | `list` · `enable` · `disable` · `tools` |
+| `cgx mcp` | `list` · `catalog` · `add` · `add-custom` · `rm` · `set-env` · `test` · `enable` · `disable` · `tools` |
 | `cgx activity` / `cgx usage` / `cgx feedback` / `cgx monitor` | observability reads (+ `feedback add`) |
 | `cgx govdata` / `cgx admin` | `policy`/`scan`/`purge`/`erase` · `overview`/`logs`/`metrics`/`purge-logs` |
 | `cgx trace` · `cgx metrics` · `cgx health` · `cgx rollback` · `cgx approvals` | runtime toggles, probes, undo, HITL |
 
-`session send`/`decide` and the core verbs stream live; destructive verbs
+`session send`/`decide` and the core verbs stream live; `session send` on a
+**finished swarm build** applies the message as feedback (a precise revision
+plus re-verification) instead of starting a new session; `send`/`decide` also
+take the shared provider flags (`--profile`, or `--provider --model
+--base-url`) **per turn**, so a follow-up or a revision can run on a different
+model than the original build -- `--model` overrides a saved profile's model
+rather than being ignored next to `--profile`; destructive verbs
 (`govdata purge`/`erase`, `admin purge-logs`) require an explicit scope flag.
 See [CLI-Reference](../wiki/CLI-Reference.md) for the full matrix.
 
@@ -355,12 +360,21 @@ and only the token varies. The token is also read from the `HF_TOKEN` /
 `HUGGINGFACEHUB_API_TOKEN` environment variables when not supplied inline.
 The model dropdown is populated from the router's **public** `/v1/models`
 list (no token required to browse); the token is only needed for the
-actual inference call.
+actual inference call. That presets dropdown is labelled **Inference
+Providers (N)** because only models the router serves work through it; any
+other id can still be typed into the Model field.
 
 The **Settings → Browse Hugging Face** panel additionally lists GGUF
 repositories from the Hub with live search and sort, and **Pull** hands
 the `hf.co/<repo>[:<quant>]` tag to your local Ollama daemon -- no HF
-token required, since the download goes through Ollama. After the pull,
+token required, since the download goes through Ollama. Only GGUF
+repositories are listed for the same reason: Ollama's `hf.co/<repo>` loader
+accepts nothing else. Results arrive **40 per page** in the chosen sort
+order and **Load more** follows the Hub's own cursor -- one click, one Hub
+request, because the unauthenticated budget is 500 requests per 5 minutes
+-- and when the Hub answers with an error, including that HTTP 429 rate
+limit, the panel shows it inline instead of an empty "No models found".
+After the pull,
 the model is re-aliased to a clean local name (e.g.
 `hf.co/ornith-ai/Ornith-1.0-9B-GGUF` -> `Ornith-1.0-9B-GGUF`) instead of
 being stored under the full web address. The panel sends this via the
@@ -717,6 +731,73 @@ creation and overridable from the launcher's mode picker
   the agent asks clarification questions, plans a layered file
   manifest, and only writes anything to disk after you approve the
   plan.
+* **Swarm mode** -- the default for an empty folder: a Tech Lead plans,
+  a Developer writes one file per turn, a Verifier builds, smoke-tests
+  and screenshots the result (see [swarm-design.md](swarm-design.md)).
+  A finished swarm build stays open for **feedback**: see *Review ->
+  feedback -> revise* below.
+
+<details>
+<summary>
+
+### Review -> feedback -> revise (swarm builds)
+</summary>
+
+When a swarm build finishes, the Agent page leads with a **Build result**
+panel: the verifier's one-line verdict, one **screenshot per route** the
+headless browser loaded, an **Open live preview** button that serves the
+real production bundle on a local port (client-side routes and assets
+intact), and the history of revisions. Review it, then type what should
+change in the composer -- it now reads *Describe what to change* and the
+button says **Revise**:
+
+```
+make the top bar span the full width of the page
+the Send button should sit on the same row as the textarea
+remember the API key after a reload
+why is the settings page blank?
+```
+
+The message does **not** start a new plan. `SWARM_REVISE` first
+localizes the feedback to the exact planned files -- the component or
+route it names, the UI copy it quotes, the file *role* a concern maps to
+(visual words -> the app stylesheet, connection words -> the API client,
+"remember after reload" -> the storage helper), the routes the last
+runtime check flagged -- then asks the model once for a per-file
+instruction restricted to those files, applies each as a grounded
+modification of the **current** file (and re-asks once if the model hands
+the file back unchanged), and hands the tree to `SWARM_VERIFY`. The
+revised app is rebuilt, smoke-tested and **re-screenshotted** before you
+see it, and the revision's report lists every file touched with the
+instruction, *why that file*, and a diff. With a local vision model
+available (`CGX_VISION_MODEL`, auto-detected), the verifier also compares
+the before/after screenshots against your words and reports whether the
+request was **visibly addressed**; if not, CGX spends one automatic
+follow-up revision with the evidence (`CGX_FEEDBACK_AUTOFIX=1`; `off`
+to disable) before handing back. Feedback that cannot be mapped to any
+file is reported as such (the task shows the reason; the build keeps its
+verdict) so you can name the screen or element you mean.
+
+The composer also carries a **Model for the next message** selector listing
+your saved profiles (`<name> · <model>`). Picking one sets the active
+provider -- workspace-wide, exactly as Settings does -- so the revision, or
+a follow-up objective on any session, runs on that model; a run already in
+progress keeps the model it started with, and while a swarm build is still
+mid-chain the message is refused with `409`, so wait for the verdict or
+press **Stop** first.
+
+The same loop works from the terminal -- `cgx session preview <sid>`
+prints the verdict, each route's screenshot path and the revision
+history, then serves the production bundle on a local port until Ctrl-C
+(`--no-serve` for JSON only); `cgx session send <sid> "make the top bar
+full width"` continues the finished session and prints `✎ revision #1:
+changed src/components/TopBar.jsx ...` followed by the verifier's verdict
+(`--profile <name>`, or `--provider --model --base-url`, runs that turn on
+a different model than the original build) -- and over HTTP (`POST /{sid}/message` on a finished
+swarm session; `409` while a build is still running). A pure question
+("how does the login work?") still routes to investigation.
+
+</details>
 
 <details>
 <summary>
@@ -1166,7 +1247,7 @@ clear error so the UI can surface the failure without re-posting.
 ### HTTP surface
 </summary>
 
-Seven JSON endpoints plus a `GET /{sid}/events` SSE stream. While a
+Ten JSON endpoints plus a `GET /{sid}/events` SSE stream. While a
 task is `in_progress` (other than an `ASK_USER`) the UI follows
 progress over the SSE feed and falls back to polling
 `GET /api/agent-session/{sid}` only when the stream is unhealthy:
@@ -1177,7 +1258,10 @@ progress over the SSE feed and falls back to polling
 | `GET`  | `/api/agent-session?project_root=...` | List sessions for the project. |
 | `GET`  | `/api/agent-session/{sid}`            | Full snapshot: `{session, tasks, artifacts, facts, decisions}`. |
 | `GET`  | `/api/agent-session/{sid}/events`     | **SSE** stream of live session events (a `snapshot` frame first, then one frame per store write, 15 s `ping` keep-alives). Subscribe with an `EventSource`. |
-| `POST` | `/api/agent-session/{sid}/message`    | `{message, provider, index, run_initial_task?}` -- post a follow-up; spawns a sibling `EXPLORE` when no `ASK_USER` is open. |
+| `POST` | `/api/agent-session/{sid}/message`    | `{message, provider, index, run_initial_task?}` -- post a follow-up; spawns a sibling `EXPLORE` when no `ASK_USER` is open. On a **finished swarm build** the message is **feedback**: the session reopens and `SWARM_REVISE -> SWARM_VERIFY` run; `409` while the build is still mid-chain. |
+| `GET`  | `/api/agent-session/{sid}/screenshots/{name}` | One route screenshot the verifier's browser smoke took (`index.png`, `settings.png`; bare `*.png` names only, served from `<project_root>/.cgx/screenshots/`). |
+| `POST` | `/api/agent-session/{sid}/preview`    | Start (or reuse) a **live preview** server for the build's production bundle; returns `{url, port, dist, host}`. `404` until the build has compiled. Binds `CGX_PREVIEW_HOST` (default loopback). |
+| `DELETE` | `/api/agent-session/{sid}/preview`  | Stop the preview server. |
 | `POST` | `/api/agent-session/{sid}/decision`   | `{task_id, chosen, rationale?, provider, index, run_initial_task?}` -- resolve a pending `ASK_USER`. |
 | `POST` | `/api/agent-session/{sid}/cancel`     | Cooperative stop -- the running drain halts after the current task finishes; a later message/decision re-drives from where it stopped. |
 | `DELETE` | `/api/agent-session/{sid}?project_root=...` | Discard the session and its tasks / facts / decisions / artifacts (SQLite `ON DELETE CASCADE`). Returns `{deleted: sid}` or 404. |
