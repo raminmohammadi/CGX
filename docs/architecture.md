@@ -496,9 +496,10 @@ retrieval, codegen, and provider stacks as the ask/plan surfaces.
 ### Session modes (`cgx.session.mode`)
 </summary>
 
-A session runs in one of two **modes** -- `explore` (modify an
-existing codebase) or `greenfield` (scaffold a new project from
-scratch). The mode is fixed at session creation and dictates which
+A session runs in one of three **modes** -- `explore` (modify an
+existing codebase), `greenfield` (scaffold a new project from
+scratch) or `swarm` (the plan-driven Tech Lead / Developer / Verifier
+build, the default for an empty folder). The mode is fixed at session creation and dictates which
 root task the router seeds and which executor branch the runner
 walks. `cgx.session.mode.detect_mode(project_root)` is the
 deterministic auto-detector; callers can override it explicitly via
@@ -513,6 +514,13 @@ the `POST /api/agent-session` body.
   index. The session seeds `CLARIFY_REQUIREMENTS` and walks the
   scaffold loop (`clarify → decompose → scaffold → apply → verify`).
   No retrieval is performed; everything is goal-driven.
+* **`swarm`** -- an empty or missing project root (the detector's
+  first rule). The session seeds `SWARM_TECH_LEAD` (or
+  `SWARM_ASSESS` for a non-empty repo) and walks
+  `tech lead → developer (one file per task) → verify`. A finished
+  swarm build stays open: a follow-up message is feedback that runs
+  `SWARM_REVISE → SWARM_VERIFY` on the same tree (see
+  [swarm-design.md](swarm-design.md#feedback-loop----review-revise-re-verify)).
 
 The detector prefers `greenfield` whenever the project signals are
 ambiguous, on the principle that mis-seeding `EXPLORE` against a
@@ -1330,7 +1338,7 @@ session-shaped persistence layout:
 ### HTTP surface (`cgx.webui.routes.agent_session`)
 </summary>
 
-Mounted at `/api/agent-session` -- seven JSON endpoints plus one SSE
+Mounted at `/api/agent-session` -- ten JSON endpoints plus one SSE
 stream.
 
 | Method | Path                                  | Purpose |
@@ -1339,7 +1347,10 @@ stream.
 | `GET`  | `/api/agent-session?project_root=...` | List sessions for a project. |
 | `GET`  | `/api/agent-session/{sid}`            | Full state snapshot (`session + tasks + artifacts + facts + decisions`). |
 | `GET`  | `/api/agent-session/{sid}/events`     | **SSE** stream of live session events off the process-wide `EventBus`; a `snapshot` frame first, then one named frame per store write, with 15 s `ping` keep-alives. |
-| `POST` | `/api/agent-session/{sid}/message`    | Post a follow-up message. Spawns a sibling `EXPLORE` when no `ASK_USER` is open. |
+| `POST` | `/api/agent-session/{sid}/message`    | Post a follow-up message. Spawns a sibling `EXPLORE` when no `ASK_USER` is open. On a **finished swarm build** the message is feedback: the router reopens the session and spawns `SWARM_REVISE` (which chains to `SWARM_VERIFY`); `409` while the build is still mid-chain. The request's `provider` builds that turn's deps, so a follow-up can run on a different model. |
+| `GET`  | `/api/agent-session/{sid}/screenshots/{name}` | A route screenshot the swarm verifier's browser smoke wrote to `<project_root>/.cgx/screenshots/` (bare `*.png` names only; the resolved path must stay in that folder). |
+| `POST` | `/api/agent-session/{sid}/preview`    | Start (or reuse) a live preview server for the build's production bundle (`dist/`), the smoke's SPA server on an ephemeral port bound to `CGX_PREVIEW_HOST` (default loopback). `404` until the build has compiled. |
+| `DELETE` | `/api/agent-session/{sid}/preview`  | Stop the preview server (also stopped when the session is deleted). |
 | `POST` | `/api/agent-session/{sid}/decision`   | Resolve a pending `ASK_USER` with a typed `{task_id, chosen, rationale?}` payload. |
 | `POST` | `/api/agent-session/{sid}/cancel`     | Cooperative stop (**P2.2**): the running drain halts after the current task finishes (no mid-flight abort); a later message/decision re-drives from where it stopped. |
 | `DELETE` | `/api/agent-session/{sid}`          | Discard a session and its aggregate (tasks / facts / decisions / artifacts) via SQLite `ON DELETE CASCADE`. Returns `{deleted: sid}` or 404. |
@@ -1368,8 +1379,9 @@ stream is unhealthy.
 modular components live under `frontend/src/components/agent/`:
 
 * `SessionLauncher.tsx` -- create a session (objective + project
-  root + mode picker: *auto / explore / greenfield*; *auto* defers
-  to `detect_mode`).
+  root + mode picker: *auto / swarm / explore*; *auto* defers
+  to `detect_mode`, which picks swarm for an empty root), plus the
+  swarm *approve plan before building* checkbox.
 * `TaskTree.tsx` -- hierarchical DAG renderer keyed on
   `parent_task_id`; depth-based indentation, status icons, selection
   highlighting. Orphaned tasks re-surface at the top level so a
@@ -1397,7 +1409,20 @@ modular components live under `frontend/src/components/agent/`:
   An LLM-trace panel reads `LLM_CALL` facts (**Phase 5.1**) and
   surfaces provider, model, latency, and tokens per call.
 * `LiveView.tsx` -- right-hand active-task pane with polling and a
-  mode badge in the session header (`explore` / `greenfield`).
+  mode badge in the session header (`explore` / `greenfield` /
+  `swarm`).
+* `BuildResult.tsx` -- leads the centre pane once a swarm session holds
+  a `swarm_verify_report`: the verdict, one screenshot per route
+  (`GET /{sid}/screenshots/{name}`), **Open live preview** / **Preview
+  here** (`POST /{sid}/preview`), and the revision history (each
+  `swarm_revision` with its feedback parts, per-file instruction, *why
+  this file*, outcome, diff and screenshot-review verdict).
+  `ArtifactPreview.tsx` renders both artifact kinds as well.
+* `FollowUpBar.tsx` -- the composer. On a finished swarm build it reads
+  *Describe what to change* and its button **Revise**; its **Model for
+  the next message** selector lists the saved profiles and applies the
+  pick to the workspace provider (`useWorkspace().applyProfile`), which
+  is what the next `POST /{sid}/message` carries.
 
 `frontend/src/store/agentSession.ts` (Zustand + `persist` middleware,
 key `cgx-agent-session`) holds the active session id, the selected
@@ -1478,13 +1503,25 @@ three divergent hardcoded dispatch chains. `parse_tool_calls` extracts every
 `describe_for_prompt` auto-injects each role's tool list into its system prompt
 so the agent's advertised toolset always matches what can run. Native tools:
 `run_python_probe`, `file_skeleton`, `list_symbols`, `query_codebase`,
-`search_web`.
+`search_web`, `fetch_url` (`file_skeleton` / `list_symbols` understand JS/TS
+modules too, via `cgx.session.js_symbols`).
 
 **MCP** (`cgx.mcp`, optional `cgx[mcp]`): external Model Context Protocol tool
-servers, exposed as three lazy-discovery registry tools (`mcp_list_servers` /
-`mcp_list_tools` / `mcp_call`). Servers live in a local `~/.cgx/mcp.json`
-roster (stdio/http, per-server enable, env-sourced bearer auth), so adding a
-tool server is a config edit. See [`mcp.md`](mcp.md).
+servers, exposed as four lazy-discovery registry tools (`mcp_list_servers` /
+`mcp_list_tools` / `mcp_describe_tool` / `mcp_call`). Servers live in a local
+`~/.cgx/mcp.json` roster (stdio/http, per-server enable, `${VAR}` references
+resolved from the environment or the OS keyring), a curated **catalog** of
+common developer servers (`cgx.mcp.catalog`) adds one in a click, and each
+enabled server's *agent hint* is injected into the Tech Lead and Developer
+prompts so a local model knows when to reach for it. See [`mcp.md`](mcp.md).
+
+**Design layer, runtime smoke, feedback loop.** UI-bearing swarm builds get a
+deterministic design brief, a CGX-written tokens stylesheet, design checks and
+a design gate (`cgx.design`, [`design.md`](design.md)); the Verifier loads
+every route in headless Chrome (`cgx.codegen.browser_smoke`), screenshots it
+and repairs a blank route once; and a finished build accepts feedback that
+`SWARM_REVISE` localizes to the exact files and re-verifies
+([`swarm-design.md`](swarm-design.md)).
 
 **Human-in-the-loop approval** (`cgx.session.approval`): an opt-in gate at
 registry dispatch that requires human sign-off for risky tool calls

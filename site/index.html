@@ -830,7 +830,7 @@ flowchart LR
                 <li><strong>Index</strong> — point at a root or upload a zip; cancel mid-run.</li>
                 <li><strong>Ask</strong> — streaming thought-process panel, then the grounded answer.</li>
                 <li><strong>Plan</strong> — validate diffs and run impacted tests before you read them.</li>
-                <li><strong>Agent</strong> — the task DAG with status icons, facts, artifacts, and Undo; explore, greenfield, or <strong>swarm</strong> mode with a live Swarm Operations feed.</li>
+                <li><strong>Agent</strong> — the task DAG with status icons, facts, artifacts, and Undo; explore, greenfield, or <strong>swarm</strong> mode with a live Swarm Operations feed. A finished swarm build shows a <strong>Build result</strong> panel (verdict, a screenshot per route, live preview) and the composer turns into a <strong>Revise</strong> box, with a <strong>Model for the next message</strong> selector to run any follow-up on a different saved profile.</li>
                 <li><strong>Ops</strong> — ten-tab MLOps hub: metrics, activity, monitoring, cost, feedback, governance, health, and a Trace explorer.</li>
                 <li><strong>Hardware</strong> — fit verdicts per model; fully offline.</li>
               </ul>
@@ -861,7 +861,7 @@ flowchart LR
 
 <span class="c"># everything the web UI can do, as scriptable command groups</span>
 <span class="p">$</span> cgx skills list <span class="c"># + profile · agent-profile · context</span>
-<span class="p">$</span> cgx session list <span class="c"># inspect/drive: show · rm · send · decide</span>
+<span class="p">$</span> cgx session list <span class="c"># inspect/drive: show · rm · send · decide · preview</span>
 <span class="p">$</span> cgx mcp catalog <span class="c"># add · test · set-env + model · activity · usage</span>
 <span class="p">$</span> cgx govdata policy <span class="c"># + admin · trace · metrics · health · rollback</span></code></pre>
             </div>
@@ -1054,7 +1054,8 @@ ans = <span class="f">answer_with_llm</span>(
             <article class="card reveal">
               <h3>No model yet? Browse and pull one.</h3>
               <p>
-                Settings → <strong>Browse Hugging Face</strong> lists GGUF repos from the Hub, sizes each
+                Settings → <strong>Browse Hugging Face</strong> lists GGUF repos from the Hub, 40 at a time
+                with <strong>Load more</strong> following the Hub's own cursor, sizes each
                 against your hardware with <strong>Check fit</strong>, and <strong>Pull</strong>s it
                 straight into your local Ollama daemon — then <strong>re-aliases</strong> the download to
                 a clean local name (<code class="inline">ornith-1.0-9b-gguf</code>) instead of the full

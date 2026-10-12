@@ -387,6 +387,16 @@ Deletion is **hard-limited to trace/log files** (`cgx-trace.log` /
 `agent.log` and their backups), refuses symlinks, and never touches other
 files — see **[[Privacy and Security]]**.
 
+**Swarm builds and revisions.** A swarm run also writes `swarm_beat` events
+to the project's `agent.log` (and as facts the Agent page renders), one per
+step, keyed by **role**: `tech_lead` (plan, design brief), `developer`
+(generate / gate / write per file), `verify` (structural, design checks,
+build, `runtime_smoke`, `vision_critic`, `feedback_check`, report) and
+`reviser` (a feedback round: `localize`, `candidates`, `plan`, `apply`,
+`report`, plus `noop_dropped` when a no-op instruction was discarded). Route
+screenshots land in `<project_root>/.cgx/screenshots/`, with the copies taken
+before each revision under `before-rev<n>/`.
+
 **Below the controls:**
 
 - **Category chips** — `all` plus one chip per derived category (llm, router,

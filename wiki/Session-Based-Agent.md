@@ -12,21 +12,27 @@ This page is the practical guide. The full internals live in
 
 ---
 
-## Two modes
+## Modes
 
 The mode is auto-detected by `detect_mode(project_root)` at session
-creation (or set explicitly via the launcher / API):
+creation (or set explicitly via the launcher's *auto / swarm / explore*
+picker or the API):
 
+- **Swarm** — the project root is missing or empty (the default for a new
+  project). A Tech Lead plans, a Developer writes one file per turn, a
+  Verifier builds, tests and (for frontends) screenshots every route; the
+  finished build then accepts feedback as precise revisions. See
+  **[[Swarm Agent]]**.
 - **Explore** — the project root exists and has a usable FAISS index.
   Use it for exploratory questions ("how should we refactor this layer?")
   and grounded code changes on an existing codebase.
-- **Greenfield** — the project root is missing, empty, or has no index.
-  Use it to scaffold a brand-new project from a plain-language idea; the
-  agent clarifies requirements, plans a layered file manifest, and only
-  writes after you approve.
+- **Greenfield** — the project root has files but no index (or the mode is
+  chosen explicitly via the API / `--mode greenfield`). The agent
+  clarifies requirements, plans a layered file manifest, and only writes
+  after you approve.
 
-The detector prefers **greenfield** when signals are ambiguous, because
-mis-seeding explore against a missing index fails immediately while
+For a populated but unindexed root the detector prefers **greenfield**,
+because mis-seeding explore against a missing index fails immediately while
 greenfield still produces useful clarification questions.
 
 ---

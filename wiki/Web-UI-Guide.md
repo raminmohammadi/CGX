@@ -52,7 +52,7 @@ pages is non-destructive. See **[[Self Testing Code Generation]]**.
 
 ### Agent Loop (`/agent`)
 The **session-based** agentic surface. Start a session with an objective, pick
-a **mode** (auto / explore / greenfield / swarm), and watch the agent walk the chain,
+a **mode** (auto / swarm / explore; *auto* builds with the swarm in an empty folder), and watch the agent walk the chain,
 pausing at every branch for a typed decision. The task tree shows the full DAG
 with status icons; a side panel surfaces the Knowledge Base (facts) and
 Artifacts. Nothing reaches disk until you tick the approval checkpoint, and an

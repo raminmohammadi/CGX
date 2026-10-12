@@ -526,6 +526,32 @@ The whole run streams `swarm_beat` telemetry that the Agent page
 renders as a live *Swarm Operations* feed. Full reference:
 [`docs/swarm-design.md`](swarm-design.md).
 
+For a UI-bearing goal ("a chatbot app", "a dashboard", "a landing
+page") the three roles share a deterministic **design brief**
+(`cgx.design`): the product archetype with its screens, components and
+checkable UX requirements, a contrast-verified theme, and the canonical
+files a real frontend ships. CGX writes the design-tokens stylesheet
+itself, the Developer gets per-file UI guidance, and the Verifier gates
+on UI quality, loads every route in headless Chrome, screenshots it and
+repairs a blank or crashing route once -- so "verified" means the app
+actually renders, not just that it compiles. See
+[`docs/design.md`](design.md).
+
+A finished swarm build is not the end of the conversation. The Agent
+page shows the verdict, a screenshot per route and a live preview of
+the real bundle; the user's next message ("make the top bar span the
+full width", "remember the API key after a reload") becomes a
+**`SWARM_REVISE`** task. It localizes the feedback to the exact files
+with stated reasons (named components, routes, quoted UI copy, the file
+role a concern maps to, the DOM ancestry and its CSS rules), asks the
+model once for a per-file instruction, applies each as a grounded
+modification of the whole current file, checks that the diff touched
+what the instruction named, and hands the tree back to `SWARM_VERIFY`.
+For well-understood layout failures -- a header narrowed by a centring
+`body` two levels up -- a deterministic CSS diagnosis supplies the fix
+when a weak model cannot. Each message carries its own provider, so a
+follow-up can run on a different model.
+
 </details>
 
 <details>

@@ -117,7 +117,10 @@ The **[[Session Based Agent]]** is the orchestration layer above this
 pipeline. It turns a natural-language goal into a persistent DAG of typed
 tasks — exploring an existing codebase or scaffolding a new project —
 pausing at each branch for a human decision, and reusing the same
-retrieval, codegen, and provider stacks described here.
+retrieval, codegen, and provider stacks described here. The
+**[[Swarm Agent]]** builds new projects file by file, verifies the real
+build (including a headless-browser check and screenshots for frontends),
+and then takes your feedback as precise revisions of the exact files.
 
 ---
 

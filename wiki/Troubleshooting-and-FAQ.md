@@ -62,6 +62,24 @@ Keys are read from the environment or the keyring-backed profile store,
 (or save them via a profile) and re-**Ping**. See
 **[[Providers and Models]]**.
 
+### "Browse Hugging Face" shows only a few models
+The panel lists GGUF repositories only (pulls go through Ollama's
+`hf.co/<repo>` loader) and serves **40 per page** in the chosen sort
+order: click **Load more** at the bottom to fetch the next page, and the
+footer says when more are available. If the panel shows an error such as
+"Hugging Face Hub returned HTTP 429", you hit the Hub's unauthenticated
+rate limit (500 requests per 5 minutes); wait a few minutes and retry.
+The **presets** dropdown next to the Model field for the Hugging Face
+provider kind is a different list: only the models Hugging Face Inference
+Providers serve through the router (labelled *Inference Providers (N)*);
+any other id can still be typed. See **[[Providers and Models]]**.
+
+### MCP servers launched with `npx` fail with `E401`
+Your `~/.npmrc` points npm at a private registry (an expired token is the
+usual cause). Set `CGX_NPM_REGISTRY=https://registry.npmjs.org/` so MCP
+children use the public registry without touching your npmrc;
+`cgx mcp test <name>` prints this hint when it sees the failure.
+
 ### Re-indexing seems to re-embed everything
 Indexing is incremental by default. A full re-embed happens when the
 embedding `model_name`, `dim`, or `normalize` flag changed (the cache is
@@ -133,6 +151,36 @@ phantom third-party imports and contract mismatches are **advisory** now: since
 reconciliation installs every real import, the real build/test is the
 authority, and a truly hallucinated package fails the real install anyway. See
 **[[Swarm Agent]]**.
+
+### My swarm build says "verified" but the app looks wrong
+"Verified" means the tree builds, its routes render without errors in a
+headless browser, and no fatal design defect remains -- not that it matches
+your taste. Review the screenshots or **Open live preview** in the Agent
+page's **Build result** panel (or `cgx session preview <sid>`), then
+describe what to change in the composer: CGX localizes the feedback to the
+exact files, applies it and re-verifies. If no Chrome/Chromium is installed
+the runtime check is skipped (set `CGX_BROWSER` to a binary to enable it).
+See **[[Swarm Agent]]**.
+
+### My feedback said "nothing changed"
+The revision could not map the feedback to a file, or the model handed the
+file back unchanged twice. The build keeps its previous verdict, and the
+revision row says which. Rephrase with the screen, element or visible text
+you mean ("the Send button on the chat page", "the 'Not Connected' badge");
+the **how the files were located** details in the revision row show what the
+scan matched.
+
+### Sending feedback returns 409 / "this build is still running"
+A swarm build is still mid-chain. Wait for the verdict, or press **Stop**
+(CLI: Ctrl-C), then send the feedback again; CGX never forks a running
+build.
+
+### How do I use a different model for a follow-up?
+Pick a saved profile in the composer's **Model for the next message**
+selector before sending (it sets the active provider, as Settings does), or
+on the CLI pass `--profile <name>` and optionally `--model <id>` to
+`cgx session send`. A run already in progress keeps the model it started
+with; the choice applies to the next message. See **[[Session Based Agent]]**.
 
 ### How do I debug a session that fails in a weird place?
 Turn on **function-call tracing**: flip the toggle on the `/settings`

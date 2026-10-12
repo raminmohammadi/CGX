@@ -718,16 +718,17 @@ API, and the engine-level activation gate.
 The **🤖 Agent** tab (`/agent`) is the default agentic surface. It
 drives a **persistent, session-shaped** orchestrator under
 `cgx.session` whose state survives restarts and whose every branch is
-an explicit, replayable user decision. The agent runs in one of two
+an explicit, replayable user decision. The agent runs in one of three
 **modes**, auto-detected by `cgx.session.mode.detect_mode` at session
 creation and overridable from the launcher's mode picker
-(*auto / explore / greenfield*):
+(*auto / swarm / explore*; greenfield via the API or `--mode greenfield`):
 
 * **Explore mode** -- the project root exists and has a usable FAISS
   index. Use it for exploratory questions ("how should we refactor
   this layer?") and grounded code changes on an existing codebase.
-* **Greenfield mode** -- the project root is missing, empty, or has
-  no index. Use it to scaffold a brand-new project from scratch;
+* **Greenfield mode** -- the project root has files but no index (an
+  empty or missing root defaults to swarm). Use it to scaffold a
+  brand-new project from scratch;
   the agent asks clarification questions, plans a layered file
   manifest, and only writes anything to disk after you approve the
   plan.

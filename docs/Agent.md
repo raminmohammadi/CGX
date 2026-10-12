@@ -58,7 +58,7 @@ written. The session-based agent makes those branches first-class:
 every divergence point is an explicit `ASK_USER` task with a typed
 decision contract, and every choice is replayable.
 
-A session runs in one of two **modes** (`Session.mode`):
+A session runs in one of three **modes** (`Session.mode`):
 
 * **`explore`** -- modify an existing, indexed codebase. The router
   starts with an `EXPLORE` task that runs retrieval-grounded
@@ -67,11 +67,18 @@ A session runs in one of two **modes** (`Session.mode`):
 * **`greenfield`** -- scaffold a new project from scratch. The router
   starts with `CLARIFY_REQUIREMENTS` (no index, no retrieval) and
   walks the user through a structured clarify → decompose → approve
-  → scaffold loop. Used when the project root is empty, doesn't
-  exist yet, or has no FAISS index.
+  → scaffold loop. Used for a populated project root with no FAISS
+  index, or when chosen explicitly.
+* **`swarm`** -- the plan-driven build: a Tech Lead (`SWARM_TECH_LEAD`)
+  plans, a Developer (`SWARM_DEVELOPER`) writes one file per task, a
+  Verifier (`SWARM_VERIFY`) builds, tests, smoke-loads every frontend
+  route in headless Chrome and screenshots it. A finished build stays
+  open: a follow-up message is feedback that `SWARM_REVISE` localizes
+  to the exact files and hands back to `SWARM_VERIFY`. Full reference:
+  [`swarm-design.md`](swarm-design.md).
 
 Mode is resolved in `cgx.session.mode.detect_mode`: empty / missing
-`project_root` → greenfield; populated root but no usable
+`project_root` → swarm; populated root but no usable
 `meta.json` + records file → greenfield; everything else → explore.
 The webui route honors an explicit `mode` field on the create
 request and falls back to `detect_mode` only when none is given.
@@ -906,7 +913,9 @@ records land in the correct project log.
 | `GET`  | `/api/agent-session?project_root` | List sessions for a project. |
 | `GET`  | `/api/agent-session/{sid}`        | Full state snapshot (`session + tasks + artifacts + facts + decisions`). |
 | `GET`  | `/api/agent-session/{sid}/events` | **SSE** stream of live session events. Subscribes to the process-wide `EventBus` (`cgx.session.events`), sends a `snapshot` frame first (so a late subscriber still renders current state), then one named frame per store write; a `ping` every 15 s detects a vanished client. |
-| `POST` | `/api/agent-session/{sid}/message` | Post a follow-up message (spawns a sibling EXPLORE when no ASK is open). |
+| `POST` | `/api/agent-session/{sid}/message` | Post a follow-up message (spawns a sibling EXPLORE when no ASK is open). On a finished swarm build it is feedback: the session reopens and `SWARM_REVISE → SWARM_VERIFY` run; `409` while the build is still mid-chain. The request's `provider` builds that turn's deps, so a follow-up can use a different model. |
+| `GET`  | `/api/agent-session/{sid}/screenshots/{name}` | A route screenshot from the swarm verifier's browser smoke (`<project_root>/.cgx/screenshots/*.png`, contained to that folder). |
+| `POST` / `DELETE` | `/api/agent-session/{sid}/preview` | Start (or reuse) / stop a live preview server for the build's `dist/` on an ephemeral port bound to `CGX_PREVIEW_HOST` (default loopback). |
 | `POST` | `/api/agent-session/{sid}/decision` | Resolve a pending ASK_USER with a typed `chosen` payload. |
 | `POST` | `/api/agent-session/{sid}/cancel` | Cooperative stop (**P2.2**): flag the session so its background drain halts after the current task finishes -- no task is aborted mid-flight. Returns the snapshot immediately; a later message/decision re-drives from where it stopped. |
 | `DELETE` | `/api/agent-session/{sid}` | Discard a session and its full aggregate (tasks / facts / decisions / artifacts) via SQLite `ON DELETE CASCADE`. Returns `{deleted: sid}` or 404. |
@@ -938,8 +947,9 @@ components live under `frontend/src/components/agent/`:
   drives a 2.5 s polling fallback that only fires while a task is
   in-flight *and* the SSE stream is unhealthy.
 * `SessionLauncher.tsx` -- create a new session (objective + project
-  root + mode picker: *auto / explore / greenfield*). *Auto* defers
-  to `detect_mode`; the two explicit choices override it.
+  root + mode picker: *auto / swarm / explore*). *Auto* defers
+  to `detect_mode`; the explicit choices override it. Greenfield is
+  reachable through the API's `mode` field or `--mode greenfield`.
 * `TaskTree.tsx` -- hierarchical DAG renderer keyed on
   `parent_task_id`; depth-based indentation, status icons, selection
   highlighting. Orphaned tasks re-surface at the top level. Carries
@@ -962,8 +972,16 @@ components live under `frontend/src/components/agent/`:
   questions, layered manifests, and generated/failed file lists
   with combined unified diffs.
 * `LiveView.tsx` -- the right-hand active-task pane, with a mode
-  badge in the session header (`explore` / `greenfield`) so the
-  loop shape is visible at a glance.
+  badge in the session header (`explore` / `greenfield` / `swarm`)
+  so the loop shape is visible at a glance.
+* `BuildResult.tsx` -- for a swarm session with a verify report: the
+  verdict, one screenshot per route, **Open live preview** / **Preview
+  here**, and the revision history (feedback, files changed, per-file
+  instruction, *why this file*, diff, screenshot-review verdict).
+* `FollowUpBar.tsx` -- the composer: *Describe what to change* /
+  **Revise** on a finished swarm build, plus the **Model for the next
+  message** selector over the saved profiles (it applies the pick to
+  the workspace provider that the next message carries).
 * `SidePanel.tsx` -- tabbed view of the Knowledge Base (facts) and
   Artifacts; `ArtifactPreview.tsx` renders each artifact by kind.
 
