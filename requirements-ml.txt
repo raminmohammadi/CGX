@@ -40,5 +40,5 @@
 # last jina-compatible line (transformers 4.57.x / sentence-transformers 5.7.x)
 # avoids an ImportError at model load on a fresh install.
 sentence-transformers>=2.7,<6
-transformers>=4.40,<5
+transformers>=4.40,<6
 torch>=2.13.0

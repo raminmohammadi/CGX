@@ -36,7 +36,7 @@ embeddings = [
   # sentence-transformers 6.x hard-requires transformers>=5. So both are held on
   # the last jina-compatible line (transformers 4.57.x / sentence-transformers 5.7.x).
   "sentence-transformers>=2.7,<6",
-  "transformers>=4.40,<5",
+  "transformers>=4.40,<6",
   "torch>=2.13.0",
 ]
 faiss = ["faiss-cpu>=1.7"]
@@ -72,7 +72,7 @@ all = [
   # sentence-transformers 6.x hard-requires transformers>=5. So both are held on
   # the last jina-compatible line (transformers 4.57.x / sentence-transformers 5.7.x).
   "sentence-transformers>=2.7,<6",
-  "transformers>=4.40,<5",
+  "transformers>=4.40,<6",
   "torch>=2.13.0",
   "faiss-cpu>=1.7",
   "fastapi>=0.115",
