@@ -51,6 +51,33 @@ the pipeline as grounded as the Python side.
   "feedback"` continues the finished session and prints `✎ revision #n:
   changed ...` plus the verdict. A pure
   question still routes to investigation.
+* **Pick the model for the next message** (`FollowUpBar.tsx`,
+  `provider_factory.provider_from_profile_name`, `handlers._resolve_provider`,
+  `cgx session send/decide`). The Agent page composer gains a **Model for the
+  next message** selector over the saved profiles: picking one sets the active
+  provider (workspace-wide, as Settings does) so the next message -- a
+  feedback revision or a follow-up objective -- runs on it; a run already in
+  progress keeps its model (`_schedule_drain` coalesces onto the in-flight
+  drain and now logs that the request's provider will not apply), and a swarm
+  build mid-chain still answers `409`. On the CLI, `cgx session send`/`decide`
+  read `--profile` / `--provider --model --base-url` **per turn**, and
+  `--model` now overrides a saved profile's model everywhere (`ask`, `plan`,
+  `agent`, `status`, `session send/decide`) -- it used to be silently ignored
+  next to `--profile`.
+* **Hugging Face browser: paging, honest errors, router-only presets**
+  (`routes/setup.py`, `HuggingFacePanel.tsx`, `ActiveProviderCard.tsx`,
+  `ProfileEditModal.tsx`). **Browse Hugging Face** serves **40 repos per
+  page** in the chosen sort order and **Load more** follows the Hub's own
+  cursor (`GET /api/setup/hf_models?cursor=` -> `next_cursor` / `has_more`;
+  the cursor is validated and never auto-followed server-side because the
+  unauthenticated Hub budget is 500 requests per 5 minutes). A Hub failure --
+  including the HTTP 429 rate limit -- now comes back as `error` and is shown
+  inline instead of masquerading as "No models found", and the panel states
+  that the list is GGUF-only because pulls go through Ollama's `hf.co/<repo>`
+  loader. For the Hugging Face provider kind the presets dropdown is labelled
+  **Inference Providers (N)** with a hint that only router-served models work
+  (any other id can still be typed), and the offline fallback list was
+  re-verified against `router.huggingface.co/v1/models`.
 * **Design layer** (`cgx/design/`, see `docs/design.md`). A UI-bearing
   objective gets a deterministic **design brief**: product archetype (chat
   app, admin/CRUD dashboard, analytics dashboard, tasks tool, landing site,

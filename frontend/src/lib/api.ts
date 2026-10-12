@@ -573,6 +573,17 @@ export type HfHubModel = {
   // Detected quantization labels (``Q4_K_M`` …) for ``pull_tag:<quant>``.
   quants: string[];
 };
+export type HfModelsResponse = {
+  models: HfHubModel[];
+  // Opaque Hub cursor for the next page. It is only valid for the exact
+  // search+sort that produced it, so callers must drop it on any query change.
+  next_cursor?: string | null;
+  has_more?: boolean;
+  limit?: number;
+  // Upstream failure (rate limit, timeout) reported alongside an empty page so
+  // the panel can show why the list is short instead of a bare "No models".
+  error?: string | null;
+};
 
 // --- MCP / Approvals ---
 
@@ -760,13 +771,14 @@ export const api = {
       "POST",
       body,
     ),
-  hfModels: (params: { search?: string; sort?: string; limit?: number } = {}) => {
+  hfModels: (params: { search?: string; sort?: string; limit?: number; cursor?: string } = {}) => {
     const q = new URLSearchParams();
     if (params.search) q.set("search", params.search);
     if (params.sort) q.set("sort", params.sort);
     if (params.limit) q.set("limit", String(params.limit));
+    if (params.cursor) q.set("cursor", params.cursor);
     const qs = q.toString();
-    return jsonReq<{ models: HfHubModel[] }>(
+    return jsonReq<HfModelsResponse>(
       `/api/setup/hf_models${qs ? `?${qs}` : ""}`,
     );
   },

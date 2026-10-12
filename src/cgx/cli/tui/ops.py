@@ -114,12 +114,20 @@ def provider_kwargs(state: Any) -> Dict[str, Any]:
     A saved profile takes precedence (``use_profile``); otherwise the raw
     kind/model/base_url from the dashboard are forwarded and the handler's
     :func:`build_provider` resolves any API key from the environment.
+
+    ``model`` is forwarded on the profile path too, on purpose: ``state.model``
+    is the profile's own model unless ``--model`` (``_state_from_args``) or
+    ``/model`` replaced it, and the factory keeps the profile's model for an
+    equal or empty value, so this is how ``--profile x --model y`` reaches the
+    provider instead of being a silent no-op.
     """
     use_profile = bool(getattr(state, "profile_name", None))
     return {
         "use_profile": use_profile,
         "profile_name": getattr(state, "profile_name", None),
         "kind": state.provider_kind,
+        # On the profile path: the --model override, or the profile's own
+        # model (which the factory treats as "no override").
         "model": state.model,
         "base_url": state.base_url,
         "api_key": None,

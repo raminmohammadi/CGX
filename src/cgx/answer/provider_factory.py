@@ -120,14 +120,22 @@ def build_provider(
     )
 
 
-def provider_from_profile_name(name: str) -> LLMProvider:
-    """Resolve a saved profile by name into a ready-to-use provider."""
+def provider_from_profile_name(name: str, *,
+                               model: Optional[str] = None) -> LLMProvider:
+    """Resolve a saved profile by name into a ready-to-use provider.
+
+    ``model`` swaps the profile's model for this one provider while keeping
+    everything else the profile saved (kind, base URL, API key, temperature,
+    token budgets, endpoint quirks). It is what makes ``--profile x --model y``
+    mean "x's server and credentials, but model y" instead of silently running
+    the profile's model; an empty or ``None`` value keeps the profile's.
+    """
     p = get_profile(name)
     if p is None:
         raise ValueError(f"Profile not found: {name!r}")
     api_key = load_api_key(p.name) if p.has_api_key else None
     return build_provider(
-        kind=p.kind, model=p.model, base_url=p.base_url, api_key=api_key,
+        kind=p.kind, model=model or p.model, base_url=p.base_url, api_key=api_key,
         temperature=p.temperature, num_predict=p.num_predict,
         num_ctx=getattr(p, "num_ctx", None),
         rate_limit=getattr(p, "rate_limit", None),

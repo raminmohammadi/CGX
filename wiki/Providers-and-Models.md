@@ -68,14 +68,22 @@ The model dropdown is populated from the router's **public**
 `/v1/models` list (no token required to browse), so you can see what's
 available before pasting a key; the token is only needed for the actual
 inference call. Ping validates the token with a 1-token completion when a
-model is set, or falls back to the public model list otherwise.
+model is set, or falls back to the public model list otherwise. That presets
+dropdown is labelled **Inference Providers (N)** because only models the
+router actually serves work through it — any other id can still be typed into
+the Model field.
 
 ### Browse Hugging Face → pull GGUFs locally
 
 The **Settings → Browse Hugging Face** panel lists GGUF repositories from
 the Hub and pulls any one of them straight into your local Ollama daemon.
 No HF token is required to browse or to pull — the download goes through
-Ollama's `hf.co/<repo>` mechanism.
+Ollama's `hf.co/<repo>` mechanism. That mechanism is also why the list is
+GGUF-only: the loader accepts nothing else. Results arrive **40 per page** in
+the chosen sort order and are never auto-paged — the unauthenticated Hub
+budget is 500 requests per 5 minutes, so one click costs one request — and a
+Hub error (including that HTTP 429 rate limit) is shown inline instead of an
+empty list.
 
 **Panel controls, element by element:**
 
@@ -84,6 +92,7 @@ Ollama's `hf.co/<repo>` mechanism.
 | **Search box** | Free-text Hub search (`llama`, `qwen`, `gemma`, …). Submitting the form (or **Refresh**) reloads the list. |
 | **Sort** dropdown | **Trending** (default) · **Most downloaded** · **Most liked** · **Recently updated**. Changing it reloads immediately. |
 | **Refresh** | Re-runs the current search/sort. |
+| **Load more** | Fetches the next 40 with the Hub's own cursor (the footer reads *Showing N GGUF repos · more available*); gone once the Hub has no further page. A new search or sort starts over from page one. |
 
 **Each model row shows:** the repo id (a link to `huggingface.co/<repo>`),
 a **downloads** count and a **likes** count (compacted, e.g. `12.3k`), and a

@@ -173,6 +173,13 @@ question still routes to investigation; feedback while a build is mid-chain
 is refused (`409` / CLI error) rather than forking the build. Same loop from
 the terminal: `cgx session send <sid> "make the top bar full width"`.
 
+The composer's **Model for the next message** selector lists your saved
+profiles; picking one sets the active provider (workspace-wide, as Settings
+does) so the revision runs on it -- a run already in progress keeps its model,
+and a build still mid-chain answers `409`, so wait or **Stop** first. On the
+CLI, `--profile <name>` (or `--provider --model --base-url`) on `session
+send`/`decide` makes the same per-turn choice.
+
 ## Design-aware UI builds
 
 A UI-bearing objective (a chat app, a dashboard, a website, "an app") gets a
@@ -234,6 +241,7 @@ Use the `--mode swarm` flag in the CLI:
 python -m cgx.cli.main agent --model qwen2.5-coder:7b-instruct --mode swarm "your objective here"
 # review the result (screenshots in <root>/.cgx/screenshots/, or the Agent page's live preview), then:
 cgx session send <sid> "make the top bar span the full width"   # -> revision + re-verify
+cgx session send <sid> "tighten the copy" --profile <name>      # -> same, this turn on a saved profile (--model overrides its model)
 ```
 
 ## Extending the stack matrix

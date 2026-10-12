@@ -407,6 +407,10 @@ glance; the groups below hold the working pages:
      against your hardware with **Check fit**, and **Pull**s them straight into
      your local Ollama daemon, re-aliasing each download to a clean local name
      (e.g. `ornith-1.0-9b-gguf`) instead of the full `hf.co/<repo>` web address.
+     Results arrive **40 per page** in the chosen sort order and **Load more**
+     follows the Hub's own cursor; the list is GGUF-only because every pull
+     goes through Ollama's `hf.co/<repo>` loader, and a Hub error (including
+     the HTTP 429 rate limit) is shown inline rather than as an empty list.
    - **Observability** -- a single **tracing toggle** (equivalent to
      `CGX_TRACE=1`) that turns on the rich `@traced` records read by the Ops
      hub's Trace tab.
@@ -453,6 +457,7 @@ cgx profile add prod --kind openai   # LLM connection presets (list/show/rm)
 cgx session list                     # inspect/drive: show/rm/send/decide
 cgx session preview <sid>            # review a finished build: verdict, screenshots, live preview
 cgx session send <sid> "make the top bar full width"   # feedback on a finished build -> revise + re-verify
+cgx session send <sid> "tighten the copy" --profile <name>   # same, but this turn runs on a saved profile (--model overrides its model)
 cgx mcp catalog --table              # MCP servers: add/rm/set-env/test/enable/disable/tools
 cgx model matrix --table             # model discovery/pull, hardware fit
 cgx usage summary                    # activity · usage · feedback · monitor

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   api, ApiError,
   type AgentSessionState, type AgentSessionSummary, type TaskProgress,
-  type SessionModeValue, type ApprovalRequest,
+  type SessionModeValue, type ApprovalRequest, type ProfileSummary,
 } from "../../lib/api";
 import { useWorkspace } from "../../store/workspace";
 import { useAgentSession } from "../../store/agentSession";
@@ -21,6 +21,17 @@ export interface AgentProfileLaunch {
   skills: string[];
 }
 
+// A session is running while any non-ASK task is in flight (ready or
+// in_progress): an open ask_user node is waiting on the human, not working.
+// Also decides whether a post dispatches a fresh drain (and so a fresh
+// provider) or is picked up by the one already running.
+function isRunning(state: AgentSessionState | null): boolean {
+  return !!state && state.tasks.some(
+    (t) => t.kind !== "ask_user"
+      && (t.status === "in_progress" || t.status === "ready"),
+  );
+}
+
 // Stateful, session-shaped Agent Run view. Extracted verbatim from the
 // former single-view AgentPage.tsx (Phase 4) so it can sit under a tab
 // bar alongside Agent Profiles / Skills / New Skill; behavior here is
@@ -32,7 +43,7 @@ export function RunTab({
   pendingLaunch: AgentProfileLaunch | null;
   onLaunchConsumed: () => void;
 }) {
-  const { provider, index, projectRoot, setProjectRoot } = useWorkspace();
+  const { provider, index, projectRoot, setProjectRoot, applyProfile } = useWorkspace();
   const {
     activeId, setActiveId, selectedTaskId, setSelectedTaskId,
     runModels, setRunModel,
@@ -44,6 +55,12 @@ export function RunTab({
   const [error, setError] = useState<string | null>(null);
   const [reply, setReply] = useState("");
   const [progress, setProgress] = useState<Record<string, TaskProgress>>({});
+  // Saved LLM profiles for the composer's model picker; best-effort, the
+  // picker degrades to a Settings link when the list is empty.
+  const [profiles, setProfiles] = useState<ProfileSummary[]>([]);
+  useEffect(() => {
+    api.listProfiles().then(setProfiles).catch(() => setProfiles([]));
+  }, []);
   // Human-in-the-loop approvals raised by risky tool calls in this session.
   const [approvals, setApprovals] = useState<ApprovalRequest[]>([]);
   const [approvalBusy, setApprovalBusy] = useState<string | null>(null);
@@ -150,11 +167,7 @@ export function RunTab({
   // stream is unavailable, so a dropped stream still converges.
   useEffect(() => {
     if (!activeId || !state) return;
-    const hasInFlight = state.tasks.some(
-      (t) => t.kind !== "ask_user"
-        && (t.status === "in_progress" || t.status === "ready"),
-    );
-    if (!hasInFlight || sseOkRef.current) {
+    if (!isRunning(state) || sseOkRef.current) {
       if (pollRef.current) { window.clearInterval(pollRef.current); pollRef.current = null; }
       return;
     }
@@ -269,9 +282,15 @@ export function RunTab({
     }
   }, [activeId, projectRoot, refreshSessions, setActiveId, setSelectedTaskId]);
 
+  // The provider sent with a post only takes effect when it starts a fresh
+  // drain. A post made while the session is already running is picked up by
+  // the in-flight drain on its next loop (``_schedule_drain`` coalesces) and
+  // so executes with the deps that drain was dispatched with; recording the
+  // current model in that case would make the header's run-model note lie.
   const postDecision = useCallback(async (taskId: string,
       payload: { chosen: Record<string, any>; rationale?: string }) => {
     if (!activeId) return;
+    const wasRunning = isRunning(state);
     setPending(true); setError(null);
     try {
       const next = await api.agentSessionDecision(activeId, {
@@ -279,27 +298,28 @@ export function RunTab({
         rationale: payload.rationale ?? null,
         index, provider, run_initial_task: true,
       });
-      setRunModel(activeId, provider.model);
+      if (!wasRunning) setRunModel(activeId, provider.model);
       setState(next);
     } catch (e) {
       setError(String((e as Error)?.message || e));
     } finally { setPending(false); }
-  }, [activeId, index, provider, setRunModel]);
+  }, [activeId, index, provider, state, setRunModel]);
 
   const postMessage = useCallback(async () => {
     if (!activeId || !reply.trim()) return;
+    const wasRunning = isRunning(state);
     setPending(true); setError(null);
     try {
       const next = await api.agentSessionMessage(activeId, {
         message: reply.trim(),
         index, provider, run_initial_task: true,
       });
-      setRunModel(activeId, provider.model);
+      if (!wasRunning) setRunModel(activeId, provider.model);
       setState(next); setReply("");
     } catch (e) {
       setError(String((e as Error)?.message || e));
     } finally { setPending(false); }
-  }, [activeId, index, provider, reply, setRunModel]);
+  }, [activeId, index, provider, reply, state, setRunModel]);
 
   // Cooperative cancel (P2.2): ask the backend to stop the drain after
   // the current task. SSE then converges the snapshot to the stopped
@@ -334,10 +354,7 @@ export function RunTab({
       </div>
     );
   }
-  const running = !!state && state.tasks.some(
-    (t) => t.kind !== "ask_user"
-      && (t.status === "in_progress" || t.status === "ready"),
-  );
+  const running = isRunning(state);
 
   return (
     <div className="relative flex flex-col h-full min-h-0">
@@ -357,6 +374,7 @@ export function RunTab({
           state={state} sessions={sessions} pending={pending} error={error}
           progress={progress} running={running}
           runModel={runModels[activeId] ?? null} selectedModel={provider.model}
+          profiles={profiles} provider={provider} onPickProfile={applyProfile}
           reply={reply} setReply={setReply}
           selectedTaskId={selectedTaskId} setSelectedTaskId={setSelectedTaskId}
           onDecide={(payload) => {

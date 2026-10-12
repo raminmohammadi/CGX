@@ -140,7 +140,11 @@ the matching REST route uses:
 
 `session send`/`decide` and the core verbs stream live; `session send` on a
 **finished swarm build** applies the message as feedback (a precise revision
-plus re-verification) instead of starting a new session; destructive verbs
+plus re-verification) instead of starting a new session; `send`/`decide` also
+take the shared provider flags (`--profile`, or `--provider --model
+--base-url`) **per turn**, so a follow-up or a revision can run on a different
+model than the original build -- `--model` overrides a saved profile's model
+rather than being ignored next to `--profile`; destructive verbs
 (`govdata purge`/`erase`, `admin purge-logs`) require an explicit scope flag.
 See [CLI-Reference](../wiki/CLI-Reference.md) for the full matrix.
 
@@ -356,12 +360,21 @@ and only the token varies. The token is also read from the `HF_TOKEN` /
 `HUGGINGFACEHUB_API_TOKEN` environment variables when not supplied inline.
 The model dropdown is populated from the router's **public** `/v1/models`
 list (no token required to browse); the token is only needed for the
-actual inference call.
+actual inference call. That presets dropdown is labelled **Inference
+Providers (N)** because only models the router serves work through it; any
+other id can still be typed into the Model field.
 
 The **Settings → Browse Hugging Face** panel additionally lists GGUF
 repositories from the Hub with live search and sort, and **Pull** hands
 the `hf.co/<repo>[:<quant>]` tag to your local Ollama daemon -- no HF
-token required, since the download goes through Ollama. After the pull,
+token required, since the download goes through Ollama. Only GGUF
+repositories are listed for the same reason: Ollama's `hf.co/<repo>` loader
+accepts nothing else. Results arrive **40 per page** in the chosen sort
+order and **Load more** follows the Hub's own cursor -- one click, one Hub
+request, because the unauthenticated budget is 500 requests per 5 minutes
+-- and when the Hub answers with an error, including that HTTP 429 rate
+limit, the panel shows it inline instead of an empty "No models found".
+After the pull,
 the model is re-aliased to a clean local name (e.g.
 `hf.co/ornith-ai/Ornith-1.0-9B-GGUF` -> `Ornith-1.0-9B-GGUF`) instead of
 being stored under the full web address. The panel sends this via the
@@ -765,12 +778,22 @@ to disable) before handing back. Feedback that cannot be mapped to any
 file is reported as such (the task shows the reason; the build keeps its
 verdict) so you can name the screen or element you mean.
 
+The composer also carries a **Model for the next message** selector listing
+your saved profiles (`<name> · <model>`). Picking one sets the active
+provider -- workspace-wide, exactly as Settings does -- so the revision, or
+a follow-up objective on any session, runs on that model; a run already in
+progress keeps the model it started with, and while a swarm build is still
+mid-chain the message is refused with `409`, so wait for the verdict or
+press **Stop** first.
+
 The same loop works from the terminal -- `cgx session preview <sid>`
 prints the verdict, each route's screenshot path and the revision
 history, then serves the production bundle on a local port until Ctrl-C
 (`--no-serve` for JSON only); `cgx session send <sid> "make the top bar
 full width"` continues the finished session and prints `✎ revision #1:
-changed src/components/TopBar.jsx ...` followed by the verifier's verdict -- and over HTTP (`POST /{sid}/message` on a finished
+changed src/components/TopBar.jsx ...` followed by the verifier's verdict
+(`--profile <name>`, or `--provider --model --base-url`, runs that turn on
+a different model than the original build) -- and over HTTP (`POST /{sid}/message` on a finished
 swarm session; `409` while a build is still running). A pure question
 ("how does the login work?") still routes to investigation.
 

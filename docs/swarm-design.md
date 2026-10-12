@@ -321,7 +321,14 @@ history with diffs); the composer reads *Describe what to change* and the
 button *Revise*. CLI: `cgx session preview <sid>` prints the verdict, screenshot paths and
 revision history and serves the bundle on a local port; `cgx session send <sid>
 "feedback"` continues the finished session (it no longer starts a new one) and
-prints `✎ revision #n: changed ...` followed by the verifier's verdict.
+prints `✎ revision #n: changed ...` followed by the verifier's verdict. The
+composer's **Model for the next message** selector applies a saved profile as
+the active provider so the revision runs on it; `_schedule_drain` coalesces
+onto a drain already in flight, which keeps the deps it started with, so a
+running build keeps its model (and a build mid-chain answers `409`). The CLI
+makes the same per-turn choice with `--profile <name>` or `--provider --model
+--base-url` on `session send`/`decide`, where `--model` overrides the profile's
+model via `provider_from_profile_name(model=...)`.
 
 ## Design layer -- product + design intelligence for UI builds
 **Files:** `src/cgx/design/` -- see [`design.md`](design.md).

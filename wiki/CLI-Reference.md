@@ -64,7 +64,10 @@ flags. Notes: `session send`/`decide` **drive** an existing session (stream live
 Ctrl-C cancels) — `send` posts a follow-up message (on a **finished swarm build** it is
 *feedback*: a precise revision of the exact files plus re-verification, not a
 new session), `decide --task-id --chosen '{"approved": true}'` answers an open
-decision; `session preview <sid>` prints a finished swarm build's verdict,
+decision; both take the shared provider flags (`--profile`, or `--provider
+--model --base-url`) **per turn**, so a follow-up can run on a different model
+than the original build — `--model` overrides a saved profile's model instead
+of being ignored next to `--profile`; `session preview <sid>` prints a finished swarm build's verdict,
 screenshot paths and revision history and serves its production bundle on a
 local port (`--no-serve` for JSON); run from the project dir (or pass
 `--project-root`) so the session id resolves. `cgx agent` (unattended) and

@@ -1,19 +1,19 @@
 import {
   History, PanelLeftClose, PanelRightClose,
-  Plus, RefreshCw, Send, Square, Trash2,
+  Plus, RefreshCw, Trash2,
 } from "lucide-react";
 import type {
-  AgentSessionState, AgentSessionSummary, SessionModeValue, TaskNodeDTO,
-  TaskProgress,
+  AgentSessionState, AgentSessionSummary, ProfileSummary, ProviderConfig,
+  SessionModeValue, TaskNodeDTO, TaskProgress,
 } from "../../lib/api";
 import { TaskTree } from "./TaskTree";
 import { ActiveTaskPanel } from "./ActiveTask";
 import { BuildResult, latestVerifyReport } from "./BuildResult";
+import { FollowUpBar } from "./FollowUpBar";
 import { SessionDashboard } from "./SessionDashboard";
 import { SidePanel } from "./SidePanel";
 import { ResizeHandle } from "./ResizeHandle";
 import { CollapsedRail } from "../CollapsedRail";
-import { TextArea } from "../Input";
 import { ErrorBoundary } from "../ErrorBoundary";
 import { cn, formatRelative } from "../../lib/utils";
 import { useAgentSession } from "../../store/agentSession";
@@ -39,6 +39,7 @@ export function activeTask(state: AgentSessionState): TaskNodeDTO | null {
 export function LiveView({
   state, sessions, pending, error, progress, running,
   runModel, selectedModel,
+  profiles, provider, onPickProfile,
   reply, setReply,
   selectedTaskId, setSelectedTaskId,
   onDecide, onSend, onCancel, onSwitch, onNew, onRefresh, onDelete,
@@ -55,6 +56,11 @@ export function LiveView({
   // into the running drain and can't be hot-swapped).
   runModel?: string | null;
   selectedModel?: string;
+  // Saved LLM profiles the composer offers for the next message, the
+  // workspace provider it reflects, and the action that applies a pick.
+  profiles: ProfileSummary[];
+  provider: ProviderConfig;
+  onPickProfile: (p: ProfileSummary) => void;
   reply: string;
   setReply: (s: string) => void;
   selectedTaskId: string | null;
@@ -191,6 +197,7 @@ export function LiveView({
           onSend={onSend} pending={pending}
           running={!!running} onCancel={onCancel}
           revisable={revisable}
+          profiles={profiles} provider={provider} onPickProfile={onPickProfile}
         />
       </div>
       {sidePanelCollapsed ? (
@@ -295,46 +302,6 @@ function SessionBar({
         ))}
       </div>
     </aside>
-  );
-}
-
-function FollowUpBar({
-  reply, setReply, onSend, pending, running, onCancel, revisable,
-}: {
-  reply: string; setReply: (s: string) => void; onSend: () => void;
-  pending: boolean; running?: boolean;
-  onCancel?: () => void | Promise<void>;
-  // The session holds a finished swarm build: the message is feedback that
-  // revises it (SWARM_REVISE -> SWARM_VERIFY) rather than a new objective.
-  revisable?: boolean;
-}) {
-  return (
-    <div className="px-4 pt-2.5 pb-3 border-t border-muted bg-slate-950/60 flex items-end gap-2">
-      <TextArea
-        rows={2}
-        value={reply}
-        onChange={(e) => setReply(e.target.value)}
-        placeholder={revisable
-          ? "Describe what to change (e.g. “make the top bar span the full width”, “remember the API key after a reload”)…"
-          : "Post a follow-up objective…"}
-        disabled={pending}
-        className="flex-1"
-        aria-label={revisable ? "Feedback on the build" : "Follow-up objective"}
-      />
-      {running && onCancel && (
-        <button
-          type="button" onClick={() => { void onCancel(); }}
-          title="Stop after the current step"
-          className="av-btn-ghost text-red-300 hover:text-red-200"
-        ><Square className="h-3 w-3" /> Stop</button>
-      )}
-      <button
-        type="button" onClick={onSend}
-        disabled={pending || !reply.trim()}
-        className="av-btn-primary"
-        title={revisable ? "Apply this feedback to the build and re-verify" : "Send"}
-      ><Send className="h-3 w-3" /> {revisable ? "Revise" : "Send"}</button>
-    </div>
   );
 }
 

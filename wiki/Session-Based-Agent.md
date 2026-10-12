@@ -233,6 +233,7 @@ cgx session show <sid>                         # tasks / artifacts / facts / dec
 cgx session send <sid> "focus on the parser"   # follow-up message, drives one turn (live)
 cgx session preview <sid>                       # finished swarm build: verdict, screenshots, live preview
 cgx session send <sid> "make the top bar full width"   # on a finished swarm build: revise + re-verify
+cgx session send <sid> "tighten the copy" --profile <name>   # this turn on a saved profile (--model overrides its model)
 cgx session decide <sid> --task-id <tid> \      # answer an open ASK_USER
   --chosen '{"approved": true}'
 cgx session rm <sid>                            # delete
@@ -240,6 +241,10 @@ cgx session rm <sid>                            # delete
 
 `send`/`decide` reuse the exact drive path as `cgx agent`; run from the
 project directory (or pass `--project-root`) so the session id resolves.
+The shared provider flags (`--profile`, or `--provider --model --base-url`)
+are read **per turn**, so a follow-up can run on a different model than the
+one that started the session; in the web UI the composer's **Model for the
+next message** selector makes the same choice.
 
 ---
 

@@ -144,7 +144,13 @@ def _resolve_provider(
     # has engaged CGX_LLM_DISABLED, so no LLM call can run this request.
     assert_llm_enabled()
     if use_profile and profile_name:
-        prov = provider_from_profile_name(profile_name)
+        # ``model`` rides along on the profile path as an override. Every
+        # caller fills it with the profile's own model when the user picked
+        # nothing else (the CLI state via ``_state_from_args``/``/provider``,
+        # the web store via ``applyProfile``), so an equal value is a no-op
+        # and only a deliberately different one -- ``--profile x --model y``
+        # -- changes which model runs on the profile's kind/key/base URL.
+        prov = provider_from_profile_name(profile_name, model=model or None)
     else:
         prov = build_provider(
             kind=kind, model=model, base_url=base_url, api_key=api_key or None,

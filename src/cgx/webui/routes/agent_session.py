@@ -394,6 +394,16 @@ async def _schedule_drain(runner: SessionRunner, session_id: str,
         return
     existing = _SESSION_DRAINS.get(session_id)
     if existing is not None and not existing.done():
+        # The running drain keeps the deps it started with, so the provider
+        # built for *this* request (say, a different model for a follow-up)
+        # is not what executes the task it just queued; say so rather than
+        # letting the switch look like it silently took effect.
+        model = getattr(getattr(deps, "provider", None), "model", None)
+        logger.info(
+            "drain: session %s is already draining; coalescing -- the provider "
+            "on this request%s will not apply until the next drive",
+            sanitize_for_log(session_id),
+            f" (model {sanitize_for_log(model)})" if model else "")
         return
     # Fresh drive: drop any stale cancel flag left by a prior run so a
     # user-initiated resume isn't cancelled before its first task.

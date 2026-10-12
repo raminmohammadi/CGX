@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 from unittest.mock import patch
 
 import pytest
@@ -19,17 +19,24 @@ from cgx.webui.routes.setup import (
 
 
 class _FakeResp:
-    def __init__(self, json_data: Dict[str, Any], status_code: int = 200):
+    def __init__(self, json_data: Any, status_code: int = 200,
+                 links: Optional[Dict[str, Dict[str, str]]] = None):
         self._json = json_data
         self.status_code = status_code
         self.content = b"x" if json_data else b""
+        # Mirrors ``requests.Response.links`` (the parsed ``Link`` header keyed
+        # by rel) so the Hub pagination tests can hand back a next-page link.
+        self.links = links or {}
 
     def raise_for_status(self) -> None:
         if self.status_code >= 400:
             from requests import HTTPError
+            # ``response=self`` mirrors real requests; it is what lets a route
+            # read the status code off the exception.
             raise HTTPError(
                 f"{self.status_code} Client Error: Bad for url: "
-                f"https://x/v1beta/models?key=SECRET123"
+                f"https://x/v1beta/models?key=SECRET123",
+                response=self,
             )
 
     def json(self) -> Dict[str, Any]:
@@ -199,6 +206,9 @@ def test_hf_models_parses_hub_and_builds_pull_tags():
     # Quant labels are extracted from the .gguf siblings (README ignored).
     assert m.quants == ["Q4_K_M", "Q8_0"]
     assert m.downloads == 1000 and m.likes == 42
+    # No ``Link`` header from the Hub means this is the only page.
+    assert r.next_cursor is None and r.has_more is False
+    assert r.limit == 5 and r.error is None
 
 
 def test_hf_models_uses_fixed_host_and_sanitizes_sort():
@@ -239,6 +249,80 @@ def test_hf_models_returns_empty_on_error():
     with patch("requests.get", side_effect=_ConnErr("down")):
         r = hf_models()
     assert r.models == []
+    # Still HTTP 200 / empty so the panel degrades gracefully, but the reason
+    # is surfaced instead of masquerading as "No models found".
+    assert r.error is not None and "unreachable" in r.error
+    assert r.has_more is False
+
+
+def test_hf_models_rate_limit_surfaces_http_status():
+    # The unauthenticated Hub rate limit (HTTP 429) used to be swallowed into
+    # an empty list that looked exactly like a search with no matches.
+    with patch("requests.get", return_value=_FakeResp({}, status_code=429)):
+        r = hf_models()
+    assert r.models == []
+    assert r.error is not None and "HTTP 429" in r.error
+    assert r.has_more is False and r.next_cursor is None
+
+
+def _hf_hub_next_link(url: str) -> Dict[str, Dict[str, str]]:
+    return {"next": {"url": url, "rel": "next"}}
+
+
+def test_hf_models_surfaces_next_cursor_from_hub_link():
+    link = ("https://huggingface.co/api/models?filter=gguf&sort=trendingScore"
+            "&limit=5&full=true&cursor=abc")
+    with patch("requests.get",
+               return_value=_FakeResp(_hf_hub_payload(), links=_hf_hub_next_link(link))):
+        r = hf_models(search="", sort="trending_score", limit=5)
+    # Only the opaque cursor is handed to the client (never the Hub URL); the
+    # client decides whether to spend another request on the next page.
+    assert r.next_cursor == "abc"
+    assert r.has_more is True
+    assert r.limit == 5
+    assert r.error is None
+
+
+@pytest.mark.parametrize("link", [
+    # A next link pointing anywhere but the Hub is not trusted.
+    "https://evil.example/api/models?cursor=abc",
+    # A cursor that our own validation would drop on the way back in is not
+    # advertised either, so ``has_more`` never dangles an unusable token.
+    "https://huggingface.co/api/models?cursor=a%20b",
+    "https://huggingface.co/api/models?cursor=..%2Fx",
+])
+def test_hf_models_ignores_untrusted_or_unusable_next_link(link):
+    with patch("requests.get",
+               return_value=_FakeResp(_hf_hub_payload(), links=_hf_hub_next_link(link))):
+        r = hf_models()
+    assert r.next_cursor is None
+    assert r.has_more is False
+    assert len(r.models) == 1  # the page itself is still served
+
+
+@pytest.mark.parametrize("cursor,forwarded", [
+    ("abc=", True),   # base64-style token as the Hub hands it back
+    ("../x", False),  # path-ish text
+    ("a b", False),   # whitespace
+    ("", False),      # empty -> first page
+])
+def test_hf_models_forwards_only_well_formed_cursors(cursor, forwarded):
+    captured: Dict[str, Any] = {}
+
+    def fake_get(url, *_args, **kwargs):
+        captured["url"] = url
+        captured["params"] = kwargs.get("params") or {}
+        return _FakeResp(_hf_hub_payload())
+
+    with patch("requests.get", side_effect=fake_get):
+        hf_models(cursor=cursor)
+    # The cursor travels only through the URL-encoded params mapping against
+    # the fixed Hub host; anything outside the token alphabet is dropped.
+    assert captured["url"] == "https://huggingface.co/api/models"
+    if forwarded:
+        assert captured["params"]["cursor"] == cursor
+    else:
+        assert "cursor" not in captured["params"]
 
 
 # ------------------- local-name sanitisation (HF pull re-alias) -------------

@@ -50,7 +50,10 @@ def register(sub) -> None:
     from cgx.cli.main import _add_provider_flags  # provider/index/mode flags
 
     p_send = verbs.add_parser(
-        "send", help="Post a follow-up message to a session and drive one turn.")
+        "send", help="Post a follow-up message to a session and drive one turn. "
+                     "The provider flags (--profile / --provider --model --base-url) "
+                     "pick the model for this turn, so a follow-up can run on a "
+                     "different model than the original build.")
     p_send.add_argument("sid")
     p_send.add_argument("message", nargs="+", help="The message to send.")
     p_send.add_argument("--auto", action="store_true",
@@ -60,7 +63,10 @@ def register(sub) -> None:
     p_send.set_defaults(func=_send)
 
     p_decide = verbs.add_parser(
-        "decide", help="Answer an open decision task with a structured choice.")
+        "decide", help="Answer an open decision task with a structured choice. "
+                       "The provider flags (--profile / --provider --model --base-url) "
+                       "pick the model for this turn, so the steps it unblocks can "
+                       "run on a different model than the original build.")
     p_decide.add_argument("sid")
     p_decide.add_argument("--task-id", required=True,
                           help="The ASK_USER task id awaiting a decision (see `show`).")

@@ -1451,3 +1451,58 @@ def test_preview_endpoint_serves_the_built_bundle(
         stopped = _run(routes.stop_preview(sid))
     assert stopped["was_running"] is True
     assert _run(routes.stop_preview(sid))["was_running"] is False
+
+
+# =====================================================================
+# Per-turn provider: every drive builds its deps from *its* request
+# =====================================================================
+
+_ALT_PROFILE = {"use_profile": True, "profile_name": "alt", "model": "b"}
+
+
+def _record_build_deps(monkeypatch: pytest.MonkeyPatch) -> list:
+    """Swap ``_build_deps`` for a recorder of the request provider it was
+    handed, returning the same provider-less deps the autouse stub does."""
+    seen: list = []
+
+    def _recorder(req_provider, req_index, project_root, store=None):
+        seen.append(req_provider)
+        return ExecutorDeps(store=store)
+
+    monkeypatch.setattr(routes, "_build_deps", _recorder)
+    return seen
+
+
+def test_message_builds_deps_from_the_request_provider(
+        client: _HandlerClient, project_root: Path,
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """A follow-up runs on the provider *it* names, not the one the session
+    was created with -- the web counterpart of ``cgx session send --profile``."""
+    _install_stubs()
+    seen = _record_build_deps(monkeypatch)
+    state = client.create(objective="g", project_root=str(project_root),
+                          run_initial_task=True, provider={"model": "a"})
+    assert seen[-1].use_profile is False and seen[-1].model == "a"
+    client.message(state["session"]["session_id"], message="now on alt",
+                   run_initial_task=True, provider=_ALT_PROFILE)
+    assert client.last_status == 200
+    assert seen[-1].use_profile is True and seen[-1].profile_name == "alt"
+    assert seen[-1].model == "b"
+
+
+def test_feedback_revision_uses_the_request_provider(
+        client: _HandlerClient, project_root: Path,
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """Feedback on a finished swarm build revises and re-verifies on the
+    provider named by the feedback request, not the one that built it."""
+    _install_swarm_stubs(project_root)
+    seen = _record_build_deps(monkeypatch)
+    state = _build_swarm_session(client, project_root)
+    assert seen[-1].use_profile is False
+    after = client.message(state["session"]["session_id"],
+                           message="make the top bar span the full width",
+                           provider=_ALT_PROFILE)
+    assert client.last_status == 200
+    assert seen[-1].use_profile is True and seen[-1].profile_name == "alt"
+    kinds = [t["kind"] for t in after["tasks"]]
+    assert kinds[-2:] == ["swarm_revise", "swarm_verify"]

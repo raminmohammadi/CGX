@@ -1,7 +1,8 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   AlertTriangle,
   CheckCircle,
+  ChevronDown,
   Cpu,
   Download,
   Gauge,
@@ -22,6 +23,10 @@ import { PullProgress } from "./PullProgress";
 // GGUF models are pulled through the local Ollama daemon, so downloads always
 // target the default Ollama host regardless of the active cloud provider.
 const OLLAMA_BASE_URL = "http://localhost:11434";
+
+// Hub page size. "Load more" fetches another page of this size using the
+// opaque cursor the backend handed back for the previous page.
+const PAGE_SIZE = 40;
 
 const SORTS = [
   { value: "trending_score", label: "Trending" },
@@ -54,6 +59,11 @@ export function HuggingFacePanel() {
   const [sort, setSort] = useState("trending_score");
   const [models, setModels] = useState<HfHubModel[]>([]);
   const [loading, setLoading] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
+  // Opaque Hub cursor for the next page; null once the list is exhausted. The
+  // Hub only honours it for the exact search+sort it was issued for, so every
+  // query change clears it and the next load() starts from the first page.
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [quant, setQuant] = useState<Record<string, string>>({});
   // Per-repo "Check fit" state: the resolved spec + verdict, an in-flight
@@ -62,6 +72,9 @@ export function HuggingFacePanel() {
   const [fitLoading, setFitLoading] = useState<Record<string, boolean>>({});
   const [fitError, setFitError] = useState<Record<string, string>>({});
   const activePull = usePullState();
+  // Monotonic request id so a page that was still in flight when the query
+  // changed (e.g. a Load more racing a sort switch) can't land in the new list.
+  const reqRef = useRef(0);
 
   const checkFit = (repo: string) => {
     setFitLoading((s) => ({ ...s, [repo]: true }));
@@ -73,14 +86,53 @@ export function HuggingFacePanel() {
       .finally(() => setFitLoading((s) => ({ ...s, [repo]: false })));
   };
 
+  const query = () => ({ search: search.trim(), sort, limit: PAGE_SIZE });
+
   const load = () => {
+    const id = ++reqRef.current;
     setLoading(true);
     setError(null);
+    setNextCursor(null);
     api
-      .hfModels({ search: search.trim(), sort, limit: 40 })
-      .then((r) => setModels(r.models))
-      .catch((e: any) => setError(String(e?.message || e)))
+      .hfModels(query())
+      .then((r) => {
+        if (id !== reqRef.current) return;
+        setModels(r.models);
+        setNextCursor(r.next_cursor ?? null);
+        if (r.error) setError(r.error);
+      })
+      .catch((e: any) => {
+        if (id === reqRef.current) setError(String(e?.message || e));
+      })
       .finally(() => setLoading(false));
+  };
+
+  const loadMore = () => {
+    if (!nextCursor || loadingMore) return;
+    const id = ++reqRef.current;
+    setLoadingMore(true);
+    setError(null);
+    api
+      .hfModels({ ...query(), cursor: nextCursor })
+      .then((r) => {
+        if (id !== reqRef.current) return;
+        // De-dupe on id: a repo can straddle a page boundary when its sort key
+        // (downloads, trending) moves between two requests.
+        setModels((prev) => {
+          const seen = new Set(prev.map((m) => m.id));
+          return [...prev, ...r.models.filter((m) => !seen.has(m.id))];
+        });
+        if (r.error) {
+          // Keep the cursor so a transient Hub failure (rate limit) can be retried.
+          setError(r.error);
+          return;
+        }
+        setNextCursor(r.next_cursor ?? null);
+      })
+      .catch((e: any) => {
+        if (id === reqRef.current) setError(String(e?.message || e));
+      })
+      .finally(() => setLoadingMore(false));
   };
 
   // Reload on sort change and on first mount; search is applied via the form.
@@ -102,7 +154,7 @@ export function HuggingFacePanel() {
       <CardHeader
         eyebrow="Hugging Face Hub"
         title="Browse GGUF models"
-        description="Pull any GGUF repository straight into Ollama via hf.co/<repo>. Use Check fit to size a model against your hardware before pulling."
+        description="Only GGUF repositories are listed: pulls go through Ollama's hf.co/<repo> loader, which accepts nothing else. Use Check fit to size a model against your hardware before pulling."
         right={
           <button className="av-btn-ghost" onClick={load} disabled={loading}>
             {loading ? <Loader2 className="h-3 w-3 animate-spin" /> : <RefreshCw className="h-3 w-3" />}
@@ -122,7 +174,12 @@ export function HuggingFacePanel() {
           <Search className="h-3 w-3 text-slate-600 absolute left-2.5 top-1/2 -translate-y-1/2" />
           <TextInput
             value={search}
-            onChange={(e) => setSearch(e.target.value)}
+            onChange={(e) => {
+              setSearch(e.target.value);
+              // The listed page belongs to the previous search, so its cursor
+              // must never be combined with the new text.
+              setNextCursor(null);
+            }}
             placeholder="Search the Hub (e.g. llama, qwen, gemma)…"
             className="pl-7"
           />
@@ -217,6 +274,20 @@ export function HuggingFacePanel() {
           <p className="text-xs text-slate-500 font-mono">No models found.</p>
         )}
       </div>
+
+      {models.length > 0 && (
+        <div className="flex items-center justify-between gap-3 mt-3">
+          <p className="text-[10px] text-slate-500 font-mono">
+            Showing {models.length} GGUF repos{nextCursor ? " · more available" : ""}
+          </p>
+          {nextCursor && (
+            <button className="av-btn-ghost" onClick={loadMore} disabled={loadingMore}>
+              {loadingMore ? <Loader2 className="h-3 w-3 animate-spin" /> : <ChevronDown className="h-3 w-3" />}
+              Load more
+            </button>
+          )}
+        </div>
+      )}
     </Card>
   );
 }
