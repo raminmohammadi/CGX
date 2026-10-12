@@ -1,11 +1,12 @@
 import {
-  CheckCircle2, ClipboardList, FileEdit, FlaskConical, GitBranch,
-  HelpCircle, ListChecks, Package, Search, TerminalSquare, Wrench, XCircle,
+  CheckCircle2, ClipboardList, FileDiff, FileEdit, FlaskConical, GitBranch,
+  HelpCircle, ListChecks, MonitorPlay, Package, Search, TerminalSquare, Wrench, XCircle,
 } from "lucide-react";
 import type { ArtifactDTO, ArtifactKind } from "../../lib/api";
 import { Markdown } from "../Markdown";
 import { DiffView } from "../DiffView";
 import { ErrorBoundary } from "../ErrorBoundary";
+import { RevisionRow } from "./BuildResult";
 
 // Icon per artifact kind so each card reads at a glance as "tool call: X",
 // mirroring how tool invocations are shown in richer agent-chat UIs.
@@ -23,6 +24,8 @@ const ARTIFACT_ICONS: Partial<Record<ArtifactKind, typeof HelpCircle>> = {
   repair_plan: Wrench,
   smoke_report: TerminalSquare,
   api_check_report: TerminalSquare,
+  swarm_verify_report: MonitorPlay,
+  swarm_revision: FileDiff,
 };
 
 // Best-effort ok/fail read per kind, purely for a small header status icon --
@@ -44,6 +47,12 @@ function artifactStatus(artifact: ArtifactDTO): "ok" | "fail" | null {
     case "api_check_report":
       if (c.outcome === "passed") return "ok";
       if (c.outcome === "failed") return "fail";
+      return null;
+    case "swarm_verify_report":
+      return c.verify_ok ? "ok" : "fail";
+    case "swarm_revision":
+      if (c.status === "applied") return "ok";
+      if (c.status === "unlocalized" || c.status === "nothing_changed") return "fail";
       return null;
     default:
       return null;
@@ -87,6 +96,8 @@ function Body({ artifact }: { artifact: ArtifactDTO }) {
   if (artifact.kind === "smoke_report") return <SmokeReportBody c={c} />;
   if (artifact.kind === "api_check_report") return <ApiCheckReportBody c={c} />;
   if (artifact.kind === "repair_plan") return <RepairPlanBody c={c} />;
+  if (artifact.kind === "swarm_verify_report") return <SwarmVerifyBody c={c} />;
+  if (artifact.kind === "swarm_revision") return <RevisionRow artifact={artifact} />;
   return <pre className="text-[11px] font-mono text-slate-300 whitespace-pre-wrap break-words">{JSON.stringify(c, null, 2)}</pre>;
 }
 
@@ -640,6 +651,101 @@ function RepairPlanBody({ c }: { c: any }) {
       )}
       {diffs.length > 0 && (
         <DiffView diff={diffs.map((d) => d.patch).join("\n")} />
+      )}
+    </div>
+  );
+}
+
+
+// The swarm verifier's report: the one-line verdict, then the gates that
+// produced it (structure, build/tests, design, runtime smoke per route). The
+// screenshots themselves live in the Build result panel.
+function SwarmVerifyBody({ c }: { c: any }) {
+  const ok = Boolean(c.verify_ok);
+  const env = c.env || {};
+  const design = c.design || {};
+  const runtime = c.runtime || {};
+  const routes: any[] = Array.isArray(runtime.routes) ? runtime.routes : [];
+  const gaps: string[] = Array.isArray(c.coverage_gaps) ? c.coverage_gaps : [];
+  const imports: any[] = Array.isArray(c.import_warnings) ? c.import_warnings : [];
+  const issues: any[] = Array.isArray(design.issues) ? design.issues : [];
+  const fatal = issues.filter((i) => i?.severity === "fatal");
+  return (
+    <div className="space-y-2 text-[11px] font-mono">
+      <p className={ok ? "text-emerald-300" : "text-amber-300"}>{String(c.summary || (ok ? "verified" : "partial build"))}</p>
+      {c.revision_index != null && (
+        <p className="text-slate-500">verification of revision #{String(c.revision_index)}</p>
+      )}
+      <ul className="space-y-0.5 text-slate-300">
+        <li>
+          <span className="text-slate-500">structure:</span>{" "}
+          {c.structural_ok ? <span className="text-emerald-400">ok</span>
+            : <span className="text-red-300">{gaps.length} missing · {imports.length} import break{imports.length === 1 ? "" : "s"}</span>}
+          {typeof c.regen_rounds === "number" && c.regen_rounds > 0 && (
+            <span className="text-slate-500"> · {c.regen_rounds} regen round{c.regen_rounds === 1 ? "" : "s"}</span>
+          )}
+        </li>
+        <li>
+          <span className="text-slate-500">build/tests:</span>{" "}
+          <span className={env.outcome === "passed" ? "text-emerald-400" : env.outcome === "failed" ? "text-red-300" : "text-slate-400"}>
+            {String(env.outcome || "skipped")}
+          </span>
+          {typeof c.dynamic_regen_rounds === "number" && c.dynamic_regen_rounds > 0 && (
+            <span className="text-slate-500"> · {c.dynamic_regen_rounds} repair round{c.dynamic_regen_rounds === 1 ? "" : "s"}</span>
+          )}
+        </li>
+        {design.applies && (
+          <li>
+            <span className="text-slate-500">design:</span>{" "}
+            {fatal.length === 0
+              ? <span className="text-emerald-400">ok{issues.length > 0 ? ` (${issues.length} advisory)` : ""}</span>
+              : <span className="text-red-300">{fatal.length} fatal ({fatal.map((i) => i.id).join(", ")})</span>}
+            <span className="text-slate-500"> · {String(design.archetype || "")} · {String(design.theme || "")} · {String(design.framework || "")}</span>
+          </li>
+        )}
+        {runtime.ran && (
+          <li>
+            <span className="text-slate-500">runtime:</span>{" "}
+            {routes.map((r, i) => (
+              <span key={i} className="mr-2">
+                <span className="text-slate-200">{String(r.route)}</span>{" "}
+                {r.mounted && !(r.errors || []).length
+                  ? <span className="text-emerald-400">renders</span>
+                  : <span className="text-red-300">{r.mounted ? "errors" : "blank"}</span>}
+              </span>
+            ))}
+          </li>
+        )}
+        {c.vision?.vision_model && (
+          <li><span className="text-slate-500">vision critic:</span> {String(c.vision.vision_model)}</li>
+        )}
+        {c.feedback_check && (
+          <li>
+            <span className="text-slate-500">feedback check:</span>{" "}
+            {c.feedback_check.satisfied === true
+              ? <span className="text-emerald-400">visibly addressed</span>
+              : c.feedback_check.satisfied === false
+                ? <span className="text-amber-300">NOT visibly addressed{c.feedback_check.evidence ? ` — ${String(c.feedback_check.evidence)}` : ""}</span>
+                : <span className="text-slate-400">undecidable from screenshots</span>}
+          </li>
+        )}
+      </ul>
+      {issues.length > 0 && (
+        <details>
+          <summary className="cursor-pointer text-slate-400 hover:text-slate-200">design issues ({issues.length})</summary>
+          <ul className="mt-1 space-y-0.5">
+            {issues.map((i, k) => (
+              <li key={k} className={i.severity === "fatal" ? "text-red-300" : "text-slate-400"}>
+                [{String(i.id)}] {String(i.file || "")}: {String(i.message || "")}
+              </li>
+            ))}
+          </ul>
+        </details>
+      )}
+      {env.outcome === "failed" && env.output && (
+        <pre className="bg-slate-950 border border-red-900/40 rounded p-2 text-slate-300 max-h-60 overflow-y-auto whitespace-pre-wrap">
+          {String(env.output).slice(-3000)}
+        </pre>
       )}
     </div>
   );

@@ -27,3 +27,4 @@ Auto-recorded by CGX after failed/repaired runs. Each is a durable rule fed back
 - Avoid nested React Router components to prevent runtime errors. Ensure that only one instance of `BrowserRouter` or `HashRouter` is used in the application.  <!-- id=lsn_c5751299b4c2 2026-10-11 -->
 - Verify that components accept all necessary props passed by their parents. Ensure that destructuring in component props includes all expected properties.  <!-- id=lsn_475dcc2ab538 2026-10-11 -->
 - Handle potential null or undefined data before using array methods like `map` to prevent runtime errors. Ensure that data is properly initialized and validated before rendering.  <!-- id=lsn_370ed2ee8f99 2026-10-11 -->
+- Ensure that all props passed to a React component are destructured in the component's parameter list.  <!-- id=lsn_9aa8e76240c1 2026-10-11 -->

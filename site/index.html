@@ -559,7 +559,8 @@ flowchart TD
             <span>SWARM_TECH_LEAD</span><i>→</i>
             <span>SWARM_DEVELOPER</span><i>⟲ per file</i>
             <span class="write">SWARM_VERIFY</span><i>⟲</i>
-            <span class="write">REPAIR</span>
+            <span class="write">REPAIR</span><i>→ review →</i>
+            <span class="write">SWARM_REVISE</span><i>⟲ feedback</i>
           </div>
 
           <div class="grid grid-3" style="margin-top: 1.25rem">
@@ -582,12 +583,14 @@ flowchart TD
               </p>
             </article>
             <article class="card reveal">
-              <h3>Live Swarm Operations feed</h3>
+              <h3>Review → feedback → precise revision</h3>
               <p>
-                The Agent page renders a <strong>Swarm Operations</strong> timeline of
-                <code class="inline">swarm_beat</code> telemetry — role, phase, target file, tool calls
-                and pass/fail — streamed over SSE, with Developer tasks nested under the Tech Lead in the
-                task tree.
+                A finished build shows a <strong>Build result</strong> panel — verdict, a screenshot per
+                route, a <strong>live preview</strong> of the real bundle. Your feedback ("make the top
+                bar full width") is <strong>localized to the exact files</strong> (named components,
+                routes, quoted UI copy, the file role a concern maps to), applied as a grounded
+                modification, then rebuilt, re-smoked and re-screenshotted — with a per-file
+                instruction, <em>why that file</em>, and a diff in the report.
               </p>
             </article>
           </div>
@@ -610,6 +613,8 @@ flowchart LR
     VER -->|red suite| REP[REPAIR<br/>AST inject · logic fix<br/>temp 0.2 → 0.8, bounded]
     REP --> VER
     VER -->|green| Done[Runnable project<br/>or honest FAILED]
+    Done -->|user feedback| REV[Reviser<br/>SWARM_REVISE<br/>localize → per-file instruction → apply]
+    REV -->|changed files| VER
 
     style Swarm fill:#0f172a,stroke:#a78bfa,color:#fff
     style TL fill:#0b1220,stroke:#38bdf8,color:#fff
@@ -617,10 +622,12 @@ flowchart LR
     style VER fill:#0b1220,stroke:#fbbf24,color:#fff
     style REP fill:#0b1220,stroke:#fb7185,color:#fff
     style Done fill:#0b1220,stroke:#34d399,color:#fff
+    style REV fill:#0b1220,stroke:#c084fc,color:#fff
             </div>
             <figcaption>
               The swarm loop — plan once, generate file by file, verify the real build, repair a red
-              suite under a hard ceiling. Deterministic invariants gate every stage.
+              suite under a hard ceiling, then take the user's feedback as a precise revision and
+              verify again. Deterministic invariants gate every stage.
             </figcaption>
           </figure>
         </div>

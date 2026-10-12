@@ -239,6 +239,14 @@ class AgentSessionDecisionRequest(BaseModel):
     run_initial_task: bool = False
 
 
+class AgentPreviewState(BaseModel):
+    """A live preview server for a finished swarm build's production bundle."""
+    url: str
+    port: int
+    dist: str
+    host: str
+
+
 class AgentSessionState(BaseModel):
     """Full read of a session's persistent state.
 

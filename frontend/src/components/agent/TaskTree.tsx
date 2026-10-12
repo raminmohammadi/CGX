@@ -27,6 +27,7 @@ const KIND_META: Record<TaskKind, { badge: string; label: string }> = {
   swarm_tech_lead:       { badge: "bg-fuchsia-900/80 text-fuchsia-300", label: "tech lead" },
   swarm_developer:       { badge: "bg-emerald-900/80 text-emerald-300", label: "developer" },
   swarm_verify:          { badge: "bg-cyan-900/80 text-cyan-300",       label: "swarm verify" },
+  swarm_revise:          { badge: "bg-violet-900/80 text-violet-300",   label: "revise" },
 };
 
 // Cap how deep the tree indents. Swarm developer tasks are siblings under the

@@ -72,6 +72,20 @@ def register(sub) -> None:
     _add_provider_flags(p_decide)
     p_decide.set_defaults(func=_decide)
 
+    p_preview = verbs.add_parser(
+        "preview",
+        help="Review a finished swarm build: verdict, screenshots, revisions, and a "
+             "live preview server for the production bundle (Ctrl-C stops it).")
+    p_preview.add_argument("sid")
+    p_preview.add_argument("--project-root", default=None)
+    p_preview.add_argument("--host", default=None,
+                           help="Bind host for the preview server (default: "
+                                "$CGX_PREVIEW_HOST or 127.0.0.1).")
+    p_preview.add_argument("--no-serve", action="store_true",
+                           help="Print the review summary as JSON and exit without "
+                                "starting the preview server.")
+    p_preview.set_defaults(func=_preview)
+
 
 def _root(args: argparse.Namespace) -> str:
     """Absolute project root -- sessions persist their root as an absolute path,
@@ -179,3 +193,102 @@ def _decide(args: argparse.Namespace) -> None:
         state, args.task_id, chosen, rationale=args.rationale,
         index_dir=args.index_dir, records=args.records, auto=args.auto,
         cancel_event=ce))
+
+
+def build_review(store, sid: str, project_root: str) -> dict:
+    """The review-step summary of a swarm build: verdict, screens, revisions, bundle.
+
+    Pure read over the session store (plus a ``dist/`` existence check), shared
+    by ``cgx session preview`` so the terminal shows the same facts the Agent
+    page's Build result panel does: the verifier's one-line summary, each route
+    with its screenshot path and render status, the revision history (feedback
+    -> files changed), and where the production bundle lives.
+    """
+    from cgx.codegen.browser_smoke import find_dist
+    from cgx.session.models import ArtifactKind
+
+    arts = sorted(store.list_artifacts(sid), key=lambda a: a.created_at)
+    report = None
+    ui_root = ""
+    revisions = []
+    for a in arts:
+        if a.kind is ArtifactKind.SWARM_VERIFY_REPORT:
+            report = a
+        elif a.kind is ArtifactKind.WORK_PLAN and isinstance(a.content, dict):
+            design = a.content.get("design") or {}
+            if isinstance(design, dict) and design.get("app_root"):
+                ui_root = str(design["app_root"])
+        elif a.kind is ArtifactKind.SWARM_REVISION and isinstance(a.content, dict):
+            c = a.content
+            revisions.append({
+                "index": c.get("revision_index"), "feedback": c.get("feedback"),
+                "status": c.get("status"), "note": c.get("note"),
+                "changed": list(c.get("changed") or []),
+                "unchanged": list(c.get("unchanged") or []),
+                "failed": list(c.get("failed") or []),
+            })
+    routes = []
+    content = report.content if report is not None and isinstance(report.content, dict) else {}
+    runtime = content.get("runtime") or {}
+    for r in (runtime.get("routes") or []) if isinstance(runtime, dict) else []:
+        routes.append({"route": r.get("route"),
+                       "ok": bool(r.get("mounted")) and not (r.get("errors") or []),
+                       "errors": list(r.get("errors") or []),
+                       "screenshot": r.get("screenshot")})
+    dist = find_dist(project_root, ui_root)
+    return {
+        "session_id": sid,
+        "verify_ok": bool(content.get("verify_ok")) if report is not None else None,
+        "summary": content.get("summary") if report is not None else None,
+        "verified_at": report.created_at if report is not None else None,
+        "routes": routes,
+        "revisions": revisions,
+        "dist": str(dist) if dist else None,
+    }
+
+
+def _preview(args: argparse.Namespace) -> None:
+    import time
+
+    from cgx.codegen.browser_smoke import serve_spa
+
+    root = _root(args)
+    store = _open_store(root)
+    try:
+        session = store.get_session(args.sid)
+        if session is None:
+            _render.die(f"session {args.sid!r} not found", code=2)
+        review = build_review(store, args.sid, root)
+    finally:
+        store.close()
+    if getattr(args, "no_serve", False):
+        _render.print_json(review)
+        return
+    if review["summary"]:
+        print(("✔ " if review["verify_ok"] else "✖ ") + str(review["summary"]))
+    else:
+        print("(no verification report yet -- the build has not finished)")
+    for r in review["routes"]:
+        state = "renders" if r["ok"] else ("errors" if not r["errors"] else "blank/errors")
+        shot = f"  {r['screenshot']}" if r.get("screenshot") else ""
+        print(f"  {r['route']:<24} {state}{shot}")
+    for rev in review["revisions"]:
+        changed = ", ".join(rev["changed"]) or "nothing changed"
+        print(f"  ✎ revision #{rev['index']}: \"{rev['feedback']}\" -> {changed}")
+    if not review["dist"]:
+        _render.die("no production bundle (dist/) to preview yet -- the build has to "
+                    "compile first", code=3)
+    host = (args.host or os.environ.get("CGX_PREVIEW_HOST") or "127.0.0.1").strip()
+    from pathlib import Path as _Path
+    server, port = serve_spa(_Path(review["dist"]), host)
+    url = f"http://{host}:{port}/"
+    print(f"\nlive preview: {url}   (serving {review['dist']}; Ctrl-C to stop)")
+    print(f"then: cgx session send {args.sid} \"<what to change>\" --project-root {root}")
+    try:
+        while True:
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.shutdown()
+        server.server_close()

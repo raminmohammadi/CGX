@@ -88,6 +88,17 @@ CGX ensures all data, embeddings, and executions remain strictly on your machine
   hard-coded endpoints, no persistence, missing navigation ...) plus one
   bounded design-critic pass. Works with small local models because nothing
   is left to taste. See [docs/design.md](docs/design.md).
+- **Build -> review -> feedback loop.** A finished swarm build is not the end
+  of the conversation. The Agent page shows a **Build result** panel -- the
+  verdict, a screenshot per route, a **live preview** of the real bundle --
+  and your feedback (*"make the top bar span the full width"*, *"remember the
+  API key after a reload"*) becomes a precise **revision**: CGX localizes it
+  to the exact files (named components, routes, quoted UI copy, the file role
+  a concern maps to, the routes that failed), asks the model for a per-file
+  instruction, applies it as a grounded modification, then rebuilds,
+  re-smokes and re-screenshots. Every revision reports what changed where
+  and why, with diffs; `cgx session send <sid> "..."` does the same from the
+  terminal. See [docs/swarm-design.md](docs/swarm-design.md#feedback-loop----review-revise-re-verify).
 - **MCP tool catalog.** A curated catalog of the MCP servers developers use
   (GitHub, Playwright, Context7, Brave Search, Postgres, Supabase, Stripe,
   Sentry, Figma, the official reference servers ...) with one-click add,
@@ -440,6 +451,8 @@ Beyond those core verbs, **everything the web UI can do is also a scriptable
 cgx skills list                      # registry: also show/create/edit/delete
 cgx profile add prod --kind openai   # LLM connection presets (list/show/rm)
 cgx session list                     # inspect/drive: show/rm/send/decide
+cgx session preview <sid>            # review a finished build: verdict, screenshots, live preview
+cgx session send <sid> "make the top bar full width"   # feedback on a finished build -> revise + re-verify
 cgx mcp catalog --table              # MCP servers: add/rm/set-env/test/enable/disable/tools
 cgx model matrix --table             # model discovery/pull, hardware fit
 cgx usage summary                    # activity · usage · feedback · monitor

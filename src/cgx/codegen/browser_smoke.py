@@ -197,14 +197,27 @@ class _SpaHandler(SimpleHTTPRequestHandler):
         return os.path.join(self.directory, "index.html")  # type: ignore[attr-defined]
 
 
-def _serve(directory: Path) -> Tuple[ThreadingHTTPServer, int]:
+def _serve(directory: Path, host: str = "127.0.0.1") -> Tuple[ThreadingHTTPServer, int]:
     with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
+        s.bind((host, 0))
         port = s.getsockname()[1]
     handler = partial(_SpaHandler, directory=str(directory))
-    server = ThreadingHTTPServer(("127.0.0.1", port), handler)
+    server = ThreadingHTTPServer((host, port), handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server, port
+
+
+def serve_spa(directory: Path, host: str = "127.0.0.1") -> Tuple[ThreadingHTTPServer, int]:
+    """Serve a built single-page app from ``directory`` on an ephemeral port.
+
+    The same stdlib server the runtime smoke uses (static files + index.html
+    fallback for client-side routes), exposed for the Agent page's **live
+    preview** of a finished build: the user clicks through the real bundle
+    before giving feedback. Runs on a daemon thread; call ``shutdown()`` on
+    the returned server to stop it. Files are read per request, so a rebuilt
+    bundle in the same directory is picked up without a restart.
+    """
+    return _serve(directory, host)
 
 
 def _parse_console_errors(stderr: str, dom: str = "") -> List[str]:

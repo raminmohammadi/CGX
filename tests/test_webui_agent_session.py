@@ -1254,3 +1254,200 @@ def test_create_rejects_project_root_that_is_a_file(tmp_path):
         _validate_project_root_writable(str(f))
     assert ei.value.status_code == 400
     assert "not a directory" in str(ei.value.detail).lower()
+
+
+# ----------------------------- feedback loop (swarm builds) -----------------------------
+
+def _install_swarm_stubs(project_root: Path, *, revise_changes=("src/App.jsx",)) -> None:
+    """Minimal swarm executors: plan -> one file -> verify, plus a revision."""
+    @register_executor(TaskKind.SWARM_TECH_LEAD)
+    def _lead(task, deps):
+        art = Artifact.new(
+            task.session_id, task.task_id, ArtifactKind.WORK_PLAN,
+            {"goal": task.inputs.get("goal"), "paths": ["src/App.jsx"],
+             "layers": [{"name": "ui", "files": [{"path": "src/App.jsx", "description": "shell"}]}],
+             "contracts": {}, "project_root": str(project_root), "skills": ["react"],
+             "design": None})
+        return ExecutorResult(artifact=art, outputs={
+            "work_plan_artifact_id": art.artifact_id, "file_count": 1,
+            "goal": task.inputs.get("goal"), "project_root": str(project_root)})
+
+    @register_executor(TaskKind.SWARM_DEVELOPER)
+    def _dev(task, deps):
+        return ExecutorResult(outputs={**task.inputs, "file_ok": True,
+                                       "failed_paths": [], "path": "src/App.jsx"})
+
+    @register_executor(TaskKind.SWARM_VERIFY)
+    def _verify(task, deps):
+        art = Artifact.new(
+            task.session_id, task.task_id, ArtifactKind.SWARM_VERIFY_REPORT,
+            {"verify_ok": True, "summary": "verified: built 1/1 files",
+             "revision_artifact_id": task.inputs.get("revision_artifact_id"),
+             "runtime": {"ran": True, "ok": True, "routes": [
+                 {"route": "/", "mounted": True, "errors": [],
+                  "screenshot": str(project_root / ".cgx" / "screenshots" / "index.png")}]}})
+        return ExecutorResult(artifact=art, outputs={
+            "verify_ok": True, "verify_report_artifact_id": art.artifact_id,
+            "summary": "verified: built 1/1 files", "failed_paths": [],
+            "project_root": str(project_root)})
+
+    @register_executor(TaskKind.SWARM_REVISE)
+    def _revise(task, deps):
+        changed = list(revise_changes)
+        art = Artifact.new(
+            task.session_id, task.task_id, ArtifactKind.SWARM_REVISION,
+            {"feedback": task.inputs.get("feedback"), "status": "applied" if changed else "unlocalized",
+             "changed": changed, "changes": [], "note": "ok" if changed else "could not map",
+             "revision_index": task.inputs.get("revision_index")})
+        return ExecutorResult(artifact=art, outputs={
+            "changed": changed, "failed_paths": [], "note": art.content["note"],
+            "reason": "" if changed else "could not map the feedback",
+            "work_plan_artifact_id": task.inputs.get("work_plan_artifact_id"),
+            "goal": task.inputs.get("goal"), "project_root": str(project_root),
+            "revision_artifact_id": art.artifact_id,
+            "revision_index": task.inputs.get("revision_index"),
+            "prior_status": task.inputs.get("prior_status")})
+
+
+def _build_swarm_session(client: _HandlerClient, project_root: Path) -> dict:
+    project_root.mkdir(parents=True, exist_ok=True)
+    state = client.create(objective="build a chatbot app", project_root=str(project_root),
+                          mode="swarm", run_initial_task=True)
+    assert state["session"]["status"] == "completed", state["session"]
+    kinds = [t["kind"] for t in state["tasks"]]
+    assert kinds == ["swarm_tech_lead", "swarm_developer", "swarm_verify"]
+    return state
+
+
+def test_feedback_on_completed_swarm_build_revises_then_reverifies(
+        client: _HandlerClient, project_root: Path) -> None:
+    _install_swarm_stubs(project_root)
+    state = _build_swarm_session(client, project_root)
+    sid = state["session"]["session_id"]
+
+    after = client.message(sid, message="make the top bar span the full width")
+    assert client.last_status == 200
+    kinds = [t["kind"] for t in after["tasks"]]
+    # the feedback became a revision + a fresh verification, not a new plan
+    assert kinds == ["swarm_tech_lead", "swarm_developer", "swarm_verify",
+                     "swarm_revise", "swarm_verify"]
+    revise = _find_task(after, kind="swarm_revise")
+    assert revise["status"] == "done"
+    assert revise["inputs"]["feedback"] == "make the top bar span the full width"
+    assert revise["inputs"]["revision_index"] == 1
+    assert revise["inputs"]["prior_status"] == "completed"
+    verifies = [t for t in after["tasks"] if t["kind"] == "swarm_verify"]
+    assert verifies[-1]["parent_task_id"] == revise["task_id"]
+    assert verifies[-1]["inputs"]["revision_artifact_id"]
+    # the session was reopened for the revision and closed again by the verifier
+    assert after["session"]["status"] == "completed"
+    arts = [a["kind"] for a in after["artifacts"]]
+    assert arts.count("swarm_verify_report") == 2 and "swarm_revision" in arts
+    # a second round keeps counting
+    again = client.message(sid, message="remember the API key after a reload")
+    assert _find_task(again, kind="swarm_revise") is not None
+    revises = [t for t in again["tasks"] if t["kind"] == "swarm_revise"]
+    assert revises[-1]["inputs"]["revision_index"] == 2
+
+
+def test_unlocalizable_feedback_restores_the_verdict_with_a_reason(
+        client: _HandlerClient, project_root: Path) -> None:
+    _install_swarm_stubs(project_root, revise_changes=())
+    state = _build_swarm_session(client, project_root)
+    sid = state["session"]["session_id"]
+    after = client.message(sid, message="make it pop")
+    revise = _find_task(after, kind="swarm_revise")
+    assert revise["status"] == "done"
+    assert "could not map" in (revise["error"] or "")
+    # no second verification ran; the build keeps its prior verdict
+    assert [t["kind"] for t in after["tasks"]].count("swarm_verify") == 1
+    assert after["session"]["status"] == "completed"
+
+
+def test_question_on_completed_swarm_build_still_explores(
+        client: _HandlerClient, project_root: Path) -> None:
+    _install_swarm_stubs(project_root)
+    _install_stubs()
+    state = _build_swarm_session(client, project_root)
+    after = client.message(state["session"]["session_id"],
+                           message="how does the settings page store the key?")
+    assert _find_task(after, kind="explore") is not None
+    assert _find_task(after, kind="swarm_revise") is None
+
+
+def test_feedback_while_swarm_build_runs_is_409(
+        client: _HandlerClient, project_root: Path) -> None:
+    _install_swarm_stubs(project_root)
+    state = _build_swarm_session(client, project_root)
+    sid = state["session"]["session_id"]
+    # Simulate a build mid-chain: a READY developer task on the finished tree.
+    runner = routes._resolve_runner_for(sid)
+    from cgx.session.models import TaskNode
+    runner.store.save_task(TaskNode.new(
+        session_id=sid, kind=TaskKind.SWARM_DEVELOPER, name="Generate file 2",
+        inputs={"work_plan_artifact_id": "wp", "file_index": 1}))
+    result = client.message(sid, message="make it blue", run_initial_task=False)
+    assert result is None and client.last_status == 409
+    assert "still running" in str(client.last_detail)
+
+
+def test_screenshot_endpoint_serves_png_and_contains_paths(
+        client: _HandlerClient, project_root: Path) -> None:
+    _install_swarm_stubs(project_root)
+    state = _build_swarm_session(client, project_root)
+    sid = state["session"]["session_id"]
+    shots = project_root / ".cgx" / "screenshots"
+    shots.mkdir(parents=True, exist_ok=True)
+    (shots / "index.png").write_bytes(b"\x89PNG\r\n\x1a\nfake")
+    (project_root / "secret.png").write_bytes(b"nope")
+
+    resp = _run(routes.session_screenshot(sid, "index.png"))
+    assert resp.path == str(shots / "index.png")
+    assert resp.media_type == "image/png"
+
+    for bad in ("../secret.png", "secret.png", "index.txt", "..", ""):
+        with pytest.raises(HTTPException) as ei:
+            _run(routes.session_screenshot(sid, bad))
+        assert ei.value.status_code in (400, 404)
+    with pytest.raises(HTTPException) as ei:
+        _run(routes.session_screenshot("ses_missing", "index.png"))
+    assert ei.value.status_code == 404
+
+
+def test_preview_endpoint_serves_the_built_bundle(
+        client: _HandlerClient, project_root: Path) -> None:
+    import urllib.request
+
+    _install_swarm_stubs(project_root)
+    state = _build_swarm_session(client, project_root)
+    sid = state["session"]["session_id"]
+
+    class _Url:
+        hostname = "localhost"
+
+    class _Req:
+        url = _Url()
+
+    # no bundle yet -> 404 with an actionable message
+    with pytest.raises(HTTPException) as ei:
+        _run(routes.start_preview(sid, _Req()))
+    assert ei.value.status_code == 404 and "dist/" in str(ei.value.detail)
+
+    dist = project_root / "dist"
+    dist.mkdir()
+    (dist / "index.html").write_text("<!doctype html><html><head></head><body><div id=root>hi</div></body></html>")
+    try:
+        preview = _run(routes.start_preview(sid, _Req()))
+        assert preview.url.startswith("http://127.0.0.1:") and preview.dist == str(dist)
+        body = urllib.request.urlopen(preview.url, timeout=5).read().decode()
+        assert "<div id=root>hi</div>" in body
+        # client-side routes fall back to index.html
+        body2 = urllib.request.urlopen(preview.url + "settings", timeout=5).read().decode()
+        assert "<div id=root>hi</div>" in body2
+        # a second call reuses the server
+        again = _run(routes.start_preview(sid, _Req()))
+        assert again.port == preview.port
+    finally:
+        stopped = _run(routes.stop_preview(sid))
+    assert stopped["was_running"] is True
+    assert _run(routes.stop_preview(sid))["was_running"] is False

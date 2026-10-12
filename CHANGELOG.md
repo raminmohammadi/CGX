@@ -9,6 +9,48 @@ with an API-key profile tab" -- and called it verified. This release teaches
 CGX what a real product looks like, generally, and makes the frontend side of
 the pipeline as grounded as the Python side.
 
+* **Feedback loop for swarm builds** (`cgx/session/revise.py`,
+  `SWARM_REVISE`, `BuildResult.tsx`). *User asks -> swarm builds -> user
+  reviews -> user gives feedback -> the agent knows exactly where and how to
+  apply it -> rebuild + re-verify -> review again.* A message on a finished
+  swarm session no longer re-plans from scratch: the session reopens and
+  `SWARM_REVISE` localizes the feedback deterministically (named components
+  and exported symbols, routes/screens, quoted UI copy found in the sources,
+  concern keywords mapped to file roles from the design brief, the routes the
+  last runtime smoke flagged), refines it with one bounded model call that
+  returns a per-file instruction restricted to planned files, applies each as
+  a grounded modification of the **whole current file** (an unchanged
+  hand-back, or a diff that touches none of the selectors / properties / props
+  the instruction names, is re-asked once, then reported as `partial`, never
+  counted as done; a selector/identifier the instruction names but the file
+  lacks is called out as something to ADD), splits multi-part feedback and
+  guarantees every part is covered, shows the model whole CSS rules for the implicated components *and
+  their containers* plus the component's DOM ancestry (`body > #root > .app >
+  .topbar`, each ring with its rules or "no rule") so it can name the ring
+  that actually constrains an element -- and for "full width" complaints
+  diagnoses the constraining ring deterministically (centring flex parents,
+  max-width caps, unstyled `#root`), drops no-op instructions and queues the
+  diagnosed CSS fix itself when the model misses it, switches
+  the deterministic theme for "dark mode"-style requests, and chains to
+  `SWARM_VERIFY` so the result is rebuilt, smoke-tested and re-screenshotted --
+  and the verifier regenerates a user-revised file as a modification that
+  preserves the applied asks, never from the bare spec. With a vision model
+  available the verifier judges the **feedback itself** -- before/after
+  screenshots against the user's words -- and on NOT SATISFIED the router
+  spends one bounded automatic follow-up revision (`CGX_FEEDBACK_AUTOFIX`).
+  The `SWARM_REVISION` artifact records every candidate with its score and
+  reasons, every change with its instruction / why / outcome / diff; the
+  WORK_PLAN keeps a revision history the next round sees. Web UI: the Agent
+  page's **Build result** panel (verdict, a screenshot per route, **live
+  preview** of the real bundle via a per-session SPA server, revision history
+  with diffs) and a composer that reads *Describe what to change* / **Revise**.
+  New endpoints: `GET /{sid}/screenshots/{name}`, `POST`/`DELETE
+  /{sid}/preview`; `POST /{sid}/message` answers `409` while a build is
+  mid-chain. CLI: `cgx session preview <sid>` reviews a build (verdict,
+  screenshot paths, revisions, live preview server); `cgx session send <sid>
+  "feedback"` continues the finished session and prints `✎ revision #n:
+  changed ...` plus the verdict. A pure
+  question still routes to investigation.
 * **Design layer** (`cgx/design/`, see `docs/design.md`). A UI-bearing
   objective gets a deterministic **design brief**: product archetype (chat
   app, admin/CRUD dashboard, analytics dashboard, tasks tool, landing site,

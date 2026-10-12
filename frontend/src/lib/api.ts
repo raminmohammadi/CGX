@@ -224,7 +224,8 @@ export type TaskKind =
   | "swarm_assess"
   | "swarm_tech_lead"
   | "swarm_developer"
-  | "swarm_verify";
+  | "swarm_verify"
+  | "swarm_revise";
 
 export type TaskNodeStatus =
   | "pending"
@@ -249,7 +250,12 @@ export type ArtifactKind =
   | "build_report"
   | "repair_plan"
   | "smoke_report"
-  | "api_check_report";
+  | "api_check_report"
+  | "runtime_report"
+  | "diagnosis"
+  | "swarm_state"
+  | "swarm_verify_report"
+  | "swarm_revision";
 
 export type FactKind =
   | "file" | "symbol" | "parameter" | "anchor" | "llm_call" | "swarm_beat";
@@ -264,7 +270,16 @@ export type DecisionKind =
   | "relocate";
 
 export type SessionStatusValue =
-  | "active" | "paused" | "completed" | "abandoned";
+  | "active" | "paused" | "completed" | "failed" | "abandoned";
+
+// A live preview server for a finished swarm build's production bundle
+// (``POST /api/agent-session/{sid}/preview``).
+export interface AgentPreviewState {
+  url: string;
+  port: number;
+  dist: string;
+  host: string;
+}
 
 export interface AgentSessionSummary {
   session_id: string;
@@ -919,6 +934,23 @@ export const api = {
     jsonReq<AgentSessionState>(
       `/api/agent-session/${encodeURIComponent(sid)}/cancel`,
       "POST",
+    ),
+  // --- build review (swarm feedback loop) ---
+  // Same-origin URL of a route screenshot the verifier took; ``name`` is the
+  // bare file name (``index.png``). ``v`` busts the browser cache after a
+  // re-verify rewrote the file in place.
+  agentSessionScreenshotUrl: (sid: string, name: string, v?: number | string) =>
+    `/api/agent-session/${encodeURIComponent(sid)}/screenshots/${encodeURIComponent(name)}`
+    + (v != null ? `?v=${encodeURIComponent(String(v))}` : ""),
+  agentSessionPreviewStart: (sid: string) =>
+    jsonReq<AgentPreviewState>(
+      `/api/agent-session/${encodeURIComponent(sid)}/preview`,
+      "POST",
+    ),
+  agentSessionPreviewStop: (sid: string) =>
+    jsonReq<{ stopped: string; was_running: boolean }>(
+      `/api/agent-session/${encodeURIComponent(sid)}/preview`,
+      "DELETE",
     ),
   agentSessionDelete: (sid: string, projectRoot?: string | null) => {
     const q = projectRoot

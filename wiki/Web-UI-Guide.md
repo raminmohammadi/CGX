@@ -60,6 +60,16 @@ Artifacts. Nothing reaches disk until you tick the approval checkpoint, and an
 its own sub-tabs for **Agent Profiles**, **Skills** and **New Skill**. Full
 walkthrough: **[[Session Based Agent]]**.
 
+**Build result & feedback (swarm).** When a swarm build finishes, the centre
+pane leads with a **Build result** panel: the verifier's verdict, one
+**screenshot per route** (click to enlarge), **Open live preview** / **Preview
+here** (the real production bundle served on a local port, inline or in a new
+tab), and the **revision history**. The composer reads *Describe what to
+change* and its button **Revise**: your feedback is localized to the exact
+files, applied, rebuilt and re-screenshotted, and each revision row lists the
+files touched with the instruction, *why that file*, and a diff -- plus how
+the files were located. See **[[Swarm Agent]]**.
+
 **Swarm view fixes.** When a run is in `swarm` mode, the task tree now renders
 Developer tasks as **siblings under the Tech Lead** instead of a deepening
 parent chain that indented one level per file (with a defensive indentation

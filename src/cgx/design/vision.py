@@ -128,3 +128,131 @@ def critique_screenshots(brief: Any, shots: Dict[str, str], ui_files: List[str],
         logger.debug("vision critic failed: %s", exc)
         return {}
     return parse_fixes(text, ui_files)
+
+
+# --------------------------------------------------------------------------
+# feedback acceptance: did the revision visibly do what the user asked?
+# --------------------------------------------------------------------------
+
+_FEEDBACK_PROMPT = (
+    "You are reviewing whether a coding agent's revision of a web app did what the user asked. "
+    "You get screenshots of the same route(s) BEFORE and AFTER the revision, in the order listed. "
+    "Judge ONLY the user's request below against what is visible; ignore anything else.\n"
+    "Reply with exactly one line. If the request is visibly satisfied in the AFTER screenshot(s), "
+    "reply `SATISFIED`. Otherwise reply `NOT SATISFIED: <what is still wrong, concretely -- which "
+    "element, and what it looks like now versus what was asked>`. A request about size, width, "
+    "position, alignment, spacing, colour or layout is ALWAYS judgeable from a screenshot -- compare "
+    "the element's extent against the page edges and against the BEFORE image and decide. Reply "
+    "`UNDECIDABLE` ONLY for behaviour, data or wording you cannot see."
+)
+
+
+def check_feedback(feedback: str, before: Dict[str, str], after: Dict[str, str], provider: Any,
+                   model: Optional[Tuple[str, str]] = None) -> Optional[Dict[str, Any]]:
+    """Ask the vision model whether ``feedback`` is visibly satisfied after a revision.
+
+    ``before`` / ``after`` map a route to a screenshot path; routes present in
+    both are compared (at most two). Returns ``{"satisfied": True|False|None,
+    "verdict": "satisfied|not_satisfied|undecidable", "evidence": str,
+    "routes": [...], "model": name}`` or ``None`` when no vision model or no
+    comparable screenshots are available. The caller surfaces the verdict and
+    may spend one bounded automatic follow-up revision on a NOT SATISFIED.
+    """
+    feedback = (feedback or "").strip()
+    if not feedback or not after:
+        return None
+    model = model or resolve_vision_model(provider)
+    if not model:
+        return None
+    base, name = model
+    pairs: List[Tuple[str, str, str]] = []
+    for route, after_path in after.items():
+        before_path = before.get(route)
+        if before_path and after_path:
+            pairs.append((route, before_path, after_path))
+    if not pairs:
+        # No "before" to compare against: judge the AFTER screenshots alone.
+        pairs = [(route, "", path) for route, path in list(after.items())[:2]]
+    pairs = pairs[:2]
+    images: List[str] = []
+    order: List[str] = []
+    for route, b_path, a_path in pairs:
+        if b_path:
+            enc_b = _b64(b_path)
+            if enc_b:
+                images.append(enc_b)
+                order.append(f"{route} BEFORE")
+        enc_a = _b64(a_path)
+        if enc_a:
+            images.append(enc_a)
+            order.append(f"{route} AFTER")
+    if not images or not any(o.endswith("AFTER") for o in order):
+        return None
+    user = (f"{_FEEDBACK_PROMPT}\n\nUSER REQUEST: \"{feedback}\"\n"
+            f"SCREENSHOTS (in order): {', '.join(order)} at 1280x900.")
+    try:
+        import requests
+        resp = requests.post(f"{base}/api/chat", json={
+            "model": name, "stream": False,
+            "messages": [{"role": "user", "content": user, "images": images}],
+            "options": {"temperature": 0, "num_predict": 200},
+        }, timeout=_TIMEOUT_S)
+        text = str(((resp.json() or {}).get("message") or {}).get("content") or "").strip()
+    except Exception as exc:  # pragma: no cover - depends on a live server
+        logger.debug("feedback check failed: %s", exc)
+        return None
+    verdict = parse_feedback_verdict(text, routes=[r for r, _b, _a in pairs], model=name)
+    if verdict["satisfied"] is None and _layout_request(feedback):
+        # A layout question IS decidable from pixels; one firmer re-ask that
+        # forbids the hedge (the first answer is kept if the model still hedges).
+        try:
+            resp = requests.post(f"{base}/api/chat", json={
+                "model": name, "stream": False,
+                "messages": [{"role": "user", "content": user, "images": images},
+                             {"role": "assistant", "content": text},
+                             {"role": "user", "content": (
+                                 "This is a layout request, which is decidable from the screenshots. "
+                                 "Look at the AFTER image: does the element extend the way the user "
+                                 "asked? Answer with `SATISFIED` or `NOT SATISFIED: <reason>` only.")}],
+                "options": {"temperature": 0, "num_predict": 200},
+            }, timeout=_TIMEOUT_S)
+            text2 = str(((resp.json() or {}).get("message") or {}).get("content") or "").strip()
+            second = parse_feedback_verdict(text2, routes=[r for r, _b, _a in pairs], model=name)
+            if second["satisfied"] is not None:
+                second["reasked"] = True
+                return second
+        except Exception as exc:  # pragma: no cover - depends on a live server
+            logger.debug("feedback re-ask failed: %s", exc)
+    return verdict
+
+
+def _layout_request(feedback: str) -> bool:
+    try:
+        from cgx.session.revise import is_layout_feedback
+        return is_layout_feedback(feedback)
+    except Exception:  # pragma: no cover
+        return False
+
+
+def parse_feedback_verdict(text: str, *, routes: Optional[List[str]] = None,
+                           model: str = "") -> Dict[str, Any]:
+    """Parse the one-line SATISFIED / NOT SATISFIED / UNDECIDABLE reply."""
+    first = (text or "").strip().splitlines()[0].strip() if (text or "").strip() else ""
+    low = first.lower().lstrip("`*- ").rstrip("`*. ")
+    out: Dict[str, Any] = {"satisfied": None, "verdict": "undecidable", "evidence": "",
+                           "routes": list(routes or []), "model": model}
+    if low.startswith("not satisfied"):
+        out["satisfied"] = False
+        out["verdict"] = "not_satisfied"
+        out["evidence"] = first.split(":", 1)[1].strip() if ":" in first else ""
+    elif low.startswith("satisfied"):
+        out["satisfied"] = True
+        out["verdict"] = "satisfied"
+    elif low.startswith("undecidable"):
+        out["evidence"] = first.split(":", 1)[1].strip() if ":" in first else ""
+    else:
+        out["evidence"] = first[:300]
+    return out
+
+
+__all__ += ["check_feedback", "parse_feedback_verdict"]

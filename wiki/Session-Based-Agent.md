@@ -185,9 +185,13 @@ the failure without re-posting.
 
 ## HTTP surface
 
-The API at `/api/agent-session/*` has eight endpoints — seven JSON
-(create / list / get / message / decision / cancel / delete) plus a
-`GET /{sid}/events` **SSE** stream. Mutating endpoints return the full
+The API at `/api/agent-session/*` has eleven endpoints — ten JSON
+(create / list / get / message / decision / cancel / delete, plus the
+swarm build-review trio: `GET /{sid}/screenshots/{name}`, `POST` /
+`DELETE /{sid}/preview`) and a `GET /{sid}/events` **SSE** stream. On a
+finished **swarm** build `POST /{sid}/message` is *feedback*: the session
+reopens and `SWARM_REVISE -> SWARM_VERIFY` run (`409` while the build is
+still mid-chain) — see **[[Swarm Agent]]**. Mutating endpoints return the full
 `AgentSessionState` snapshot so the UI re-renders the task tree in one
 round-trip. The UI follows a running session over SSE and falls back to
 polling only when the stream is unhealthy.
@@ -227,6 +231,8 @@ The same lifecycle is scriptable via `cgx session` — see **[[CLI Reference]]**
 cgx session list --table                      # sessions for the project
 cgx session show <sid>                         # tasks / artifacts / facts / decisions
 cgx session send <sid> "focus on the parser"   # follow-up message, drives one turn (live)
+cgx session preview <sid>                       # finished swarm build: verdict, screenshots, live preview
+cgx session send <sid> "make the top bar full width"   # on a finished swarm build: revise + re-verify
 cgx session decide <sid> --task-id <tid> \      # answer an open ASK_USER
   --chosen '{"approved": true}'
 cgx session rm <sid>                            # delete

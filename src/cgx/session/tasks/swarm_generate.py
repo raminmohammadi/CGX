@@ -687,8 +687,14 @@ def generate_file(*, path: str, description: str, depends_on: List[str],
                   skills: Optional[List[str]] = None,
                   deps: Any = None,
                   modify_existing: bool = False,
-                  design: Optional[Dict[str, Any]] = None) -> GenerationOutcome:
+                  design: Optional[Dict[str, Any]] = None,
+                  existing_limit: Optional[int] = None) -> GenerationOutcome:
     """Run the full-file -> AST fallback ladder for a single file.
+
+    ``existing_limit`` caps how much of an existing file body is quoted back
+    when ``modify_existing`` is set (default :data:`_DEP_CONTENT_LIMIT`). A
+    *revision* of a finished file passes a much larger cap: the model must see
+    the whole current file to change one thing and preserve the rest.
 
     ``design`` is the WORK_PLAN's design brief (see :mod:`cgx.design`). The
     brief's tokens stylesheet is emitted deterministically here -- a curated,
@@ -732,7 +738,7 @@ def generate_file(*, path: str, description: str, depends_on: List[str],
                 + "\n\nIMPORTANT: this file ALREADY EXISTS. MODIFY it to satisfy "
                 "the requirements while PRESERVING all unrelated existing code, "
                 "imports, and public symbols. Do not delete working code. "
-                "Current content:\n" + _truncate(existing, _DEP_CONTENT_LIMIT))
+                "Current content:\n" + _truncate(existing, existing_limit or _DEP_CONTENT_LIMIT))
             swarm_beat(log_root, "developer", "modify_existing", file=path,
                        bytes=len(existing))
     content = err = ""

@@ -8,6 +8,7 @@ import type {
 } from "../../lib/api";
 import { TaskTree } from "./TaskTree";
 import { ActiveTaskPanel } from "./ActiveTask";
+import { BuildResult, latestVerifyReport } from "./BuildResult";
 import { SessionDashboard } from "./SessionDashboard";
 import { SidePanel } from "./SidePanel";
 import { ResizeHandle } from "./ResizeHandle";
@@ -79,6 +80,13 @@ export function LiveView({
   // drain at dispatch, so a profile switch mid-run applies only to the next.
   const providerMismatch = !!running && !!runModel && !!selectedModel
     && runModel !== selectedModel;
+  // A swarm session that holds a verified (or partial) build is in the
+  // feedback loop: the centre pane leads with the Build result (verdict,
+  // screenshots, live preview, revisions) and the composer takes feedback
+  // that SWARM_REVISE maps to the exact files.
+  const hasBuild = state.session.mode === "swarm"
+    && latestVerifyReport(state.artifacts) !== null;
+  const revisable = hasBuild && !running;
   return (
     <div className="flex h-full w-full overflow-hidden">
       {sessionBarCollapsed ? (
@@ -161,6 +169,11 @@ export function LiveView({
               && focused.status === "in_progress" && (
               <LiveProgress p={progress[focused.task_id]} taskKind={focused.kind} />
             )}
+            {hasBuild && (
+              <ErrorBoundary label="build-result">
+                <BuildResult sid={state.session.session_id} state={state} />
+              </ErrorBoundary>
+            )}
             <ErrorBoundary label="active-task">
               <ActiveTaskPanel
                 task={focused ?? null}
@@ -177,6 +190,7 @@ export function LiveView({
           reply={reply} setReply={setReply}
           onSend={onSend} pending={pending}
           running={!!running} onCancel={onCancel}
+          revisable={revisable}
         />
       </div>
       {sidePanelCollapsed ? (
@@ -285,11 +299,14 @@ function SessionBar({
 }
 
 function FollowUpBar({
-  reply, setReply, onSend, pending, running, onCancel,
+  reply, setReply, onSend, pending, running, onCancel, revisable,
 }: {
   reply: string; setReply: (s: string) => void; onSend: () => void;
   pending: boolean; running?: boolean;
   onCancel?: () => void | Promise<void>;
+  // The session holds a finished swarm build: the message is feedback that
+  // revises it (SWARM_REVISE -> SWARM_VERIFY) rather than a new objective.
+  revisable?: boolean;
 }) {
   return (
     <div className="px-4 pt-2.5 pb-3 border-t border-muted bg-slate-950/60 flex items-end gap-2">
@@ -297,9 +314,12 @@ function FollowUpBar({
         rows={2}
         value={reply}
         onChange={(e) => setReply(e.target.value)}
-        placeholder="Post a follow-up objective…"
+        placeholder={revisable
+          ? "Describe what to change (e.g. “make the top bar span the full width”, “remember the API key after a reload”)…"
+          : "Post a follow-up objective…"}
         disabled={pending}
         className="flex-1"
+        aria-label={revisable ? "Feedback on the build" : "Follow-up objective"}
       />
       {running && onCancel && (
         <button
@@ -312,7 +332,8 @@ function FollowUpBar({
         type="button" onClick={onSend}
         disabled={pending || !reply.trim()}
         className="av-btn-primary"
-      ><Send className="h-3 w-3" /> Send</button>
+        title={revisable ? "Apply this feedback to the build and re-verify" : "Send"}
+      ><Send className="h-3 w-3" /> {revisable ? "Revise" : "Send"}</button>
     </div>
   );
 }
@@ -383,6 +404,7 @@ function LiveProgress({ p, taskKind }: { p: TaskProgress; taskKind?: string }) {
   let prefix = "Generating";
   if (kind === "swarm_tech_lead") prefix = "Planning";
   if (kind === "swarm_verify") prefix = "Verifying";
+  if (kind === "swarm_revise") prefix = "Revising";
   
   return (
     <div className={`mb-3 rounded-lg border p-3 ${isFailed

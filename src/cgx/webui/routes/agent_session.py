@@ -17,6 +17,16 @@ Endpoint shape:
 * ``POST /api/agent-session/{sid}/decision`` -- resolve an ASK_USER.
 * ``DELETE /api/agent-session/{sid}`` -- discard a session and its
   tasks / facts / decisions / artifacts (``ON DELETE CASCADE``).
+
+Feedback loop (swarm builds):
+
+* ``POST /api/agent-session/{sid}/message`` on a *finished* swarm build is
+  a revision: the router reopens the session and spawns ``SWARM_REVISE`` ->
+  ``SWARM_VERIFY``; a build still mid-chain answers ``409``.
+* ``GET /api/agent-session/{sid}/screenshots/{name}`` -- a route screenshot
+  the verifier's browser smoke took (``<root>/.cgx/screenshots/*.png``).
+* ``POST`` / ``DELETE /api/agent-session/{sid}/preview`` -- start / stop a
+  live preview server for the build's production bundle.
 """
 
 from __future__ import annotations
@@ -31,6 +41,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.responses import FileResponse
 from sse_starlette.sse import EventSourceResponse
 
 # Importing the tasks package side-effect-registers Phase 1 executors.
@@ -46,6 +57,7 @@ from cgx.session.tasks.base import ExecutorDeps
 from cgx.logging_setup import sanitize_for_log
 from cgx.webui.handlers import _resolve_provider
 from cgx.webui.models import (
+    AgentPreviewState,
     AgentSessionCreateRequest,
     AgentSessionDecisionRequest,
     AgentSessionMessageRequest,
@@ -667,13 +679,146 @@ async def post_message(sid: str,
     if session is None:
         raise HTTPException(status_code=404,
                             detail=f"session {sid!r} not found")
-    await asyncio.to_thread(
+    plan = await asyncio.to_thread(
         runner.post_message, session_id=sid, message=req.message)
+    if not plan.actions and _swarm_build_busy(runner, sid):
+        # Feedback on a swarm build that is still mid-chain is refused rather
+        # than silently dropped or forked into a second build on one tree.
+        raise HTTPException(
+            status_code=409,
+            detail=("This build is still running. Wait for it to finish, or "
+                    "stop it, before sending feedback."))
     if req.run_initial_task:
         deps = _build_deps(req.provider, req.index, session.project_root,
                            store=runner.store)
         await _schedule_drain(runner, sid, deps)
     return _snapshot(runner, sid)
+
+
+def _swarm_build_busy(runner: SessionRunner, sid: str) -> bool:
+    """True when ``sid`` is a swarm session whose build is still mid-chain."""
+    from cgx.session.revise import latest_build
+    session = runner.store.get_session(sid)
+    if session is None or session.mode is not SessionMode.SWARM:
+        return False
+    build = latest_build(runner.store.list_tasks(sid))
+    return bool(build is not None and build.in_flight)
+
+
+# --------------------- build review: screenshots + live preview ---------------------
+
+# One preview server per session: ``{sid: {"server", "port", "dist", "host"}}``.
+_PREVIEWS: Dict[str, Dict[str, Any]] = {}
+_PREVIEWS_LOCK = threading.Lock()
+
+
+def _session_or_404(sid: str):
+    runner = _resolve_runner_for(sid)
+    session = runner.store.get_session(sid)
+    if session is None:
+        raise HTTPException(status_code=404,
+                            detail=f"session {sid!r} not found")
+    return runner, session
+
+
+@router.get("/{sid}/screenshots/{name}")
+async def session_screenshot(sid: str, name: str) -> FileResponse:
+    """Serve one route screenshot the verifier's browser smoke took.
+
+    Screenshots live in ``<project_root>/.cgx/screenshots/`` and are named by
+    route slug (``index.png``, ``settings.png``). Only a bare ``*.png`` file
+    name is accepted and the resolved path must stay inside that folder.
+    """
+    _runner, session = _session_or_404(sid)
+    root = session.project_root
+    if not root:
+        raise HTTPException(status_code=404, detail="session has no project root")
+    safe = os.path.basename(name or "")
+    if not safe or safe != name or not safe.lower().endswith(".png"):
+        raise HTTPException(status_code=400, detail="invalid screenshot name")
+    shots_dir = os.path.realpath(os.path.join(root, ".cgx", "screenshots"))
+    full = os.path.realpath(os.path.join(shots_dir, safe))
+    if not full.startswith(shots_dir + os.sep) or not os.path.isfile(full):  # codeql[py/path-injection]
+        raise HTTPException(status_code=404, detail="screenshot not found")
+    return FileResponse(full, media_type="image/png",
+                        headers={"Cache-Control": "no-store"})
+
+
+def _build_dist(runner: SessionRunner, session) -> Optional[Path]:
+    """The build's production bundle directory (``dist/``), if it exists."""
+    from cgx.codegen.browser_smoke import find_dist
+    from cgx.session.models import ArtifactKind
+    if not session.project_root:
+        return None
+    ui_root = ""
+    try:
+        for art in runner.store.list_artifacts(session.session_id):
+            if art.kind is ArtifactKind.WORK_PLAN and isinstance(art.content, dict):
+                design = art.content.get("design") or {}
+                if isinstance(design, dict) and design.get("app_root"):
+                    ui_root = str(design.get("app_root"))
+    except Exception:  # pragma: no cover - best-effort
+        ui_root = ""
+    return find_dist(session.project_root, ui_root)
+
+
+def _stop_preview(sid: str) -> bool:
+    with _PREVIEWS_LOCK:
+        entry = _PREVIEWS.pop(sid, None)
+    if entry is None:
+        return False
+    try:
+        entry["server"].shutdown()
+        entry["server"].server_close()
+    except Exception:  # pragma: no cover - best-effort
+        pass
+    return True
+
+
+@router.post("/{sid}/preview", response_model=AgentPreviewState)
+async def start_preview(sid: str, request: Request) -> AgentPreviewState:
+    """Start (or reuse) a live preview of the build's production bundle.
+
+    Serves ``dist/`` with the same SPA server the runtime smoke uses, on an
+    ephemeral port, so the user can click through the real app -- client-side
+    routes and absolute asset URLs included -- before giving feedback. Bind
+    host is ``CGX_PREVIEW_HOST`` (default loopback); when bound to all
+    interfaces the returned URL uses the host the browser reached CGX on.
+    """
+    runner, session = _session_or_404(sid)
+    dist = _build_dist(runner, session)
+    if dist is None:
+        raise HTTPException(
+            status_code=404,
+            detail=("No production bundle (dist/) exists for this build yet -- "
+                    "the build has to compile before it can be previewed."))
+    host = (os.environ.get("CGX_PREVIEW_HOST") or "127.0.0.1").strip()
+    with _PREVIEWS_LOCK:
+        entry = _PREVIEWS.get(sid)
+        if entry is not None and entry.get("dist") != str(dist):
+            entry = None
+    if entry is None:
+        _stop_preview(sid)
+        from cgx.codegen.browser_smoke import serve_spa
+        try:
+            server, port = await asyncio.to_thread(serve_spa, dist, host)
+        except OSError as exc:
+            raise HTTPException(status_code=500,
+                                detail=f"could not start the preview server: {exc}")
+        entry = {"server": server, "port": port, "dist": str(dist), "host": host}
+        with _PREVIEWS_LOCK:
+            _PREVIEWS[sid] = entry
+    public_host = host
+    if host in ("0.0.0.0", "::", ""):
+        public_host = request.url.hostname or "127.0.0.1"
+    return AgentPreviewState(url=f"http://{public_host}:{entry['port']}/",
+                             port=int(entry["port"]), dist=str(entry["dist"]), host=host)
+
+
+@router.delete("/{sid}/preview", response_model=Dict[str, Any])
+async def stop_preview(sid: str) -> Dict[str, Any]:
+    """Stop the session's live preview server (no-op when none is running)."""
+    return {"stopped": sid, "was_running": _stop_preview(sid)}
 
 
 @router.post("/{sid}/decision", response_model=AgentSessionState)
@@ -743,6 +888,7 @@ async def delete_session(sid: str,
     drain = _SESSION_DRAINS.pop(sid, None)
     if drain is not None and not drain.done():
         drain.cancel()
+    _stop_preview(sid)
     removed = await asyncio.to_thread(runner.store.delete_session, sid)
     if not removed:
         raise HTTPException(status_code=404,
